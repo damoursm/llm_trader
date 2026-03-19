@@ -1,0 +1,54 @@
+"""Fetch real-time and historical market data via yfinance."""
+
+import yfinance as yf
+import pandas as pd
+from loguru import logger
+from typing import List
+from src.models import TickerSnapshot
+
+
+def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
+    """Return latest price, change, and basic technicals for each ticker."""
+    snapshots = []
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.fast_info
+            hist = t.history(period="5d", interval="1d")
+
+            if hist.empty:
+                logger.warning(f"No history for {ticker}")
+                continue
+
+            current_price = float(info.last_price)
+            prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current_price
+            pct_change = (current_price - prev_close) / prev_close * 100
+
+            # 5-day return
+            week_open = float(hist["Close"].iloc[0])
+            week_return = (current_price - week_open) / week_open * 100
+
+            snapshots.append(TickerSnapshot(
+                ticker=ticker,
+                price=current_price,
+                pct_change_1d=round(pct_change, 2),
+                pct_change_5d=round(week_return, 2),
+                volume=int(info.three_month_average_volume or 0),
+                market_cap=getattr(info, "market_cap", None),
+            ))
+        except Exception as e:
+            logger.warning(f"market_data failed for {ticker}: {e}")
+
+    logger.info(f"Fetched snapshots for {len(snapshots)}/{len(tickers)} tickers")
+    return snapshots
+
+
+def get_history(ticker: str, period: str = "1mo") -> pd.DataFrame:
+    """Return OHLCV history for technical analysis."""
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval="1d")
+        return df
+    except Exception as e:
+        logger.warning(f"get_history failed for {ticker}: {e}")
+        return pd.DataFrame()
