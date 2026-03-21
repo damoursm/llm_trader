@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     stock_watchlist: str = "AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL"
     sector_etfs: str = "XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC"
 
+    # Scheduling (cron expressions, US/Eastern timezone)
+    schedule_premarket: str = "0 8 * * 1-5"
+    schedule_midday: str = "0 12 * * 1-5"
+    schedule_close: str = "30 16 * * 1-5"
+
     @property
     def recipients_list(self) -> List[str]:
         return [r.strip() for r in self.email_recipients.split(",") if r.strip()]
