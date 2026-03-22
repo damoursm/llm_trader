@@ -7,25 +7,26 @@ class Settings(BaseSettings):
     # Claude API
     anthropic_api_key: str
 
+    # DeepSeek API (used for low-reasoning tasks)
+    deepseek_api_key: str = ""
+
     # News sources
     newsapi_key: str = ""
     alpha_vantage_key: str = ""
 
-    # Email
+    # Email (all optional — only needed when running with --email)
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
-    smtp_user: str
-    smtp_password: str
-    email_recipients: str  # comma-separated
+    smtp_user: str = ""
+    smtp_password: str = ""
+    email_recipients: str = ""  # comma-separated
 
     # Watchlist
     stock_watchlist: str = "AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL"
     sector_etfs: str = "XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC"
 
-    # Scheduling (cron expressions, US/Eastern timezone)
-    schedule_premarket: str = "0 8 * * 1-5"
-    schedule_midday: str = "0 12 * * 1-5"
-    schedule_close: str = "30 16 * * 1-5"
+    # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
+    schedule_daily: str = "0 8 * * 1-5"
 
     @property
     def recipients_list(self) -> List[str]:

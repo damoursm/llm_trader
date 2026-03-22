@@ -9,8 +9,9 @@ feedparser==6.0.11
 beautifulsoup4==4.12.3
 httpx==0.28.1
 
-# LLM analysis (Claude)
+# LLM analysis
 anthropic==0.49.0
+openai==1.77.0
 
 # Technical analysis
 ta==0.11.0

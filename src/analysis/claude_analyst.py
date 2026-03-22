@@ -28,12 +28,14 @@ def generate_recommendations(signals: List[TickerSignal]) -> List[Recommendation
 
     signals_text = "\n".join(
         f"- {s.ticker}: direction={s.direction}, confidence={s.confidence:.0%}, "
-        f"sentiment={s.sentiment_score:+.2f}, technical={s.technical_score:+.2f}\n"
-        f"  Rationale: {s.rationale}"
+        f"news_sentiment={s.sentiment_score:+.2f}\n"
+        f"  News rationale: {s.rationale}"
         for s in signals
     )
 
-    prompt = f"""You are a senior portfolio strategist. Based on the following ticker signals combining news sentiment and technical analysis, produce final actionable recommendations.
+    prompt = f"""You are a senior portfolio strategist. Based on the following ticker signals derived exclusively from recent news and current events, produce final actionable recommendations.
+
+Do NOT factor in technical analysis, chart patterns, or price history. Base your judgement solely on the news sentiment and the catalysts described.
 
 <signals>
 {signals_text}
@@ -46,7 +48,7 @@ For each ticker, output a JSON object with:
 - "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
 - "action": "BUY" | "SELL" | "HOLD" | "WATCH"
 - "confidence": float 0.0-1.0
-- "rationale": 2-3 sentence explanation
+- "rationale": 2-3 sentence explanation citing the specific news catalyst
 
 Return a JSON array of these objects. No markdown, JSON only."""
 

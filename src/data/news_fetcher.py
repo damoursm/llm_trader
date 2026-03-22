@@ -34,7 +34,7 @@ RSS_FEEDS = {
 }
 
 
-def fetch_rss_news(max_age_hours: int = 4) -> List[NewsArticle]:
+def fetch_rss_news(max_age_hours: int = 24) -> List[NewsArticle]:
     """Fetch news from all RSS feeds, filtered to recent articles."""
     articles: List[NewsArticle] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
@@ -60,7 +60,7 @@ def fetch_rss_news(max_age_hours: int = 4) -> List[NewsArticle]:
     return articles
 
 
-def fetch_newsapi(query: str, max_age_hours: int = 4) -> List[NewsArticle]:
+def fetch_newsapi(query: str, max_age_hours: int = 24) -> List[NewsArticle]:
     """Fetch news from NewsAPI for a given query string."""
     if not settings.newsapi_key:
         return []

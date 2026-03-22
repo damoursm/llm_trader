@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from config import settings
 from src.data.news_fetcher import fetch_all_news
 from src.data.market_data import get_snapshots
+from src.data.cache import load_news, save_news, load_snapshots, save_snapshots
 from src.signals.aggregator import build_signals
 from src.analysis.claude_analyst import generate_recommendations
 from src.notifications.email_sender import send_recommendations
@@ -19,21 +20,30 @@ def run_pipeline(send_email: bool = True) -> None:
     sectors = settings.sectors_list
     all_tickers = tickers + sectors
 
-    # 1. Fetch news
+    # 1. Fetch news (use cache if available for this hour)
     logger.info("Step 1/4: Fetching news...")
-    articles = fetch_all_news(tickers, sectors)
+    articles = load_news()
+    if articles is None:
+        articles = fetch_all_news(tickers, sectors)
+        save_news(articles)
+    else:
+        logger.info("Step 1/4: Using cached news (skip live fetch)")
 
-    # 2. Fetch market data
+    # 2. Fetch market data (use cache if available for this hour)
     logger.info("Step 2/4: Fetching market snapshots...")
-    snapshots = get_snapshots(all_tickers)
+    snapshots = load_snapshots()
+    if snapshots is None:
+        snapshots = get_snapshots(all_tickers)
+        save_snapshots(snapshots)
+    else:
+        logger.info("Step 2/4: Using cached snapshots (skip live fetch)")
 
     if not snapshots:
-        logger.error("No market data retrieved. Aborting pipeline.")
-        return
+        logger.warning("No market data retrieved — continuing with news-only signals.")
 
-    # 3. Build signals (sentiment + technical per ticker)
-    logger.info("Step 3/4: Building signals...")
-    signals = build_signals(snapshots, articles)
+    # 3. Build signals (news sentiment only)
+    logger.info("Step 3/4: Building news-based signals...")
+    signals = build_signals(all_tickers, articles)
 
     # 4. Generate final recommendations via Claude
     logger.info("Step 4/4: Generating recommendations...")
