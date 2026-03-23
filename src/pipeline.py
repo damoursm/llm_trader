@@ -11,7 +11,7 @@ from src.analysis.claude_analyst import generate_recommendations
 from src.notifications.email_sender import send_recommendations
 
 
-def run_pipeline(send_email: bool = True) -> None:
+def run_pipeline(send_email: bool = False) -> None:
     """Execute the full analysis pipeline."""
     start = datetime.now(timezone.utc)
     logger.info(f"Pipeline started at {start.strftime('%Y-%m-%d %H:%M UTC')}")
@@ -49,31 +49,79 @@ def run_pipeline(send_email: bool = True) -> None:
     logger.info("Step 4/4: Generating recommendations...")
     recommendations = generate_recommendations(signals)
 
-    # Filter to actionable recommendations only (exclude low-confidence HOLDs)
-    actionable = [r for r in recommendations if not (r.action == "HOLD" and r.confidence < 0.4)]
+    # Only surface BUY and SELL as actionable
+    actionable = [r for r in recommendations if r.action in ("BUY", "SELL")]
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-    logger.info(
-        f"Pipeline complete in {elapsed:.1f}s | "
-        f"{len(snapshots)} tickers | {len(articles)} articles | "
-        f"{len(actionable)} actionable recommendations"
-    )
+    logger.info(f"Pipeline complete in {elapsed:.1f}s | {len(all_tickers)} tickers | {len(articles)} articles")
 
-    # Print to console
+    # Log every recommendation
+    _log_recommendations(recommendations)
+
+    # Print actionable summary to console
     _print_summary(actionable)
 
-    # Send email
-    if send_email and actionable:
-        send_recommendations(actionable, total_analysed=len(snapshots))
+    # Send email if configured or explicitly requested
+    email_configured = bool(settings.smtp_user and settings.email_recipients)
+    if (send_email or email_configured) and actionable:
+        send_recommendations(actionable, total_analysed=len(all_tickers))
+    elif not actionable:
+        logger.info("No BUY/SELL signals today — no email sent.")
+
+
+def _log_recommendations(recommendations) -> None:
+    """Write every recommendation to the log file."""
+    stocks = [r for r in recommendations if r.type == "STOCK"]
+    etfs = [r for r in recommendations if r.type == "ETF"]
+
+    logger.info("=" * 60)
+    logger.info(f"RECOMMENDATIONS — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    logger.info("=" * 60)
+
+    if stocks:
+        logger.info("--- STOCKS ---")
+        for r in sorted(stocks, key=lambda x: x.confidence, reverse=True):
+            logger.info(f"  {r.ticker:<6} {r.action:<5} {r.direction:<8} conf={r.confidence:.0%}")
+            logger.info(f"    {r.rationale}")
+
+    if etfs:
+        logger.info("--- ETFs / MARKETS ---")
+        for r in sorted(etfs, key=lambda x: x.confidence, reverse=True):
+            logger.info(f"  {r.ticker:<6} {r.action:<5} {r.direction:<8} conf={r.confidence:.0%}")
+            logger.info(f"    {r.rationale}")
+
+    logger.info("=" * 60)
 
 
 def _print_summary(recommendations) -> None:
+    """Print BUY/SELL signals to the console, grouped by type."""
+    if not recommendations:
+        print("\n  No BUY/SELL signals today.\n")
+        return
+
+    stocks = [r for r in recommendations if r.type == "STOCK"]
+    etfs = [r for r in recommendations if r.type == "ETF"]
+
     print("\n" + "=" * 60)
-    print(f"  RECOMMENDATIONS  ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})")
+    print(f"  ACTIONABLE SIGNALS  ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})")
     print("=" * 60)
-    for rec in recommendations:
-        bar = "▲" if rec.direction == "BULLISH" else ("▼" if rec.direction == "BEARISH" else "◆")
-        print(f"  {bar} {rec.ticker:<6} {rec.action:<5}  conf={rec.confidence:.0%}  {rec.direction}")
-        print(f"    {rec.rationale[:100]}")
-        print()
+
+    if stocks:
+        print("\n  STOCKS")
+        print("  " + "-" * 40)
+        for rec in sorted(stocks, key=lambda x: x.confidence, reverse=True):
+            bar = "▲" if rec.direction == "BULLISH" else "▼"
+            print(f"  {bar} {rec.ticker:<6} {rec.action:<5}  conf={rec.confidence:.0%}")
+            print(f"    {rec.rationale}")
+            print()
+
+    if etfs:
+        print("  ETFs / MARKETS")
+        print("  " + "-" * 40)
+        for rec in sorted(etfs, key=lambda x: x.confidence, reverse=True):
+            bar = "▲" if rec.direction == "BULLISH" else "▼"
+            print(f"  {bar} {rec.ticker:<6} {rec.action:<5}  conf={rec.confidence:.0%}")
+            print(f"    {rec.rationale}")
+            print()
+
     print("=" * 60 + "\n")

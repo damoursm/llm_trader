@@ -41,6 +41,11 @@ def _get_haiku() -> anthropic.Anthropic:
 
 
 def _parse_response(raw: str) -> tuple[float, str]:
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
     data = json.loads(raw)
     score = max(-1.0, min(1.0, float(data["score"])))
     rationale = str(data["rationale"])

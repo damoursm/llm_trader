@@ -36,8 +36,9 @@ class TickerSignal(BaseModel):
 
 class Recommendation(BaseModel):
     ticker: str
+    type: str = "STOCK"        # "STOCK" or "ETF"
     direction: Direction
     confidence: float
-    action: str                # e.g. "BUY", "SELL", "HOLD", "WATCH"
+    action: str                # "BUY", "SELL", "HOLD", "WATCH"
     rationale: str
     generated_at: datetime

@@ -33,9 +33,15 @@ def generate_recommendations(signals: List[TickerSignal]) -> List[Recommendation
         for s in signals
     )
 
-    prompt = f"""You are a senior portfolio strategist. Based on the following ticker signals derived exclusively from recent news and current events, produce final actionable recommendations.
+    prompt = f"""You are a senior portfolio strategist. Based on the following ticker signals derived exclusively from recent news and current events, identify the best opportunities to act on today.
 
-Do NOT factor in technical analysis, chart patterns, or price history. Base your judgement solely on the news sentiment and the catalysts described.
+Rules:
+- Do NOT factor in technical analysis, chart patterns, or price history.
+- Only assign BUY or SELL when there is a clear, specific news catalyst that justifies it.
+- Assign HOLD for tickers with mixed or weak signals.
+- Assign WATCH for tickers with insufficient news coverage.
+- Be selective: it is better to have 2-3 strong BUY/SELL calls than to assign BUY to everything.
+- The input contains both individual stocks and sector ETFs — treat them separately and pick the best opportunity in each category if one exists.
 
 <signals>
 {signals_text}
@@ -45,10 +51,11 @@ Today's date: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 
 For each ticker, output a JSON object with:
 - "ticker": string
+- "type": "STOCK" | "ETF"
 - "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
 - "action": "BUY" | "SELL" | "HOLD" | "WATCH"
 - "confidence": float 0.0-1.0
-- "rationale": 2-3 sentence explanation citing the specific news catalyst
+- "rationale": 2-3 sentences citing the specific news catalyst
 
 Return a JSON array of these objects. No markdown, JSON only."""
 
@@ -56,15 +63,23 @@ Return a JSON array of these objects. No markdown, JSON only."""
         client = _get_client()
         message = client.messages.create(
             model="claude-opus-4-6",
-            max_tokens=2048,
+            max_tokens=8096,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
+        # Strip markdown fences if the model wrapped the response
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        logger.debug(f"Raw Claude response ({len(raw)} chars): {raw[:200]}")
         data = json.loads(raw)
         now = datetime.now(timezone.utc)
         recommendations = [
             Recommendation(
                 ticker=r["ticker"],
+                type=r.get("type", "STOCK"),
                 direction=r["direction"],
                 action=r["action"],
                 confidence=float(r["confidence"]),
