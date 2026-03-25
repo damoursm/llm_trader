@@ -55,7 +55,7 @@ For each ticker, output a JSON object with:
 - "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
 - "action": "BUY" | "SELL" | "HOLD" | "WATCH"
 - "confidence": float 0.0-1.0
-- "rationale": 2-3 sentences citing the specific news catalyst
+- "rationale": 2-3 sentences that (1) cite the specific news catalyst, (2) explain the causal mechanism by which this catalyst will drive the price up or down, and (3) state the expected time horizon
 
 Return a JSON array of these objects. No markdown, JSON only."""
 

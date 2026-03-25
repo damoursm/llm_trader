@@ -79,7 +79,7 @@ Focus exclusively on news-driven catalysts: earnings, guidance, regulatory news,
 
 Respond with a JSON object with exactly these fields:
 - "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral
-- "rationale": one to three sentences citing the specific news catalyst(s)
+- "rationale": one to three sentences explaining (1) what the catalyst is and (2) why it will cause the price to move in that direction over the next 1-5 days
 
 Example: {{"score": 0.6, "rationale": "Strong earnings beat and raised guidance dominate headlines."}}
 

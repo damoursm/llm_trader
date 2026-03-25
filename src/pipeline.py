@@ -9,6 +9,7 @@ from src.data.cache import load_news, save_news, load_snapshots, save_snapshots
 from src.signals.aggregator import build_signals
 from src.analysis.claude_analyst import generate_recommendations
 from src.notifications.email_sender import send_recommendations
+from src.performance.tracker import record_new_trades, update_open_trades, log_performance_summary, get_performance_for_email
 
 
 def run_pipeline(send_email: bool = False) -> None:
@@ -58,13 +59,19 @@ def run_pipeline(send_email: bool = False) -> None:
     # Log every recommendation
     _log_recommendations(recommendations)
 
+    # Performance tracking
+    update_open_trades()          # refresh prices + close expired positions
+    record_new_trades(actionable) # open new trades for today's signals
+    log_performance_summary()     # write P&L to log
+
     # Print actionable summary to console
     _print_summary(actionable)
 
     # Send email if configured or explicitly requested
     email_configured = bool(settings.smtp_user and settings.email_recipients)
     if (send_email or email_configured) and actionable:
-        send_recommendations(actionable, total_analysed=len(all_tickers))
+        perf = get_performance_for_email()
+        send_recommendations(actionable, total_analysed=len(all_tickers), performance=perf)
     elif not actionable:
         logger.info("No BUY/SELL signals today — no email sent.")
 
