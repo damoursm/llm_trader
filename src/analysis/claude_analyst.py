@@ -33,31 +33,48 @@ def generate_recommendations(signals: List[TickerSignal]) -> List[Recommendation
         for s in signals
     )
 
-    prompt = f"""You are a senior portfolio strategist. Based on the following ticker signals derived exclusively from recent news and current events, identify the best opportunities to act on today.
+    prompt = f"""You are a high-conviction portfolio manager who makes decisive long and short calls every trading day. Your edge is identifying stocks and ETFs where recent news creates a clear asymmetric opportunity.
 
-Rules:
-- Do NOT factor in technical analysis, chart patterns, or price history.
-- Only assign BUY or SELL when there is a clear, specific news catalyst that justifies it.
-- Assign HOLD for tickers with mixed or weak signals.
-- Assign WATCH for tickers with insufficient news coverage.
-- Be selective: it is better to have 2-3 strong BUY/SELL calls than to assign BUY to everything.
-- The input contains both individual stocks and sector ETFs — treat them separately and pick the best opportunity in each category if one exists.
+Today's date: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 
+INPUT — ticker signals derived from recent news sentiment:
 <signals>
 {signals_text}
 </signals>
 
-Today's date: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+YOUR TASK:
+1. Identify the 3-5 BEST opportunities across the full list — both longs (BUY) and shorts (SELL).
+   - Every day you MUST find at least one actionable BUY and one actionable SELL if the news supports it.
+   - Prefer high-momentum, high-news-volume tickers where the catalyst is fresh (< 48 h).
+   - If a trending/newly-discovered ticker has strong news flow, do NOT ignore it just because it's not a mega-cap.
 
-For each ticker, output a JSON object with:
+2. Distinguish time horizons:
+   - "SWING" (2-10 days): catalyst-driven, price hasn't fully priced in the news yet.
+   - "SHORT-TERM" (1-4 weeks): sector rotation, earnings run-up/fade, macro shift.
+   - "POSITION" (1-3 months): structural change — regulatory, competitive moat disruption, macro theme.
+
+3. Conviction rules:
+   - confidence ≥ 0.75 → eligible for BUY / SELL.
+   - confidence 0.50-0.74 → HOLD (monitor closely).
+   - confidence < 0.50 → WATCH only.
+   - Do NOT inflate confidence. A 90%+ call should be rare and backed by a dominant, unambiguous catalyst.
+
+4. Short-selling discipline:
+   - SELL means initiating a short position (or buying an inverse ETF).
+   - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
+
+5. Do NOT factor in technical charts, moving averages, or price history — news catalysts only.
+
+Output a JSON array where each element has:
 - "ticker": string
 - "type": "STOCK" | "ETF"
 - "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
 - "action": "BUY" | "SELL" | "HOLD" | "WATCH"
+- "time_horizon": "SWING" | "SHORT-TERM" | "POSITION" | "N/A"
 - "confidence": float 0.0-1.0
-- "rationale": 2-3 sentences that (1) cite the specific news catalyst, (2) explain the causal mechanism by which this catalyst will drive the price up or down, and (3) state the expected time horizon
+- "rationale": 2-3 sentences — (1) name the specific catalyst, (2) explain the price mechanism, (3) state expected time horizon and risk.
 
-Return a JSON array of these objects. No markdown, JSON only."""
+Return ALL tickers from the input. No markdown, JSON only."""
 
     try:
         client = _get_client()
@@ -83,6 +100,7 @@ Return a JSON array of these objects. No markdown, JSON only."""
                 direction=r["direction"],
                 action=r["action"],
                 confidence=float(r["confidence"]),
+                time_horizon=r.get("time_horizon", "N/A"),
                 rationale=r["rationale"],
                 generated_at=now,
             )

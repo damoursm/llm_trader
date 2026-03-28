@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     stock_watchlist: str = "AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL"
     sector_etfs: str = "XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC"
 
+    # Feature flags
+    enable_market_data: bool = True  # set to false to skip yfinance fetching entirely
+
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 

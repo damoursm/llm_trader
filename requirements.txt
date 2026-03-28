@@ -16,6 +16,10 @@ openai==1.77.0
 # Technical analysis
 ta==0.11.0
 
+# Charts
+plotly==5.24.1
+kaleido==0.2.1
+
 # Scheduling
 apscheduler==3.11.0
 

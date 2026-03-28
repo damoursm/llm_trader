@@ -96,6 +96,68 @@ def save_snapshots(snapshots: List[TickerSnapshot], key: Optional[str] = None) -
 
 
 # ---------------------------------------------------------------------------
+# Latest-snapshot fallback (used when live fetch is disabled)
+# ---------------------------------------------------------------------------
+
+def load_latest_snapshots() -> Optional[List[TickerSnapshot]]:
+    """
+    Return the most recently saved snapshot file, regardless of hour key.
+    Used when ENABLE_MARKET_DATA=false so the pipeline still has price context
+    from the last successful fetch.
+    """
+    if not CACHE_DIR.exists():
+        return None
+    files = sorted(CACHE_DIR.glob("snapshots_*.json"), reverse=True)
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            snaps = [TickerSnapshot.model_validate(s) for s in data]
+            logger.info(f"[cache] Loaded {len(snaps)} snapshots from historical cache {path.name}")
+            return snaps
+        except Exception as e:
+            logger.warning(f"[cache] Skipping corrupt snapshot file {path.name}: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# OHLCV cache (per-ticker, daily — used by chart builder)
+# ---------------------------------------------------------------------------
+
+OHLCV_DIR = CACHE_DIR / "ohlcv"
+
+
+def _ohlcv_path(ticker: str) -> Path:
+    return OHLCV_DIR / f"{ticker.upper()}.json"
+
+
+def load_ohlcv(ticker: str) -> Optional["pd.DataFrame"]:
+    """Return cached OHLCV DataFrame for a ticker, or None if not cached."""
+    import pandas as pd
+    path = _ohlcv_path(ticker)
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_json(path, orient="split")
+        df.index = pd.to_datetime(df.index)
+        logger.debug(f"[cache] Loaded OHLCV for {ticker} from {path.name} ({len(df)} rows)")
+        return df
+    except Exception as e:
+        logger.warning(f"[cache] Failed to load OHLCV cache for {ticker}: {e}")
+        return None
+
+
+def save_ohlcv(ticker: str, df: "pd.DataFrame") -> None:
+    """Persist OHLCV DataFrame to disk, overwriting any previous version."""
+    OHLCV_DIR.mkdir(parents=True, exist_ok=True)
+    path = _ohlcv_path(ticker)
+    try:
+        path.write_text(df.to_json(orient="split", date_format="iso"), encoding="utf-8")
+        logger.debug(f"[cache] Saved OHLCV for {ticker} → {path.name}")
+    except Exception as e:
+        logger.warning(f"[cache] Failed to save OHLCV for {ticker}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

@@ -40,5 +40,6 @@ class Recommendation(BaseModel):
     direction: Direction
     confidence: float
     action: str                # "BUY", "SELL", "HOLD", "WATCH"
+    time_horizon: str = "N/A"  # "SWING", "SHORT-TERM", "POSITION", "N/A"
     rationale: str
     generated_at: datetime
