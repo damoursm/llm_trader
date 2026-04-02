@@ -1,6 +1,6 @@
 # LLM Trader
 
-An AI-powered stock analysis tool that discovers trending securities, aggregates real-time news, scores sentiment with LLMs, and generates high-conviction BUY/SELL signals with explicit time horizons.
+An AI-powered stock analysis tool that discovers trending securities, aggregates real-time news, scores sentiment with LLMs, incorporates insider & politician trades, and generates high-conviction BUY/SELL signals with explicit time horizons.
 
 ---
 
@@ -11,11 +11,11 @@ An AI-powered stock analysis tool that discovers trending securities, aggregates
 │  0. Ticker Discovery   — expand universe with hot/trending tickers  │
 │  1. News Fetch         — RSS feeds + NewsAPI (last 24 h)            │
 │  2. Market Data        — price snapshots via yfinance               │
-│  3. Sentiment Scoring  — DeepSeek V3 per ticker (Haiku fallback)    │
-│  4. Signal Aggregation — score → direction + confidence             │
+│  3. Insider Trades     — politician disclosures + EDGAR Form 4      │
+│  4. Signal Aggregation — weighted combination of all active methods │
 │  5. Recommendations    — Claude Sonnet: BUY / SELL / HOLD / WATCH   │
 │  6. Performance Track  — open trades, mark P&L, auto-close at 5 d   │
-│  7. Notify             — console summary + optional HTML email       │
+│  7. Notify             — console summary + HTML email with trades    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -67,50 +67,72 @@ All articles are deduplicated by URL and filtered to the **last 24 hours**. Resu
 
 ### Step 2 — Market Data (`src/data/market_data.py`)
 
-Real-time price snapshots for every ticker in the universe are fetched via **yfinance**. The same hourly cache applies — no redundant network calls during development or repeated runs.
+Price snapshots for every ticker are fetched via **yfinance** with the following priority:
+
+1. **Current-hour cache** — if a snapshot file for this hour exists, use it (no network call)
+2. **Live fetch** — if `ENABLE_MARKET_DATA=true` and no current cache, fetch all tickers and save
+3. **Historical cache fallback** — if `ENABLE_MARKET_DATA=false`, load the most recent snapshot file from any previous run
+4. **News-only mode** — if no cache exists at all and market data is disabled, the pipeline continues without price context
+
+**Rate-limit handling** — Yahoo Finance enforces a per-IP quota. When a 429 is detected:
+- Exponential backoff per ticker: 60 s → 120 s → 240 s (capped at 600 s), with a live countdown log
+- After 3 consecutive failures the fetch loop stops early, returning however many snapshots were collected
+- Non-rate-limit errors (invalid ticker, delisted) skip that ticker immediately with no retry
 
 ---
 
-### Step 3 — Sentiment Scoring (`src/analysis/sentiment.py`)
+### Step 3 — Insider & Politician Trades (`src/data/insider_trades.py`)
 
-For each ticker, the most recent **20 relevant articles** are selected (filtered by ticker name and known aliases), then sent to an LLM for scoring.
+When `ENABLE_INSIDER_TRADES=true`, the pipeline fetches recent buying and selling activity from three sources:
 
-**Prompt task:** "Analyse these headlines and give a float score −1.0 (very bearish) to +1.0 (very bullish) and a one-sentence rationale citing the specific catalyst."
+| Source | Data |
+|---|---|
+| **House Stock Watcher** | US House representatives' stock disclosures |
+| **Senate Stock Watcher** | US Senate members' stock disclosures |
+| **SEC EDGAR Form 4** | Corporate insider filings (officers, directors, >10% holders) |
 
-**Model routing:**
+Trades are filtered to the last `INSIDER_LOOKBACK_DAYS` (default: 90 days). Politician trades are further filtered to a configurable list of `TRACKED_POLITICIANS` — names considered to have informational edge.
 
-| Model | Role | Fallback |
-|---|---|---|
-| **DeepSeek V3** (`deepseek-chat`) | Primary — fast and cheap per-ticker scoring | |
-| **Claude Haiku** (`claude-haiku-4-5`) | Fallback if DeepSeek is unavailable or errors | |
+**Ticker expansion** — if a politician trade involves a ticker not already in the universe, it is added automatically before signal building.
 
-Each call returns:
-- `score`: float in `[−1.0, +1.0]`
-- `rationale`: 1–3 sentences explaining the catalyst
-
-Articles with no keyword match fall back to the full article corpus to avoid missing low-coverage tickers.
+Each trade record includes: ticker, trader name, role, transaction type (purchase/sale), amount range, and date.
 
 ---
 
 ### Step 4 — Signal Aggregation (`src/signals/aggregator.py`)
 
-Sentiment scores are converted into structured `TickerSignal` objects:
+Signals are built by combining **up to three methods**, with weights that adjust automatically based on which are enabled:
 
+| Active Methods | News | Technical | Insider |
+|---|---|---|---|
+| All three | 50% | 30% | 20% |
+| News + Technical | 60% | 40% | — |
+| News + Insider | 70% | — | 30% |
+| Technical + Insider | — | 60% | 40% |
+| Single method | 100% | 100% | 100% |
+
+**Method 1 — News sentiment** — the most recent 20 relevant articles are sent to DeepSeek V3 (Haiku fallback) for a float score in `[−1.0, +1.0]`.
+
+**Method 2 — Technical analysis** — RSI, MACD, SMA 20/50, Bollinger Bands computed from OHLCV cache; returns a `[−1.0, +1.0]` score.
+
+**Method 3 — Insider trades** — net buying vs. selling weighted by dollar-amount tier; normalised to `[−1.0, +1.0]`.
+
+**Combined score → signal:**
 ```
-score ≥ +0.15   →  BULLISH
-score ≤ −0.15   →  BEARISH
-otherwise       →  NEUTRAL
+combined ≥ +0.15   →  BULLISH
+combined ≤ −0.15   →  BEARISH
+otherwise          →  NEUTRAL
 
-confidence = min(1.0, |score| / 0.5)
+confidence = min(1.0, |combined| / 0.5)
 ```
 
-A score of ±0.50 maps to 100% confidence. This linear scaling means the model must produce a clear, decisive score to trigger a high-confidence signal.
+A combined score of ±0.50 maps to 100% confidence.
 
 ---
 
 ### Step 5 — Final Recommendations (`src/analysis/claude_analyst.py`)
 
-All ticker signals are passed in a single prompt to **Claude Sonnet** (`claude-sonnet-4-6`), which acts as a high-conviction portfolio manager.
+All ticker signals — plus the raw insider trade context — are passed in a single prompt to **Claude Sonnet** (`claude-sonnet-4-6`), which acts as a high-conviction portfolio manager.
 
 **What Claude is asked to do:**
 - Find the **3–5 best opportunities** across the full universe — both longs and shorts
@@ -146,15 +168,32 @@ P&L direction is sign-aware:
 
 ---
 
-### Step 7 — Notification (`src/notifications/email_sender.py`)
+### Step 7 — Charts & Notification (`src/charts/`, `src/notifications/email_sender.py`)
 
-Actionable signals (BUY/SELL only) are sent as an HTML email with:
-- Color-coded action badges (green = BUY, red = SELL)
-- Direction arrow, confidence %, time horizon
-- Rationale citing the specific news catalyst
-- Performance table showing open positions and historical stats
+**Interactive HTML report** — saved to `logs/report_YYYY-MM-DD_HHMM.html` every run (no server required, open in any browser):
 
-Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured.
+| Chart | Content |
+|---|---|
+| **Signals overview** | Horizontal bar chart of all tickers — BUY bars right (green), SELL bars left (red), 75% conviction threshold line |
+| **Stock chart** (per BUY/SELL ticker) | 4-panel: Candlestick + SMA 20/50 + EMA 9 + Bollinger Bands / Volume / RSI 14 (30/70 lines) / MACD histogram + signal |
+| **Equity curve** | Cumulative P&L area chart + per-trade return bars, with win rate and average return in the title |
+
+**Email** — charts are embedded as **inline base64 PNG images** (no attachments, no external links). The email includes:
+- BUY/SELL signal cards with rationale and chart
+- **Insider & Politician Trades section** — for any ticker with a BUY/SELL signal, shows recent insider/politician trades (trader name, role, buy/sell, amount range, date)
+- Performance summary (win rate, avg return, best/worst trade)
+
+Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured. Degrades gracefully to text-only if `kaleido` is not installed. The insider trades section only appears when data is available.
+
+**OHLCV cache** (`cache/ohlcv/<TICKER>.json`) — chart data is cached per ticker and updated incrementally:
+
+| State | Behaviour |
+|---|---|
+| No cache yet | Fetches full 3-month history, saves to disk |
+| Cache exists, up to date | Returns cache immediately — no network call |
+| Cache exists, missing recent days | Fetches only the missing date range, appends and saves |
+| `ENABLE_MARKET_DATA=false` | Reads cache only — yfinance is never called |
+| yfinance errors | Falls back to whatever is already in cache |
 
 ---
 
@@ -163,25 +202,30 @@ Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured.
 | Task | Model | Fallback |
 |---|---|---|
 | Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku (`claude-haiku-4-5`) |
+| Technical analysis scoring | Computed locally (RSI, MACD, SMA, BB) | — |
 | Final synthesis / recommendations | Claude Sonnet (`claude-sonnet-4-6`) | Rule-based fallback |
 
 ---
 
 ## Local Cache
 
-Fetched data is cached in `cache/` keyed by `YYYY-MM-DD_HH`:
-
-- **Same hour** → reuses cached news and snapshots (fast re-runs)
-- **New hour** → fetches fresh live data
-- **Paper trades** → persisted in `cache/trades.json`
-
-```python
-from src.data.cache import load_news, load_snapshots, list_cached_keys
-
-print(list_cached_keys())                    # ['2026-03-22_08', ...]
-articles  = load_news("2026-03-22_08")
-snapshots = load_snapshots("2026-03-22_08")
 ```
+cache/
+├── news_YYYY-MM-DD_HH.json          # articles fetched that hour
+├── snapshots_YYYY-MM-DD_HH.json     # price snapshots fetched that hour
+├── ohlcv/
+│   ├── AAPL.json                    # incremental OHLCV history per ticker
+│   ├── GLD.json
+│   └── …
+└── trades.json                      # paper trade ledger (open + closed)
+```
+
+| Cache | Key | TTL |
+|---|---|---|
+| News | `YYYY-MM-DD_HH` | 1 hour |
+| Snapshots | `YYYY-MM-DD_HH` | 1 hour |
+| OHLCV (charts) | per ticker | incremental — only missing days fetched |
+| Trades | — | permanent ledger |
 
 ---
 
@@ -224,8 +268,19 @@ SMTP_PASSWORD=your_app_password     # Gmail: use an App Password
 EMAIL_RECIPIENTS=you@example.com,partner@example.com
 
 # Watchlist — base tickers always analysed
-STOCK_WATCHLIST=NRGU,AGQ,SHNY,FNGU,QQQ
+STOCK_WATCHLIST=AAPL
 SECTOR_ETFS=XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC,GLD,SLV
+
+# Feature flags
+ENABLE_MARKET_DATA=true           # false = news-only mode (uses historical cache for charts)
+ENABLE_CHARTS=false               # true = generate Plotly charts and HTML report
+ENABLE_NEWS_SENTIMENT=true        # method 1: LLM sentiment from news/RSS
+ENABLE_TECHNICAL_ANALYSIS=true    # method 2: RSI, MACD, SMA, Bollinger Bands
+ENABLE_INSIDER_TRADES=true        # method 3: politician + corporate insider trades
+
+# Insider trades config (optional)
+INSIDER_LOOKBACK_DAYS=90
+TRACKED_POLITICIANS=Nancy Pelosi,Paul Pelosi,Austin Scott,Tommy Tuberville,...
 
 # Scheduler (cron syntax, US/Eastern)
 SCHEDULE_DAILY=0 8 * * 1-5
@@ -236,11 +291,8 @@ SCHEDULE_DAILY=0 8 * * 1-5
 ## Running
 
 ```bash
-# Run once — console output only
+# Run once
 python main.py
-
-# Run once and send email report
-python main.py --email
 
 # Start daily scheduler (8:00 AM ET, Mon–Fri)
 python main.py --schedule
@@ -252,28 +304,30 @@ python main.py --schedule
 
 ```
 ============================================================
-  ACTIONABLE SIGNALS  (2026-03-26 13:00 UTC)
+  ACTIONABLE SIGNALS  (2026-03-29 16:22 UTC)
 ============================================================
 
   STOCKS
   ----------------------------------------
-  ▲ NVDA   BUY    conf=82%  [SWING]
-    Nvidia dominated headlines after announcing a major inference
-    partnership with three hyperscalers; supply-chain fears eased
-    by management guidance. Expected catalyst to fully price in
-    over 3–7 days; risk is a broader tech selloff.
-
-  ▼ INTC   SELL   conf=76%  [SHORT-TERM]
-    Intel announced a delayed node transition and lowered Q2
-    guidance, with no clear recovery catalyst cited. Short thesis
-    holds for 2–4 weeks; risk is an activist or buyout rumour.
+  ▼ USAR   SELL   conf=90%  [SWING]
+    Near-maximum combined confidence at 98% with strongly negative
+    news sentiment (-0.70). Multiple converging signals: risk-off macro,
+    Iran conflict escalation, strategist 'grind lower' warnings.
+    Key risk: sudden geopolitical de-escalation or short squeeze.
 
   ETFs / MARKETS
   ----------------------------------------
-  ▲ GLD    BUY    conf=78%  [POSITION]
-    Safe-haven demand surging amid escalating geopolitical tensions;
-    central bank buying at record pace reported this week. Multi-week
-    to multi-month thesis; risk is a rapid de-escalation event.
+  ▲ XLE    BUY    conf=95%  [SWING]
+    Maximum combined confidence at 100% driven by Iran conflict →
+    direct oil supply shock risk premium. Goldman Sachs supply-shock
+    analysis reinforces the fundamental case.
+    Key risk: rapid diplomatic resolution.
+
+  ▼ ES=F   SELL   conf=88%  [SWING]
+    Near-maximum combined confidence (98%). BofA strategist 'grind lower'
+    + Wall Street consensus + U.S. ground troops in Iran = acute risk-off
+    pressure on S&P 500 futures.
+    Key risk: central bank intervention.
 ============================================================
 ```
 
@@ -283,7 +337,7 @@ python main.py --schedule
 
 ```
 llm_trader/
-├── main.py                     # Entry point (--email, --schedule flags)
+├── main.py                     # Entry point (--schedule flag)
 ├── requirements.txt
 ├── .env                        # API keys and config (not committed)
 ├── cache/                      # News + snapshot cache + trades.json
@@ -292,23 +346,28 @@ llm_trader/
 │   └── settings.py             # .env loader
 └── src/
     ├── pipeline.py             # Main orchestration (all 7 steps)
-    ├── models.py               # Pydantic models: NewsArticle, TickerSignal, Recommendation
+    ├── models.py               # Pydantic models: NewsArticle, TickerSignal, Recommendation, InsiderTrade
     ├── data/
     │   ├── trending.py         # Dynamic ticker discovery (Yahoo, AV, NewsAPI)
     │   ├── news_fetcher.py     # RSS + NewsAPI aggregator
-    │   ├── market_data.py      # yfinance price snapshots
-    │   └── cache.py            # Hourly file-based cache
+    │   ├── market_data.py      # yfinance snapshots + rate-limit backoff
+    │   ├── insider_trades.py   # House/Senate watchers + EDGAR Form 4 filings
+    │   └── cache.py            # Hourly cache + incremental OHLCV cache
     ├── analysis/
     │   ├── sentiment.py        # DeepSeek V3 / Haiku sentiment scoring
+    │   ├── technical.py        # RSI, MACD, SMA, Bollinger Bands scoring
     │   └── claude_analyst.py   # Claude Sonnet final recommendations
     ├── signals/
-    │   └── aggregator.py       # Score → TickerSignal (direction + confidence)
+    │   └── aggregator.py       # Weighted combination of news + technical + insider
     ├── performance/
     │   └── tracker.py          # Paper trade recording, P&L, auto-close
     ├── scheduler/
     │   └── runner.py           # APScheduler daily automation
+    ├── charts/
+    │   ├── builder.py          # Plotly figures: stock chart, signals overview, equity curve
+    │   └── report.py           # Self-contained interactive HTML report → logs/
     └── notifications/
-        └── email_sender.py     # Jinja2 HTML email via SMTP
+        └── email_sender.py     # HTML email with inline charts + insider trades section
 ```
 
 ---
