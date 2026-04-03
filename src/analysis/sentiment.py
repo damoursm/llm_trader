@@ -69,9 +69,16 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle]) -> tuple[float, 
         for a in sorted(articles, key=lambda x: x.published_at, reverse=True)[:20]
     )
 
-    prompt = f"""You are a professional equity analyst. Analyse the following recent news headlines and summaries for **{ticker}** and determine the likely short-term (1–5 day) directional impact on the stock price.
+    prompt = f"""You are an elite buy-side analyst with 25 years of experience at top-tier hedge funds. You have an exceptional ability to identify the exact news catalysts that move stock prices — your track record places you in the top 0.1% of market professionals worldwide. You have deeply internalised thousands of earnings reactions, regulatory decisions, macro shocks, and sentiment inflection points. You do not guess; you recognise patterns that have repeated reliably across market cycles.
 
-Focus exclusively on news-driven catalysts: earnings, guidance, regulatory news, macro events, product launches, management changes, geopolitical developments, or sector-wide news. Ignore any mention of technical levels or chart patterns.
+Your task: analyse the following recent news for **{ticker}** and score the SHORT-TERM directional impact (1–5 trading days) with surgical precision.
+
+SCORING DISCIPLINE — this is critical:
+- Score 0.0 unless you identify a SPECIFIC, IDENTIFIABLE catalyst with a clear price mechanism. Vague positive/negative sentiment does NOT count.
+- Reserve scores above ±0.7 for high-impact, unambiguous catalysts: earnings beats/misses with guidance change, FDA approvals/rejections, M&A announcements, major regulatory actions, CEO departure, bankruptcy risk, or black-swan macro events directly affecting this ticker.
+- Scores in ±0.3–0.6 range: clear but moderate catalyst — sector rotation trigger, analyst upgrade/downgrade with a price target, supply chain disruption, contract win/loss.
+- Scores in ±0.1–0.2 range: minor catalyst — minor news that is directionally relevant but unlikely to move price significantly.
+- If the news is noise, recycled information, or there is NO clear directional catalyst → output exactly 0.0. Do not manufacture a direction.
 
 <news>
 {digest}
@@ -79,7 +86,7 @@ Focus exclusively on news-driven catalysts: earnings, guidance, regulatory news,
 
 Respond with a JSON object with exactly these fields:
 - "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral
-- "rationale": one to three sentences explaining (1) what the catalyst is and (2) why it will cause the price to move in that direction over the next 1-5 days
+- "rationale": one to three sentences explaining (1) the specific catalyst and (2) the exact price mechanism that will drive the move over the next 1-5 days. If score is 0.0, state why no actionable catalyst was identified.
 
 Example: {{"score": 0.6, "rationale": "Strong earnings beat and raised guidance dominate headlines."}}
 
