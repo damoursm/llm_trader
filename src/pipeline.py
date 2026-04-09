@@ -107,6 +107,7 @@ def run_pipeline(send_email: bool = False) -> None:
     # 4. Build signals (all enabled methods)
     logger.info("Step 4/5: Building signals...")
     signals = build_signals(all_tickers, articles, insider_trades=insider_trades)
+    signals_by_ticker = {s.ticker: s for s in signals}
 
     # 5. Generate final recommendations via Claude
     logger.info("Step 5/5: Generating recommendations...")
@@ -131,7 +132,8 @@ def run_pipeline(send_email: bool = False) -> None:
     if settings.enable_charts:
         logger.info("Generating charts and HTML report...")
         ts_label = start.strftime("%Y-%m-%d_%H%M")
-        report_path = save_html_report(recommendations, performance=perf, label=ts_label)
+        report_path = save_html_report(recommendations, performance=perf, label=ts_label,
+                                       signals_by_ticker=signals_by_ticker)
         if report_path:
             logger.info(f"Report: {report_path.resolve()}")
     else:

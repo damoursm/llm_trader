@@ -195,6 +195,7 @@ def build_signals(
             confidence=confidence,
             sentiment_score=round(sentiment_score, 3),
             technical_score=round(technical_score, 3),
+            insider_score=round(insider_score, 3),
             rationale=rationale,
             insider_summary=insider_summary,
             sources_agreeing=sources_agreeing,

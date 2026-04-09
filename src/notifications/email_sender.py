@@ -8,14 +8,16 @@ Layout:
   5. Smart money signals
   6. Portfolio performance
 
-Charts are embedded as inline base64 PNG images using kaleido.
+Charts are attached as inline MIME images (CID references) so Gmail renders them.
 If kaleido is not installed the email falls back gracefully to text-only.
 """
 
 import smtplib
 from datetime import datetime, timezone
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import base64
 from jinja2 import Template
 from loguru import logger
 from typing import Dict, List, Optional
@@ -133,7 +135,7 @@ HTML_TEMPLATE = """
      ══════════════════════════════════════ -->
 {% if overview_png %}
 <h2>Signal Overview</h2>
-<img class="chart-img" src="data:image/png;base64,{{ overview_png }}" alt="Signal Overview">
+<img class="chart-img" src="cid:overview_chart" alt="Signal Overview">
 {% endif %}
 
 <!-- ══════════════════════════════════════
@@ -309,7 +311,7 @@ HTML_TEMPLATE = """
   <!-- Per-ticker price chart -->
   {% if charts and rec.ticker in charts %}
   <img class="chart-img"
-       src="data:image/png;base64,{{ charts[rec.ticker] }}"
+       src="cid:chart_{{ rec.ticker }}"
        alt="{{ rec.ticker }} price chart">
   {% endif %}
 
@@ -416,7 +418,7 @@ HTML_TEMPLATE = """
 {% if perf %}
 <h2>Portfolio Performance</h2>
 {% if equity_png %}
-<img class="chart-img" src="data:image/png;base64,{{ equity_png }}" alt="Equity Curve">
+<img class="chart-img" src="cid:equity_chart" alt="Equity Curve">
 {% endif %}
 {% if perf.stats %}
 <div class="card" style="border-left: 4px solid #2563eb;">
@@ -466,6 +468,7 @@ def _build_chart_pngs(
     actionable: List[Recommendation],
     all_recommendations: List[Recommendation],
     performance: Optional[dict],
+    signals_by_ticker: Optional[dict] = None,
 ) -> tuple[dict, Optional[str], Optional[str]]:
     charts: dict[str, str] = {}
     for rec in actionable:
@@ -474,7 +477,7 @@ def _build_chart_pngs(
         if b64:
             charts[rec.ticker] = b64
             logger.debug(f"[email] Chart rendered for {rec.ticker}")
-    overview_fig = build_signals_overview(all_recommendations or actionable)
+    overview_fig = build_signals_overview(all_recommendations or actionable, signals_by_ticker)
     overview_png = fig_to_png_b64(overview_fig, width=1100, height=None)
     closed = (performance or {}).get("closed_trades", [])
     equity_fig = build_equity_curve(closed)
@@ -566,7 +569,7 @@ def send_recommendations(
     if settings.enable_charts:
         logger.info("[email] Rendering chart images...")
         charts, overview_png, equity_png = _build_chart_pngs(
-            recommendations, all_recs, performance
+            recommendations, all_recs, performance, signals_by_ticker
         )
         logger.info(
             f"[email] {len(charts)} chart image(s) embedded"
@@ -654,12 +657,32 @@ def send_recommendations(
         subject = f"LLM Trader | {now_str} | No actionable signals — daily report"
 
     try:
-        msg = MIMEMultipart("alternative")
+        # Outer wrapper: multipart/related so inline CID images are recognised
+        msg = MIMEMultipart("related")
         msg["Subject"] = subject
         msg["From"]    = settings.smtp_user
         msg["To"]      = ", ".join(settings.recipients_list)
-        msg.attach(MIMEText(text_body, "plain"))
-        msg.attach(MIMEText(html_body, "html"))
+
+        # Inner alternative part (plain-text + HTML)
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(text_body, "plain"))
+        alt.attach(MIMEText(html_body, "html"))
+        msg.attach(alt)
+
+        # Attach each chart image with its Content-ID so Gmail renders it
+        def _attach_png(cid: str, b64_data: str) -> None:
+            img_bytes = base64.b64decode(b64_data)
+            part = MIMEImage(img_bytes, "png")
+            part["Content-ID"] = f"<{cid}>"
+            part["Content-Disposition"] = "inline"
+            msg.attach(part)
+
+        if overview_png:
+            _attach_png("overview_chart", overview_png)
+        if equity_png:
+            _attach_png("equity_chart", equity_png)
+        for ticker, b64 in (charts or {}).items():
+            _attach_png(f"chart_{ticker}", b64)
 
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
             server.starttls()

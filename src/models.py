@@ -80,6 +80,7 @@ class TickerSignal(BaseModel):
     confidence: float          # 0.0 – 1.0
     sentiment_score: float     # -1.0 to +1.0
     technical_score: float     # -1.0 to +1.0
+    insider_score: float = 0.0 # -1.0 to +1.0
     rationale: str
     insider_summary: str = ""  # human-readable insider/politician trade context
     sources_agreeing: int = 0  # how many enabled signal layers agree with the direction

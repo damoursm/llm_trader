@@ -167,9 +167,11 @@ Return ALL tickers from the input. No markdown, JSON only."""
     try:
         client = _get_client()
         logger.info(f"[claude] Using model: {settings.analyst_model}")
+        # Haiku max output = 8096; Sonnet/Opus support higher limits
+        _max_tokens = 8096 if "haiku" in settings.analyst_model else 16000
         message = client.messages.create(
             model=settings.analyst_model,
-            max_tokens=16000,
+            max_tokens=_max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
