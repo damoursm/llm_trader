@@ -7,7 +7,7 @@ from typing import List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
 from src.utils import now_et, fmt_et
 from config import settings
-from src.models import TickerSignal, Recommendation, InsiderTrade
+from src.models import TickerSignal, Recommendation, InsiderTrade, MacroContext
 from src.data.insider_trades import build_insider_summary
 
 
@@ -24,6 +24,7 @@ def _get_client() -> anthropic.Anthropic:
 def generate_recommendations(
     signals: List[TickerSignal],
     insider_trades: Optional[List["InsiderTrade"]] = None,
+    macro_context: Optional["MacroContext"] = None,
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -107,6 +108,47 @@ def generate_recommendations(
    - Factor in the technical score: a score above +0.3 adds conviction to a BUY; below -0.3 adds conviction to a SELL.
    - Require alignment between news catalyst and technical picture for highest-confidence calls."""
 
+    # Build macro context block for the prompt
+    macro_block = ""
+    macro_instructions = ""
+    if macro_context and macro_context.summary:
+        regime_color = {
+            "RECESSION":  "DANGER — recession risk is elevated",
+            "LATE_CYCLE": "CAUTION — late-cycle dynamics, reduce risk exposure",
+            "SLOWDOWN":   "CAUTION — growth is decelerating",
+            "EXPANSION":  "CONSTRUCTIVE — macro tailwind supports risk assets",
+        }.get(macro_context.regime, "UNCERTAIN")
+
+        macro_block = f"""
+<macro_context>
+FRED Macro Regime: {macro_context.regime} ({regime_color})
+{macro_context.summary}
+
+Key indicators:
+- Yield curve (10Y-2Y): {f"{macro_context.yield_spread_10y2y:+.2f}%" if macro_context.yield_spread_10y2y is not None else "N/A"} — {macro_context.yield_curve_signal}
+- Fed Funds Rate: {f"{macro_context.fed_funds_rate:.2f}%" if macro_context.fed_funds_rate is not None else "N/A"}
+- CPI YoY: {f"{macro_context.cpi_yoy:+.1f}%" if macro_context.cpi_yoy is not None else "N/A"} — {macro_context.inflation_signal}
+- Unemployment: {f"{macro_context.unemployment_rate:.1f}%" if macro_context.unemployment_rate is not None else "N/A"} ({macro_context.unemployment_trend})
+- HY Credit Spread: {f"{macro_context.hy_spread:.2f}%" if macro_context.hy_spread is not None else "N/A"} — {macro_context.credit_signal}
+- IG Credit Spread: {f"{macro_context.ig_spread:.2f}%" if macro_context.ig_spread is not None else "N/A"}
+- M2 Growth YoY: {f"{macro_context.m2_growth_yoy:+.1f}%" if macro_context.m2_growth_yoy is not None else "N/A"}
+</macro_context>
+"""
+        macro_instructions = f"""
+6. Macro regime overlay (from FRED data — apply to ALL recommendations):
+   - Regime is {macro_context.regime}. Calibrate conviction accordingly:
+     * RECESSION: strongly prefer HOLD/WATCH for longs; shorts become higher-conviction. Avoid POSITION-horizon BUYs.
+     * LATE_CYCLE: be selective — only BUY names with recession-resistant fundamentals. Favor SWING over POSITION horizons.
+     * SLOWDOWN: tilt bearish on cyclicals, constructive on defensives (staples, utilities, gold). Shorten time horizons.
+     * EXPANSION: macro tailwind — conviction on longs is higher. Still require signal convergence.
+   - Inverted yield curve (current: {macro_context.yield_curve_signal}): historically predicts recession 6-18 months out.
+     Do NOT extend time horizons on speculative longs if curve is inverted.
+   - Credit spreads ({macro_context.credit_signal}): widening HY spreads signal institutional risk-off.
+     When credit is STRESSED or ELEVATED, be more conservative on all BUY calls.
+   - Inflation ({macro_context.inflation_signal}): high inflation → Fed stays restrictive → pressure on rate-sensitive sectors (tech, real estate).
+   - Unemployment trend ({macro_context.unemployment_trend}): rising unemployment is a leading recession indicator.
+     Downgrade POSITION-horizon BUY calls to SWING or HOLD when unemployment is rising."""
+
     commodity_tickers = ", ".join(settings.commodities_list) or "GLD, SLV, IAU, GDX, PPLT, PALL, CPER"
 
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.
@@ -116,7 +158,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-
+{macro_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -146,7 +188,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{insider_instructions}
+{insider_instructions}{macro_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

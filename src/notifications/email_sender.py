@@ -373,7 +373,89 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
-     4 — SMART MONEY SIGNALS
+     4 — MACRO CONTEXT (FRED)
+     ══════════════════════════════════════ -->
+{% if macro_context %}
+{% set regime_color = {'EXPANSION': '#4ade80', 'SLOWDOWN': '#fb923c', 'LATE_CYCLE': '#f59e0b', 'RECESSION': '#f87171'} %}
+{% set regime_bg    = {'EXPANSION': '#14532d', 'SLOWDOWN': '#431407', 'LATE_CYCLE': '#451a03', 'RECESSION': '#450a0a'} %}
+<h2>Macro Context <span style="font-size:13px;font-weight:400;color:#94a3b8;">(FRED)</span></h2>
+<div class="card" style="border-left: 4px solid {{ regime_color.get(macro_context.regime, '#94a3b8') }};">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+    <span class="ticker" style="font-size:15px;">{{ macro_context.regime }}</span>
+    <span class="badge" style="background:{{ regime_bg.get(macro_context.regime, '#1e293b') }};color:{{ regime_color.get(macro_context.regime, '#94a3b8') }};border:1px solid {{ regime_color.get(macro_context.regime, '#94a3b8') }};">
+      Macro Regime
+    </span>
+  </div>
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ macro_context.summary }}</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;">
+
+    {% if macro_context.yield_spread_10y2y is not none %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Yield Curve (10Y-2Y)</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:{{ '#f87171' if macro_context.yield_spread_10y2y < 0 else '#4ade80' }};">
+        {{ "%+.2f"|format(macro_context.yield_spread_10y2y) }}%
+      </div>
+      <div style="font-size:12px;color:#94a3b8;">{{ macro_context.yield_curve_signal }}</div>
+    </div>
+    {% endif %}
+
+    {% if macro_context.fed_funds_rate is not none %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Fed Funds Rate</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:#e2e8f0;">
+        {{ "%.2f"|format(macro_context.fed_funds_rate) }}%
+      </div>
+    </div>
+    {% endif %}
+
+    {% if macro_context.cpi_yoy is not none %}
+    {% set inf_color = {'HIGH': '#f87171', 'ELEVATED': '#fb923c', 'MODERATE': '#4ade80', 'LOW': '#60a5fa'} %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">CPI YoY</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:{{ inf_color.get(macro_context.inflation_signal, '#e2e8f0') }};">
+        {{ "%+.1f"|format(macro_context.cpi_yoy) }}%
+      </div>
+      <div style="font-size:12px;color:#94a3b8;">{{ macro_context.inflation_signal }}</div>
+    </div>
+    {% endif %}
+
+    {% if macro_context.unemployment_rate is not none %}
+    {% set unemp_color = {'RISING': '#f87171', 'STABLE': '#e2e8f0', 'FALLING': '#4ade80'} %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Unemployment</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:{{ unemp_color.get(macro_context.unemployment_trend, '#e2e8f0') }};">
+        {{ "%.1f"|format(macro_context.unemployment_rate) }}%
+      </div>
+      <div style="font-size:12px;color:#94a3b8;">{{ macro_context.unemployment_trend }}</div>
+    </div>
+    {% endif %}
+
+    {% if macro_context.hy_spread is not none %}
+    {% set credit_color = {'STRESSED': '#f87171', 'ELEVATED': '#fb923c', 'NORMAL': '#e2e8f0', 'TIGHT': '#4ade80'} %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">HY Credit Spread</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:{{ credit_color.get(macro_context.credit_signal, '#e2e8f0') }};">
+        {{ "%.2f"|format(macro_context.hy_spread) }}%
+      </div>
+      <div style="font-size:12px;color:#94a3b8;">{{ macro_context.credit_signal }}</div>
+    </div>
+    {% endif %}
+
+    {% if macro_context.m2_growth_yoy is not none %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">M2 Growth YoY</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:{{ '#4ade80' if macro_context.m2_growth_yoy > 2 else ('#f87171' if macro_context.m2_growth_yoy < -2 else '#e2e8f0') }};">
+        {{ "%+.1f"|format(macro_context.m2_growth_yoy) }}%
+      </div>
+    </div>
+    {% endif %}
+
+  </div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
 <h2>Smart Money Signals</h2>
@@ -413,7 +495,7 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
-     5 — PORTFOLIO PERFORMANCE
+     7 — PORTFOLIO PERFORMANCE
      ══════════════════════════════════════ -->
 {% if perf %}
 <h2>Portfolio Performance</h2>
@@ -493,6 +575,7 @@ def send_recommendations(
     insider_trades: Optional[List[InsiderTrade]] = None,
     signals: Optional[List[TickerSignal]] = None,
     articles: Optional[List[NewsArticle]] = None,
+    macro_context=None,   # Optional[MacroContext] — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -606,6 +689,8 @@ def send_recommendations(
         equity_png=equity_png,
         # performance
         perf=performance,
+        # macro context (FRED)
+        macro_context=macro_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────

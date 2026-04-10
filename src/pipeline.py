@@ -104,6 +104,15 @@ def run_pipeline(send_email: bool = False) -> None:
             logger.info(f"Step 3: Adding {new_from_smart} to universe from smart money signals")
             all_tickers = all_tickers + new_from_smart
 
+    # 3d. FRED macro context (yield curve, inflation, credit spreads, M2)
+    macro_context = None
+    if settings.enable_fred:
+        logger.info("Step 3d: Fetching FRED macro indicators...")
+        from src.data.fred import fetch_macro_context
+        macro_context = fetch_macro_context(settings.fred_api_key)
+    else:
+        logger.info("Step 3d: FRED macro context disabled (ENABLE_FRED=false)")
+
     # 4. Build signals (all enabled methods)
     logger.info("Step 4/5: Building signals...")
     signals = build_signals(all_tickers, articles, insider_trades=insider_trades)
@@ -111,7 +120,7 @@ def run_pipeline(send_email: bool = False) -> None:
 
     # 5. Generate final recommendations via Claude
     logger.info("Step 5/5: Generating recommendations...")
-    recommendations = generate_recommendations(signals, insider_trades=insider_trades)
+    recommendations = generate_recommendations(signals, insider_trades=insider_trades, macro_context=macro_context)
 
     # Only surface BUY and SELL as actionable, with minimum confidence guard
     actionable = [r for r in recommendations if r.action in ("BUY", "SELL") and r.confidence >= 0.78]
@@ -155,6 +164,7 @@ def run_pipeline(send_email: bool = False) -> None:
             insider_trades=insider_trades,
             signals=signals,
             articles=articles,
+            macro_context=macro_context,
         )
     else:
         logger.info("Email not configured — skipping.")

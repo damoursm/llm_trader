@@ -74,6 +74,36 @@ class InsiderTrade(BaseModel):
 Direction = Literal["BULLISH", "BEARISH", "NEUTRAL"]
 
 
+class MacroContext(BaseModel):
+    """Macro regime snapshot derived from FRED indicators."""
+    # Yield curve
+    yield_spread_10y2y: Optional[float] = None   # 10Y - 2Y spread in %
+    yield_curve_signal: str = "UNKNOWN"           # INVERTED | FLAT | NORMAL | STEEP
+
+    # Monetary policy
+    fed_funds_rate: Optional[float] = None        # Effective Fed Funds Rate %
+
+    # Inflation
+    cpi_yoy: Optional[float] = None              # CPI year-over-year %
+    inflation_signal: str = "UNKNOWN"            # HIGH | ELEVATED | MODERATE | LOW
+
+    # Labor market
+    unemployment_rate: Optional[float] = None
+    unemployment_trend: str = "STABLE"           # RISING | STABLE | FALLING
+
+    # Credit markets
+    hy_spread: Optional[float] = None            # HY OAS spread %
+    ig_spread: Optional[float] = None            # IG OAS spread %
+    credit_signal: str = "UNKNOWN"               # STRESSED | ELEVATED | NORMAL | TIGHT
+
+    # Liquidity
+    m2_growth_yoy: Optional[float] = None        # M2 year-over-year %
+
+    # Overall
+    regime: str = "UNKNOWN"                      # EXPANSION | SLOWDOWN | LATE_CYCLE | RECESSION
+    summary: str = ""                            # Human-readable 2-3 sentence summary
+
+
 class TickerSignal(BaseModel):
     ticker: str
     direction: Direction

@@ -1,6 +1,6 @@
 # LLM Trader
 
-An AI-powered stock analysis tool that discovers trending securities, aggregates real-time news, scores sentiment with LLMs, incorporates insider & politician trades, and generates high-conviction BUY/SELL signals with explicit time horizons.
+An AI-powered stock analysis tool that discovers trending securities, aggregates real-time news, scores sentiment with LLMs, incorporates insider trades, politician disclosures, unusual options flow, and SEC EDGAR smart money signals, then generates high-conviction BUY/SELL signals with explicit time horizons.
 
 ---
 
@@ -11,11 +11,14 @@ An AI-powered stock analysis tool that discovers trending securities, aggregates
 │  0. Ticker Discovery   — expand universe with hot/trending tickers  │
 │  1. News Fetch         — RSS feeds + NewsAPI (last 24 h)            │
 │  2. Market Data        — price snapshots via yfinance               │
-│  3. Insider Trades     — politician disclosures + EDGAR Form 4      │
+│  3a. Insider Trades    — politician disclosures + EDGAR Form 4      │
+│  3b. Options Flow      — unusual sweep detection via yfinance       │
+│  3c. SEC Filings       — 13D/13G activist, Form 144, 13F positions  │
+│  3d. FRED Macro        — yield curve, CPI, credit spreads, M2       │
 │  4. Signal Aggregation — weighted combination of all active methods │
-│  5. Recommendations    — Claude Sonnet: BUY / SELL / HOLD / WATCH   │
-│  6. Performance Track  — open trades, mark P&L, auto-close at 5 d   │
-│  7. Notify             — console summary + HTML email with trades    │
+│  5. Recommendations    — Claude: BUY / SELL / HOLD / WATCH          │
+│  6. Performance Track  — open trades, mark P&L, auto-close at 5 d  │
+│  7. Notify             — console summary + HTML email with trades   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,6 +38,8 @@ Before fetching any news the pipeline builds a **dynamic ticker universe** by me
 | **Alpha Vantage news feed** | `NEWS_SENTIMENT` endpoint — tickers appearing in the most news items today |
 
 Up to **30 discovered tickers** are appended after your static `STOCK_WATCHLIST` and `SECTOR_ETFS`, giving a combined universe that is always fresh and market-relevant.
+
+**Pinned commodities** (`COMMODITY_ETFS`) are always included in every run regardless of trending, after the dynamic discovery step.
 
 > The static watchlist is always analysed first and is never diluted by trending additions.
 
@@ -81,7 +86,7 @@ Price snapshots for every ticker are fetched via **yfinance** with the following
 
 ---
 
-### Step 3 — Insider & Politician Trades (`src/data/insider_trades.py`)
+### Step 3a — Insider & Politician Trades (`src/data/insider_trades.py`)
 
 When `ENABLE_INSIDER_TRADES=true`, the pipeline fetches recent buying and selling activity from three sources:
 
@@ -93,9 +98,96 @@ When `ENABLE_INSIDER_TRADES=true`, the pipeline fetches recent buying and sellin
 
 Trades are filtered to the last `INSIDER_LOOKBACK_DAYS` (default: 90 days). Politician trades are further filtered to a configurable list of `TRACKED_POLITICIANS` — names considered to have informational edge.
 
-**Ticker expansion** — if a politician trade involves a ticker not already in the universe, it is added automatically before signal building.
+**Ticker expansion** — if a trade involves a ticker not already in the universe, it is added automatically before signal building.
 
 Each trade record includes: ticker, trader name, role, transaction type (purchase/sale), amount range, and date.
+
+---
+
+### Step 3b — Unusual Options Flow (`src/data/options_flow.py`)
+
+When `ENABLE_OPTIONS_FLOW=true`, the pipeline scans near-term options chains via yfinance for **institutional sweep activity**. No API key required.
+
+For each ticker, expirations ≤ 60 days out are scanned. A contract is flagged as a sweep when:
+
+| Filter | Threshold |
+|---|---|
+| Volume / Open Interest ratio | ≥ 2× (sweep-like institutional flow) |
+| Out-of-the-money | ≥ 1% |
+| Notional premium | ≥ $25,000 |
+
+- **Call sweeps** → bullish signal
+- **Put sweeps** → bearish signal
+
+Each sweep is emitted as an `InsiderTrade` object with `trader_type="options_flow"`, including strike, expiry, vol/OI ratio, and notional size.
+
+---
+
+### Step 3c — SEC EDGAR Filings (`src/data/sec_filings.py`)
+
+When `ENABLE_SEC_FILINGS=true`, the pipeline pulls three categories of smart money signals directly from the SEC's public EDGAR system. No API key required.
+
+**Strategy 1 — SC 13D / SC 13G (Activist & Institutional Stakes)**
+
+Fetches all recent filings disclosing >5% ownership in a company within `SEC_FILINGS_LOOKBACK_DAYS` (default: 30 days). 13D filers are classified as "Activist Investor", 13G as "Passive Institutional". Tickers are discovered from the filings themselves via the SEC company tickers index — not limited to any predefined watchlist.
+
+**Strategy 2 — Form 144 (Planned Insider Sales)**
+
+Fetches all recent Form 144 filings — the pre-sale disclosure filed by officers and directors before selling restricted shares. These are bearish signals indicating planned insider distribution.
+
+**Strategy 3 — Form 13F-HR (Superinvestor Quarterly Holdings)**
+
+For each institution in `TRACKED_INSTITUTIONS`, the pipeline:
+1. Resolves the SEC CIK dynamically from EDGAR (no manual lookup needed)
+2. Downloads the two most recent 13F-HR filings
+3. Diffs holdings quarter-over-quarter to detect meaningful changes (>10% position size change)
+4. Emits signals for: new positions, exits, significant increases, and significant decreases
+
+Tickers are discovered from the 13F holdings themselves — adds stocks to the analysis universe beyond the static watchlist.
+
+---
+
+### Step 3d — FRED Macro Context (`src/data/fred.py`)
+
+When `ENABLE_FRED=true`, the pipeline fetches macro regime indicators from the St. Louis Fed FRED API. Requires a free API key (no credit card). All data is public.
+
+**Series fetched:**
+
+| Series | Indicator | Frequency |
+|---|---|---|
+| `T10Y2Y` | 10Y-2Y Treasury yield spread | Daily |
+| `DFF` | Effective Federal Funds Rate | Daily |
+| `CPIAUCSL` | CPI (YoY computed) | Monthly |
+| `UNRATE` | Unemployment rate + trend | Monthly |
+| `BAMLH0A0HYM2` | HY OAS credit spread | Daily |
+| `BAMLC0A0CM` | IG OAS credit spread | Daily |
+| `M2SL` | M2 money supply (YoY computed) | Monthly |
+
+**Derived regime signals:**
+
+| Signal | Labels |
+|---|---|
+| Yield curve | `INVERTED` (<-0.25%) / `FLAT` / `NORMAL` / `STEEP` |
+| Inflation | `HIGH` (>5%) / `ELEVATED` (>3%) / `MODERATE` / `LOW` |
+| Credit | `STRESSED` (HY >6%) / `ELEVATED` / `NORMAL` / `TIGHT` |
+| Unemployment trend | `RISING` / `STABLE` / `FALLING` |
+
+**Overall macro regime** is derived from the combination of yield curve, credit conditions, and unemployment trend:
+
+| Regime | Conditions |
+|---|---|
+| `RECESSION` | Inverted curve + rising unemployment |
+| `LATE_CYCLE` | Inverted/flat curve + stressed/elevated credit |
+| `SLOWDOWN` | Normal curve + elevated credit or rising unemployment |
+| `EXPANSION` | Normal/steep curve + normal/tight credit + stable employment |
+
+**How it affects recommendations:** The macro context is injected directly into the Claude prompt as a labeled `<macro_context>` block. Claude applies the regime overlay to every BUY/SELL call:
+- `RECESSION`: favors shorts, avoids POSITION-horizon longs
+- `LATE_CYCLE`: prefers recession-resistant names and SWING horizons
+- `SLOWDOWN`: tilts bearish on cyclicals, constructive on defensives and gold
+- `EXPANSION`: macro tailwind raises conviction on longs
+
+The macro dashboard also appears as a dedicated card in the HTML email with color-coded indicators for each FRED series.
 
 ---
 
@@ -115,7 +207,7 @@ Signals are built by combining **up to three methods**, with weights that adjust
 
 **Method 2 — Technical analysis** — RSI, MACD, SMA 20/50, Bollinger Bands computed from OHLCV cache; returns a `[−1.0, +1.0]` score.
 
-**Method 3 — Insider trades** — net buying vs. selling weighted by dollar-amount tier; normalised to `[−1.0, +1.0]`.
+**Method 3 — Insider trades** — net buying vs. selling weighted by dollar-amount tier; normalised to `[−1.0, +1.0]`. Incorporates all smart money sources (insider trades, options flow, SEC filings).
 
 **Combined score → signal:**
 ```
@@ -132,13 +224,13 @@ A combined score of ±0.50 maps to 100% confidence.
 
 ### Step 5 — Final Recommendations (`src/analysis/claude_analyst.py`)
 
-All ticker signals — plus the raw insider trade context — are passed in a single prompt to **Claude Sonnet** (`claude-sonnet-4-6`), which acts as a high-conviction portfolio manager.
+All ticker signals — plus the raw smart money context — are passed in a single prompt to the configured **analyst model** (default: `claude-haiku-4-5-20251001`, configurable via `ANALYST_MODEL`), which acts as a high-conviction portfolio manager.
 
-**What Claude is asked to do:**
+**What the model is asked to do:**
 - Find the **3–5 best opportunities** across the full universe — both longs and shorts
 - **Must produce at least one BUY and one SELL** per day if the news supports it
 - Classify every signal by **time horizon**: `SWING` (2–10 d) / `SHORT-TERM` (1–4 wk) / `POSITION` (1–3 mo)
-- Apply **conviction discipline**: confidence ≥ 0.75 required for BUY/SELL; 0.50–0.74 → HOLD; < 0.50 → WATCH
+- Apply **conviction discipline**: confidence ≥ 0.78 required for BUY/SELL; 0.50–0.77 → HOLD; < 0.50 → WATCH
 - Short-selling rules: only SELL when catalyst is unambiguous, uncontested, and market is not in capitulation
 
 **Output per ticker:**
@@ -148,7 +240,7 @@ All ticker signals — plus the raw insider trade context — are passed in a si
 - `time_horizon`: SWING / SHORT-TERM / POSITION / N/A
 - `rationale`: catalyst → price mechanism → time horizon + risk
 
-Only `BUY` and `SELL` actions are considered **actionable** and flow to the performance tracker and email.
+Only `BUY` and `SELL` actions with confidence ≥ 78% are considered **actionable** and flow to the performance tracker and email.
 
 ---
 
@@ -180,10 +272,10 @@ P&L direction is sign-aware:
 
 **Email** — charts are embedded as **inline base64 PNG images** (no attachments, no external links). The email includes:
 - BUY/SELL signal cards with rationale and chart
-- **Insider & Politician Trades section** — for any ticker with a BUY/SELL signal, shows recent insider/politician trades (trader name, role, buy/sell, amount range, date)
+- **Smart Money section** — for any ticker with a BUY/SELL signal, shows all smart money signals (insider trades, options sweeps, SEC filings) with trader name, role, signal type, amount, and date
 - Performance summary (win rate, avg return, best/worst trade)
 
-Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured. Degrades gracefully to text-only if `kaleido` is not installed. The insider trades section only appears when data is available.
+Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured. Degrades gracefully to text-only if `kaleido` is not installed. The smart money section only appears when data is available.
 
 **OHLCV cache** (`cache/ohlcv/<TICKER>.json`) — chart data is cached per ticker and updated incrementally:
 
@@ -201,9 +293,9 @@ Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured. Degrade
 
 | Task | Model | Fallback |
 |---|---|---|
-| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku (`claude-haiku-4-5`) |
+| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku (`claude-haiku-4-5-20251001`) |
 | Technical analysis scoring | Computed locally (RSI, MACD, SMA, BB) | — |
-| Final synthesis / recommendations | Claude Sonnet (`claude-sonnet-4-6`) | Rule-based fallback |
+| Final synthesis / recommendations | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | Rule-based fallback |
 
 ---
 
@@ -232,12 +324,13 @@ cache/
 ## Prerequisites
 
 - Python 3.11+
-- [Anthropic API key](https://console.anthropic.com/) — Claude Sonnet (synthesis) + Haiku (sentiment fallback)
+- [Anthropic API key](https://console.anthropic.com/) — analyst model (synthesis) + Haiku (sentiment fallback)
 - [DeepSeek API key](https://platform.deepseek.com/) — V3 for per-ticker sentiment scoring
 
 Optional (extend coverage):
 - [NewsAPI key](https://newsapi.org/) — targeted ticker/sector queries + trending detection
 - [Alpha Vantage key](https://www.alphavantage.co/) — top movers + news-active ticker discovery
+- [FRED API key](https://fred.stlouisfed.org/docs/api/api_key.html) — macro regime context (yield curve, CPI, credit spreads, M2) — free, no credit card
 
 ---
 
@@ -256,9 +349,15 @@ pip install -r requirements.txt
 ANTHROPIC_API_KEY=your_anthropic_api_key
 DEEPSEEK_API_KEY=your_deepseek_api_key
 
+# Model selection (default: claude-haiku-4-5-20251001, use claude-sonnet-4-6 for higher quality)
+ANALYST_MODEL=claude-haiku-4-5-20251001
+
 # Recommended — extends news coverage and trending discovery
 NEWSAPI_KEY=your_newsapi_key
 ALPHA_VANTAGE_KEY=your_alpha_vantage_key
+
+# FRED (Federal Reserve macro context — free key, no credit card)
+FRED_API_KEY=your_fred_api_key            # https://fred.stlouisfed.org/docs/api/api_key.html
 
 # Email reports (optional)
 SMTP_HOST=smtp.gmail.com
@@ -269,18 +368,28 @@ EMAIL_RECIPIENTS=you@example.com,partner@example.com
 
 # Watchlist — base tickers always analysed
 STOCK_WATCHLIST=AAPL
-SECTOR_ETFS=XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC,GLD,SLV
+SECTOR_ETFS=XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC
+
+# Commodities — always included in every run (pinned, never dropped by trending)
+COMMODITY_ETFS=GLD,SLV,IAU,GDX,PPLT,PALL,CPER
 
 # Feature flags
 ENABLE_MARKET_DATA=true           # false = news-only mode (uses historical cache for charts)
 ENABLE_CHARTS=false               # true = generate Plotly charts and HTML report
 ENABLE_NEWS_SENTIMENT=true        # method 1: LLM sentiment from news/RSS
 ENABLE_TECHNICAL_ANALYSIS=true    # method 2: RSI, MACD, SMA, Bollinger Bands
-ENABLE_INSIDER_TRADES=true        # method 3: politician + corporate insider trades
+ENABLE_INSIDER_TRADES=true        # method 3: politician + corporate insider trades (House/Senate/Form 4)
+ENABLE_OPTIONS_FLOW=true          # method 4: unusual options sweep detection (yfinance, no key needed)
+ENABLE_SEC_FILINGS=true           # method 5: SEC EDGAR 13D/13G activist, Form 144, 13F superinvestors
+ENABLE_FRED=true                  # macro regime overlay: yield curve, CPI, credit spreads, M2 (requires FRED_API_KEY)
 
 # Insider trades config (optional)
 INSIDER_LOOKBACK_DAYS=90
 TRACKED_POLITICIANS=Nancy Pelosi,Paul Pelosi,Austin Scott,Tommy Tuberville,...
+
+# SEC EDGAR filings config (optional)
+SEC_FILINGS_LOOKBACK_DAYS=30      # lookback window for 13D/13G and Form 144 filings
+TRACKED_INSTITUTIONS=Berkshire Hathaway,Pershing Square Capital Management,...
 
 # Scheduler (cron syntax, US/Eastern)
 SCHEDULE_DAILY=0 8 * * 1-5
@@ -304,7 +413,7 @@ python main.py --schedule
 
 ```
 ============================================================
-  ACTIONABLE SIGNALS  (2026-03-29 16:22 UTC)
+  ACTIONABLE SIGNALS  (2026-04-09 08:22 EDT)
 ============================================================
 
   STOCKS
@@ -323,11 +432,11 @@ python main.py --schedule
     analysis reinforces the fundamental case.
     Key risk: rapid diplomatic resolution.
 
-  ▼ ES=F   SELL   conf=88%  [SWING]
-    Near-maximum combined confidence (98%). BofA strategist 'grind lower'
-    + Wall Street consensus + U.S. ground troops in Iran = acute risk-off
-    pressure on S&P 500 futures.
-    Key risk: central bank intervention.
+  SMART MONEY SIGNALS
+  ----------------------------------------
+  GLD     [+] Unusual CALL Sweep (Options Sweep — CALL)
+  XLE     [+] 13D Activist Stake (Elliott Management), [+] Unusual CALL Sweep
+  NVDA    [-] Planned Sale (Officer/Director Form 144)
 ============================================================
 ```
 
@@ -347,16 +456,20 @@ llm_trader/
 └── src/
     ├── pipeline.py             # Main orchestration (all 7 steps)
     ├── models.py               # Pydantic models: NewsArticle, TickerSignal, Recommendation, InsiderTrade
+    ├── utils.py                # Shared utilities (Eastern timezone helpers)
     ├── data/
     │   ├── trending.py         # Dynamic ticker discovery (Yahoo, AV, NewsAPI)
     │   ├── news_fetcher.py     # RSS + NewsAPI aggregator
     │   ├── market_data.py      # yfinance snapshots + rate-limit backoff
     │   ├── insider_trades.py   # House/Senate watchers + EDGAR Form 4 filings
+    │   ├── options_flow.py     # Unusual options sweep detection (yfinance, no key)
+    │   ├── sec_filings.py      # SEC EDGAR: 13D/13G activist, Form 144, 13F superinvestors
+    │   ├── fred.py             # FRED macro regime: yield curve, CPI, credit spreads, M2
     │   └── cache.py            # Hourly cache + incremental OHLCV cache
     ├── analysis/
     │   ├── sentiment.py        # DeepSeek V3 / Haiku sentiment scoring
     │   ├── technical.py        # RSI, MACD, SMA, Bollinger Bands scoring
-    │   └── claude_analyst.py   # Claude Sonnet final recommendations
+    │   └── claude_analyst.py   # Analyst model final recommendations
     ├── signals/
     │   └── aggregator.py       # Weighted combination of news + technical + insider
     ├── performance/
@@ -367,7 +480,7 @@ llm_trader/
     │   ├── builder.py          # Plotly figures: stock chart, signals overview, equity curve
     │   └── report.py           # Self-contained interactive HTML report → logs/
     └── notifications/
-        └── email_sender.py     # HTML email with inline charts + insider trades section
+        └── email_sender.py     # HTML email with inline charts + smart money section
 ```
 
 ---

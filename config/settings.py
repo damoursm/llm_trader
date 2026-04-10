@@ -64,6 +64,11 @@ class Settings(BaseSettings):
         "Appaloosa Management,Baupost Group"
     )
 
+    # FRED (Federal Reserve of St. Louis) — macro regime context
+    # Free API key: https://fred.stlouisfed.org/docs/api/api_key.html
+    fred_api_key: str = ""
+    enable_fred: bool = True    # fetch yield curve, CPI, unemployment, credit spreads, M2
+
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 
