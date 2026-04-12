@@ -305,6 +305,27 @@ HTML_TEMPLATE = """
     </div>
     {% endif %}
 
+    <!-- Put/Call Ratio -->
+    {% set pc = sig.put_call_score if sig.put_call_score is defined else 0 %}
+    {% if use_put_call and pc != 0 %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Put/Call Ratio</span>
+        <span class="mscore {{ 'sp' if pc > 0 else 'sn' }}">
+          {{ "%+.2f"|format(pc) }}
+        </span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar"
+             style="width:{{ (pc|abs * 100)|int }}%;
+                    background:{{ '#06b6d4' if pc >= 0 else '#a855f7' }};"></div>
+      </div>
+      <div class="mtext">
+        {{ 'Elevated put volume → contrarian bullish signal' if pc > 0 else 'Elevated call volume → contrarian bearish signal' }}
+      </div>
+    </div>
+    {% endif %}
+
   </div>
   {% endif %}
 
@@ -367,7 +388,82 @@ HTML_TEMPLATE = """
       </td>
       <td style="color:#64748b;">{{ rec.time_horizon }}</td>
     </tr>
+    {% if rec.rationale %}
+    <tr>
+      <td colspan="{{ 6 + (1 if use_news else 0) + (1 if use_tech else 0) }}"
+          style="padding:4px 12px 10px 12px;color:#94a3b8;font-size:12px;
+                 line-height:1.5;border-top:none;">
+        {{ rec.rationale }}
+      </td>
+    </tr>
+    {% endif %}
     {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     3b — ANALYST RATINGS
+     ══════════════════════════════════════ -->
+{% if analyst_articles %}
+<h2>Analyst Ratings <span style="font-size:13px;font-weight:400;color:#94a3b8;">(upgrades · downgrades · price targets)</span></h2>
+{% for art in analyst_articles %}
+{% set is_bull = 'upgrade' in art.title.lower() or 'initiated' in art.title.lower() %}
+{% set is_bear = 'downgrade' in art.title.lower() %}
+{% set accent = '#4ade80' if is_bull else ('#f87171' if is_bear else '#0ea5e9') %}
+<div class="card" style="border-left: 4px solid {{ accent }}; padding: 14px 18px; margin: 10px 0;">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+    <span style="font-size:14px;font-weight:700;color:#f8fafc;">{{ art.title }}</span>
+  </div>
+  <div style="font-size:12px;color:#94a3b8;line-height:1.6;">{{ art.summary }}</div>
+  <div style="font-size:11px;color:#475569;margin-top:6px;">
+    <span class="art-src">[{{ art.source }}]</span>
+    &nbsp;&bull;&nbsp;{{ fmt_et(art.published_at) }}
+    &nbsp;&bull;&nbsp;<a href="{{ art.url }}" style="color:#475569;">Yahoo Finance →</a>
+  </div>
+</div>
+{% endfor %}
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     3c — EPS SURPRISES + ALTERNATIVE DATA
+     ══════════════════════════════════════ -->
+{% set all_alt = eps_articles + alt_data_articles %}
+{% if all_alt %}
+<h2>Alternative Signals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(EPS surprises · Google Trends · Reddit · Short Interest)</span></h2>
+<table class="ctbl">
+  <thead>
+    <tr>
+      <th>Source</th>
+      <th>Signal</th>
+      <th>Published</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for art in all_alt %}
+  {% set src_color = {
+      'Earnings/EPS':   '#f59e0b',
+      'Google Trends':  '#0ea5e9',
+      'Reddit/WSB':     '#7c3aed',
+      'Short Interest': '#ec4899'
+  }.get(art.source, '#94a3b8') %}
+  {% set is_bull = 'beat' in art.title.lower() or 'surge' in art.title.lower() or 'squeeze' in art.title.lower() or 'covering' in art.title.lower() or 'bullish' in art.summary.lower()[:80] %}
+  {% set is_bear = 'miss' in art.title.lower() or 'drop' in art.title.lower() or 'bearish' in art.title.lower() or 'bearish' in art.summary.lower()[:80] %}
+    <tr>
+      <td>
+        <span style="background:#0f172a;color:{{ src_color }};border:1px solid {{ src_color }};
+                     border-radius:3px;padding:2px 6px;font-size:10px;font-weight:700;white-space:nowrap;">
+          {{ art.source }}
+        </span>
+      </td>
+      <td>
+        <span style="color:{{ '#4ade80' if is_bull else ('#f87171' if is_bear else '#e2e8f0') }};font-size:12px;">
+          {{ art.title }}
+        </span>
+      </td>
+      <td style="color:#475569;font-size:11px;white-space:nowrap;">{{ fmt_et(art.published_at) }}</td>
+    </tr>
+  {% endfor %}
   </tbody>
 </table>
 {% endif %}
@@ -451,6 +547,363 @@ HTML_TEMPLATE = """
     {% endif %}
 
   </div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5 — IPO PIPELINE (SEC S-1/S-11)
+     ══════════════════════════════════════ -->
+{% if ipo_context and ipo_context.total_new > 0 %}
+{% set activity_color = '#4ade80' if ipo_context.total_new >= 20 else ('#fb923c' if ipo_context.total_new >= 10 else '#94a3b8') %}
+<h2>IPO Pipeline <span style="font-size:13px;font-weight:400;color:#94a3b8;">(SEC S-1/S-11 — last {{ ipo_context.lookback_days }} days)</span></h2>
+<div class="card" style="border-left: 4px solid #0ea5e9;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ ipo_context.summary }}</p>
+
+  <!-- Sector bar chart (relative widths) -->
+  {% set max_count = ipo_context.sector_counts.values() | max %}
+  <div style="margin-bottom:18px;">
+    {% for sector, count in ipo_context.sector_counts.items() %}
+    {% set bar_pct = (count / max_count * 100) | int %}
+    {% set is_hot  = sector in ipo_context.hot_sectors %}
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+      <div style="width:160px;font-size:12px;color:{{ '#e2e8f0' if is_hot else '#94a3b8' }};text-align:right;flex-shrink:0;">
+        {{ sector }}
+      </div>
+      <div style="flex:1;background:#1e293b;border-radius:3px;height:16px;">
+        <div style="width:{{ bar_pct }}%;background:{{ '#0ea5e9' if is_hot else '#334155' }};border-radius:3px;height:100%;"></div>
+      </div>
+      <div style="width:28px;font-size:12px;color:{{ '#0ea5e9' if is_hot else '#64748b' }};font-weight:{{ '700' if is_hot else '400' }};">
+        {{ count }}
+      </div>
+    </div>
+    {% endfor %}
+    <div style="font-size:11px;color:#475569;margin-top:6px;">
+      + {{ ipo_context.total_amendments }} amendment(s) (S-1/A, S-11/A) — companies advancing toward listing
+    </div>
+  </div>
+
+  <!-- Recent initial filings table -->
+  {% if ipo_context.filings %}
+  <div style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Recent Registrations</div>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="color:#475569;">
+          <th style="text-align:left;padding:4px 8px;">Date</th>
+          <th style="text-align:left;padding:4px 8px;">Form</th>
+          <th style="text-align:left;padding:4px 8px;">Sector</th>
+          <th style="text-align:left;padding:4px 8px;">Company</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for f in ipo_context.filings[:12] %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:5px 8px;color:#64748b;white-space:nowrap;">{{ f.filing_date }}</td>
+          <td style="padding:5px 8px;color:#94a3b8;">{{ f.form_type }}</td>
+          <td style="padding:5px 8px;color:#94a3b8;font-size:11px;">{{ f.sector }}</td>
+          <td style="padding:5px 8px;color:#e2e8f0;">{{ f.company }}</td>
+        </tr>
+      {% endfor %}
+      {% if ipo_context.total_new > 12 %}
+        <tr><td colspan="4" style="padding:5px 8px;color:#475569;font-size:11px;">… and {{ ipo_context.total_new - 12 }} more</td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5b — UPCOMING EARNINGS CALENDAR
+     ══════════════════════════════════════ -->
+{% if earnings_context and earnings_context.upcoming %}
+<h2>Upcoming Earnings <span style="font-size:13px;font-weight:400;color:#94a3b8;">(next {{ earnings_context.upcoming[-1].days_until }} days)</span></h2>
+<div class="card" style="border-left: 4px solid #f59e0b;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ earnings_context.summary }}</p>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <thead>
+        <tr style="color:#64748b;text-transform:uppercase;font-size:11px;letter-spacing:.5px;">
+          <th style="text-align:left;padding:6px 8px;">Ticker</th>
+          <th style="text-align:left;padding:6px 8px;">Earnings Date</th>
+          <th style="text-align:right;padding:6px 8px;">Days</th>
+          <th style="text-align:right;padding:6px 8px;">EPS Estimate</th>
+          <th style="text-align:left;padding:6px 8px;">Alert</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for ev in earnings_context.upcoming %}
+      {% set urgency_color = '#f87171' if ev.days_until <= 3 else ('#f59e0b' if ev.days_until <= 7 else '#94a3b8') %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:7px 8px;color:#e2e8f0;font-weight:600;">{{ ev.ticker }}</td>
+          <td style="padding:7px 8px;color:#94a3b8;">{{ ev.earnings_date }}</td>
+          <td style="padding:7px 8px;text-align:right;color:{{ urgency_color }};font-weight:700;">{{ ev.days_until }}d</td>
+          <td style="padding:7px 8px;text-align:right;color:#cbd5e1;">
+            {% if ev.estimated_eps is not none %}${{ "%.2f"|format(ev.estimated_eps) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:7px 8px;">
+            {% if ev.days_until <= 3 %}
+            <span style="background:#450a0a;color:#f87171;border:1px solid #f87171;border-radius:4px;padding:2px 7px;font-size:11px;">BINARY EVENT</span>
+            {% elif ev.days_until <= 7 %}
+            <span style="background:#451a03;color:#f59e0b;border:1px solid #f59e0b;border-radius:4px;padding:2px 7px;font-size:11px;">IV EXPANSION</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    BINARY EVENT: avoid POSITION-length trades. IV EXPANSION: pre-earnings options plays may be favoured over stock.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6 — COT FUTURES POSITIONING (CFTC)
+     ══════════════════════════════════════ -->
+{% if cot_context %}
+{% set sig_color = {
+    'EXTREME_LONG':  '#f87171',
+    'BULLISH_TREND': '#4ade80',
+    'NEUTRAL':       '#94a3b8',
+    'BEARISH_TREND': '#fb923c',
+    'EXTREME_SHORT': '#60a5fa'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>COT Futures Positioning <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CFTC — as of {{ cot_context.report_date }})</span></h2>
+<div class="card" style="border-left: 4px solid #7c3aed;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ cot_context.summary }}</p>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <thead>
+        <tr style="color:#64748b;text-transform:uppercase;font-size:11px;letter-spacing:.5px;">
+          <th style="text-align:left;padding:6px 8px;">Contract</th>
+          <th style="text-align:left;padding:6px 8px;">Tickers</th>
+          <th style="text-align:right;padding:6px 8px;">Net Spec %</th>
+          <th style="text-align:right;padding:6px 8px;">WoW</th>
+          <th style="text-align:right;padding:6px 8px;">52W Pct</th>
+          <th style="text-align:center;padding:6px 8px;">Signal</th>
+          <th style="text-align:center;padding:6px 8px;">Direction</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for s in cot_context.signals %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:7px 8px;color:#e2e8f0;font-weight:600;">{{ s.contract }}</td>
+          <td style="padding:7px 8px;color:#94a3b8;font-size:12px;">{{ s.tickers | join(', ') }}</td>
+          <td style="padding:7px 8px;text-align:right;color:{{ '#4ade80' if s.net_speculator_pct > 0 else '#f87171' }};">
+            {{ "%+.1f"|format(s.net_speculator_pct) }}%
+          </td>
+          <td style="padding:7px 8px;text-align:right;color:{{ '#4ade80' if s.net_change_wow > 0.5 else ('#f87171' if s.net_change_wow < -0.5 else '#94a3b8') }};">
+            {{ "%+.1f"|format(s.net_change_wow) }}%
+          </td>
+          <td style="padding:7px 8px;text-align:right;color:#e2e8f0;">{{ "%.0f"|format(s.percentile_52w) }}th</td>
+          <td style="padding:7px 8px;text-align:center;">
+            <span style="background:#1e293b;color:{{ sig_color.get(s.signal, '#94a3b8') }};border:1px solid {{ sig_color.get(s.signal, '#334155') }};border-radius:4px;padding:2px 7px;font-size:11px;white-space:nowrap;">
+              {{ s.signal.replace('_', ' ') }}
+            </span>
+          </td>
+          <td style="padding:7px 8px;text-align:center;color:{{ dir_color.get(s.direction, '#94a3b8') }};font-weight:700;">
+            {{ '▲' if s.direction == 'BULLISH' else ('▼' if s.direction == 'BEARISH' else '→') }}
+            {{ s.direction }}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Contrarian applied at extremes: EXTREME_LONG → bearish signal; EXTREME_SHORT → bullish signal.
+    Managed Money (commodities) / Leveraged Money (index futures) as proxy for hedge fund positioning.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a — VIX & TERM STRUCTURE
+     ══════════════════════════════════════ -->
+{% if vix_context and vix_context.vix is not none %}
+{% set vix_sig_color = {
+    'PANIC':        '#7c3aed',
+    'EXTREME_FEAR': '#f87171',
+    'HIGH':         '#fb923c',
+    'ELEVATED':     '#fbbf24',
+    'NORMAL':       '#94a3b8',
+    'LOW':          '#86efac',
+    'COMPLACENCY':  '#4ade80',
+    'UNKNOWN':      '#64748b'
+} %}
+{% set ts_color = {
+    'BACKWARDATION': '#f87171',
+    'FLAT':          '#94a3b8',
+    'CONTANGO':      '#4ade80',
+    'UNKNOWN':       '#64748b'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>VIX &amp; Volatility Regime <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^VIX · ^VXN · ^VVIX · term structure)</span></h2>
+<div class="card" style="border-left: 4px solid {{ vix_sig_color.get(vix_context.vix_signal, '#94a3b8') }};">
+
+  <!-- Top row: VIX gauge + term structure -->
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- VIX gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">VIX</div>
+      <div style="font-size:30px;font-weight:800;color:{{ vix_sig_color.get(vix_context.vix_signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%.1f"|format(vix_context.vix) }}
+      </div>
+      <div style="font-size:11px;font-weight:700;color:{{ vix_sig_color.get(vix_context.vix_signal, '#94a3b8') }};">
+        {{ vix_context.vix_signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ dir_color.get(vix_context.vix_direction, '#94a3b8') }};margin-top:3px;">
+        {{ '▲ BULLISH' if vix_context.vix_direction == 'BULLISH' else ('▼ BEARISH' if vix_context.vix_direction == 'BEARISH' else '→ NEUTRAL') }} bias
+      </div>
+    </div>
+
+    <!-- Term structure curve -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;flex:1;min-width:240px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">
+        Vol Curve
+        <span style="color:{{ ts_color.get(vix_context.term_structure, '#94a3b8') }};margin-left:6px;">
+          {{ vix_context.term_structure }}
+          {% if vix_context.slope_1m_3m is not none %}({{ "%+.1f"|format(vix_context.slope_1m_3m) }}pt){% endif %}
+        </span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:flex-end;height:50px;">
+        {% set levels = [
+            ('9D', vix_context.vix9d),
+            ('1M', vix_context.vix),
+            ('3M', vix_context.vix3m),
+            ('6M', vix_context.vix6m)
+        ] %}
+        {% set max_val = [vix_context.vix9d or 0, vix_context.vix or 0, vix_context.vix3m or 0, vix_context.vix6m or 0] | max %}
+        {% for label, val in levels %}
+        {% if val is not none %}
+        {% set bar_h = ((val / max_val) * 44) | int if max_val > 0 else 20 %}
+        <div style="display:flex;flex-direction:column;align-items:center;flex:1;">
+          <div style="font-size:10px;color:#94a3b8;margin-bottom:2px;">{{ "%.1f"|format(val) }}</div>
+          <div style="height:{{ bar_h }}px;width:100%;background:{{ ts_color.get(vix_context.term_structure,'#334155') }};border-radius:3px 3px 0 0;opacity:0.8;"></div>
+          <div style="font-size:10px;color:#475569;margin-top:2px;">{{ label }}</div>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Related indices -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:130px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Related</div>
+      {% if vix_context.vxn is not none %}
+      <div style="margin-bottom:6px;">
+        <span style="color:#475569;font-size:11px;">VXN (Nasdaq)</span>
+        <span style="color:#e2e8f0;font-weight:700;float:right;">{{ "%.1f"|format(vix_context.vxn) }}</span>
+      </div>
+      {% endif %}
+      {% if vix_context.vvix is not none %}
+      {% set vvix_color = '#f87171' if vix_context.vvix > 120 else ('#fb923c' if vix_context.vvix > 100 else '#94a3b8') %}
+      <div>
+        <span style="color:#475569;font-size:11px;">VVIX (vol-of-vol)</span>
+        <span style="color:{{ vvix_color }};font-weight:700;float:right;">{{ "%.1f"|format(vix_context.vvix) }}</span>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 6px 0;">{{ vix_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:0;">
+    Contrarian: EXTREME_FEAR / PANIC → fade SELLs, upgrade BUY conviction on quality names.
+    BACKWARDATION = near-term panic spike, often marks short-term lows.
+    COMPLACENCY → reduce aggressive long exposure.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6b — PUT/CALL RATIO
+     ══════════════════════════════════════ -->
+{% if put_call_context %}
+{% set mkt_color = {
+    'EXTREME_GREED': '#f87171',
+    'GREED':         '#fb923c',
+    'NEUTRAL':       '#94a3b8',
+    'FEAR':          '#4ade80',
+    'EXTREME_FEAR':  '#60a5fa',
+    'UNKNOWN':       '#64748b'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+{% set sig_color = {
+    'EXTREME_PUTS':  '#f87171',
+    'PUTS_HEAVY':    '#fb923c',
+    'BALANCED':      '#94a3b8',
+    'CALLS_HEAVY':   '#86efac',
+    'EXTREME_CALLS': '#4ade80'
+} %}
+<h2>Put/Call Ratio <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CBOE equity · yfinance per-ticker)</span></h2>
+<div class="card" style="border-left: 4px solid {{ mkt_color.get(put_call_context.market_signal, '#94a3b8') }};">
+
+  <!-- Market-wide gauge -->
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:14px;">
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:120px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">CBOE Equity P/C</div>
+      <div style="font-size:28px;font-weight:800;color:{{ mkt_color.get(put_call_context.market_signal, '#e2e8f0') }};margin:4px 0;">
+        {% if put_call_context.market_pc_ratio is not none %}{{ "%.2f"|format(put_call_context.market_pc_ratio) }}{% else %}N/A{% endif %}
+      </div>
+      <div style="font-size:12px;color:{{ mkt_color.get(put_call_context.market_signal, '#94a3b8') }};font-weight:700;">
+        {{ put_call_context.market_signal.replace('_', ' ') }}
+      </div>
+    </div>
+    <div>
+      <div style="font-size:13px;color:#cbd5e1;margin-bottom:4px;">{{ put_call_context.summary }}</div>
+      <div style="font-size:12px;color:#475569;">
+        Contrarian signal: FEAR → market bottom risk; GREED → complacency risk.
+        Range: &lt;0.60 extreme calls, 0.80–1.00 neutral, &gt;1.20 extreme puts.
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-ticker extremes -->
+  {% if put_call_context.ticker_signals %}
+  <div style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Per-Ticker Extremes</div>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="color:#475569;text-transform:uppercase;font-size:10px;letter-spacing:.5px;">
+          <th style="text-align:left;padding:5px 8px;">Ticker</th>
+          <th style="text-align:right;padding:5px 8px;">P/C Ratio</th>
+          <th style="text-align:right;padding:5px 8px;">Put Vol</th>
+          <th style="text-align:right;padding:5px 8px;">Call Vol</th>
+          <th style="text-align:center;padding:5px 8px;">Signal</th>
+          <th style="text-align:center;padding:5px 8px;">Direction</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for s in put_call_context.ticker_signals %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:6px 8px;color:#e2e8f0;font-weight:600;">{{ s.ticker }}</td>
+          <td style="padding:6px 8px;text-align:right;color:{{ '#f87171' if s.put_call_ratio > 1.5 else ('#4ade80' if s.put_call_ratio < 0.5 else '#e2e8f0') }};font-weight:700;">
+            {{ "%.2f"|format(s.put_call_ratio) }}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">{{ "{:,}".format(s.put_volume) }}</td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">{{ "{:,}".format(s.call_volume) }}</td>
+          <td style="padding:6px 8px;text-align:center;">
+            <span style="background:#1e293b;color:{{ sig_color.get(s.signal, '#94a3b8') }};border:1px solid {{ sig_color.get(s.signal, '#334155') }};border-radius:4px;padding:2px 7px;font-size:10px;white-space:nowrap;">
+              {{ s.signal.replace('_', ' ') }}
+            </span>
+          </td>
+          <td style="padding:6px 8px;text-align:center;color:{{ dir_color.get(s.direction, '#94a3b8') }};font-weight:700;">
+            {{ '▲' if s.direction == 'BULLISH' else ('▼' if s.direction == 'BEARISH' else '→') }}
+            {{ s.direction }}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div style="font-size:12px;color:#475569;">No per-ticker extremes detected — all watchlist tickers have balanced put/call activity.</div>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -575,7 +1028,12 @@ def send_recommendations(
     insider_trades: Optional[List[InsiderTrade]] = None,
     signals: Optional[List[TickerSignal]] = None,
     articles: Optional[List[NewsArticle]] = None,
-    macro_context=None,   # Optional[MacroContext] — avoid circular import
+    macro_context=None,     # Optional[MacroContext]    — avoid circular import
+    cot_context=None,       # Optional[COTContext]      — avoid circular import
+    ipo_context=None,       # Optional[IPOContext]      — avoid circular import
+    vix_context=None,       # Optional[VIXContext]      — avoid circular import
+    put_call_context=None,  # Optional[PutCallContext]  — avoid circular import
+    earnings_context=None,  # Optional[EarningsContext] — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -645,21 +1103,56 @@ def send_recommendations(
                 sorted(
                     insider_by_ticker.items(),
                     key=lambda kv: (kv[0] not in actionable_tickers, kv[0]),
-                )
+                )[:settings.smart_money_top_tickers]
             )
 
+    # ── Analyst ratings articles (dedicated section) ─────────────────────
+    analyst_articles: List[NewsArticle] = sorted(
+        [a for a in (articles or []) if a.source == "Analyst Ratings"],
+        key=lambda a: a.published_at, reverse=True,
+    )
+
+    # ── EPS surprise articles ─────────────────────────────────────────────
+    eps_articles: List[NewsArticle] = sorted(
+        [a for a in (articles or []) if a.source == "Earnings/EPS"],
+        key=lambda a: a.published_at, reverse=True,
+    )
+
+    # ── Alternative data articles (Google Trends + Reddit + Short Interest) ──
+    alt_data_articles: List[NewsArticle] = sorted(
+        [a for a in (articles or []) if a.source in ("Google Trends", "Reddit/WSB", "Short Interest")],
+        key=lambda a: a.published_at, reverse=True,
+    )
+
     # ── Charts ─────────────────────────────────────────────────────────────
+    # The overview chart is always generated — it's a single cheap chart that
+    # shows method-breakdown stacked bars for every recommendation.
+    # Per-ticker stock charts and the equity curve are only built when ENABLE_CHARTS=true.
+    charts: dict = {}
+    equity_png: Optional[str] = None
+    try:
+        from src.charts.builder import PLOTLY_AVAILABLE
+        if PLOTLY_AVAILABLE:
+            overview_fig = build_signals_overview(all_recs, signals_by_ticker)
+            overview_png = fig_to_png_b64(overview_fig, width=1100, height=None)
+        else:
+            overview_png = None
+    except Exception as e:
+        logger.debug(f"[email] Overview chart skipped: {e}")
+        overview_png = None
+
     if settings.enable_charts:
-        logger.info("[email] Rendering chart images...")
-        charts, overview_png, equity_png = _build_chart_pngs(
-            recommendations, all_recs, performance, signals_by_ticker
-        )
-        logger.info(
-            f"[email] {len(charts)} chart image(s) embedded"
-            if charts else "[email] No chart images (kaleido not available)"
-        )
-    else:
-        charts, overview_png, equity_png = {}, None, None
+        logger.info("[email] Rendering per-ticker chart images...")
+        try:
+            charts, _, equity_png = _build_chart_pngs(
+                recommendations, all_recs, performance, signals_by_ticker
+            )
+            logger.info(
+                f"[email] {len(charts)} chart image(s) embedded"
+                if charts else "[email] No chart images (kaleido not available)"
+            )
+        except Exception as e:
+            logger.warning(f"[email] Per-ticker charts failed: {e}")
 
     rec_actions = {r.ticker: r.action for r in recommendations}
 
@@ -679,6 +1172,7 @@ def send_recommendations(
         use_news=use_news,
         use_tech=use_tech,
         use_insider=use_insider,
+        use_put_call=settings.enable_put_call,
         active_methods=active_methods,
         # smart money
         insider_trades=insider_by_ticker,
@@ -689,8 +1183,22 @@ def send_recommendations(
         equity_png=equity_png,
         # performance
         perf=performance,
+        # analyst ratings / EPS surprises / alternative data
+        analyst_articles=analyst_articles,
+        eps_articles=eps_articles,
+        alt_data_articles=alt_data_articles,
         # macro context (FRED)
         macro_context=macro_context,
+        # COT context (CFTC)
+        cot_context=cot_context,
+        # IPO pipeline (SEC S-1/S-11)
+        ipo_context=ipo_context,
+        # VIX volatility regime
+        vix_context=vix_context,
+        # Put/Call ratio (CBOE + per-ticker)
+        put_call_context=put_call_context,
+        # Earnings calendar
+        earnings_context=earnings_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────
@@ -717,6 +1225,8 @@ def send_recommendations(
                 lines.append(f"Technical score: {sig.technical_score:+.2f}")
             if use_insider and sig.insider_summary:
                 lines.append(f"Smart money:\n{sig.insider_summary}")
+            if settings.enable_put_call and sig.put_call_score != 0:
+                lines.append(f"Put/call score:  {sig.put_call_score:+.2f}")
         lines.append(f"Claude's synthesis: {rec.rationale}")
         lines.append("")
     if insider_by_ticker:

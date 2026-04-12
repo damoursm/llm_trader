@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     # Insider trades config
     insider_lookback_days: int = 90      # how far back to look for trades
+    smart_money_top_tickers: int = 5     # max number of ticker groups shown in smart money section
     # Comma-separated names to prioritise (empty = include all politicians)
     tracked_politicians: str = (
         "Nancy Pelosi,Paul Pelosi,Austin Scott,Michael McCaul,"
@@ -68,6 +69,50 @@ class Settings(BaseSettings):
     # Free API key: https://fred.stlouisfed.org/docs/api/api_key.html
     fred_api_key: str = ""
     enable_fred: bool = True    # fetch yield curve, CPI, unemployment, credit spreads, M2
+
+    # CFTC Commitment of Traders — weekly futures positioning (no API key required)
+    enable_cot: bool = True     # download COT data from CFTC; cached by ISO week
+
+    # SEC 8-K material event filings — faster than RSS feeds (no API key required)
+    enable_8k_filings: bool = True
+    eight_k_lookback_days: int = 5   # fetch 8-Ks filed in the last N days
+
+    # SEC S-1/S-11 IPO pipeline — sector-level institutional demand signal (no API key required)
+    enable_ipo_pipeline: bool = True
+    ipo_lookback_days: int = 30      # S-1 filings accumulate over weeks; 30 days gives a full picture
+
+    # Analyst upgrades/downgrades/price-target changes — yfinance (free, no key required)
+    enable_analyst_ratings: bool = True
+    analyst_ratings_lookback_days: int = 30
+
+    # Put/Call ratio — market sentiment + per-ticker directional bias
+    # Market-wide: CBOE equity P/C CSV (free, no key); per-ticker: yfinance options volume
+    enable_put_call: bool = True
+
+    # VIX & term structure — CBOE volatility indices via yfinance (no key required)
+    # ^VIX, ^VXN, ^VVIX, ^VIX9D, ^VIX3M, ^VXMT
+    enable_vix: bool = True
+
+    # Earnings calendar + EPS surprises
+    # Upcoming dates: yfinance (free) + Alpha Vantage EARNINGS_CALENDAR (free with key)
+    # EPS beat/miss: yfinance earnings_dates (free)
+    enable_earnings: bool = True
+    earnings_lookback_days: int = 90   # how far back to look for recent EPS surprises
+    earnings_upcoming_days: int = 14   # how many days ahead to include in calendar
+
+    # Short interest — FINRA Reg SHO daily short volume + yfinance (no API key required)
+    # Squeeze setups (high SI + low days-to-cover), bearish positioning, short covering signals
+    enable_short_interest: bool = True
+
+    # Google Trends — search interest spike/drop as retail attention proxy (no API key required)
+    enable_google_trends: bool = True   # uses pytrends (unofficial API); cached daily
+
+    # Reddit social sentiment — r/wallstreetbets, r/stocks, r/investing
+    # Free Reddit API credentials: https://www.reddit.com/prefs/apps (create "script" app)
+    enable_reddit_sentiment: bool = True
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
+    reddit_user_agent: str = "llm_trader/1.0 (stock analysis bot)"
 
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"

@@ -10,11 +10,14 @@ An AI-powered stock analysis tool that discovers trending securities, aggregates
 ┌─────────────────────────────────────────────────────────────────────┐
 │  0. Ticker Discovery   — expand universe with hot/trending tickers  │
 │  1. News Fetch         — RSS feeds + NewsAPI (last 24 h)            │
+│  1b. SEC 8-K Filings   — material events (earnings, M&A, changes)  │
 │  2. Market Data        — price snapshots via yfinance               │
 │  3a. Insider Trades    — politician disclosures + EDGAR Form 4      │
 │  3b. Options Flow      — unusual sweep detection via yfinance       │
 │  3c. SEC Filings       — 13D/13G activist, Form 144, 13F positions  │
 │  3d. FRED Macro        — yield curve, CPI, credit spreads, M2       │
+│  3e. CFTC COT          — weekly speculator positioning in futures    │
+│  3f. IPO Pipeline      — S-1/S-11 sector demand signal              │
 │  4. Signal Aggregation — weighted combination of all active methods │
 │  5. Recommendations    — Claude: BUY / SELL / HOLD / WATCH          │
 │  6. Performance Track  — open trades, mark P&L, auto-close at 5 d  │
@@ -83,6 +86,41 @@ Price snapshots for every ticker are fetched via **yfinance** with the following
 - Exponential backoff per ticker: 60 s → 120 s → 240 s (capped at 600 s), with a live countdown log
 - After 3 consecutive failures the fetch loop stops early, returning however many snapshots were collected
 - Non-rate-limit errors (invalid ticker, delisted) skip that ticker immediately with no retry
+
+---
+
+### Step 1b — SEC 8-K Material Event Filings (`src/data/eight_k.py`)
+
+When `ENABLE_8K_FILINGS=true`, the pipeline fetches recent 8-K filings for every ticker in the analysis universe directly from SEC EDGAR's submissions API. No API key required.
+
+**Why 8-Ks beat RSS feeds:** Companies must file within 4 business days of the triggering event. EDGAR receives the filing before most financial news outlets publish their coverage, giving a structural time advantage on catalysts.
+
+**Material items tracked:**
+
+| Item | Event |
+|---|---|
+| 1.01 | Entry into Material Definitive Agreement |
+| 1.02 | Termination of Material Agreement |
+| 1.03 | Bankruptcy or Receivership |
+| 1.05 | Material Cybersecurity Incident |
+| 2.01 | Completion of Acquisition or Disposition |
+| 2.02 | Results of Operations — **Earnings Release** |
+| 2.05 | Costs Associated with Exit/Disposal — Restructuring/Layoffs |
+| 2.06 | Material Impairment |
+| 3.01 | Notice of Delisting |
+| 3.02 | Unregistered Sales of Securities (Dilution) |
+| 4.01 | Change in Certifying Accountant |
+| 4.02 | Non-Reliance on Previously Issued Financial Statements — **Restatement** |
+| 5.01 | Change in Control of Registrant |
+| 5.02 | Departure or Appointment of Principal Officers/Directors |
+
+Exhibit-only items (9.01) and pure compliance items (5.03, 5.08, 1.04) are filtered out.
+
+**Integration:** 8-K filings are converted to `NewsArticle` objects and injected directly into the news feed **before** sentiment scoring. The DeepSeek/Haiku LLM then scores them alongside RSS and NewsAPI articles. No separate pipeline stage or prompt change is needed — a restatement 8-K naturally scores -0.8, an acquisition completion scores +0.4, and earnings releases get scored on content context.
+
+**Always fetched fresh** — unlike RSS news (cached hourly), 8-K articles are fetched on every run so same-day filings are never missed even on pipeline re-runs.
+
+Tickers with no CIK in the SEC master list (some ETFs, indices) are skipped silently.
 
 ---
 
@@ -188,6 +226,80 @@ When `ENABLE_FRED=true`, the pipeline fetches macro regime indicators from the S
 - `EXPANSION`: macro tailwind raises conviction on longs
 
 The macro dashboard also appears as a dedicated card in the HTML email with color-coded indicators for each FRED series.
+
+---
+
+### Step 3e — CFTC Commitment of Traders (`src/data/cot.py`)
+
+When `ENABLE_COT=true`, the pipeline downloads the weekly CFTC COT report. No API key required — data is public and updated every Friday.
+
+**Two reports downloaded:**
+
+| Report | Coverage | Speculator proxy |
+|---|---|---|
+| **Disaggregated Futures Only** | Physical commodities | Managed Money (hedge funds) |
+| **Traders in Financial Futures (TFF)** | S&P 500, Nasdaq futures | Leveraged Money (hedge funds) |
+
+**Contracts tracked:**
+
+| Contract | Related tickers |
+|---|---|
+| Gold | GLD, IAU, GDX |
+| Silver | SLV |
+| Crude Oil | USO |
+| Natural Gas | UNG |
+| Copper | CPER |
+| Platinum | PPLT |
+| Palladium | PALL |
+| S&P 500 | SPY |
+| Nasdaq 100 | QQQ |
+
+**Signal logic:**
+
+Net speculator position = (longs − shorts) / open interest × 100. This is ranked within the last 52 weekly observations to produce a percentile:
+
+| Percentile | Signal | Applied direction |
+|---|---|---|
+| ≥ 80th | `EXTREME_LONG` | **BEARISH** (contrarian — specs crowded, reversal risk high) |
+| 60–79th | `BULLISH_TREND` | BULLISH (momentum) |
+| 40–59th | `NEUTRAL` | NEUTRAL |
+| 20–39th | `BEARISH_TREND` | BEARISH (momentum) |
+| ≤ 20th | `EXTREME_SHORT` | **BULLISH** (contrarian — specs max short, coiled for squeeze) |
+
+Week-over-week change in net position is also tracked as a trend confirmation.
+
+**Results are cached by ISO week** — re-runs within the same week skip the download entirely. The current + previous year's files are fetched to ensure a full 52-week history even early in the calendar year.
+
+**How it affects recommendations:** COT data is injected into the Claude prompt as a `<cot_context>` table. Claude uses it as a medium-term overlay: extreme readings cap conviction on positions in the crowded direction, while confirmed momentum builds. COT alone is never sufficient for a BUY/SELL — it must converge with at least one other signal layer.
+
+---
+
+### Step 3f — IPO Pipeline (`src/data/ipo_pipeline.py`)
+
+When `ENABLE_IPO_PIPELINE=true`, the pipeline fetches recent S-1 and S-11 registration statements from EDGAR. No API key required. Results are cached daily.
+
+**What S-1/S-11 filings signal:** Institutional underwriters only launch the IPO window when their real-money clients (hedge funds, pension funds, asset managers) have committed to buy. A cluster of S-1 filings in a sector is a revealed-preference signal that institutional capital is actively flowing there — 4 to 12 weeks ahead of when it shows up in sector ETF flows.
+
+**Forms tracked:**
+
+| Form | Meaning |
+|---|---|
+| S-1 | Initial IPO registration |
+| S-1/A | Amendment — company is actively progressing toward listing |
+| S-11 | REIT / real estate trust IPO |
+| S-11/A | REIT amendment |
+
+**Sector classification:** Two-tier — SIC code (from EDGAR) when available, company name keyword matching as fallback. S-11/S-11/A filings are always classified as Real Estate.
+
+**What goes to Claude:**
+- Sector breakdown table (filing counts per sector)
+- Recent initial registrations (last 10)
+- Amendment count (pipeline maturity signal)
+- Overall IPO market temperature: `highly active` (≥20 new) / `moderately active` (≥10) / `modest` / `quiet`
+
+Claude uses this as a **confirming layer** — if news is already bullish on XLK and Technology has the most S-1s, that convergence raises conviction. A cold IPO market tempers aggressive growth-sector BUYs even when news is positive.
+
+**Email:** Sector bar chart with highlighted top-3 sectors + recent filings table.
 
 ---
 
@@ -331,6 +443,9 @@ Optional (extend coverage):
 - [NewsAPI key](https://newsapi.org/) — targeted ticker/sector queries + trending detection
 - [Alpha Vantage key](https://www.alphavantage.co/) — top movers + news-active ticker discovery
 - [FRED API key](https://fred.stlouisfed.org/docs/api/api_key.html) — macro regime context (yield curve, CPI, credit spreads, M2) — free, no credit card
+- **CFTC COT** — no key required; weekly futures positioning data fetched directly from `cftc.gov`
+- **SEC 8-K** — no key required; material event filings fetched directly from EDGAR
+- **SEC S-1/S-11** — no key required; IPO pipeline fetched directly from EDGAR
 
 ---
 
@@ -382,6 +497,11 @@ ENABLE_INSIDER_TRADES=true        # method 3: politician + corporate insider tra
 ENABLE_OPTIONS_FLOW=true          # method 4: unusual options sweep detection (yfinance, no key needed)
 ENABLE_SEC_FILINGS=true           # method 5: SEC EDGAR 13D/13G activist, Form 144, 13F superinvestors
 ENABLE_FRED=true                  # macro regime overlay: yield curve, CPI, credit spreads, M2 (requires FRED_API_KEY)
+ENABLE_COT=true                   # CFTC COT futures positioning (no API key; cached weekly)
+ENABLE_8K_FILINGS=true            # SEC 8-K material events (no API key; always fresh)
+EIGHT_K_LOOKBACK_DAYS=5           # fetch 8-Ks filed in the last N days
+ENABLE_IPO_PIPELINE=true          # SEC S-1/S-11 sector demand signal (no API key; cached daily)
+IPO_LOOKBACK_DAYS=30              # S-1 filings accumulate over weeks; 30 days gives full picture
 
 # Insider trades config (optional)
 INSIDER_LOOKBACK_DAYS=90
@@ -465,6 +585,9 @@ llm_trader/
     │   ├── options_flow.py     # Unusual options sweep detection (yfinance, no key)
     │   ├── sec_filings.py      # SEC EDGAR: 13D/13G activist, Form 144, 13F superinvestors
     │   ├── fred.py             # FRED macro regime: yield curve, CPI, credit spreads, M2
+    │   ├── cot.py              # CFTC COT: weekly speculator positioning (9 contracts, cached by week)
+    │   ├── eight_k.py          # SEC 8-K: material event filings → NewsArticle objects
+    │   ├── ipo_pipeline.py     # SEC S-1/S-11: IPO pipeline sector intelligence (cached daily)
     │   └── cache.py            # Hourly cache + incremental OHLCV cache
     ├── analysis/
     │   ├── sentiment.py        # DeepSeek V3 / Haiku sentiment scoring

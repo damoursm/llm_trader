@@ -362,28 +362,31 @@ def build_signals_overview(
         return fig
 
     # ── Stacked method-breakdown bars ──────────────────────────────────────
-    # Colors: BUY (greens/teal), SELL (red → orange → amber)
-    BUY_COLORS  = ["#22c55e", "#4ade80", "#0d9488"]   # news, tech, smart money
-    SELL_COLORS = ["#ef4444", "#f97316", "#eab308"]    # news, tech, smart money
-    METHOD_NAMES = ["News / Sentiment", "Technical", "Smart Money"]
+    # Colors: BUY (greens/teal/cyan), SELL (red/orange/amber/purple)
+    BUY_COLORS  = ["#22c55e", "#4ade80", "#0d9488", "#06b6d4"]  # news, tech, insider, put/call
+    SELL_COLORS = ["#ef4444", "#f97316", "#eab308", "#a855f7"]  # news, tech, insider, put/call
+    METHOD_NAMES = ["News / Sentiment", "Technical", "Smart Money", "Put/Call"]
 
-    use_news    = settings.enable_news_sentiment
-    use_tech    = settings.enable_technical_analysis and settings.enable_market_data
-    use_insider = (settings.enable_insider_trades or
-                   settings.enable_options_flow or
-                   settings.enable_sec_filings)
-    method_enabled = [use_news, use_tech, use_insider]
+    use_news     = settings.enable_news_sentiment
+    use_tech     = settings.enable_technical_analysis and settings.enable_market_data
+    use_insider  = (settings.enable_insider_trades or
+                    settings.enable_options_flow or
+                    settings.enable_sec_filings)
+    use_put_call = settings.enable_put_call
+    method_enabled = [use_news, use_tech, use_insider, use_put_call]
 
     def _get_scores(sig) -> list:
+        pc = getattr(sig, "put_call_score", 0.0)
         return [
-            abs(sig.sentiment_score) if use_news    else 0.0,
-            abs(sig.technical_score) if use_tech    else 0.0,
-            abs(sig.insider_score)   if use_insider else 0.0,
+            abs(sig.sentiment_score) if use_news     else 0.0,
+            abs(sig.technical_score) if use_tech     else 0.0,
+            abs(sig.insider_score)   if use_insider  else 0.0,
+            abs(pc)                  if use_put_call else 0.0,
         ]
 
     traces = []
 
-    for m_idx in range(3):
+    for m_idx in range(4):
         if not method_enabled[m_idx]:
             continue
 
@@ -401,7 +404,12 @@ def build_signals_overview(
             else:
                 scores = _get_scores(sig)
                 total  = sum(scores)
-                frac   = (scores[m_idx] / total * rec.confidence) if total > 0 else 0.0
+                if total > 0:
+                    frac = scores[m_idx] / total * rec.confidence
+                else:
+                    # All method scores are zero — fall back to equal weighting
+                    active_count = sum(method_enabled)
+                    frac = rec.confidence / active_count if active_count else 0.0
 
             i = ticker_idx[rec.ticker]
             if rec.action == "BUY":

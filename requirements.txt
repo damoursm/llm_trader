@@ -8,6 +8,7 @@ requests==2.32.3
 feedparser==6.0.11
 beautifulsoup4==4.12.3
 httpx==0.28.1
+pytrends==4.9.2
 
 # LLM analysis
 anthropic==0.49.0
