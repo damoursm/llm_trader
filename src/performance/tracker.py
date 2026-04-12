@@ -18,7 +18,10 @@ from src.models import Recommendation
 from config import settings
 
 TRADES_FILE = Path("cache/trades.json")
-HOLDING_DAYS = 5  # auto-close after this many calendar days
+HOLDING_DAYS = 5   # auto-close after this many calendar days
+SPREAD_PCT   = 0.10  # round-trip bid-ask spread in % (5 bps each way)
+               # Applied as a penalty: half at entry (you buy at the ask / short at the bid),
+               # half at exit (you sell at the bid / cover at the ask).
 
 
 # ---------------------------------------------------------------------------
@@ -59,11 +62,24 @@ def _days_held(entry_date: str) -> int:
 
 
 def _pct_return(action: str, entry: float, current: float) -> float:
-    """Positive = profitable regardless of direction."""
+    """Positive = profitable regardless of direction.
+
+    Applies a round-trip bid-ask spread penalty (SPREAD_PCT).
+    BUY:  you paid the ask at entry  (+half spread),
+          you receive the bid at exit (-half spread).
+    SELL: you shorted at the bid at entry  (-half spread),
+          you covered at the ask at exit   (+half spread).
+    Net effect is identical for both directions: raw return minus SPREAD_PCT.
+    """
+    half = SPREAD_PCT / 2 / 100          # fractional half-spread
     if action == "BUY":
-        return (current - entry) / entry * 100
+        effective_entry = entry  * (1 + half)
+        effective_exit  = current * (1 - half)
+        return (effective_exit - effective_entry) / effective_entry * 100
     else:  # SELL = short position
-        return (entry - current) / entry * 100
+        effective_entry = entry  * (1 - half)
+        effective_exit  = current * (1 + half)
+        return (effective_entry - effective_exit) / effective_entry * 100
 
 
 # ---------------------------------------------------------------------------
