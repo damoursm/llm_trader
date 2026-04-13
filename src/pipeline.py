@@ -26,6 +26,8 @@ from src.data.cot import fetch_cot_context
 from src.data.ipo_pipeline import fetch_ipo_context
 from src.data.vix import fetch_vix_context
 from src.data.put_call import fetch_put_call_context
+from src.data.tick import fetch_tick_context
+from src.data.gamma_exposure import fetch_gex_context
 from src.notifications.email_sender import send_recommendations
 from src.performance.tracker import record_new_trades, update_open_trades, log_performance_summary, get_performance_for_email
 from src.charts.report import save_html_report
@@ -59,18 +61,40 @@ def _fetch_snapshots(all_tickers):
     if snapshots is not None:
         logger.info("[snapshots] Using cache")
         return snapshots
-    if not settings.enable_market_data:
+    if not settings.enable_fetch_data:
         snapshots = load_latest_snapshots()
         if snapshots:
-            logger.info("[snapshots] ENABLE_MARKET_DATA=false — using latest historical cache")
+            logger.info("[snapshots] ENABLE_FETCH_DATA=false — using latest historical cache")
             return snapshots
-        logger.warning("[snapshots] ENABLE_MARKET_DATA=false and no historical cache — news-only mode")
+        logger.warning("[snapshots] ENABLE_FETCH_DATA=false and no historical cache — news-only mode")
         return []
     snapshots = get_snapshots(all_tickers)
     save_snapshots(snapshots)
     if not snapshots:
         logger.warning("[snapshots] No market data retrieved — continuing with news-only signals")
     return snapshots
+
+
+def _run_yf_options_tasks(all_tickers):
+    """Run options_flow and GEX sequentially inside one thread.
+
+    Both modules scan yfinance options chains.  Running them concurrently
+    combines to ~20+ req/s against yfinance's unofficial rate limit, causing
+    429 errors on every ticker.  Serialising them here keeps the combined
+    options-chain request rate safe while still running in parallel with all
+    other data sources.
+
+    Returns a dict keyed by task name so the caller can unpack results cleanly.
+    """
+    results = {}
+
+    if settings.enable_options_flow:
+        results["options"] = _safe("options", fetch_options_flow, all_tickers)
+
+    if settings.enable_gex:
+        results["gex"] = _safe("gex", fetch_gex_context, all_tickers)
+
+    return results
 
 
 def _run_edgar_tasks(all_tickers):
@@ -125,11 +149,13 @@ def run_pipeline(send_email: bool = False) -> None:
 
     # ── Steps 1–3: Parallel data fetch ────────────────────────────────────
     #
-    # Two concurrent groups:
-    #   A) Non-EDGAR sources — all truly parallel (no shared rate limit)
-    #   B) EDGAR sources     — sequential inside one thread to honour the
-    #                          10 req/s cap shared by eight_k / insider_trades /
-    #                          sec_filings / ipo_pipeline
+    # Three concurrent groups:
+    #   A) Non-yfinance-options sources — truly parallel (no shared rate limit)
+    #   B) yfinance options sources     — options_flow + GEX run sequentially
+    #                                     inside one thread so they never compete
+    #                                     for the yfinance options endpoint
+    #   C) EDGAR sources                — sequential inside one thread to honour
+    #                                     the 10 req/s cap
     #
     # The pool shuts down (wait=True) at the end of the `with` block, so all
     # futures are resolved before we collect results below.
@@ -138,7 +164,7 @@ def run_pipeline(send_email: bool = False) -> None:
 
     with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:
 
-        # Group A: non-EDGAR — submit all at once, run concurrently
+        # Group A: non-yfinance-options — submit all at once, run concurrently
         f_news         = pool.submit(_safe, "news", _fetch_news, tickers, sectors)
         f_snapshots    = pool.submit(_safe, "snapshots", _fetch_snapshots, all_tickers)
 
@@ -167,9 +193,6 @@ def run_pipeline(send_email: bool = False) -> None:
         f_short        = (pool.submit(_safe, "short", fetch_short_interest, tickers)
                           if settings.enable_short_interest else None)
 
-        f_options      = (pool.submit(_safe, "options", fetch_options_flow, all_tickers)
-                          if settings.enable_options_flow else None)
-
         f_fred         = (pool.submit(_safe, "fred", fetch_macro_context, settings.fred_api_key)
                           if settings.enable_fred else None)
 
@@ -182,7 +205,15 @@ def run_pipeline(send_email: bool = False) -> None:
         f_put_call     = (pool.submit(_safe, "put_call", fetch_put_call_context, tickers)
                           if settings.enable_put_call else None)
 
-        # Group B: EDGAR — one thread, all four sources sequential inside it
+        f_tick         = (pool.submit(_safe, "tick", fetch_tick_context)
+                          if settings.enable_tick else None)
+
+        # Group B: yfinance options — options_flow then GEX, sequential in one thread
+        # Both modules scan yfinance options chains; running them concurrently causes
+        # 429 rate-limit errors on every ticker. One thread keeps the combined rate safe.
+        f_yf_options = pool.submit(_run_yf_options_tasks, all_tickers)
+
+        # Group C: EDGAR — one thread, all four sources sequential inside it
         f_edgar = pool.submit(_run_edgar_tasks, all_tickers)
 
     # ── Collect results ───────────────────────────────────────────────────
@@ -211,13 +242,15 @@ def run_pipeline(send_email: bool = False) -> None:
 
     snapshots = get(f_snapshots) or []
 
+    yf_options = get(f_yf_options) or {}
+
     # Merge smart money signals
     smart_money = []
     for key in ("insider", "sec"):
         chunk = edgar.get(key)
         if chunk:
             smart_money.extend(chunk)
-    options_trades = get(f_options)
+    options_trades = yf_options.get("options")
     if options_trades:
         smart_money.extend(options_trades)
 
@@ -241,6 +274,8 @@ def run_pipeline(send_email: bool = False) -> None:
     ipo_context      = edgar.get("ipo")
     vix_context      = get(f_vix)
     put_call_context = get(f_put_call)
+    tick_context     = get(f_tick)
+    gex_context      = yf_options.get("gex")
     earnings_context = get(f_earnings_cal)
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
@@ -250,6 +285,7 @@ def run_pipeline(send_email: bool = False) -> None:
         articles,
         insider_trades=insider_trades,
         put_call_context=put_call_context,
+        gex_context=gex_context,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
 
@@ -263,7 +299,9 @@ def run_pipeline(send_email: bool = False) -> None:
         ipo_context=ipo_context,
         vix_context=vix_context,
         put_call_context=put_call_context,
+        tick_context=tick_context,
         earnings_context=earnings_context,
+        gex_context=gex_context,
     )
 
     # Only surface BUY and SELL as actionable, with minimum confidence guard
@@ -320,7 +358,9 @@ def run_pipeline(send_email: bool = False) -> None:
             ipo_context=ipo_context,
             vix_context=vix_context,
             put_call_context=put_call_context,
+            tick_context=tick_context,
             earnings_context=earnings_context,
+            gex_context=gex_context,
         )
     else:
         logger.info("Email not configured — skipping.")

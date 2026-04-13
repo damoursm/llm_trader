@@ -17,6 +17,7 @@ from typing import List, Optional
 
 from loguru import logger
 
+from config import settings
 from src.models import InsiderTrade
 from src.data.insider_trades import _notional_to_amount_range
 
@@ -123,6 +124,10 @@ def fetch_options_flow(tickers: List[str]) -> List[InsiderTrade]:
     Scan options chains for unusual sweep activity across all tickers.
     Returns InsiderTrade objects with transaction_type 'unusual_call' or 'unusual_put'.
     """
+    if not settings.enable_fetch_data:
+        logger.debug("[options] ENABLE_FETCH_DATA=false — skipping yfinance fetch")
+        return []
+
     try:
         import yfinance as yf
     except ImportError:

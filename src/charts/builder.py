@@ -67,10 +67,10 @@ def _fetch_ohlcv(ticker: str, initial_period: str = "3mo") -> Optional[pd.DataFr
     """
     Return OHLCV history for a ticker.
 
-    ENABLE_MARKET_DATA=false
+    ENABLE_FETCH_DATA=false
         Load from cache only; skip yfinance entirely.
 
-    ENABLE_MARKET_DATA=true
+    ENABLE_FETCH_DATA=true
         1. Load existing cache.
         2. Determine the first missing date (day after last cached row).
         3. Fetch only that missing range from yfinance (or the full initial_period
@@ -79,10 +79,10 @@ def _fetch_ohlcv(ticker: str, initial_period: str = "3mo") -> Optional[pd.DataFr
     """
     cached = load_ohlcv(ticker)
 
-    if not settings.enable_market_data:
+    if not settings.enable_fetch_data:
         if cached is not None and not cached.empty:
             return cached
-        logger.debug(f"[charts] ENABLE_MARKET_DATA=false and no OHLCV cache for {ticker} — skipping chart")
+        logger.debug(f"[charts] ENABLE_FETCH_DATA=false and no OHLCV cache for {ticker} — skipping chart")
         return None
 
     # Determine the date range to fetch
@@ -368,7 +368,7 @@ def build_signals_overview(
     METHOD_NAMES = ["News / Sentiment", "Technical", "Smart Money", "Put/Call"]
 
     use_news     = settings.enable_news_sentiment
-    use_tech     = settings.enable_technical_analysis and settings.enable_market_data
+    use_tech     = settings.enable_technical_analysis and settings.enable_fetch_data
     use_insider  = (settings.enable_insider_trades or
                     settings.enable_options_flow or
                     settings.enable_sec_filings)

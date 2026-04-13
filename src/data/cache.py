@@ -102,7 +102,7 @@ def save_snapshots(snapshots: List[TickerSnapshot], key: Optional[str] = None) -
 def load_latest_snapshots() -> Optional[List[TickerSnapshot]]:
     """
     Return the most recently saved snapshot file, regardless of hour key.
-    Used when ENABLE_MARKET_DATA=false so the pipeline still has price context
+    Used when ENABLE_FETCH_DATA=false so the pipeline still has price context
     from the last successful fetch.
     """
     if not CACHE_DIR.exists():

@@ -44,7 +44,7 @@ def _save_trades(trades: List[dict]) -> None:
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
-    if not settings.enable_market_data:
+    if not settings.enable_fetch_data:
         return None
     try:
         info = yf.Ticker(ticker).fast_info
@@ -188,7 +188,7 @@ def log_performance_summary() -> None:
         for t in sorted(open_trades, key=lambda x: x["entry_date"], reverse=True):
             logger.info(
                 f"    {t['action']:<4} {t['ticker']:<6} | "
-                f"entry={t['entry_price']:.2f}  now={t['current_price']:.2f}  "
+                f"date={t['entry_date']}  entry={t['entry_price']:.2f}  now={t['current_price']:.2f}  "
                 f"P&L={t['return_pct']:+.2f}%  ({t['days_held']}d held)"
             )
 
@@ -205,7 +205,7 @@ def log_performance_summary() -> None:
         for t in sorted(closed_trades, key=lambda x: x["exit_date"] or "", reverse=True):
             logger.info(
                 f"    {t['action']:<4} {t['ticker']:<6} | "
-                f"entry={t['entry_price']:.2f}  exit={t['exit_price']:.2f}  "
+                f"date={t['entry_date']}  entry={t['entry_price']:.2f}  exit={t['exit_price']:.2f}  "
                 f"return={t['return_pct']:+.2f}%  ({t['days_held']}d)"
             )
 

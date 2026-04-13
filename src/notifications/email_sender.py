@@ -151,6 +151,7 @@ HTML_TEMPLATE = """
       <th>Direction</th>
       <th>Confidence</th>
       <th>Sources</th>
+      {% if enable_gex %}<th>GEX</th>{% endif %}
       <th>Horizon</th>
       <th>At (UTC)</th>
     </tr>
@@ -180,6 +181,15 @@ HTML_TEMPLATE = """
       <td style="color:#94a3b8;">
         {% if sig %}{{ sig.sources_agreeing }}/{{ active_methods }}{% else %}&mdash;{% endif %}
       </td>
+      {% if enable_gex %}
+      <td style="font-size:11px;">
+        {% if sig and sig.gex_signal %}
+        {% set gex_col = {'PINNED': '#0ea5e9', 'AMPLIFIED': '#f87171', 'NEUTRAL': '#94a3b8'}.get(sig.gex_signal, '#94a3b8') %}
+        <span style="color:{{ gex_col }};">{{ sig.gex_signal }}</span>
+        {% if sig.expected_move_pct %}<span style="color:#475569;"> ±{{ "%.1f"|format(sig.expected_move_pct) }}%</span>{% endif %}
+        {% else %}&mdash;{% endif %}
+      </td>
+      {% endif %}
       <td style="color:#94a3b8;">{{ rec.time_horizon }}</td>
       <td style="color:#64748b;font-size:11px;">{{ fmt_et(rec.generated_at, include_date=False) }}</td>
     </tr>
@@ -322,6 +332,120 @@ HTML_TEMPLATE = """
       </div>
       <div class="mtext">
         {{ 'Elevated put volume → contrarian bullish signal' if pc > 0 else 'Elevated call volume → contrarian bearish signal' }}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Max Pain gravity -->
+    {% if sig.max_pain_score is defined and sig.max_pain_score != 0 %}
+    {% set mp = sig.max_pain_score %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Max Pain</span>
+        <span class="mscore {{ 'sp' if mp > 0 else 'sn' }}">
+          {{ "%+.2f"|format(mp) }}
+        </span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar"
+             style="width:{{ (mp|abs * 100)|int }}%;
+                    background:{{ '#16a34a' if mp >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if mp > 0 %}Spot trading below max pain → gravity pulls price higher into expiry.
+        {% else %}Spot trading above max pain → gravity pulls price lower into expiry.{% endif %}
+        {% if sig.max_pain_bias %}<span style="color:#64748b;"> ({{ sig.max_pain_bias }} bias)</span>{% endif %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- OI Skew -->
+    {% if sig.oi_skew_score is defined and sig.oi_skew_score != 0 %}
+    {% set sk = sig.oi_skew_score %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">OI Skew</span>
+        <span class="mscore {{ 'sp' if sk > 0 else 'sn' }}">
+          {{ "%+.3f"|format(sk) }}
+        </span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar"
+             style="width:{{ (sk|abs * 100)|int }}%;
+                    background:{{ '#16a34a' if sk >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if sk > 0.3 %}Strong call-side OI lean → bullish positioning bias.
+        {% elif sk > 0.1 %}Mild call-side OI lean → slight bullish tilt.
+        {% elif sk < -0.3 %}Strong put-side OI lean → bearish positioning bias.
+        {% elif sk < -0.1 %}Mild put-side OI lean → slight bearish tilt.
+        {% else %}OI roughly balanced between calls and puts.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (directional, not contrarian)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- VWAP Distance -->
+    {% if sig.vwap_score is defined and sig.vwap_score != 0 %}
+    {% set vw = sig.vwap_score %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">VWAP Distance</span>
+        <span class="mscore {{ 'sp' if vw > 0 else 'sn' }}">
+          {{ "%+.2f"|format(vw) }}
+        </span>
+        {% if sig.vwap_distance_pct %}
+        <span style="font-size:10px;color:#64748b;margin-left:6px;">
+          ({{ "%+.1f"|format(sig.vwap_distance_pct) }}% from VWAP)
+        </span>
+        {% endif %}
+      </div>
+      <div class="bar-wrap">
+        <div class="bar"
+             style="width:{{ (vw|abs * 100)|int }}%;
+                    background:{{ '#16a34a' if vw >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if vw > 0.5 %}Price stretched well below VWAP — institutions likely to step in as buyers.
+        {% elif vw > 0.15 %}Price below VWAP — mild mean-reversion pull upward.
+        {% elif vw < -0.5 %}Price stretched well above VWAP — institutions likely to sell into strength.
+        {% elif vw < -0.15 %}Price above VWAP — mild mean-reversion pull downward.
+        {% else %}Price near VWAP — no significant reversion pressure.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (mean-reversion; weaker in strong trends)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Gamma Exposure (GEX) per-ticker -->
+    {% if sig.gex_signal %}
+    {% set gex_col = {'PINNED': '#0ea5e9', 'AMPLIFIED': '#f87171', 'NEUTRAL': '#94a3b8'}.get(sig.gex_signal, '#94a3b8') %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Gamma Exposure</span>
+        <span style="font-size:11px;font-weight:bold;padding:2px 7px;border-radius:3px;
+                     background:#1e293b;color:{{ gex_col }};border:1px solid {{ gex_col }};">
+          {{ sig.gex_signal }}
+        </span>
+      </div>
+      <div class="mtext" style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px;">
+        {% if sig.gamma_flip is not none %}
+        <span>Gamma flip: <strong style="color:#e2e8f0;">${{ "%.2f"|format(sig.gamma_flip) }}</strong></span>
+        {% endif %}
+        {% if sig.max_pain_bias %}
+        <span>Max pain bias:
+          <strong style="color:{{ {'BULLISH':'#4ade80','BEARISH':'#f87171'}.get(sig.max_pain_bias,'#94a3b8') }};">
+            {{ sig.max_pain_bias }}
+          </strong>
+        </span>
+        {% endif %}
+        {% if sig.expected_move_pct %}
+        <span>Exp. move: <strong style="color:#e2e8f0;">±{{ "%.1f"|format(sig.expected_move_pct) }}%</strong></span>
+        {% endif %}
+      </div>
+      <div class="mtext" style="margin-top:5px;color:#64748b;font-size:11px;">
+        {% if sig.gex_signal == 'PINNED' %}Positive GEX → dealers suppress volatility; price likely stays near gamma flip.
+        {% elif sig.gex_signal == 'AMPLIFIED' %}Negative GEX → dealers amplify moves; expect wider swings than normal.
+        {% else %}Balanced GEX → no structural dealer-flow bias.{% endif %}
       </div>
     </div>
     {% endif %}
@@ -908,6 +1032,163 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     6c — NYSE TICK INDEX
+     ══════════════════════════════════════ -->
+{% if tick_context and tick_context.signal != 'UNKNOWN' %}
+{% set tick_sig_color = {
+    'EXTREME_BULLS': '#f87171',
+    'EXTREME_BEARS': '#4ade80',
+    'WHIPSAW':       '#fbbf24',
+    'NEUTRAL':       '#94a3b8'
+} %}
+{% set tick_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>NYSE TICK Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^TICK · breadth exhaustion)</span></h2>
+<div class="card" style="border-left: 4px solid {{ tick_sig_color.get(tick_context.signal, '#94a3b8') }};">
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- TICK gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:130px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">{{ tick_context.session_date }}</div>
+      <div style="font-size:22px;font-weight:800;color:{{ tick_sig_color.get(tick_context.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ tick_context.signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ tick_dir_color.get(tick_context.direction, '#94a3b8') }};margin-top:3px;">
+        {{ '▲ BULLISH' if tick_context.direction == 'BULLISH' else ('▼ BEARISH' if tick_context.direction == 'BEARISH' else '→ NEUTRAL') }} bias (contrarian)
+      </div>
+    </div>
+
+    <!-- High / Low / Close tiles -->
+    <div style="display:flex;flex-direction:column;gap:6px;justify-content:center;">
+      {% for label, val, color in [
+          ('Session High', tick_context.tick_high, '#f87171'),
+          ('Session Low',  tick_context.tick_low,  '#4ade80'),
+          ('Close',        tick_context.tick_close, '#94a3b8')
+      ] %}
+      {% if val is not none %}
+      <div style="background:#0f172a;border-radius:6px;padding:6px 14px;display:flex;gap:12px;align-items:center;">
+        <span style="color:#64748b;font-size:11px;min-width:90px;">{{ label }}</span>
+        <span style="font-weight:700;color:{{ color }};font-size:14px;">{{ "%+.0f"|format(val) }}</span>
+        {% if label == 'Session High' and val >= 1000 %}
+        <span style="font-size:10px;color:#f87171;margin-left:4px;">⚠ EXTREME</span>
+        {% elif label == 'Session Low' and val <= -1000 %}
+        <span style="font-size:10px;color:#4ade80;margin-left:4px;">⚠ EXTREME</span>
+        {% endif %}
+      </div>
+      {% endif %}
+      {% endfor %}
+    </div>
+
+    <!-- 5-session extreme counts -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;font-size:12px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">5-Session Pattern</div>
+      <div style="margin-bottom:5px;">
+        <span style="color:#94a3b8;">TICK &gt; +1000:</span>
+        <span style="font-weight:700;color:{{ '#f87171' if tick_context.extreme_high_count >= 3 else '#e2e8f0' }};margin-left:6px;">
+          {{ tick_context.extreme_high_count }} / 5
+        </span>
+        {% if tick_context.extreme_high_count >= 3 %}<span style="color:#f87171;font-size:10px;"> sustained buying</span>{% endif %}
+      </div>
+      <div>
+        <span style="color:#94a3b8;">TICK &lt; −1000:</span>
+        <span style="font-weight:700;color:{{ '#4ade80' if tick_context.extreme_low_count >= 3 else '#e2e8f0' }};margin-left:6px;">
+          {{ tick_context.extreme_low_count }} / 5
+        </span>
+        {% if tick_context.extreme_low_count >= 3 %}<span style="color:#4ade80;font-size:10px;"> repeated flush</span>{% endif %}
+      </div>
+    </div>
+  </div>
+
+  <p style="color:#94a3b8;font-size:12px;margin:0;">{{ tick_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    TICK measures NYSE upticks − downticks in real time.
+    Extreme readings (&gt;+1000 or &lt;−1000) are contrarian short-term reversal signals.
+    EXTREME_BEARS = capitulation flush → fade the sell; EXTREME_BULLS = buying climax → fade the ramp.
+    Directional edge weakens when the same extreme repeats 3+ sessions (distribution / accumulation phase).
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6d — GAMMA EXPOSURE (GEX)
+     ══════════════════════════════════════ -->
+{% if gex_context and gex_context.signals %}
+{% set gex_sig_color = {
+    'PINNED':    '#0ea5e9',
+    'NEUTRAL':   '#94a3b8',
+    'AMPLIFIED': '#f87171'
+} %}
+{% set bias_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Gamma Exposure <span style="font-size:13px;font-weight:400;color:#94a3b8;">(dealer hedging flows · gamma flip · max pain)</span></h2>
+<div class="card" style="border-left: 4px solid #0ea5e9;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ gex_context.summary }}</p>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="color:#64748b;text-transform:uppercase;font-size:10px;letter-spacing:.5px;">
+          <th style="text-align:left;padding:5px 8px;">Ticker</th>
+          <th style="text-align:center;padding:5px 8px;">Signal</th>
+          <th style="text-align:right;padding:5px 8px;">Net GEX ($B)</th>
+          <th style="text-align:right;padding:5px 8px;">Gamma Flip</th>
+          <th style="text-align:right;padding:5px 8px;">Max Pain</th>
+          <th style="text-align:center;padding:5px 8px;">Pain Bias</th>
+          <th style="text-align:right;padding:5px 8px;">Pain Score</th>
+          <th style="text-align:right;padding:5px 8px;">Exp. Move</th>
+          <th style="text-align:right;padding:5px 8px;">OI Skew</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for s in gex_context.signals %}
+      {% set sig_col = gex_sig_color.get(s.gex_signal, '#94a3b8') %}
+      {% set tsig = signals_by_ticker.get(s.ticker) %}
+      {% set mp_score = tsig.max_pain_score if tsig else 0 %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:6px 8px;color:#e2e8f0;font-weight:600;">{{ s.ticker }}</td>
+          <td style="padding:6px 8px;text-align:center;">
+            <span style="background:#1e293b;color:{{ sig_col }};border:1px solid {{ sig_col }};
+                         border-radius:4px;padding:2px 7px;font-size:10px;white-space:nowrap;">
+              {{ s.gex_signal }}
+            </span>
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:{{ '#4ade80' if s.net_gex_bn >= 0 else '#f87171' }};font-weight:700;">
+            {{ "%+.2f"|format(s.net_gex_bn) }}B
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">
+            {% if s.gamma_flip is not none %}${{ "%.2f"|format(s.gamma_flip) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">
+            {% if s.max_pain is not none %}${{ "%.2f"|format(s.max_pain) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:center;color:{{ bias_color.get(s.max_pain_bias, '#94a3b8') }};font-weight:700;">
+            {{ '▲' if s.max_pain_bias == 'BULLISH' else ('▼' if s.max_pain_bias == 'BEARISH' else '→') }}
+            {{ s.max_pain_bias }}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-weight:700;
+                     color:{{ '#4ade80' if mp_score > 0.05 else ('#f87171' if mp_score < -0.05 else '#64748b') }};">
+            {% if mp_score %}{{ "%+.2f"|format(mp_score) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#e2e8f0;">
+            ±{{ "%.1f"|format(s.expected_move_pct) }}%
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-weight:700;
+                     color:{{ '#4ade80' if s.oi_skew > 0.1 else ('#f87171' if s.oi_skew < -0.1 else '#64748b') }};">
+            {% if s.oi_skew %}{{ "%+.3f"|format(s.oi_skew) }}{% else %}&mdash;{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    PINNED: positive GEX → dealers sell rallies/buy dips → price stays anchored near gamma flip.
+    AMPLIFIED: negative GEX → dealers amplify moves → expect wider swings.
+    Gamma flip = price where dealer hedging switches direction.
+    Pain Score: expiry-weighted gravity signal — fades beyond 14 days, strongest within 4 days of expiry.
+    OI Skew: dollar-distance-weighted call vs put OI lean (+1 = all calls, −1 = all puts). Directional (not contrarian).
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
@@ -965,10 +1246,11 @@ HTML_TEMPLATE = """
 </div>
 {% endif %}
 {% if perf.open_trades %}
+<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Open positions</h3>
 <table class="pt">
   <thead>
     <tr>
-      <th>Ticker</th><th>Action</th><th>Entry</th>
+      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
       <th>Current</th><th>P&amp;L</th><th>Days</th>
     </tr>
   </thead>
@@ -977,8 +1259,35 @@ HTML_TEMPLATE = """
     <tr>
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.action }}</td>
+      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
       <td>${{ "%.2f"|format(t.entry_price) }}</td>
       <td>${{ "%.2f"|format(t.current_price) }}</td>
+      <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
+        {{ "%+.2f"|format(t.return_pct) }}%
+      </td>
+      <td>{{ t.days_held }}d</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if perf.closed_trades %}
+<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Closed positions</h3>
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
+      <th>Exit</th><th>P&amp;L</th><th>Days</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in perf.closed_trades %}
+    <tr>
+      <td><strong>{{ t.ticker }}</strong></td>
+      <td>{{ t.action }}</td>
+      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
+      <td>${{ "%.2f"|format(t.entry_price) }}</td>
+      <td>${{ "%.2f"|format(t.exit_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
         {{ "%+.2f"|format(t.return_pct) }}%
       </td>
@@ -1033,7 +1342,9 @@ def send_recommendations(
     ipo_context=None,       # Optional[IPOContext]      — avoid circular import
     vix_context=None,       # Optional[VIXContext]      — avoid circular import
     put_call_context=None,  # Optional[PutCallContext]  — avoid circular import
+    tick_context=None,      # Optional[TICKContext]     — avoid circular import
     earnings_context=None,  # Optional[EarningsContext] — avoid circular import
+    gex_context=None,       # Optional[GEXContext]      — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -1051,7 +1362,7 @@ def send_recommendations(
 
     # ── Active methods (for "N/M sources agree" display) ──────────────────
     use_news    = settings.enable_news_sentiment
-    use_tech    = settings.enable_technical_analysis and settings.enable_market_data
+    use_tech    = settings.enable_technical_analysis and settings.enable_fetch_data
     use_insider = (
         settings.enable_insider_trades or
         settings.enable_options_flow or
@@ -1173,6 +1484,7 @@ def send_recommendations(
         use_tech=use_tech,
         use_insider=use_insider,
         use_put_call=settings.enable_put_call,
+        enable_gex=settings.enable_gex,
         active_methods=active_methods,
         # smart money
         insider_trades=insider_by_ticker,
@@ -1197,8 +1509,12 @@ def send_recommendations(
         vix_context=vix_context,
         # Put/Call ratio (CBOE + per-ticker)
         put_call_context=put_call_context,
+        # NYSE TICK breadth
+        tick_context=tick_context,
         # Earnings calendar
         earnings_context=earnings_context,
+        # Gamma Exposure (GEX)
+        gex_context=gex_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────

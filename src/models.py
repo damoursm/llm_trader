@@ -146,6 +146,24 @@ class IPOContext(BaseModel):
     summary: str
 
 
+class TICKContext(BaseModel):
+    """NYSE TICK index breadth / short-term exhaustion signal."""
+    tick_high:  Optional[float] = None   # session maximum TICK reading
+    tick_low:   Optional[float] = None   # session minimum TICK reading
+    tick_close: Optional[float] = None   # session closing TICK reading
+
+    session_date: date
+    signal: str = "UNKNOWN"             # EXTREME_BULLS | EXTREME_BEARS | WHIPSAW | NEUTRAL | UNKNOWN
+    direction: str = "NEUTRAL"          # contrarian: EXTREME_BULLS → BEARISH, EXTREME_BEARS → BULLISH
+
+    # Pattern over recent sessions
+    extreme_high_count: int = 0         # sessions with TICK > +1000 in 5-day lookback
+    extreme_low_count:  int = 0         # sessions with TICK < −1000 in 5-day lookback
+
+    report_date: date
+    summary: str
+
+
 class VIXContext(BaseModel):
     """VIX volatility regime and term structure."""
     # Spot levels
@@ -209,6 +227,30 @@ class EarningsContext(BaseModel):
     summary: str
 
 
+class GEXSignal(BaseModel):
+    """Gamma Exposure (GEX) signal for a single ticker."""
+    ticker: str
+    spot_price: float
+    net_gex_bn: float            # net GEX in $B  (positive = stabilising, negative = amplifying)
+    gex_normalized: float        # net / |total|  ∈ [-1, +1]
+    gex_signal: str              # PINNED | NEUTRAL | AMPLIFIED
+    gamma_flip: Optional[float]  # price below which moves accelerate; None if not found
+    max_pain: Optional[float]    # strike minimising total options $ loss at nearest expiry
+    expected_move_pct: float     # OI-weighted straddle / spot as %  (market-implied ±1σ range)
+    max_pain_bias: str           # BULLISH (price < max_pain) | BEARISH (price > max_pain) | NEUTRAL
+    oi_skew: float = 0.0         # OI-weighted directional lean ∈ [-1,+1]; +ve = call-heavy (bullish)
+    dominant_expiry: str         # nearest expiry with meaningful OI
+    report_date: date
+    summary: str
+
+
+class GEXContext(BaseModel):
+    """GEX context for all covered tickers."""
+    signals: List[GEXSignal]
+    report_date: date
+    summary: str                 # e.g. "SPY: PINNED; QQQ: AMPLIFIED; IWM: NEUTRAL"
+
+
 class TickerSignal(BaseModel):
     ticker: str
     direction: Direction
@@ -217,9 +259,18 @@ class TickerSignal(BaseModel):
     technical_score: float      # -1.0 to +1.0
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)
     put_call_score: float = 0.0 # -1.0 to +1.0  (per-ticker options put/call sentiment)
+    vwap_score: float = 0.0     # -1.0 to +1.0  (mean-reversion: above VWAP→bearish, below→bullish)
+    vwap_distance_pct: float = 0.0  # raw (price - VWAP) / VWAP × 100 (positive = above VWAP)
     rationale: str
     insider_summary: str = ""   # human-readable insider/politician trade context
     sources_agreeing: int = 0   # how many enabled signal layers agree with the direction
+    # GEX fields — populated when enable_gex=true
+    gex_signal: str = ""           # PINNED | AMPLIFIED | NEUTRAL | ""
+    gamma_flip: Optional[float] = None
+    max_pain_bias: str = ""        # BULLISH | BEARISH | NEUTRAL | ""
+    max_pain_score: float = 0.0    # [-1, +1] max-pain gravity score (expiry-weighted)
+    oi_skew_score: float = 0.0     # [-1, +1] OI-weighted directional lean (from GEX options chain)
+    expected_move_pct: float = 0.0
 
 
 class Recommendation(BaseModel):

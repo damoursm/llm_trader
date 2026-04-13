@@ -29,7 +29,9 @@ def generate_recommendations(
     ipo_context: Optional["IPOContext"] = None,
     vix_context: Optional["VIXContext"] = None,
     put_call_context: Optional["PutCallContext"] = None,
+    tick_context=None,   # Optional[TICKContext]
     earnings_context: Optional["EarningsContext"] = None,
+    gex_context=None,    # Optional[GEXContext]
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -39,7 +41,7 @@ def generate_recommendations(
         return []
 
     use_news    = settings.enable_news_sentiment
-    use_tech    = settings.enable_technical_analysis and settings.enable_market_data
+    use_tech    = settings.enable_technical_analysis and settings.enable_fetch_data
     use_insider = (
         (settings.enable_insider_trades or
          settings.enable_options_flow or
@@ -72,6 +74,15 @@ def generate_recommendations(
             parts.append(f"  Technical score={s.technical_score:+.2f}")
         if use_insider and s.insider_summary:
             parts.append(f"  Insider activity: {s.insider_summary}")
+        if s.vwap_score:
+            dist = f" ({s.vwap_distance_pct:+.1f}% from VWAP)" if s.vwap_distance_pct else ""
+            parts.append(f"  VWAP_score={s.vwap_score:+.2f}{dist}")
+        if s.gex_signal:
+            flip = f", gamma_flip=${s.gamma_flip:.2f}" if s.gamma_flip else ""
+            em   = f", exp_move=±{s.expected_move_pct:.1f}%" if s.expected_move_pct else ""
+            mp   = f", max_pain_score={s.max_pain_score:+.2f}" if s.max_pain_score else ""
+            sk   = f", oi_skew={s.oi_skew_score:+.2f}" if s.oi_skew_score else ""
+            parts.append(f"  GEX={s.gex_signal}{flip}, max_pain_bias={s.max_pain_bias}{mp}{sk}{em}")
         signal_lines.append("\n".join(parts))
 
     signals_text = "\n\n".join(signal_lines)
@@ -364,6 +375,43 @@ Per-ticker interpretation (directional — follows positioning):
     - P/C alone never justifies a BUY/SELL. It is a confirming layer — it adds conviction when it agrees
       with the direction already supported by news + technicals + smart money."""
 
+    # Build NYSE TICK breadth context block for the prompt
+    tick_block        = ""
+    tick_instructions = ""
+    if tick_context and tick_context.signal not in ("UNKNOWN",):
+        t = tick_context
+        tick_block = f"""
+<tick_context>
+NYSE TICK Index (^TICK) — breadth exhaustion signal  ({t.session_date})
+High: {t.tick_high or 'N/A'}   Low: {t.tick_low or 'N/A'}   Close: {t.tick_close or 'N/A'}
+Signal: {t.signal}  →  contrarian direction: {t.direction}
+{t.summary}
+
+Lookback (last 5 sessions): {t.extreme_high_count} session(s) with TICK > +1000 | {t.extreme_low_count} session(s) with TICK < −1000
+
+Interpretation guide (contrarian reversal signal):
+  EXTREME_BULLS (high > +1000): institutions buying en masse → exhaustion; contrarian BEARISH
+  EXTREME_BEARS (low  < −1000): panic selling cascade → capitulation; contrarian BULLISH
+  WHIPSAW (both extremes hit): no directional edge; high-noise session
+  NEUTRAL: breadth orderly; no reversal signal
+</tick_context>
+"""
+        tick_instructions = f"""
+13. NYSE TICK overlay — breadth exhaustion / reversal signal:
+    Today's TICK: high={t.tick_high or 'N/A'}, low={t.tick_low or 'N/A'} ({t.signal} → contrarian: {t.direction}).
+    This is a SHORT-TERM intraday reversal signal. Rules:
+    - EXTREME_BEARS (low < −1000): panic selling is exhausted. Contrarian BULLISH.
+      * For broad market ETFs (SPY, QQQ, IWM): reduce SELL conviction; upgrade HOLD/WATCH calls.
+      * For individual tickers with otherwise bullish signals: note "breadth capitulation → reversal setup" in rationale.
+      * Persistent EXTREME_BEARS over 3+ sessions ({t.extreme_low_count} observed): forced institutional selling / distribution.
+        In this case the contrarian edge weakens — prefer "WATCH for stabilisation" over outright BUY.
+    - EXTREME_BULLS (high > +1000): broad buying climax. Contrarian BEARISH.
+      * Fade aggressive long calls on broad market ETFs. Tag as SWING only — don't extend horizon.
+      * Persistent EXTREME_BULLS over 3+ sessions ({t.extreme_high_count} observed): late-cycle institutional accumulation.
+        Momentum may continue but reward/risk deteriorates; trim conviction slightly.
+    - WHIPSAW: institutions active on both sides; no edge. Do not use TICK as a modifier today.
+    - NEUTRAL: TICK provides no incremental signal today. No override."""
+
     # Build earnings calendar context block for the prompt
     earnings_block        = ""
     earnings_instructions = ""
@@ -406,6 +454,112 @@ Ticker  | Report Date  | Days | EPS Est
    - Post-earnings tickers (surprise already in the news signal): the initial gap is partially priced in.
      Focus on whether there is further follow-through vs. a fade pattern — check technical score direction."""
 
+    # Build GEX context block for the prompt
+    gex_block        = ""
+    gex_instructions = ""
+    if gex_context and gex_context.signals:
+        idx_sigs = {s.ticker: s for s in gex_context.signals if s.ticker in ("SPY", "QQQ", "IWM")}
+        indiv    = [s for s in gex_context.signals if s.ticker not in idx_sigs]
+
+        def _gex_row(s):
+            flip = f"${s.gamma_flip:.2f}" if s.gamma_flip else "N/A"
+            pain = f"${s.max_pain:.2f} ({s.max_pain_bias})" if s.max_pain else "N/A"
+            em   = f"±{s.expected_move_pct:.1f}%" if s.expected_move_pct else "N/A"
+            return (
+                f"  {s.ticker:<6} {s.gex_signal:<10} norm={s.gex_normalized:+.2f}  "
+                f"flip={flip:<10} max_pain={pain:<20} exp_move={em}"
+            )
+
+        idx_rows   = "\n".join(_gex_row(s) for s in idx_sigs.values())
+        indiv_rows = "\n".join(_gex_row(s) for s in indiv[:15])  # cap to 15 individual tickers
+
+        gex_block = f"""
+<gex_context>
+Gamma Exposure (GEX) — dealer positioning as of {gex_context.report_date}
+{gex_context.summary}
+
+Index ETFs (most reliable GEX data):
+  Ticker GEX_Signal  Norm       Gamma_Flip  Max_Pain(Bias)       Exp_Move
+{idx_rows}
+
+Individual tickers (top {min(15, len(indiv))} by options liquidity):
+{indiv_rows}
+
+Legend:
+  PINNED    — dealers long gamma → stabilising; price suppressed near gamma flip
+  AMPLIFIED — dealers short gamma → destabilising; directional moves will accelerate
+  NEUTRAL   — no meaningful dealer gamma influence
+  Gamma flip: price below which GEX turns negative and moves accelerate
+  Max pain:   expiry gravitational level (strongest pull in final 3-5 days before expiry)
+  Exp move:   ATM straddle / spot = market-implied ±1σ range to nearest expiry
+</gex_context>
+"""
+
+        gex_instructions = """
+12. GEX (Gamma Exposure) overlay — options market structure:
+    Each ticker's GEX signal, gamma flip level, max pain, and expected move are shown in the
+    signals block above AND in the <gex_context> table.  Use them as follows:
+
+    PINNED (positive GEX):
+    - Dealers are net long gamma → they SELL rallies and BUY dips to delta-hedge.
+    - This dampens volatility and keeps price near the gamma flip level.
+    - Do NOT set short time_horizons (SWING) unless a hard catalyst (earnings, news) is imminent.
+    - Require additional signal convergence before issuing a BUY/SELL — signals are slower to
+      materialise in a pinned regime.
+
+    AMPLIFIED (negative GEX):
+    - Dealers are net short gamma → they BUY into rallies and SELL into drops (momentum feeding).
+    - Moves will be larger and faster than normal.
+    - A BUY or SELL signal with AMPLIFIED GEX can set time_horizon = "SWING" with higher conviction.
+    - Note: it cuts both ways — a bad entry in an AMPLIFIED regime loses faster too.
+
+    Gamma flip:
+    - The gamma flip is the line between a stabilising and destabilising dealer regime.
+    - If the current price is near (within 1%) or below the gamma flip, treat it as a key breakdown
+      trigger: breaking below = accelerated move; holding above = potential pin/bounce.
+    - Mention the gamma flip level explicitly in the rationale for any SWING BUY/SELL.
+
+    Max pain (gravity score):
+    - A numeric max_pain_score ∈ [-1, +1] is now pre-computed and included in each ticker's signal.
+      It combines the direction of the pull (spot vs max_pain) with an expiry-decay factor:
+        • > 0: spot is below max pain → bullish gravitational pull toward max pain into expiry.
+        • < 0: spot is above max pain → bearish gravitational pull toward max pain into expiry.
+        • Score fades to near-zero beyond 14 days; strongest within 2-4 days of expiry.
+    - Treat max_pain_score as a weak corroborating signal: ≥ +0.30 or ≤ -0.30 is notable.
+    - If max_pain_score reinforces the combined direction, mildly boost confidence.
+    - If max_pain_score contradicts the combined direction, note the conflict; avoid aggressive
+      BUY/SELL targets where price must move through max pain to reach the target.
+    - Only meaningful within the final week before expiry; ignore for POSITION horizons.
+
+    Expected move:
+    - The options market is pricing ±X% by the nearest expiry.
+    - A BUY recommendation with 0.85 confidence on a name with ±0.5% expected move is inconsistent —
+      the market doesn't believe it will move much. Reduce confidence or extend horizon.
+    - A name with ±3% expected move + AMPLIFIED GEX + directional signal convergence = high-conviction
+      setup; acknowledge the expected-move range in the rationale."""
+
+    # Build VWAP instructions
+    vwap_instructions = ""
+    if settings.enable_vwap and settings.enable_fetch_data:
+        vwap_instructions = """
+14. VWAP distance overlay — mean-reversion signal:
+    Each ticker's VWAP_score ∈ [-1, +1] measures how far price sits from its rolling 20-day VWAP,
+    normalised by the security's own typical deviation (z-score / 2). Interpretation:
+    - VWAP_score > 0: price is BELOW VWAP → institutions seeking VWAP see value; mean-reversion BUY bias.
+    - VWAP_score < 0: price is ABOVE VWAP → institutions selling to unwind into VWAP; mean-reversion SELL bias.
+    - Raw distance shown as e.g. "+3.2% from VWAP" — how far price has stretched.
+
+    Using VWAP as a modifier (not a standalone signal):
+    - A strong VWAP_score (|score| ≥ 0.5) in the SAME direction as the combined signal: mild confidence boost.
+      Example: BULLISH combined + VWAP_score = +0.70 → price stretched below VWAP; institutions likely to buy.
+    - A strong VWAP_score CONTRADICTING the combined direction: note the conflict.
+      Example: BULLISH combined + VWAP_score = -0.80 → price already far above VWAP; a rally chase from here
+      has poor risk/reward. Prefer WATCH or shorten horizon to SWING.
+    - VWAP pull is weaker in strong trending markets (momentum can override mean-reversion gravity).
+      If other signals strongly point to a breakout (AMPLIFIED GEX + positive news + insider buying),
+      de-emphasise the VWAP headwind and acknowledge in the rationale.
+    - Near-zero VWAP_score (|score| < 0.15): price trading near VWAP; no reversion pressure. No VWAP override."""
+
     commodity_tickers = ", ".join(settings.commodities_list) or "GLD, SLV, IAU, GDX, PPLT, PALL, CPER"
 
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.
@@ -415,7 +569,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-{macro_block}{cot_block}{ipo_block}{vix_block}{pc_block}{earnings_block}
+{macro_block}{cot_block}{ipo_block}{vix_block}{pc_block}{tick_block}{earnings_block}{gex_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -446,7 +600,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{insider_instructions}{macro_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{pc_instructions}{earnings_instructions}
+{insider_instructions}{macro_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{pc_instructions}{tick_instructions}{earnings_instructions}{gex_instructions}{vwap_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

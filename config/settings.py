@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     commodity_etfs: str = "GLD,SLV,IAU,GDX,PPLT,PALL,CPER"
 
     # Feature flags
-    enable_market_data: bool = True       # set to false to skip yfinance fetching entirely
+    enable_fetch_data: bool = True        # set to false to skip all yfinance fetching entirely
     enable_charts: bool = False           # set to true to build Plotly charts and HTML report
 
     # Analysis method flags (at least one should be true)
@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     # ^VIX, ^VXN, ^VVIX, ^VIX9D, ^VIX3M, ^VXMT
     enable_vix: bool = True
 
+    # NYSE TICK index — breadth exhaustion / reversal signal (^TICK via yfinance, no key required)
+    # Extreme readings (>+1000 or <-1000) are contrarian reversal signals.
+    enable_tick: bool = True
+
+    # VWAP distance — rolling 20-day volume-weighted average price vs current price.
+    # Mean-reversion signal: large deviations attract institutional order flow back toward VWAP.
+    enable_vwap: bool = True
+
     # Earnings calendar + EPS surprises
     # Upcoming dates: yfinance (free) + Alpha Vantage EARNINGS_CALENDAR (free with key)
     # EPS beat/miss: yfinance earnings_dates (free)
@@ -103,6 +111,11 @@ class Settings(BaseSettings):
     # Short interest — FINRA Reg SHO daily short volume + yfinance (no API key required)
     # Squeeze setups (high SI + low days-to-cover), bearish positioning, short covering signals
     enable_short_interest: bool = True
+
+    # Gamma Exposure (GEX) — options market structure: dealer positioning, gamma flip,
+    # max pain, and expected move derived from yfinance options chains (no key required).
+    # Covers SPY/QQQ/IWM always + any watchlist ticker with OI ≥ 1000 contracts.
+    enable_gex: bool = True
 
     # Google Trends — search interest spike/drop as retail attention proxy (no API key required)
     enable_google_trends: bool = True   # uses pytrends (unofficial API); cached daily

@@ -20,6 +20,7 @@ import yfinance as yf
 import pandas as pd
 from loguru import logger
 from typing import List, Optional, Tuple
+from config import settings
 from src.models import TickerSnapshot
 
 
@@ -119,6 +120,10 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
     Stops early (returns partial results) if Yahoo Finance rate-limits us
     beyond recovery.  The pipeline continues with whatever was collected.
     """
+    if not settings.enable_fetch_data:
+        logger.debug("[market_data] ENABLE_FETCH_DATA=false — skipping snapshot fetch")
+        return []
+
     snapshots: List[TickerSnapshot] = []
 
     for i, ticker in enumerate(tickers):
@@ -170,6 +175,10 @@ def get_history(ticker: str, period: str = "3mo") -> pd.DataFrame:
     Return OHLCV history for chart generation / technical analysis.
     Applies the same rate-limit backoff as get_snapshots.
     """
+    if not settings.enable_fetch_data:
+        logger.debug(f"[market_data] ENABLE_FETCH_DATA=false — skipping history fetch for {ticker}")
+        return pd.DataFrame()
+
     rl_hits = 0
     while True:
         try:

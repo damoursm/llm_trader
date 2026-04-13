@@ -78,8 +78,8 @@ All articles are deduplicated by URL and filtered to the **last 24 hours**. Resu
 Price snapshots for every ticker are fetched via **yfinance** with the following priority:
 
 1. **Current-hour cache** — if a snapshot file for this hour exists, use it (no network call)
-2. **Live fetch** — if `ENABLE_MARKET_DATA=true` and no current cache, fetch all tickers and save
-3. **Historical cache fallback** — if `ENABLE_MARKET_DATA=false`, load the most recent snapshot file from any previous run
+2. **Live fetch** — if `ENABLE_FETCH_DATA=true` and no current cache, fetch all tickers and save
+3. **Historical cache fallback** — if `ENABLE_FETCH_DATA=false`, load the most recent snapshot file from any previous run
 4. **News-only mode** — if no cache exists at all and market data is disabled, the pipeline continues without price context
 
 **Rate-limit handling** — Yahoo Finance enforces a per-IP quota. When a 429 is detected:
@@ -396,7 +396,7 @@ Email is sent only if `SMTP_USER` and `EMAIL_RECIPIENTS` are configured. Degrade
 | No cache yet | Fetches full 3-month history, saves to disk |
 | Cache exists, up to date | Returns cache immediately — no network call |
 | Cache exists, missing recent days | Fetches only the missing date range, appends and saves |
-| `ENABLE_MARKET_DATA=false` | Reads cache only — yfinance is never called |
+| `ENABLE_FETCH_DATA=false` | Reads cache only — yfinance is never called |
 | yfinance errors | Falls back to whatever is already in cache |
 
 ---
@@ -489,7 +489,7 @@ SECTOR_ETFS=XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU,XLRE,XLC
 COMMODITY_ETFS=GLD,SLV,IAU,GDX,PPLT,PALL,CPER
 
 # Feature flags
-ENABLE_MARKET_DATA=true           # false = news-only mode (uses historical cache for charts)
+ENABLE_FETCH_DATA=true            # false = block all yfinance calls, use historical cache only
 ENABLE_CHARTS=false               # true = generate Plotly charts and HTML report
 ENABLE_NEWS_SENTIMENT=true        # method 1: LLM sentiment from news/RSS
 ENABLE_TECHNICAL_ANALYSIS=true    # method 2: RSI, MACD, SMA, Bollinger Bands
