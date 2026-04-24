@@ -25,9 +25,22 @@ from src.data.fred import fetch_macro_context
 from src.data.cot import fetch_cot_context
 from src.data.ipo_pipeline import fetch_ipo_context
 from src.data.vix import fetch_vix_context
+from src.data.credit import fetch_credit_context
 from src.data.put_call import fetch_put_call_context
 from src.data.tick import fetch_tick_context
 from src.data.gamma_exposure import fetch_gex_context
+from src.data.breadth import fetch_breadth_context
+from src.data.highs_lows import fetch_highs_lows_context
+from src.data.mcclellan import fetch_mcclellan_context
+from src.data.macro_surprise import fetch_macro_surprise_context
+from src.data.fedwatch import fetch_fedwatch_context
+from src.data.revision_momentum import fetch_revision_momentum_context
+from src.data.earnings_whisper import fetch_whisper_context
+from src.data.opex import compute_opex_context
+from src.data.seasonality import compute_seasonality_context
+from src.data.bond_internals import fetch_bond_internals_context
+from src.data.move import fetch_move_context
+from src.data.global_macro import fetch_global_macro_context
 from src.notifications.email_sender import send_recommendations
 from src.performance.tracker import record_new_trades, update_open_trades, log_performance_summary, get_performance_for_email
 from src.charts.report import save_html_report
@@ -202,11 +215,44 @@ def run_pipeline(send_email: bool = False) -> None:
         f_vix          = (pool.submit(_safe, "vix", fetch_vix_context)
                           if settings.enable_vix else None)
 
+        f_credit       = (pool.submit(_safe, "credit", fetch_credit_context)
+                          if settings.enable_credit else None)
+
         f_put_call     = (pool.submit(_safe, "put_call", fetch_put_call_context, tickers)
                           if settings.enable_put_call else None)
 
         f_tick         = (pool.submit(_safe, "tick", fetch_tick_context)
                           if settings.enable_tick else None)
+
+        f_breadth      = (pool.submit(_safe, "breadth", fetch_breadth_context)
+                          if settings.enable_breadth else None)
+
+        f_highs_lows   = (pool.submit(_safe, "highs_lows", fetch_highs_lows_context)
+                          if settings.enable_highs_lows else None)
+
+        f_mcclellan    = (pool.submit(_safe, "mcclellan", fetch_mcclellan_context)
+                          if settings.enable_mcclellan else None)
+
+        f_macro_surprise = (pool.submit(_safe, "macro_surprise", fetch_macro_surprise_context)
+                            if settings.enable_macro_surprise else None)
+
+        f_fedwatch       = (pool.submit(_safe, "fedwatch", fetch_fedwatch_context)
+                            if settings.enable_fedwatch else None)
+
+        f_revision       = (pool.submit(_safe, "revision", fetch_revision_momentum_context, tickers)
+                            if settings.enable_revision_momentum else None)
+
+        f_whisper        = (pool.submit(_safe, "whisper", fetch_whisper_context, tickers)
+                            if settings.enable_earnings_whisper else None)
+
+        f_bond_internals = (pool.submit(_safe, "bond_internals", fetch_bond_internals_context)
+                            if settings.enable_bond_internals else None)
+
+        f_move           = (pool.submit(_safe, "move", fetch_move_context)
+                            if settings.enable_move else None)
+
+        f_global_macro   = (pool.submit(_safe, "global_macro", fetch_global_macro_context)
+                            if settings.enable_global_macro else None)
 
         # Group B: yfinance options — options_flow then GEX, sequential in one thread
         # Both modules scan yfinance options chains; running them concurrently causes
@@ -273,10 +319,31 @@ def run_pipeline(send_email: bool = False) -> None:
     cot_context      = get(f_cot)
     ipo_context      = edgar.get("ipo")
     vix_context      = get(f_vix)
+    credit_context   = get(f_credit)
     put_call_context = get(f_put_call)
     tick_context     = get(f_tick)
-    gex_context      = yf_options.get("gex")
+    breadth_context       = get(f_breadth)
+    highs_lows_context    = get(f_highs_lows)
+    mcclellan_context     = get(f_mcclellan)
+    macro_surprise_context    = get(f_macro_surprise)
+    fedwatch_context          = get(f_fedwatch)
+    revision_momentum_context = get(f_revision)
+    whisper_context           = get(f_whisper)
+    bond_internals_context    = get(f_bond_internals)
+    move_context              = get(f_move)
+    global_macro_context      = get(f_global_macro)
+    gex_context               = yf_options.get("gex")
     earnings_context = get(f_earnings_cal)
+
+    # OpEx context — pure date math, computed synchronously (no I/O)
+    opex_context = compute_opex_context() if settings.enable_opex else None
+    if opex_context:
+        logger.info(f"[opex] {opex_context.signal}: {opex_context.summary}")
+
+    # Seasonality context — pure date math, computed synchronously (no I/O)
+    seasonality_context = compute_seasonality_context() if settings.enable_seasonality else None
+    if seasonality_context:
+        logger.info(f"[seasonality] {seasonality_context.composite_signal}: {seasonality_context.summary[:120]}")
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
@@ -298,14 +365,24 @@ def run_pipeline(send_email: bool = False) -> None:
         cot_context=cot_context,
         ipo_context=ipo_context,
         vix_context=vix_context,
+        credit_context=credit_context,
         put_call_context=put_call_context,
         tick_context=tick_context,
+        breadth_context=breadth_context,
+        highs_lows_context=highs_lows_context,
+        mcclellan_context=mcclellan_context,
+        macro_surprise_context=macro_surprise_context,
+        fedwatch_context=fedwatch_context,
+        revision_momentum_context=revision_momentum_context,
+        whisper_context=whisper_context,
         earnings_context=earnings_context,
         gex_context=gex_context,
+        opex_context=opex_context,
+        seasonality_context=seasonality_context,
+        bond_internals_context=bond_internals_context,
+        move_context=move_context,
+        global_macro_context=global_macro_context,
     )
-
-    # Only surface BUY and SELL as actionable, with minimum confidence guard
-    actionable = [r for r in recommendations if r.action in ("BUY", "SELL") and r.confidence >= 0.78]
 
     # Keep only the top 10 recommendations by conviction:
     # BUY/SELL first (sorted by confidence desc), then HOLD/WATCH to fill up to 10.
@@ -314,6 +391,7 @@ def run_pipeline(send_email: bool = False) -> None:
         recommendations,
         key=lambda r: (_ACTION_RANK.get(r.action, 3), -r.confidence),
     )[:10]
+    # Only surface BUY and SELL as actionable, with minimum confidence guard
     actionable = [r for r in recommendations if r.action in ("BUY", "SELL") and r.confidence >= 0.78]
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
@@ -357,10 +435,23 @@ def run_pipeline(send_email: bool = False) -> None:
             cot_context=cot_context,
             ipo_context=ipo_context,
             vix_context=vix_context,
+            credit_context=credit_context,
             put_call_context=put_call_context,
             tick_context=tick_context,
+            breadth_context=breadth_context,
+            highs_lows_context=highs_lows_context,
+            mcclellan_context=mcclellan_context,
+            macro_surprise_context=macro_surprise_context,
+            fedwatch_context=fedwatch_context,
+            revision_momentum_context=revision_momentum_context,
+            whisper_context=whisper_context,
             earnings_context=earnings_context,
             gex_context=gex_context,
+            opex_context=opex_context,
+            seasonality_context=seasonality_context,
+            bond_internals_context=bond_internals_context,
+            move_context=move_context,
+            global_macro_context=global_macro_context,
         )
     else:
         logger.info("Email not configured — skipping.")

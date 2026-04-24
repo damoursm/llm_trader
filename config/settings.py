@@ -70,6 +70,24 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     enable_fred: bool = True    # fetch yield curve, CPI, unemployment, credit spreads, M2
 
+    # Earnings whisper vs. consensus gap — infers the implied "whisper number" from:
+    # historical beat rate, avg EPS surprise magnitude, and consensus revision trend.
+    # Uses yfinance earnings_dates + eps_trend + eps_revisions (free, no key required).
+    enable_earnings_whisper: bool = True
+
+    # Analyst estimate revision momentum — compares PT/rating changes over two 30-day windows
+    # to detect whether analyst consensus is accelerating (improving) or decelerating (deteriorating).
+    # Requires enable_analyst_ratings=True for yfinance data; cached daily.
+    enable_revision_momentum: bool = True
+
+    # CESI-style Macro Surprise Index — compare recent FRED releases to trailing 3-period averages
+    # Consistent beats → cyclical tailwind; consistent misses → defensive bias. Requires FRED_API_KEY.
+    enable_macro_surprise: bool = True
+
+    # Market-implied Fed rate expectations — T-bill spreads proxy for CME FedWatch.
+    # Derives P(cut/hold/hike) at next FOMC meeting + 12m cumulative cuts in bp. Requires FRED_API_KEY.
+    enable_fedwatch: bool = True
+
     # CFTC Commitment of Traders — weekly futures positioning (no API key required)
     enable_cot: bool = True     # download COT data from CFTC; cached by ISO week
 
@@ -88,6 +106,10 @@ class Settings(BaseSettings):
     # Put/Call ratio — market sentiment + per-ticker directional bias
     # Market-wide: CBOE equity P/C CSV (free, no key); per-ticker: yfinance options volume
     enable_put_call: bool = True
+
+    # Credit market leading indicator — HYG vs SPY divergence (yfinance, no key required)
+    # High-yield bonds lead equities by 1-3 days; divergence warns of coming equity moves.
+    enable_credit: bool = True
 
     # VIX & term structure — CBOE volatility indices via yfinance (no key required)
     # ^VIX, ^VXN, ^VVIX, ^VIX9D, ^VIX3M, ^VXMT
@@ -117,6 +139,18 @@ class Settings(BaseSettings):
     # Covers SPY/QQQ/IWM always + any watchlist ticker with OI ≥ 1000 contracts.
     enable_gex: bool = True
 
+    # McClellan Oscillator & Summation Index — NYSE A/D breadth momentum (^NYAD via yfinance, no key required)
+    # Oscillator = EMA19 − EMA39 of daily net advances; Summation = running total; zero crosses = swing timing
+    enable_mcclellan: bool = True
+
+    # New 52-week highs vs. lows — HL Spread = %near_highs − %near_lows over sector ETFs + watchlist (yfinance, no key)
+    # Divergence: SPY near 52w high + HL spread declining → bearish; SPY near 52w low + HL spread rising → bullish
+    enable_highs_lows: bool = True
+
+    # Market breadth — % of S&P 500 sector ETFs above their 200-day SMA (yfinance, no key required)
+    # < 30% = broadly oversold; rising from < 30% = confirmed breadth thrust (strong multi-month bullish signal)
+    enable_breadth: bool = True
+
     # Google Trends — search interest spike/drop as retail attention proxy (no API key required)
     enable_google_trends: bool = True   # uses pytrends (unofficial API); cached daily
 
@@ -126,6 +160,27 @@ class Settings(BaseSettings):
     reddit_client_id: str = ""
     reddit_client_secret: str = ""
     reddit_user_agent: str = "llm_trader/1.0 (stock analysis bot)"
+
+    # OpEx calendar — options expiration week effects (pure date math, no API calls)
+    # OpEx week (3rd Friday) → max pain pinning; Triple Witching (Mar/Jun/Sep/Dec) → strongest
+    enable_opex: bool = True
+
+    # Seasonality calendar — end-of-month rebalancing, quarter-end window dressing,
+    # January effect (small-cap rebound), and monthly historical biases (pure date math, no API calls)
+    enable_seasonality: bool = True
+
+    # Bond market internals — 1–8 week macro regime signals via yfinance (no API key required)
+    # Treasury curve (10Y-3M), TLT/IEF/TIP/LQD price momentum, real yield, IG credit
+    enable_bond_internals: bool = True
+
+    # MOVE Index — ICE BofA Treasury implied volatility (bond market VIX) via yfinance (no key required)
+    # ^MOVE primary ticker; VXTLT fallback. Spikes precede equity dislocations by 1–5 days.
+    enable_move: bool = True
+
+    # Global macro cross-asset regime — DXY strength (DX-Y.NYB) + Copper/Gold ratio (HG=F / GC=F)
+    # DXY: strong dollar = headwind for EM, commodities, multinationals.
+    # Copper/Gold: rising ratio = risk-on expansion; declining = risk-off contraction.
+    enable_global_macro: bool = True
 
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
@@ -157,6 +212,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 settings = Settings()

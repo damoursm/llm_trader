@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(python -c \":*)",
+      "Read(//mnt/c/Users/mathi/PycharmProjects/**)",
+      "Bash(python -c \"from src.data.fred import fetch_macro_context; from src.models import MacroContext; print\\('OK'\\)\")",
+      "Bash(python -c \"from src.pipeline import run_pipeline; from src.analysis.claude_analyst import generate_recommendations; print\\('OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python:*)",
+      "Bash(ls cache/gex_*.json)",
+      "Bash(ls /mnt/c/Users/mathi/PycharmProjects/llm_trader/cache/credit_*.json)",
+      "Bash(del \"cache\\\\bond_internals_2026-04-18.json\")"
+    ]
+  }
+}

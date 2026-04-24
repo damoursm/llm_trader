@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 from typing import Dict, List, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class NewsArticle(BaseModel):
@@ -164,6 +164,21 @@ class TICKContext(BaseModel):
     summary: str
 
 
+class CreditContext(BaseModel):
+    """Credit market leading indicator — HYG vs SPY divergence."""
+    hyg_price:     Optional[float] = None   # HYG last close
+    spy_price:     Optional[float] = None   # SPY last close
+    hyg_return_1d: Optional[float] = None   # HYG 1-day return %
+    hyg_return_5d: Optional[float] = None   # HYG 5-day return %
+    spy_return_1d: Optional[float] = None   # SPY 1-day return %
+    spy_return_5d: Optional[float] = None   # SPY 5-day return %
+    divergence_5d: Optional[float] = None   # hyg_5d − spy_5d; negative = HYG lagging equities
+    signal:    str = "UNKNOWN"              # CREDIT_STRESS | CREDIT_CAUTION | NEUTRAL | CREDIT_STRONG | CREDIT_SURGE
+    direction: str = "NEUTRAL"             # BEARISH | NEUTRAL | BULLISH
+    report_date: date
+    summary: str
+
+
 class VIXContext(BaseModel):
     """VIX volatility regime and term structure."""
     # Spot levels
@@ -251,6 +266,401 @@ class GEXContext(BaseModel):
     summary: str                 # e.g. "SPY: PINNED; QQQ: AMPLIFIED; IWM: NEUTRAL"
 
 
+class McClellanContext(BaseModel):
+    """NYSE McClellan Oscillator and Summation Index — A/D breadth momentum."""
+    # Core values
+    oscillator: float                       # 19d EMA − 39d EMA of net advances (daily A−D)
+    oscillator_5d_ago: Optional[float] = None
+    summation: float                        # running cumulative total of oscillator
+    summation_5d_ago: Optional[float] = None
+    ema19: float                            # 19-day EMA of net advances (short / "10% trend")
+    ema39: float                            # 39-day EMA of net advances (long  / "5% trend")
+
+    # Classification
+    osc_signal: str    # OVERBOUGHT | BULLISH_MOMENTUM | NEUTRAL | BEARISH_MOMENTUM | OVERSOLD
+    sum_signal: str    # EXTENDED_BULL | BULL_TREND | NEUTRAL | BEAR_TREND | EXTENDED_BEAR
+    direction: str     # BULLISH | BEARISH | NEUTRAL
+
+    # Crossover flags (last 3 sessions)
+    is_bullish_cross: bool = False   # oscillator crossed above 0
+    is_bearish_cross: bool = False   # oscillator crossed below 0
+
+    report_date: date
+    summary: str
+
+
+class BreadthContext(BaseModel):
+    """S&P 500 market breadth — % of sector ETFs above their 200-day SMA."""
+    pct_above_200d: float                      # 0–100: % of covered sector ETFs above 200d SMA
+    pct_above_200d_5d_ago: Optional[float] = None  # same reading 5 trading days ago
+    etf_count: int                             # total ETFs checked
+    etfs_above: int                            # how many are above their 200d SMA
+    signal: str                                # BREADTH_COLLAPSE | BREADTH_WEAK | BREADTH_MIXED | BREADTH_HEALTHY | BREADTH_EXTENDED
+    direction: str                             # BULLISH | BEARISH | NEUTRAL
+    is_breadth_thrust: bool = False            # rising ≥8pp from sub-35% reading = confirmed thrust
+    spy_above_200d: Optional[bool] = None      # whether SPY itself is above its 200d SMA
+    spy_200d_distance_pct: Optional[float] = None  # % SPY is above/below its 200d SMA
+    report_date: date
+    summary: str
+
+
+class HighsLowsContext(BaseModel):
+    """52-week new highs vs. new lows — market breadth divergence signal."""
+    # Current counts
+    highs_count: int            # tickers near 52-week high (within 5% threshold)
+    lows_count: int             # tickers near 52-week low  (within 5% threshold)
+    neutral_count: int          # tickers in the middle
+    total_count: int            # total tickers with valid data
+
+    # Percentages and spread
+    pct_near_highs: float       # highs_count / total_count × 100
+    pct_near_lows: float        # lows_count  / total_count × 100
+    hl_spread: float            # pct_near_highs − pct_near_lows  ∈ [−100, +100]
+
+    # Historical spreads (for trend detection)
+    hl_spread_5d_ago:  Optional[float] = None
+    hl_spread_10d_ago: Optional[float] = None
+
+    # SPY reference (index context for divergence)
+    spy_pct_from_52w_high: Optional[float] = None   # ≤ 0  (negative = below high)
+    spy_pct_from_52w_low:  Optional[float] = None   # ≥ 0  (positive = above low)
+
+    # Classification
+    signal: str     # STRONG_HIGHS | HIGHS_DOMINATE | BALANCED | LOWS_DOMINATE | STRONG_LOWS
+    direction: str  # BULLISH | BEARISH | NEUTRAL
+
+    # Divergence flags (precede index reversals by 1–2 weeks)
+    is_bearish_divergence: bool = False  # SPY near 52w high, HL spread declining
+    is_bullish_divergence: bool = False  # SPY near 52w low,  HL spread rising
+
+    report_date: date
+    summary: str
+
+
+class FedWatchContext(BaseModel):
+    """Market-implied Fed rate expectations derived from T-bill spreads and FOMC calendar."""
+    # Current FOMC target range
+    ff_upper: float            # upper bound of FF target (DFEDTARU)
+    ff_lower: float            # lower bound (DFEDTARL)
+    ff_midpoint: float         # midpoint = (upper + lower) / 2
+
+    # Market-implied rates from T-bills (proxy for expected average FF rate)
+    tbill_3m: Optional[float] = None   # DTB3  — 90-day forward expectation
+    tbill_6m: Optional[float] = None   # DTB6  — 180-day forward expectation
+    tbill_12m: Optional[float] = None  # DTB1YR — 365-day forward expectation
+
+    # Rate-change expectations (positive = cuts expected, negative = hikes)
+    implied_cuts_3m_bp: float = 0.0    # basis points of cuts priced into 3m T-bill
+    implied_cuts_6m_bp: float = 0.0    # ... 6m T-bill
+    implied_cuts_12m_bp: float = 0.0   # ... 12m T-bill
+
+    # Per-meeting probabilities for the NEXT FOMC meeting
+    next_meeting: Optional[date] = None
+    days_to_next_meeting: Optional[int] = None
+    p_cut_next: float = 0.0    # P(≥25bp cut at next meeting)
+    p_hold_next: float = 1.0   # P(no change at next meeting)
+    p_hike_next: float = 0.0   # P(≥25bp hike at next meeting)
+
+    # Week-over-week trend (5 trading days)
+    tbill_3m_5d_ago: Optional[float] = None
+    rate_trend: str = "NEUTRAL"   # DOVISH_SHIFT | NEUTRAL | HAWKISH_SHIFT
+
+    # Classification
+    signal: str     # STRONGLY_DOVISH | DOVISH | MILDLY_DOVISH | NEUTRAL | MILDLY_HAWKISH | HAWKISH | STRONGLY_HAWKISH
+    direction: str  # BULLISH | NEUTRAL | BEARISH
+
+    report_date: date
+    summary: str
+
+
+class MacroSurpriseIndicator(BaseModel):
+    """Per-indicator surprise result from the CESI-style computation."""
+    series_id: str        # FRED series ID, e.g. "PAYEMS"
+    name: str             # friendly name, e.g. "Nonfarm Payrolls"
+    unit: str             # display unit, e.g. "k jobs"
+    actual: float         # most recent reading (or MoM change)
+    expected: float       # trailing 3-period average
+    surprise: float       # actual − expected
+    z_score: float        # sign-adjusted z-score ∈ [-3, +3]
+    signal: str           # BEAT | IN_LINE | MISS
+    release_date: str     # date of most recent non-missing observation
+
+
+class MacroSurpriseContext(BaseModel):
+    """Composite economic surprise score across 6 FRED indicators."""
+    score: float          # weighted composite ∈ [-1, +1]
+    signal: str           # STRONG_BEAT | MILD_BEAT | NEUTRAL | MILD_MISS | STRONG_MISS
+    direction: str        # BULLISH | NEUTRAL | BEARISH
+    indicators: List[MacroSurpriseIndicator]
+    beats: int
+    misses: int
+    in_line: int
+    report_date: date
+    summary: str
+
+
+class WhisperSignal(BaseModel):
+    """Per-ticker earnings whisper proxy signal."""
+    ticker: str
+
+    # Upcoming earnings (if within the look-ahead window)
+    earnings_date: Optional[date] = None
+    days_until_earnings: Optional[int] = None
+
+    # Historical beat/miss record (last 4–8 quarters of yfinance earnings_dates)
+    quarters_analyzed: int = 0
+    beat_count:  int = 0
+    miss_count:  int = 0
+    beat_rate_pct: float = 0.0           # 0–100
+    avg_eps_surprise_pct: float = 0.0    # mean Surprise(%) over history; positive = company beats
+
+    # Implied whisper (consensus × (1 + avg_beat_pct/100))
+    current_eps_estimate: Optional[float] = None   # current quarter sell-side consensus
+    implied_whisper:      Optional[float] = None   # historical-beat-adjusted expectation
+    whisper_gap_pct:      Optional[float] = None   # ≈ avg_eps_surprise_pct; positive = market expects above consensus
+
+    # Consensus revision trend (from eps_trend — how estimate has moved 7/30d)
+    eps_trend_current: Optional[float] = None
+    eps_trend_7d:      Optional[float] = None
+    eps_trend_30d:     Optional[float] = None
+    eps_trend_direction: str = "STABLE"            # REVISING_UP | STABLE | REVISING_DOWN
+
+    # Net analyst revisions (from eps_revisions)
+    revisions_up_30d:   int = 0
+    revisions_down_30d: int = 0
+
+    # Classification
+    signal:    str = "NEUTRAL"   # BEAT_LIKELY | BEAT_POSSIBLE | NEUTRAL | MISS_POSSIBLE | MISS_LIKELY
+    direction: str = "NEUTRAL"   # BULLISH | NEUTRAL | BEARISH
+    summary:   str = ""
+
+
+class WhisperContext(BaseModel):
+    """Aggregate earnings whisper proxy context across the watchlist."""
+    signals: List["WhisperSignal"]
+    n_beat_likely:   int = 0
+    n_beat_possible: int = 0
+    n_miss_possible: int = 0
+    n_miss_likely:   int = 0
+    avg_beat_rate_pct: float = 0.0   # mean historical beat rate across all tickers
+    report_date: date
+    summary: str
+
+
+class TickerRevisionData(BaseModel):
+    """Per-ticker analyst estimate revision momentum (recent 0-30d vs prior 31-60d window)."""
+    ticker: str
+    recent_upgrades:   int = 0     # upgrades in last 30 days
+    recent_downgrades: int = 0
+    recent_pt_raises:  int = 0     # PT raises on maintained coverage (last 30d)
+    recent_pt_cuts:    int = 0
+    prior_upgrades:    int = 0     # upgrades in 31-60 days ago
+    prior_downgrades:  int = 0
+    prior_pt_raises:   int = 0
+    prior_pt_cuts:     int = 0
+    momentum_score:  float = 0.0   # [-1, +1]: positive = accelerating positive revisions
+    direction: str = "STABLE"      # IMPROVING | STABLE | DETERIORATING
+    avg_pt_current: Optional[float] = None   # mean PT across recent window (with PT data)
+    avg_pt_prior:   Optional[float] = None   # mean PT across prior window
+    pt_change_pct:  Optional[float] = None   # % change in avg PT between windows
+    n_firms: int = 0               # unique firms covering in the full 60d window
+
+
+class RevisionMomentumContext(BaseModel):
+    """Estimate revision momentum — analyst consensus trend across the watchlist."""
+    tickers:     List[TickerRevisionData]
+    breadth_score: float          # mean momentum ∈ [-1, +1]
+    signal: str                   # STRONG_IMPROVING | IMPROVING | NEUTRAL | DETERIORATING | STRONG_DETERIORATING
+    direction: str                # BULLISH | NEUTRAL | BEARISH
+    top_improving:     List[str]  # tickers with strongest positive momentum
+    top_deteriorating: List[str]  # tickers with strongest negative momentum
+    report_date: date
+    summary: str
+
+
+class SeasonalEffect(BaseModel):
+    """A single active calendar/seasonal effect."""
+    name: str             # e.g. "Month-End Rebalancing"
+    direction: str        # BULLISH | BEARISH | NEUTRAL
+    assets_affected: str  # e.g. "equities broadly; especially if month had equity losses"
+    description: str      # human-readable explanation of the effect
+
+
+class SeasonalityContext(BaseModel):
+    """Seasonal calendar context — pure date math, no API calls."""
+    today: date
+    month: int
+    month_name: str
+    quarter: int
+
+    # Monthly baseline bias
+    monthly_bias: str          # BULLISH | NEUTRAL | BEARISH
+    monthly_signal: str        # e.g. APRIL_STRONG | SEPTEMBER_WEAK | SELL_IN_MAY
+    monthly_description: str
+
+    # Calendar window flags
+    in_month_end_window: bool      # last 3 calendar days of month
+    in_month_start_window: bool    # first 3 calendar days of month
+    in_quarter_end_window: bool    # last 5 calendar days of quarter-end month
+    in_quarter_start_window: bool  # first 5 calendar days of quarter-start month
+    in_january_effect: bool        # January 1–15 small-cap rebound window
+    is_fiscal_year_end: bool       # June or December quarter-end (more intense window dressing)
+
+    # Active effects and composite signal
+    active_effects: List["SeasonalEffect"]
+    composite_signal: str      # STRONG_TAILWIND | TAILWIND | NEUTRAL | HEADWIND | STRONG_HEADWIND
+    composite_direction: str   # BULLISH | NEUTRAL | BEARISH
+    summary: str
+
+
+class BondInternalsContext(BaseModel):
+    """Bond market internals — macro regime signals from Treasury and credit ETFs (yfinance)."""
+    # Raw Treasury yields (%)
+    yield_10y:  Optional[float] = None     # ^TNX — 10-year Treasury yield
+    yield_3m:   Optional[float] = None     # ^IRX — 13-week T-bill yield
+    yield_5y:   Optional[float] = None     # ^FVX — 5-year Treasury yield
+    yield_30y:  Optional[float] = None     # ^TYX — 30-year Treasury yield
+
+    # Yield curve spreads (percentage points)
+    spread_10y_3m:  Optional[float] = None   # 10Y − 3M: premier recession predictor
+    spread_10y_5y:  Optional[float] = None   # 10Y − 5Y: mid-curve steepness
+    spread_30y_10y: Optional[float] = None   # 30Y − 10Y: long-end term premium
+    curve_signal: str = "UNKNOWN"            # DEEPLY_INVERTED | INVERTED | FLAT | NORMAL | STEEP
+
+    # TLT (20+ year Treasury ETF) momentum — proxy for long-rate direction
+    tlt_return_5d:  Optional[float] = None   # 1-week return %
+    tlt_return_20d: Optional[float] = None   # 4-week return %
+    tlt_return_40d: Optional[float] = None   # 8-week return %
+    tlt_signal: str = "UNKNOWN"              # RALLYING_STRONG | RALLYING | FLAT | FALLING | FALLING_STRONG
+
+    # Duration positioning: TLT vs IEF (long-end vs intermediate, 5-day spread)
+    tlt_ief_spread_5d: Optional[float] = None   # TLT 5d return − IEF 5d return
+    tlt_ief_signal: str = "UNKNOWN"              # LONG_END_PRESSURE | FLAT | LONG_END_RALLY
+
+    # Inflation expectations: TIP vs IEF (5-day spread)
+    tip_ief_spread_5d: Optional[float] = None    # TIP 5d return − IEF 5d return
+    real_yield_signal: str = "UNKNOWN"            # REAL_RATES_RISING | NEUTRAL | REAL_RATES_FALLING
+
+    # IG credit risk premium: LQD vs TLT (5-day spread)
+    lqd_tlt_spread_5d: Optional[float] = None    # LQD 5d return − TLT 5d return
+    ig_credit_signal: str = "UNKNOWN"             # IG_STRESS | IG_CAUTION | NEUTRAL | IG_STRONG
+
+    # Bond-equity divergence: TLT/IEF vs SPY (5-day return spread)
+    spy_return_5d:   Optional[float] = None   # SPY 5-day return %
+    spy_return_20d:  Optional[float] = None   # SPY 20-day return %
+    tlt_spy_div_5d:  Optional[float] = None   # TLT 5d − SPY 5d (positive = bonds leading)
+    ief_spy_div_5d:  Optional[float] = None   # IEF 5d − SPY 5d (intermediate-bond confirmation)
+    # EQUITY_CATCHUP_LIKELY | EQUITY_CATCHUP_POSSIBLE | NEUTRAL |
+    # EQUITY_SELLOFF_RISK | SYNCHRONIZED_RISK_OFF | SYNCHRONIZED_RISK_ON
+    bond_equity_signal: str = "NEUTRAL"
+    bond_equity_direction: str = "NEUTRAL"    # BULLISH | NEUTRAL | BEARISH
+
+    # Composite regime
+    regime: str = "UNKNOWN"     # RISK_OFF | DEFENSIVE | NEUTRAL | CONSTRUCTIVE | RISK_ON | REFLATIONARY
+    direction: str = "NEUTRAL"  # BULLISH | NEUTRAL | BEARISH (for equities)
+
+    report_date: date
+    summary: str
+
+
+class GlobalMacroContext(BaseModel):
+    """Global macro cross-asset regime — DXY strength and Copper/Gold ratio.
+
+    DXY (US Dollar Index): strong dollar is a headwind for EM equities, commodities,
+    and multinationals. DX-Y.NYB via yfinance.
+
+    Copper/Gold ratio (HG=F / GC=F): "Dr. Copper" vs safe-haven gold.
+    Rising ratio = industrial demand > safety demand = risk-on expansion.
+    Declining ratio = safety demand > industrial demand = risk-off contraction.
+    """
+    # DXY — US Dollar Index
+    dxy:            Optional[float] = None   # current level (~100 = neutral baseline)
+    dxy_return_5d:  Optional[float] = None   # 5-day % return
+    dxy_return_20d: Optional[float] = None   # 20-day % return
+    # STRONG_BULL | BULL | NEUTRAL | BEAR | STRONG_BEAR (for the USD itself)
+    dxy_signal:    str = "UNKNOWN"
+    # for equities: strong DXY = BEARISH; weak DXY = BULLISH
+    dxy_direction: str = "NEUTRAL"
+
+    # Copper / Gold ratio
+    copper_price:          Optional[float] = None   # HG=F last close (cents/lb)
+    gold_price:            Optional[float] = None   # GC=F last close ($/oz)
+    copper_gold_ratio:     Optional[float] = None   # copper / gold
+    copper_gold_ratio_5d_ago:  Optional[float] = None
+    copper_gold_ratio_20d_ago: Optional[float] = None
+    copper_gold_change_5d:  Optional[float] = None  # % change in ratio over 5d
+    copper_gold_change_20d: Optional[float] = None  # % change in ratio over 20d
+    # RISK_ON_SURGE | RISK_ON | NEUTRAL | RISK_OFF | RISK_OFF_CRASH
+    copper_gold_signal:    str = "UNKNOWN"
+    copper_gold_direction: str = "NEUTRAL"   # BULLISH | NEUTRAL | BEARISH
+
+    # Oil (WTI crude — CL=F)
+    oil_price:     Optional[float] = None   # $/barrel
+    oil_return_5d: Optional[float] = None   # 5-day % return
+    oil_return_20d: Optional[float] = None  # 20-day % return
+
+    # Oil/Bond divergence — CL=F vs TLT 5-day co-movement
+    # Normally oil and bonds are inversely correlated (oil up = inflation → bonds down).
+    # When both move the same direction, the usual macro logic is being overridden:
+    #   Both up   → POLICY_PIVOT_SIGNAL  (market pricing Fed cut despite oil = unusual, BULLISH equities)
+    #   Both down → DEFLATION_SHOCK      (demand destruction, BEARISH)
+    #   Oil up, bonds down → STAGFLATION_RISK  (worst combo for equities, BEARISH)
+    #   Oil down, bonds up → GROWTH_FEAR_RISK_OFF (classic risk-off, BEARISH for cyclicals)
+    tlt_return_5d_ob: Optional[float] = None  # TLT 5d return used for this calc
+    # POLICY_PIVOT_SIGNAL | GROWTH_FEAR_RISK_OFF | STAGFLATION_RISK | DEFLATION_SHOCK | NEUTRAL
+    oil_bond_signal:    str = "NEUTRAL"
+    oil_bond_direction: str = "NEUTRAL"   # BULLISH | BEARISH | NEUTRAL
+
+    # Composite
+    composite_signal:    str = "UNKNOWN"  # RISK_ON | CONSTRUCTIVE | NEUTRAL | DEFENSIVE | RISK_OFF
+    composite_direction: str = "NEUTRAL"  # BULLISH | NEUTRAL | BEARISH
+
+    report_date: date
+    summary: str
+
+
+class MOVEContext(BaseModel):
+    """ICE BofA MOVE Index — Treasury market implied volatility (bond market VIX).
+
+    Spikes in MOVE precede equity dislocations by 1–5 days: rising bond vol
+    compresses risk appetite, triggers de-leveraging, and widens credit spreads
+    before equity markets fully reprice the risk.
+    """
+    move: Optional[float] = None          # current MOVE level
+    move_5d_ago: Optional[float] = None   # level 5 trading days ago
+    move_20d_avg: Optional[float] = None  # 20-day rolling average
+
+    # Spike detection
+    spike_5d: Optional[float] = None      # absolute change over 5 trading days
+    is_spiking: bool = False              # True when |spike_5d| > 20pt
+
+    # Classification
+    signal: str = "UNKNOWN"    # CALM | LOW | NORMAL | ELEVATED | HIGH | EXTREME | PANIC
+    direction: str = "NEUTRAL" # BEARISH | NEUTRAL | BULLISH (spikes = bearish for equities)
+
+    # Cross-asset context
+    move_vix_ratio: Optional[float] = None  # MOVE / VIX — >8 signals bond fear >> equity fear
+
+    source: str = "^MOVE"      # ticker used (^MOVE primary, VXTLT fallback)
+    report_date: date
+    summary: str
+
+
+class OpExContext(BaseModel):
+    """Options expiration calendar context — pure date math, no API calls."""
+    today: date
+    next_opex: date                  # 3rd Friday of current or next month
+    prev_opex: date                  # 3rd Friday of the previous expiry cycle
+    days_to_opex: int                # calendar days until next_opex
+    days_since_prev_opex: int        # calendar days since prev_opex
+    opex_week_monday: date           # Monday of the OpEx week
+    in_opex_week: bool               # True if today is Mon–Fri of OpEx week
+    is_triple_witching: bool         # True if next_opex is in Mar/Jun/Sep/Dec
+    in_post_opex_window: bool        # True if 1–5 calendar days after prev_opex
+    signal: str                      # OPEX_DAY | OPEX_IMMINENT | TRIPLE_WITCHING_WEEK | OPEX_WEEK | POST_OPEX | NEUTRAL
+    summary: str
+
+
 class TickerSignal(BaseModel):
     ticker: str
     direction: Direction
@@ -271,6 +681,9 @@ class TickerSignal(BaseModel):
     max_pain_score: float = 0.0    # [-1, +1] max-pain gravity score (expiry-weighted)
     oi_skew_score: float = 0.0     # [-1, +1] OI-weighted directional lean (from GEX options chain)
     expected_move_pct: float = 0.0
+    # Insider cluster fields — populated when ≥3 different insiders buy within 5 days
+    insider_cluster_detected: bool = False
+    insider_cluster_size: int = 0
 
 
 class Recommendation(BaseModel):

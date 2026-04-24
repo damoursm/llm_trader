@@ -108,6 +108,9 @@ HTML_TEMPLATE = """
   /* Smart money */
   .sm-type { font-size: 10px; background: #0f172a; padding: 2px 5px;
              border-radius: 3px; color: #94a3b8; margin-right: 5px; }
+  .cluster-badge { display: inline-block; background: #7c3aed22; border: 1px solid #7c3aed;
+                   color: #a78bfa; font-size: 11px; font-weight: bold; padding: 2px 8px;
+                   border-radius: 4px; margin-left: 8px; letter-spacing: .03em; }
 
   /* Performance */
   .pt    { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
@@ -675,6 +678,390 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     4a — MACRO SURPRISE INDEX (CESI-style)
+     ══════════════════════════════════════ -->
+{% if macro_surprise_context %}
+{% set ms = macro_surprise_context %}
+{% set ms_color = {
+    'STRONG_BEAT':  '#4ade80',
+    'MILD_BEAT':    '#86efac',
+    'NEUTRAL':      '#94a3b8',
+    'MILD_MISS':    '#fb923c',
+    'STRONG_MISS':  '#f87171'
+} %}
+{% set ms_bg = {
+    'STRONG_BEAT':  '#14532d',
+    'MILD_BEAT':    '#166534',
+    'NEUTRAL':      '#1e293b',
+    'MILD_MISS':    '#431407',
+    'STRONG_MISS':  '#450a0a'
+} %}
+{% set ms_dir_arrow = {'BULLISH': '▲', 'BEARISH': '▼', 'NEUTRAL': '→'} %}
+<h2>Macro Surprise Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CESI-style — FRED actual vs. trend)</span></h2>
+<div class="card" style="border-left: 4px solid {{ ms_color.get(ms.signal, '#94a3b8') }};">
+
+  <!-- Header row: score pill + signal badge + direction -->
+  <div style="display:flex;align-items:center;gap:14px;margin-bottom:12px;flex-wrap:wrap;">
+    <div style="background:{{ ms_bg.get(ms.signal, '#1e293b') }};border:1px solid {{ ms_color.get(ms.signal, '#94a3b8') }};
+                border-radius:8px;padding:10px 16px;text-align:center;">
+      <div style="font-size:26px;font-weight:800;color:{{ ms_color.get(ms.signal, '#e2e8f0') }};line-height:1.1;">
+        {{ '%+.2f'|format(ms.score) }}
+      </div>
+      <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;">Composite Score</div>
+    </div>
+    <div>
+      <span class="badge" style="background:{{ ms_bg.get(ms.signal, '#1e293b') }};color:{{ ms_color.get(ms.signal, '#94a3b8') }};border:1px solid {{ ms_color.get(ms.signal, '#94a3b8') }};font-size:13px;">
+        {{ ms_dir_arrow.get(ms.direction, '→') }} {{ ms.signal.replace('_', ' ') }}
+      </span>
+      <div style="font-size:13px;color:#94a3b8;margin-top:6px;">
+        {{ ms.beats }} beat{{ 's' if ms.beats != 1 else '' }} &nbsp;·&nbsp;
+        {{ ms.in_line }} in-line &nbsp;·&nbsp;
+        {{ ms.misses }} miss{{ 'es' if ms.misses != 1 else '' }}
+        &nbsp;<span style="color:#475569;">across {{ ms.indicators|length }} indicators</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Summary -->
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ ms.summary }}</p>
+
+  <!-- Score bar gauge -->
+  {% set bar_pct = ((ms.score + 1.0) / 2.0 * 100) | int %}
+  <div style="margin-bottom:16px;">
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:#475569;margin-bottom:3px;">
+      <span>STRONG MISS</span><span>NEUTRAL</span><span>STRONG BEAT</span>
+    </div>
+    <div style="height:8px;background:#1e293b;border-radius:4px;position:relative;overflow:hidden;">
+      <!-- center line -->
+      <div style="position:absolute;left:50%;top:0;width:1px;height:100%;background:#334155;"></div>
+      <div style="width:{{ bar_pct }}%;height:100%;background:{{ ms_color.get(ms.signal, '#94a3b8') }};border-radius:4px;"></div>
+    </div>
+    <div style="position:relative;height:14px;">
+      <div style="position:absolute;left:{{ bar_pct }}%;transform:translateX(-50%);font-size:10px;color:{{ ms_color.get(ms.signal, '#94a3b8') }};font-weight:700;">
+        {{ '%+.2f'|format(ms.score) }}
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-indicator table -->
+  <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Indicator Breakdown</div>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="color:#475569;border-bottom:1px solid #1e293b;">
+          <th style="text-align:left;padding:5px 8px;">Indicator</th>
+          <th style="text-align:right;padding:5px 8px;">Actual</th>
+          <th style="text-align:right;padding:5px 8px;">Expected</th>
+          <th style="text-align:right;padding:5px 8px;">Surprise</th>
+          <th style="text-align:right;padding:5px 8px;">Z-Score</th>
+          <th style="text-align:center;padding:5px 8px;">Signal</th>
+          <th style="text-align:right;padding:5px 8px;">Released</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for ind in ms.indicators %}
+      {% set ind_color = '#4ade80' if ind.signal == 'BEAT' else ('#f87171' if ind.signal == 'MISS' else '#94a3b8') %}
+      <tr style="border-top:1px solid #1e293b55;">
+        <td style="padding:6px 8px;color:#e2e8f0;font-weight:600;">{{ ind.name }}</td>
+        <td style="padding:6px 8px;text-align:right;color:#e2e8f0;">{{ '%.3f'|format(ind.actual) }} <span style="color:#475569;font-size:10px;">{{ ind.unit }}</span></td>
+        <td style="padding:6px 8px;text-align:right;color:#94a3b8;">{{ '%.3f'|format(ind.expected) }}</td>
+        <td style="padding:6px 8px;text-align:right;color:{{ '#4ade80' if ind.surprise > 0 else ('#f87171' if ind.surprise < 0 else '#94a3b8') }};">{{ '%+.3f'|format(ind.surprise) }}</td>
+        <td style="padding:6px 8px;text-align:right;color:{{ ind_color }};font-weight:700;">{{ '%+.2f'|format(ind.z_score) }}</td>
+        <td style="padding:6px 8px;text-align:center;">
+          <span style="background:{{ '#14532d' if ind.signal == 'BEAT' else ('#450a0a' if ind.signal == 'MISS' else '#1e293b') }};
+                       color:{{ ind_color }};border-radius:3px;padding:2px 6px;font-size:10px;font-weight:700;">
+            {{ ind.signal }}
+          </span>
+        </td>
+        <td style="padding:6px 8px;text-align:right;color:#475569;font-size:11px;">{{ ind.release_date }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div style="font-size:11px;color:#334155;margin-top:10px;">
+    Score ∈ [−1, +1] = weighted average z-score / 3 across 6 FRED indicators. CPI and Unemployment sign-flipped (lower = positive surprise).
+  </div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4b — FED RATE EXPECTATIONS
+     ══════════════════════════════════════ -->
+{% if fedwatch_context %}
+{% set fw = fedwatch_context %}
+{% set fw_color = {
+    'STRONGLY_DOVISH':  '#4ade80',
+    'DOVISH':           '#86efac',
+    'MILDLY_DOVISH':    '#a3e635',
+    'NEUTRAL':          '#94a3b8',
+    'MILDLY_HAWKISH':   '#fb923c',
+    'HAWKISH':          '#f87171',
+    'STRONGLY_HAWKISH': '#ef4444'
+} %}
+{% set fw_bg = {
+    'STRONGLY_DOVISH':  '#14532d',
+    'DOVISH':           '#166534',
+    'MILDLY_DOVISH':    '#1a2e05',
+    'NEUTRAL':          '#1e293b',
+    'MILDLY_HAWKISH':   '#431407',
+    'HAWKISH':          '#450a0a',
+    'STRONGLY_HAWKISH': '#3b0000'
+} %}
+{% set fw_arrow = {'BULLISH': '▲', 'BEARISH': '▼', 'NEUTRAL': '→'} %}
+{% set trend_icon = {'DOVISH_SHIFT': '⬇', 'HAWKISH_SHIFT': '⬆', 'NEUTRAL': '→'} %}
+{% set trend_color = {'DOVISH_SHIFT': '#4ade80', 'HAWKISH_SHIFT': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Fed Rate Expectations <span style="font-size:13px;font-weight:400;color:#94a3b8;">(T-bill spread proxy · FRED)</span></h2>
+<div class="card" style="border-left: 4px solid {{ fw_color.get(fw.signal, '#94a3b8') }};">
+
+  <!-- Header: Signal + FF target + trend -->
+  <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:14px;flex-wrap:wrap;">
+
+    <!-- Score tile -->
+    <div style="background:{{ fw_bg.get(fw.signal, '#1e293b') }};border:1px solid {{ fw_color.get(fw.signal, '#94a3b8') }};
+                border-radius:8px;padding:10px 16px;text-align:center;min-width:100px;">
+      <div style="font-size:22px;font-weight:800;color:{{ fw_color.get(fw.signal, '#e2e8f0') }};line-height:1.1;">
+        {{ '%+.0f'|format(fw.implied_cuts_12m_bp) }}bp
+      </div>
+      <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;">12m implied cuts</div>
+    </div>
+
+    <!-- FF target + signal -->
+    <div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span style="font-size:16px;font-weight:700;color:#f8fafc;">
+          {{ '%.2f'|format(fw.ff_lower) }}–{{ '%.2f'|format(fw.ff_upper) }}%
+        </span>
+        <span style="font-size:11px;color:#64748b;">FF Target</span>
+      </div>
+      <span class="badge" style="background:{{ fw_bg.get(fw.signal, '#1e293b') }};color:{{ fw_color.get(fw.signal, '#94a3b8') }};border:1px solid {{ fw_color.get(fw.signal, '#94a3b8') }};font-size:12px;">
+        {{ fw_arrow.get(fw.direction, '→') }} {{ fw.signal.replace('_', ' ') }}
+      </span>
+      <div style="font-size:12px;color:{{ trend_color.get(fw.rate_trend, '#94a3b8') }};margin-top:6px;">
+        {{ trend_icon.get(fw.rate_trend, '→') }}
+        {% if fw.rate_trend == 'DOVISH_SHIFT' %}
+          Dovish shift this week — market pricing in more cuts
+        {% elif fw.rate_trend == 'HAWKISH_SHIFT' %}
+          Hawkish shift this week — market pricing in fewer cuts
+        {% else %}
+          No significant rate expectation shift this week
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Next FOMC tile -->
+    {% if fw.next_meeting %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px 14px;text-align:center;">
+      <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Next FOMC</div>
+      <div style="font-size:14px;font-weight:700;color:#e2e8f0;">{{ fw.next_meeting }}</div>
+      <div style="font-size:12px;color:#64748b;">{{ fw.days_to_next_meeting }}d away</div>
+      {% if fw.days_to_next_meeting is not none and fw.days_to_next_meeting <= 7 %}
+      <div style="font-size:11px;color:#fb923c;margin-top:4px;font-weight:700;">⚠ IMMINENT</div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+  </div>
+
+  <!-- Summary -->
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ fw.summary }}</p>
+
+  <!-- Probability + T-bill grid -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:14px;">
+
+    <!-- P(cut) -->
+    {% if fw.next_meeting %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">P(Cut) next meeting</div>
+      <div style="font-size:22px;font-weight:700;margin:4px 0;color:{{ '#4ade80' if fw.p_cut_next > 0.5 else ('#fb923c' if fw.p_cut_next > 0.2 else '#e2e8f0') }};">
+        {{ '%.0f'|format(fw.p_cut_next * 100) }}%
+      </div>
+    </div>
+
+    <!-- P(hold) -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">P(Hold) next meeting</div>
+      <div style="font-size:22px;font-weight:700;margin:4px 0;color:{{ '#4ade80' if fw.p_hold_next > 0.7 else '#e2e8f0' }};">
+        {{ '%.0f'|format(fw.p_hold_next * 100) }}%
+      </div>
+    </div>
+
+    <!-- P(hike) -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">P(Hike) next meeting</div>
+      <div style="font-size:22px;font-weight:700;margin:4px 0;color:{{ '#f87171' if fw.p_hike_next > 0.3 else '#e2e8f0' }};">
+        {{ '%.0f'|format(fw.p_hike_next * 100) }}%
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- 12m implied cuts -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">12m Implied</div>
+      <div style="font-size:22px;font-weight:700;margin:4px 0;color:{{ '#4ade80' if fw.implied_cuts_12m_bp > 8 else ('#f87171' if fw.implied_cuts_12m_bp < -8 else '#e2e8f0') }};">
+        {{ '%+.0f'|format(fw.implied_cuts_12m_bp) }}bp
+      </div>
+      <div style="font-size:11px;color:#64748b;">cuts / hikes</div>
+    </div>
+
+  </div>
+
+  <!-- T-bill horizon bar chart -->
+  {% if fw.tbill_3m is not none and fw.tbill_6m is not none and fw.tbill_12m is not none %}
+  <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">T-Bill Implied Rates vs. FF Midpoint ({{ '%.3f'|format(fw.ff_midpoint) }}%)</div>
+  {% for label, tbill_val, cuts_bp in [
+      ('3-Month',  fw.tbill_3m,  fw.implied_cuts_3m_bp),
+      ('6-Month',  fw.tbill_6m,  fw.implied_cuts_6m_bp),
+      ('12-Month', fw.tbill_12m, fw.implied_cuts_12m_bp)
+  ] %}
+  {% set bar_color = '#4ade80' if cuts_bp > 4 else ('#f87171' if cuts_bp < -4 else '#64748b') %}
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;">
+    <div style="width:70px;font-size:12px;color:#94a3b8;text-align:right;flex-shrink:0;">{{ label }}</div>
+    <div style="width:52px;font-size:12px;color:#e2e8f0;text-align:right;flex-shrink:0;">{{ '%.3f'|format(tbill_val) }}%</div>
+    <div style="flex:1;background:#1e293b;border-radius:3px;height:12px;">
+      {% set bar_pct = [[(cuts_bp / 75 * 50 + 50) | int, 1] | max, 99] | min %}
+      <div style="width:{{ bar_pct }}%;height:100%;background:{{ bar_color }};border-radius:3px;"></div>
+    </div>
+    <div style="width:50px;font-size:11px;color:{{ bar_color }};font-weight:700;text-align:right;">{{ '%+.1f'|format(cuts_bp) }}bp</div>
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <div style="font-size:11px;color:#334155;margin-top:10px;">
+    T-bill spread = FF midpoint minus T-bill rate × 100 = market's implied rate change (bp). Positive = cuts priced in. Source: FRED DTB3/DTB6/DTB1YR.
+  </div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4c — ESTIMATE REVISION MOMENTUM
+     ══════════════════════════════════════ -->
+{% if revision_momentum_context and revision_momentum_context.tickers %}
+{% set rm = revision_momentum_context %}
+{% set sig_color = {
+    'STRONG_IMPROVING':     '#4ade80',
+    'IMPROVING':            '#86efac',
+    'NEUTRAL':              '#94a3b8',
+    'DETERIORATING':        '#fca5a5',
+    'STRONG_DETERIORATING': '#f87171'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Estimate Revision Momentum <span style="font-size:13px;font-weight:400;color:#94a3b8;">(analyst consensus trend · 30d recent vs 31-60d prior)</span></h2>
+<div class="card" style="border-left: 4px solid {{ sig_color.get(rm.signal, '#94a3b8') }};">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ rm.summary }}</p>
+
+  <!-- Top-line tiles -->
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+
+    <!-- Breadth score tile -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:140px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Breadth Score</div>
+      <div style="font-size:28px;font-weight:800;
+                  color:{{ sig_color.get(rm.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%+.2f"|format(rm.breadth_score) }}
+      </div>
+      <div style="font-size:11px;color:{{ dir_color.get(rm.direction, '#94a3b8') }};font-weight:700;">
+        {{ rm.signal.replace('_', ' ') }}
+      </div>
+    </div>
+
+    <!-- Improving / Stable / Deteriorating counts -->
+    {% set n_improving     = rm.tickers | selectattr('direction', 'equalto', 'IMPROVING') | list | length %}
+    {% set n_stable        = rm.tickers | selectattr('direction', 'equalto', 'STABLE') | list | length %}
+    {% set n_deteriorating = rm.tickers | selectattr('direction', 'equalto', 'DETERIORATING') | list | length %}
+
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:120px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Improving</div>
+      <div style="font-size:24px;font-weight:800;color:#4ade80;margin:4px 0;">{{ n_improving }}</div>
+      <div style="font-size:11px;color:#64748b;">tickers ↑</div>
+    </div>
+
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:120px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Stable</div>
+      <div style="font-size:24px;font-weight:800;color:#94a3b8;margin:4px 0;">{{ n_stable }}</div>
+      <div style="font-size:11px;color:#64748b;">tickers →</div>
+    </div>
+
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:120px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Deteriorating</div>
+      <div style="font-size:24px;font-weight:800;color:#f87171;margin:4px 0;">{{ n_deteriorating }}</div>
+      <div style="font-size:11px;color:#64748b;">tickers ↓</div>
+    </div>
+
+  </div>
+
+  <!-- Per-ticker table -->
+  <div style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">
+    Per-Ticker Revision Detail <span style="font-size:10px;">(sorted by momentum score)</span>
+  </div>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="color:#475569;text-transform:uppercase;font-size:10px;letter-spacing:.5px;">
+          <th style="text-align:left;padding:5px 8px;">Ticker</th>
+          <th style="text-align:center;padding:5px 8px;">Momentum</th>
+          <th style="text-align:center;padding:5px 8px;">Direction</th>
+          <th style="text-align:right;padding:5px 8px;">Recent ↑↓</th>
+          <th style="text-align:right;padding:5px 8px;">Prior ↑↓</th>
+          <th style="text-align:right;padding:5px 8px;">Avg PT (Recent)</th>
+          <th style="text-align:right;padding:5px 8px;">PT Chg</th>
+          <th style="text-align:right;padding:5px 8px;">Firms</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for t in rm.tickers | sort(attribute='momentum_score', reverse=True) %}
+      {% set score_col = '#4ade80' if t.momentum_score >= 0.25 else ('#f87171' if t.momentum_score <= -0.25 else '#94a3b8') %}
+      {% set dir_col   = '#4ade80' if t.direction == 'IMPROVING' else ('#f87171' if t.direction == 'DETERIORATING' else '#64748b') %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:6px 8px;color:#e2e8f0;font-weight:600;">{{ t.ticker }}</td>
+          <td style="padding:6px 8px;text-align:center;font-weight:700;color:{{ score_col }};">
+            {{ "%+.3f"|format(t.momentum_score) }}
+          </td>
+          <td style="padding:6px 8px;text-align:center;">
+            <span style="background:#1e293b;color:{{ dir_col }};border:1px solid {{ dir_col }};
+                         border-radius:4px;padding:2px 7px;font-size:10px;white-space:nowrap;">
+              {{ '▲ ' if t.direction == 'IMPROVING' else ('▼ ' if t.direction == 'DETERIORATING' else '→ ') }}{{ t.direction }}
+            </span>
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;white-space:nowrap;">
+            <span style="color:#4ade80;">{{ t.recent_upgrades }}↑</span>
+            <span style="color:#f87171;">{{ t.recent_downgrades }}↓</span>
+            {% if t.recent_pt_raises or t.recent_pt_cuts %}
+            <span style="color:#64748b;font-size:11px;">
+              &nbsp;PT:{{ t.recent_pt_raises }}↑{{ t.recent_pt_cuts }}↓
+            </span>
+            {% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#64748b;white-space:nowrap;">
+            {{ t.prior_upgrades }}↑{{ t.prior_downgrades }}↓
+            {% if t.prior_pt_raises or t.prior_pt_cuts %}
+            <span style="font-size:11px;">&nbsp;PT:{{ t.prior_pt_raises }}↑{{ t.prior_pt_cuts }}↓</span>
+            {% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">
+            {% if t.avg_pt_current is not none %}${{ "%.0f"|format(t.avg_pt_current) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-weight:700;
+                     color:{{ '#4ade80' if t.pt_change_pct and t.pt_change_pct > 0 else ('#f87171' if t.pt_change_pct and t.pt_change_pct < 0 else '#64748b') }};">
+            {% if t.pt_change_pct is not none %}{{ "%+.1f"|format(t.pt_change_pct) }}%{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#64748b;">{{ t.n_firms }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Momentum score compares recent (0-30d) vs prior (31-60d) analyst actions.
+    Positive = more upgrades/PT-raises in recent window. Negative = more downgrades/cuts.
+    Rising revisions = earnings momentum factor. Score ≥ +0.25 = IMPROVING; ≤ -0.25 = DETERIORATING.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5 — IPO PIPELINE (SEC S-1/S-11)
      ══════════════════════════════════════ -->
 {% if ipo_context and ipo_context.total_new > 0 %}
@@ -780,6 +1167,167 @@ HTML_TEMPLATE = """
   </div>
   <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
     BINARY EVENT: avoid POSITION-length trades. IV EXPANSION: pre-earnings options plays may be favoured over stock.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5c — EARNINGS WHISPER vs. CONSENSUS
+     ══════════════════════════════════════ -->
+{% if whisper_context and whisper_context.signals %}
+{% set wc = whisper_context %}
+{% set sig_color_w = {
+    'BEAT_LIKELY':   '#4ade80',
+    'BEAT_POSSIBLE': '#86efac',
+    'NEUTRAL':       '#94a3b8',
+    'MISS_POSSIBLE': '#fca5a5',
+    'MISS_LIKELY':   '#f87171'
+} %}
+{% set dir_color_w = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Earnings Whisper <span style="font-size:13px;font-weight:400;color:#94a3b8;">(implied whisper vs. sell-side consensus · beat/miss history)</span></h2>
+<div class="card" style="border-left: 4px solid #f59e0b;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ wc.summary }}</p>
+
+  <!-- Summary tiles -->
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
+
+    <div style="background:#0f172a;border-radius:8px;padding:10px 16px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.5px;">Beat Likely</div>
+      <div style="font-size:24px;font-weight:800;color:#4ade80;margin:3px 0;">{{ wc.n_beat_likely }}</div>
+    </div>
+    <div style="background:#0f172a;border-radius:8px;padding:10px 16px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.5px;">Beat Possible</div>
+      <div style="font-size:24px;font-weight:800;color:#86efac;margin:3px 0;">{{ wc.n_beat_possible }}</div>
+    </div>
+    <div style="background:#0f172a;border-radius:8px;padding:10px 16px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.5px;">Miss Possible</div>
+      <div style="font-size:24px;font-weight:800;color:#fca5a5;margin:3px 0;">{{ wc.n_miss_possible }}</div>
+    </div>
+    <div style="background:#0f172a;border-radius:8px;padding:10px 16px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.5px;">Miss Likely</div>
+      <div style="font-size:24px;font-weight:800;color:#f87171;margin:3px 0;">{{ wc.n_miss_likely }}</div>
+    </div>
+    <div style="background:#0f172a;border-radius:8px;padding:10px 16px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.5px;">Avg Beat Rate</div>
+      <div style="font-size:24px;font-weight:800;color:#e2e8f0;margin:3px 0;">{{ "%.0f"|format(wc.avg_beat_rate_pct) }}%</div>
+    </div>
+
+  </div>
+
+  <!-- Per-ticker table -->
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="color:#475569;text-transform:uppercase;font-size:10px;letter-spacing:.5px;">
+          <th style="text-align:left;padding:5px 8px;">Ticker</th>
+          <th style="text-align:center;padding:5px 8px;">Signal</th>
+          <th style="text-align:right;padding:5px 8px;">Beat Rate</th>
+          <th style="text-align:right;padding:5px 8px;">Avg Surprise</th>
+          <th style="text-align:right;padding:5px 8px;">Consensus</th>
+          <th style="text-align:right;padding:5px 8px;">Whisper</th>
+          <th style="text-align:center;padding:5px 8px;">Trend</th>
+          <th style="text-align:right;padding:5px 8px;">Rev 30d</th>
+          <th style="text-align:right;padding:5px 8px;">Earns Date</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for s in wc.signals | sort(attribute='days_until_earnings') if s.days_until_earnings is not none %}
+      {% set sc = sig_color_w.get(s.signal, '#94a3b8') %}
+        <tr style="border-top:1px solid #1e293b;">
+          <td style="padding:6px 8px;color:#e2e8f0;font-weight:600;">{{ s.ticker }}</td>
+          <td style="padding:6px 8px;text-align:center;">
+            <span style="background:#1e293b;color:{{ sc }};border:1px solid {{ sc }};
+                         border-radius:4px;padding:2px 6px;font-size:10px;white-space:nowrap;">
+              {{ s.signal.replace('_', ' ') }}
+            </span>
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#e2e8f0;font-weight:700;">
+            {% if s.quarters_analyzed > 0 %}
+            {{ "%.0f"|format(s.beat_rate_pct) }}%
+            <span style="color:#64748b;font-size:10px;">({{ s.quarters_analyzed }}q)</span>
+            {% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-weight:700;
+                     color:{{ '#4ade80' if s.avg_eps_surprise_pct > 0.5 else ('#f87171' if s.avg_eps_surprise_pct < -0.5 else '#94a3b8') }};">
+            {% if s.quarters_analyzed > 0 %}{{ "%+.1f"|format(s.avg_eps_surprise_pct) }}%{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">
+            {% if s.current_eps_estimate is not none %}${{ "%.2f"|format(s.current_eps_estimate) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-weight:700;
+                     color:{{ '#4ade80' if s.implied_whisper and s.implied_whisper > (s.current_eps_estimate or 0) else ('#f87171' if s.implied_whisper and s.implied_whisper < (s.current_eps_estimate or 0) else '#94a3b8') }};">
+            {% if s.implied_whisper is not none %}
+            ${{ "%.2f"|format(s.implied_whisper) }}
+            {% if s.whisper_gap_pct is not none %}
+            <span style="font-size:10px;">({{ "%+.1f"|format(s.whisper_gap_pct) }}%)</span>
+            {% endif %}
+            {% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:center;white-space:nowrap;">
+            {% if s.eps_trend_direction == 'REVISING_UP' %}
+            <span style="color:#4ade80;font-size:11px;">▲ UP</span>
+            {% elif s.eps_trend_direction == 'REVISING_DOWN' %}
+            <span style="color:#f87171;font-size:11px;">▼ DOWN</span>
+            {% else %}
+            <span style="color:#64748b;font-size:11px;">→ STABLE</span>
+            {% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-size:11px;color:#64748b;white-space:nowrap;">
+            {% if s.revisions_up_30d + s.revisions_down_30d > 0 %}
+            <span style="color:#4ade80;">{{ s.revisions_up_30d }}↑</span>
+            <span style="color:#f87171;">{{ s.revisions_down_30d }}↓</span>
+            {% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;font-size:11px;white-space:nowrap;">
+            {% if s.earnings_date %}{{ s.earnings_date }}&nbsp;<span style="color:#f59e0b;">{{ s.days_until_earnings }}d</span>{% else %}&mdash;{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      {% for s in wc.signals | sort(attribute='avg_eps_surprise_pct', reverse=True) if s.days_until_earnings is none %}
+      {% set sc = sig_color_w.get(s.signal, '#94a3b8') %}
+        <tr style="border-top:1px solid #1e293b;opacity:0.75;">
+          <td style="padding:6px 8px;color:#94a3b8;font-weight:600;">{{ s.ticker }}</td>
+          <td style="padding:6px 8px;text-align:center;">
+            <span style="background:#1e293b;color:{{ sc }};border:1px solid {{ sc }};
+                         border-radius:4px;padding:2px 6px;font-size:10px;white-space:nowrap;">
+              {{ s.signal.replace('_', ' ') }}
+            </span>
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#e2e8f0;">
+            {% if s.quarters_analyzed > 0 %}{{ "%.0f"|format(s.beat_rate_pct) }}%
+            <span style="color:#64748b;font-size:10px;">({{ s.quarters_analyzed }}q)</span>
+            {% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-weight:700;
+                     color:{{ '#4ade80' if s.avg_eps_surprise_pct > 0.5 else ('#f87171' if s.avg_eps_surprise_pct < -0.5 else '#94a3b8') }};">
+            {% if s.quarters_analyzed > 0 %}{{ "%+.1f"|format(s.avg_eps_surprise_pct) }}%{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#94a3b8;">
+            {% if s.current_eps_estimate is not none %}${{ "%.2f"|format(s.current_eps_estimate) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#64748b;">
+            {% if s.implied_whisper is not none %}${{ "%.2f"|format(s.implied_whisper) }}{% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:center;">
+            {% if s.eps_trend_direction == 'REVISING_UP' %}<span style="color:#4ade80;font-size:11px;">▲ UP</span>
+            {% elif s.eps_trend_direction == 'REVISING_DOWN' %}<span style="color:#f87171;font-size:11px;">▼ DOWN</span>
+            {% else %}<span style="color:#475569;font-size:11px;">→</span>{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;font-size:11px;color:#64748b;">
+            {% if s.revisions_up_30d + s.revisions_down_30d > 0 %}
+            <span style="color:#4ade80;">{{ s.revisions_up_30d }}↑</span><span style="color:#f87171;">{{ s.revisions_down_30d }}↓</span>
+            {% else %}&mdash;{% endif %}
+          </td>
+          <td style="padding:6px 8px;text-align:right;color:#475569;font-size:11px;">&mdash;</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Implied whisper = consensus × (1 + avg_historical_surprise%). A stock that beats consensus
+    but misses the implied whisper often sells off. Top rows = tickers with upcoming earnings.
+    Trend = direction of consensus over last 30 days. Source: yfinance earnings_dates, eps_trend.
   </p>
 </div>
 {% endif %}
@@ -945,7 +1493,348 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
-     6b — PUT/CALL RATIO
+     6a2 — MOVE INDEX (BOND MARKET VIX)
+     ══════════════════════════════════════ -->
+{% if move_context and move_context.move is not none %}
+{% set move_sig_color = {
+    'CALM':     '#475569',
+    'LOW':      '#94a3b8',
+    'NORMAL':   '#94a3b8',
+    'ELEVATED': '#fbbf24',
+    'HIGH':     '#fb923c',
+    'EXTREME':  '#f87171',
+    'PANIC':    '#7c3aed',
+    'UNKNOWN':  '#475569'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>MOVE Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(bond market VIX · ^MOVE / VXTLT · spikes precede equity dislocations)</span></h2>
+<div class="card" style="border-left: 4px solid {{ move_sig_color.get(move_context.signal, '#94a3b8') }};">
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- MOVE gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">MOVE</div>
+      <div style="font-size:30px;font-weight:800;color:{{ move_sig_color.get(move_context.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%.1f"|format(move_context.move) }}
+      </div>
+      <div style="font-size:11px;font-weight:700;color:{{ move_sig_color.get(move_context.signal, '#94a3b8') }};">
+        {{ move_context.signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ dir_color.get(move_context.direction, '#94a3b8') }};margin-top:3px;">
+        {{ '▼ BEARISH' if move_context.direction == 'BEARISH' else ('▲ BULLISH' if move_context.direction == 'BULLISH' else '→ NEUTRAL') }} for equities
+      </div>
+    </div>
+
+    <!-- 5d change + spike warning -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:140px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">5-Day Change</div>
+      {% if move_context.spike_5d is not none %}
+      <div style="font-size:20px;font-weight:800;color:{{ '#f87171' if move_context.spike_5d > 0 else '#4ade80' }};">
+        {{ "%+.1f"|format(move_context.spike_5d) }}pt
+      </div>
+      {% endif %}
+      {% if move_context.is_spiking %}
+      <div style="font-size:11px;color:#f87171;font-weight:700;margin-top:4px;">⚠ SPIKING</div>
+      {% endif %}
+    </div>
+
+    <!-- 20d avg -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:130px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">20d Average</div>
+      {% if move_context.move_20d_avg is not none %}
+      <div style="font-size:20px;font-weight:800;color:#94a3b8;">
+        {{ "%.1f"|format(move_context.move_20d_avg) }}
+      </div>
+      {% set vs_avg = move_context.move - move_context.move_20d_avg %}
+      <div style="font-size:11px;color:{{ '#f87171' if vs_avg > 5 else ('#4ade80' if vs_avg < -5 else '#94a3b8') }};margin-top:3px;">
+        {{ "%+.1f"|format(vs_avg) }}pt vs avg
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- MOVE/VIX ratio -->
+    {% if move_context.move_vix_ratio is not none %}
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:130px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">MOVE / VIX</div>
+      <div style="font-size:20px;font-weight:800;color:{{ '#f87171' if move_context.move_vix_ratio > 8 else '#94a3b8' }};">
+        {{ "%.1f"|format(move_context.move_vix_ratio) }}×
+      </div>
+      {% if move_context.move_vix_ratio > 8 %}
+      <div style="font-size:10px;color:#fb923c;margin-top:3px;">Bond fear > equity fear</div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+  </div>
+
+  {% if move_context.is_spiking and move_context.spike_5d is not none and move_context.spike_5d > 0 %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:10px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ BOND VOL SPIKE — Treasury implied vol surged {{ "%+.1f"|format(move_context.spike_5d) }}pt in 5 days. Equity dislocation risk elevated.
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 6px 0;">{{ move_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:0;">
+    Source: {{ move_context.source }}.
+    Typical range 60–130 (normal). Readings above 120 precede equity weakness.
+    MOVE/VIX ratio normally 4–7×; above 8× indicates bond market pricing stress equities haven't reflected.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a3 — GLOBAL MACRO (DXY + Copper/Gold)
+     ══════════════════════════════════════ -->
+{% if global_macro_context %}
+{% set gm = global_macro_context %}
+{% set gm_composite_colors = {
+    'RISK_ON':      '#4ade80',
+    'CONSTRUCTIVE': '#86efac',
+    'NEUTRAL':      '#94a3b8',
+    'DEFENSIVE':    '#fca5a5',
+    'RISK_OFF':     '#f87171',
+    'UNKNOWN':      '#475569'
+} %}
+{% set dxy_colors = {
+    'STRONG_BULL': '#f87171',
+    'BULL':        '#fca5a5',
+    'NEUTRAL':     '#94a3b8',
+    'BEAR':        '#86efac',
+    'STRONG_BEAR': '#4ade80',
+    'UNKNOWN':     '#475569'
+} %}
+{% set cg_colors = {
+    'RISK_ON_SURGE':   '#4ade80',
+    'RISK_ON':         '#86efac',
+    'NEUTRAL':         '#94a3b8',
+    'RISK_OFF':        '#fca5a5',
+    'RISK_OFF_CRASH':  '#f87171',
+    'UNKNOWN':         '#475569'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Global Macro <span style="font-size:13px;font-weight:400;color:#94a3b8;">(DXY dollar strength · Copper/Gold ratio · cross-asset regime)</span></h2>
+<div class="card" style="border-left: 4px solid {{ gm_composite_colors.get(gm.composite_signal, '#475569') }};">
+
+  {% if gm.copper_gold_signal == 'RISK_OFF_CRASH' or gm.dxy_signal == 'STRONG_BULL' %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;color:#f87171;font-weight:700;">
+    {% if gm.copper_gold_signal == 'RISK_OFF_CRASH' %}
+    ⚠ DR. COPPER CRASH — Copper/Gold ratio collapsing{{ ' (' + '%+.1f'|format(gm.copper_gold_change_20d) + '% 20d)' if gm.copper_gold_change_20d is not none else '' }}. Markets pricing recession risk. Avoid cyclical longs.
+    {% elif gm.dxy_signal == 'STRONG_BULL' %}
+    ⚠ DOLLAR SURGE — DXY strong{{ ' (' + '%+.2f'|format(gm.dxy_return_5d) + '% 5d)' if gm.dxy_return_5d is not none else '' }}. Headwind for EM equities, commodities, and multinationals.
+    {% endif %}
+  </div>
+  {% elif gm.copper_gold_signal == 'RISK_ON_SURGE' or gm.dxy_signal == 'STRONG_BEAR' %}
+  <div style="background:#14532d;border:1px solid #4ade80;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;color:#4ade80;font-weight:700;">
+    {% if gm.copper_gold_signal == 'RISK_ON_SURGE' %}
+    ⚡ DR. COPPER SURGE — Copper/Gold ratio rallying{{ ' (' + '%+.1f'|format(gm.copper_gold_change_20d) + '% 20d)' if gm.copper_gold_change_20d is not none else '' }}. Cyclical growth signal. Favour industrials and EM.
+    {% elif gm.dxy_signal == 'STRONG_BEAR' %}
+    ⚡ DOLLAR WEAKNESS — DXY falling sharply{{ ' (' + '%+.2f'|format(gm.dxy_return_5d) + '% 5d)' if gm.dxy_return_5d is not none else '' }}. Tailwind for commodities and emerging markets.
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+
+    <!-- Composite tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:150px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Composite</div>
+      <div style="font-size:15px;font-weight:800;color:{{ gm_composite_colors.get(gm.composite_signal, '#94a3b8') }};">
+        {{ gm.composite_signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:10px;color:{{ dir_color.get(gm.composite_direction, '#94a3b8') }};margin-top:4px;">
+        {{ gm.composite_direction }}
+      </div>
+    </div>
+
+    <!-- DXY tile -->
+    {% if gm.dxy is not none %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">DXY (US Dollar)</div>
+      <div style="font-size:24px;font-weight:800;color:{{ dxy_colors.get(gm.dxy_signal, '#94a3b8') }};">
+        {{ "%.2f"|format(gm.dxy) }}
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:4px;flex-wrap:wrap;">
+        {% if gm.dxy_return_5d is not none %}
+        <span style="font-size:11px;color:{{ '#f87171' if gm.dxy_return_5d > 0 else '#4ade80' }};">5d {{ "%+.2f"|format(gm.dxy_return_5d) }}%</span>
+        {% endif %}
+        {% if gm.dxy_return_20d is not none %}
+        <span style="font-size:11px;color:#64748b;">20d {{ "%+.2f"|format(gm.dxy_return_20d) }}%</span>
+        {% endif %}
+      </div>
+      <div style="font-size:11px;font-weight:700;color:{{ dxy_colors.get(gm.dxy_signal, '#94a3b8') }};margin-top:4px;">
+        {{ gm.dxy_signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:10px;color:{{ dir_color.get(gm.dxy_direction, '#94a3b8') }};margin-top:2px;">
+        {{ gm.dxy_direction }} for equities
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Copper/Gold ratio tile -->
+    {% if gm.copper_gold_ratio is not none %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:180px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Copper / Gold ratio</div>
+      <div style="font-size:20px;font-weight:800;color:{{ cg_colors.get(gm.copper_gold_signal, '#94a3b8') }};">
+        {{ "%.5f"|format(gm.copper_gold_ratio) }}
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:4px;flex-wrap:wrap;">
+        {% if gm.copper_gold_change_5d is not none %}
+        <span style="font-size:11px;color:{{ '#4ade80' if gm.copper_gold_change_5d > 0 else '#f87171' }};">5d {{ "%+.1f"|format(gm.copper_gold_change_5d) }}%</span>
+        {% endif %}
+        {% if gm.copper_gold_change_20d is not none %}
+        <span style="font-size:11px;color:{{ '#4ade80' if gm.copper_gold_change_20d > 0 else '#f87171' }};">20d {{ "%+.1f"|format(gm.copper_gold_change_20d) }}%</span>
+        {% endif %}
+      </div>
+      <div style="font-size:11px;font-weight:700;color:{{ cg_colors.get(gm.copper_gold_signal, '#94a3b8') }};margin-top:4px;">
+        {{ gm.copper_gold_signal.replace('_', ' ') }}
+      </div>
+      {% if gm.copper_price is not none and gm.gold_price is not none %}
+      <div style="font-size:10px;color:#475569;margin-top:3px;">Cu {{ "%.4f"|format(gm.copper_price) }} · Au ${{ "%.0f"|format(gm.gold_price) }}</div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- Oil tile -->
+    {% if gm.oil_price is not none %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:150px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">WTI Oil (CL=F)</div>
+      <div style="font-size:24px;font-weight:800;color:{{ '#4ade80' if gm.oil_return_5d is not none and gm.oil_return_5d > 0 else ('#f87171' if gm.oil_return_5d is not none and gm.oil_return_5d < 0 else '#94a3b8') }};">
+        ${{ "%.1f"|format(gm.oil_price) }}
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:4px;flex-wrap:wrap;">
+        {% if gm.oil_return_5d is not none %}
+        <span style="font-size:11px;color:{{ '#4ade80' if gm.oil_return_5d > 0 else '#f87171' }};">5d {{ "%+.1f"|format(gm.oil_return_5d) }}%</span>
+        {% endif %}
+        {% if gm.oil_return_20d is not none %}
+        <span style="font-size:11px;color:#64748b;">20d {{ "%+.1f"|format(gm.oil_return_20d) }}%</span>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Oil/Bond divergence tile -->
+    {% if gm.oil_bond_signal != 'NEUTRAL' and gm.oil_return_5d is not none and gm.tlt_return_5d_ob is not none %}
+    {% set ob_colors = {
+        'POLICY_PIVOT_SIGNAL':   '#4ade80',
+        'STAGFLATION_RISK':      '#f87171',
+        'GROWTH_FEAR_RISK_OFF':  '#fca5a5',
+        'DEFLATION_SHOCK':       '#f87171',
+        'NEUTRAL':               '#94a3b8'
+    } %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:180px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Oil / Bond Divergence</div>
+      <div style="font-size:11px;font-weight:700;color:{{ ob_colors.get(gm.oil_bond_signal, '#94a3b8') }};margin-top:4px;">
+        {{ gm.oil_bond_signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:4px;">
+        Oil {{ "%+.1f"|format(gm.oil_return_5d) }}% · TLT {{ "%+.1f"|format(gm.tlt_return_5d_ob) }}%
+      </div>
+      <div style="font-size:10px;color:{{ dir_color.get(gm.oil_bond_direction, '#94a3b8') }};margin-top:3px;font-weight:700;">
+        {{ gm.oil_bond_direction }}
+      </div>
+    </div>
+    {% endif %}
+
+  </div>
+
+  <!-- Oil/Bond divergence alert banners -->
+  {% if gm.oil_bond_signal == 'POLICY_PIVOT_SIGNAL' %}
+  <div style="background:#14532d;border:1px solid #4ade80;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#4ade80;font-weight:700;">
+    ⚡ OIL/BOND POLICY PIVOT — Oil and bonds rallying simultaneously (Oil {{ "%+.1f"|format(gm.oil_return_5d) }}%, TLT {{ "%+.1f"|format(gm.tlt_return_5d_ob) }}% 5d). Unusual co-movement signals Fed policy pivot expected. Short-term bullish for equities.
+  </div>
+  {% elif gm.oil_bond_signal == 'STAGFLATION_RISK' %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ STAGFLATION RISK — Oil surging ({{ "%+.1f"|format(gm.oil_return_5d) }}% 5d) while bonds sell off (TLT {{ "%+.1f"|format(gm.tlt_return_5d_ob) }}% 5d). Rising costs + tightening rates = worst regime for equity valuations.
+  </div>
+  {% elif gm.oil_bond_signal == 'GROWTH_FEAR_RISK_OFF' %}
+  <div style="background:#450a0a;border:1px solid #fca5a5;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#fca5a5;font-weight:700;">
+    ⚠ GROWTH FEAR — Oil falling ({{ "%+.1f"|format(gm.oil_return_5d) }}% 5d) + bonds rallying (TLT {{ "%+.1f"|format(gm.tlt_return_5d_ob) }}% 5d). Classic pre-recession signal: demand destruction + flight to safety.
+  </div>
+  {% elif gm.oil_bond_signal == 'DEFLATION_SHOCK' %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ DEFLATION SHOCK — Oil ({{ "%+.1f"|format(gm.oil_return_5d) }}% 5d) and bonds (TLT {{ "%+.1f"|format(gm.tlt_return_5d_ob) }}% 5d) selling off together. Broad de-risking or liquidity squeeze. Avoid new longs.
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0;">{{ gm.summary }}</p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6b — CREDIT MARKET (HYG vs SPY)
+     ══════════════════════════════════════ -->
+{% if credit_context and credit_context.divergence_5d is not none %}
+{% set cr_color = {
+    'CREDIT_STRESS':  '#f87171',
+    'CREDIT_CAUTION': '#fb923c',
+    'NEUTRAL':        '#94a3b8',
+    'CREDIT_STRONG':  '#86efac',
+    'CREDIT_SURGE':   '#4ade80',
+    'UNKNOWN':        '#64748b'
+} %}
+{% set cr_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Credit Market <span style="font-size:13px;font-weight:400;color:#94a3b8;">(HYG vs SPY · leading indicator)</span></h2>
+<div class="card" style="border-left: 4px solid {{ cr_color.get(credit_context.signal, '#94a3b8') }};">
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+
+    <!-- Divergence gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:130px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">HYG−SPY 5d div</div>
+      <div style="font-size:26px;font-weight:800;color:{{ cr_color.get(credit_context.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%+.2f"|format(credit_context.divergence_5d) }}%
+      </div>
+      <div style="font-size:11px;font-weight:700;color:{{ cr_color.get(credit_context.signal, '#94a3b8') }};">
+        {{ credit_context.signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ cr_dir_color.get(credit_context.direction, '#94a3b8') }};margin-top:3px;">
+        {{ '▲ BULLISH' if credit_context.direction == 'BULLISH' else ('▼ BEARISH' if credit_context.direction == 'BEARISH' else '→ NEUTRAL') }}
+      </div>
+    </div>
+
+    <!-- HYG / SPY breakdown -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;flex:1;min-width:200px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">5-day returns</div>
+      {% for label, ret in [('HYG (high-yield bonds)', credit_context.hyg_return_5d), ('SPY (S&P 500)', credit_context.spy_return_5d)] %}
+      {% if ret is not none %}
+      {% set bar_color = '#4ade80' if ret >= 0 else '#f87171' %}
+      <div style="margin-bottom:7px;">
+        <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px;">
+          <span style="color:#94a3b8;">{{ label }}</span>
+          <span style="color:{{ bar_color }};font-weight:700;">{{ "%+.2f"|format(ret) }}%</span>
+        </div>
+        {% set bar_w = [(ret | abs * 6) | int, 100] | min %}
+        <div style="height:4px;border-radius:2px;background:#1e293b;">
+          <div style="height:4px;width:{{ bar_w }}%;border-radius:2px;background:{{ bar_color }};"></div>
+        </div>
+      </div>
+      {% endif %}
+      {% endfor %}
+      {% if credit_context.hyg_return_1d is not none and credit_context.spy_return_1d is not none %}
+      <div style="margin-top:8px;font-size:11px;color:#475569;">
+        1-day: HYG {{ "%+.2f"|format(credit_context.hyg_return_1d) }}%  /  SPY {{ "%+.2f"|format(credit_context.spy_return_1d) }}%
+      </div>
+      {% endif %}
+    </div>
+
+  </div>
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 6px 0;">{{ credit_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:0;">
+    High-yield bonds lead equities by 1–3 days. CREDIT_STRESS → watch for equity follow-through weakness.
+    CREDIT_SURGE → risk-on confirmation, bullish for cyclicals and growth.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6c — PUT/CALL RATIO
      ══════════════════════════════════════ -->
 {% if put_call_context %}
 {% set mkt_color = {
@@ -1109,7 +1998,259 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
-     6d — GAMMA EXPOSURE (GEX)
+     6d — MARKET BREADTH (200-day SMA)
+     ══════════════════════════════════════ -->
+{% if breadth_context %}
+{% set bc_sig_color = {
+    'BREADTH_COLLAPSE': '#f87171',
+    'BREADTH_WEAK':     '#fb923c',
+    'BREADTH_MIXED':    '#94a3b8',
+    'BREADTH_HEALTHY':  '#4ade80',
+    'BREADTH_EXTENDED': '#fbbf24'
+} %}
+{% set bc_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Market Breadth <span style="font-size:13px;font-weight:400;color:#94a3b8;">(% sector ETFs above 200-day SMA)</span></h2>
+<div class="card" style="border-left: 4px solid {{ bc_sig_color.get(breadth_context.signal, '#94a3b8') }};">
+
+  {% if breadth_context.is_breadth_thrust %}
+  <div style="background:#14532d;border:1px solid #4ade80;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;
+              color:#4ade80;font-weight:700;">
+    ⚡ BREADTH THRUST CONFIRMED — rising strongly from oversold levels.
+    Historically one of the strongest multi-month bullish signals.
+  </div>
+  {% endif %}
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- Gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:130px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Above 200d SMA</div>
+      <div style="font-size:32px;font-weight:800;
+                  color:{{ bc_sig_color.get(breadth_context.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%.0f"|format(breadth_context.pct_above_200d) }}%
+      </div>
+      <div style="font-size:12px;color:#94a3b8;">
+        {{ breadth_context.etfs_above }}/{{ breadth_context.etf_count }} ETFs
+      </div>
+      <div style="font-size:11px;font-weight:700;
+                  color:{{ bc_sig_color.get(breadth_context.signal, '#94a3b8') }};margin-top:3px;">
+        {{ breadth_context.signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;
+                  color:{{ bc_dir_color.get(breadth_context.direction, '#94a3b8') }};margin-top:2px;">
+        {{ '▲ BULLISH' if breadth_context.direction == 'BULLISH'
+           else ('▼ BEARISH' if breadth_context.direction == 'BEARISH' else '→ NEUTRAL') }}
+      </div>
+    </div>
+
+    <!-- 5-day change + SPY tiles -->
+    <div style="display:flex;flex-direction:column;gap:8px;justify-content:center;">
+
+      {% if breadth_context.pct_above_200d_5d_ago is not none %}
+      {% set delta = breadth_context.pct_above_200d - breadth_context.pct_above_200d_5d_ago %}
+      <div style="background:#0f172a;border-radius:6px;padding:8px 14px;">
+        <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">5-Session Change</div>
+        <div style="font-size:18px;font-weight:700;margin:3px 0;
+                    color:{{ '#4ade80' if delta > 0 else ('#f87171' if delta < 0 else '#94a3b8') }};">
+          {{ "%+.0f"|format(delta) }}pp
+        </div>
+        <div style="font-size:11px;color:#64748b;">
+          {{ "%.0f"|format(breadth_context.pct_above_200d_5d_ago) }}% &rarr; {{ "%.0f"|format(breadth_context.pct_above_200d) }}%
+        </div>
+      </div>
+      {% endif %}
+
+      {% if breadth_context.spy_above_200d is not none %}
+      <div style="background:#0f172a;border-radius:6px;padding:8px 14px;">
+        <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">SPY vs 200d SMA</div>
+        <div style="font-size:15px;font-weight:700;margin:3px 0;
+                    color:{{ '#4ade80' if breadth_context.spy_above_200d else '#f87171' }};">
+          {{ 'ABOVE' if breadth_context.spy_above_200d else 'BELOW' }}
+        </div>
+        {% if breadth_context.spy_200d_distance_pct is not none %}
+        <div style="font-size:11px;color:#64748b;">
+          {{ "%+.1f"|format(breadth_context.spy_200d_distance_pct) }}% from 200d SMA
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+
+    </div>
+
+    <!-- Progress bar with zone markers -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;flex:1;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;
+                  letter-spacing:.5px;margin-bottom:10px;">Breadth Level</div>
+      <div style="background:#1e293b;border-radius:6px;height:20px;
+                  position:relative;margin-bottom:6px;overflow:hidden;">
+        <div style="width:{{ "%.0f"|format(breadth_context.pct_above_200d) }}%;
+                    background:{{ bc_sig_color.get(breadth_context.signal, '#94a3b8') }};
+                    height:100%;border-radius:6px;"></div>
+        <div style="position:absolute;left:30%;top:0;height:100%;
+                    border-left:1px dashed #475569;"></div>
+        <div style="position:absolute;left:70%;top:0;height:100%;
+                    border-left:1px dashed #475569;"></div>
+        <div style="position:absolute;left:85%;top:0;height:100%;
+                    border-left:1px dashed #475569;"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#475569;margin-bottom:10px;">
+        <span>0%</span><span>30%</span><span>70%</span><span>85%</span><span>100%</span>
+      </div>
+      <div style="font-size:11px;color:#64748b;line-height:1.8;">
+        <span style="color:#f87171;">■</span> &lt;30% Collapse &nbsp;
+        <span style="color:#fb923c;">■</span> 30–50% Weak &nbsp;
+        <span style="color:#94a3b8;">■</span> 50–70% Mixed<br>
+        <span style="color:#4ade80;">■</span> 70–85% Healthy &nbsp;
+        <span style="color:#fbbf24;">■</span> &gt;85% Extended (contrarian bearish)
+      </div>
+    </div>
+
+  </div>
+
+  <p style="color:#94a3b8;font-size:12px;margin:0;">{{ breadth_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    Based on 11 SPDR sector ETFs (XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLB, XLU, XLRE, XLC).
+    Sub-30% breadth with a rising thrust = historically one of the strongest multi-month bullish setups.
+    Extended breadth (&gt;85%) is a contrarian risk — limited upside when nearly all sectors are overbought.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6e — MCCLELLAN OSCILLATOR
+     ══════════════════════════════════════ -->
+{% if mcclellan_context %}
+{% set osc_sig_color = {
+    'OVERBOUGHT':       '#fbbf24',
+    'BULLISH_MOMENTUM': '#4ade80',
+    'NEUTRAL':          '#94a3b8',
+    'BEARISH_MOMENTUM': '#fb923c',
+    'OVERSOLD':         '#60a5fa'
+} %}
+{% set sum_sig_color = {
+    'EXTENDED_BULL': '#fbbf24',
+    'BULL_TREND':    '#4ade80',
+    'NEUTRAL':       '#94a3b8',
+    'BEAR_TREND':    '#fb923c',
+    'EXTENDED_BEAR': '#f87171'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>McClellan Oscillator <span style="font-size:13px;font-weight:400;color:#94a3b8;">(NYSE A/D breadth momentum · swing timing)</span></h2>
+<div class="card" style="border-left: 4px solid {{ osc_sig_color.get(mcclellan_context.osc_signal, '#94a3b8') }};">
+
+  {% if mcclellan_context.is_bullish_cross %}
+  <div style="background:#14532d;border:1px solid #4ade80;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;color:#4ade80;font-weight:700;">
+    ⚡ BULLISH ZERO CROSS — oscillator crossed above 0. Highest-conviction swing-trade BUY timing signal.
+  </div>
+  {% elif mcclellan_context.is_bearish_cross %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ BEARISH ZERO CROSS — oscillator crossed below 0. Bearish momentum shift confirmed.
+  </div>
+  {% endif %}
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- Oscillator gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:130px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Oscillator</div>
+      <div style="font-size:28px;font-weight:800;
+                  color:{{ osc_sig_color.get(mcclellan_context.osc_signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%+.1f"|format(mcclellan_context.oscillator) }}
+      </div>
+      {% if mcclellan_context.oscillator_5d_ago is not none %}
+      <div style="font-size:11px;color:#64748b;">
+        5d ago: {{ "%+.1f"|format(mcclellan_context.oscillator_5d_ago) }}
+        <span style="color:{{ '#4ade80' if mcclellan_context.oscillator > mcclellan_context.oscillator_5d_ago else '#f87171' }};">
+          ({{ "%+.1f"|format(mcclellan_context.oscillator - mcclellan_context.oscillator_5d_ago) }})
+        </span>
+      </div>
+      {% endif %}
+      <div style="font-size:11px;font-weight:700;
+                  color:{{ osc_sig_color.get(mcclellan_context.osc_signal, '#94a3b8') }};margin-top:4px;">
+        {{ mcclellan_context.osc_signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ dir_color.get(mcclellan_context.direction, '#94a3b8') }};margin-top:2px;">
+        {{ '▲ BULLISH' if mcclellan_context.direction == 'BULLISH' else ('▼ BEARISH' if mcclellan_context.direction == 'BEARISH' else '→ NEUTRAL') }}
+      </div>
+    </div>
+
+    <!-- Summation Index -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:130px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Summation Index</div>
+      <div style="font-size:24px;font-weight:800;
+                  color:{{ sum_sig_color.get(mcclellan_context.sum_signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%+.0f"|format(mcclellan_context.summation) }}
+      </div>
+      {% if mcclellan_context.summation_5d_ago is not none %}
+      {% set si_delta = mcclellan_context.summation - mcclellan_context.summation_5d_ago %}
+      <div style="font-size:11px;color:#64748b;">
+        5d Δ <span style="color:{{ '#4ade80' if si_delta > 0 else '#f87171' }};">{{ "%+.0f"|format(si_delta) }}</span>
+      </div>
+      {% endif %}
+      <div style="font-size:11px;font-weight:700;
+                  color:{{ sum_sig_color.get(mcclellan_context.sum_signal, '#94a3b8') }};margin-top:4px;">
+        {{ mcclellan_context.sum_signal.replace('_', ' ') }}
+      </div>
+    </div>
+
+    <!-- EMA values + oscillator zero-bar -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;flex:1;min-width:200px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">
+        A/D Momentum (EMA19 − EMA39)
+      </div>
+      <!-- Zero-line bar -->
+      {% set osc_abs = mcclellan_context.oscillator|abs %}
+      {% set bar_pct = [osc_abs / 1.5, 100]|min|int %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        {% if mcclellan_context.oscillator >= 0 %}
+        <div style="width:50%;text-align:right;">
+          <div style="background:#1e293b;height:14px;border-radius:3px 0 0 3px;position:relative;overflow:hidden;">
+          </div>
+        </div>
+        <div style="width:4px;background:#475569;height:20px;flex-shrink:0;"></div>
+        <div style="width:50%;">
+          <div style="width:{{ bar_pct }}%;background:{{ osc_sig_color.get(mcclellan_context.osc_signal,'#94a3b8') }};
+                      height:14px;border-radius:0 3px 3px 0;"></div>
+        </div>
+        {% else %}
+        <div style="width:50%;text-align:right;">
+          <div style="display:flex;justify-content:flex-end;">
+            <div style="width:{{ bar_pct }}%;background:{{ osc_sig_color.get(mcclellan_context.osc_signal,'#94a3b8') }};
+                        height:14px;border-radius:3px 0 0 3px;"></div>
+          </div>
+        </div>
+        <div style="width:4px;background:#475569;height:20px;flex-shrink:0;"></div>
+        <div style="width:50%;">
+          <div style="background:#1e293b;height:14px;border-radius:0 3px 3px 0;"></div>
+        </div>
+        {% endif %}
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#475569;margin-bottom:10px;">
+        <span>Oversold</span><span>← 0 →</span><span>Overbought</span>
+      </div>
+      <div style="font-size:12px;color:#94a3b8;line-height:1.7;">
+        EMA19 (fast): <strong style="color:#e2e8f0;">{{ "%+.1f"|format(mcclellan_context.ema19) }}</strong>
+        &nbsp;&nbsp;EMA39 (slow): <strong style="color:#e2e8f0;">{{ "%+.1f"|format(mcclellan_context.ema39) }}</strong>
+      </div>
+    </div>
+
+  </div>
+
+  <p style="color:#94a3b8;font-size:12px;margin:0;">{{ mcclellan_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    McClellan Oscillator = EMA(19) − EMA(39) of daily NYSE net advances (^NYAD).
+    Zero-line crossings are the primary swing-trade timing signal.
+    Oscillator &lt; −100 + turning up = capitulation reversal setup (contrarian bullish).
+    Summation Index is the running total: trend is bullish above 0, bearish below 0.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6f — GAMMA EXPOSURE (GEX)
      ══════════════════════════════════════ -->
 {% if gex_context and gex_context.signals %}
 {% set gex_sig_color = {
@@ -1189,6 +2330,450 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     6f2 — OPEX CALENDAR
+     ══════════════════════════════════════ -->
+{% if opex_context %}
+{% set opex_colors = {
+    'OPEX_DAY':             '#f87171',
+    'OPEX_IMMINENT':        '#fb923c',
+    'TRIPLE_WITCHING_WEEK': '#a78bfa',
+    'OPEX_WEEK':            '#60a5fa',
+    'POST_OPEX':            '#34d399',
+    'NEUTRAL':              '#475569'
+} %}
+{% set ox = opex_context %}
+<h2>OpEx Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(options expiration · max pain timing · pure date math)</span></h2>
+<div class="card" style="border-left: 4px solid {{ opex_colors.get(ox.signal, '#475569') }};">
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+
+    <!-- Signal tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Signal</div>
+      <div style="font-size:15px;font-weight:800;color:{{ opex_colors.get(ox.signal, '#94a3b8') }};">
+        {{ ox.signal.replace('_', ' ') }}
+      </div>
+      {% if ox.is_triple_witching %}
+      <div style="font-size:10px;color:#a78bfa;margin-top:4px;font-weight:700;">TRIPLE WITCHING</div>
+      {% endif %}
+    </div>
+
+    <!-- Next OpEx tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:140px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Next OpEx</div>
+      <div style="font-size:17px;font-weight:700;color:#e2e8f0;">{{ ox.next_opex.strftime('%b %d') }}</div>
+      <div style="font-size:12px;color:{{ '#f87171' if ox.days_to_opex <= 1 else ('#fb923c' if ox.days_to_opex <= 5 else '#94a3b8') }};margin-top:3px;">
+        {{ ox.days_to_opex }}d away
+      </div>
+    </div>
+
+    <!-- Previous OpEx tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:140px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Prev OpEx</div>
+      <div style="font-size:17px;font-weight:700;color:#475569;">{{ ox.prev_opex.strftime('%b %d') }}</div>
+      <div style="font-size:12px;color:{{ '#34d399' if ox.in_post_opex_window else '#475569' }};margin-top:3px;">
+        {{ ox.days_since_prev_opex }}d ago{% if ox.in_post_opex_window %} · POST-OPEX{% endif %}
+      </div>
+    </div>
+
+    <!-- Max pain effect tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:180px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Max Pain Gravity</div>
+      {% if ox.signal in ('OPEX_DAY', 'OPEX_IMMINENT') %}
+      <div style="font-size:13px;font-weight:700;color:#f87171;">PEAK STRENGTH</div>
+      <div style="font-size:11px;color:#64748b;margin-top:3px;">Strongest pin force</div>
+      {% elif ox.signal in ('TRIPLE_WITCHING_WEEK', 'OPEX_WEEK') %}
+      <div style="font-size:13px;font-weight:700;color:#60a5fa;">ELEVATED</div>
+      <div style="font-size:11px;color:#64748b;margin-top:3px;">Amplified vs baseline</div>
+      {% elif ox.signal == 'POST_OPEX' %}
+      <div style="font-size:13px;font-weight:700;color:#34d399;">RELEASED</div>
+      <div style="font-size:11px;color:#64748b;margin-top:3px;">Pin unwinding · discount</div>
+      {% else %}
+      <div style="font-size:13px;font-weight:700;color:#475569;">BASELINE</div>
+      <div style="font-size:11px;color:#64748b;margin-top:3px;">Normal weighting</div>
+      {% endif %}
+    </div>
+
+  </div>
+  <p style="color:#cbd5e1;font-size:13px;margin:0;">{{ ox.summary }}</p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6f3 — SEASONALITY CALENDAR
+     ══════════════════════════════════════ -->
+{% if seasonality_context %}
+{% set sc = seasonality_context %}
+{% set bias_colors = {
+    'BULLISH': '#4ade80',
+    'NEUTRAL': '#94a3b8',
+    'BEARISH': '#f87171'
+} %}
+{% set composite_colors = {
+    'STRONG_TAILWIND': '#4ade80',
+    'TAILWIND':        '#86efac',
+    'NEUTRAL':         '#94a3b8',
+    'HEADWIND':        '#fca5a5',
+    'STRONG_HEADWIND': '#f87171'
+} %}
+{% set effect_dir_colors = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>Seasonal Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(monthly biases · calendar windows · pure date math)</span></h2>
+<div class="card" style="border-left: 4px solid {{ composite_colors.get(sc.composite_signal, '#475569') }};">
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+
+    <!-- Month tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:140px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Month</div>
+      <div style="font-size:17px;font-weight:800;color:#e2e8f0;">{{ sc.month_name }}</div>
+      <div style="font-size:11px;color:#64748b;margin-top:3px;">Q{{ sc.quarter }} · {{ sc.today.year }}</div>
+    </div>
+
+    <!-- Monthly bias tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Monthly Bias</div>
+      <div style="font-size:15px;font-weight:800;color:{{ bias_colors.get(sc.monthly_bias, '#94a3b8') }};">
+        {{ sc.monthly_bias }}
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:4px;">{{ sc.monthly_signal.replace('_', ' ') }}</div>
+    </div>
+
+    <!-- Composite tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:180px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Composite Signal</div>
+      <div style="font-size:14px;font-weight:800;color:{{ composite_colors.get(sc.composite_signal, '#94a3b8') }};">
+        {{ sc.composite_signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:4px;">{{ sc.composite_direction }}</div>
+    </div>
+
+    <!-- Active windows tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:140px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Active Windows</div>
+      <div style="font-size:22px;font-weight:800;color:{{ '#4ade80' if sc.active_effects else '#475569' }};">
+        {{ sc.active_effects|length }}
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:3px;">calendar effect{{ 's' if sc.active_effects|length != 1 else '' }} active</div>
+    </div>
+
+  </div>
+
+  {% if sc.active_effects %}
+  <div style="margin-bottom:14px;">
+    <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Active Calendar Effects</div>
+    {% for effect in sc.active_effects %}
+    <div style="background:#0f172a;border-radius:6px;padding:8px 12px;margin-bottom:6px;
+                border-left:3px solid {{ effect_dir_colors.get(effect.direction, '#94a3b8') }};">
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:3px;">
+        <span style="font-weight:700;color:#e2e8f0;font-size:13px;">{{ effect.name }}</span>
+        <span style="font-size:11px;font-weight:700;color:{{ effect_dir_colors.get(effect.direction, '#94a3b8') }};">{{ effect.direction }}</span>
+        <span style="font-size:11px;color:#64748b;">{{ effect.assets_affected }}</span>
+      </div>
+      <div style="color:#94a3b8;font-size:12px;">{{ effect.description }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0;">{{ sc.summary }}</p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6f4 — BOND MARKET INTERNALS
+     ══════════════════════════════════════ -->
+{% if bond_internals_context %}
+{% set bi = bond_internals_context %}
+{% set regime_colors = {
+    'RISK_ON':      '#4ade80',
+    'CONSTRUCTIVE': '#86efac',
+    'NEUTRAL':      '#94a3b8',
+    'DEFENSIVE':    '#fca5a5',
+    'RISK_OFF':     '#f87171',
+    'REFLATIONARY': '#fb923c'
+} %}
+{% set curve_colors = {
+    'DEEPLY_INVERTED': '#f87171',
+    'INVERTED':        '#fca5a5',
+    'FLAT':            '#fbbf24',
+    'NORMAL':          '#94a3b8',
+    'STEEP':           '#4ade80',
+    'UNKNOWN':         '#475569'
+} %}
+{% set tlt_colors = {
+    'RALLYING_STRONG': '#4ade80',
+    'RALLYING':        '#86efac',
+    'FLAT':            '#94a3b8',
+    'FALLING':         '#fca5a5',
+    'FALLING_STRONG':  '#f87171',
+    'UNKNOWN':         '#475569'
+} %}
+{% set ig_colors = {
+    'IG_STRESS':  '#f87171',
+    'IG_CAUTION': '#fb923c',
+    'NEUTRAL':    '#94a3b8',
+    'IG_STRONG':  '#4ade80',
+    'UNKNOWN':    '#475569'
+} %}
+<h2>Bond Market Internals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(1–8 week macro regime · Treasury curve · TLT/TIP/LQD · yfinance)</span></h2>
+<div class="card" style="border-left: 4px solid {{ regime_colors.get(bi.regime, '#475569') }};">
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+
+    <!-- Regime tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Regime</div>
+      <div style="font-size:15px;font-weight:800;color:{{ regime_colors.get(bi.regime, '#94a3b8') }};">{{ bi.regime }}</div>
+      <div style="font-size:10px;color:#64748b;margin-top:4px;">{{ bi.direction }}</div>
+    </div>
+
+    <!-- Yield curve tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">10Y − 3M Spread</div>
+      {% if bi.spread_10y_3m is not none %}
+      <div style="font-size:20px;font-weight:800;color:{{ curve_colors.get(bi.curve_signal, '#94a3b8') }};">
+        {{ "%+.2f"|format(bi.spread_10y_3m) }}pp
+      </div>
+      {% endif %}
+      <div style="font-size:11px;color:{{ curve_colors.get(bi.curve_signal, '#94a3b8') }};margin-top:3px;">{{ bi.curve_signal.replace('_', ' ') }}</div>
+    </div>
+
+    <!-- TLT momentum tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">TLT (long rates)</div>
+      {% if bi.tlt_return_20d is not none %}
+      <div style="font-size:20px;font-weight:800;color:{{ tlt_colors.get(bi.tlt_signal, '#94a3b8') }};">
+        {{ "%+.1f"|format(bi.tlt_return_20d) }}%
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:2px;">4-week return</div>
+      {% endif %}
+      <div style="font-size:11px;color:{{ tlt_colors.get(bi.tlt_signal, '#94a3b8') }};margin-top:3px;">{{ bi.tlt_signal.replace('_', ' ') }}</div>
+    </div>
+
+    <!-- IG credit tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">IG Credit (LQD−TLT)</div>
+      {% if bi.lqd_tlt_spread_5d is not none %}
+      <div style="font-size:20px;font-weight:800;color:{{ ig_colors.get(bi.ig_credit_signal, '#94a3b8') }};">
+        {{ "%+.2f"|format(bi.lqd_tlt_spread_5d) }}pp
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:2px;">5-day spread</div>
+      {% endif %}
+      <div style="font-size:11px;color:{{ ig_colors.get(bi.ig_credit_signal, '#94a3b8') }};margin-top:3px;">{{ bi.ig_credit_signal.replace('_', ' ') }}</div>
+    </div>
+
+    <!-- Real yield tile -->
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:160px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Real Yield (TIP−IEF)</div>
+      {% if bi.tip_ief_spread_5d is not none %}
+      <div style="font-size:20px;font-weight:800;color:{{ '#fb923c' if bi.real_yield_signal == 'REAL_RATES_RISING' else ('#4ade80' if bi.real_yield_signal == 'REAL_RATES_FALLING' else '#94a3b8') }};">
+        {{ "%+.2f"|format(bi.tip_ief_spread_5d) }}pp
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:2px;">5-day spread</div>
+      {% endif %}
+      <div style="font-size:11px;color:#94a3b8;margin-top:3px;">{{ bi.real_yield_signal.replace('_', ' ') }}</div>
+    </div>
+
+    <!-- Bond-equity divergence tile -->
+    {% if bi.tlt_spy_div_5d is not none %}
+    {% set be_colors = {
+        'EQUITY_CATCHUP_LIKELY':   '#4ade80',
+        'EQUITY_CATCHUP_POSSIBLE': '#86efac',
+        'SYNCHRONIZED_RISK_ON':    '#4ade80',
+        'NEUTRAL':                 '#94a3b8',
+        'EQUITY_SELLOFF_RISK':     '#f87171',
+        'SYNCHRONIZED_RISK_OFF':   '#f87171'
+    } %}
+    <div style="background:#0f172a;border-radius:6px;padding:10px 16px;min-width:180px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Bond-Equity Div (TLT-SPY)</div>
+      <div style="font-size:20px;font-weight:800;color:{{ be_colors.get(bi.bond_equity_signal, '#94a3b8') }};">
+        {{ "%+.2f"|format(bi.tlt_spy_div_5d) }}pp
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:2px;">5-day spread</div>
+      {% if bi.spy_return_5d is not none %}
+      <div style="font-size:10px;color:#64748b;margin-top:1px;">SPY {{ "%+.1f"|format(bi.spy_return_5d) }}% · TLT {{ "%+.1f"|format(bi.tlt_return_5d) }}%</div>
+      {% endif %}
+      <div style="font-size:10px;font-weight:700;color:{{ be_colors.get(bi.bond_equity_signal, '#94a3b8') }};margin-top:3px;">
+        {{ bi.bond_equity_signal.replace('_', ' ') }}
+      </div>
+    </div>
+    {% endif %}
+
+  </div>
+
+  <!-- Bond-equity divergence alert banner -->
+  {% if bi.bond_equity_signal == 'EQUITY_CATCHUP_LIKELY' %}
+  <div style="background:#14532d;border:1px solid #4ade80;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#4ade80;font-weight:700;">
+    ⚡ BOND-EQUITY DIVERGENCE — Bonds rallied hard while equities held. Bond market pricing rate cuts/growth slowdown. Equity catch-up move expected within 1–2 weeks.
+  </div>
+  {% elif bi.bond_equity_signal == 'EQUITY_SELLOFF_RISK' %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ BOND-EQUITY DIVERGENCE — Bonds selling off while equities hold. Rising rate headwind not yet priced into stocks. Equity weakness likely within 1–2 weeks.
+  </div>
+  {% elif bi.bond_equity_signal == 'SYNCHRONIZED_RISK_OFF' %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:12px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ SYNCHRONIZED RISK-OFF — Both bonds and equities selling off. Broad de-risking underway.
+  </div>
+  {% endif %}
+
+  <!-- Yield levels row -->
+  {% if bi.yield_10y is not none %}
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+    {% if bi.yield_10y is not none %}
+    <span style="background:#1e293b;border-radius:4px;padding:3px 10px;font-size:12px;color:#94a3b8;">10Y <b style="color:#e2e8f0;">{{ "%.2f"|format(bi.yield_10y) }}%</b></span>
+    {% endif %}
+    {% if bi.yield_5y is not none %}
+    <span style="background:#1e293b;border-radius:4px;padding:3px 10px;font-size:12px;color:#94a3b8;">5Y <b style="color:#e2e8f0;">{{ "%.2f"|format(bi.yield_5y) }}%</b></span>
+    {% endif %}
+    {% if bi.yield_3m is not none %}
+    <span style="background:#1e293b;border-radius:4px;padding:3px 10px;font-size:12px;color:#94a3b8;">3M <b style="color:#e2e8f0;">{{ "%.2f"|format(bi.yield_3m) }}%</b></span>
+    {% endif %}
+    {% if bi.yield_30y is not none %}
+    <span style="background:#1e293b;border-radius:4px;padding:3px 10px;font-size:12px;color:#94a3b8;">30Y <b style="color:#e2e8f0;">{{ "%.2f"|format(bi.yield_30y) }}%</b></span>
+    {% endif %}
+    {% if bi.tlt_ief_spread_5d is not none %}
+    <span style="background:#1e293b;border-radius:4px;padding:3px 10px;font-size:12px;color:#94a3b8;">Duration TLT−IEF <b style="color:#e2e8f0;">{{ "%+.2f"|format(bi.tlt_ief_spread_5d) }}pp</b> ({{ bi.tlt_ief_signal.replace('_', ' ') }})</span>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0;">{{ bi.summary }}</p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6g — NEW 52-WEEK HIGHS / LOWS
+     ══════════════════════════════════════ -->
+{% if highs_lows_context %}
+{% set sig_color = {
+    'STRONG_HIGHS':   '#4ade80',
+    'HIGHS_DOMINATE': '#86efac',
+    'BALANCED':       '#94a3b8',
+    'LOWS_DOMINATE':  '#fca5a5',
+    'STRONG_LOWS':    '#f87171'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>New 52-Week Highs / Lows <span style="font-size:13px;font-weight:400;color:#94a3b8;">(breadth divergence · participation · reversal timing)</span></h2>
+<div class="card" style="border-left: 4px solid {{ sig_color.get(highs_lows_context.signal, '#94a3b8') }};">
+
+  {% if highs_lows_context.is_bearish_divergence %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ BEARISH DIVERGENCE — SPY near 52-week high but HL spread is declining. Narrowing leadership = distribution phase.
+  </div>
+  {% elif highs_lows_context.is_bullish_divergence %}
+  <div style="background:#14532d;border:1px solid #4ade80;border-radius:6px;
+              padding:8px 14px;margin-bottom:14px;font-size:13px;color:#4ade80;font-weight:700;">
+    ⚡ BULLISH DIVERGENCE — SPY near 52-week low but new lows are contracting. Selling exhaustion signal.
+  </div>
+  {% endif %}
+
+  <!-- Tiles row -->
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+
+    <!-- HL Spread tile -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:140px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">HL Spread</div>
+      <div style="font-size:28px;font-weight:800;
+                  color:{{ sig_color.get(highs_lows_context.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%+.0f"|format(highs_lows_context.hl_spread) }}pp
+      </div>
+      {% if highs_lows_context.hl_spread_5d_ago is not none %}
+      {% set delta = highs_lows_context.hl_spread - highs_lows_context.hl_spread_5d_ago %}
+      <div style="font-size:11px;color:#64748b;">
+        5d ago: {{ "%+.0f"|format(highs_lows_context.hl_spread_5d_ago) }}pp
+        <span style="color:{{ '#4ade80' if delta > 0 else '#f87171' }};">
+          ({{ "%+.0f"|format(delta) }})
+        </span>
+      </div>
+      {% endif %}
+      <div style="font-size:11px;font-weight:700;
+                  color:{{ sig_color.get(highs_lows_context.signal, '#94a3b8') }};margin-top:4px;">
+        {{ highs_lows_context.signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ dir_color.get(highs_lows_context.direction, '#94a3b8') }};margin-top:2px;">
+        {{ '▲ BULLISH' if highs_lows_context.direction == 'BULLISH' else ('▼ BEARISH' if highs_lows_context.direction == 'BEARISH' else '→ NEUTRAL') }}
+      </div>
+    </div>
+
+    <!-- Counts tile -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:140px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Basket ({{ highs_lows_context.total_count }} tickers)</div>
+      <div style="margin-top:8px;font-size:13px;">
+        <div style="color:#4ade80;font-weight:700;">▲ {{ highs_lows_context.highs_count }} near highs
+          <span style="color:#64748b;font-weight:400;">({{ "%.0f"|format(highs_lows_context.pct_near_highs) }}%)</span>
+        </div>
+        <div style="color:#f87171;font-weight:700;margin-top:4px;">▼ {{ highs_lows_context.lows_count }} near lows
+          <span style="color:#64748b;font-weight:400;">({{ "%.0f"|format(highs_lows_context.pct_near_lows) }}%)</span>
+        </div>
+        <div style="color:#64748b;margin-top:4px;">→ {{ highs_lows_context.neutral_count }} neutral</div>
+      </div>
+    </div>
+
+    <!-- SPY reference tile -->
+    {% if highs_lows_context.spy_pct_from_52w_high is not none %}
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:140px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">SPY Position</div>
+      <div style="margin-top:8px;font-size:13px;">
+        <div style="color:{{ '#4ade80' if highs_lows_context.spy_pct_from_52w_high >= -2 else '#e2e8f0' }};">
+          {{ "%+.1f"|format(highs_lows_context.spy_pct_from_52w_high) }}% from 52w high
+        </div>
+        {% if highs_lows_context.spy_pct_from_52w_low is not none %}
+        <div style="color:{{ '#f87171' if highs_lows_context.spy_pct_from_52w_low <= 5 else '#94a3b8' }};margin-top:4px;">
+          {{ "%+.1f"|format(highs_lows_context.spy_pct_from_52w_low) }}% from 52w low
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Spread bar gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;flex:1;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">
+        Near-Highs vs Near-Lows
+      </div>
+      {% set hl_abs = highs_lows_context.hl_spread|abs %}
+      {% set bar_pct = [hl_abs / 1.0, 100]|min|int %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        {% if highs_lows_context.hl_spread >= 0 %}
+        <div style="width:50%;text-align:right;">
+          <div style="background:#1e293b;height:14px;border-radius:3px 0 0 3px;"></div>
+        </div>
+        <div style="width:4px;background:#475569;height:20px;flex-shrink:0;"></div>
+        <div style="width:50%;">
+          <div style="width:{{ bar_pct }}%;background:{{ sig_color.get(highs_lows_context.signal,'#94a3b8') }};
+                      height:14px;border-radius:0 3px 3px 0;"></div>
+        </div>
+        {% else %}
+        <div style="width:50%;text-align:right;">
+          <div style="display:flex;justify-content:flex-end;">
+            <div style="width:{{ bar_pct }}%;background:{{ sig_color.get(highs_lows_context.signal,'#94a3b8') }};
+                        height:14px;border-radius:3px 0 0 3px;"></div>
+          </div>
+        </div>
+        <div style="width:4px;background:#475569;height:20px;flex-shrink:0;"></div>
+        <div style="width:50%;">
+          <div style="background:#1e293b;height:14px;border-radius:0 3px 3px 0;"></div>
+        </div>
+        {% endif %}
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#475569;">
+        <span>More Lows</span><span>← 0 →</span><span>More Highs</span>
+      </div>
+    </div>
+
+  </div>
+
+  <p style="color:#94a3b8;font-size:12px;margin:0;">{{ highs_lows_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    HL Spread = %near-highs − %near-lows across sector ETFs + broad indices + watchlist stocks.
+    Divergence: SPY near 52w high + spread declining → narrowing leadership (distribution).
+    SPY near 52w low + spread rising → lows contracting (capitulation exhaustion).
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
@@ -1199,13 +2784,17 @@ HTML_TEMPLATE = """
 </div>
 {% endif %}
 {% for ticker, trades in (insider_trades or {}).items() %}
-<div class="card" style="border-left: 4px solid #7c3aed;">
+{% set _sig = signals_by_ticker.get(ticker) %}
+<div class="card" style="border-left: 4px solid {% if _sig and _sig.insider_cluster_detected %}#a78bfa{% else %}#7c3aed{% endif %};">
   <span class="ticker">{{ ticker }}</span>
   {% if ticker in rec_actions %}
   <span class="badge"
         style="background:{{ colors[rec_actions[ticker]] }};margin-left:10px;">
     {{ rec_actions[ticker] }}
   </span>
+  {% endif %}
+  {% if _sig and _sig.insider_cluster_detected %}
+  <span class="cluster-badge">CLUSTER &bull; {{ _sig.insider_cluster_size }} insiders / 5d</span>
   {% endif %}
   <br><br>
   {% for t in trades %}
@@ -1341,10 +2930,23 @@ def send_recommendations(
     cot_context=None,       # Optional[COTContext]      — avoid circular import
     ipo_context=None,       # Optional[IPOContext]      — avoid circular import
     vix_context=None,       # Optional[VIXContext]      — avoid circular import
+    credit_context=None,    # Optional[CreditContext]   — avoid circular import
     put_call_context=None,  # Optional[PutCallContext]  — avoid circular import
     tick_context=None,      # Optional[TICKContext]     — avoid circular import
-    earnings_context=None,  # Optional[EarningsContext] — avoid circular import
-    gex_context=None,       # Optional[GEXContext]      — avoid circular import
+    breadth_context=None,     # Optional[BreadthContext]    — avoid circular import
+    highs_lows_context=None,  # Optional[HighsLowsContext]  — avoid circular import
+    mcclellan_context=None,      # Optional[McClellanContext]       — avoid circular import
+    macro_surprise_context=None,     # Optional[MacroSurpriseContext]        — avoid circular import
+    fedwatch_context=None,           # Optional[FedWatchContext]             — avoid circular import
+    revision_momentum_context=None,  # Optional[RevisionMomentumContext]     — avoid circular import
+    whisper_context=None,            # Optional[WhisperContext]              — avoid circular import
+    earnings_context=None,           # Optional[EarningsContext]             — avoid circular import
+    gex_context=None,            # Optional[GEXContext]             — avoid circular import
+    opex_context=None,           # Optional[OpExContext]            — avoid circular import
+    seasonality_context=None,    # Optional[SeasonalityContext]     — avoid circular import
+    bond_internals_context=None, # Optional[BondInternalsContext]   — avoid circular import
+    move_context=None,           # Optional[MOVEContext]            — avoid circular import
+    global_macro_context=None,   # Optional[GlobalMacroContext]     — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -1507,14 +3109,40 @@ def send_recommendations(
         ipo_context=ipo_context,
         # VIX volatility regime
         vix_context=vix_context,
+        # Credit market leading indicator
+        credit_context=credit_context,
         # Put/Call ratio (CBOE + per-ticker)
         put_call_context=put_call_context,
         # NYSE TICK breadth
         tick_context=tick_context,
+        # Market breadth (% above 200d SMA)
+        breadth_context=breadth_context,
+        # New 52-week highs vs lows (HL spread divergence)
+        highs_lows_context=highs_lows_context,
+        # McClellan Oscillator (A/D breadth momentum)
+        mcclellan_context=mcclellan_context,
+        # Macro Surprise Index (CESI-style)
+        macro_surprise_context=macro_surprise_context,
+        # Fed Rate Expectations (T-bill proxy for FedWatch)
+        fedwatch_context=fedwatch_context,
+        # Estimate Revision Momentum (analyst consensus trend)
+        revision_momentum_context=revision_momentum_context,
+        # Earnings Whisper vs. Consensus
+        whisper_context=whisper_context,
         # Earnings calendar
         earnings_context=earnings_context,
         # Gamma Exposure (GEX)
         gex_context=gex_context,
+        # OpEx calendar (pure date math)
+        opex_context=opex_context,
+        # Seasonality calendar (pure date math)
+        seasonality_context=seasonality_context,
+        # Bond market internals (yfinance)
+        bond_internals_context=bond_internals_context,
+        # MOVE Index (ICE BofA Treasury vol)
+        move_context=move_context,
+        # Global macro: DXY + Copper/Gold ratio
+        global_macro_context=global_macro_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────

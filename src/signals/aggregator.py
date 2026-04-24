@@ -101,11 +101,51 @@ _AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as having a view
 
 # ── Per-method score helpers ──────────────────────────────────────────────────
 
-def _insider_score(ticker: str, trades: List[InsiderTrade]) -> float:
-    """Derive a [-1, +1] score from all smart money signals for a ticker."""
+def _detect_insider_cluster(ticker: str, trades: List[InsiderTrade]) -> tuple[bool, int]:
+    """
+    Detect if ≥3 DIFFERENT insiders bought the same ticker within any 5-day window.
+    Only counts corporate_insider and politician purchases (not options flow or institutional).
+    Returns (cluster_detected, max_distinct_insiders_in_any_5d_window).
+    """
+    from datetime import timedelta
+
+    buys = [
+        t for t in trades
+        if t.ticker.upper() == ticker.upper()
+        and "purchase" in t.transaction_type
+        and t.trader_type in ("corporate_insider", "politician")
+    ]
+
+    if len(buys) < 3:
+        return False, len({t.trader_name for t in buys})
+
+    buys.sort(key=lambda t: t.transaction_date)
+
+    max_cluster = 0
+    for anchor in buys:
+        window_end = anchor.transaction_date + timedelta(days=5)
+        names_in_window = {
+            t.trader_name
+            for t in buys
+            if anchor.transaction_date <= t.transaction_date <= window_end
+        }
+        if len(names_in_window) > max_cluster:
+            max_cluster = len(names_in_window)
+
+    return max_cluster >= 3, max_cluster
+
+
+def _insider_score(ticker: str, trades: List[InsiderTrade]) -> tuple[float, bool, int]:
+    """Derive a [-1, +1] score from all smart money signals for a ticker.
+
+    Returns (score, cluster_detected, cluster_size).
+    When ≥3 different corporate insiders/politicians buy within 5 days, a 1.75×
+    amplifier is applied to the raw score — simultaneous independent buying is
+    far more predictive than any single insider purchase.
+    """
     relevant = [t for t in trades if t.ticker.upper() == ticker.upper()]
     if not relevant:
-        return 0.0
+        return 0.0, False, 0
     from src.data.insider_trades import _amount_weight
     total = 0.0
     for t in relevant:
@@ -118,7 +158,19 @@ def _insider_score(ticker: str, trades: List[InsiderTrade]) -> float:
             total += w
         elif "sale" in tx:
             total -= w
-    return round(max(-1.0, min(1.0, total / 3.0)), 3)
+    base_score = round(max(-1.0, min(1.0, total / 3.0)), 3)
+
+    # Cluster amplifier — 3+ different insiders buying within 5 days
+    cluster_detected, cluster_size = _detect_insider_cluster(ticker, trades)
+    if cluster_detected and base_score > 0:
+        amplified = round(min(1.0, base_score * 1.75), 3)
+        logger.debug(
+            f"[cluster] {ticker}: {cluster_size} insiders within 5d — "
+            f"score {base_score:+.3f} → {amplified:+.3f} (1.75×)"
+        )
+        base_score = amplified
+
+    return base_score, cluster_detected, cluster_size
 
 
 def _put_call_score_for(ticker: str, put_call_context) -> float:
@@ -494,10 +546,12 @@ def build_signals(
         bb_width_pct    = tech_result.bb_width_pct
 
         # ── Method 3: Smart money ─────────────────────────────────────────
-        insider_sc      = 0.0
-        insider_summary = ""
+        insider_sc       = 0.0
+        insider_summary  = ""
+        cluster_detected = False
+        cluster_size     = 0
         if use_insider:
-            insider_sc      = _insider_score(ticker, insider_trades)
+            insider_sc, cluster_detected, cluster_size = _insider_score(ticker, insider_trades)
             insider_summary = build_insider_summary(ticker, insider_trades)
 
         # ── Method 4: Put/call ratio (contrarian) ─────────────────────────
@@ -618,16 +672,19 @@ def build_signals(
             gamma_flip=gamma_flip,
             max_pain_bias=max_pain_bias,
             expected_move_pct=expected_move_pct,
+            insider_cluster_detected=cluster_detected,
+            insider_cluster_size=cluster_size,
         ))
 
-        gex_str = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
-        mp_str   = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
-        skew_str = f"  skew={oi_skew_score:+.2f}" if oi_skew_score != 0.0 else ""
-        vwap_str = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
+        gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
+        mp_str      = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
+        skew_str    = f"  skew={oi_skew_score:+.2f}" if oi_skew_score != 0.0 else ""
+        vwap_str    = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
+        cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

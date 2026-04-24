@@ -9,7 +9,7 @@ Trades are stored in cache/trades.json. Each daily run:
 
 import json
 import yfinance as yf
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 from loguru import logger
@@ -18,7 +18,7 @@ from src.models import Recommendation
 from config import settings
 
 TRADES_FILE = Path("cache/trades.json")
-HOLDING_DAYS = 5   # auto-close after this many calendar days
+HOLDING_DAYS = 5   # auto-close after this many trading days (Mon–Fri, weekends excluded)
 SPREAD_PCT   = 0.10  # round-trip bid-ask spread in % (5 bps each way)
                # Applied as a penalty: half at entry (you buy at the ask / short at the bid),
                # half at exit (you sell at the bid / cover at the ask).
@@ -44,6 +44,13 @@ def _save_trades(trades: List[dict]) -> None:
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
+    """Fetch the latest available price.
+
+    NOTE: the pipeline runs at 8:00 AM ET — 90 min before market open.
+    At that time fast_info.last_price returns the previous close or a thin
+    pre-market print, NOT the actual next-open tradeable price.  Performance
+    numbers will therefore understate slippage on gap-open news catalysts.
+    """
     if not settings.enable_fetch_data:
         return None
     try:
@@ -54,9 +61,18 @@ def _fetch_price(ticker: str) -> Optional[float]:
         return None
 
 
-def _days_held(entry_date: str) -> int:
+def _trading_days_held(entry_date: str) -> int:
+    """Count weekdays (Mon–Fri) between entry_date (exclusive) and today (inclusive)."""
     try:
-        return (date.today() - date.fromisoformat(entry_date)).days
+        start = date.fromisoformat(entry_date)
+        end = date.today()
+        count = 0
+        current = start + timedelta(days=1)
+        while current <= end:
+            if current.weekday() < 5:  # 0–4 = Mon–Fri
+                count += 1
+            current += timedelta(days=1)
+        return count
     except Exception:
         return 0
 
@@ -91,14 +107,15 @@ def record_new_trades(recommendations: List[Recommendation]) -> None:
     trades = _load_trades()
     today = date.today().isoformat()
 
-    # Index open trades to avoid duplicates on the same day
-    open_today = {t["ticker"] for t in trades if t["entry_date"] == today and t["status"] == "OPEN"}
+    # Prevent stacking: skip any ticker that already has an OPEN position, regardless of entry date.
+    # Opening a second position while one is live would misrepresent reality (you'd just hold the first).
+    already_open = {t["ticker"] for t in trades if t["status"] == "OPEN"}
 
     new_count = 0
     for rec in recommendations:
         if rec.action not in ("BUY", "SELL"):
             continue
-        if rec.ticker in open_today:
+        if rec.ticker in already_open:
             continue
 
         price = _fetch_price(rec.ticker)
@@ -144,7 +161,7 @@ def update_open_trades() -> None:
         if price is None:
             continue
 
-        days = _days_held(trade["entry_date"])
+        days = _trading_days_held(trade["entry_date"])
         ret = _pct_return(trade["action"], trade["entry_price"], price)
 
         trade["current_price"] = round(price, 4)

@@ -39,6 +39,20 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 3g. VIX & term structure  — vix.py → ^VIX/^VXN/^VVIX/^VIX3M/^VXMT, cached daily
 3h. Put/call ratio        — put_call.py → CBOE market-wide + per-ticker extremes, cached daily
 3i. Earnings calendar     — earnings.py → upcoming dates + IV warning, cached daily
+3j. Credit market         — credit.py → HYG vs SPY divergence, leading indicator, cached daily
+3k. Market breadth        — breadth.py → % of sector ETFs above 200d SMA, thrust detection, cached daily
+3l. McClellan Oscillator  — mcclellan.py → EMA19−EMA39 of NYSE A/D, Summation Index, zero-cross, cached daily
+3m. New 52-week highs/lows — highs_lows.py → HL Spread = %near-highs − %near-lows, divergence detection, cached daily
+3n. Macro Surprise Index  — macro_surprise.py → CESI-style: actual FRED vs trailing 3-period avg, composite z-score, cached daily
+3o. Fed Rate Expectations — fedwatch.py → T-bill spread proxy for CME FedWatch: implied cuts/hikes bp, P(cut/hold/hike) at next FOMC, rate-trend shift, cached daily
+3p. Revision Momentum     — revision_momentum.py → analyst PT/rating trend: recent (0-30d) vs prior (31-60d) upgrade/downgrade delta, momentum score per ticker, cached daily
+3q. Earnings Whisper      — earnings_whisper.py → implied whisper = consensus × (1 + avg_historical_beat%); beat-rate, eps_trend direction, net revisions; cached daily
+3r. Insider cluster       — aggregator.py → _detect_insider_cluster(): ≥3 different insiders buying within 5 days → 1.75× amplifier on insider_score; cluster_detected/size stored on TickerSignal
+3s. OpEx calendar         — opex.py → compute_opex_context(): pure date math; 3rd-Friday detection, Triple Witching flag, POST_OPEX window; amplifies/discounts max_pain_score confidence in Claude prompt
+3t. Seasonality calendar  — seasonality.py → compute_seasonality_context(): pure date math; monthly historical biases (April strongest, September weakest, Sell in May), end-of-month/quarter rebalancing windows, January effect (small-cap IWM), quarterly window dressing; STRONG_TAILWIND→STRONG_HEADWIND composite signal
+3u. Bond market internals — bond_internals.py → 10Y-3M yield curve (recession predictor), TLT/IEF/TIP/LQD 1/4/8-week momentum, real yield, IG credit; bond-equity divergence (TLT vs SPY 5d return — EQUITY_CATCHUP_LIKELY when bonds rally hard while equities hold); RISK_OFF→RISK_ON composite regime; cached daily
+3v. MOVE Index            — move.py → ICE BofA Treasury implied vol (^MOVE primary, VXTLT fallback); CALM→PANIC signal, 5d spike detection, MOVE/VIX ratio divergence; cached daily
+3w. Global macro          — global_macro.py → DXY strength (DX-Y.NYB: strong dollar = headwind for EM/commodities/multinationals) + Copper/Gold ratio (HG=F/GC=F: Dr. Copper growth barometer) + Oil/Bond divergence (CL=F vs TLT: co-rally = POLICY_PIVOT_SIGNAL; oil up + bonds down = STAGFLATION_RISK; oil down + bonds up = GROWTH_FEAR_RISK_OFF); RISK_OFF→RISK_ON composite; cached daily
 4. Signal aggregation    — aggregator.py → per-ticker combined score
 5. Recommendations       — claude_analyst.py → Claude generates BUY/SELL/HOLD/WATCH
 6. Performance tracking  — tracker.py → paper trades in cache/trades.json
@@ -74,11 +88,22 @@ To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env
 | Google Trends | `YYYY-MM-DD` | 1 day | `cache/trends_*.json` |
 | IPO pipeline | `YYYY-MM-DD` | 1 day | `cache/ipo_*.json` |
 | VIX & term structure | `YYYY-MM-DD` | 1 day | `cache/vix_*.json` |
+| Credit market (HYG/SPY) | `YYYY-MM-DD` | 1 day | `cache/credit_*.json` |
 | Put/call ratio | `YYYY-MM-DD` | 1 day | `cache/put_call_*.json` |
 | Analyst ratings | `YYYY-MM-DD` | 1 day | `cache/analyst_ratings_*.json` |
 | Earnings surprises | `YYYY-MM-DD` | 1 day | `cache/earnings_surprises_*.json` |
 | Earnings calendar | `YYYY-MM-DD` | 1 day | `cache/earnings_calendar_*.json` |
 | Short interest | `YYYY-MM-DD` | 1 day | `cache/short_interest_*.json` |
+| Market breadth | `YYYY-MM-DD` | 1 day | `cache/breadth_*.json` |
+| New 52w highs/lows | `YYYY-MM-DD` | 1 day | `cache/highs_lows_*.json` |
+| McClellan Oscillator | `YYYY-MM-DD` | 1 day | `cache/mcclellan_*.json` |
+| Macro Surprise Index | `YYYY-MM-DD` | 1 day | `cache/macro_surprise_*.json` |
+| Fed Rate Expectations | `YYYY-MM-DD` | 1 day | `cache/fedwatch_*.json` |
+| Revision Momentum | `YYYY-MM-DD` | 1 day | `cache/revision_momentum_*.json` |
+| Earnings Whisper | `YYYY-MM-DD` | 1 day | `cache/whisper_*.json` |
+| Bond market internals | `YYYY-MM-DD` | 1 day | `cache/bond_internals_*.json` |
+| MOVE Index | `YYYY-MM-DD` | 1 day | `cache/move_*.json` |
+| Global macro (DXY + Cu/Au) | `YYYY-MM-DD` | 1 day | `cache/global_macro_*.json` |
 | OHLCV (charts) | per ticker | incremental | `cache/ohlcv/*.json` |
 | COT positioning | ISO week | 1 week | `cache/cot_YYYY_WW.json` |
 | Trades ledger | — | permanent | `cache/trades.json` |
