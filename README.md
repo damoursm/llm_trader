@@ -35,9 +35,11 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │  3p. Revision Momentum    — analyst PT/rating trend: 30d vs 31-60d      │
 │  3q. Earnings Whisper     — implied whisper = consensus × (1+avg_beat%)  │
 │  3r. Insider Cluster      — ≥3 different insiders buying within 5 days  │
+│  3A. Pattern Recognition  — 8 classical chart patterns + per-ticker      │
+│                              historical win rates (2y library, 7d cache) │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
 │  5.  Recommendations      — Claude: BUY / SELL / HOLD / WATCH           │
-│  6.  Performance Tracking — paper trades, P&L, auto-close at 5 days     │
+│  6.  Performance Tracking — paper trades, P&L, method attribution        │
 │  7.  Charts + Email       — HTML report + inline-chart email             │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -635,6 +637,109 @@ Oil and Treasury bonds are normally inversely correlated (oil up = inflation →
 
 ---
 
+### Step 3y — Market Mode Switching (`src/data/market_mode.py`)
+
+When `ENABLE_MARKET_MODE_SWITCHING=true` (default), classifies the market as **TRENDING**, **NEUTRAL**, or **CHOPPY** and dynamically adjusts the signal weight profile passed to `build_signals()`. **Zero API calls, zero network I/O** — pure computation from already-fetched contexts. Runs synchronously before Step 4.
+
+**Why fixed weights underperform:**
+
+Momentum strategies (technical analysis, news catalysts) work in low-volatility, directional markets. Mean-reversion strategies (VWAP deviation, put/call contrarian) work in high-volatility, range-bound markets. Blending both with fixed weights gives mediocre results in either regime.
+
+**Scoring inputs:**
+
+| Source | Weight | Trending signal | Choppy signal |
+|---|---|---|---|
+| VIX | 2.0× | LOW/COMPLACENCY → +1.5/+2.0 | HIGH/EXTREME_FEAR → −1.5/−2.0 |
+| Market breadth | 1.5× | BREADTH_HEALTHY/EXTENDED → +1.0/+1.5 | BREADTH_WEAK/COLLAPSE → −1.0/−2.0 |
+| 52w Highs/Lows | 1.0× | HIGHS_DOMINATE/STRONG_HIGHS → +0.75/+1.5 | LOWS_DOMINATE/STRONG_LOWS → −0.75/−1.5 |
+| McClellan | 1.0× | BULLISH_MOMENTUM/OVERBOUGHT → +0.75/+1.5 | BEARISH_MOMENTUM/OVERSOLD → −0.75/−1.5 |
+
+Normalised composite → **TRENDING** (> +0.5) | **NEUTRAL** (±0.5) | **CHOPPY** (< −0.5)
+
+**Weight profiles (raw unnormalised, `_normalised_weights()` divides by total):**
+
+| Method | TRENDING | NEUTRAL (baseline) | CHOPPY |
+|---|---|---|---|
+| `news` | 0.40 | 0.40 | 0.30 |
+| `tech` | **0.45** ↑ | 0.30 | **0.15** ↓ |
+| `insider` | 0.30 | 0.30 | 0.30 |
+| `put_call` | **0.08** ↓ | 0.15 | **0.28** ↑ |
+| `max_pain` | 0.12 | 0.12 | 0.12 |
+| `oi_skew` | 0.15 | 0.15 | 0.15 |
+| `vwap` | **0.04** ↓ | 0.12 | **0.28** ↑ |
+
+The weight profile is passed to `build_signals()` as a `weight_profile` override on `_normalised_weights()`. NEUTRAL uses the baseline `_BASE_WEIGHTS` unchanged.
+
+---
+
+### Step 3x — Macro Regime Filter (`src/data/macro_regime.py`)
+
+When `ENABLE_MACRO_REGIME_FILTER=true` (default), computes a composite top-down regime from all available macro context objects. **Zero API calls, zero network I/O** — pure computation from already-fetched contexts. Runs synchronously between Step 3 and Step 4.
+
+**What it does:**
+
+Reads VIX, MOVE, bond internals, global macro, FRED, breadth, and credit signals, weights them, and classifies the market into one of five regimes. Each regime gates signal entry and adjusts the minimum confidence threshold required for a signal to be marked actionable.
+
+**Input sources and weights:**
+
+| Source | Weight | Signal fields used |
+|---|---|---|
+| VIX | 2.0× | `vix_signal` (PANIC → COMPLACENCY) |
+| MOVE | 2.0× | `signal` (PANIC → CALM) |
+| Bond internals | 1.5× | `regime` (RISK_OFF → REFLATIONARY) |
+| Global macro | 1.0× | `composite_signal` (RISK_OFF → RISK_ON) |
+| FRED | 1.0× | `regime` (RECESSION → EXPANSION) |
+| Market breadth | 1.0× | `signal` (BREADTH_COLLAPSE → BREADTH_EXTENDED) |
+| Credit | 0.5× | `signal` (CREDIT_STRESS → CREDIT_SURGE) |
+
+**Regime thresholds:**
+
+| Regime | Composite score | Confidence threshold | BUY entries |
+|---|---|---|---|
+| `PANIC` | ≤ −1.5 (or any PANIC source) | **88%** | **BLOCKED** |
+| `RISK_OFF` | −1.5 to −0.8 | **82%** | **BLOCKED** |
+| `CAUTION` | −0.8 to −0.3 | 80% | Allowed |
+| `NEUTRAL` | −0.3 to +0.3 | 78% (baseline) | Allowed |
+| `RISK_ON` | > +0.3 | **72%** | Allowed |
+
+**Effect on the pipeline:**
+
+The regime is computed after Step 3 (all macro data collected) and before the actionable signal filter. It replaces the hardcoded `0.78` threshold in `pipeline.py` with a dynamic value, and optionally blocks all new BUY entries during PANIC and RISK_OFF regimes. SELL entries are always allowed (shorting into a downturn is valid). The regime and its evidence are reported in the email report (section 4) and logged at INFO level.
+
+**When not all sources are available** (e.g. `ENABLE_FETCH_DATA=false`), only the available contexts contribute to the weighted composite. If only FRED is available, the regime reflects FRED's expansion/recession signal at full weight.
+
+---
+
+### Step 3z — Catalyst Timing (`src/data/catalyst_timing.py`)
+
+When `ENABLE_CATALYST_TIMING=true` (default), applies three event-driven guards and amplifiers. **Zero additional API calls** — all inputs come from already-fetched contexts. Runs after Step 5 (recommendations ranked) and before the actionable filter.
+
+**Mechanism 1 — Earnings Blackout**
+
+Any ticker with an earnings report within 2 calendar days is removed from the actionable BUY/SELL set. IV crush, gap risk, and binary outcomes make directional trades around earnings highly unreliable. The blackout covers both sides: no new longs or shorts into a catalyst that erases the edge.
+
+**Mechanism 2 — OpEx Max-Pain Amplifier**
+
+During OpEx week (3rd Friday of each month), the `max_pain` signal weight in the aggregator is boosted from its 0.12 baseline. Triple Witching months (Mar/Jun/Sep/Dec) get the strongest boost:
+
+| Condition | max_pain weight | Boost |
+|---|---|---|
+| Normal (non-OpEx week) | 0.12 | baseline |
+| OpEx week | **0.20** | +67% |
+| Triple Witching week | **0.28** | +133% |
+
+This is applied as a weight_profile override in `build_signals()` before normalisation, so it combines cleanly with the market-mode weight profile.
+
+**Mechanism 3 — 8-K + Insider Buy → WATCH Elevation**
+
+The combination of a freshly filed SEC 8-K (material catalyst) and an insider purchase by a corporate officer or politician is among the highest-predictive pre-signal setups. When both are present for the same ticker:
+- If the ticker is already in the top-10 as HOLD → upgraded to WATCH in-place
+- If not yet in the top-10 → injected as a new WATCH recommendation
+
+Volume confirmation (via TickerSignal `technical_score`/`vwap_score` > 0.10) is noted when available but is not required to trigger the elevation.
+
+---
+
 ### Step 3t — Seasonality Calendar (`src/data/seasonality.py`)
 
 When `ENABLE_SEASONALITY=true`, computes seasonal calendar context from pure date arithmetic. **Zero API calls, zero network I/O** — runs synchronously after the parallel fetch completes, immediately after OpEx.
@@ -688,11 +793,77 @@ Computed as part of signal aggregation (no separate data fetch step). No extra d
 
 **Amplifier:** When a cluster is detected AND the baseline `insider_score` is positive, the score is multiplied by **1.75×** (capped at +1.0). The `TickerSignal` stores `insider_cluster_detected=True` and `insider_cluster_size=N`. Claude receives an explicit `*** INSIDER CLUSTER ***` flag in the signals block and instruction #22 explaining how to weight it.
 
+**Cross-run persistence (`src/data/cluster_watchlist.py`):** The same-day score amplifier captures the signal on detection day, but insider clusters historically precede price movement by 5–20 days. To exploit the full lead window:
+
+- When a cluster is first detected, the ticker is written to `cache/cluster_watchlist.json` with the detection date and cluster metadata.
+- On every subsequent run within the **10-day watch window**, the ticker is injected into the analysis universe at Step 0 — so it is always re-evaluated by the full signal stack even if it has dropped off the trending/discovery list.
+- After 10 days the entry expires and is removed.
+- Active watchlist entries are shown in the email report (section 5z) with a progress bar showing days elapsed vs. remaining.
+
+The watchlist survives pipeline restarts (JSON file on disk) and adds no network I/O — it is pure computation from already-built `TickerSignal` objects.
+
+---
+
+### Step 3A — Pattern Recognition (`src/signals/pattern_recognition.py`)
+
+Detects 8 classical chart patterns in recent price action and converts each detection into a `[-1, +1]` signal score driven by the **ticker's own historical win rate** for that pattern type.
+
+**Patterns detected:**
+
+| Pattern | Inherent direction | Type |
+|---|---|---|
+| Double Bottom | Bullish | Reversal |
+| Inverse Head & Shoulders | Bullish | Reversal |
+| Ascending Triangle | Bullish | Continuation |
+| Bull Flag | Bullish | Continuation |
+| Double Top | Bearish | Reversal |
+| Head & Shoulders | Bearish | Reversal |
+| Descending Triangle | Bearish | Continuation |
+| Bear Flag | Bearish | Continuation |
+
+**Two-phase design:**
+
+1. **Cold path (first run per ticker):** fetches 2 years of OHLCV data, scans the full history with a 40-bar sliding window (step=5), records the 5d/10d forward return for each pattern detected, and computes per-pattern win rates. Library cached for 7 days in `cache/patterns/<TICKER>.json`.
+2. **Warm path (subsequent runs):** loads the cached library instantly, detects the current pattern from the last 60 price bars.
+
+**Scoring formula:**
+```
+win_rate  = fraction of historical occurrences where the pattern correctly predicted its direction
+edge      = (win_rate − 0.5) × 2         ∈ [−1, +1]
+score     = clip(edge × inherent_direction, −1, +1)
+```
+
+A win rate of 0.75 → edge = +0.50 → score ±0.50 (moderate historical edge).  
+When fewer than 3 historical occurrences exist, a weak prior (±0.25) is used instead.
+
+**Key insight:** the score overrides the pattern's theoretical direction with actual per-ticker history. If double tops for a specific stock have historically been followed by rallies (e.g., fake-out breakdowns that reverse), the score turns bullish rather than blindly applying the bearish template.
+
+**Base weight:** 0.18 in the aggregator (between news/insider at 0.30–0.40 and VWAP/max_pain at 0.12).
+
+---
+
+### Step 4a — Sector Pairs / Relative Value (`src/signals/sector_pairs.py`)
+
+After signal aggregation, `find_sector_pairs()` scans `_SECTOR_MAP` for divergences between sector ETFs and their constituent stocks. When the ETF and the stock disagree on direction, a market-neutral pair trade removes sector beta and isolates idiosyncratic alpha.
+
+**Two setup types:**
+
+| Setup | ETF | Stock | Trade |
+|---|---|---|---|
+| `ETF_BULL_STOCK_BEAR` | BULLISH | BEARISH | Long ETF / Short Stock |
+| `ETF_BEAR_STOCK_BULL` | BEARISH | BULLISH | Long Stock / Short ETF |
+
+**Entry criteria:** both legs must have a non-NEUTRAL direction and confidence ≥ 35%. The `pair_score` = average of both confidences — pairs are sorted by score descending and capped at 10 per run.
+
+**Why it works:** when XLK is BULLISH but INTC is BEARISH, the sector tailwind is not lifting INTC. That idiosyncratic weakness is the alpha. Going Long XLK / Short INTC captures both the sector momentum and the relative underperformance, while the XLK long hedges away broad-tech beta from the short.
+
+**Note:** pairs are reported in the email but are **not** fed into `cache/trades.json` — pair-trade P&L accounting (two legs, correlated moves) requires different tracking than single-leg signals.
+
 ---
 
 ### Step 4 — Signal Aggregation (`src/signals/aggregator.py`)
 
-Combines up to seven signal methods with dynamically normalized weights:
+Combines up to eight signal methods with dynamically normalized weights:
 
 | Method | Base weight | Source |
 |---|---|---|
@@ -703,6 +874,7 @@ Combines up to seven signal methods with dynamically normalized weights:
 | Max pain gravity | 12% | GEX options chain, expiry-decay weighted |
 | OI-weighted skew | 15% | GEX call/put OI directional lean |
 | VWAP distance | 12% | Price vs. rolling 20-day VWAP (mean-reversion) |
+| Pattern recognition | 18% | Historical win rate for current chart pattern |
 
 Weights are re-normalized at runtime based on which methods are enabled — they always sum to 100%.
 
@@ -762,11 +934,51 @@ Claude acts as an elite portfolio manager with 22 numbered decision rules coveri
 
 Every actionable signal is recorded in `cache/trades.json`:
 
-1. **Open** — entry price fetched at recommendation time
+1. **Open** — entry price fetched at recommendation time; position size computed from confidence tier
 2. **Update** — each daily run refreshes current price and unrealised P&L
 3. **Auto-close** — positions are automatically closed after **5 calendar days**
 
-P&L is sign-aware: BUY profits when price rises; SELL (short) profits when price falls. Metrics: win rate, average return, best/worst trade.
+P&L is sign-aware: BUY profits when price rises; SELL (short) profits when price falls.
+
+**Confidence-Scaled Position Sizing**
+
+Each trade is assigned a `position_size_multiplier` based on the signal's confidence level:
+
+| Confidence | Multiplier | Interpretation |
+|---|---|---|
+| 0.78 – 0.85 | **1.0×** | Baseline — meets the actionable threshold |
+| 0.85 – 0.92 | **1.5×** | Mid-conviction — worth committing more capital |
+| > 0.92 | **2.0×** | High-conviction — maximum allocation |
+
+**Per-sector cap:** The sum of position-size multipliers across all *open* positions in the same sector cannot exceed **3.0×**. If a new trade would push the sector over the cap, its multiplier is reduced to fit (or the trade is skipped if the sector is already at capacity). Sector groupings:
+- Sector ETFs (XLK, XLF …): each ETF is its own bucket
+- Commodities (GLD, SLV, GDX …): grouped together as "COMMODITY"
+- Stocks: looked up in `_SECTOR_MAP`; unknown stocks each count independently
+
+**Reporting:** The email performance section shows a Size column (1×/1.5×/2×) on each position and reports both equal-weight avg return and size-adjusted **weighted avg return** — giving a more accurate picture of actual portfolio-level performance.
+
+**Method Attribution Analytics**
+
+Every *new* trade stores seven raw method scores at entry time:
+
+| Field | Signal |
+|---|---|
+| `news` | News sentiment (DeepSeek) |
+| `tech` | Technical analysis (RSI/MACD/SMA/BB) |
+| `insider` | Smart money (Form 4 + options flow + 13F) |
+| `put_call` | Put/Call ratio |
+| `max_pain` | Options max pain / GEX |
+| `oi_skew` | Open interest skew |
+| `vwap` | VWAP distance |
+
+Plus `methods_agreeing` (the subset with `|score| > 0.10` in the trade direction) and `dominant_method` (highest absolute score). After sufficient attributed trades accumulate, the email section **Signal Method Attribution** shows four analytics tables:
+
+1. **Individual Methods** — win rate, avg return, size-adjusted weighted avg return; sorted descending by win rate; color-coded green ≥55%, amber 45–55%, red <45%.
+2. **Method Categories** — rolls individual methods up into four groups: Sentiment (news), Technical (tech, vwap), Smart Money (insider), Options (put_call, max_pain, oi_skew).
+3. **Signal Convergence** — performance grouped by how many methods agreed (1 / 2 / 3 / 4+); validates whether the 1.25×/0.60× coherence multiplier in the aggregator is actually improving outcomes.
+4. **Lead Signal** — which single method had the highest score in the trade direction; shows which signal type tends to lead profitable setups.
+
+Legacy trades (recorded before this feature) have no `methods_agreeing` field and are excluded from attribution stats. The email section shows a graceful "no attribution data yet" placeholder until enough attributed trades close.
 
 ---
 

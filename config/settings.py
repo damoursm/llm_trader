@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 from typing import List
 
@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     # Model selection
     # Options: "claude-haiku-4-5-20251001" (fast/cheap), "claude-opus-4-6" (highest quality)
     analyst_model: str = "claude-haiku-4-5-20251001"
+
+    # Polygon.io market data (primary source for equity/ETF price + OHLCV)
+    # Free API key: https://polygon.io — no credit card, works globally.
+    # If absent, the pipeline falls back to yfinance for all market data.
+    polygon_api_key: str = ""
 
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
@@ -34,7 +39,7 @@ class Settings(BaseSettings):
     commodity_etfs: str = "GLD,SLV,IAU,GDX,PPLT,PALL,CPER"
 
     # Feature flags
-    enable_fetch_data: bool = True        # set to false to skip all yfinance fetching entirely
+    enable_fetch_data: bool = True        # set to false to skip all live data fetching (Polygon + yfinance)
     enable_charts: bool = False           # set to true to build Plotly charts and HTML report
 
     # Analysis method flags (at least one should be true)
@@ -182,6 +187,32 @@ class Settings(BaseSettings):
     # Copper/Gold: rising ratio = risk-on expansion; declining = risk-off contraction.
     enable_global_macro: bool = True
 
+    # Pattern recognition — detects 8 classical chart patterns and scores them by historical win rate.
+    # On first run per ticker: fetches 2y of OHLCV data and builds a pattern success library
+    # (cache/patterns/<TICKER>.json, TTL 7 days). Subsequent runs are instant (warm-cache lookup).
+    enable_pattern_recognition: bool = True
+
+    # Market Mode Switching — dynamically adjusts signal weights based on TRENDING/CHOPPY regime.
+    # TRENDING (low VIX, healthy breadth): up-weights tech/news, down-weights vwap/put_call.
+    # CHOPPY   (high VIX, mixed breadth):  up-weights vwap/put_call, down-weights tech.
+    # NEUTRAL:  uses baseline _BASE_WEIGHTS unchanged.
+    enable_market_mode_switching: bool = True
+
+    # Macro Regime Filter — top-down overlay that gates BUY entries and adjusts thresholds.
+    # Reads VIX, MOVE, bond internals, global macro, FRED, breadth, and credit to produce:
+    #   PANIC     → threshold 0.88, BUY entries blocked
+    #   RISK_OFF  → threshold 0.82, BUY entries blocked
+    #   CAUTION   → threshold 0.80
+    #   NEUTRAL   → threshold 0.78 (baseline, unchanged)
+    #   RISK_ON   → threshold 0.72
+    enable_macro_regime_filter: bool = True
+
+    # Catalyst Timing — three event-driven guards and amplifiers:
+    #   1. Earnings Blackout: block BUY/SELL for tickers within 2 days of earnings (IV crush/gap risk)
+    #   2. OpEx Max-Pain Amplifier: boost max_pain weight during OpEx week (0.20) / Triple Witching (0.28)
+    #   3. 8-K + Insider Buy: auto-elevate to WATCH when both signals coincide for the same ticker
+    enable_catalyst_timing: bool = True
+
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 
@@ -209,10 +240,11 @@ class Settings(BaseSettings):
     def commodities_list(self) -> List[str]:
         return [s.strip() for s in self.commodity_etfs.split(",") if s.strip()]
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()

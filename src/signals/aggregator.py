@@ -48,6 +48,7 @@ from src.analysis.sentiment import analyse_sentiment, filter_relevant_articles
 from src.data.insider_trades import build_insider_summary
 from src.analysis.technical import TechnicalResult, EMPTY_RESULT, compute_technical_score
 from src.signals.vwap import compute_vwap_score
+from src.signals.pattern_recognition import compute_pattern_score
 
 
 # ── Smart-money signal direction + strength ──────────────────────────────────
@@ -73,6 +74,7 @@ _BASE_WEIGHTS = {
     "max_pain":  0.12,   # options-expiry gravity; weight fades automatically via expiry_factor
     "oi_skew":   0.15,   # OI-weighted call/put directional positioning
     "vwap":      0.12,   # mean-reversion: price vs rolling 20-day VWAP
+    "pattern":   0.18,   # chart pattern recognition: historical win-rate based score
 }
 
 # Put/call contrarian score mapping
@@ -182,8 +184,9 @@ def _put_call_score_for(ticker: str, put_call_context) -> float:
     return 0.0
 
 
-def _normalised_weights(active_flags: dict) -> dict:
-    raw   = {m: (_BASE_WEIGHTS[m] if on else 0.0) for m, on in active_flags.items()}
+def _normalised_weights(active_flags: dict, weight_profile: Optional[dict] = None) -> dict:
+    profile = weight_profile or _BASE_WEIGHTS
+    raw   = {m: (profile.get(m, _BASE_WEIGHTS.get(m, 0.0)) if on else 0.0) for m, on in active_flags.items()}
     total = sum(raw.values())
     if total == 0:
         return {m: 0.0 for m in active_flags}
@@ -482,7 +485,9 @@ def build_signals(
     articles: List[NewsArticle],
     insider_trades: Optional[List[InsiderTrade]] = None,
     put_call_context=None,
-    gex_context=None,      # Optional[GEXContext]
+    gex_context=None,         # Optional[GEXContext]
+    market_mode_context=None, # Optional[MarketModeContext]
+    opex_context=None,        # Optional[OpExContext]
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods."""
 
@@ -499,10 +504,31 @@ def build_signals(
     use_oi_skew   = settings.enable_gex and gex_context is not None
     # VWAP uses the OHLCV chart cache first, so it works even with ENABLE_FETCH_DATA=false.
     use_vwap      = settings.enable_vwap
+    # Pattern recognition uses OHLCV chart cache first; fetches 2y history only on cold cache.
+    use_pattern   = settings.enable_pattern_recognition
 
     if not use_news and not use_tech and not use_insider and not use_put_call:
         logger.warning("All analysis methods disabled — no signals will be generated.")
         return []
+
+    # Dynamic weight profile from market mode (TRENDING/NEUTRAL/CHOPPY)
+    weight_profile: Optional[dict] = None
+    if (settings.enable_market_mode_switching
+            and market_mode_context is not None
+            and market_mode_context.mode != "NEUTRAL"):
+        weight_profile = market_mode_context.weight_profile
+
+    # OpEx max-pain amplifier — boost max_pain weight during OpEx / Triple Witching week
+    if (settings.enable_catalyst_timing
+            and opex_context is not None
+            and opex_context.in_opex_week):
+        boosted_mp = 0.28 if opex_context.is_triple_witching else 0.20
+        weight_profile = dict(weight_profile or _BASE_WEIGHTS)
+        weight_profile["max_pain"] = boosted_mp
+        logger.info(
+            f"[catalyst] OpEx max-pain boost: weight → {boosted_mp:.2f}"
+            + (" [TRIPLE WITCHING]" if opex_context.is_triple_witching else "")
+        )
 
     active_flags = {
         "news":      use_news,
@@ -512,16 +538,18 @@ def build_signals(
         "max_pain":  use_max_pain,
         "oi_skew":   use_oi_skew,
         "vwap":      use_vwap,
+        "pattern":   use_pattern,
     }
-    weights      = _normalised_weights(active_flags)
+    weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     active_count = sum(active_flags.values())
 
+    mode_label = f" [{market_mode_context.mode}]" if market_mode_context else ""
     logger.info(
-        f"Signal weights — "
+        f"Signal weights{mode_label} — "
         f"news={weights['news']:.0%}  tech={weights['tech']:.0%}  "
         f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
-        f"vwap={weights['vwap']:.0%}"
+        f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}"
     )
 
     signals        = []
@@ -580,6 +608,15 @@ def build_signals(
         if use_vwap:
             vwap_score, vwap_dist_pct = compute_vwap_score(ticker)
 
+        # ── Method 8: Chart pattern recognition ──────────────────────────
+        # Score derived from the pattern's historical win rate for this ticker.
+        # Positive = bullish pattern with good historical accuracy.
+        # Negative = bearish pattern with good historical accuracy.
+        pattern_score = 0.0
+        pattern_name  = ""
+        if use_pattern:
+            pattern_score, pattern_name = compute_pattern_score(ticker)
+
         # ── Weighted combination ──────────────────────────────────────────
         combined = (
             weights["news"]      * sentiment_score +
@@ -588,7 +625,8 @@ def build_signals(
             weights["put_call"]  * pc_score +
             weights["max_pain"]  * mp_score +
             weights["oi_skew"]   * oi_skew_score +
-            weights["vwap"]      * vwap_score
+            weights["vwap"]      * vwap_score +
+            weights["pattern"]   * pattern_score
         )
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -618,6 +656,7 @@ def build_signals(
             (use_max_pain,  mp_score),
             (use_oi_skew,   oi_skew_score),
             (use_vwap,      vwap_score),
+            (use_pattern,   pattern_score),
         ]
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
 
@@ -674,17 +713,20 @@ def build_signals(
             expected_move_pct=expected_move_pct,
             insider_cluster_detected=cluster_detected,
             insider_cluster_size=cluster_size,
+            pattern_score=round(pattern_score, 3),
+            pattern_name=pattern_name,
         ))
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
         mp_str      = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
         skew_str    = f"  skew={oi_skew_score:+.2f}" if oi_skew_score != 0.0 else ""
         vwap_str    = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
+        pat_str     = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
         cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

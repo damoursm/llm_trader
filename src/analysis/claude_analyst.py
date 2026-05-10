@@ -1942,14 +1942,22 @@ Return ALL tickers from the input. No markdown, JSON only."""
     try:
         client = _get_client()
         logger.info(f"[claude] Using model: {settings.analyst_model}")
-        # Haiku max output = 8096; Sonnet/Opus support higher limits
-        _max_tokens = 8096 if "haiku" in settings.analyst_model else 16000
-        message = client.messages.create(
+        # Haiku 4.5 = 8 192 tokens max output; Sonnet 4.6 = 64 000; Opus = 32 000
+        if "haiku" in settings.analyst_model:
+            _max_tokens = 8096
+        elif "opus" in settings.analyst_model:
+            _max_tokens = 32000
+        else:
+            _max_tokens = 64000   # Sonnet 4.6
+        raw_parts: list[str] = []
+        with client.messages.stream(
             model=settings.analyst_model,
             max_tokens=_max_tokens,
             messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
+        ) as stream:
+            for text in stream.text_stream:
+                raw_parts.append(text)
+        raw = "".join(raw_parts).strip()
         # Strip markdown fences if the model wrapped the response
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -1957,7 +1965,22 @@ Return ALL tickers from the input. No markdown, JSON only."""
                 raw = raw[4:]
             raw = raw.strip()
         logger.debug(f"Raw Claude response ({len(raw)} chars): {raw[:200]}")
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Response was likely truncated at the output token limit.
+            # Salvage every complete object by trimming to the last closing brace.
+            last_brace = raw.rfind("}")
+            if last_brace == -1:
+                raise
+            repaired = raw[:last_brace + 1].rstrip().rstrip(",") + "]"
+            if not repaired.startswith("["):
+                repaired = "[" + repaired
+            data = json.loads(repaired)
+            logger.warning(
+                f"[claude] Truncated response repaired — recovered {len(data)}/{len(signals)} tickers. "
+                f"Consider switching to a model with higher output limits."
+            )
         now = now_et()
         recommendations = [
             Recommendation(

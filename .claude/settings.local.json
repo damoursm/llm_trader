@@ -10,7 +10,11 @@
       "Bash(python:*)",
       "Bash(ls cache/gex_*.json)",
       "Bash(ls /mnt/c/Users/mathi/PycharmProjects/llm_trader/cache/credit_*.json)",
-      "Bash(del \"cache\\\\bond_internals_2026-04-18.json\")"
+      "Bash(del \"cache\\\\bond_internals_2026-04-18.json\")",
+      "Bash(ENABLE_FETCH_DATA=false python main.py)",
+      "Bash(wait)",
+      "Bash(Remove-Item *)",
+      "Bash(del _move_attribution.py)"
     ]
   }
 }

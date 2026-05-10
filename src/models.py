@@ -646,6 +646,92 @@ class MOVEContext(BaseModel):
     summary: str
 
 
+class MarketModeContext(BaseModel):
+    """Market mode classification for dynamic signal weight switching."""
+    mode: str                    # TRENDING | NEUTRAL | CHOPPY
+    composite_score: float       # weighted composite; >+0.5 = trending, <-0.5 = choppy
+    weight_profile: Dict[str, float]  # raw unnormalised weights for the aggregator
+    evidence: str = ""           # pipe-separated per-source contributions
+    weight_summary: str = ""     # human-readable weight delta vs. NEUTRAL baseline
+    summary: str = ""
+
+
+class MacroRegimeContext(BaseModel):
+    """Composite macro regime derived from VIX, MOVE, bond internals, global macro, FRED, breadth, and credit."""
+    regime: str                     # PANIC | RISK_OFF | CAUTION | NEUTRAL | RISK_ON
+    composite_score: float          # weighted composite ∈ [-3, +1]; negative = risk-off
+    confidence_threshold: float     # adjusted min confidence for actionable BUY/SELL signals
+    allow_buys: bool                # False during PANIC or RISK_OFF — new longs blocked
+    has_panic_signal: bool = False  # at least one source (VIX or MOVE) fired PANIC
+    evidence: str = ""              # pipe-separated per-source contributions
+    summary: str = ""              # human-readable full summary
+
+
+class SectorPair(BaseModel):
+    """A market-neutral pair trade: one leg long + one leg short within the same sector.
+
+    Formed when a sector ETF and one of its constituents disagree on direction.
+    Long the BULLISH leg, short the BEARISH leg — removes broad market beta,
+    isolates the idiosyncratic signal.
+    """
+    stock: str                  # individual stock ticker
+    etf: str                    # sector ETF ticker (e.g. XLK)
+    long_leg: str               # ticker to go long
+    short_leg: str              # ticker to go short
+    stock_direction: str        # BULLISH | BEARISH
+    etf_direction: str          # BULLISH | BEARISH (opposite of stock_direction)
+    stock_confidence: float
+    etf_confidence: float
+    pair_score: float           # composite conviction = (stock_conf + etf_conf) / 2
+    setup_type: str             # "ETF_BULL_STOCK_BEAR" | "ETF_BEAR_STOCK_BULL"
+    rationale: str
+
+
+class SectorPairsContext(BaseModel):
+    """All sector-pair relative-value opportunities detected in the current run."""
+    pairs: List[SectorPair]
+    summary: str
+
+
+class ClusterWatchEntry(BaseModel):
+    """A single ticker under active insider-cluster surveillance (within 10-day window)."""
+    ticker: str
+    detected_at: date
+    cluster_size: int                   # number of distinct insiders in the triggering cluster
+    insider_summary: str = ""           # human-readable names/roles from TickerSignal
+    days_elapsed: int = 0               # calendar days since detection
+    days_remaining: int = 10            # days left in the 10-day watch window
+
+
+class ClusterWatchlistContext(BaseModel):
+    """Cross-run persistent watchlist of insider cluster signals (up to 10 days)."""
+    entries: List[ClusterWatchEntry]
+    active_tickers: List[str]           # tickers still within the watch window
+    summary: str
+
+
+class CatalystSetup(BaseModel):
+    """A ticker with both a recent 8-K filing and an insider buy — highest-conviction pre-signal setup."""
+    ticker: str
+    has_8k: bool = False
+    has_insider_buy: bool = False
+    has_vol_spike: bool = False
+    catalyst_reason: str = ""
+
+
+class CatalystTimingContext(BaseModel):
+    """Event-driven catalyst timing signals: earnings blackout, OpEx amplifier, and 8-K+insider WATCH elevation."""
+    earnings_blackout_tickers: List[str]
+    earnings_blackout_details: Dict[str, int]   # ticker → days_until_earnings
+    opex_max_pain_weight: float                 # 0.12 base, 0.20 opex week, 0.28 triple witching
+    opex_boost_active: bool
+    opex_is_triple_witching: bool
+    opex_signal: str                            # from OpExContext.signal
+    catalyst_setups: List[CatalystSetup]
+    watch_elevation_tickers: List[str]
+    summary: str
+
+
 class OpExContext(BaseModel):
     """Options expiration calendar context — pure date math, no API calls."""
     today: date
@@ -684,6 +770,9 @@ class TickerSignal(BaseModel):
     # Insider cluster fields — populated when ≥3 different insiders buy within 5 days
     insider_cluster_detected: bool = False
     insider_cluster_size: int = 0
+    # Pattern recognition fields — populated when enable_pattern_recognition=true
+    pattern_score: float = 0.0   # [-1, +1] historical win-rate based pattern signal
+    pattern_name: str = ""        # detected pattern (e.g. "double_bottom", "head_shoulders")
 
 
 class Recommendation(BaseModel):

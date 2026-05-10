@@ -3,10 +3,10 @@
 Layout:
   1. Signal overview chart
   2. Aggregated recommendations — summary table of every ticker
-  3. Trade details — full per-method breakdown for each BUY / SELL
-  4. Monitor list — compact HOLD / WATCH table
-  5. Smart money signals
-  6. Portfolio performance
+  3. Portfolio performance
+  4. Trade details — full per-method breakdown for each BUY / SELL
+  5. Monitor list — compact HOLD / WATCH table
+  6. Smart money signals
 
 Charts are attached as inline MIME images (CID references) so Gmail renders them.
 If kaleido is not installed the email falls back gracefully to text-only.
@@ -137,7 +137,7 @@ HTML_TEMPLATE = """
      SIGNAL OVERVIEW CHART
      ══════════════════════════════════════ -->
 {% if overview_png %}
-<h2>Signal Overview</h2>
+<h2>1. Signal Overview</h2>
 <img class="chart-img" src="cid:overview_chart" alt="Signal Overview">
 {% endif %}
 
@@ -145,7 +145,7 @@ HTML_TEMPLATE = """
      1 — AGGREGATED RECOMMENDATIONS
      Summary of every ticker, BUY/SELL first
      ══════════════════════════════════════ -->
-<h2>Aggregated Recommendations</h2>
+<h2>2. Aggregated Recommendations</h2>
 <table class="tbl">
   <thead>
     <tr>
@@ -201,11 +201,250 @@ HTML_TEMPLATE = """
 </table>
 
 <!-- ══════════════════════════════════════
-     2 — TRADE DETAILS  (BUY / SELL only)
+     2 — PORTFOLIO PERFORMANCE
+     ══════════════════════════════════════ -->
+{% if perf %}
+<h2>3. Portfolio Performance</h2>
+{% if not perf.open_trades and not perf.closed_trades %}
+<div class="card" style="border-left:4px solid #334155;">
+  <span style="color:#64748b;font-size:13px;">
+    No trades recorded yet — positions will appear here once entries are opened.<br>
+    <small style="color:#475569;">Tip: set <code>ENABLE_FETCH_DATA=true</code> so entry prices can be fetched.</small>
+  </span>
+</div>
+{% endif %}
+{% if perf.trades_svg %}
+{{ perf.trades_svg | safe }}
+{% endif %}
+{% if perf.stats %}
+{# ── Inception summary banner — shown whenever any trades exist ── #}
+{% if perf.stats.total_all %}
+{% set cret = perf.stats.compound_return if perf.stats.compound_return is defined else none %}
+{% set cret_color = '#4ade80' if (cret is not none and cret > 0) else ('#f87171' if (cret is not none and cret < 0) else '#60a5fa') %}
+<div class="card" style="border-left:4px solid {{ cret_color }};margin-bottom:10px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+    <div>
+      <span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Since inception</span><br>
+      <span style="font-size:12px;color:#94a3b8;">
+        {% if perf.stats.first_trade_date %}{{ perf.stats.first_trade_date }}{% endif %}
+        {% if perf.stats.inception_days %}
+        &nbsp;&bull;&nbsp;{{ perf.stats.inception_days }} days
+        {% endif %}
+        &nbsp;&bull;&nbsp;{{ perf.stats.total_all }} total trades
+        ({{ perf.stats.total_closed }} closed, {{ perf.stats.total_open }} open)
+      </span>
+    </div>
+    <div style="text-align:right;">
+      {% if cret is not none %}
+      <span style="font-size:11px;color:#64748b;">Compound return</span><br>
+      <span style="font-size:28px;font-weight:700;color:{{ cret_color }};">
+        {{ "%+.2f"|format(cret) }}%
+      </span>
+      {% else %}
+      <span style="font-size:12px;color:#64748b;">No closed trades yet</span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{# ── Closed-trade stats card — only when returns are available ── #}
+{% if perf.stats.total_closed %}
+<div class="card" style="border-left: 4px solid #2563eb;">
+  <strong>Closed trades ({{ perf.stats.total_closed }})</strong><br><br>
+  Win rate: <strong>{{ perf.stats.win_rate }}%</strong>
+  &bull; Avg return: <strong>{{ "%+.2f"|format(perf.stats.avg_return) }}%</strong>
+  {% if perf.stats.weighted_avg_return is defined and perf.stats.weighted_avg_return != perf.stats.avg_return %}
+  &bull; Weighted avg: <strong>{{ "%+.2f"|format(perf.stats.weighted_avg_return) }}%</strong>
+  <span style="font-size:11px;color:#64748b;">(size-adjusted)</span>
+  {% endif %}
+  &bull; Best: <strong class="pos">{{ "%+.2f"|format(perf.stats.best) }}%</strong>
+  &bull; Worst: <strong class="neg">{{ "%+.2f"|format(perf.stats.worst) }}%</strong>
+</div>
+{% endif %}
+
+{% endif %}
+{% if perf.open_trades %}
+<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Open positions</h3>
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
+      <th>Current</th><th>P&amp;L</th><th>Size</th><th>Days</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in perf.open_trades %}
+    {% set mul = t.position_size_multiplier if t.position_size_multiplier is defined else 1.0 %}
+    <tr>
+      <td><strong>{{ t.ticker }}</strong></td>
+      <td>{{ t.action }}</td>
+      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
+      <td>${{ "%.2f"|format(t.entry_price) }}</td>
+      <td>${{ "%.2f"|format(t.current_price) }}</td>
+      <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
+        {{ "%+.2f"|format(t.return_pct) }}%
+      </td>
+      <td style="color:{% if mul >= 2.0 %}#4ade80{% elif mul >= 1.5 %}#60a5fa{% else %}#94a3b8{% endif %};">
+        {{ mul }}×
+      </td>
+      <td>{{ t.days_held }}d</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if perf.closed_trades %}
+<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Closed positions</h3>
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
+      <th>Exit</th><th>P&amp;L</th><th>Size</th><th>Days</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in perf.closed_trades %}
+    {% set mul = t.position_size_multiplier if t.position_size_multiplier is defined else 1.0 %}
+    <tr>
+      <td><strong>{{ t.ticker }}</strong></td>
+      <td>{{ t.action }}</td>
+      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
+      <td>${{ "%.2f"|format(t.entry_price) }}</td>
+      <td>${{ "%.2f"|format(t.exit_price) }}</td>
+      <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
+        {{ "%+.2f"|format(t.return_pct) }}%
+      </td>
+      <td style="color:{% if mul >= 2.0 %}#4ade80{% elif mul >= 1.5 %}#60a5fa{% else %}#94a3b8{% endif %};">
+        {{ mul }}×
+      </td>
+      <td>{{ t.days_held }}d</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# ── Confidence-Ranked Trades ── #}
+{% if perf and perf.confidence_ranked %}
+<h3 style="color:#94a3b8;font-size:13px;margin:20px 0 6px;">Trades Ranked by Confidence</h3>
+<p style="color:#64748b;font-size:11px;margin:0 0 8px 0;">
+  Sorted highest → lowest conviction. Cumulative columns show what avg return &amp; win rate
+  would have been if you stopped at that rank — e.g. "only take the top-3 most confident signals."
+</p>
+<table class="pt">
+  <thead>
+    <tr>
+      <th>#</th><th>Ticker</th><th>Action</th><th>Confidence</th>
+      <th>Return</th><th>Cum. Avg Return</th><th>Cum. Win Rate</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in perf.confidence_ranked %}
+  {% set cum_color = '#4ade80' if row.cumulative_avg > 0 else '#f87171' %}
+  {% set wr_color  = '#4ade80' if row.cumulative_win_rate >= 55 else '#f59e0b' if row.cumulative_win_rate >= 45 else '#f87171' %}
+  <tr>
+    <td style="color:#64748b;">{{ row.rank }}</td>
+    <td><strong>{{ row.ticker }}</strong></td>
+    <td style="color:{{ '#16a34a' if row.action == 'BUY' else '#dc2626' }};font-weight:700;">
+      {{ row.action }}
+    </td>
+    <td style="color:#60a5fa;font-weight:600;">{{ (row.confidence * 100)|round(1) }}%</td>
+    <td class="{{ 'pos' if row.return_pct > 0 else 'neg' }}">
+      {{ "%+.2f"|format(row.return_pct) }}%
+    </td>
+    <td style="color:{{ cum_color }};font-weight:700;">
+      {{ "%+.2f"|format(row.cumulative_avg) }}%
+    </td>
+    <td style="color:{{ wr_color }};font-weight:700;">
+      {{ row.cumulative_win_rate }}%
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4 — PERFORMANCE BREAKDOWN
+     ══════════════════════════════════════ -->
+{% if perf and perf.performance_table %}
+<h2>4. Performance Breakdown</h2>
+{% if perf.attributed_count and perf.attributed_count > 0 %}
+<p style="color:#64748b;font-size:12px;margin:0 0 10px 0;">
+  Signal method rows cover <strong style="color:#94a3b8;">{{ perf.attributed_count }}</strong> attribution-enabled closed trade{{ 's' if perf.attributed_count != 1 else '' }}.
+  A method "agreed" when its score exceeded &plusmn;0.10 in the trade direction.
+</p>
+{% endif %}
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Segment</th>
+      <th style="text-align:right;">Trades</th>
+      <th style="text-align:right;">Win Rate</th>
+      <th style="text-align:right;">Compound</th>
+      <th style="text-align:right;">Avg Return</th>
+      <th style="text-align:right;">Wtd Avg</th>
+      <th style="text-align:right;">Best</th>
+      <th style="text-align:right;">Worst</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% set ns = namespace(last_group='') %}
+  {% for row in perf.performance_table %}
+  {% if row.group == 'direction' and ns.last_group not in ('direction',) %}
+  <tr>
+    <td colspan="8" style="background:#0f172a;padding:5px 10px;font-size:11px;color:#64748b;font-style:italic;border-top:1px solid #334155;">
+      &#8212; By Trade Direction &#8212;
+    </td>
+  </tr>
+  {% elif row.group == 'method' and ns.last_group not in ('method',) %}
+  <tr>
+    <td colspan="8" style="background:#0f172a;padding:5px 10px;font-size:11px;color:#64748b;font-style:italic;border-top:1px solid #334155;">
+      &#8212; By Signal Method (attribution-enabled trades) &#8212;
+    </td>
+  </tr>
+  {% endif %}
+  {% set ns.last_group = row.group %}
+  {% set wr_c  = '#4ade80' if row.win_rate        >= 55 else '#f59e0b' if row.win_rate        >= 45 else '#f87171' %}
+  {% set cp_c  = '#4ade80' if row.compound_return  > 0  else '#f87171' %}
+  {% set av_c  = '#4ade80' if row.avg_return       > 0  else '#f87171' %}
+  {% set wt_c  = '#4ade80' if row.wtd_avg_return   > 0  else '#f87171' %}
+  <tr style="{{ 'font-weight:700;background:#1e293b;' if row.group == 'total' else '' }}">
+    <td>
+      {% if row.group == 'total' %}
+        <strong style="color:#e2e8f0;">{{ row.label }}</strong>
+      {% elif row.group == 'asset' %}
+        <span style="padding-left:10px;color:#94a3b8;">{{ row.label }}</span>
+      {% else %}
+        <span style="padding-left:10px;">{{ row.label }}</span>
+      {% endif %}
+    </td>
+    <td style="text-align:right;color:#94a3b8;">{{ row.trades }}</td>
+    <td style="text-align:right;color:{{ wr_c }};font-weight:700;">{{ row.win_rate }}%</td>
+    <td style="text-align:right;color:{{ cp_c }};font-weight:{{ '700' if row.group == 'total' else '400' }};">{{ "%+.2f"|format(row.compound_return) }}%</td>
+    <td style="text-align:right;color:{{ av_c }};">{{ "%+.2f"|format(row.avg_return) }}%</td>
+    <td style="text-align:right;color:{{ wt_c }};">{{ "%+.2f"|format(row.wtd_avg_return) }}%</td>
+    <td style="text-align:right;color:#4ade80;font-size:11px;">{{ "%+.2f"|format(row.best) }}%</td>
+    <td style="text-align:right;color:#f87171;font-size:11px;">{{ "%+.2f"|format(row.worst) }}%</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<h2>4. Performance Breakdown</h2>
+<div class="card" style="border-left:4px solid #334155;">
+  <span style="color:#64748b;font-size:13px;">No closed trades yet — breakdown will appear once trades are closed.</span>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5 — TRADE DETAILS  (BUY / SELL only)
      Per-method breakdown with dates
      ══════════════════════════════════════ -->
 {% if actionable_recs %}
-<h2>Trade Details</h2>
+<h2>5. Trade Details</h2>
 {% for rec in actionable_recs %}
 {% set sig = signals_by_ticker.get(rec.ticker) %}
 <div class="card" style="border-left: 4px solid {{ colors[rec.action] }};">
@@ -419,6 +658,42 @@ HTML_TEMPLATE = """
     </div>
     {% endif %}
 
+    <!-- Pattern Recognition -->
+    {% if use_pattern and sig.pattern_score is defined and sig.pattern_score != 0 %}
+    {% set pr = sig.pattern_score %}
+    {% set pn = sig.pattern_name if sig.pattern_name is defined else "" %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Pattern Recognition</span>
+        <span class="mscore {{ 'sp' if pr > 0 else 'sn' }}">
+          {{ "%+.2f"|format(pr) }}
+        </span>
+        {% if pn %}
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">
+          {{ pn | replace("_", " ") | title }}
+        </span>
+        {% endif %}
+      </div>
+      <div class="bar-wrap">
+        <div class="bar"
+             style="width:{{ (pr|abs * 100)|int }}%;
+                    background:{{ '#16a34a' if pr >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if pn == "double_bottom" %}Double bottom detected — W-shape reversal, historically bullish for this ticker.
+        {% elif pn == "inv_head_shoulders" %}Inverse head &amp; shoulders — three-trough reversal, historically bullish.
+        {% elif pn == "ascending_triangle" %}Ascending triangle — flat resistance + rising support, bullish breakout bias.
+        {% elif pn == "bull_flag" %}Bull flag — sharp rally followed by tight consolidation, continuation higher.
+        {% elif pn == "double_top" %}Double top detected — M-shape reversal, historically bearish for this ticker.
+        {% elif pn == "head_shoulders" %}Head &amp; shoulders — three-peak reversal, historically bearish.
+        {% elif pn == "descending_triangle" %}Descending triangle — flat support + declining resistance, bearish breakdown bias.
+        {% elif pn == "bear_flag" %}Bear flag — sharp decline followed by tight consolidation, continuation lower.
+        {% else %}{{ pn | replace("_", " ") | title }} pattern detected.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (score reflects this ticker&rsquo;s own historical win rate for this pattern)</span>
+      </div>
+    </div>
+    {% endif %}
+
     <!-- Gamma Exposure (GEX) per-ticker -->
     {% if sig.gex_signal %}
     {% set gex_col = {'PINNED': '#0ea5e9', 'AMPLIFIED': '#f87171', 'NEUTRAL': '#94a3b8'}.get(sig.gex_signal, '#94a3b8') %}
@@ -471,7 +746,7 @@ HTML_TEMPLATE = """
      3 — MONITOR LIST  (HOLD / WATCH)
      ══════════════════════════════════════ -->
 {% if passive_recs %}
-<h2>Monitor List</h2>
+<h2>6. Monitor List</h2>
 <table class="ctbl">
   <thead>
     <tr>
@@ -533,7 +808,7 @@ HTML_TEMPLATE = """
      3b — ANALYST RATINGS
      ══════════════════════════════════════ -->
 {% if analyst_articles %}
-<h2>Analyst Ratings <span style="font-size:13px;font-weight:400;color:#94a3b8;">(upgrades · downgrades · price targets)</span></h2>
+<h2>7. Analyst Ratings <span style="font-size:13px;font-weight:400;color:#94a3b8;">(upgrades · downgrades · price targets)</span></h2>
 {% for art in analyst_articles %}
 {% set is_bull = 'upgrade' in art.title.lower() or 'initiated' in art.title.lower() %}
 {% set is_bear = 'downgrade' in art.title.lower() %}
@@ -557,7 +832,7 @@ HTML_TEMPLATE = """
      ══════════════════════════════════════ -->
 {% set all_alt = eps_articles + alt_data_articles %}
 {% if all_alt %}
-<h2>Alternative Signals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(EPS surprises · Google Trends · Reddit · Short Interest)</span></h2>
+<h2>8. Alternative Signals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(EPS surprises · Google Trends · Reddit · Short Interest)</span></h2>
 <table class="ctbl">
   <thead>
     <tr>
@@ -596,12 +871,160 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
-     4 — MACRO CONTEXT (FRED)
+     4 — MACRO REGIME FILTER
+     ══════════════════════════════════════ -->
+{% if macro_regime_context %}
+{% set mrc = macro_regime_context %}
+{% set regime_colors = {
+    'PANIC':    '#f87171',
+    'RISK_OFF': '#fb923c',
+    'CAUTION':  '#fbbf24',
+    'NEUTRAL':  '#94a3b8',
+    'RISK_ON':  '#4ade80'
+} %}
+{% set regime_bgs = {
+    'PANIC':    '#450a0a',
+    'RISK_OFF': '#431407',
+    'CAUTION':  '#451a03',
+    'NEUTRAL':  '#1e293b',
+    'RISK_ON':  '#14532d'
+} %}
+{% set rcolor = regime_colors.get(mrc.regime, '#94a3b8') %}
+{% set rbg    = regime_bgs.get(mrc.regime, '#1e293b') %}
+<h2>9. Macro Regime <span style="font-size:13px;font-weight:400;color:#94a3b8;">(composite overlay)</span></h2>
+<div class="card" style="border-left: 4px solid {{ rcolor }};">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+    <span class="ticker" style="font-size:16px;color:{{ rcolor }};">{{ mrc.regime }}</span>
+    <span class="badge" style="background:{{ rbg }};color:{{ rcolor }};border:1px solid {{ rcolor }};">
+      Composite Regime
+    </span>
+    {% if not mrc.allow_buys %}
+    <span class="badge" style="background:#450a0a;color:#f87171;border:1px solid #f87171;">
+      BUY ENTRIES BLOCKED
+    </span>
+    {% endif %}
+    <span style="font-size:12px;color:#64748b;">score={{ "%.2f"|format(mrc.composite_score) }} &bull; threshold={{ "%.0f"|format(mrc.confidence_threshold * 100) }}%</span>
+  </div>
+  <div class="synth">{{ mrc.summary }}</div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4a — MARKET MODE (weight switching)
+     ══════════════════════════════════════ -->
+{% if market_mode_context %}
+{% set mmc = market_mode_context %}
+{% set mode_colors = {
+    'TRENDING': '#4ade80',
+    'NEUTRAL':  '#94a3b8',
+    'CHOPPY':   '#fb923c'
+} %}
+{% set mode_bgs = {
+    'TRENDING': '#14532d',
+    'NEUTRAL':  '#1e293b',
+    'CHOPPY':   '#431407'
+} %}
+{% set mcolor = mode_colors.get(mmc.mode, '#94a3b8') %}
+{% set mbg    = mode_bgs.get(mmc.mode, '#1e293b') %}
+<h2>10. Market Mode <span style="font-size:13px;font-weight:400;color:#94a3b8;">(signal weight switching)</span></h2>
+<div class="card" style="border-left: 4px solid {{ mcolor }}; padding: 14px 18px;">
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+    <span style="font-size:15px;font-weight:700;color:{{ mcolor }};">{{ mmc.mode }}</span>
+    <span class="badge" style="background:{{ mbg }};color:{{ mcolor }};border:1px solid {{ mcolor }};">
+      {{ {'TRENDING': 'Momentum bias', 'CHOPPY': 'Mean-reversion bias', 'NEUTRAL': 'Balanced weights'}.get(mmc.mode, '') }}
+    </span>
+    <span style="font-size:11px;color:#64748b;">score={{ "%.2f"|format(mmc.composite_score) }}</span>
+  </div>
+  {% if mmc.weight_summary %}
+  <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;">
+    Weight adjustments vs. baseline: <strong style="color:#e2e8f0;">{{ mmc.weight_summary }}</strong>
+  </div>
+  {% endif %}
+  <div style="font-size:11px;color:#475569;">{{ mmc.evidence }}</div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4b — CATALYST TIMING (event-driven)
+     ══════════════════════════════════════ -->
+{% if catalyst_timing_context %}
+{% set ctc = catalyst_timing_context %}
+<h2>11. Catalyst Timing <span style="font-size:13px;font-weight:400;color:#94a3b8;">(event-driven guards)</span></h2>
+<div class="card" style="padding:14px 18px;">
+
+  {# Earnings Blackout #}
+  {% if ctc.earnings_blackout_tickers %}
+  <div style="margin-bottom:12px;">
+    <span style="font-size:12px;font-weight:600;color:#f87171;text-transform:uppercase;letter-spacing:.5px;">Earnings Blackout</span>
+    <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;">
+      {% for ticker in ctc.earnings_blackout_tickers %}
+      {% set days = ctc.earnings_blackout_details.get(ticker, '?') %}
+      <span class="badge" style="background:#450a0a;color:#f87171;border:1px solid #f87171;">
+        {{ ticker }} — {{ days }}d
+      </span>
+      {% endfor %}
+    </div>
+    <div style="font-size:11px;color:#64748b;margin-top:4px;">BUY/SELL entries blocked within 2 days of earnings (IV crush / gap risk)</div>
+  </div>
+  {% else %}
+  <div style="margin-bottom:12px;">
+    <span style="font-size:12px;font-weight:600;color:#4ade80;text-transform:uppercase;letter-spacing:.5px;">Earnings Blackout</span>
+    <span style="font-size:12px;color:#64748b;margin-left:8px;">No tickers within 2-day earnings window</span>
+  </div>
+  {% endif %}
+
+  {# OpEx Amplifier #}
+  {% if ctc.opex_boost_active %}
+  <div style="margin-bottom:12px;">
+    {% set opex_color = '#f59e0b' if ctc.opex_is_triple_witching else '#60a5fa' %}
+    <span style="font-size:12px;font-weight:600;color:{{ opex_color }};text-transform:uppercase;letter-spacing:.5px;">
+      OpEx Amplifier{% if ctc.opex_is_triple_witching %} — Triple Witching{% endif %}
+    </span>
+    <div style="font-size:12px;color:#94a3b8;margin-top:4px;">
+      max_pain weight boosted: <strong style="color:{{ opex_color }};">0.12 → {{ "%.2f"|format(ctc.opex_max_pain_weight) }}</strong>
+      <span style="color:#64748b;margin-left:8px;">{{ ctc.opex_signal }}</span>
+    </div>
+  </div>
+  {% else %}
+  <div style="margin-bottom:12px;">
+    <span style="font-size:12px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.5px;">OpEx Amplifier</span>
+    <span style="font-size:12px;color:#64748b;margin-left:8px;">Not in OpEx week — baseline max_pain weight (0.12)</span>
+  </div>
+  {% endif %}
+
+  {# 8-K + Insider WATCH Candidates #}
+  {% if ctc.catalyst_setups %}
+  <div>
+    <span style="font-size:12px;font-weight:600;color:#c084fc;text-transform:uppercase;letter-spacing:.5px;">8-K + Insider Buy → WATCH</span>
+    <div style="margin-top:6px;display:flex;flex-direction:column;gap:6px;">
+      {% for setup in ctc.catalyst_setups %}
+      <div style="background:#0f172a;border-radius:6px;padding:8px 12px;border-left:3px solid #c084fc;">
+        <span class="ticker" style="font-size:13px;color:#c084fc;">{{ setup.ticker }}</span>
+        {% if setup.has_vol_spike %}
+        <span class="badge" style="background:#2e1065;color:#c084fc;border:1px solid #c084fc;margin-left:6px;">vol confirmed</span>
+        {% endif %}
+        <div style="font-size:11px;color:#94a3b8;margin-top:4px;">{{ setup.catalyst_reason }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% else %}
+  <div>
+    <span style="font-size:12px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.5px;">8-K + Insider Buy</span>
+    <span style="font-size:12px;color:#64748b;margin-left:8px;">No overlapping 8-K + insider buy setups detected</span>
+  </div>
+  {% endif %}
+
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4c — MACRO CONTEXT (FRED)
      ══════════════════════════════════════ -->
 {% if macro_context %}
 {% set regime_color = {'EXPANSION': '#4ade80', 'SLOWDOWN': '#fb923c', 'LATE_CYCLE': '#f59e0b', 'RECESSION': '#f87171'} %}
 {% set regime_bg    = {'EXPANSION': '#14532d', 'SLOWDOWN': '#431407', 'LATE_CYCLE': '#451a03', 'RECESSION': '#450a0a'} %}
-<h2>Macro Context <span style="font-size:13px;font-weight:400;color:#94a3b8;">(FRED)</span></h2>
+<h2>12. Macro Context <span style="font-size:13px;font-weight:400;color:#94a3b8;">(FRED)</span></h2>
 <div class="card" style="border-left: 4px solid {{ regime_color.get(macro_context.regime, '#94a3b8') }};">
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
     <span class="ticker" style="font-size:15px;">{{ macro_context.regime }}</span>
@@ -697,7 +1120,7 @@ HTML_TEMPLATE = """
     'STRONG_MISS':  '#450a0a'
 } %}
 {% set ms_dir_arrow = {'BULLISH': '▲', 'BEARISH': '▼', 'NEUTRAL': '→'} %}
-<h2>Macro Surprise Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CESI-style — FRED actual vs. trend)</span></h2>
+<h2>13. Macro Surprise Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CESI-style — FRED actual vs. trend)</span></h2>
 <div class="card" style="border-left: 4px solid {{ ms_color.get(ms.signal, '#94a3b8') }};">
 
   <!-- Header row: score pill + signal badge + direction -->
@@ -812,7 +1235,7 @@ HTML_TEMPLATE = """
 {% set fw_arrow = {'BULLISH': '▲', 'BEARISH': '▼', 'NEUTRAL': '→'} %}
 {% set trend_icon = {'DOVISH_SHIFT': '⬇', 'HAWKISH_SHIFT': '⬆', 'NEUTRAL': '→'} %}
 {% set trend_color = {'DOVISH_SHIFT': '#4ade80', 'HAWKISH_SHIFT': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Fed Rate Expectations <span style="font-size:13px;font-weight:400;color:#94a3b8;">(T-bill spread proxy · FRED)</span></h2>
+<h2>14. Fed Rate Expectations <span style="font-size:13px;font-weight:400;color:#94a3b8;">(T-bill spread proxy · FRED)</span></h2>
 <div class="card" style="border-left: 4px solid {{ fw_color.get(fw.signal, '#94a3b8') }};">
 
   <!-- Header: Signal + FF target + trend -->
@@ -947,7 +1370,7 @@ HTML_TEMPLATE = """
     'STRONG_DETERIORATING': '#f87171'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Estimate Revision Momentum <span style="font-size:13px;font-weight:400;color:#94a3b8;">(analyst consensus trend · 30d recent vs 31-60d prior)</span></h2>
+<h2>15. Estimate Revision Momentum <span style="font-size:13px;font-weight:400;color:#94a3b8;">(analyst consensus trend · 30d recent vs 31-60d prior)</span></h2>
 <div class="card" style="border-left: 4px solid {{ sig_color.get(rm.signal, '#94a3b8') }};">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ rm.summary }}</p>
 
@@ -1066,7 +1489,7 @@ HTML_TEMPLATE = """
      ══════════════════════════════════════ -->
 {% if ipo_context and ipo_context.total_new > 0 %}
 {% set activity_color = '#4ade80' if ipo_context.total_new >= 20 else ('#fb923c' if ipo_context.total_new >= 10 else '#94a3b8') %}
-<h2>IPO Pipeline <span style="font-size:13px;font-weight:400;color:#94a3b8;">(SEC S-1/S-11 — last {{ ipo_context.lookback_days }} days)</span></h2>
+<h2>16. IPO Pipeline <span style="font-size:13px;font-weight:400;color:#94a3b8;">(SEC S-1/S-11 — last {{ ipo_context.lookback_days }} days)</span></h2>
 <div class="card" style="border-left: 4px solid #0ea5e9;">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ ipo_context.summary }}</p>
 
@@ -1129,7 +1552,7 @@ HTML_TEMPLATE = """
      5b — UPCOMING EARNINGS CALENDAR
      ══════════════════════════════════════ -->
 {% if earnings_context and earnings_context.upcoming %}
-<h2>Upcoming Earnings <span style="font-size:13px;font-weight:400;color:#94a3b8;">(next {{ earnings_context.upcoming[-1].days_until }} days)</span></h2>
+<h2>17. Upcoming Earnings <span style="font-size:13px;font-weight:400;color:#94a3b8;">(next {{ earnings_context.upcoming[-1].days_until }} days)</span></h2>
 <div class="card" style="border-left: 4px solid #f59e0b;">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ earnings_context.summary }}</p>
   <div style="overflow-x:auto;">
@@ -1184,7 +1607,7 @@ HTML_TEMPLATE = """
     'MISS_LIKELY':   '#f87171'
 } %}
 {% set dir_color_w = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Earnings Whisper <span style="font-size:13px;font-weight:400;color:#94a3b8;">(implied whisper vs. sell-side consensus · beat/miss history)</span></h2>
+<h2>18. Earnings Whisper <span style="font-size:13px;font-weight:400;color:#94a3b8;">(implied whisper vs. sell-side consensus · beat/miss history)</span></h2>
 <div class="card" style="border-left: 4px solid #f59e0b;">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ wc.summary }}</p>
 
@@ -1344,7 +1767,7 @@ HTML_TEMPLATE = """
     'EXTREME_SHORT': '#60a5fa'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>COT Futures Positioning <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CFTC — as of {{ cot_context.report_date }})</span></h2>
+<h2>19. COT Futures Positioning <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CFTC — as of {{ cot_context.report_date }})</span></h2>
 <div class="card" style="border-left: 4px solid #7c3aed;">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ cot_context.summary }}</p>
   <div style="overflow-x:auto;">
@@ -1414,7 +1837,7 @@ HTML_TEMPLATE = """
     'UNKNOWN':       '#64748b'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>VIX &amp; Volatility Regime <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^VIX · ^VXN · ^VVIX · term structure)</span></h2>
+<h2>20. VIX &amp; Volatility Regime <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^VIX · ^VXN · ^VVIX · term structure)</span></h2>
 <div class="card" style="border-left: 4px solid {{ vix_sig_color.get(vix_context.vix_signal, '#94a3b8') }};">
 
   <!-- Top row: VIX gauge + term structure -->
@@ -1507,7 +1930,7 @@ HTML_TEMPLATE = """
     'UNKNOWN':  '#475569'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>MOVE Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(bond market VIX · ^MOVE / VXTLT · spikes precede equity dislocations)</span></h2>
+<h2>21. MOVE Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(bond market VIX · ^MOVE / VXTLT · spikes precede equity dislocations)</span></h2>
 <div class="card" style="border-left: 4px solid {{ move_sig_color.get(move_context.signal, '#94a3b8') }};">
 
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
@@ -1614,7 +2037,7 @@ HTML_TEMPLATE = """
     'UNKNOWN':         '#475569'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Global Macro <span style="font-size:13px;font-weight:400;color:#94a3b8;">(DXY dollar strength · Copper/Gold ratio · cross-asset regime)</span></h2>
+<h2>22. Global Macro <span style="font-size:13px;font-weight:400;color:#94a3b8;">(DXY dollar strength · Copper/Gold ratio · cross-asset regime)</span></h2>
 <div class="card" style="border-left: 4px solid {{ gm_composite_colors.get(gm.composite_signal, '#475569') }};">
 
   {% if gm.copper_gold_signal == 'RISK_OFF_CRASH' or gm.dxy_signal == 'STRONG_BULL' %}
@@ -1781,7 +2204,7 @@ HTML_TEMPLATE = """
     'UNKNOWN':        '#64748b'
 } %}
 {% set cr_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Credit Market <span style="font-size:13px;font-weight:400;color:#94a3b8;">(HYG vs SPY · leading indicator)</span></h2>
+<h2>23. Credit Market <span style="font-size:13px;font-weight:400;color:#94a3b8;">(HYG vs SPY · leading indicator)</span></h2>
 <div class="card" style="border-left: 4px solid {{ cr_color.get(credit_context.signal, '#94a3b8') }};">
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
 
@@ -1853,7 +2276,7 @@ HTML_TEMPLATE = """
     'CALLS_HEAVY':   '#86efac',
     'EXTREME_CALLS': '#4ade80'
 } %}
-<h2>Put/Call Ratio <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CBOE equity · yfinance per-ticker)</span></h2>
+<h2>24. Put/Call Ratio <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CBOE equity · yfinance per-ticker)</span></h2>
 <div class="card" style="border-left: 4px solid {{ mkt_color.get(put_call_context.market_signal, '#94a3b8') }};">
 
   <!-- Market-wide gauge -->
@@ -1931,7 +2354,7 @@ HTML_TEMPLATE = """
     'NEUTRAL':       '#94a3b8'
 } %}
 {% set tick_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>NYSE TICK Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^TICK · breadth exhaustion)</span></h2>
+<h2>25. NYSE TICK Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^TICK · breadth exhaustion)</span></h2>
 <div class="card" style="border-left: 4px solid {{ tick_sig_color.get(tick_context.signal, '#94a3b8') }};">
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
 
@@ -2009,7 +2432,7 @@ HTML_TEMPLATE = """
     'BREADTH_EXTENDED': '#fbbf24'
 } %}
 {% set bc_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Market Breadth <span style="font-size:13px;font-weight:400;color:#94a3b8;">(% sector ETFs above 200-day SMA)</span></h2>
+<h2>26. Market Breadth <span style="font-size:13px;font-weight:400;color:#94a3b8;">(% sector ETFs above 200-day SMA)</span></h2>
 <div class="card" style="border-left: 4px solid {{ bc_sig_color.get(breadth_context.signal, '#94a3b8') }};">
 
   {% if breadth_context.is_breadth_thrust %}
@@ -2136,7 +2559,7 @@ HTML_TEMPLATE = """
     'EXTENDED_BEAR': '#f87171'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>McClellan Oscillator <span style="font-size:13px;font-weight:400;color:#94a3b8;">(NYSE A/D breadth momentum · swing timing)</span></h2>
+<h2>27. McClellan Oscillator <span style="font-size:13px;font-weight:400;color:#94a3b8;">(NYSE A/D breadth momentum · swing timing)</span></h2>
 <div class="card" style="border-left: 4px solid {{ osc_sig_color.get(mcclellan_context.osc_signal, '#94a3b8') }};">
 
   {% if mcclellan_context.is_bullish_cross %}
@@ -2259,7 +2682,7 @@ HTML_TEMPLATE = """
     'AMPLIFIED': '#f87171'
 } %}
 {% set bias_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Gamma Exposure <span style="font-size:13px;font-weight:400;color:#94a3b8;">(dealer hedging flows · gamma flip · max pain)</span></h2>
+<h2>28. Gamma Exposure <span style="font-size:13px;font-weight:400;color:#94a3b8;">(dealer hedging flows · gamma flip · max pain)</span></h2>
 <div class="card" style="border-left: 4px solid #0ea5e9;">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ gex_context.summary }}</p>
   <div style="overflow-x:auto;">
@@ -2342,7 +2765,7 @@ HTML_TEMPLATE = """
     'NEUTRAL':              '#475569'
 } %}
 {% set ox = opex_context %}
-<h2>OpEx Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(options expiration · max pain timing · pure date math)</span></h2>
+<h2>29. OpEx Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(options expiration · max pain timing · pure date math)</span></h2>
 <div class="card" style="border-left: 4px solid {{ opex_colors.get(ox.signal, '#475569') }};">
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
 
@@ -2416,7 +2839,7 @@ HTML_TEMPLATE = """
     'STRONG_HEADWIND': '#f87171'
 } %}
 {% set effect_dir_colors = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>Seasonal Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(monthly biases · calendar windows · pure date math)</span></h2>
+<h2>30. Seasonal Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(monthly biases · calendar windows · pure date math)</span></h2>
 <div class="card" style="border-left: 4px solid {{ composite_colors.get(sc.composite_signal, '#475569') }};">
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
 
@@ -2513,7 +2936,7 @@ HTML_TEMPLATE = """
     'IG_STRONG':  '#4ade80',
     'UNKNOWN':    '#475569'
 } %}
-<h2>Bond Market Internals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(1–8 week macro regime · Treasury curve · TLT/TIP/LQD · yfinance)</span></h2>
+<h2>31. Bond Market Internals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(1–8 week macro regime · Treasury curve · TLT/TIP/LQD · yfinance)</span></h2>
 <div class="card" style="border-left: 4px solid {{ regime_colors.get(bi.regime, '#475569') }};">
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
 
@@ -2653,7 +3076,7 @@ HTML_TEMPLATE = """
     'STRONG_LOWS':    '#f87171'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>New 52-Week Highs / Lows <span style="font-size:13px;font-weight:400;color:#94a3b8;">(breadth divergence · participation · reversal timing)</span></h2>
+<h2>32. New 52-Week Highs / Lows <span style="font-size:13px;font-weight:400;color:#94a3b8;">(breadth divergence · participation · reversal timing)</span></h2>
 <div class="card" style="border-left: 4px solid {{ sig_color.get(highs_lows_context.signal, '#94a3b8') }};">
 
   {% if highs_lows_context.is_bearish_divergence %}
@@ -2774,10 +3197,105 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5z — INSIDER CLUSTER WATCHLIST
+     ══════════════════════════════════════ -->
+{% if cluster_watchlist_context and cluster_watchlist_context.entries %}
+<h2>33. Insider Cluster Watchlist <span style="font-size:13px;font-weight:400;color:#94a3b8;">(cross-run 10-day tracking)</span></h2>
+<div class="card" style="border-left: 4px solid #a78bfa; padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">
+    Tickers where ≥3 insiders bought within 5 days. Clusters precede price movement by 5–20 days —
+    each ticker stays in the analysis universe for the full 10-day window.
+  </p>
+  <div style="display:flex;flex-direction:column;gap:8px;">
+  {% for entry in cluster_watchlist_context.entries %}
+  {% set urgency = '#f59e0b' if entry.days_remaining <= 3 else '#a78bfa' %}
+  {% set bar_pct = ((10 - entry.days_remaining) / 10 * 100)|int %}
+  <div style="background:#0f172a;border-radius:6px;padding:10px 14px;border-left:3px solid {{ urgency }};">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+      <span class="ticker" style="font-size:14px;color:#a78bfa;">{{ entry.ticker }}</span>
+      <span class="badge" style="background:#1e1b4b;color:#a78bfa;border:1px solid #a78bfa;">
+        {{ entry.cluster_size }} insiders
+      </span>
+      <span style="font-size:11px;color:#64748b;">detected {{ entry.detected_at }}</span>
+      <span style="font-size:11px;color:{{ urgency }};margin-left:auto;">
+        {{ entry.days_remaining }}d remaining
+      </span>
+    </div>
+    {# Progress bar showing how far through the 10-day window we are #}
+    <div style="background:#1e293b;border-radius:3px;height:4px;margin-bottom:6px;">
+      <div style="background:{{ urgency }};border-radius:3px;height:4px;width:{{ bar_pct }}%;"></div>
+    </div>
+    {% if entry.insider_summary %}
+    <div style="font-size:11px;color:#94a3b8;">{{ entry.insider_summary[:140] }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5y — SECTOR PAIRS / RELATIVE VALUE
+     ══════════════════════════════════════ -->
+{% if sector_pairs_context and sector_pairs_context.pairs %}
+<h2>34. Sector Pairs <span style="font-size:13px;font-weight:400;color:#94a3b8;">(market-neutral relative value)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">
+    ETF vs. constituent divergences: Long the bullish leg, Short the bearish leg.
+    Removes broad-market beta and isolates the idiosyncratic signal.
+  </p>
+  <div style="display:flex;flex-direction:column;gap:10px;">
+  {% for pair in sector_pairs_context.pairs %}
+  {% set is_etf_bull = pair.setup_type == 'ETF_BULL_STOCK_BEAR' %}
+  {% set accent = '#4ade80' if is_etf_bull else '#60a5fa' %}
+  {% set accent_bg = '#052e16' if is_etf_bull else '#082044' %}
+  <div style="background:#0f172a;border-radius:8px;padding:12px 14px;border-left:3px solid {{ accent }};">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+      {# Long leg #}
+      <div style="display:flex;align-items:center;gap:5px;">
+        <span style="font-size:10px;font-weight:700;color:#4ade80;background:#052e16;padding:2px 6px;border-radius:3px;border:1px solid #4ade80;">LONG</span>
+        <span class="ticker" style="font-size:14px;color:#e2e8f0;">{{ pair.long_leg }}</span>
+      </div>
+      <span style="color:#475569;font-size:13px;">/</span>
+      {# Short leg #}
+      <div style="display:flex;align-items:center;gap:5px;">
+        <span style="font-size:10px;font-weight:700;color:#f87171;background:#450a0a;padding:2px 6px;border-radius:3px;border:1px solid #f87171;">SHORT</span>
+        <span class="ticker" style="font-size:14px;color:#e2e8f0;">{{ pair.short_leg }}</span>
+      </div>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+        <span class="badge" style="background:{{ accent_bg }};color:{{ accent }};border:1px solid {{ accent }};">
+          {{ 'Sector Bull / Stock Bear' if is_etf_bull else 'Sector Bear / Stock Bull' }}
+        </span>
+        <span style="font-size:12px;color:#64748b;">score={{ "%.0f"|format(pair.pair_score * 100) }}%</span>
+      </span>
+    </div>
+    {# Conviction bars for each leg #}
+    <div style="display:flex;gap:16px;margin-bottom:8px;">
+      <div style="flex:1;">
+        <div style="font-size:10px;color:#64748b;margin-bottom:2px;">{{ pair.etf }} ({{ pair.etf_direction }}) conf={{ "%.0f"|format(pair.etf_confidence * 100) }}%</div>
+        <div style="background:#1e293b;border-radius:2px;height:3px;">
+          <div style="background:{{ '#4ade80' if pair.etf_direction == 'BULLISH' else '#f87171' }};border-radius:2px;height:3px;width:{{ (pair.etf_confidence * 100)|int }}%;"></div>
+        </div>
+      </div>
+      <div style="flex:1;">
+        <div style="font-size:10px;color:#64748b;margin-bottom:2px;">{{ pair.stock }} ({{ pair.stock_direction }}) conf={{ "%.0f"|format(pair.stock_confidence * 100) }}%</div>
+        <div style="background:#1e293b;border-radius:2px;height:3px;">
+          <div style="background:{{ '#4ade80' if pair.stock_direction == 'BULLISH' else '#f87171' }};border-radius:2px;height:3px;width:{{ (pair.stock_confidence * 100)|int }}%;"></div>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:11px;color:#94a3b8;line-height:1.5;">{{ pair.rationale }}</div>
+  </div>
+  {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
-<h2>Smart Money Signals</h2>
+<h2>35. Smart Money Signals</h2>
 {% if not insider_trades %}
 <div class="card" style="border-left: 4px solid #475569;">
   <span style="color:#64748b;font-size:13px;">No unusual smart money activity detected.</span>
@@ -2815,77 +3333,6 @@ HTML_TEMPLATE = """
   {% endfor %}
 </div>
 {% endfor %}
-{% endif %}
-
-<!-- ══════════════════════════════════════
-     7 — PORTFOLIO PERFORMANCE
-     ══════════════════════════════════════ -->
-{% if perf %}
-<h2>Portfolio Performance</h2>
-{% if equity_png %}
-<img class="chart-img" src="cid:equity_chart" alt="Equity Curve">
-{% endif %}
-{% if perf.stats %}
-<div class="card" style="border-left: 4px solid #2563eb;">
-  <strong>Closed trades ({{ perf.stats.total_closed }})</strong><br><br>
-  Win rate: <strong>{{ perf.stats.win_rate }}%</strong>
-  &bull; Avg return: <strong>{{ "%+.2f"|format(perf.stats.avg_return) }}%</strong>
-  &bull; Best: <strong class="pos">{{ "%+.2f"|format(perf.stats.best) }}%</strong>
-  &bull; Worst: <strong class="neg">{{ "%+.2f"|format(perf.stats.worst) }}%</strong>
-</div>
-{% endif %}
-{% if perf.open_trades %}
-<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Open positions</h3>
-<table class="pt">
-  <thead>
-    <tr>
-      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
-      <th>Current</th><th>P&amp;L</th><th>Days</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for t in perf.open_trades %}
-    <tr>
-      <td><strong>{{ t.ticker }}</strong></td>
-      <td>{{ t.action }}</td>
-      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ "%.2f"|format(t.entry_price) }}</td>
-      <td>${{ "%.2f"|format(t.current_price) }}</td>
-      <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
-        {{ "%+.2f"|format(t.return_pct) }}%
-      </td>
-      <td>{{ t.days_held }}d</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% endif %}
-{% if perf.closed_trades %}
-<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Closed positions</h3>
-<table class="pt">
-  <thead>
-    <tr>
-      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
-      <th>Exit</th><th>P&amp;L</th><th>Days</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for t in perf.closed_trades %}
-    <tr>
-      <td><strong>{{ t.ticker }}</strong></td>
-      <td>{{ t.action }}</td>
-      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ "%.2f"|format(t.entry_price) }}</td>
-      <td>${{ "%.2f"|format(t.exit_price) }}</td>
-      <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
-        {{ "%+.2f"|format(t.return_pct) }}%
-      </td>
-      <td>{{ t.days_held }}d</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% endif %}
 {% endif %}
 
 <div class="footer">
@@ -2947,6 +3394,11 @@ def send_recommendations(
     bond_internals_context=None, # Optional[BondInternalsContext]   — avoid circular import
     move_context=None,           # Optional[MOVEContext]            — avoid circular import
     global_macro_context=None,   # Optional[GlobalMacroContext]     — avoid circular import
+    macro_regime_context=None,   # Optional[MacroRegimeContext]     — avoid circular import
+    market_mode_context=None,    # Optional[MarketModeContext]      — avoid circular import
+    catalyst_timing_context=None,   # Optional[CatalystTimingContext]   — avoid circular import
+    cluster_watchlist_context=None, # Optional[ClusterWatchlistContext] — avoid circular import
+    sector_pairs_context=None,      # Optional[SectorPairsContext]      — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -3086,6 +3538,7 @@ def send_recommendations(
         use_tech=use_tech,
         use_insider=use_insider,
         use_put_call=settings.enable_put_call,
+        use_pattern=settings.enable_pattern_recognition,
         enable_gex=settings.enable_gex,
         active_methods=active_methods,
         # smart money
@@ -3143,6 +3596,16 @@ def send_recommendations(
         move_context=move_context,
         # Global macro: DXY + Copper/Gold ratio
         global_macro_context=global_macro_context,
+        # Macro Regime Filter composite regime
+        macro_regime_context=macro_regime_context,
+        # Market Mode switching (TRENDING/NEUTRAL/CHOPPY)
+        market_mode_context=market_mode_context,
+        # Catalyst Timing (earnings blackout + OpEx amplifier + 8-K+insider WATCH)
+        catalyst_timing_context=catalyst_timing_context,
+        # Insider Cluster Watchlist (cross-run 10-day tracking)
+        cluster_watchlist_context=cluster_watchlist_context,
+        # Sector Pairs / Relative Value
+        sector_pairs_context=sector_pairs_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────
@@ -3171,6 +3634,9 @@ def send_recommendations(
                 lines.append(f"Smart money:\n{sig.insider_summary}")
             if settings.enable_put_call and sig.put_call_score != 0:
                 lines.append(f"Put/call score:  {sig.put_call_score:+.2f}")
+            if settings.enable_pattern_recognition and sig.pattern_score != 0:
+                pn = f" [{sig.pattern_name}]" if sig.pattern_name else ""
+                lines.append(f"Pattern score:   {sig.pattern_score:+.2f}{pn}")
         lines.append(f"Claude's synthesis: {rec.rationale}")
         lines.append("")
     if insider_by_ticker:
@@ -3180,6 +3646,36 @@ def send_recommendations(
                 lines.append(
                     f"  {ticker}: {t.action_label} — {t.trader_name} ({t.role})"
                     f" | {t.amount_range} | {t.transaction_date}"
+                )
+        lines.append("")
+    if performance and performance.get("stats"):
+        s = performance["stats"]
+        lines.append("PORTFOLIO PERFORMANCE")
+        if s.get("first_trade_date"):
+            days_str = f"  ({s.get('inception_days', '?')} days)" if s.get("inception_days") else ""
+            lines.append(f"  Since: {s['first_trade_date']}{days_str}  |  Trades: {s.get('total_all', '?')} total")
+        if s.get("compound_return") is not None:
+            lines.append(f"  Compound return: {s['compound_return']:+.2f}%")
+        lines.append(
+            f"  Win rate: {s.get('win_rate', '?')}%  |  "
+            f"Avg return: {s.get('avg_return', 0):+.2f}%  |  "
+            f"Best: {s.get('best', 0):+.2f}%  |  Worst: {s.get('worst', 0):+.2f}%"
+        )
+        if performance.get("method_stats"):
+            lines.append("  Methods (by win rate):")
+            method_labels_txt = {
+                "news": "News", "tech": "Technical", "insider": "Smart Money",
+                "put_call": "Put/Call", "max_pain": "Max Pain", "oi_skew": "OI Skew",
+                "vwap": "VWAP", "pattern": "Pattern",
+            }
+            sorted_methods = sorted(
+                performance["method_stats"].items(), key=lambda x: x[1]["win_rate"], reverse=True
+            )
+            for mname, ms in sorted_methods:
+                label = method_labels_txt.get(mname, mname)
+                lines.append(
+                    f"    {label:<18} {ms['trades']} trades  "
+                    f"WR={ms['win_rate']}%  avg={ms['avg_return']:+.2f}%"
                 )
         lines.append("")
     text_body = "\n".join(lines)

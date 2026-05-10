@@ -41,8 +41,16 @@ from src.data.seasonality import compute_seasonality_context
 from src.data.bond_internals import fetch_bond_internals_context
 from src.data.move import fetch_move_context
 from src.data.global_macro import fetch_global_macro_context
+from src.data.macro_regime import compute_macro_regime
+from src.data.market_mode import compute_market_mode
+from src.data.catalyst_timing import compute_catalyst_context, apply_watch_elevation
+from src.data.cluster_watchlist import (
+    load_cluster_watchlist, save_cluster_watchlist,
+    update_cluster_watchlist, build_cluster_watchlist_context,
+)
+from src.signals.sector_pairs import find_sector_pairs
 from src.notifications.email_sender import send_recommendations
-from src.performance.tracker import record_new_trades, update_open_trades, log_performance_summary, get_performance_for_email
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers
 from src.charts.report import save_html_report
 
 
@@ -159,6 +167,33 @@ def run_pipeline(send_email: bool = False) -> None:
     if new_commodities:
         all_tickers = all_tickers + new_commodities
         logger.info(f"Step 0: Pinned commodities: {new_commodities}")
+
+    # Load cluster watchlist and inject still-active tickers into the universe
+    # so they are re-evaluated every day for the full 10-day window even if they
+    # have dropped off the trending/discovery list.
+    _cluster_raw = load_cluster_watchlist()
+    _cluster_ctx_pre = build_cluster_watchlist_context(_cluster_raw)
+    if _cluster_ctx_pre.active_tickers:
+        new_from_cluster = [t for t in _cluster_ctx_pre.active_tickers if t not in all_tickers]
+        if new_from_cluster:
+            all_tickers = all_tickers + new_from_cluster
+            logger.info(
+                f"[cluster_watch] Injecting {new_from_cluster} from cluster watchlist "
+                f"({len(_cluster_ctx_pre.active_tickers)} active)"
+            )
+        else:
+            logger.info(
+                f"[cluster_watch] {len(_cluster_ctx_pre.active_tickers)} active cluster watch(es) "
+                f"already in universe: {_cluster_ctx_pre.active_tickers}"
+            )
+
+    # Pin tickers of open trades so their prices are always refreshed,
+    # even if they've dropped off the trending/discovery list.
+    open_trade_tickers = get_open_trade_tickers()
+    new_from_trades = [t for t in open_trade_tickers if t not in all_tickers]
+    if new_from_trades:
+        all_tickers = all_tickers + new_from_trades
+        logger.info(f"[tracker] Pinning open-trade tickers into universe: {new_from_trades}")
 
     # ── Steps 1–3: Parallel data fetch ────────────────────────────────────
     #
@@ -345,6 +380,29 @@ def run_pipeline(send_email: bool = False) -> None:
     if seasonality_context:
         logger.info(f"[seasonality] {seasonality_context.composite_signal}: {seasonality_context.summary[:120]}")
 
+    # ── Market Mode (TRENDING / NEUTRAL / CHOPPY) ─────────────────────────
+    market_mode_context = None
+    if settings.enable_market_mode_switching:
+        market_mode_context = compute_market_mode(
+            vix_context=vix_context,
+            breadth_context=breadth_context,
+            highs_lows_context=highs_lows_context,
+            mcclellan_context=mcclellan_context,
+        )
+
+    # ── Macro Regime Filter ───────────────────────────────────────────────
+    macro_regime_context = None
+    if settings.enable_macro_regime_filter:
+        macro_regime_context = compute_macro_regime(
+            vix_context=vix_context,
+            move_context=move_context,
+            bond_internals_context=bond_internals_context,
+            global_macro_context=global_macro_context,
+            macro_context=macro_context,
+            breadth_context=breadth_context,
+            credit_context=credit_context,
+        )
+
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
     signals = build_signals(
@@ -353,8 +411,20 @@ def run_pipeline(send_email: bool = False) -> None:
         insider_trades=insider_trades,
         put_call_context=put_call_context,
         gex_context=gex_context,
+        market_mode_context=market_mode_context,
+        opex_context=opex_context,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
+
+    # Update cluster watchlist: add newly detected clusters, expire stale entries
+    _cluster_raw = update_cluster_watchlist(signals_by_ticker, _cluster_raw)
+    save_cluster_watchlist(_cluster_raw)
+    cluster_watchlist_context = build_cluster_watchlist_context(_cluster_raw)
+    if cluster_watchlist_context.entries:
+        logger.info(f"[cluster_watch] {cluster_watchlist_context.summary}")
+
+    # Sector pairs: find ETF vs constituent divergences (market-neutral pair trades)
+    sector_pairs_context = find_sector_pairs(signals_by_ticker)
 
     # ── Step 5: Generate recommendations ─────────────────────────────────
     logger.info("Step 5: Generating recommendations...")
@@ -391,8 +461,66 @@ def run_pipeline(send_email: bool = False) -> None:
         recommendations,
         key=lambda r: (_ACTION_RANK.get(r.action, 3), -r.confidence),
     )[:10]
-    # Only surface BUY and SELL as actionable, with minimum confidence guard
-    actionable = [r for r in recommendations if r.action in ("BUY", "SELL") and r.confidence >= 0.78]
+
+    # Macro regime gate — adjust threshold and optionally block BUY entries
+    _confidence_threshold = 0.78
+    _allow_buys = True
+    if macro_regime_context and settings.enable_macro_regime_filter:
+        _confidence_threshold = macro_regime_context.confidence_threshold
+        _allow_buys           = macro_regime_context.allow_buys
+        if not _allow_buys:
+            logger.warning(
+                f"[macro_regime] Regime={macro_regime_context.regime} — "
+                f"all new BUY entries BLOCKED (only SELLs allowed)"
+            )
+        logger.info(
+            f"[macro_regime] Actionable threshold: {_confidence_threshold:.0%} "
+            f"(default 78%) | allow_buys={_allow_buys}"
+        )
+
+    # Catalyst timing — earnings blackout, OpEx amplifier already applied in build_signals,
+    # now apply WATCH elevation (8-K + insider buy) and earnings blackout on actionable
+    catalyst_timing_context = None
+    if settings.enable_catalyst_timing:
+        catalyst_timing_context = compute_catalyst_context(
+            earnings_context=earnings_context,
+            opex_context=opex_context,
+            articles=articles,
+            insider_trades=insider_trades,
+            signals_by_ticker=signals_by_ticker,
+            sectors_list=settings.sectors_list,
+            commodities_list=settings.commodities_list,
+        )
+        # Apply WATCH elevation to the top-10 recommendations
+        recommendations = apply_watch_elevation(
+            recommendations,
+            catalyst_timing_context,
+            signals_by_ticker=signals_by_ticker,
+            sectors_list=settings.sectors_list,
+            commodities_list=settings.commodities_list,
+        )
+
+    actionable = [
+        r for r in recommendations
+        if r.action in ("BUY", "SELL")
+        and r.confidence >= _confidence_threshold
+        and (r.action != "BUY" or _allow_buys)
+        # Earnings blackout: don't open new positions within 2 days of earnings
+        and (
+            catalyst_timing_context is None
+            or r.ticker not in catalyst_timing_context.earnings_blackout_tickers
+        )
+    ]
+    if catalyst_timing_context and catalyst_timing_context.earnings_blackout_tickers:
+        blocked = [
+            r.ticker for r in recommendations
+            if r.action in ("BUY", "SELL")
+            and r.ticker in catalyst_timing_context.earnings_blackout_tickers
+        ]
+        if blocked:
+            logger.warning(
+                f"[catalyst] Earnings blackout blocked {len(blocked)} actionable(s): {blocked}"
+            )
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     logger.info(
@@ -405,7 +533,8 @@ def run_pipeline(send_email: bool = False) -> None:
 
     # Performance tracking
     update_open_trades()
-    record_new_trades(actionable)
+    close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
+    record_new_trades(actionable, signals_by_ticker=signals_by_ticker)
     log_performance_summary()
     perf = get_performance_for_email()
 
@@ -452,6 +581,11 @@ def run_pipeline(send_email: bool = False) -> None:
             bond_internals_context=bond_internals_context,
             move_context=move_context,
             global_macro_context=global_macro_context,
+            macro_regime_context=macro_regime_context,
+            market_mode_context=market_mode_context,
+            catalyst_timing_context=catalyst_timing_context,
+            cluster_watchlist_context=cluster_watchlist_context,
+            sector_pairs_context=sector_pairs_context,
         )
     else:
         logger.info("Email not configured — skipping.")
