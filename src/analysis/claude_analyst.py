@@ -45,6 +45,9 @@ def generate_recommendations(
     bond_internals_context: Optional["BondInternalsContext"] = None,
     move_context: Optional["MOVEContext"] = None,
     global_macro_context: Optional["GlobalMacroContext"] = None,
+    sector_rotation_context=None,   # Optional[SectorRotationContext]
+    rotation_drivers_context=None,  # Optional[RotationDriversContext]
+    business_cycle_context=None,    # Optional[BusinessCycleContext]
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -106,6 +109,21 @@ def generate_recommendations(
             mp   = f", max_pain_score={s.max_pain_score:+.2f}" if s.max_pain_score else ""
             sk   = f", oi_skew={s.oi_skew_score:+.2f}" if s.oi_skew_score else ""
             parts.append(f"  GEX={s.gex_signal}{flip}, max_pain_bias={s.max_pain_bias}{mp}{sk}{em}")
+        pat_score = getattr(s, "pattern_score", 0.0)
+        pat_name  = getattr(s, "pattern_name", "")
+        if pat_score and pat_name:
+            parts.append(f"  Pattern_score={pat_score:+.2f} [{pat_name}]  (historical win-rate; >0=bullish pattern, <0=bearish)")
+        mom_score = getattr(s, "momentum_score", 0.0)
+        mom_1m    = getattr(s, "momentum_1m_pct", 0.0)
+        mom_3m    = getattr(s, "momentum_3m_pct", 0.0)
+        if mom_score:
+            mom_ret = f" (1m:{mom_1m:+.1f}%, 3m:{mom_3m:+.1f}%)" if mom_1m else ""
+            parts.append(f"  Momentum_score={mom_score:+.2f}{mom_ret}  (perceived-value trend vs own history)")
+        mf_score = getattr(s, "money_flow_score", 0.0)
+        mfi_val  = getattr(s, "mfi_value", 50.0)
+        cmf_val  = getattr(s, "cmf_value", 0.0)
+        if mf_score:
+            parts.append(f"  MoneyFlow_score={mf_score:+.2f} (MFI={mfi_val:.0f}, CMF={cmf_val:+.2f})  (>0=accumulation, <0=distribution)")
         signal_lines.append("\n".join(parts))
 
     signals_text = "\n\n".join(signal_lines)
@@ -131,6 +149,12 @@ def generate_recommendations(
         active_methods.append("VWAP distance (mean-reversion vs 20-day VWAP)")
     if use_gex_signal:
         active_methods.append("gamma exposure / GEX (max pain, OI skew, dealer positioning)")
+    if settings.enable_pattern_recognition:
+        active_methods.append("chart pattern recognition (8 classical patterns, per-ticker historical win rate)")
+    if settings.enable_price_momentum:
+        active_methods.append("price momentum / perceived value (1m/2m returns normalised vs own trailing history)")
+    if settings.enable_money_flow:
+        active_methods.append("money flow indicators (MFI 14-period, CMF 20-period, OBV slope — accumulation vs distribution)")
     methods_desc = ", ".join(active_methods) if active_methods else "combined signals"
 
     # Insider-specific instructions
@@ -645,6 +669,241 @@ Composite regime guide (DXY + Copper/Gold):
       near-term individual stock catalysts (earnings, M&A, guidance changes).
     - Convergence check: DXY STRONG_BULL + Cu/Au RISK_OFF + STAGFLATION_RISK oil/bond + MOVE elevated
       = maximum bearish regime confidence. Avoid all new cyclical/long-duration longs."""
+
+    # Build sector rotation context block ("Ebb and Flow")
+    sector_rotation_block        = ""
+    sector_rotation_instructions = ""
+    if sector_rotation_context:
+        sr = sector_rotation_context
+        dir_arrow_sr = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "→"}.get(sr.rotation_direction, "→")
+
+        sector_lines = ""
+        for e in sr.sectors:
+            rel5  = f"{e.relative_5d:+.1f}%" if e.relative_5d  is not None else "  N/A"
+            rel21 = f"{e.relative_21d:+.1f}%" if e.relative_21d is not None else "  N/A"
+            rel63 = f"{e.relative_63d:+.1f}%" if e.relative_63d is not None else "  N/A"
+            vol   = f"{e.volume_ratio:.2f}x"  if e.volume_ratio is not None else " N/A"
+            sector_lines += (
+                f"  {e.etf:<5} {e.name:<28} rel1w={rel5:>7}  rel1m={rel21:>7}  rel3m={rel63:>7}"
+                f"  vol={vol:>6}  score={e.rotation_score:+.2f}  {e.flow_signal}\n"
+            )
+
+        pairs_str = "\n".join(f"  {p}" for p in sr.rotation_pairs) if sr.rotation_pairs else "  (no clear rotation pairs)"
+
+        sector_rotation_block = f"""
+<sector_rotation_context>
+Sector Rotation — "Ebb and Flow":  {sr.rotation_regime}  {dir_arrow_sr} {sr.rotation_direction}
+{sr.summary}
+
+Top INFLOW  (capital entering): {", ".join(sr.top_inflow)  if sr.top_inflow  else "none"}
+Top OUTFLOW (capital exiting):  {", ".join(sr.top_outflow) if sr.top_outflow else "none"}
+Cyclical avg score: {sr.cyclical_avg:+.2f}  |  Defensive avg score: {sr.defensive_avg:+.2f}  |  Spread: {sr.cyc_def_spread:+.2f}
+
+Rotation pairs (capital path):
+{pairs_str}
+
+All sectors (sorted by inflow score desc):
+{sector_lines}
+Score guide: +1.0 = strongest relative inflow, -1.0 = strongest outflow vs peer group.
+Rotation regime: RISK_ON (cyclicals leading) | NEUTRAL | RISK_OFF (defensives leading)
+</sector_rotation_context>
+"""
+
+        inflow_clause = ""
+        if sr.top_inflow:
+            inflow_clause = (
+                f"\n    Capital is flowing INTO [{', '.join(sr.top_inflow)}]: "
+                f"these sectors have strong relative momentum and/or elevated volume. "
+                f"Stocks in these sectors with confirming signals get a mild confidence boost (+0.03)."
+            )
+        outflow_clause = ""
+        if sr.top_outflow:
+            outflow_clause = (
+                f"\n    Capital is leaving [{', '.join(sr.top_outflow)}]: "
+                f"relative underperformance confirms institutional selling pressure. "
+                f"Tickers in these sectors require stronger non-rotation signals to justify a BUY."
+            )
+        regime_clause = ""
+        if sr.rotation_regime == "RISK_ON":
+            regime_clause = (
+                f"\n    RISK_ON rotation (spread={sr.cyc_def_spread:+.2f}): "
+                f"cyclicals leading defensives broadly. Confirms growth-oriented sector exposure. "
+                f"Reduces haircut on cyclical BUY calls; raises bar for defensive SELL calls."
+            )
+        elif sr.rotation_regime == "RISK_OFF":
+            regime_clause = (
+                f"\n    RISK_OFF rotation (spread={sr.cyc_def_spread:+.2f}): "
+                f"defensives leading cyclicals broadly. Adds caution to cyclical/growth longs. "
+                f"Confirms defensive holds (XLV, XLP, XLU). Mild confidence haircut (−0.03) on cyclical BUYs."
+            )
+
+        sector_rotation_instructions = f"""
+27b. Sector rotation overlay — "Ebb and Flow" (where is the money going?):
+    Regime: {sr.rotation_regime} ({sr.rotation_direction}).{regime_clause}{inflow_clause}{outflow_clause}
+
+    Core principle — money acts like water:
+    - When capital floods into a sector it is usually simultaneously leaving another.
+      Use this to confirm or challenge individual stock calls: a BULLISH stock in an OUTFLOW
+      sector faces institutional headwinds even if its own signals are positive.
+    - When a stock is in a STRONG_INFLOW sector AND has independent bullish signals
+      (news + insider + technical agreeing), the sector rotation confirms the thesis → add +0.02.
+    - When a stock is in a STRONG_OUTFLOW sector with only weak or mixed signals → HOLD, not BUY.
+    - ETF-level signals: an ETF in its own INFLOW category is directly telling you where to go.
+      E.g., XLF in STRONG_INFLOW → financials ETF itself is a valid long candidate.
+    - Rotation regime vs individual stock overrides: a single compelling earnings catalyst
+      or insider cluster CAN override the sector headwind, but must be stated explicitly.
+    - Do NOT mechanically apply the rotation signal — use it as one more layer of evidence.
+      A RISK_OFF rotation that contradicts a bullish FRED/VIX/credit picture → NEUTRAL, not BEARISH."""
+
+    # Build rotation drivers context block (rate-cycle phase)
+    rotation_drivers_block        = ""
+    rotation_drivers_instructions = ""
+    if rotation_drivers_context:
+        rd = rotation_drivers_context
+        dir_arrow_rd = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "→"}.get(rd.cycle_direction, "→")
+
+        rate_line = ""
+        if rd.fed_rate_current is not None:
+            rate_line = f"  FF rate: {rd.fed_rate_current:.2f}%"
+            if rd.rate_change_12m_bp is not None:
+                rate_line += f"  (12m chg: {rd.rate_change_12m_bp:+.0f}bp)"
+            if rd.rate_change_3m_bp is not None:
+                rate_line += f"  (3m chg: {rd.rate_change_3m_bp:+.0f}bp)"
+
+        cpi_line = ""
+        if rd.cpi_yoy_current is not None:
+            cpi_line = f"  CPI YoY: {rd.cpi_yoy_current:+.1f}%"
+            if rd.cpi_yoy_6m_ago is not None:
+                cpi_line += f"  (6m ago: {rd.cpi_yoy_6m_ago:+.1f}%)"
+            cpi_line += f"  → {rd.inflation_trend}"
+
+        real_line = ""
+        if rd.real_rate is not None:
+            real_line = f"  Real rate: {rd.real_rate:+.2f}%  ({rd.real_rate_regime})"
+
+        favour_str = ", ".join(rd.favoured_assets) if rd.favoured_assets else "none"
+        avoid_str  = ", ".join(rd.avoid_assets)    if rd.avoid_assets    else "none"
+
+        rotation_drivers_block = f"""
+<rotation_drivers_context>
+Rate-Cycle Phase: {rd.cycle_phase}  {dir_arrow_rd} {rd.cycle_direction}
+Trajectory: {rd.rate_trajectory}
+{rate_line}
+{cpi_line}
+{real_line}
+
+Favoured by this cycle phase: {favour_str}
+Avoid / underweight:          {avoid_str}
+
+{rd.summary}
+</rotation_drivers_context>
+"""
+
+        favour_clause = ""
+        if rd.favoured_assets:
+            favour_clause = (
+                f"\n    Cycle-favoured assets [{', '.join(rd.favoured_assets)}]: "
+                f"these benefit structurally from the current rate phase. "
+                f"Confirming signals raise conviction; conflicting signals raise the bar."
+            )
+        avoid_clause = ""
+        if rd.avoid_assets:
+            avoid_clause = (
+                f"\n    Cycle-headwind assets [{', '.join(rd.avoid_assets)}]: "
+                f"rate dynamics work against these. Require stronger independent catalysts for BUY. "
+                f"Bearish signals here carry higher conviction."
+            )
+
+        rotation_drivers_instructions = f"""
+27c. Rotation Drivers — rate-cycle phase overlay:
+    Phase: {rd.cycle_phase}  ({rd.cycle_direction}).{favour_clause}{avoid_clause}
+
+    How to apply:
+    - EARLY_TIGHTENING / PEAK_TIGHTENING: apply −0.04 confidence haircut on POSITION-horizon longs
+      in rate-sensitive names (XLRE, XLU, TLT, high-PE tech). Confirm shorts in these sectors.
+    - TIGHTENING_PAUSE: transitional — do not materially adjust; flag that pivot hasn't happened yet.
+    - PIVOT_IMMINENT: apply +0.03 boost on rate-sensitive BUY calls (TLT, XLRE, XLU).
+      This is the highest-conviction phase for long-duration / rate-sensitive accumulation.
+    - EASING_CYCLE: apply +0.03 on growth/cyclical BUY calls (XLK, XLY, XLC).
+    - NEUTRAL: no override — rate cycle is not a directional input.
+    - Rate-cycle phase is a MEDIUM-TERM signal (weeks to months). Never let it override a
+      strong near-term individual catalyst (earnings beat, M&A, guidance raise).
+    - Convergence rule: rate-cycle direction confirming sector rotation direction (both BEARISH
+      or both BULLISH) → amplify the overlay; contradicting directions → apply neither."""
+
+    # Build business cycle rotation context block
+    business_cycle_block        = ""
+    business_cycle_instructions = ""
+    if business_cycle_context and business_cycle_context.cycle_phase != "UNKNOWN":
+        bc = business_cycle_context
+        dir_arrow_bc = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "→"}.get(bc.cycle_direction, "→")
+
+        leaders_str  = ", ".join(bc.top_cycle_leaders)  if bc.top_cycle_leaders  else "none"
+        laggards_str = ", ".join(bc.weak_cycle_sectors) if bc.weak_cycle_sectors else "none"
+
+        # Top-5 and bottom-3 sector scores for the prompt
+        top_sectors = bc.sector_biases[:5] if bc.sector_biases else []
+        bot_sectors = bc.sector_biases[-3:] if len(bc.sector_biases) >= 3 else []
+        top_rows = "\n".join(
+            f"  {b.etf:<5}  {b.name:<20}  score={b.cycle_score:+.2f}  {b.cycle_signal}"
+            for b in top_sectors
+        )
+        bot_rows = "\n".join(
+            f"  {b.etf:<5}  {b.name:<20}  score={b.cycle_score:+.2f}  {b.cycle_signal}"
+            for b in bot_sectors
+        )
+
+        convergence_str = bc.convergence_notes if bc.convergence_notes else "no convergence data"
+
+        business_cycle_block = f"""
+<business_cycle_context>
+Business Cycle Phase: {bc.cycle_phase}  {dir_arrow_bc} {bc.cycle_direction}
+Evidence: {bc.evidence}
+
+Top sector leaders in this phase:
+{top_rows}
+
+Structural laggards in this phase:
+{bot_rows}
+
+Convergence with Ebb-and-Flow: {convergence_str}
+
+{bc.summary}
+</business_cycle_context>
+"""
+
+        leaders_clause  = f" [{leaders_str}]" if leaders_str  != "none" else ""
+        laggards_clause = f" [{laggards_str}]" if laggards_str != "none" else ""
+
+        business_cycle_instructions = f"""
+27d. Business Cycle Rotation — structural sector leadership overlay:
+    Current phase: {bc.cycle_phase}  ({bc.cycle_direction}).
+
+    Cycle leaders{leaders_clause}: sectors that historically outperform in this phase.
+    - When news/technical signals are mixed, prefer cycle-aligned names.
+    - A BUY signal on a cycle-leader sector ETF gets +0.03 confidence boost.
+    - A BUY on a STRONG_LEADER at {bc.cycle_phase} with confirming Ebb-and-Flow inflow → high conviction.
+
+    Structural laggards{laggards_clause}: sectors that historically underperform.
+    - Apply −0.03 confidence haircut on POSITION-horizon BUY calls for STRONG_LAGGARD sectors.
+    - Bearish signals on structural laggards carry higher conviction.
+
+    Convergence rule: when both business-cycle model AND Ebb-and-Flow AND rate-cycle (rotation drivers)
+    all point the same direction for a sector, maximum conviction applies.
+    When they contradict, note it as a divergence and reduce confidence by 0.03 on the directional call.
+
+    Phase-specific guidance:
+    - EARLY_EXPANSION: financials, real estate, consumer discretionary are historically the
+      fastest to re-rate. Position before the broad market recognises the recovery.
+    - MID_EXPANSION: tech and industrials are the earnings growth leaders. Cyclicals outperform.
+    - LATE_EXPANSION: energy and materials benefit from inflation pass-through.
+      Start reducing exposure to rate-sensitive sectors (XLRE, XLU, XLK).
+    - LATE_CYCLE: rotate defensively. Healthcare, staples, utilities should receive BUY
+      consideration when other signals are neutral. Avoid opening new cyclical POSITION longs.
+    - CONTRACTION: maximum defensive posture. Only defensives and special-situation SELL calls
+      on cyclicals are appropriate. No new POSITION-horizon BUYs on cyclical names.
+    - This is a MEDIUM-TERM signal (months). A strong near-term catalyst (M&A, earnings beat,
+      product launch) can override the cycle bias for SWING-horizon calls."""
 
     # Build credit market context block for the prompt
     credit_block        = ""
@@ -1859,6 +2118,33 @@ Regime guide:
     - Convergence check: bond internals + FRED regime + credit (HYG/SPY) + VIX all pointing
       the same direction = highest conviction for broad-market-level calls."""
 
+    # Build Pattern Recognition instructions
+    pattern_instructions = ""
+    if settings.enable_pattern_recognition:
+        pattern_instructions = """
+14. Chart Pattern Recognition overlay:
+    Pattern_score ∈ [-1, +1] is derived from the ticker's own historical win rate for the
+    detected pattern type (double_bottom, inv_head_shoulders, ascending_triangle, bull_flag,
+    double_top, head_shoulders, descending_triangle, bear_flag). This is NOT a generic textbook
+    score — it reflects how often THIS specific pattern, on THIS specific ticker, produced
+    a profitable 5–10 day forward return over the last 2 years.
+
+    Interpretation:
+    - Pattern_score > +0.4: bullish pattern with strong historical track record for this ticker.
+      Adds momentum confirmation to a BULLISH directional call. Especially useful for timing
+      entry into a position that is already supported by news + insider signals.
+    - Pattern_score > +0.2: mild bullish pattern — confirming but not sufficient alone.
+    - Pattern_score near 0 (|score| < 0.2): no clear pattern, or insufficient history (≤3 occurrences).
+    - Pattern_score < -0.2: mild bearish pattern — mild headwind for BUY calls.
+    - Pattern_score < -0.4: strong bearish pattern with track record. Apply -0.05 haircut on
+      confidence for POSITION-horizon BUY calls.
+
+    Pattern signals are most reliable when:
+    - The same directional pattern confirms the news and insider signals.
+    - Volume is elevated on the breakout/breakdown bar (already reflected in confidence).
+    - Use primarily for SWING and SHORT-TERM horizons; structural patterns are less predictive
+      over POSITION (3-month) horizons where fundamentals dominate."""
+
     # Build VWAP instructions
     vwap_instructions = ""
     if settings.enable_vwap and settings.enable_fetch_data:
@@ -1881,6 +2167,65 @@ Regime guide:
       de-emphasise the VWAP headwind and acknowledge in the rationale.
     - Near-zero VWAP_score (|score| < 0.15): price trading near VWAP; no reversion pressure. No VWAP override."""
 
+    # Build price momentum instructions
+    momentum_instructions = ""
+    if settings.enable_price_momentum:
+        momentum_instructions = """
+15. Price Momentum (Perceived Value) overlay:
+    Momentum_score ∈ [-1, +1] captures where price is trending vs its own trailing history.
+    Normalised: score = tanh(z / 1.5) where z = composite z-score of 1m/3m returns.
+    Volume-adjusted: confirmed by rising institutional volume when score > 0.5.
+
+    Interpretation:
+    - Momentum_score > +0.5: stock is trending significantly above its own historical baseline.
+      Perceived value is rising; money is chasing this name. Confirms BULLISH direction.
+      Especially powerful when: news catalyst + insider buying + STRONG momentum all agree.
+    - Momentum_score > +0.3: positive momentum — mild tailwind; confirming but not dominant.
+    - Momentum_score near 0 (|score| < 0.2): no trend edge — stock tracking its own baseline.
+    - Momentum_score < -0.3: downward momentum — mild headwind for BUY calls.
+    - Momentum_score < -0.5: strong downtrend; perceived value falling; money is fleeing.
+      Apply −0.05 confidence haircut to new POSITION-horizon BUY calls.
+
+    Momentum vs VWAP (they often conflict — resolve by time horizon):
+    - Momentum HIGH + VWAP_score negative (above VWAP): stock has run — valid for SWING momentum
+      plays but poor risk/reward for POSITION length. Use SWING horizon if BUYing.
+    - Momentum LOW + VWAP_score positive (below VWAP): mean-reversion setup. Valid for SWING.
+      Only upgrade to POSITION if news catalyst is strong AND trend has turned positive.
+    - Both momentum HIGH and VWAP positive: extremely rare; strong BULLISH setup — price pulled
+      back into VWAP while trend remains intact. Highest conviction for POSITION BUY.
+
+    Momentum is a medium-term signal (weeks). Strong individual catalysts (earnings,
+    M&A, product launch) can break trends quickly — do not let a weak momentum score
+    block a high-conviction event-driven BUY."""
+
+    # Build money flow instructions
+    money_flow_instructions = ""
+    if settings.enable_money_flow:
+        money_flow_instructions = """
+16. Money Flow Indicators overlay (MFI + CMF + OBV):
+    MoneyFlow_score ∈ [-1, +1] is a composite of three volume-based indicators.
+    Measures whether institutional capital is accumulating (buying) or distributing (selling).
+
+    Components:
+    - MFI (Money Flow Index, 14-period): volume-weighted RSI. < 20 = oversold/accumulation, > 80 = overbought/distribution.
+    - CMF (Chaikin Money Flow, 20-period): positive = buyers in control; negative = sellers in control.
+    - OBV slope z-score: rising = sustained buying pressure; falling = distribution.
+
+    Interpretation:
+    - MoneyFlow_score > +0.5: strong institutional accumulation. Smart money is building positions.
+      Confirms BULLISH signals, especially when combined with positive news or insider buying.
+    - MoneyFlow_score > +0.2: mild accumulation bias — gentle tailwind for BULLISH direction.
+    - MoneyFlow_score near 0 (|score| < 0.15): no clear flow signal; price/volume in equilibrium.
+    - MoneyFlow_score < -0.2: mild distribution — caution on new BUY entries; existing longs at risk.
+    - MoneyFlow_score < -0.5: strong distribution. Institutional selling. Weight against BUY calls.
+      For SELL signals: strong confirming evidence that sellers are already active.
+
+    Use-case rules:
+    - Do NOT use money flow as the sole basis for BUY/SELL — it requires convergence with at least one other signal.
+    - Divergence alert: if price rises but MoneyFlow_score is falling (negative), the move may be weak — caution.
+    - High MFI (> 80) alone is not bearish — it can persist in strong trends. Weight CMF and OBV equally.
+    - In early-stage breakouts, CMF turning positive before price fully breaks out is an early warning signal."""
+
     commodity_tickers = ", ".join(settings.commodities_list) or "GLD, SLV, IAU, GDX, PPLT, PALL, CPER"
 
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.
@@ -1890,7 +2235,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{global_macro_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
+{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -1921,7 +2266,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{global_macro_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{vwap_instructions}{cluster_instruction}{opex_instructions}{seasonality_instructions}
+{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{cluster_instruction}{opex_instructions}{seasonality_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

@@ -29,7 +29,7 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 1e. Analyst ratings      — analyst_ratings.py → upgrades/downgrades/PT changes, cached daily
 1f. EPS surprises        — earnings.py → recent beat/miss articles, cached daily
 1g. Short interest       — short_interest.py → FINRA Reg SHO + yfinance squeeze/covering, cached daily
-2. Market snapshots      — market_data.py → Polygon.io (batch) primary, yfinance fallback, cached hourly
+2. Market snapshots      — market_data.py → polygon_client.py (single batch REST call) primary, yfinance fallback for anything Polygon doesn't cover (indices, futures, OTC), cached hourly
 3a. Insider/pol trades   — insider_trades.py → House/Senate watchers + EDGAR Form 4
 3b. Options flow         — options_flow.py → yfinance sweep detection
 3c. SEC EDGAR filings    — sec_filings.py → 13D/13G, Form 144, 13F superinvestors
@@ -57,10 +57,15 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 3y. Market Mode Switching — market_mode.py → compute_market_mode(): VIX+breadth+HL+McClellan composite into TRENDING|NEUTRAL|CHOPPY; dynamically adjusts aggregator signal weights: TRENDING up-weights tech/news (momentum bias), down-weights vwap/put_call; CHOPPY up-weights vwap/put_call (mean-reversion bias), down-weights tech; passed to build_signals() as weight_profile override; no cache (instant)
 3z. Catalyst Timing      — catalyst_timing.py → three event-driven guards applied after recommendations are ranked: (1) Earnings Blackout: tickers within 2 days of earnings are removed from actionable BUY/SELL set (IV crush/gap risk); (2) OpEx Max-Pain Amplifier: during OpEx week, max_pain weight in aggregator boosted 0.12→0.20; Triple Witching (Mar/Jun/Sep/Dec) → 0.28; (3) 8-K + Insider Buy WATCH elevation: when both a recent 8-K filing and an insider purchase coincide for the same ticker, the ticker is auto-elevated from HOLD→WATCH or injected as a new WATCH if not yet in the top-10; no cache (instant, uses already-fetched contexts)
 3A. Pattern Recognition  — pattern_recognition.py → compute_pattern_score(): detects 8 classical chart patterns (double_bottom, inv_head_shoulders, ascending_triangle, bull_flag, double_top, head_shoulders, descending_triangle, bear_flag) using local extrema on the last 60 bars; scores each detection by its historical win rate on that specific ticker (cold path: fetches 2y of history, scans 40-bar sliding windows with step=5, records 5d/10d forward returns — library cached 7 days in cache/patterns/<TICKER>.json; warm path: instant lookup + current detection); score = (win_rate − 0.5) × 2 × inherent_direction ∈ [−1, +1]; falls back to weak prior (±0.25) when fewer than 3 historical occurrences exist; base weight 0.18 in aggregator
+3B. Sector Rotation      — sector_rotation.py → fetch_sector_rotation_context(): "Ebb and Flow" mechanism — tracks where money is entering and exiting across all 11 SPDR sector ETFs; computes excess return vs SPY (1w/1m/3m), volume ratio (5d/20d), and a cross-sectional z-score rotation_score ∈ [-1,+1]; volume modifier amplifies conviction; classifies STRONG_INFLOW/INFLOW/NEUTRAL/OUTFLOW/STRONG_OUTFLOW per sector; derives cyclical vs defensive avg spread → RISK_ON/NEUTRAL/RISK_OFF regime; surfaces explicit rotation pairs (e.g., "XLK → XLP") and top 3 inflow/outflow sectors; cached daily in cache/sector_rotation_YYYY-MM-DD.json
+3C. Rotation Drivers     — rotation_drivers.py → fetch_rotation_drivers_context(): rate-cycle phase from FRED DFF trajectory (3m/12m bp change) + CPIAUCSL inflation trend; real rate = DFF − CPI; classifies EARLY_TIGHTENING|PEAK_TIGHTENING|TIGHTENING_PAUSE|PIVOT_IMMINENT|EASING_CYCLE|NEUTRAL; maps each phase to favoured/avoid asset lists (e.g., PIVOT_IMMINENT → favour TLT/XLRE/XLU, avoid XLE); Claude instruction 27c applies ±0.03–0.04 confidence adjustments per phase; optionally enhanced by FedWatch implied_cuts_12m_bp for PIVOT_IMMINENT detection; cached daily in cache/rotation_drivers_YYYY-MM-DD.json; requires FRED_API_KEY
+3D. Business Cycle Rotation — business_cycle_rotation.py → compute_business_cycle_context(): Fidelity-style structural economic cycle phase derived from already-fetched FRED macro context (regime, yield_curve_signal, inflation_signal, unemployment_trend — no new API calls); phases: EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION|UNKNOWN; maps each phase to per-sector cycle scores ∈ [-1,+1] (EARLY: XLF/XLRE/XLY lead; MID: XLK/XLI lead; LATE: XLE/XLB lead; LATE_CYCLE/CONTRACTION: XLV/XLP/XLU lead); convergence check vs Ebb-and-Flow real-time inflows; Claude instruction 27d applies ±0.03 confidence adjustments per cycle phase and surfaces sector-leadership guidance; no cache (instant, pure synthesis); ENABLE_BUSINESS_CYCLE_ROTATION=true
+3E. Price Momentum (Perceived Value) — price_momentum.py → compute_price_momentum_score(): 1m (21-bar) and 2m (42-bar) returns normalised against the ticker's own trailing 252-bar return distribution (rolling std of 21-bar returns); z_composite = 0.6×z_1m + 0.4×z_2m; volume-confirmation adjustment ±0.10 (uptrend+rising vol → +0.10; downtrend+rising vol → -0.10; thin vol → -0.05×sign); tanh(z/1.5) + vol_adj clamped to [-1,+1]; weight 0.18 in aggregator; OHLCV cache-first (load_ohlcv() → works with ENABLE_FETCH_DATA=false); falls back to get_history(18mo); minimum 50 bars; tracked in performance attribution under "Technical" category; email section 5x: Price Momentum Leaderboard (top 5 chased / bottom 5 sold); ENABLE_PRICE_MOMENTUM=true
+3F. Money Flow Indicators — money_flow.py → compute_money_flow_score(): three complementary volume-based indicators combined into a single accumulation/distribution score; MFI 14-period (volume-weighted RSI: <20=accumulation zone, >80=distribution zone; contrarian score = tanh((50−MFI)/20)); CMF 20-period (Chaikin Money Flow: positive=buyers in control, negative=sellers; score = tanh(CMF/0.15)); OBV 21-bar linear-regression slope z-score (rising=sustained buying, score = tanh(obv_z)); composite = 0.40×mfi_score + 0.40×cmf_score + 0.20×obv_score, final = tanh(composite/0.6) clamped to [-1,+1]; weight 0.15 in aggregator; OHLCV cache-first (works with ENABLE_FETCH_DATA=false); falls back to get_history(18mo); minimum 30 bars; tracked in performance attribution under "Technical" category; email section 5z: Money Flow Leaderboard (top 5 accumulation / bottom 5 distribution); ENABLE_MONEY_FLOW=true
 4a. Sector Pairs         — sector_pairs.py → find_sector_pairs(): scans _SECTOR_MAP for stocks and their sector ETF having opposing non-NEUTRAL directions (both ≥35% confidence); forms market-neutral LONG/SHORT pair trades that isolate idiosyncratic alpha from sector beta; ETF_BULL_STOCK_BEAR or ETF_BEAR_STOCK_BULL setups; reported in email but not tracked in trades.json (pair-trade accounting differs from single-leg); no cache (instant)
 4. Signal aggregation    — aggregator.py → per-ticker combined score
 5. Recommendations       — claude_analyst.py → Claude generates BUY/SELL/HOLD/WATCH
-6. Performance tracking  — tracker.py → paper trades in cache/trades.json; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; weighted avg return reported alongside equal-weight avg; method attribution: at entry each trade stores the 7 per-method scores + methods_agreeing list + dominant_method; get_performance_for_email() returns method_stats/category_stats/convergence_stats/dominant_stats for the email section "Signal Method Attribution"
+6. Performance tracking  — tracker.py → paper trades in cache/trades.json; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; weighted avg return reported alongside equal-weight avg; method attribution: at entry each trade stores the 10 raw method scores + methods_agreeing list + dominant_method; get_performance_for_email() returns performance_table (unified breakdown rows), trades_svg (inline SVG equity curve + per-trade bars), attributed_count, and solo_method_perf (hypothetical per-method standalone simulation)
 7. Charts + email        — charts/, email_sender.py
 ```
 
@@ -77,16 +82,27 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 
 **Smart money signals** (insider trades, options flow, SEC filings) all return `List[InsiderTrade]` and are combined into a single `insider_score` per ticker in the aggregator.
 
-**Method attribution** (`tracker.py`): every new trade stores the 8 raw method scores (`news`, `tech`, `insider`, `put_call`, `max_pain`, `oi_skew`, `vwap`, `pattern`) at entry time plus `methods_agreeing` and `dominant_method`. After enough attributed trades accumulate, `get_performance_for_email()` computes four analytics tables: (1) per-method win-rate/avg-return, (2) per-category (Sentiment/Technical/Smart Money/Options), (3) convergence (1/2/3/4+ methods agreeing — validates the 1.25×/0.60× multiplier), (4) lead-signal (dominant method at entry). Legacy trades without `methods_agreeing` are excluded from attribution stats; the email section shows a graceful "no data yet" placeholder until enough attributed trades close.
+**Method attribution** (`tracker.py`): every new trade stores the 10 raw method scores (`news`, `tech`, `insider`, `put_call`, `max_pain`, `oi_skew`, `vwap`, `pattern`, `momentum`, `money_flow`) at entry time plus `methods_agreeing` and `dominant_method`. `get_performance_for_email()` returns:
+- `performance_table`: unified list of breakdown rows (columns: trades, win_rate, compound_return, avg_return, wtd_avg_return, best, worst) grouped as: **total** (All Trades) → **asset** (Stocks only / ETFs only / Commodities only) → **direction** (Longs only BUY / Shorts only SELL) → **method** (per signal method, ≥2 attributed trades required). Rows are rendered in the email "Performance Breakdown" section with visual dividers between groups.
+- `trades_svg`: inline SVG (820×336px dark-theme) with equity curve (top panel) and per-trade return bars (bottom panel). Embedded directly in the email via `{{ perf.trades_svg | safe }}` — no kaleido/Plotly dependency.
+- `attributed_count`: count of trades with `methods_agreeing` populated (used to decide whether method rows appear).
+- `solo_method_perf`: dict from `compute_solo_method_performance()` — for each closed trade with stored method_scores, asks "what direction would this method alone have signalled?" Same direction as actual → actual return; opposite → negated return; |score| < 0.10 (no view) → skipped. Rendered in email section 4b as a standalone table (trades, win_rate, compound_return, avg_return, best, worst per method). Distinct from `performance_table` method rows which only count trades where the method agreed with the aggregated direction.
+- `method_eval_stats`: dict from `compute_method_eval_stats()` — per-method directional accuracy and conviction calibration. For each method: overall directional_accuracy (% correct directions), avg_return_correct, avg_return_wrong, and conviction_bands (Low 0.10–0.35 / Medium 0.35–0.65 / High 0.65+) each with trades, accuracy, avg_return. Rendered in email section 4c as per-method cards. A well-calibrated signal shows rising accuracy Low→High; flat/declining accuracy suggests the method adds noise rather than genuine directional insight.
+Legacy trades without `methods_agreeing` are excluded from method rows but included in total/asset/direction rows.
 
 ### Model routing
 
 | Task | Model |
 |---|---|
-| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`), Haiku fallback |
+| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`), Haiku 4.5 fallback |
 | Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) |
 
-To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env`.
+Available analyst models (set in `.env`):
+- `claude-haiku-4-5-20251001` — fastest, cheapest; 8 192 output tokens
+- `claude-sonnet-4-6` — higher quality; 64 000 output tokens
+- `claude-opus-4-7` — highest quality; 32 000 output tokens
+
+**Claude API calls use streaming** (`client.messages.stream`) to avoid SDK timeout errors on large prompts (40+ tickers can take >10 minutes non-streaming). Text chunks are accumulated into a single string before JSON parsing.
 
 ### Caching strategy
 
@@ -114,6 +130,8 @@ To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env
 | Bond market internals | `YYYY-MM-DD` | 1 day | `cache/bond_internals_*.json` |
 | MOVE Index | `YYYY-MM-DD` | 1 day | `cache/move_*.json` |
 | Global macro (DXY + Cu/Au) | `YYYY-MM-DD` | 1 day | `cache/global_macro_*.json` |
+| Sector rotation (Ebb & Flow) | `YYYY-MM-DD` | 1 day | `cache/sector_rotation_*.json` |
+| Rotation Drivers (rate cycle) | `YYYY-MM-DD` | 1 day | `cache/rotation_drivers_*.json` |
 | OHLCV (charts) | per ticker | incremental | `cache/ohlcv/*.json` |
 | COT positioning | ISO week | 1 week | `cache/cot_YYYY_WW.json` |
 | Insider cluster watchlist | ticker | 10 days | `cache/cluster_watchlist.json` |
@@ -132,6 +150,8 @@ Three patterns depending on what the source produces:
 
 ### Key constraints
 
+**Polygon.io client** (`src/data/polygon_client.py`): wraps the Polygon REST API. `get_snapshots_batch()` fetches all tickers in two calls (snapshots + prev-close). `get_bars()` fetches OHLCV history. Falls back gracefully when `POLYGON_API_KEY` is absent — `is_available()` returns False and `market_data.py` routes everything through yfinance instead. Free Polygon tier covers all US equity/ETF tickers; indices (^VIX etc.) and futures (GC=F etc.) must use yfinance directly.
+
 **SEC EDGAR rate limit:** 10 requests/second. All EDGAR calls use `_REQUEST_DELAY = 0.12–0.15s`. The `_ticker_index` (name→ticker) and `_ticker_cik` (ticker→CIK) maps are module-level globals populated once per process — never re-fetch them in a loop.
 
 **yfinance rate limits:** When a 429 is returned, `market_data.py` applies exponential backoff (60s → 120s → 240s). After 3 failures the loop stops early. Options chain scanning (`options_flow.py`) is silent-fail per ticker.
@@ -142,7 +162,20 @@ Three patterns depending on what the source produces:
 
 ### Email HTML template
 
-The HTML is a Jinja2 template string (`HTML_TEMPLATE`) embedded directly in `email_sender.py` — there is no separate `.html` file. When adding new sections, follow the existing comment convention (`<!-- ══ N — SECTION NAME ══ -->`) and pass new variables through the `Template(...).render(...)` call. All chart images are embedded as base64 inline (`cid:` references in the MIME structure).
+The HTML is a Jinja2 template string (`HTML_TEMPLATE`) embedded directly in `email_sender.py` — there is no separate `.html` file. When adding new sections, follow the existing comment convention (`<!-- ══ N — SECTION NAME ══ -->`) and pass new variables through the `Template(...).render(...)` call.
+
+**Chart embedding:**
+- Per-ticker OHLCV charts (when `ENABLE_CHARTS=true`): base64 PNG embedded as `cid:chart_<TICKER>` MIME parts.
+- Signal overview chart (when `ENABLE_CHARTS=true`): base64 PNG embedded as `cid:overview_chart`.
+- Equity curve + trade bars: **inline SVG** generated by `_build_trades_svg()` in `tracker.py`, embedded via `{{ perf.trades_svg | safe }}` — no kaleido or Plotly required.
+
+**Email sections (current order):**
+1. Aggregated Recommendations (BUY/SELL)
+2. Portfolio Performance (stats + inline SVG equity curve)
+3. Performance Breakdown (unified table: total/asset/direction/method rows)
+4. Trade Details (BUY/SELL only)
+5. Monitor List (HOLD/WATCH)
+6. Analyst Ratings, EPS Surprises, Macro Regime Filter, Market Mode, Catalyst Timing, FRED, COT, VIX, McClellan, Highs/Lows, Breadth, Macro Surprise, FedWatch, Credit, MOVE, Bond Internals, Global Macro, Seasonality, OpEx, Put/Call, Short Interest, GEX, Revision Momentum, Earnings Whisper, IPO Pipeline, Reddit, Sector Pairs, Smart Money Signals
 
 ### Configuration
 

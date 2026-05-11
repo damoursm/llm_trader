@@ -440,6 +440,239 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     4b — SOLO METHOD PERFORMANCE
+     ══════════════════════════════════════ -->
+{% if perf and perf.solo_method_perf %}
+<h2>4b. Solo Method Performance <span style="font-size:13px;font-weight:400;color:#94a3b8;">(simulated — each signal used in isolation)</span></h2>
+<p style="color:#64748b;font-size:12px;margin:0 0 10px 0;">
+  For each closed trade with stored signal scores, we ask: &ldquo;what direction would this method alone have signalled, and what would the return have been?&rdquo;
+  Same direction as actual trade &rarr; actual return. Opposite direction &rarr; negated return. Scores &plusmn;&lt;0.10 (no view) are excluded.
+  This is a <em>hypothetical backtest on executed trades</em> — not a real forward portfolio — but it shows which signals individually carry predictive power.
+</p>
+{% set solo = perf.solo_method_perf %}
+{% set labels = perf.method_labels if perf.method_labels is defined else {} %}
+{% set method_order = ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Method / Direction</th>
+      <th style="text-align:right;">Trades</th>
+      <th style="text-align:right;">Win Rate</th>
+      <th style="text-align:right;">Compound</th>
+      <th style="text-align:right;">Avg Return</th>
+      <th style="text-align:right;">Best</th>
+      <th style="text-align:right;">Worst</th>
+      <th style="text-align:left;padding-left:12px;">Bar</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for mkey in method_order %}
+  {% if mkey in solo %}
+  {% set method_data = solo[mkey] %}
+  {% set ov = method_data.overall %}
+  {# ── method header row (overall) ── #}
+  <tr style="background:#16213a;">
+    <td colspan="8" style="padding:7px 8px 4px;font-size:13px;font-weight:700;color:#e2e8f0;border-top:1px solid #1e293b;">
+      {{ labels.get(mkey, mkey) if labels else mkey }}
+      <span style="font-weight:400;color:#64748b;font-size:11px;margin-left:8px;">
+        {{ ov.trades }} trade{{ 's' if ov.trades != 1 else '' }} &nbsp;|&nbsp;
+        <span style="color:{{ '#4ade80' if ov.win_rate >= 55 else '#f59e0b' if ov.win_rate >= 45 else '#f87171' }};">{{ ov.win_rate }}% win</span>
+        &nbsp;|&nbsp;
+        <span style="color:{{ '#4ade80' if ov.compound_return > 0 else '#f87171' }};">{{ "%+.2f"|format(ov.compound_return) }}% compound</span>
+        &nbsp;|&nbsp; avg <span style="color:{{ '#4ade80' if ov.avg_return > 0 else '#f87171' }};">{{ "%+.2f"|format(ov.avg_return) }}%</span>
+      </span>
+    </td>
+  </tr>
+  {# ── BUY sub-row ── #}
+  {% if method_data.buys %}
+  {% set br = method_data.buys %}
+  {% set wr_c = '#4ade80' if br.win_rate >= 55 else '#f59e0b' if br.win_rate >= 45 else '#f87171' %}
+  {% set bar_pct = [(br.avg_return|abs / 5 * 100)|int, 100]|min %}
+  <tr>
+    <td style="padding-left:18px;font-size:12px;color:#4ade80;">&#9650; BUY signals</td>
+    <td style="text-align:right;color:#94a3b8;font-size:12px;">{{ br.trades }}</td>
+    <td style="text-align:right;color:{{ wr_c }};font-weight:700;font-size:12px;">{{ br.win_rate }}%</td>
+    <td style="text-align:right;color:{{ '#4ade80' if br.compound_return > 0 else '#f87171' }};font-weight:700;font-size:12px;">{{ "%+.2f"|format(br.compound_return) }}%</td>
+    <td style="text-align:right;color:{{ '#4ade80' if br.avg_return > 0 else '#f87171' }};font-size:12px;">{{ "%+.2f"|format(br.avg_return) }}%</td>
+    <td style="text-align:right;color:#4ade80;font-size:11px;">{{ "%+.2f"|format(br.best) }}%</td>
+    <td style="text-align:right;color:#f87171;font-size:11px;">{{ "%+.2f"|format(br.worst) }}%</td>
+    <td style="padding-left:12px;width:120px;">
+      <div style="background:#1e293b;border-radius:3px;height:8px;overflow:hidden;position:relative;">
+        {% if br.avg_return >= 0 %}<div style="position:absolute;left:50%;width:{{ bar_pct // 2 }}%;height:8px;background:#4ade80;border-radius:0 3px 3px 0;"></div>
+        {% else %}<div style="position:absolute;right:50%;width:{{ bar_pct // 2 }}%;height:8px;background:#f87171;border-radius:3px 0 0 3px;"></div>{% endif %}
+        <div style="position:absolute;left:50%;top:0;width:1px;height:8px;background:#334155;"></div>
+      </div>
+    </td>
+  </tr>
+  {% endif %}
+  {# ── SELL sub-row ── #}
+  {% if method_data.sells %}
+  {% set sr = method_data.sells %}
+  {% set wr_c = '#4ade80' if sr.win_rate >= 55 else '#f59e0b' if sr.win_rate >= 45 else '#f87171' %}
+  {% set bar_pct = [(sr.avg_return|abs / 5 * 100)|int, 100]|min %}
+  <tr>
+    <td style="padding-left:18px;font-size:12px;color:#f87171;">&#9660; SELL signals</td>
+    <td style="text-align:right;color:#94a3b8;font-size:12px;">{{ sr.trades }}</td>
+    <td style="text-align:right;color:{{ wr_c }};font-weight:700;font-size:12px;">{{ sr.win_rate }}%</td>
+    <td style="text-align:right;color:{{ '#4ade80' if sr.compound_return > 0 else '#f87171' }};font-weight:700;font-size:12px;">{{ "%+.2f"|format(sr.compound_return) }}%</td>
+    <td style="text-align:right;color:{{ '#4ade80' if sr.avg_return > 0 else '#f87171' }};font-size:12px;">{{ "%+.2f"|format(sr.avg_return) }}%</td>
+    <td style="text-align:right;color:#4ade80;font-size:11px;">{{ "%+.2f"|format(sr.best) }}%</td>
+    <td style="text-align:right;color:#f87171;font-size:11px;">{{ "%+.2f"|format(sr.worst) }}%</td>
+    <td style="padding-left:12px;width:120px;">
+      <div style="background:#1e293b;border-radius:3px;height:8px;overflow:hidden;position:relative;">
+        {% if sr.avg_return >= 0 %}<div style="position:absolute;left:50%;width:{{ bar_pct // 2 }}%;height:8px;background:#4ade80;border-radius:0 3px 3px 0;"></div>
+        {% else %}<div style="position:absolute;right:50%;width:{{ bar_pct // 2 }}%;height:8px;background:#f87171;border-radius:3px 0 0 3px;"></div>{% endif %}
+        <div style="position:absolute;left:50%;top:0;width:1px;height:8px;background:#334155;"></div>
+      </div>
+    </td>
+  </tr>
+  {% endif %}
+  {% else %}
+  <tr style="background:#16213a;">
+    <td colspan="8" style="padding:7px 8px 4px;font-size:13px;font-weight:700;color:#e2e8f0;border-top:1px solid #1e293b;">
+      {{ labels.get(mkey, mkey) if labels else mkey }}
+      <span style="font-weight:400;color:#475569;font-size:11px;margin-left:8px;">No qualifying trades yet</span>
+    </td>
+  </tr>
+  {% endif %}
+  {% endfor %}
+  </tbody>
+</table>
+<p style="color:#475569;font-size:11px;margin:8px 0 0 0;">
+  Each method shows its overall stats (header row) plus a BUY-signal row and a SELL-signal row separately.
+  Compound = sequential reinvestment assuming equal unit size per trade.
+  Compare Avg Return to the Performance Breakdown above: a method beating the system avg contributes alpha; underperforming in one direction reveals where it adds noise.
+</p>
+{% else %}
+<h2>4b. Solo Method Performance</h2>
+<div class="card" style="border-left:4px solid #334155;">
+  <span style="color:#64748b;font-size:13px;">No trades with stored method scores yet — this section will populate once attribution-enabled trades are closed.</span>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4C — METHOD EVALUATION
+     Directional accuracy + conviction calibration
+     ══════════════════════════════════════ -->
+{% if perf and perf.method_eval_stats %}
+<h2>4c. Method Evaluation <span style="font-size:13px;font-weight:400;color:#94a3b8;">(directional accuracy &amp; conviction calibration)</span></h2>
+<p style="color:#64748b;font-size:12px;margin:0 0 10px 0;">
+  Answers: &ldquo;when this method had a view, was its direction correct?&rdquo; and &ldquo;does higher conviction (|score|) predict better outcomes?&rdquo;
+  <br>Correct = hypothetical return &gt; 0 (method direction matched a profitable result).
+  A well-calibrated signal shows accuracy rising Low &rarr; Medium &rarr; High conviction.
+</p>
+{% set meval = perf.method_eval_stats %}
+{% set labels = perf.method_labels if perf.method_labels is defined else {} %}
+{% set method_order = ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
+{# ── conviction-band sub-table macro (inlined as a block for each direction) ── #}
+{% macro band_table(direction_stats) %}
+{% if direction_stats %}
+{% set ds = direction_stats %}
+{% set acc_c = '#4ade80' if ds.directional_accuracy >= 60 else '#f59e0b' if ds.directional_accuracy >= 45 else '#f87171' %}
+{% set cor_c = '#4ade80' if ds.avg_return_correct > 0 else '#f87171' %}
+{% set wrg_c = '#f87171' if ds.avg_return_wrong < 0 else '#f59e0b' %}
+<div style="margin-bottom:4px;">
+  <span style="font-size:12px;color:#94a3b8;">{{ ds.trades }} trade{{ 's' if ds.trades != 1 else '' }}</span>
+  &nbsp;<span style="font-size:12px;color:{{ acc_c }};font-weight:700;">{{ ds.directional_accuracy }}% accurate</span>
+  &nbsp;<span style="font-size:11px;color:{{ cor_c }};">&check; {{ "%+.2f"|format(ds.avg_return_correct) }}%</span>
+  <span style="font-size:11px;color:{{ wrg_c }};">&nbsp;&times; {{ "%+.2f"|format(ds.avg_return_wrong) }}%</span>
+</div>
+<table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:4px;">
+  <thead>
+    <tr>
+      <th style="text-align:left;color:#475569;padding:1px 10px 3px 0;font-weight:500;">Conviction</th>
+      <th style="text-align:right;color:#475569;padding:1px 8px 3px;font-weight:500;">Trades</th>
+      <th style="text-align:right;color:#475569;padding:1px 8px 3px;font-weight:500;">Accuracy</th>
+      <th style="text-align:right;color:#475569;padding:1px 8px 3px;font-weight:500;">Avg Return</th>
+      <th style="padding:1px 0 3px 10px;font-weight:500;color:#475569;">Bar</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for band in ds.conviction_bands %}
+  {% set ba_c = '#4ade80' if band.accuracy >= 60 else '#f59e0b' if band.accuracy >= 45 else '#f87171' %}
+  {% set br_c = '#4ade80' if band.avg_return > 0 else '#f87171' %}
+  {% set bbar = [(band.avg_return|abs / 5 * 100)|int, 100]|min %}
+  <tr>
+    <td style="color:#64748b;padding:1px 10px 1px 0;">{{ band.label }}</td>
+    {% if band.trades > 0 %}
+    <td style="text-align:right;color:#cbd5e1;padding:1px 8px;">{{ band.trades }}</td>
+    <td style="text-align:right;color:{{ ba_c }};font-weight:700;padding:1px 8px;">{{ band.accuracy }}%</td>
+    <td style="text-align:right;color:{{ br_c }};padding:1px 8px;">{{ "%+.2f"|format(band.avg_return) }}%</td>
+    <td style="padding:1px 0 1px 10px;">
+      <div style="background:#1e293b;border-radius:3px;height:5px;overflow:hidden;position:relative;width:70px;display:inline-block;vertical-align:middle;">
+        {% if band.avg_return >= 0 %}<div style="position:absolute;left:50%;width:{{ bbar // 2 }}%;height:5px;background:#4ade80;border-radius:0 3px 3px 0;"></div>
+        {% else %}<div style="position:absolute;right:50%;width:{{ bbar // 2 }}%;height:5px;background:#f87171;border-radius:3px 0 0 3px;"></div>{% endif %}
+        <div style="position:absolute;left:50%;top:0;width:1px;height:5px;background:#334155;"></div>
+      </div>
+    </td>
+    {% else %}
+    <td style="text-align:right;color:#334155;padding:1px 8px;">0</td>
+    <td style="text-align:right;color:#334155;padding:1px 8px;">&mdash;</td>
+    <td style="text-align:right;color:#334155;padding:1px 8px;">&mdash;</td>
+    <td></td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endmacro %}
+{% for mkey in method_order %}
+{% set ev = meval.get(mkey) if meval else none %}
+{% set label = labels.get(mkey, mkey) if labels else mkey %}
+{% if ev %}
+{% set ov = ev.overall %}
+{% set acc_c = '#4ade80' if ov.directional_accuracy >= 60 else '#f59e0b' if ov.directional_accuracy >= 45 else '#f87171' %}
+<div class="card" style="margin-bottom:10px;padding:12px 16px;">
+  {# ── card header: method + overall summary ── #}
+  <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #1e293b;">
+    <span style="font-size:14px;font-weight:700;color:#e2e8f0;">{{ label }}</span>
+    <span style="font-size:12px;color:#64748b;">{{ ov.trades }} total</span>
+    <span style="font-size:12px;color:{{ acc_c }};font-weight:700;">{{ ov.directional_accuracy }}% overall accuracy</span>
+  </div>
+  {# ── BUY section ── #}
+  {% if ev.buys %}
+  <div style="margin-bottom:10px;">
+    <div style="font-size:12px;font-weight:700;color:#4ade80;margin-bottom:4px;">&#9650; BUY signals</div>
+    {{ band_table(ev.buys) }}
+  </div>
+  {% else %}
+  <div style="margin-bottom:10px;">
+    <div style="font-size:12px;color:#334155;">&#9650; BUY — no data yet</div>
+  </div>
+  {% endif %}
+  {# ── SELL section ── #}
+  {% if ev.sells %}
+  <div>
+    <div style="font-size:12px;font-weight:700;color:#f87171;margin-bottom:4px;">&#9660; SELL signals</div>
+    {{ band_table(ev.sells) }}
+  </div>
+  {% else %}
+  <div>
+    <div style="font-size:12px;color:#334155;">&#9660; SELL — no data yet</div>
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<div class="card" style="margin-bottom:10px;padding:10px 16px;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:14px;font-weight:700;color:#e2e8f0;min-width:200px;">{{ label }}</span>
+  <span style="font-size:12px;color:#475569;">No qualifying trades yet — will populate once this method records a closed trade with a non-neutral score.</span>
+</div>
+{% endif %}
+{% endfor %}
+<p style="color:#475569;font-size:11px;margin:4px 0 0 0;">
+  Conviction bands: Low = |score| 0.10&ndash;0.35, Medium = 0.35&ndash;0.65, High = 0.65+.
+  Each method card shows BUY and SELL directions separately so you can identify whether a method is better at calling longs or shorts.
+  Rising accuracy Low&rarr;High = well-calibrated. Flat/declining = noise.
+</p>
+{% else %}
+<h2>4c. Method Evaluation</h2>
+<div class="card" style="border-left:4px solid #334155;">
+  <span style="color:#64748b;font-size:13px;">No trades with stored method scores yet — this section will populate once attribution-enabled trades are closed.</span>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5 — TRADE DETAILS  (BUY / SELL only)
      Per-method breakdown with dates
      ══════════════════════════════════════ -->
@@ -690,6 +923,57 @@ HTML_TEMPLATE = """
         {% elif pn == "bear_flag" %}Bear flag — sharp decline followed by tight consolidation, continuation lower.
         {% else %}{{ pn | replace("_", " ") | title }} pattern detected.{% endif %}
         <span style="color:#64748b;font-size:10px;"> (score reflects this ticker&rsquo;s own historical win rate for this pattern)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Price Momentum -->
+    {% if enable_price_momentum and sig.momentum_score is defined and sig.momentum_score != 0 %}
+    {% set ms = sig.momentum_score %}
+    {% set m1 = sig.momentum_1m_pct if sig.momentum_1m_pct is defined else 0 %}
+    {% set m3 = sig.momentum_3m_pct if sig.momentum_3m_pct is defined else 0 %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Price Momentum</span>
+        <span class="mscore {{ 'sp' if ms > 0 else 'sn' }}">{{ "%+.2f"|format(ms) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">{{ '%+.1f'|format(m1) }}% 1m | {{ '%+.1f'|format(m3) }}% 3m</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (ms|abs * 100)|int }}%;background:{{ '#16a34a' if ms >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if ms > 0.5 %}Strong uptrend — price significantly above own historical baseline; perceived value rising.
+        {% elif ms > 0.2 %}Mild positive momentum — gentle tailwind; trend intact but not stretched.
+        {% elif ms < -0.5 %}Strong downtrend — price falling well below own historical baseline; perceived value falling.
+        {% elif ms < -0.2 %}Mild negative momentum — mild headwind; trend tilted lower.
+        {% else %}Neutral momentum — price tracking within its own historical baseline.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (tanh z-score of 1m/3m returns vs 252-bar history)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Money Flow -->
+    {% if enable_money_flow and sig.money_flow_score is defined and sig.money_flow_score != 0 %}
+    {% set mfs = sig.money_flow_score %}
+    {% set mfi = sig.mfi_value if sig.mfi_value is defined else 50 %}
+    {% set cmf = sig.cmf_value if sig.cmf_value is defined else 0 %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Money Flow</span>
+        <span class="mscore {{ 'sp' if mfs > 0 else 'sn' }}">{{ "%+.2f"|format(mfs) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">MFI={{ '%.0f'|format(mfi) }} | CMF={{ '%+.2f'|format(cmf) }}</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (mfs|abs * 100)|int }}%;background:{{ '#16a34a' if mfs >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if mfs > 0.4 %}Strong institutional accumulation — volume-weighted flows confirm buyers in control.
+        {% elif mfs > 0.15 %}Mild accumulation bias — more volume flowing in than out.
+        {% elif mfs < -0.4 %}Strong distribution — institutions exiting; sellers dominating volume.
+        {% elif mfs < -0.15 %}Mild distribution — selling pressure building.
+        {% else %}Balanced money flow — no clear institutional conviction.{% endif %}
+        {% if mfi < 20 %} MFI &lt; 20 = oversold/accumulation zone.{% elif mfi > 80 %} MFI &gt; 80 = overbought/distribution zone.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (MFI 14-period + CMF 20-period + OBV slope)</span>
       </div>
     </div>
     {% endif %}
@@ -2192,6 +2476,292 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     6a4 — SECTOR ROTATION (Ebb and Flow)
+     ══════════════════════════════════════ -->
+{% if sector_rotation_context %}
+{% set sr = sector_rotation_context %}
+{% set regime_colors = {
+    'RISK_ON':  '#4ade80',
+    'NEUTRAL':  '#94a3b8',
+    'RISK_OFF': '#f87171',
+    'UNKNOWN':  '#475569'
+} %}
+{% set flow_colors = {
+    'STRONG_INFLOW':  '#4ade80',
+    'INFLOW':         '#86efac',
+    'NEUTRAL':        '#94a3b8',
+    'OUTFLOW':        '#fca5a5',
+    'STRONG_OUTFLOW': '#f87171'
+} %}
+{% set dir_col = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>23. Sector Rotation <span style="font-size:13px;font-weight:400;color:#94a3b8;">("Ebb and Flow" · where is the money going?)</span></h2>
+<div class="card" style="border-left: 4px solid {{ regime_colors.get(sr.rotation_regime, '#475569') }};">
+
+  <!-- Regime banner -->
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:14px;">
+    <div style="background:#0f172a;border-radius:8px;padding:10px 18px;text-align:center;min-width:140px;">
+      <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Rotation Regime</div>
+      <div style="font-size:16px;font-weight:800;color:{{ regime_colors.get(sr.rotation_regime, '#94a3b8') }};">
+        {{ sr.rotation_regime.replace('_', ' ') }}
+      </div>
+      <div style="font-size:10px;color:{{ dir_col.get(sr.rotation_direction, '#94a3b8') }};margin-top:3px;">{{ sr.rotation_direction }}</div>
+    </div>
+    <div style="background:#0f172a;border-radius:8px;padding:10px 18px;text-align:center;min-width:130px;">
+      <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Cyc − Def Spread</div>
+      <div style="font-size:20px;font-weight:800;color:{{ '#4ade80' if sr.cyc_def_spread > 0 else ('#f87171' if sr.cyc_def_spread < 0 else '#94a3b8') }};">
+        {{ "%+.2f"|format(sr.cyc_def_spread) }}
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:3px;">cyc={{ "%+.2f"|format(sr.cyclical_avg) }} def={{ "%+.2f"|format(sr.defensive_avg) }}</div>
+    </div>
+    <div style="flex:1;min-width:200px;">
+      <div style="font-size:11px;color:#94a3b8;line-height:1.5;">{{ sr.summary }}</div>
+      {% if sr.rotation_pairs %}
+      <div style="margin-top:8px;font-size:11px;color:#64748b;">
+        <span style="color:#475569;text-transform:uppercase;font-size:10px;letter-spacing:.5px;">Rotation paths: </span>
+        {% for pair in sr.rotation_pairs %}
+        <span style="color:#94a3b8;">{{ pair }}</span>{% if not loop.last %} &nbsp;|&nbsp; {% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Per-sector table -->
+  <table class="pt" style="width:100%;">
+    <thead>
+      <tr>
+        <th style="text-align:left;">Sector</th>
+        <th>ETF</th>
+        <th>1W vs SPY</th>
+        <th>1M vs SPY</th>
+        <th>3M vs SPY</th>
+        <th>Vol Ratio</th>
+        <th>Score</th>
+        <th>Signal</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for e in sr.sectors %}
+    {% set fc = flow_colors.get(e.flow_signal, '#94a3b8') %}
+    <tr style="{% if e.flow_signal in ('STRONG_INFLOW', 'INFLOW') %}background:rgba(74,222,128,0.04);{% elif e.flow_signal in ('STRONG_OUTFLOW', 'OUTFLOW') %}background:rgba(248,113,113,0.04);{% endif %}">
+      <td style="color:#e2e8f0;">{{ e.name }}</td>
+      <td style="color:#94a3b8;font-weight:600;">{{ e.etf }}</td>
+      <td style="color:{{ '#4ade80' if (e.relative_5d is not none and e.relative_5d > 0) else ('#f87171' if (e.relative_5d is not none and e.relative_5d < 0) else '#64748b') }};">
+        {% if e.relative_5d is not none %}{{ "%+.1f"|format(e.relative_5d) }}%{% else %}—{% endif %}
+      </td>
+      <td style="color:{{ '#4ade80' if (e.relative_21d is not none and e.relative_21d > 0) else ('#f87171' if (e.relative_21d is not none and e.relative_21d < 0) else '#64748b') }};">
+        {% if e.relative_21d is not none %}{{ "%+.1f"|format(e.relative_21d) }}%{% else %}—{% endif %}
+      </td>
+      <td style="color:{{ '#4ade80' if (e.relative_63d is not none and e.relative_63d > 0) else ('#f87171' if (e.relative_63d is not none and e.relative_63d < 0) else '#64748b') }};">
+        {% if e.relative_63d is not none %}{{ "%+.1f"|format(e.relative_63d) }}%{% else %}—{% endif %}
+      </td>
+      <td style="color:{{ '#4ade80' if (e.volume_ratio is not none and e.volume_ratio > 1.15) else ('#f87171' if (e.volume_ratio is not none and e.volume_ratio < 0.85) else '#94a3b8') }};">
+        {% if e.volume_ratio is not none %}{{ "%.2f"|format(e.volume_ratio) }}×{% else %}—{% endif %}
+      </td>
+      <td style="color:{{ fc }};font-weight:700;">{{ "%+.2f"|format(e.rotation_score) }}</td>
+      <td style="color:{{ fc }};font-size:11px;font-weight:600;">{{ e.flow_signal.replace('_', ' ') }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a5 — ROTATION DRIVERS (Rate-Cycle Phase)
+     ══════════════════════════════════════ -->
+{% if rotation_drivers_context %}
+{% set rd = rotation_drivers_context %}
+{% set phase_colors = {
+    'EARLY_TIGHTENING':  '#f87171',
+    'PEAK_TIGHTENING':   '#dc2626',
+    'TIGHTENING_PAUSE':  '#fb923c',
+    'PIVOT_IMMINENT':    '#fbbf24',
+    'EASING_CYCLE':      '#4ade80',
+    'NEUTRAL':           '#94a3b8',
+    'UNKNOWN':           '#475569'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>6a5. Rotation Drivers <span style="font-size:13px;font-weight:400;color:#94a3b8;">(rate-cycle phase · FRED DFF + CPI)</span></h2>
+<div class="card" style="border-left: 4px solid {{ phase_colors.get(rd.cycle_phase, '#94a3b8') }};">
+
+  <!-- Top row: cycle phase badge + key metrics -->
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- Cycle phase badge -->
+    <div style="background:#0f172a;border-radius:8px;padding:14px 20px;text-align:center;min-width:160px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Rate Cycle Phase</div>
+      <div style="font-size:15px;font-weight:800;color:{{ phase_colors.get(rd.cycle_phase, '#e2e8f0') }};margin-bottom:5px;letter-spacing:.5px;">
+        {{ rd.cycle_phase.replace('_', ' ') }}
+      </div>
+      <div style="font-size:12px;font-weight:700;color:{{ dir_color.get(rd.cycle_direction, '#94a3b8') }};">
+        {{ '▲ BULLISH' if rd.cycle_direction == 'BULLISH' else ('▼ BEARISH' if rd.cycle_direction == 'BEARISH' else '→ NEUTRAL') }}
+      </div>
+      <div style="font-size:11px;color:#64748b;margin-top:4px;">{{ rd.rate_trajectory.replace('_', ' ') }}</div>
+    </div>
+
+    <!-- Key rate metrics -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;flex:1;min-width:200px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">Fed Funds Rate</div>
+      {% if rd.fed_rate_current is not none %}
+      <div style="font-size:22px;font-weight:800;color:#e2e8f0;margin-bottom:4px;">{{ "%.2f"|format(rd.fed_rate_current) }}%</div>
+      {% endif %}
+      <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:#94a3b8;margin-top:6px;">
+        {% if rd.rate_change_3m_bp is not none %}
+        <span>3m: <span style="color:{{ '#f87171' if rd.rate_change_3m_bp > 0 else ('#4ade80' if rd.rate_change_3m_bp < 0 else '#94a3b8') }};font-weight:700;">{{ "%+.0f"|format(rd.rate_change_3m_bp) }}bp</span></span>
+        {% endif %}
+        {% if rd.rate_change_12m_bp is not none %}
+        <span>12m: <span style="color:{{ '#f87171' if rd.rate_change_12m_bp > 0 else ('#4ade80' if rd.rate_change_12m_bp < 0 else '#94a3b8') }};font-weight:700;">{{ "%+.0f"|format(rd.rate_change_12m_bp) }}bp</span></span>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- CPI + real rate -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">Inflation</div>
+      {% if rd.cpi_yoy_current is not none %}
+      <div style="font-size:20px;font-weight:800;color:#e2e8f0;margin-bottom:4px;">{{ "%+.1f"|format(rd.cpi_yoy_current) }}%</div>
+      {% endif %}
+      <div style="font-size:11px;color:#94a3b8;">
+        trend: <span style="color:{{ '#f87171' if rd.inflation_trend in ('ACCELERATING','RISING') else ('#4ade80' if rd.inflation_trend in ('DECLINING','LOW_STABLE') else '#94a3b8') }};font-weight:600;">{{ rd.inflation_trend.replace('_', ' ') }}</span>
+      </div>
+      {% if rd.real_rate is not none %}
+      <div style="font-size:11px;color:#94a3b8;margin-top:4px;">
+        real rate: <span style="color:{{ '#f87171' if rd.real_rate_regime in ('RESTRICTIVE','HIGHLY_RESTRICTIVE') else ('#4ade80' if rd.real_rate_regime == 'ACCOMMODATIVE' else '#94a3b8') }};font-weight:600;">{{ "%+.2f"|format(rd.real_rate) }}%</span>
+        <span style="color:#475569;"> ({{ rd.real_rate_regime.replace('_',' ').lower() }})</span>
+      </div>
+      {% endif %}
+    </div>
+
+  </div>
+
+  <!-- Favoured / avoid -->
+  {% if rd.favoured_assets or rd.avoid_assets %}
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+    {% if rd.favoured_assets %}
+    <div style="background:#0f172a;border-radius:6px;padding:8px 12px;flex:1;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Cycle-Favoured</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px;">
+        {% for asset in rd.favoured_assets %}
+        <span style="background:rgba(74,222,128,0.12);color:#4ade80;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700;">{{ asset }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% if rd.avoid_assets %}
+    <div style="background:#0f172a;border-radius:6px;padding:8px 12px;flex:1;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Cycle-Headwind</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px;">
+        {% for asset in rd.avoid_assets %}
+        <span style="background:rgba(248,113,113,0.12);color:#f87171;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700;">{{ asset }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 4px 0;">{{ rd.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:0;">
+    Rate-cycle phase is a medium-term (weeks–months) overlay. PIVOT_IMMINENT is the accumulation
+    phase for rate-sensitive assets (XLRE, XLU, TLT) before the official cut. EASING_CYCLE = risk-on.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a6 — BUSINESS CYCLE ROTATION
+     ══════════════════════════════════════ -->
+{% if business_cycle_context and business_cycle_context.cycle_phase != 'UNKNOWN' %}
+{% set bc = business_cycle_context %}
+{% set phase_colors_bc = {
+    'EARLY_EXPANSION': '#4ade80',
+    'MID_EXPANSION':   '#86efac',
+    'LATE_EXPANSION':  '#fbbf24',
+    'LATE_CYCLE':      '#fb923c',
+    'CONTRACTION':     '#f87171',
+    'UNKNOWN':         '#475569'
+} %}
+{% set dir_color_bc = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>6a6. Business Cycle Rotation <span style="font-size:13px;font-weight:400;color:#94a3b8;">(Fidelity-style economic cycle · structural sector bias)</span></h2>
+<div class="card" style="border-left: 4px solid {{ phase_colors_bc.get(bc.cycle_phase, '#94a3b8') }};">
+
+  <!-- Top row: cycle phase badge + evidence -->
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- Cycle phase badge -->
+    <div style="background:#0f172a;border-radius:8px;padding:14px 20px;text-align:center;min-width:170px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Economic Cycle</div>
+      <div style="font-size:14px;font-weight:800;color:{{ phase_colors_bc.get(bc.cycle_phase, '#e2e8f0') }};margin-bottom:5px;letter-spacing:.5px;">
+        {{ bc.cycle_phase.replace('_', ' ') }}
+      </div>
+      <div style="font-size:12px;font-weight:700;color:{{ dir_color_bc.get(bc.cycle_direction, '#94a3b8') }};">
+        {{ '▲ BULLISH' if bc.cycle_direction == 'BULLISH' else ('▼ BEARISH' if bc.cycle_direction == 'BEARISH' else '→ NEUTRAL') }}
+      </div>
+    </div>
+
+    <!-- Sector scores bar chart (top 5 leaders + 3 laggards) -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;flex:2;min-width:260px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">Sector Leadership (historical outperformance in this phase)</div>
+      {% for b in bc.sector_biases[:8] %}
+      {% set bar_w = [(b.cycle_score * 120)|abs|int, 120]|min %}
+      {% set bar_color = '#4ade80' if b.cycle_score > 0 else '#f87171' %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+        <div style="width:38px;font-size:11px;font-weight:700;color:#e2e8f0;">{{ b.etf }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}px;height:10px;background:{{ bar_color }};border-radius:3px;
+               {% if b.cycle_score < 0 %}margin-left:auto;{% endif %}"></div>
+        </div>
+        <div style="width:38px;font-size:10px;text-align:right;color:{{ bar_color }};font-weight:600;">{{ '%+.2f'|format(b.cycle_score) }}</div>
+      </div>
+      {% endfor %}
+    </div>
+
+  </div>
+
+  <!-- Sector leaders + laggards tags -->
+  {% if bc.top_cycle_leaders or bc.weak_cycle_sectors %}
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+    {% if bc.top_cycle_leaders %}
+    <div style="background:#0f172a;border-radius:6px;padding:8px 12px;flex:1;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Cycle Leaders</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px;">
+        {% for etf in bc.top_cycle_leaders %}
+        <span style="background:rgba(74,222,128,0.12);color:#4ade80;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700;">{{ etf }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% if bc.weak_cycle_sectors %}
+    <div style="background:#0f172a;border-radius:6px;padding:8px 12px;flex:1;min-width:180px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Structural Laggards</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px;">
+        {% for etf in bc.weak_cycle_sectors %}
+        <span style="background:rgba(248,113,113,0.12);color:#f87171;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700;">{{ etf }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Convergence notes -->
+  {% if bc.convergence_notes %}
+  <div style="background:#0f172a;border-radius:6px;padding:8px 12px;margin-bottom:10px;">
+    <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Ebb-and-Flow Convergence</div>
+    <p style="color:#94a3b8;font-size:12px;margin:0;">{{ bc.convergence_notes }}</p>
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 4px 0;">{{ bc.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:0;">
+    Business cycle phase is derived from FRED macro regime, yield curve, inflation, and unemployment trend.
+    Leaders/laggards are based on Fidelity-style historical sector performance in each phase.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      6b — CREDIT MARKET (HYG vs SPY)
      ══════════════════════════════════════ -->
 {% if credit_context and credit_context.divergence_5d is not none %}
@@ -2204,7 +2774,7 @@ HTML_TEMPLATE = """
     'UNKNOWN':        '#64748b'
 } %}
 {% set cr_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>23. Credit Market <span style="font-size:13px;font-weight:400;color:#94a3b8;">(HYG vs SPY · leading indicator)</span></h2>
+<h2>24. Credit Market <span style="font-size:13px;font-weight:400;color:#94a3b8;">(HYG vs SPY · leading indicator)</span></h2>
 <div class="card" style="border-left: 4px solid {{ cr_color.get(credit_context.signal, '#94a3b8') }};">
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
 
@@ -2276,7 +2846,7 @@ HTML_TEMPLATE = """
     'CALLS_HEAVY':   '#86efac',
     'EXTREME_CALLS': '#4ade80'
 } %}
-<h2>24. Put/Call Ratio <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CBOE equity · yfinance per-ticker)</span></h2>
+<h2>25. Put/Call Ratio <span style="font-size:13px;font-weight:400;color:#94a3b8;">(CBOE equity · yfinance per-ticker)</span></h2>
 <div class="card" style="border-left: 4px solid {{ mkt_color.get(put_call_context.market_signal, '#94a3b8') }};">
 
   <!-- Market-wide gauge -->
@@ -2354,7 +2924,7 @@ HTML_TEMPLATE = """
     'NEUTRAL':       '#94a3b8'
 } %}
 {% set tick_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>25. NYSE TICK Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^TICK · breadth exhaustion)</span></h2>
+<h2>26. NYSE TICK Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(^TICK · breadth exhaustion)</span></h2>
 <div class="card" style="border-left: 4px solid {{ tick_sig_color.get(tick_context.signal, '#94a3b8') }};">
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
 
@@ -2432,7 +3002,7 @@ HTML_TEMPLATE = """
     'BREADTH_EXTENDED': '#fbbf24'
 } %}
 {% set bc_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>26. Market Breadth <span style="font-size:13px;font-weight:400;color:#94a3b8;">(% sector ETFs above 200-day SMA)</span></h2>
+<h2>27. Market Breadth <span style="font-size:13px;font-weight:400;color:#94a3b8;">(% sector ETFs above 200-day SMA)</span></h2>
 <div class="card" style="border-left: 4px solid {{ bc_sig_color.get(breadth_context.signal, '#94a3b8') }};">
 
   {% if breadth_context.is_breadth_thrust %}
@@ -2559,7 +3129,7 @@ HTML_TEMPLATE = """
     'EXTENDED_BEAR': '#f87171'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>27. McClellan Oscillator <span style="font-size:13px;font-weight:400;color:#94a3b8;">(NYSE A/D breadth momentum · swing timing)</span></h2>
+<h2>28. McClellan Oscillator <span style="font-size:13px;font-weight:400;color:#94a3b8;">(NYSE A/D breadth momentum · swing timing)</span></h2>
 <div class="card" style="border-left: 4px solid {{ osc_sig_color.get(mcclellan_context.osc_signal, '#94a3b8') }};">
 
   {% if mcclellan_context.is_bullish_cross %}
@@ -2682,7 +3252,7 @@ HTML_TEMPLATE = """
     'AMPLIFIED': '#f87171'
 } %}
 {% set bias_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>28. Gamma Exposure <span style="font-size:13px;font-weight:400;color:#94a3b8;">(dealer hedging flows · gamma flip · max pain)</span></h2>
+<h2>29. Gamma Exposure <span style="font-size:13px;font-weight:400;color:#94a3b8;">(dealer hedging flows · gamma flip · max pain)</span></h2>
 <div class="card" style="border-left: 4px solid #0ea5e9;">
   <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px 0;">{{ gex_context.summary }}</p>
   <div style="overflow-x:auto;">
@@ -2765,7 +3335,7 @@ HTML_TEMPLATE = """
     'NEUTRAL':              '#475569'
 } %}
 {% set ox = opex_context %}
-<h2>29. OpEx Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(options expiration · max pain timing · pure date math)</span></h2>
+<h2>30. OpEx Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(options expiration · max pain timing · pure date math)</span></h2>
 <div class="card" style="border-left: 4px solid {{ opex_colors.get(ox.signal, '#475569') }};">
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
 
@@ -2839,7 +3409,7 @@ HTML_TEMPLATE = """
     'STRONG_HEADWIND': '#f87171'
 } %}
 {% set effect_dir_colors = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>30. Seasonal Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(monthly biases · calendar windows · pure date math)</span></h2>
+<h2>31. Seasonal Calendar <span style="font-size:13px;font-weight:400;color:#94a3b8;">(monthly biases · calendar windows · pure date math)</span></h2>
 <div class="card" style="border-left: 4px solid {{ composite_colors.get(sc.composite_signal, '#475569') }};">
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
 
@@ -2936,7 +3506,7 @@ HTML_TEMPLATE = """
     'IG_STRONG':  '#4ade80',
     'UNKNOWN':    '#475569'
 } %}
-<h2>31. Bond Market Internals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(1–8 week macro regime · Treasury curve · TLT/TIP/LQD · yfinance)</span></h2>
+<h2>32. Bond Market Internals <span style="font-size:13px;font-weight:400;color:#94a3b8;">(1–8 week macro regime · Treasury curve · TLT/TIP/LQD · yfinance)</span></h2>
 <div class="card" style="border-left: 4px solid {{ regime_colors.get(bi.regime, '#475569') }};">
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
 
@@ -3076,7 +3646,7 @@ HTML_TEMPLATE = """
     'STRONG_LOWS':    '#f87171'
 } %}
 {% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
-<h2>32. New 52-Week Highs / Lows <span style="font-size:13px;font-weight:400;color:#94a3b8;">(breadth divergence · participation · reversal timing)</span></h2>
+<h2>33. New 52-Week Highs / Lows <span style="font-size:13px;font-weight:400;color:#94a3b8;">(breadth divergence · participation · reversal timing)</span></h2>
 <div class="card" style="border-left: 4px solid {{ sig_color.get(highs_lows_context.signal, '#94a3b8') }};">
 
   {% if highs_lows_context.is_bearish_divergence %}
@@ -3200,7 +3770,7 @@ HTML_TEMPLATE = """
      5z — INSIDER CLUSTER WATCHLIST
      ══════════════════════════════════════ -->
 {% if cluster_watchlist_context and cluster_watchlist_context.entries %}
-<h2>33. Insider Cluster Watchlist <span style="font-size:13px;font-weight:400;color:#94a3b8;">(cross-run 10-day tracking)</span></h2>
+<h2>34. Insider Cluster Watchlist <span style="font-size:13px;font-weight:400;color:#94a3b8;">(cross-run 10-day tracking)</span></h2>
 <div class="card" style="border-left: 4px solid #a78bfa; padding:14px 18px;">
   <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">
     Tickers where ≥3 insiders bought within 5 days. Clusters precede price movement by 5–20 days —
@@ -3235,10 +3805,123 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5x — PRICE MOMENTUM LEADERBOARD
+     ══════════════════════════════════════ -->
+{% set mom_signals = signals | selectattr('momentum_score', 'defined') | selectattr('momentum_score', 'ne', 0) | list if signals else [] %}
+{% set mom_leaders  = mom_signals | sort(attribute='momentum_score', reverse=true) | list %}
+{% set top_mom  = mom_leaders[:5] %}
+{% set bot_mom  = mom_leaders[-5:] | reverse | list %}
+{% if top_mom %}
+<h2>34b. Price Momentum <span style="font-size:13px;font-weight:400;color:#94a3b8;">(Perceived Value · 1m/3m return vs own history)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 14px 0;">
+    Money flows chase perceived value. Normalised z-score of 1-month and 3-month returns vs each stock's own trailing distribution.
+    Score > 0 = market chasing upward trend; score &lt; 0 = momentum selling in progress.
+  </p>
+
+  <div style="display:flex;gap:14px;flex-wrap:wrap;">
+
+    <!-- Top momentum (chased names) -->
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Strongest Momentum (Market is Chasing)</div>
+      {% for s in top_mom %}
+      {% set bar_w = [(s.momentum_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.momentum_score) }}</div>
+        {% set m1 = s.momentum_1m_pct if s.momentum_1m_pct is defined else 0 %}
+        {% set m3 = s.momentum_3m_pct if s.momentum_3m_pct is defined else 0 %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ '%+.1f'|format(m1) }}% 1m | {{ '%+.1f'|format(m3) }}% 3m</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Bottom momentum (under selling pressure) -->
+    {% if bot_mom %}
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Weakest Momentum (Under Selling Pressure)</div>
+      {% for s in bot_mom %}
+      {% set bar_w = [(s.momentum_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.momentum_score) }}</div>
+        {% set m1 = s.momentum_1m_pct if s.momentum_1m_pct is defined else 0 %}
+        {% set m3 = s.momentum_3m_pct if s.momentum_3m_pct is defined else 0 %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ '%+.1f'|format(m1) }}% 1m | {{ '%+.1f'|format(m3) }}% 3m</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Score = tanh(z/1.5) where z = 0.6×(1m z-score) + 0.4×(3m z-score), normalised by each ticker's trailing 252-bar return std.
+    Volume-confirmed when score &gt; 0.5 and recent volume &gt; 1.3× baseline.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5z — MONEY FLOW LEADERBOARD
+     ══════════════════════════════════════ -->
+{% set mf_signals = signals | selectattr('money_flow_score', 'defined') | selectattr('money_flow_score', 'ne', 0) | list if signals else [] %}
+{% set mf_leaders  = mf_signals | sort(attribute='money_flow_score', reverse=true) | list %}
+{% set top_mf  = mf_leaders[:5] %}
+{% set bot_mf  = mf_leaders[-5:] | reverse | list %}
+{% if top_mf %}
+<h2>Money Flow <span style="font-size:13px;font-weight:400;color:#94a3b8;">(MFI · CMF · OBV — accumulation vs distribution)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Strongest Accumulation (Smart Money Buying)</div>
+      {% for s in top_mf %}
+      {% set bar_w = [(s.money_flow_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.money_flow_score) }}</div>
+        {% set mfi = s.mfi_value if s.mfi_value is defined else 50 %}
+        {% set cmf = s.cmf_value if s.cmf_value is defined else 0 %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">MFI={{ '%.0f'|format(mfi) }} | CMF={{ '%+.2f'|format(cmf) }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Strongest Distribution (Smart Money Selling)</div>
+      {% for s in bot_mf %}
+      {% set bar_w = [(s.money_flow_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.money_flow_score) }}</div>
+        {% set mfi = s.mfi_value if s.mfi_value is defined else 50 %}
+        {% set cmf = s.cmf_value if s.cmf_value is defined else 0 %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">MFI={{ '%.0f'|format(mfi) }} | CMF={{ '%+.2f'|format(cmf) }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    MFI &lt; 20 = accumulation zone; MFI &gt; 80 = distribution zone. CMF positive = buyers in control. OBV slope z-score confirms the trend direction.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5y — SECTOR PAIRS / RELATIVE VALUE
      ══════════════════════════════════════ -->
 {% if sector_pairs_context and sector_pairs_context.pairs %}
-<h2>34. Sector Pairs <span style="font-size:13px;font-weight:400;color:#94a3b8;">(market-neutral relative value)</span></h2>
+<h2>35. Sector Pairs <span style="font-size:13px;font-weight:400;color:#94a3b8;">(market-neutral relative value)</span></h2>
 <div class="card" style="padding:14px 18px;">
   <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">
     ETF vs. constituent divergences: Long the bullish leg, Short the bearish leg.
@@ -3295,7 +3978,7 @@ HTML_TEMPLATE = """
      6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
-<h2>35. Smart Money Signals</h2>
+<h2>36. Smart Money Signals</h2>
 {% if not insider_trades %}
 <div class="card" style="border-left: 4px solid #475569;">
   <span style="color:#64748b;font-size:13px;">No unusual smart money activity detected.</span>
@@ -3399,6 +4082,9 @@ def send_recommendations(
     catalyst_timing_context=None,   # Optional[CatalystTimingContext]   — avoid circular import
     cluster_watchlist_context=None, # Optional[ClusterWatchlistContext] — avoid circular import
     sector_pairs_context=None,      # Optional[SectorPairsContext]      — avoid circular import
+    sector_rotation_context=None,   # Optional[SectorRotationContext]   — avoid circular import
+    rotation_drivers_context=None,  # Optional[RotationDriversContext]  — avoid circular import
+    business_cycle_context=None,    # Optional[BusinessCycleContext]    — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -3422,7 +4108,18 @@ def send_recommendations(
         settings.enable_options_flow or
         settings.enable_sec_filings
     )
-    active_methods = sum([use_news, use_tech, use_insider])
+    active_methods = sum([
+        use_news,
+        use_tech,
+        use_insider,
+        settings.enable_put_call,
+        settings.enable_gex,            # max_pain
+        settings.enable_gex,            # oi_skew (both active when GEX is on)
+        settings.enable_vwap,
+        settings.enable_pattern_recognition,
+        settings.enable_price_momentum,
+        settings.enable_money_flow,
+    ])
 
     # ── All recs sorted: BUY/SELL first, then by confidence desc ──────────
     all_recs = all_recommendations or recommendations
@@ -3532,6 +4229,7 @@ def send_recommendations(
         actionable_recs=actionable_recs,
         passive_recs=passive_recs,
         # signal breakdown
+        signals=signals or [],
         signals_by_ticker=signals_by_ticker,
         articles_by_ticker=articles_by_ticker,
         use_news=use_news,
@@ -3539,6 +4237,8 @@ def send_recommendations(
         use_insider=use_insider,
         use_put_call=settings.enable_put_call,
         use_pattern=settings.enable_pattern_recognition,
+        enable_price_momentum=settings.enable_price_momentum,
+        enable_money_flow=settings.enable_money_flow,
         enable_gex=settings.enable_gex,
         active_methods=active_methods,
         # smart money
@@ -3606,6 +4306,12 @@ def send_recommendations(
         cluster_watchlist_context=cluster_watchlist_context,
         # Sector Pairs / Relative Value
         sector_pairs_context=sector_pairs_context,
+        # Sector Rotation / Ebb and Flow
+        sector_rotation_context=sector_rotation_context,
+        # Rotation Drivers (rate-cycle phase)
+        rotation_drivers_context=rotation_drivers_context,
+        # Business Cycle Rotation (structural economic phase)
+        business_cycle_context=business_cycle_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────
@@ -3637,6 +4343,14 @@ def send_recommendations(
             if settings.enable_pattern_recognition and sig.pattern_score != 0:
                 pn = f" [{sig.pattern_name}]" if sig.pattern_name else ""
                 lines.append(f"Pattern score:   {sig.pattern_score:+.2f}{pn}")
+            if settings.enable_price_momentum and getattr(sig, "momentum_score", 0) != 0:
+                m1 = getattr(sig, "momentum_1m_pct", 0)
+                m3 = getattr(sig, "momentum_3m_pct", 0)
+                lines.append(f"Momentum score:  {sig.momentum_score:+.2f} (1m:{m1:+.1f}% 3m:{m3:+.1f}%)")
+            if settings.enable_money_flow and getattr(sig, "money_flow_score", 0) != 0:
+                mfi = getattr(sig, "mfi_value", 50)
+                cmf = getattr(sig, "cmf_value", 0)
+                lines.append(f"Money flow score:{sig.money_flow_score:+.2f} (MFI={mfi:.0f} CMF={cmf:+.2f})")
         lines.append(f"Claude's synthesis: {rec.rationale}")
         lines.append("")
     if insider_by_ticker:
@@ -3667,6 +4381,7 @@ def send_recommendations(
                 "news": "News", "tech": "Technical", "insider": "Smart Money",
                 "put_call": "Put/Call", "max_pain": "Max Pain", "oi_skew": "OI Skew",
                 "vwap": "VWAP", "pattern": "Pattern",
+                "momentum": "Price Momentum", "money_flow": "Money Flow",
             }
             sorted_methods = sorted(
                 performance["method_stats"].items(), key=lambda x: x[1]["win_rate"], reverse=True

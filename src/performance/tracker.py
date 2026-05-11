@@ -106,13 +106,13 @@ def _pct_return(action: str, entry: float, current: float) -> float:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern")
+_ALL_METHODS = ("news", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "money_flow")
 _METHOD_AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as "having a view"
 
 # Category groupings: how methods map to higher-level signal families
 METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Sentiment":   ["news"],
-    "Technical":   ["tech", "vwap", "pattern"],
+    "Technical":   ["tech", "vwap", "pattern", "momentum", "money_flow"],
     "Smart Money": ["insider"],
     "Options":     ["put_call", "max_pain", "oi_skew"],
 }
@@ -127,6 +127,8 @@ METHOD_LABELS: Dict[str, str] = {
     "oi_skew":  "OI Skew",
     "vwap":     "VWAP Distance",
     "pattern":  "Pattern Recognition",
+    "momentum":   "Price Momentum",
+    "money_flow": "Money Flow (MFI+CMF+OBV)",
 }
 
 
@@ -146,7 +148,9 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "max_pain":  sig.max_pain_score,
         "oi_skew":   sig.oi_skew_score,
         "vwap":      sig.vwap_score,
-        "pattern":   getattr(sig, "pattern_score", 0.0),
+        "pattern":    getattr(sig, "pattern_score", 0.0),
+        "momentum":   getattr(sig, "momentum_score", 0.0),
+        "money_flow": getattr(sig, "money_flow_score", 0.0),
     }
 
 
@@ -909,6 +913,174 @@ def _build_trades_svg(closed_trades: List[dict]) -> str:
     return '\n'.join(parts)
 
 
+def _solo_stats(dated_returns: list) -> dict:
+    """Summary stats from (entry_date, hyp_return) pairs. Returns {} when empty."""
+    if not dated_returns:
+        return {}
+    dated_returns = sorted(dated_returns, key=lambda x: x[0])
+    hyp = [r for _, r in dated_returns]
+    wins = [r for r in hyp if r > 0]
+    compound = 1.0
+    for r in hyp:
+        compound *= (1 + r / 100)
+    return {
+        "trades":          len(hyp),
+        "win_rate":        round(len(wins) / len(hyp) * 100, 1),
+        "avg_return":      round(sum(hyp) / len(hyp), 2),
+        "compound_return": round((compound - 1) * 100, 2),
+        "best":            round(max(hyp), 2),
+        "worst":           round(min(hyp), 2),
+    }
+
+
+_EVAL_BANDS = [
+    ("Low (0.10–0.35)",    0.10, 0.35),
+    ("Medium (0.35–0.65)", 0.35, 0.65),
+    ("High (0.65+)",       0.65, 1.01),
+]
+
+
+def _eval_stats(entries: list) -> dict:
+    """Directional accuracy stats from (abs_score, hyp_return) pairs. Returns {} when empty."""
+    if not entries:
+        return {}
+    correct = [r for _, r in entries if r > 0]
+    wrong   = [r for _, r in entries if r <= 0]
+    conviction_bands = []
+    for label, lo, hi in _EVAL_BANDS:
+        band = [r for s, r in entries if lo <= s < hi]
+        if not band:
+            conviction_bands.append({"label": label, "trades": 0, "accuracy": 0.0, "avg_return": 0.0})
+            continue
+        band_correct = [r for r in band if r > 0]
+        conviction_bands.append({
+            "label":      label,
+            "trades":     len(band),
+            "accuracy":   round(len(band_correct) / len(band) * 100, 1),
+            "avg_return": round(sum(band) / len(band), 2),
+        })
+    return {
+        "trades":               len(entries),
+        "directional_accuracy": round(len(correct) / len(entries) * 100, 1),
+        "avg_return_correct":   round(sum(correct) / len(correct), 2) if correct else 0.0,
+        "avg_return_wrong":     round(sum(wrong)   / len(wrong),   2) if wrong   else 0.0,
+        "conviction_bands":     conviction_bands,
+    }
+
+
+def compute_solo_method_performance() -> dict:
+    """Simulate performance for each signal method used in isolation, split by direction.
+
+    For each closed trade with stored method_scores, each method is asked:
+    "What direction would you alone have signalled?"
+
+      score > 0  → solo BUY;  score < 0  → solo SELL;  |score| < threshold → skip
+
+    Hypothetical return:
+      same direction as actual trade  → actual return_pct
+      opposite direction              → −actual return_pct
+
+    Returns dict: method_name → {
+        "overall": {trades, win_rate, avg_return, compound_return, best, worst},
+        "buys":    {same fields, only BUY-signal trades}   — {} if none,
+        "sells":   {same fields, only SELL-signal trades}  — {} if none,
+    }
+    Only methods with ≥ 1 qualifying trade are returned.
+    """
+    MIN_TRADES = 1
+    trades = _load_trades()
+    closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
+    if not closed:
+        return {}
+
+    results: dict = {}
+    for method in _ALL_METHODS:
+        buy_dated:  list = []
+        sell_dated: list = []
+
+        for trade in closed:
+            score = trade["method_scores"].get(method, 0.0)
+            if abs(score) < _METHOD_AGREE_THRESHOLD:
+                continue
+            actual_return = trade.get("return_pct", 0.0)
+            actual_action = trade.get("action", "BUY")
+            solo_action   = "BUY" if score > 0 else "SELL"
+            hyp_return    = actual_return if solo_action == actual_action else -actual_return
+            entry = (trade.get("entry_date", ""), hyp_return)
+            if solo_action == "BUY":
+                buy_dated.append(entry)
+            else:
+                sell_dated.append(entry)
+
+        all_dated = buy_dated + sell_dated
+        if len(all_dated) < MIN_TRADES:
+            continue
+
+        results[method] = {
+            "overall": _solo_stats(all_dated),
+            "buys":    _solo_stats(buy_dated),
+            "sells":   _solo_stats(sell_dated),
+        }
+
+    return results
+
+
+def compute_method_eval_stats() -> dict:
+    """Per-method directional accuracy and conviction calibration, split by direction.
+
+    For each signal method, across all closed trades with stored method_scores:
+      - Directional accuracy: % of times the method's direction led to a positive hyp return
+      - avg_return when correct vs wrong
+      - Conviction bands (Low/Medium/High |score|): trades, accuracy, avg_return
+
+    Results are split into "overall", "buys" (score > 0), and "sells" (score < 0).
+
+    Returns dict: method_name → {
+        "overall": {trades, directional_accuracy, avg_return_correct, avg_return_wrong,
+                    conviction_bands: [{"label","trades","accuracy","avg_return"}, ...]},
+        "buys":    {same structure, only BUY-signal entries}  — {} if none,
+        "sells":   {same structure, only SELL-signal entries} — {} if none,
+    }
+    Only methods with ≥ 1 qualifying trade are returned (others shown as no-data in email).
+    """
+    MIN_TRADES = 1
+    trades = _load_trades()
+    closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
+    if not closed:
+        return {}
+
+    results: dict = {}
+    for method in _ALL_METHODS:
+        buy_entries:  list = []
+        sell_entries: list = []
+
+        for trade in closed:
+            score = trade["method_scores"].get(method, 0.0)
+            if abs(score) < _METHOD_AGREE_THRESHOLD:
+                continue
+            actual_return = trade.get("return_pct", 0.0)
+            actual_action = trade.get("action", "BUY")
+            solo_action   = "BUY" if score > 0 else "SELL"
+            hyp_return    = actual_return if solo_action == actual_action else -actual_return
+            entry = (abs(score), hyp_return)
+            if solo_action == "BUY":
+                buy_entries.append(entry)
+            else:
+                sell_entries.append(entry)
+
+        all_entries = buy_entries + sell_entries
+        if len(all_entries) < MIN_TRADES:
+            continue
+
+        results[method] = {
+            "overall": _eval_stats(all_entries),
+            "buys":    _eval_stats(buy_entries),
+            "sells":   _eval_stats(sell_entries),
+        }
+
+    return results
+
+
 def get_performance_for_email() -> dict:
     """Return structured performance data for inclusion in the email report."""
     trades = _load_trades()
@@ -964,16 +1136,21 @@ def get_performance_for_email() -> dict:
         })
 
     attributed = [t for t in closed_trades if t.get("methods_agreeing")]
-    confidence_ranked   = _compute_confidence_ranked(closed_trades)
-    performance_table   = _compute_performance_table(closed_trades) if closed_trades else []
-    trades_svg          = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
+    confidence_ranked    = _compute_confidence_ranked(closed_trades)
+    performance_table    = _compute_performance_table(closed_trades) if closed_trades else []
+    trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
+    solo_method_perf     = compute_solo_method_performance()
+    method_eval_stats    = compute_method_eval_stats()
 
     return {
-        "open_trades":       sorted(open_trades,   key=lambda x: x["entry_date"],    reverse=True),
-        "closed_trades":     sorted(closed_trades, key=lambda x: x["exit_date"] or "", reverse=True),
-        "stats":             stats,
-        "confidence_ranked": confidence_ranked,
-        "performance_table": performance_table,
-        "attributed_count":  len(attributed),
-        "trades_svg":        trades_svg,
+        "open_trades":        sorted(open_trades,   key=lambda x: x["entry_date"],    reverse=True),
+        "closed_trades":      sorted(closed_trades, key=lambda x: x["exit_date"] or "", reverse=True),
+        "stats":              stats,
+        "confidence_ranked":  confidence_ranked,
+        "performance_table":  performance_table,
+        "attributed_count":   len(attributed),
+        "trades_svg":         trades_svg,
+        "solo_method_perf":   solo_method_perf,    # hypothetical per-method solo simulation
+        "method_eval_stats":  method_eval_stats,   # per-method accuracy + conviction calibration
+        "method_labels":      METHOD_LABELS,
     }

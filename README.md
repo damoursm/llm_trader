@@ -37,6 +37,16 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │  3r. Insider Cluster      — ≥3 different insiders buying within 5 days  │
 │  3A. Pattern Recognition  — 8 classical chart patterns + per-ticker      │
 │                              historical win rates (2y library, 7d cache) │
+│  3B. Sector Rotation      — "Ebb and Flow": relative momentum vs SPY     │
+│                              across 11 GICS sectors; cyclical/defensive  │
+│  3C. Rotation Drivers     — rate-cycle phase from DFF + CPI trajectory;  │
+│                              favoured/avoid assets per HIKING→EASING cycle│
+│  3D. Business Cycle Rotation — Fidelity-style economic phase → sector    │
+│                              leadership biases (no new API calls)         │
+│  3E. Price Momentum       — perceived-value trend: 1m/2m returns vs own  │
+│                              252-bar history; volume-confirmed tanh score  │
+│  3F. Money Flow           — MFI + CMF + OBV slope composite:             │
+│                              accumulation vs distribution signal           │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
 │  5.  Recommendations      — Claude: BUY / SELL / HOLD / WATCH           │
 │  6.  Performance Tracking — paper trades, P&L, method attribution        │
@@ -842,6 +852,187 @@ When fewer than 3 historical occurrences exist, a weak prior (±0.25) is used in
 
 ---
 
+### Step 3B — Sector Rotation / "Ebb and Flow" (`src/data/sector_rotation.py`)
+
+When `ENABLE_SECTOR_ROTATION=true`, computes per-sector money-flow rotation scores across the 11 SPDR sector ETFs relative to SPY. **Money acts like water** — when it floods into one sector it is usually exiting another. Cached daily. No API key required.
+
+**Score construction:**
+
+1. **Relative return** per period: `sector_ret − SPY_ret` for 1-week, 1-month, and 3-month windows
+2. **Weighted composite:** `0.5 × rel_5d + 0.3 × rel_21d + 0.2 × rel_63d`
+3. **Cross-sectional z-score:** normalises across all 11 sector peers so scores are relative, not absolute
+4. **Volume modifier:** `vol_mod = min(0.25, (ratio − 1.0) × 0.6)` when 5d/20d volume ratio > 1.15 — amplifies confirmed accumulation/distribution
+5. **Final score:** `clip(z / 2.0 + vol_mod, −1, +1)`
+
+**Flow signals:**
+
+| Score | Signal | Equity implication |
+|---|---|---|
+| ≥ +0.5 | `STRONG_INFLOW` | Capital actively flooding in — BULLISH |
+| ≥ +0.2 | `INFLOW` | Meaningful relative inflow — BULLISH |
+| −0.2 to +0.2 | `NEUTRAL` | No directional flow conviction |
+| ≤ −0.2 | `OUTFLOW` | Money leaving — BEARISH |
+| ≤ −0.5 | `STRONG_OUTFLOW` | Significant capital exodus — BEARISH |
+
+**Rotation regime (cyclical vs defensive balance):**
+
+| Regime | Condition | Meaning |
+|---|---|---|
+| `RISK_ON` | cyclical avg − defensive avg > +0.2 | Growth / cyclical rotation dominant |
+| `NEUTRAL` | spread ±0.2 | Mixed or no clear bias |
+| `RISK_OFF` | spread < −0.2 | Defensive rotation dominant |
+
+**Cyclical sectors:** XLK, XLF, XLY, XLI, XLB, XLC, XLE  
+**Defensive sectors:** XLV, XLP, XLU, XLRE
+
+**Rotation pairs:** explicit cross-product of top outflow → top inflow sectors (e.g. `XLK → XLP  (Technology → Consumer Staples)`).
+
+**Claude prompt overlay (instruction 27b):** Stocks in STRONG_INFLOW sectors get a mild confidence boost; stocks in STRONG_OUTFLOW sectors require stronger signals before a BUY is issued ("water already leaving this bucket"). The rotation regime is applied as a sector-level overlay: RISK_OFF rotation → favour defensive names; RISK_ON → raise conviction on cyclical BUY calls.
+
+---
+
+### Step 3C — Rotation Drivers (`src/data/rotation_drivers.py`)
+
+When `ENABLE_ROTATION_DRIVERS=true`, synthesises the Federal Reserve rate trajectory and CPI inflation trend into a named rate-cycle phase and maps it to cross-asset rotation implications. Requires `FRED_API_KEY`. Cached daily.
+
+**What's distinct from FedWatch + FRED:** FedWatch gives forward-looking market-implied expectations; FRED gives current levels. Rotation Drivers gives the **actual backward-looking trajectory** — where has the Fed been over 3/6/12 months — and combines it with the inflation trend to name the current point in the cycle.
+
+**Rate trajectory (FRED DFF, 270 daily observations ≈ 13 months):**
+
+| Label | Condition |
+|---|---|
+| `ACTIVE_HIKING` | DFF +>25bp over 12m AND +>10bp over 3m |
+| `PAUSING` | DFF +>25bp over 12m AND flat last 3m (±15bp) |
+| `ACTIVE_CUTTING` | DFF −>25bp over 12m AND −>10bp over 3m |
+| `EASING_PAUSE` | DFF −>25bp over 12m AND flat last 3m |
+| `STABLE` | no clear directional trend |
+
+**Inflation trend (FRED CPIAUCSL, CPI YoY now vs 6 months ago):**
+
+| Label | Condition |
+|---|---|
+| `ACCELERATING` | CPI YoY rose >1.0pp over 6m |
+| `RISING` | CPI YoY rose 0.4–1.0pp |
+| `ELEVATED_STABLE` | CPI >4% and roughly flat |
+| `STABLE` | near-target, flat |
+| `MODERATING` | CPI YoY fell 0.5–1.5pp |
+| `DECLINING` | CPI YoY fell >1.5pp |
+| `LOW_STABLE` | CPI <2.5%, flat |
+
+**Cycle phases and equity implications:**
+
+| Phase | Conditions | Equity direction |
+|---|---|---|
+| `EARLY_TIGHTENING` | ACTIVE_HIKING + real rate not yet restrictive | BEARISH |
+| `PEAK_TIGHTENING` | ACTIVE_HIKING + real rate RESTRICTIVE, or PAUSING + elevated inflation | BEARISH |
+| `TIGHTENING_PAUSE` | PAUSING + CPI moderating | NEUTRAL |
+| `PIVOT_IMMINENT` | PAUSING/STABLE + declining CPI + FedWatch ≥25bp cuts priced | BULLISH |
+| `EASING_CYCLE` | ACTIVE_CUTTING | BULLISH |
+| `NEUTRAL` | STABLE trajectory, no inflation driver | NEUTRAL |
+
+**Asset rotation per phase:**
+
+| Phase | Favoured | Avoid |
+|---|---|---|
+| `EARLY_TIGHTENING` | XLE, XLF, XLV | XLRE, XLU, TLT, XLK |
+| `PEAK_TIGHTENING` | XLE, GLD, SLV, XLF | XLRE, XLU, TLT, QQQ, XLK |
+| `TIGHTENING_PAUSE` | XLV, XLP, GLD | XLRE, XLU |
+| `PIVOT_IMMINENT` | TLT, XLRE, XLU, GLD, IEF | XLE, TBF |
+| `EASING_CYCLE` | XLK, XLY, XLC, QQQ, XLRE | XLP, XLU |
+| `NEUTRAL` | — | — |
+
+**Claude prompt overlay (instruction 27c):** EARLY/PEAK_TIGHTENING → −0.04 on POSITION-horizon longs in rate-sensitive names. PIVOT_IMMINENT → +0.03 on rate-sensitive BUYs (TLT, XLRE, XLU). EASING_CYCLE → +0.03 on growth/cyclical BUYs. Rate-cycle phase is never allowed to override a strong near-term individual catalyst.
+
+---
+
+### Step 3D — Business Cycle Rotation (`src/data/business_cycle_rotation.py`)
+
+When `ENABLE_BUSINESS_CYCLE_ROTATION=true`, derives the current structural economic cycle phase from the already-fetched FRED macro context — no new API calls, no cache, instant computation (same pattern as `compute_market_mode()`).
+
+**What's distinct from the other rotation layers:**
+
+| Layer | What it answers | Signal type |
+|---|---|---|
+| Sector Rotation (3B) | Where is money **flowing right now**? | Reactive, real-time momentum |
+| Rotation Drivers (3C) | What is the **Fed doing**? | Monetary cycle (rate/CPI trajectory) |
+| Business Cycle Rotation (3D) | Where are we in the **economic cycle**? | Structural, historically repeating |
+
+**Phase classification (derived from FRED macro context):**
+
+| Phase | Key conditions | Equity direction |
+|---|---|---|
+| `EARLY_EXPANSION` | EXPANSION regime, inflation LOW/MODERATE, unemployment FALLING | BULLISH |
+| `MID_EXPANSION` | EXPANSION regime, inflation MODERATE, unemployment STABLE | BULLISH |
+| `LATE_EXPANSION` | EXPANSION with ELEVATED inflation, or SLOWDOWN without inverted curve | NEUTRAL |
+| `LATE_CYCLE` | LATE_CYCLE/SLOWDOWN regime, or yield curve INVERTED | BEARISH |
+| `CONTRACTION` | RECESSION regime | BEARISH |
+| `UNKNOWN` | Insufficient FRED data | NEUTRAL |
+
+**Sector leadership by phase (Fidelity-style historical model, score ∈ [−1, +1]):**
+
+| Sector | EARLY | MID | LATE | LATE_CYCLE | CONTRACTION |
+|---|---|---|---|---|---|
+| XLF Financials | +0.80 | +0.35 | 0.00 | −0.35 | −0.50 |
+| XLRE Real Estate | +0.70 | +0.10 | −0.30 | −0.45 | −0.70 |
+| XLY Consumer Disc. | +0.65 | +0.50 | −0.20 | −0.55 | −0.65 |
+| XLK Technology | +0.50 | +0.80 | −0.15 | −0.45 | −0.50 |
+| XLI Industrials | +0.30 | +0.65 | +0.45 | −0.20 | −0.55 |
+| XLE Energy | +0.10 | +0.20 | +0.80 | +0.25 | −0.30 |
+| XLB Materials | +0.20 | +0.25 | +0.65 | +0.10 | −0.45 |
+| XLV Healthcare | 0.00 | +0.05 | +0.30 | +0.80 | +0.65 |
+| XLP Consumer Staples | −0.20 | −0.25 | +0.10 | +0.70 | +0.75 |
+| XLU Utilities | −0.30 | −0.35 | +0.20 | +0.60 | +0.60 |
+
+**Convergence check:** after computing sector biases, the module compares cycle leaders (score ≥ 0.40) against real-time Ebb-and-Flow top inflows and laggards against outflows. Agreement is surfaced as "Confirming" in the prompt; disagreement is flagged as "Divergence."
+
+**Claude prompt overlay (instruction 27d):** cycle leaders get a +0.03 confidence boost; STRONG_LAGGARD sectors get a −0.03 haircut on POSITION-horizon BUY calls. Maximum conviction is applied when business-cycle, Ebb-and-Flow, and rate-cycle (rotation drivers) all point the same direction. Contradicting layers reduce conviction by 0.03.
+
+---
+
+### Step 3E — Price Momentum / Perceived Value (`src/signals/price_momentum.py`)
+
+When `ENABLE_PRICE_MOMENTUM=true`, computes a normalised multi-period price momentum score for each ticker. **Academic basis:** Jegadeesh & Titman (1993) showed that stocks outperforming over 3–12 months continue to outperform over the next 3–12 months — one of the most replicated factors in finance. The underlying mechanism is perceived value: as prices rise, investors perceive higher intrinsic value, attracting further capital and reinforcing the trend.
+
+**Score derivation:**
+
+```
+1. Compute 1m (21-bar) and 2m (42-bar) raw returns from OHLCV history.
+2. Normalise: z_1m = mom_1m / σ_1m  (trailing 252-bar std of 21-day returns)
+              z_2m = mom_2m / (σ_1m × √2)  (approximate 2m std from 1m σ)
+3. z_composite = 0.6 × z_1m + 0.4 × z_2m   (recent momentum weighted more)
+4. score = tanh(z_composite / 1.5) + vol_adj  (clamped to [-1, +1])
+```
+
+| z_composite | Raw tanh score | Interpretation |
+|---|---|---|
+| 0.0 | 0.00 | In line with own history |
+| +1.0 | +0.62 | 1σ above baseline — clear uptrend |
+| +2.0 | +0.90 | 2σ above — market is chasing this name |
+| −1.0 | −0.62 | Momentum selling territory |
+
+**Volume confirmation adjustment (±0.10 max):**
+
+| Condition | Adjustment | Interpretation |
+|---|---|---|
+| Uptrend (z > 0.5) + rising volume (ratio > 1.3×) | +0.10 | Institutional participation confirmed |
+| Downtrend (z < −0.5) + rising volume (ratio > 1.3×) | −0.10 | Distribution confirmed |
+| Any trend + thin volume (ratio < 0.6×) | −0.05 × sign(z) | "Thin air" move — less conviction |
+
+**Cache strategy:** Prefers the incremental OHLCV chart cache (`cache/ohlcv/<TICKER>.json`). Falls back to a live `yfinance` fetch (`get_history(ticker, period="18mo")`) on cold cache. Works with `ENABLE_FETCH_DATA=false` when chart caches are populated. Minimum 50 bars required.
+
+**Weight in aggregator:** 0.18 (base). Tracked in performance attribution under the **Technical** method category alongside RSI/MACD/BB.
+
+**Email section 5x — Price Momentum Leaderboard:** The top 5 most-chased tickers (highest positive score) and bottom 5 most-sold (lowest negative score) are shown as colour-coded bar charts with 1m/3m return annotations.
+
+**Why separate from VWAP:** VWAP distance measures **short-term mean-reversion** (where price is vs. 20-day average volume-weighted cost basis). Price Momentum measures **medium-term trend persistence** (whether the 1–2 month move is large relative to the ticker's own historical volatility). The two signals often conflict — when they do, the aggregator balances both.
+
+**`.env` flag:**
+```env
+ENABLE_PRICE_MOMENTUM=true
+```
+
+---
+
 ### Step 4a — Sector Pairs / Relative Value (`src/signals/sector_pairs.py`)
 
 After signal aggregation, `find_sector_pairs()` scans `_SECTOR_MAP` for divergences between sector ETFs and their constituent stocks. When the ETF and the stock disagree on direction, a market-neutral pair trade removes sector beta and isolates idiosyncratic alpha.
@@ -861,9 +1052,47 @@ After signal aggregation, `find_sector_pairs()` scans `_SECTOR_MAP` for divergen
 
 ---
 
+### Step 3F — Money Flow Indicators (`src/signals/money_flow.py`)
+
+When `ENABLE_MONEY_FLOW=true`, computes a composite accumulation/distribution score from three independent volume-based indicators.
+
+**Why money flow matters:** Price alone does not reveal conviction. When institutional investors accumulate positions, they do so at increasing volume — pushing typical price × volume (money flow) higher. Conversely, distribution occurs at declining price with elevated selling volume. Three indicators capture different facets of this dynamic:
+
+| Indicator | Period | Interpretation |
+|---|---|---|
+| MFI (Money Flow Index) | 14-period | Volume-weighted RSI. < 20 = accumulation zone (bullish); > 80 = distribution (bearish). Contrarian at extremes. |
+| CMF (Chaikin Money Flow) | 20-period | Close location × volume, summed. Positive = buyers in control; negative = sellers in control. Directional. |
+| OBV slope z-score | 21-bar regression | Cumulative volume trend normalised. Rising slope = sustained buying; falling = distribution. |
+
+**Score derivation:**
+
+```
+mfi_score  = tanh((50 − MFI) / 20)     # contrarian: low MFI → bullish
+cmf_score  = tanh(CMF / 0.15)           # directional: + = accumulation
+obv_score  = tanh(obv_z / 1.0)          # trend: rising OBV → bullish
+
+composite  = 0.40 × mfi_score + 0.40 × cmf_score + 0.20 × obv_score
+score      = tanh(composite / 0.6)  clamped to [−1, +1]
+```
+
+**Divergence signal:** When price rises but `MoneyFlow_score` falls (distribution), the move may be weak — a classic pump-without-conviction setup. When price falls but score is positive (accumulation), a reversal may be building.
+
+**Cache strategy:** Uses the OHLCV chart cache (`cache/ohlcv/<TICKER>.json`) first — works with `ENABLE_FETCH_DATA=false` when caches are populated. Falls back to `get_history(18mo)` on cold cache. Minimum 30 bars required.
+
+**Weight in aggregator:** 0.15 (base). Tracked in performance attribution under the **Technical** category.
+
+**Email section 5z — Money Flow Leaderboard:** Top 5 strongest accumulation tickers and bottom 5 strongest distribution tickers, with MFI and CMF annotations.
+
+**`.env` flag:**
+```env
+ENABLE_MONEY_FLOW=true
+```
+
+---
+
 ### Step 4 — Signal Aggregation (`src/signals/aggregator.py`)
 
-Combines up to eight signal methods with dynamically normalized weights:
+Combines up to ten signal methods with dynamically normalized weights:
 
 | Method | Base weight | Source |
 |---|---|---|
@@ -875,6 +1104,8 @@ Combines up to eight signal methods with dynamically normalized weights:
 | OI-weighted skew | 15% | GEX call/put OI directional lean |
 | VWAP distance | 12% | Price vs. rolling 20-day VWAP (mean-reversion) |
 | Pattern recognition | 18% | Historical win rate for current chart pattern |
+| Price momentum | 18% | 1m/2m normalised returns vs own 252-bar history |
+| Money flow | 15% | MFI + CMF + OBV slope composite accumulation/distribution |
 
 Weights are re-normalized at runtime based on which methods are enabled — they always sum to 100%.
 
@@ -959,7 +1190,7 @@ Each trade is assigned a `position_size_multiplier` based on the signal's confid
 
 **Method Attribution Analytics**
 
-Every *new* trade stores seven raw method scores at entry time:
+Every *new* trade stores ten raw method scores at entry time:
 
 | Field | Signal |
 |---|---|
@@ -970,13 +1201,45 @@ Every *new* trade stores seven raw method scores at entry time:
 | `max_pain` | Options max pain / GEX |
 | `oi_skew` | Open interest skew |
 | `vwap` | VWAP distance |
+| `pattern` | Chart pattern recognition |
+| `momentum` | Price Momentum (Perceived Value) |
+| `money_flow` | Money Flow (MFI + CMF + OBV) |
 
 Plus `methods_agreeing` (the subset with `|score| > 0.10` in the trade direction) and `dominant_method` (highest absolute score). After sufficient attributed trades accumulate, the email section **Signal Method Attribution** shows four analytics tables:
 
 1. **Individual Methods** — win rate, avg return, size-adjusted weighted avg return; sorted descending by win rate; color-coded green ≥55%, amber 45–55%, red <45%.
-2. **Method Categories** — rolls individual methods up into four groups: Sentiment (news), Technical (tech, vwap), Smart Money (insider), Options (put_call, max_pain, oi_skew).
-3. **Signal Convergence** — performance grouped by how many methods agreed (1 / 2 / 3 / 4+); validates whether the 1.25×/0.60× coherence multiplier in the aggregator is actually improving outcomes.
+2. **Method Categories** — rolls individual methods up into four groups: Sentiment (news), Technical (tech, vwap, pattern, momentum, money_flow), Smart Money (insider), Options (put_call, max_pain, oi_skew).
+3. **Signal Convergence** — performance grouped by how many methods agreed (1 / 2 / 3 / 4+); validates whether the coherence multiplier in the aggregator is actually improving outcomes.
 4. **Lead Signal** — which single method had the highest score in the trade direction; shows which signal type tends to lead profitable setups.
+
+**Solo Method Performance (email section 4b)**
+
+A separate simulated backtest answers: *"what would the return have been if you had only followed this one signal?"*
+
+`compute_solo_method_performance()` iterates every closed trade with stored method_scores and, for each signal method, checks:
+
+- `|score| < 0.10` → method has no view → trade not taken → skipped
+- `score > 0` → solo signal is BUY; `score < 0` → solo signal is SELL
+- Same direction as actual trade → hypothetical return = `return_pct`
+- Opposite direction → hypothetical return = `-return_pct`
+
+The result is a per-method table (email section 4b) showing trades, win rate, compound return, avg return, best, and worst for the solo-signal scenario. This differs from the attribution breakdown (which counts only trades where the method agreed with the aggregated direction) by also accounting for trades the method would have gone against — giving a true standalone predictive-power picture.
+
+**Method Evaluation (email section 4c)**
+
+`compute_method_eval_stats()` answers two distinct questions beyond section 4b's P&L simulation:
+1. **Directional accuracy** — what fraction of the time did this method's direction lead to a profitable hypothetical outcome?
+2. **Conviction calibration** — does higher |score| predict better accuracy?
+
+For each method the function produces `directional_accuracy`, `avg_return_correct`, `avg_return_wrong`, and `conviction_bands`:
+
+| Band | |score| range | Interpretation |
+|---|---|---|---|
+| Low | 0.10 – 0.35 | Weak signal |
+| Medium | 0.35 – 0.65 | Moderate conviction |
+| High | 0.65+ | Strong conviction |
+
+A well-calibrated signal shows rising accuracy Low→Medium→High. Flat or declining accuracy across bands indicates the method adds directional noise in isolation. Section 4c renders as per-method cards with overall stats and a compact conviction-band table.
 
 Legacy trades (recorded before this feature) have no `methods_agreeing` field and are excluded from attribution stats. The email section shows a graceful "no attribution data yet" placeholder until enough attributed trades close.
 
@@ -1038,6 +1301,11 @@ To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env
 | Earnings Whisper | `YYYY-MM-DD` | 1 day | `cache/whisper_*.json` |
 | OHLCV (charts) | per ticker | incremental | `cache/ohlcv/*.json` |
 | COT positioning | ISO week | 1 week | `cache/cot_YYYY_WW.json` |
+| Sector rotation | `YYYY-MM-DD` | 1 day | `cache/sector_rotation_*.json` |
+| Rotation Drivers | `YYYY-MM-DD` | 1 day | `cache/rotation_drivers_*.json` |
+| Business Cycle Rotation | — | none (instant synthesis) | no cache |
+| Price Momentum | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
+| Money Flow | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
 | Trades ledger | — | permanent | `cache/trades.json` |
 
 ---
@@ -1120,6 +1388,9 @@ ENABLE_TICK=true
 ENABLE_VWAP=true
 ENABLE_GOOGLE_TRENDS=true
 ENABLE_REDDIT_SENTIMENT=true
+ENABLE_SECTOR_ROTATION=true
+ENABLE_ROTATION_DRIVERS=true
+ENABLE_BUSINESS_CYCLE_ROTATION=true
 
 # Reddit (required for reddit sentiment)
 REDDIT_CLIENT_ID=your_id
@@ -1190,6 +1461,9 @@ llm_trader/
     │   ├── earnings_whisper.py       # Implied whisper vs consensus
     │   ├── gamma_exposure.py         # GEX: dealer gamma positioning
     │   ├── tick.py                   # NYSE TICK index breadth exhaustion
+    │   ├── sector_rotation.py        # "Ebb and Flow" per-sector money flow
+    │   ├── rotation_drivers.py       # Rate-cycle phase: DFF+CPI → EASING_CYCLE|PIVOT_IMMINENT…
+    │   ├── business_cycle_rotation.py # Fidelity-style economic phase → sector leadership biases
     │   └── cache.py                  # Hourly cache + incremental OHLCV
     ├── analysis/
     │   ├── sentiment.py              # DeepSeek V3 / Haiku sentiment scoring

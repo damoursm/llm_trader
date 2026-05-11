@@ -41,8 +41,11 @@ from src.data.seasonality import compute_seasonality_context
 from src.data.bond_internals import fetch_bond_internals_context
 from src.data.move import fetch_move_context
 from src.data.global_macro import fetch_global_macro_context
+from src.data.sector_rotation import fetch_sector_rotation_context
+from src.data.rotation_drivers import fetch_rotation_drivers_context
 from src.data.macro_regime import compute_macro_regime
 from src.data.market_mode import compute_market_mode
+from src.data.business_cycle_rotation import compute_business_cycle_context
 from src.data.catalyst_timing import compute_catalyst_context, apply_watch_elevation
 from src.data.cluster_watchlist import (
     load_cluster_watchlist, save_cluster_watchlist,
@@ -289,6 +292,12 @@ def run_pipeline(send_email: bool = False) -> None:
         f_global_macro   = (pool.submit(_safe, "global_macro", fetch_global_macro_context)
                             if settings.enable_global_macro else None)
 
+        f_sector_rotation = (pool.submit(_safe, "sector_rotation", fetch_sector_rotation_context)
+                             if settings.enable_sector_rotation else None)
+
+        f_rotation_drivers = (pool.submit(_safe, "rotation_drivers", fetch_rotation_drivers_context)
+                              if settings.enable_rotation_drivers else None)
+
         # Group B: yfinance options — options_flow then GEX, sequential in one thread
         # Both modules scan yfinance options chains; running them concurrently causes
         # 429 rate-limit errors on every ticker. One thread keeps the combined rate safe.
@@ -367,6 +376,8 @@ def run_pipeline(send_email: bool = False) -> None:
     bond_internals_context    = get(f_bond_internals)
     move_context              = get(f_move)
     global_macro_context      = get(f_global_macro)
+    sector_rotation_context   = get(f_sector_rotation)
+    rotation_drivers_context  = get(f_rotation_drivers)
     gex_context               = yf_options.get("gex")
     earnings_context = get(f_earnings_cal)
 
@@ -388,6 +399,14 @@ def run_pipeline(send_email: bool = False) -> None:
             breadth_context=breadth_context,
             highs_lows_context=highs_lows_context,
             mcclellan_context=mcclellan_context,
+        )
+
+    # ── Business Cycle Rotation ───────────────────────────────────────────
+    business_cycle_context = None
+    if settings.enable_business_cycle_rotation:
+        business_cycle_context = compute_business_cycle_context(
+            macro_context=macro_context,
+            sector_rotation_context=sector_rotation_context,
         )
 
     # ── Macro Regime Filter ───────────────────────────────────────────────
@@ -452,6 +471,9 @@ def run_pipeline(send_email: bool = False) -> None:
         bond_internals_context=bond_internals_context,
         move_context=move_context,
         global_macro_context=global_macro_context,
+        sector_rotation_context=sector_rotation_context,
+        rotation_drivers_context=rotation_drivers_context,
+        business_cycle_context=business_cycle_context,
     )
 
     # Keep only the top 10 recommendations by conviction:
@@ -586,6 +608,9 @@ def run_pipeline(send_email: bool = False) -> None:
             catalyst_timing_context=catalyst_timing_context,
             cluster_watchlist_context=cluster_watchlist_context,
             sector_pairs_context=sector_pairs_context,
+            sector_rotation_context=sector_rotation_context,
+            rotation_drivers_context=rotation_drivers_context,
+            business_cycle_context=business_cycle_context,
         )
     else:
         logger.info("Email not configured — skipping.")

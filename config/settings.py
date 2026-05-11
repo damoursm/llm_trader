@@ -207,6 +207,37 @@ class Settings(BaseSettings):
     #   RISK_ON   → threshold 0.72
     enable_macro_regime_filter: bool = True
 
+    # Sector Rotation / "Ebb and Flow" — cross-sector money flow via relative momentum + volume
+    # Ranks all 11 SPDR sector ETFs by excess return vs SPY (1w/1m/3m) adjusted for volume.
+    # Identifies top inflow/outflow sectors, rotation regime (RISK_ON/NEUTRAL/RISK_OFF),
+    # and explicit rotation pairs (e.g., "XLK → XLP"). Cached daily, yfinance/Polygon OHLCV.
+    enable_sector_rotation: bool = True
+
+    # Rotation Drivers — rate-cycle phase from actual DFF trajectory (3m/12m) + CPI trend.
+    # Maps Fed hiking/pausing/cutting cycles to cross-asset rotation implications:
+    # favoured/avoided asset classes per phase (EARLY_TIGHTENING → EASING_CYCLE).
+    # Requires FRED_API_KEY. Cached daily.
+    enable_rotation_drivers: bool = True
+
+    # Price Momentum (Perceived Value) — multi-period price trend normalised against own history.
+    # Captures the self-reinforcing dynamic: rising perceived value attracts more capital →
+    # trend continues. Scores 1m and 3m returns vs trailing 252-day return distribution.
+    # Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
+    enable_price_momentum: bool = True
+
+    # Money Flow Indicators — accumulation/distribution composite (MFI + CMF + OBV slope).
+    # MFI (14-period): volume-weighted RSI; < 20 = accumulation, > 80 = distribution.
+    # CMF (20-period): Chaikin Money Flow; positive = institutional buying.
+    # OBV slope z-score: sustained volume trend direction.
+    # Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
+    enable_money_flow: bool = True
+
+    # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
+    # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the
+    # already-fetched FRED macro context (regime, yield curve, inflation, unemployment).
+    # Pure synthesis module: no new API calls, no cache, instant computation.
+    enable_business_cycle_rotation: bool = True
+
     # Catalyst Timing — three event-driven guards and amplifiers:
     #   1. Earnings Blackout: block BUY/SELL for tickers within 2 days of earnings (IV crush/gap risk)
     #   2. OpEx Max-Pain Amplifier: boost max_pain weight during OpEx week (0.20) / Triple Witching (0.28)

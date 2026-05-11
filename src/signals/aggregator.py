@@ -49,6 +49,8 @@ from src.data.insider_trades import build_insider_summary
 from src.analysis.technical import TechnicalResult, EMPTY_RESULT, compute_technical_score
 from src.signals.vwap import compute_vwap_score
 from src.signals.pattern_recognition import compute_pattern_score
+from src.signals.price_momentum import compute_price_momentum_score
+from src.signals.money_flow import compute_money_flow_score
 
 
 # ── Smart-money signal direction + strength ──────────────────────────────────
@@ -74,7 +76,9 @@ _BASE_WEIGHTS = {
     "max_pain":  0.12,   # options-expiry gravity; weight fades automatically via expiry_factor
     "oi_skew":   0.15,   # OI-weighted call/put directional positioning
     "vwap":      0.12,   # mean-reversion: price vs rolling 20-day VWAP
-    "pattern":   0.18,   # chart pattern recognition: historical win-rate based score
+    "pattern":    0.18,   # chart pattern recognition: historical win-rate based score
+    "momentum":   0.18,   # perceived value: normalised 1m/3m price trend vs own history
+    "money_flow": 0.15,   # accumulation/distribution: MFI + CMF + OBV slope composite
 }
 
 # Put/call contrarian score mapping
@@ -506,6 +510,10 @@ def build_signals(
     use_vwap      = settings.enable_vwap
     # Pattern recognition uses OHLCV chart cache first; fetches 2y history only on cold cache.
     use_pattern   = settings.enable_pattern_recognition
+    # Price momentum uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
+    use_momentum   = settings.enable_price_momentum
+    # Money flow uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
+    use_money_flow = settings.enable_money_flow
 
     if not use_news and not use_tech and not use_insider and not use_put_call:
         logger.warning("All analysis methods disabled — no signals will be generated.")
@@ -531,14 +539,16 @@ def build_signals(
         )
 
     active_flags = {
-        "news":      use_news,
-        "tech":      use_tech,
-        "insider":   use_insider,
-        "put_call":  use_put_call,
-        "max_pain":  use_max_pain,
-        "oi_skew":   use_oi_skew,
-        "vwap":      use_vwap,
-        "pattern":   use_pattern,
+        "news":       use_news,
+        "tech":       use_tech,
+        "insider":    use_insider,
+        "put_call":   use_put_call,
+        "max_pain":   use_max_pain,
+        "oi_skew":    use_oi_skew,
+        "vwap":       use_vwap,
+        "pattern":    use_pattern,
+        "momentum":   use_momentum,
+        "money_flow": use_money_flow,
     }
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     active_count = sum(active_flags.values())
@@ -549,7 +559,8 @@ def build_signals(
         f"news={weights['news']:.0%}  tech={weights['tech']:.0%}  "
         f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
-        f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}"
+        f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
+        f"momentum={weights['momentum']:.0%}  money_flow={weights['money_flow']:.0%}"
     )
 
     signals        = []
@@ -617,16 +628,39 @@ def build_signals(
         if use_pattern:
             pattern_score, pattern_name = compute_pattern_score(ticker)
 
+        # ── Method 9: Price Momentum (Perceived Value) ────────────────────
+        # Captures the self-reinforcing dynamic where perceived value creates
+        # trends: rising prices attract more capital, confirming the trend.
+        # Score normalised against the ticker's own return distribution so it
+        # adapts to each security's volatility regime.
+        momentum_score   = 0.0
+        momentum_1m_pct  = 0.0
+        momentum_3m_pct  = 0.0
+        if use_momentum:
+            momentum_score, momentum_1m_pct, momentum_3m_pct = compute_price_momentum_score(ticker)
+
+        # ── Method 10: Money Flow Indicators ─────────────────────────────
+        # Composite of MFI (14-period volume-weighted RSI), CMF (20-period
+        # Chaikin Money Flow), and OBV slope z-score.
+        # Positive = institutional accumulation; negative = distribution.
+        money_flow_score = 0.0
+        mfi_value        = 50.0
+        cmf_value        = 0.0
+        if use_money_flow:
+            money_flow_score, mfi_value, cmf_value = compute_money_flow_score(ticker)
+
         # ── Weighted combination ──────────────────────────────────────────
         combined = (
-            weights["news"]      * sentiment_score +
-            weights["tech"]      * technical_score +
-            weights["insider"]   * insider_sc +
-            weights["put_call"]  * pc_score +
-            weights["max_pain"]  * mp_score +
-            weights["oi_skew"]   * oi_skew_score +
-            weights["vwap"]      * vwap_score +
-            weights["pattern"]   * pattern_score
+            weights["news"]       * sentiment_score +
+            weights["tech"]       * technical_score +
+            weights["insider"]    * insider_sc +
+            weights["put_call"]   * pc_score +
+            weights["max_pain"]   * mp_score +
+            weights["oi_skew"]    * oi_skew_score +
+            weights["vwap"]       * vwap_score +
+            weights["pattern"]    * pattern_score +
+            weights["momentum"]   * momentum_score +
+            weights["money_flow"] * money_flow_score
         )
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -649,14 +683,16 @@ def build_signals(
 
         # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
         method_scores = [
-            (use_news,      sentiment_score),
-            (use_tech,      technical_score),
-            (use_insider,   insider_sc),
-            (use_put_call,  pc_score),
-            (use_max_pain,  mp_score),
-            (use_oi_skew,   oi_skew_score),
-            (use_vwap,      vwap_score),
-            (use_pattern,   pattern_score),
+            (use_news,       sentiment_score),
+            (use_tech,       technical_score),
+            (use_insider,    insider_sc),
+            (use_put_call,   pc_score),
+            (use_max_pain,   mp_score),
+            (use_oi_skew,    oi_skew_score),
+            (use_vwap,       vwap_score),
+            (use_pattern,    pattern_score),
+            (use_momentum,   momentum_score),
+            (use_money_flow, money_flow_score),
         ]
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
 
@@ -715,18 +751,26 @@ def build_signals(
             insider_cluster_size=cluster_size,
             pattern_score=round(pattern_score, 3),
             pattern_name=pattern_name,
+            momentum_score=round(momentum_score, 3),
+            momentum_1m_pct=round(momentum_1m_pct, 2),
+            momentum_3m_pct=round(momentum_3m_pct, 2),
+            money_flow_score=round(money_flow_score, 3),
+            mfi_value=round(mfi_value, 2),
+            cmf_value=round(cmf_value, 4),
         ))
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
         mp_str      = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
         skew_str    = f"  skew={oi_skew_score:+.2f}" if oi_skew_score != 0.0 else ""
         vwap_str    = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
-        pat_str     = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
+        pat_str  = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
+        mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
+        mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
         cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

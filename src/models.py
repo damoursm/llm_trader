@@ -693,6 +693,91 @@ class SectorPairsContext(BaseModel):
     summary: str
 
 
+class SectorRotationEntry(BaseModel):
+    """Per-sector money-flow signal derived from relative price momentum and volume."""
+    etf: str                             # e.g. "XLK"
+    name: str                            # e.g. "Technology"
+    return_5d:    Optional[float] = None # absolute 5-day return %
+    return_21d:   Optional[float] = None # absolute 21-day return %
+    return_63d:   Optional[float] = None # absolute 63-day return %
+    relative_5d:  Optional[float] = None # excess return vs SPY, 5d (%)
+    relative_21d: Optional[float] = None # excess return vs SPY, 21d (%)
+    relative_63d: Optional[float] = None # excess return vs SPY, 63d (%)
+    volume_ratio: Optional[float] = None # 5d avg vol / 20d avg vol (>1.15 = elevated)
+    rotation_score: float = 0.0          # composite flow score ∈ [-1, +1]
+    flow_signal: str = "NEUTRAL"         # STRONG_INFLOW|INFLOW|NEUTRAL|OUTFLOW|STRONG_OUTFLOW
+    direction: str = "NEUTRAL"           # BULLISH | NEUTRAL | BEARISH
+
+
+class SectorRotationContext(BaseModel):
+    """Cross-sector money flow rotation — 'Ebb and Flow' mechanism."""
+    sectors: List[SectorRotationEntry]   # all 11 SPDR sectors, sorted by score desc
+    top_inflow:  List[str]               # top ETF tickers attracting capital
+    top_outflow: List[str]               # top ETF tickers losing capital
+    rotation_regime: str                 # RISK_ON | NEUTRAL | RISK_OFF
+    rotation_direction: str              # BULLISH | NEUTRAL | BEARISH
+    cyclical_avg: float = 0.0            # avg score across cyclical sectors
+    defensive_avg: float = 0.0          # avg score across defensive sectors
+    cyc_def_spread: float = 0.0          # cyclical_avg − defensive_avg
+    rotation_pairs: List[str]            # e.g. ["XLK → XLP (growth → defensive)"]
+    report_date: date
+    summary: str
+
+
+class RotationDriversContext(BaseModel):
+    """Federal Reserve rate-cycle phase — cross-asset rotation signal."""
+    report_date: date
+
+    # Fed Funds Rate trajectory (from FRED DFF, daily)
+    fed_rate_current:  Optional[float] = None   # most recent DFF %
+    fed_rate_3m_ago:   Optional[float] = None   # ~63 trading days ago
+    fed_rate_6m_ago:   Optional[float] = None   # ~126 trading days ago
+    fed_rate_12m_ago:  Optional[float] = None   # ~252 trading days ago
+    rate_change_3m_bp: Optional[float] = None   # change in basis points, 3m
+    rate_change_12m_bp: Optional[float] = None  # change in basis points, 12m
+    rate_trajectory: str = "UNKNOWN"            # ACTIVE_HIKING | PAUSING | ACTIVE_CUTTING | EASING_PAUSE | STABLE
+
+    # CPI inflation trend (from FRED CPIAUCSL, monthly)
+    cpi_yoy_current: Optional[float] = None     # most recent CPI YoY %
+    cpi_yoy_6m_ago:  Optional[float] = None     # CPI YoY 6 months ago
+    inflation_trend: str = "UNKNOWN"            # ACCELERATING | RISING | ELEVATED_STABLE | STABLE | MODERATING | DECLINING | LOW_STABLE
+
+    # Real rate (Fed Funds − CPI YoY)
+    real_rate: Optional[float] = None           # %
+    real_rate_regime: str = "UNKNOWN"           # HIGHLY_RESTRICTIVE | RESTRICTIVE | NEUTRAL | ACCOMMODATIVE
+
+    # Cycle phase synthesis
+    cycle_phase: str = "NEUTRAL"                # EARLY_TIGHTENING | PEAK_TIGHTENING | TIGHTENING_PAUSE | PIVOT_IMMINENT | EASING_CYCLE | NEUTRAL
+    cycle_direction: str = "NEUTRAL"            # BULLISH | BEARISH | NEUTRAL (for equities)
+
+    # Asset rotation
+    favoured_assets: List[str] = []             # e.g. ["TLT", "XLRE", "XLU"]
+    avoid_assets: List[str] = []                # e.g. ["XLK", "QQQ"]
+
+    summary: str = ""
+
+
+class SectorCycleBias(BaseModel):
+    """Per-sector expected leadership for the current business cycle phase."""
+    etf: str                      # e.g. "XLK"
+    name: str                     # e.g. "Technology"
+    cycle_score: float = 0.0      # ∈ [-1, +1]; +1 = strongest historical outperformance in this phase
+    cycle_signal: str = "NEUTRAL" # STRONG_LEADER|LEADER|NEUTRAL|LAGGARD|STRONG_LAGGARD
+
+
+class BusinessCycleContext(BaseModel):
+    """Business cycle phase → sector rotation biases (Fidelity-style historical model)."""
+    cycle_phase: str = "UNKNOWN"        # EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION|UNKNOWN
+    cycle_direction: str = "NEUTRAL"    # BULLISH|NEUTRAL|BEARISH for broad risk assets
+    evidence: str = ""                  # how the phase was derived from FRED inputs
+    sector_biases: List[SectorCycleBias] = []
+    top_cycle_leaders: List[str] = []   # ETF tickers with score > 0.4
+    weak_cycle_sectors: List[str] = []  # ETF tickers with score < -0.4
+    convergence_notes: str = ""         # agreement/disagreement with Ebb-and-Flow real-time flows
+    report_date: date
+    summary: str = ""
+
+
 class ClusterWatchEntry(BaseModel):
     """A single ticker under active insider-cluster surveillance (within 10-day window)."""
     ticker: str
@@ -773,6 +858,14 @@ class TickerSignal(BaseModel):
     # Pattern recognition fields — populated when enable_pattern_recognition=true
     pattern_score: float = 0.0   # [-1, +1] historical win-rate based pattern signal
     pattern_name: str = ""        # detected pattern (e.g. "double_bottom", "head_shoulders")
+    # Price momentum fields — populated when enable_price_momentum=true
+    momentum_score: float = 0.0  # [-1, +1] Perceived Value: normalised multi-period price trend
+    momentum_1m_pct: float = 0.0 # raw 1-month return %
+    momentum_3m_pct: float = 0.0 # raw 3-month return %
+    # Money flow fields — populated when enable_money_flow=true
+    money_flow_score: float = 0.0  # [-1, +1] accumulation/distribution composite (MFI+CMF+OBV)
+    mfi_value: float = 50.0        # raw MFI reading 0–100 (< 20 = accumulation, > 80 = distribution)
+    cmf_value: float = 0.0         # raw CMF reading [-1, +1] (positive = accumulation)
 
 
 class Recommendation(BaseModel):
