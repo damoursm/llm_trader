@@ -64,8 +64,8 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 3F. Money Flow Indicators — money_flow.py → compute_money_flow_score(): three complementary volume-based indicators combined into a single accumulation/distribution score; MFI 14-period (volume-weighted RSI: <20=accumulation zone, >80=distribution zone; contrarian score = tanh((50−MFI)/20)); CMF 20-period (Chaikin Money Flow: positive=buyers in control, negative=sellers; score = tanh(CMF/0.15)); OBV 21-bar linear-regression slope z-score (rising=sustained buying, score = tanh(obv_z)); composite = 0.40×mfi_score + 0.40×cmf_score + 0.20×obv_score, final = tanh(composite/0.6) clamped to [-1,+1]; weight 0.15 in aggregator; OHLCV cache-first (works with ENABLE_FETCH_DATA=false); falls back to get_history(18mo); minimum 30 bars; tracked in performance attribution under "Technical" category; email section 5z: Money Flow Leaderboard (top 5 accumulation / bottom 5 distribution); ENABLE_MONEY_FLOW=true
 4a. Sector Pairs         — sector_pairs.py → find_sector_pairs(): scans _SECTOR_MAP for stocks and their sector ETF having opposing non-NEUTRAL directions (both ≥35% confidence); forms market-neutral LONG/SHORT pair trades that isolate idiosyncratic alpha from sector beta; ETF_BULL_STOCK_BEAR or ETF_BEAR_STOCK_BULL setups; reported in email but not tracked in trades.json (pair-trade accounting differs from single-leg); no cache (instant)
 4. Signal aggregation    — aggregator.py → per-ticker combined score
-5. Recommendations       — claude_analyst.py → Claude generates BUY/SELL/HOLD/WATCH
-6. Performance tracking  — tracker.py → paper trades in cache/trades.json; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; weighted avg return reported alongside equal-weight avg; method attribution: at entry each trade stores the 10 raw method scores + methods_agreeing list + dominant_method; get_performance_for_email() returns performance_table (unified breakdown rows), trades_svg (inline SVG equity curve + per-trade bars), attributed_count, and solo_method_perf (hypothetical per-method standalone simulation)
+5. Recommendations       — claude_analyst.py → Claude generates BUY/SELL/HOLD/WATCH; DeepSeek V3 (`deepseek-chat`) auto-fallback on any Claude API failure (credits exhausted, 401/402/403/429/5xx, connection error); then rule-based _fallback_recommendations() as last resort
+6. Performance tracking  — tracker.py → paper trades in cache/trades.json; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; fmt_price() formats prices with 2/4/6 decimal places depending on magnitude (handles sub-penny stocks/warrants); _dynamic_half_spread() replaces fixed SPREAD_PCT with price-tiered, asset-type-aware bid-ask model (ETF=1bp, large-cap stock=2bp, penny=$0.01–$0.10→37.5bp, sub-penny→250bp); compute_portfolio_metrics() returns dollar-weighted portfolio return (compound_inception, return_1w, return_2w, return_1m) where each trade is funded by its position_size_multiplier; weighted avg return reported alongside equal-weight avg; method attribution: at entry each trade stores the 10 raw method scores + methods_agreeing list + dominant_method; get_performance_for_email() returns performance_table (unified breakdown rows), trades_svg (inline SVG equity curve + per-trade bars), portfolio_metrics (dollar-weighted time-window returns), method_order_by_winrate (methods ranked by solo win rate for sorted display), attributed_count, and solo_method_perf (hypothetical per-method standalone simulation)
 7. Charts + email        — charts/, email_sender.py
 ```
 
@@ -83,8 +83,10 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 **Smart money signals** (insider trades, options flow, SEC filings) all return `List[InsiderTrade]` and are combined into a single `insider_score` per ticker in the aggregator.
 
 **Method attribution** (`tracker.py`): every new trade stores the 10 raw method scores (`news`, `tech`, `insider`, `put_call`, `max_pain`, `oi_skew`, `vwap`, `pattern`, `momentum`, `money_flow`) at entry time plus `methods_agreeing` and `dominant_method`. `get_performance_for_email()` returns:
-- `performance_table`: unified list of breakdown rows (columns: trades, win_rate, compound_return, avg_return, wtd_avg_return, best, worst) grouped as: **total** (All Trades) → **asset** (Stocks only / ETFs only / Commodities only) → **direction** (Longs only BUY / Shorts only SELL) → **method** (per signal method, ≥2 attributed trades required). Rows are rendered in the email "Performance Breakdown" section with visual dividers between groups.
+- `performance_table`: unified list of breakdown rows (columns: trades, win_rate, compound_return, avg_return, wtd_avg_return, best, worst) grouped as: **total** (All Trades) → **asset** (Stocks only / ETFs only / Commodities only) → **direction** (Longs only BUY / Shorts only SELL) → **method** (per signal method, ≥2 attributed trades required). Rows are rendered in the email "Performance Breakdown" section with visual dividers between groups. **Includes open trades at their current M2M `return_pct`** (maintained each run by `update_open_trades()`) — treated as hypothetical exits so every live position is reflected in the breakdown.
 - `trades_svg`: inline SVG (820×336px dark-theme) with equity curve (top panel) and per-trade return bars (bottom panel). Embedded directly in the email via `{{ perf.trades_svg | safe }}` — no kaleido/Plotly dependency.
+- `portfolio_metrics`: dict from `compute_portfolio_metrics()` — sequential compound portfolio return using a daily-batch model: trades opened on the same calendar day form a session batch whose dollar-weighted return (weighted by `position_size_multiplier`) is compounded in chronological order with all prior batches. 10 sessions of +5% → ~+62.9%, not +5%. Keys: `compound_inception` (all-time sequential compound), `return_1w`, `return_2w`, `return_1m` (sequential compound of batches entered within last 7/14/30 days; open trades included at M2M P&L). Replaces the naive parallel-average in `stats["compound_return"]`. Displayed in the email Portfolio Performance card as time-window tiles.
+- `method_order_by_winrate`: list of method keys sorted descending by solo win rate (no-data methods last). Used to order the solo performance and method eval tables in the email — best-performing signals appear first.
 - `attributed_count`: count of trades with `methods_agreeing` populated (used to decide whether method rows appear).
 - `solo_method_perf`: dict from `compute_solo_method_performance()` — for each closed trade with stored method_scores, asks "what direction would this method alone have signalled?" Same direction as actual → actual return; opposite → negated return; |score| < 0.10 (no view) → skipped. Rendered in email section 4b as a standalone table (trades, win_rate, compound_return, avg_return, best, worst per method). Distinct from `performance_table` method rows which only count trades where the method agreed with the aggregated direction.
 - `method_eval_stats`: dict from `compute_method_eval_stats()` — per-method directional accuracy and conviction calibration. For each method: overall directional_accuracy (% correct directions), avg_return_correct, avg_return_wrong, and conviction_bands (Low 0.10–0.35 / Medium 0.35–0.65 / High 0.65+) each with trades, accuracy, avg_return. Rendered in email section 4c as per-method cards. A well-calibrated signal shows rising accuracy Low→High; flat/declining accuracy suggests the method adds noise rather than genuine directional insight.
@@ -92,10 +94,10 @@ Legacy trades without `methods_agreeing` are excluded from method rows but inclu
 
 ### Model routing
 
-| Task | Model |
-|---|---|
-| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`), Haiku 4.5 fallback |
-| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) |
+| Task | Model | Fallback |
+|---|---|---|
+| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku 4.5 |
+| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V3 (`deepseek-chat`) on any Claude API error, then rule-based `_fallback_recommendations()` |
 
 Available analyst models (set in `.env`):
 - `claude-haiku-4-5-20251001` — fastest, cheapest; 8 192 output tokens
@@ -103,6 +105,8 @@ Available analyst models (set in `.env`):
 - `claude-opus-4-7` — highest quality; 32 000 output tokens
 
 **Claude API calls use streaming** (`client.messages.stream`) to avoid SDK timeout errors on large prompts (40+ tickers can take >10 minutes non-streaming). Text chunks are accumulated into a single string before JSON parsing.
+
+**DeepSeek analyst fallback** (`_call_deepseek_analyst()` in `claude_analyst.py`): triggered automatically when Claude raises `anthropic.APIStatusError` (HTTP 400/401/402/403/429/5xx — covers credits exhausted, bad key, payment required, rate limit, server errors) or `anthropic.APIConnectionError`. Uses `deepseek-reasoner` (DeepSeek R1) with the identical prompt via the OpenAI-compatible streaming API. Requires `DEEPSEEK_API_KEY`. If DeepSeek also fails, falls back to rule-based `_fallback_recommendations()`. The source model name is logged at INFO level (`via <model>`).
 
 ### Caching strategy
 
@@ -171,9 +175,9 @@ The HTML is a Jinja2 template string (`HTML_TEMPLATE`) embedded directly in `ema
 
 **Email sections (current order):**
 1. Aggregated Recommendations (BUY/SELL)
-2. Portfolio Performance (stats + inline SVG equity curve)
-3. Performance Breakdown (unified table: total/asset/direction/method rows)
-4. Trade Details (BUY/SELL only)
+2. Portfolio Performance (stats + time-window tiles: 1w/2w/1m dollar-weighted returns + since-inception compound + inline SVG equity curve)
+3. Performance Breakdown (unified table: total/asset/direction/method rows; methods ordered by solo win rate descending)
+4. Trade Details (BUY/SELL only; prices formatted via `fmt_price()` for sub-penny precision)
 5. Monitor List (HOLD/WATCH)
 6. Analyst Ratings, EPS Surprises, Macro Regime Filter, Market Mode, Catalyst Timing, FRED, COT, VIX, McClellan, Highs/Lows, Breadth, Macro Surprise, FedWatch, Credit, MOVE, Bond Internals, Global Macro, Seasonality, OpEx, Put/Call, Short Interest, GEX, Revision Momentum, Earnings Whisper, IPO Pipeline, Reddit, Sector Pairs, Smart Money Signals
 

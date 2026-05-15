@@ -19,9 +19,6 @@ from config import settings
 
 TRADES_FILE = Path("cache/trades.json")
 HOLDING_DAYS = 5   # auto-close after this many trading days (Mon–Fri, weekends excluded)
-SPREAD_PCT   = 0.10  # round-trip bid-ask spread in % (5 bps each way)
-               # Applied as a penalty: half at entry (you buy at the ask / short at the bid),
-               # half at exit (you sell at the bid / cover at the ask).
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 # Confidence-scaled Kelly-inspired tiers: allocate more capital to higher conviction.
@@ -68,6 +65,16 @@ def _fetch_price(ticker: str) -> Optional[float]:
         return None
 
 
+def _now_iso() -> str:
+    """Return the current wall-clock instant as a UTC ISO 8601 string.
+
+    Stored on every entry/exit so the price used for the trade is anchored to
+    the exact moment it was fetched — no ambiguity about whether the value
+    is the prior close, a pre-market print, or an intraday mark.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def _trading_days_held(entry_date: str) -> int:
     """Count weekdays (Mon–Fri) between entry_date (exclusive) and today (inclusive)."""
     try:
@@ -84,24 +91,75 @@ def _trading_days_held(entry_date: str) -> int:
         return 0
 
 
-def _pct_return(action: str, entry: float, current: float) -> float:
+def fmt_price(p) -> str:
+    """Format a price with enough decimal places to show meaningful digits.
+
+    Handles sub-penny stocks/warrants (e.g. 0.003 → '$0.0030') without
+    rounding to '$0.00'.
+    """
+    if p is None:
+        return "N/A"
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return str(p)
+    if p >= 1.0:
+        return f"{p:.2f}"
+    if p >= 0.01:
+        return f"{p:.4f}"
+    return f"{p:.6f}"
+
+
+def _dynamic_half_spread(price: float, asset_type: str = "STOCK") -> float:
+    """One-way bid-ask half-spread as a fraction (not %).
+
+    Realistic tiers (conservative-but-not-pessimistic estimates):
+      ETF       → 1 bp  (sector SPDR ETFs, highly liquid)
+      COMMODITY → price ≥ $100: 1.5 bp (GLD/GDX); else 3 bp (SLV/CPER)
+      STOCK     → price-tiered:
+                   ≥ $50        →   2 bp   (large-cap, tight market)
+                   $10–$50      →   4 bp   (mid-cap)
+                   $1–$10       →  12.5 bp (small-cap / penny approach)
+                   $0.10–$1     →  37.5 bp (micro-cap)
+                   $0.01–$0.10  → 100 bp   (penny stock)
+                   < $0.01      → 250 bp   (sub-penny / warrant)
+    1 bp = 0.0001 fractional.
+    """
+    if asset_type == "ETF":
+        return 0.0001
+    if asset_type == "COMMODITY":
+        return 0.00015 if price >= 100 else 0.0003
+    # STOCK — price-tiered
+    if price >= 50:
+        return 0.0002
+    if price >= 10:
+        return 0.0004
+    if price >= 1:
+        return 0.00125
+    if price >= 0.10:
+        return 0.00375
+    if price >= 0.01:
+        return 0.0100
+    return 0.0250
+
+
+def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK") -> float:
     """Positive = profitable regardless of direction.
 
-    Applies a round-trip bid-ask spread penalty (SPREAD_PCT).
-    BUY:  you paid the ask at entry  (+half spread),
-          you receive the bid at exit (-half spread).
-    SELL: you shorted at the bid at entry  (-half spread),
-          you covered at the ask at exit   (+half spread).
-    Net effect is identical for both directions: raw return minus SPREAD_PCT.
+    Applies a realistic dynamic bid-ask spread based on asset type and price tier.
+    Entry and exit spreads are computed separately from their respective prices.
+    BUY:  paid the ask at entry (+half), receive bid at exit (-half).
+    SELL: shorted at the bid at entry (-half), covered at the ask at exit (+half).
     """
-    half = SPREAD_PCT / 2 / 100          # fractional half-spread
+    entry_half = _dynamic_half_spread(entry, asset_type)
+    exit_half  = _dynamic_half_spread(current, asset_type)
     if action == "BUY":
-        effective_entry = entry  * (1 + half)
-        effective_exit  = current * (1 - half)
+        effective_entry = entry   * (1 + entry_half)
+        effective_exit  = current * (1 - exit_half)
         return (effective_exit - effective_entry) / effective_entry * 100
     else:  # SELL = short position
-        effective_entry = entry  * (1 - half)
-        effective_exit  = current * (1 + half)
+        effective_entry = entry   * (1 - entry_half)
+        effective_exit  = current * (1 + exit_half)
         return (effective_entry - effective_exit) / effective_entry * 100
 
 
@@ -167,8 +225,31 @@ def _dominant_method(scores: dict, direction: str) -> str:
     return max(agreed, key=agreed.get) if agreed else "none"
 
 
+def _compute_nav_compound(trades: list) -> Optional[float]:
+    """Capital-weighted, time-weighted compound return over *trades* (in %).
+
+    Backed by ``daily_nav.compute_compound_return``: every daily return is
+    derived from the actual cached OHLCV close for that day, not from a
+    geometric split of the trade's total return. 100% deterministic — same
+    input trades always produce the same output.
+
+    Accepts trade dicts directly (the previous (entry_str, exit_str, ret_pct,
+    weight) tuple form was lossy — it threw away ticker/action/prices needed
+    to read real daily marks).  Returns ``None`` when no daily-return event
+    can be produced.
+    """
+    from src.performance.daily_nav import compute_compound_return
+
+    return compute_compound_return(trades or [])
+
+
 def _compute_segment_stats(trades: List[dict]) -> Optional[dict]:
-    """Compute all standard performance metrics for a slice of closed trades."""
+    """Compute all standard performance metrics for a slice of trades.
+
+    Compound return is computed from the actual daily price walk (no
+    interpolation) via ``_compute_nav_compound``, which accepts trade dicts
+    directly so the OHLCV cache can be consulted per ticker.
+    """
     if not trades:
         return None
     returns = [t["return_pct"] for t in trades]
@@ -178,18 +259,11 @@ def _compute_segment_stats(trades: List[dict]) -> Optional[dict]:
         sum(r * m for r, m in zip(returns, multipliers)) / total_mul
         if total_mul else 0.0
     )
-    sorted_rets = [
-        t["return_pct"]
-        for t in sorted(trades, key=lambda x: x.get("entry_date", ""))
-    ]
-    compound = 1.0
-    for r in sorted_rets:
-        compound *= (1 + r / 100)
     wins = [r for r in returns if r > 0]
     return {
         "trades":          len(trades),
         "win_rate":        round(len(wins) / len(returns) * 100, 1),
-        "compound_return": round((compound - 1) * 100, 2),
+        "compound_return": _compute_nav_compound(trades) or 0.0,
         "avg_return":      round(sum(returns) / len(returns), 2),
         "wtd_avg_return":  round(weighted_avg, 2),
         "best":            round(max(returns), 2),
@@ -204,32 +278,36 @@ _ASSET_TYPE_LABELS: Dict[str, str] = {
 }
 
 
-def _compute_performance_table(closed_trades: List[dict]) -> List[dict]:
-    """Build unified breakdown rows: total → asset types → signal methods."""
+def _compute_performance_table(trades: List[dict]) -> List[dict]:
+    """Build unified breakdown rows: total → asset types → signal methods.
+
+    Accepts both closed and open trades; open trades use their current M2M return_pct
+    (maintained by update_open_trades() each run), equivalent to a hypothetical exit.
+    """
     rows: List[dict] = []
 
     # Total row
-    stats = _compute_segment_stats(closed_trades)
+    stats = _compute_segment_stats(trades)
     if stats:
         rows.append({"label": "All Trades", "group": "total", **stats})
 
     # Asset-type rows
     for type_key, label in _ASSET_TYPE_LABELS.items():
-        subset = [t for t in closed_trades if t.get("type") == type_key]
+        subset = [t for t in trades if t.get("type") == type_key]
         stats = _compute_segment_stats(subset)
         if stats:
             rows.append({"label": label, "group": "asset", **stats})
 
     # Direction rows (long vs short)
-    longs  = [t for t in closed_trades if t.get("action") == "BUY"]
-    shorts = [t for t in closed_trades if t.get("action") == "SELL"]
+    longs  = [t for t in trades if t.get("action") == "BUY"]
+    shorts = [t for t in trades if t.get("action") == "SELL"]
     for subset, label in ((longs, "Longs only (BUY)"), (shorts, "Shorts only (SELL)")):
         stats = _compute_segment_stats(subset)
         if stats:
             rows.append({"label": label, "group": "direction", **stats})
 
     # Signal-method rows (attribution-enabled trades only)
-    attributed = [t for t in closed_trades if t.get("methods_agreeing")]
+    attributed = [t for t in trades if t.get("methods_agreeing")]
     for method in _ALL_METHODS:
         subset = [t for t in attributed if method in t.get("methods_agreeing", [])]
         if len(subset) < 2:
@@ -520,6 +598,10 @@ def record_new_trades(
                 f"(sector '{sector}' cap)"
             )
 
+        # Capture the exact instant the price is observed.  Stored alongside
+        # the price so the audit trail is self-explanatory: which value was
+        # used, and when it was sampled.
+        fetched_at = _now_iso()
         price = _fetch_price(rec.ticker)
         if price is None:
             logger.warning(f"[tracker] Skipping {rec.ticker} — could not fetch entry price")
@@ -542,13 +624,16 @@ def record_new_trades(
             "position_size_multiplier": multiplier,
             "sector_key": sector,
             "entry_date": today,
+            "entry_datetime": fetched_at,
             "entry_price": round(price, 4),
             "rationale": rec.rationale,
             "current_price": round(price, 4),
+            "current_price_datetime": fetched_at,
             "return_pct": 0.0,
             "weighted_return_pct": 0.0,
             "days_held": 0,
             "exit_date": None,
+            "exit_datetime": None,
             "exit_price": None,
             "status": "OPEN",
             # Method attribution fields
@@ -560,7 +645,7 @@ def record_new_trades(
         new_count += 1
         logger.info(
             f"[tracker] Opened {rec.action} {rec.ticker} @ {price:.2f} "
-            f"| size={multiplier}× (conf={rec.confidence:.0%})"
+            f"({fetched_at}) | size={multiplier}× (conf={rec.confidence:.0%})"
         )
 
     _save_trades(trades)
@@ -597,15 +682,23 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
         ):
             continue
 
-        exit_price = trade.get("current_price") or _fetch_price(trade["ticker"])
+        # Reuse the most recent intraday mark when available; otherwise
+        # capture a fresh sample now and timestamp it.
+        if trade.get("current_price"):
+            exit_price = trade["current_price"]
+            exit_at    = trade.get("current_price_datetime") or _now_iso()
+        else:
+            exit_at    = _now_iso()
+            exit_price = _fetch_price(trade["ticker"])
         if not exit_price:
             logger.warning(f"[tracker] Cannot close {trade['ticker']} on reversal — no price")
             continue
 
-        ret = _pct_return(trade["action"], trade["entry_price"], exit_price)
+        ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"))
         mul = trade.get("position_size_multiplier", 1.0)
         trade["status"]             = "CLOSED"
         trade["exit_date"]          = today
+        trade["exit_datetime"]      = exit_at
         trade["exit_price"]         = round(exit_price, 4)
         trade["return_pct"]         = round(ret, 3)
         trade["weighted_return_pct"]= round(ret * mul, 3)
@@ -613,12 +706,77 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
         closed += 1
         logger.info(
             f"[tracker] Signal reversal → closed {trade['action']} {trade['ticker']} "
-            f"@ {exit_price:.2f}  return={ret:+.2f}%  (new signal: {new_action})"
+            f"@ {fmt_price(exit_price)} ({exit_at})  return={ret:+.2f}%  (new signal: {new_action})"
         )
 
     if closed:
         _save_trades(trades)
     return closed
+
+
+def _normalize_closed_returns(trades: List[dict]) -> int:
+    """Re-derive ``return_pct`` for every closed trade from its stored
+    entry/exit prices using the current spread model.
+
+    Idempotent and deterministic — given the same prices and spread model,
+    the output never changes. Run on every pipeline tick so summary stats
+    (avg/best/worst/win_rate over stored ``return_pct``) always reconcile
+    with the per-trade compound produced by the daily-NAV engine.
+
+    Returns the number of trades whose ``return_pct`` changed.
+    """
+    changed = 0
+    for t in trades:
+        if t.get("status") != "CLOSED":
+            continue
+        e = t.get("entry_price")
+        x = t.get("exit_price")
+        if e is None or x is None:
+            continue
+        ret = round(_pct_return(t.get("action", "BUY"), float(e), float(x), t.get("type", "STOCK")), 3)
+        if abs(ret - t.get("return_pct", 0.0)) > 1e-3:
+            t["return_pct"] = ret
+            mul = t.get("position_size_multiplier", 1.0)
+            t["weighted_return_pct"] = round(ret * mul, 3)
+            changed += 1
+    return changed
+
+
+def _refresh_open_trade_ohlcv(trades: List[dict]) -> None:
+    """Force-refresh the OHLCV cache for every open-trade ticker.
+
+    The daily-NAV engine walks one mark per trading day held.  When the
+    OHLCV cache for a ticker is stale (last bar < yesterday), days inside
+    the holding period get lumped onto the next available mark — still
+    deterministic, but less granular.  Refreshing here guarantees we have a
+    real close for every day the position was actually held.
+    """
+    if not settings.enable_fetch_data:
+        return
+    tickers = sorted({t["ticker"] for t in trades if t.get("status") == "OPEN"})
+    if not tickers:
+        return
+    try:
+        from src.data.market_data import get_history
+        from src.data.cache import load_ohlcv
+    except Exception as e:
+        logger.warning(f"[tracker] OHLCV refresh skipped — import failed: {e}")
+        return
+
+    yesterday = date.today() - timedelta(days=1)
+    refreshed = 0
+    for tk in tickers:
+        cached = load_ohlcv(tk)
+        needs = cached is None or cached.empty or cached.index[-1].date() < yesterday
+        if not needs:
+            continue
+        try:
+            get_history(tk, period="3mo", force_refresh=True)
+            refreshed += 1
+        except Exception as e:
+            logger.debug(f"[tracker] OHLCV refresh failed for {tk}: {e}")
+    if refreshed:
+        logger.info(f"[tracker] Refreshed OHLCV cache for {refreshed} open-trade ticker(s)")
 
 
 def update_open_trades() -> None:
@@ -628,19 +786,34 @@ def update_open_trades() -> None:
     updated = 0
     closed = 0
 
+    # Keep OHLCV current for every open-trade ticker so the daily-NAV walk
+    # has a real close for each day the position was held (no synthetic
+    # lumping over a stale-cache gap).
+    _refresh_open_trade_ohlcv(trades)
+
+    # Refresh stored return_pct on closed trades so summary stats always
+    # match the current spread model and the daily-NAV engine's compound.
+    normalized = _normalize_closed_returns(trades)
+    if normalized:
+        logger.info(f"[tracker] Normalized return_pct on {normalized} closed trade(s) to current spread model")
+
     for trade in trades:
         if trade["status"] != "OPEN":
             continue
 
+        # Timestamp every live mark so the audit trail records WHEN the
+        # current_price was observed, not just its value.
+        fetched_at = _now_iso()
         price = _fetch_price(trade["ticker"])
         if price is None:
             continue
 
         days = _trading_days_held(trade["entry_date"])
-        ret = _pct_return(trade["action"], trade["entry_price"], price)
+        ret = _pct_return(trade["action"], trade["entry_price"], price, trade.get("type", "STOCK"))
 
         mul = trade.get("position_size_multiplier", 1.0)
         trade["current_price"] = round(price, 4)
+        trade["current_price_datetime"] = fetched_at
         trade["return_pct"] = round(ret, 3)
         trade["weighted_return_pct"] = round(ret * mul, 3)
         trade["days_held"] = days
@@ -650,11 +823,12 @@ def update_open_trades() -> None:
         if days >= HOLDING_DAYS:
             trade["status"] = "CLOSED"
             trade["exit_date"] = today
+            trade["exit_datetime"] = fetched_at
             trade["exit_price"] = round(price, 4)
             closed += 1
             logger.info(
                 f"[tracker] Closed {trade['action']} {trade['ticker']} | "
-                f"entry={trade['entry_price']:.2f} exit={price:.2f} "
+                f"entry={fmt_price(trade['entry_price'])} exit={fmt_price(price)} ({fetched_at}) "
                 f"return={ret:+.2f}% over {days}d"
             )
 
@@ -683,7 +857,7 @@ def log_performance_summary() -> None:
             mul = t.get("position_size_multiplier", 1.0)
             logger.info(
                 f"    {t['action']:<4} {t['ticker']:<6} | "
-                f"date={t['entry_date']}  entry={t['entry_price']:.2f}  now={t['current_price']:.2f}  "
+                f"date={t['entry_date']}  entry={fmt_price(t['entry_price'])}  now={fmt_price(t['current_price'])}  "
                 f"P&L={t['return_pct']:+.2f}%  size={mul}×  ({t['days_held']}d held)"
             )
 
@@ -704,7 +878,7 @@ def log_performance_summary() -> None:
             mul = t.get("position_size_multiplier", 1.0)
             logger.info(
                 f"    {t['action']:<4} {t['ticker']:<6} | "
-                f"date={t['entry_date']}  entry={t['entry_price']:.2f}  exit={t['exit_price']:.2f}  "
+                f"date={t['entry_date']}  entry={fmt_price(t['entry_price'])}  exit={fmt_price(t['exit_price'])}  "
                 f"return={t['return_pct']:+.2f}%  size={mul}×  ({t['days_held']}d)"
             )
 
@@ -913,21 +1087,286 @@ def _build_trades_svg(closed_trades: List[dict]) -> str:
     return '\n'.join(parts)
 
 
-def _solo_stats(dated_returns: list) -> dict:
-    """Summary stats from (entry_date, hyp_return) pairs. Returns {} when empty."""
-    if not dated_returns:
+def _build_timeline_svg(all_trades: list) -> str:
+    """Gantt-style timeline of all trades (closed + open).
+
+    One row per trade, sorted chronologically.  Bars span entry_date → exit_date
+    (or today for open positions).  Color: green=profit, red=loss, blue=open.
+    Left margin: ticker + action label.  Right of bar: return % annotation.
+    Hover tooltip: entry/exit dates, prices, and return.
+    """
+    if not all_trades:
+        return ""
+
+    today = date.today()
+    MAX_ROWS = 40
+
+    rows = []
+    for t in all_trades:
+        entry_str = t.get("entry_date", "")
+        if not entry_str:
+            continue
+        try:
+            entry_dt = date.fromisoformat(entry_str)
+        except Exception:
+            continue
+        exit_str = t.get("exit_date", "") or ""
+        try:
+            exit_dt = date.fromisoformat(exit_str) if exit_str else today
+        except Exception:
+            exit_dt = today
+        rows.append({
+            "ticker":    t.get("ticker", "?"),
+            "action":    t.get("action", "BUY"),
+            "entry_dt":  entry_dt,
+            "exit_dt":   exit_dt,
+            "entry_str": entry_str,
+            "exit_str":  exit_str,
+            "status":    t.get("status", "CLOSED"),
+            "ret":       t.get("return_pct", 0.0),
+            "entry_px":  t.get("entry_price") or 0.0,
+            "exit_px":   t.get("exit_price") or t.get("current_price") or 0.0,
+        })
+
+    if not rows:
+        return ""
+
+    rows.sort(key=lambda r: (r["entry_str"], r["ticker"]))
+    truncated = len(rows) > MAX_ROWS
+    if truncated:
+        rows = rows[-MAX_ROWS:]
+
+    min_dt = min(r["entry_dt"] for r in rows)
+    max_dt = max(r["exit_dt"] for r in rows)
+    # +1 so a same-day entry/exit gets a non-zero bar width
+    span_days = max(1, (max_dt - min_dt).days + 1)
+
+    W       = 820
+    LABEL_W = 100
+    RET_W   = 60
+    CHART_W = W - LABEL_W - RET_W
+    ROW_H   = 20
+    ROW_GAP = 3
+    PT      = 34   # top padding for axis date labels
+    PB      = 24   # bottom padding for legend
+    N       = len(rows)
+    H       = PT + N * (ROW_H + ROW_GAP) + PB
+
+    def x_dt(d: date) -> float:
+        return LABEL_W + (d - min_dt).days / span_days * CHART_W
+
+    parts: List[str] = []
+    a = parts.append
+
+    a(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+      f'viewBox="0 0 {W} {H}" '
+      f'style="background:#0f172a;border-radius:8px;display:block;max-width:100%;margin:14px 0;">')
+
+    suffix = "  (latest 40)" if truncated else ""
+    a(f'<text x="{LABEL_W}" y="15" fill="#64748b" font-size="10" '
+      f'font-family="Arial,sans-serif">Trade Timeline{suffix}</text>')
+
+    # X-axis date ticks + vertical grid lines
+    chart_bot = PT + N * (ROW_H + ROW_GAP)
+    n_ticks = min(8, max(2, span_days // 5 + 1))
+    for i in range(n_ticks):
+        frac = i / (n_ticks - 1) if n_ticks > 1 else 0.5
+        tick_day = round(frac * (span_days - 1))
+        d = min_dt + timedelta(days=tick_day)
+        tx = x_dt(d)
+        a(f'<line x1="{tx:.1f}" y1="{PT - 4}" x2="{tx:.1f}" y2="{chart_bot}" '
+          f'stroke="#1e293b" stroke-width="1"/>')
+        a(f'<text x="{tx:.1f}" y="{PT - 7}" fill="#475569" font-size="9" '
+          f'font-family="Arial,sans-serif" text-anchor="middle">{d.strftime("%m/%d")}</text>')
+
+    # Today dashed marker
+    if min_dt <= today <= max_dt + timedelta(days=1):
+        tx = x_dt(today)
+        a(f'<line x1="{tx:.1f}" y1="{PT - 4}" x2="{tx:.1f}" y2="{chart_bot}" '
+          f'stroke="#334155" stroke-width="1" stroke-dasharray="4,3"/>')
+
+    # Trade rows
+    for i, row in enumerate(rows):
+        y  = PT + i * (ROW_H + ROW_GAP)
+        cy = y + ROW_H // 2 + 4  # text baseline centred in row
+
+        if i % 2 == 1:
+            a(f'<rect x="0" y="{y}" width="{W}" height="{ROW_H}" fill="#111827" opacity="0.4"/>')
+
+        # Ticker label (right-aligned to x=62)
+        a(f'<text x="{LABEL_W - 38}" y="{cy}" fill="#cbd5e1" font-size="10" '
+          f'font-family="Arial,sans-serif" text-anchor="end" font-weight="600">'
+          f'{row["ticker"]}</text>')
+        # Action label (right-aligned to x=97)
+        act_col = "#60a5fa" if row["action"] == "BUY" else "#fb923c"
+        a(f'<text x="{LABEL_W - 3}" y="{cy}" fill="{act_col}" font-size="8" '
+          f'font-family="Arial,sans-serif" text-anchor="end">{row["action"]}</text>')
+
+        # Bar coordinates — extend by one full day-width so exit day is included
+        bx = x_dt(row["entry_dt"])
+        ex = min(x_dt(row["exit_dt"]) + CHART_W / span_days, LABEL_W + CHART_W)
+        bw = max(2.0, ex - bx)
+        bar_y = y + 4
+        bar_h = ROW_H - 8
+
+        if row["status"] == "OPEN":
+            fill, stroke = "#1e3a5f", "#60a5fa"
+        elif row["ret"] > 0:
+            fill, stroke = "#14532d", "#22c55e"
+        else:
+            fill, stroke = "#7f1d1d", "#ef4444"
+
+        # Tooltip
+        ep_s = f"${fmt_price(row['entry_px'])}" if row["entry_px"] else "n/a"
+        xp_s = f"${fmt_price(row['exit_px'])}"  if row["exit_px"]  else "n/a"
+        exit_label = row["exit_str"] if row["exit_str"] else "open"
+        tip = (f"{row['ticker']} {row['action']} | "
+               f"{row['entry_str']} → {exit_label} | "
+               f"Entry {ep_s}  Exit {xp_s} | "
+               f"{row['ret']:+.2f}%")
+        if row["status"] == "OPEN":
+            tip += " [OPEN]"
+
+        a(f'<rect x="{bx:.1f}" y="{bar_y}" width="{bw:.1f}" height="{bar_h}" '
+          f'fill="{fill}" stroke="{stroke}" stroke-width="0.8" rx="2">'
+          f'<title>{tip}</title></rect>')
+
+        # Entry price inside bar (only when bar is wide enough to fit the label)
+        if bw > 52 and row["entry_px"]:
+            a(f'<text x="{bx + 4:.1f}" y="{cy}" fill="{stroke}" font-size="8" '
+              f'font-family="Arial,sans-serif" opacity="0.9">'
+              f'${fmt_price(row["entry_px"])}</text>')
+
+        # Return annotation to the right of the bar
+        ann_x = min(ex + 4, W - RET_W + 4)
+        ret_col = "#4ade80" if row["ret"] > 0 else "#f87171" if row["ret"] < 0 else "#94a3b8"
+        sfx = "*" if row["status"] == "OPEN" else ""
+        a(f'<text x="{ann_x:.1f}" y="{cy}" fill="{ret_col}" font-size="9" '
+          f'font-family="Arial,sans-serif" font-weight="700">{row["ret"]:+.1f}%{sfx}</text>')
+
+    # Legend
+    leg_y = H - 8
+    for off, col, lbl in [(0, "#22c55e", "Profit"), (58, "#ef4444", "Loss"), (110, "#60a5fa", "Open*")]:
+        lx = LABEL_W + off
+        a(f'<rect x="{lx}" y="{leg_y - 8}" width="10" height="8" fill="{col}" rx="2" opacity="0.7"/>')
+        a(f'<text x="{lx + 13}" y="{leg_y}" fill="#64748b" font-size="9" '
+          f'font-family="Arial,sans-serif">{lbl}</text>')
+
+    a('</svg>')
+    return '\n'.join(parts)
+
+
+def compute_portfolio_metrics(closed_trades: list, open_trades: list) -> dict:
+    """True time-weighted compound portfolio return across all trades (closed + open).
+
+    Uses ``daily_nav.compute_compound_return``: every per-day return is derived
+    from the real OHLCV close for that ticker on that day, capital-weighted
+    across whatever positions are active. No geometric interpolation, no
+    proxy assumptions about intermediate prices — same trades.json + same
+    OHLCV cache → identical numbers every run.
+
+    Closed trades: walk uses entry_price → daily closes → exit_price (each
+        bracket-adjusted by the dynamic bid-ask spread on entry/exit only).
+    Open trades:   walk uses entry_price → daily closes → today's
+        current_price (also spread-adjusted, treating the live mark as a
+        hypothetical close-out so the per-trade compound matches the trade's
+        stored ``return_pct``).
+
+    Time windows include only trades ENTERED within the last N calendar days.
+    Inception includes every trade ever recorded.
+
+    Returns dict: {
+        compound_inception — compound over all trades ever,
+        return_1w          — compound for trades entered in last 7 days,
+        return_2w          — compound for trades entered in last 14 days,
+        return_1m          — compound for trades entered in last 30 days,
+    }  Values are percentages.  None when no trades exist for that window.
+    """
+    today = date.today()
+    all_trades = [t for t in (closed_trades + open_trades) if t.get("entry_date")]
+    if not all_trades:
         return {}
-    dated_returns = sorted(dated_returns, key=lambda x: x[0])
-    hyp = [r for _, r in dated_returns]
-    wins = [r for r in hyp if r > 0]
-    compound = 1.0
-    for r in hyp:
-        compound *= (1 + r / 100)
+
+    def _window(days: int) -> Optional[float]:
+        cutoff = str(today - timedelta(days=days))
+        return _compute_nav_compound([t for t in all_trades if t["entry_date"] >= cutoff])
+
     return {
-        "trades":          len(hyp),
+        "compound_inception": _compute_nav_compound(all_trades),
+        "return_1w":          _window(7),
+        "return_2w":          _window(14),
+        "return_1m":          _window(30),
+    }
+
+
+def _flip_trade(trade: dict) -> dict:
+    """Return a shallow-copied trade with action/direction inverted.
+
+    Used to model the "what if this method had signalled the opposite
+    direction" hypothetical. Prices, dates, and ticker are preserved so the
+    daily NAV engine walks the real OHLCV closes — the only thing that
+    changes is whether each day's price move is counted as long-favourable or
+    short-favourable. The trade's ``return_pct`` is also re-derived from
+    ``_pct_return`` for the flipped action so summary stats line up with the
+    flipped compound.
+    """
+    flipped = dict(trade)
+    action = trade.get("action", "BUY")
+    flipped["action"]    = "SELL" if action == "BUY" else "BUY"
+    flipped["direction"] = "BEARISH" if trade.get("direction") == "BULLISH" else "BULLISH"
+
+    entry_px   = trade.get("entry_price")
+    asset_type = trade.get("type", "STOCK")
+    if entry_px is not None:
+        if flipped["status"] == "CLOSED" and trade.get("exit_price") is not None:
+            flipped["return_pct"] = round(
+                _pct_return(flipped["action"], float(entry_px), float(trade["exit_price"]), asset_type),
+                3,
+            )
+        else:
+            cp = trade.get("current_price") or entry_px
+            flipped["return_pct"] = round(
+                _pct_return(flipped["action"], float(entry_px), float(cp), asset_type),
+                3,
+            )
+    return flipped
+
+
+def _hypothetical_trades_for_method(method: str, closed: List[dict]) -> List[dict]:
+    """Build the per-method hypothetical trade list (real or flipped).
+
+    For each closed trade with stored method_scores: if the method's view
+    matches the actual action, include the trade verbatim; if it disagrees,
+    include the flipped trade. Trades where the method has no view
+    (|score| < threshold) are skipped entirely.
+    """
+    out: List[dict] = []
+    for trade in closed:
+        score = trade.get("method_scores", {}).get(method, 0.0)
+        if abs(score) < _METHOD_AGREE_THRESHOLD:
+            continue
+        actual = trade.get("action", "BUY")
+        solo   = "BUY" if score > 0 else "SELL"
+        out.append(trade if solo == actual else _flip_trade(trade))
+    return out
+
+
+def _solo_stats(trades: list) -> dict:
+    """Summary stats from a list of (real or flipped) trade dicts.
+
+    Compound return walks the actual OHLCV closes via the daily-NAV engine;
+    every other stat is computed from the trades' ``return_pct`` so it
+    reconciles exactly with the compound on a single-trade slice.
+    """
+    if not trades:
+        return {}
+    hyp = [t["return_pct"] for t in trades]
+    wins = [r for r in hyp if r > 0]
+    return {
+        "trades":          len(trades),
         "win_rate":        round(len(wins) / len(hyp) * 100, 1),
         "avg_return":      round(sum(hyp) / len(hyp), 2),
-        "compound_return": round((compound - 1) * 100, 2),
+        "compound_return": _compute_nav_compound(trades) or 0.0,
         "best":            round(max(hyp), 2),
         "worst":           round(min(hyp), 2),
     }
@@ -941,29 +1380,37 @@ _EVAL_BANDS = [
 
 
 def _eval_stats(entries: list) -> dict:
-    """Directional accuracy stats from (abs_score, hyp_return) pairs. Returns {} when empty."""
+    """Directional accuracy stats from (trade_dict, abs_score) pairs.
+
+    The trade dict is either the real trade (when the method agreed with the
+    actual action) or a flipped copy (when it disagreed) — see
+    ``_hypothetical_trades_for_method``. Compound returns are walked through
+    the actual OHLCV cache via the daily-NAV engine, never interpolated.
+    """
     if not entries:
         return {}
-    correct = [r for _, r in entries if r > 0]
-    wrong   = [r for _, r in entries if r <= 0]
+    correct = [t["return_pct"] for t, _ in entries if t["return_pct"] > 0]
+    wrong   = [t["return_pct"] for t, _ in entries if t["return_pct"] <= 0]
     conviction_bands = []
     for label, lo, hi in _EVAL_BANDS:
-        band = [r for s, r in entries if lo <= s < hi]
+        band = [t for t, s in entries if lo <= s < hi]
         if not band:
-            conviction_bands.append({"label": label, "trades": 0, "accuracy": 0.0, "avg_return": 0.0})
+            conviction_bands.append({"label": label, "trades": 0, "accuracy": 0.0, "avg_return": 0.0, "compound_return": 0.0})
             continue
-        band_correct = [r for r in band if r > 0]
+        band_correct = [t["return_pct"] for t in band if t["return_pct"] > 0]
         conviction_bands.append({
-            "label":      label,
-            "trades":     len(band),
-            "accuracy":   round(len(band_correct) / len(band) * 100, 1),
-            "avg_return": round(sum(band) / len(band), 2),
+            "label":           label,
+            "trades":          len(band),
+            "accuracy":        round(len(band_correct) / len(band) * 100, 1),
+            "avg_return":      round(sum(t["return_pct"] for t in band) / len(band), 2),
+            "compound_return": _compute_nav_compound(band) or 0.0,
         })
     return {
         "trades":               len(entries),
         "directional_accuracy": round(len(correct) / len(entries) * 100, 1),
         "avg_return_correct":   round(sum(correct) / len(correct), 2) if correct else 0.0,
         "avg_return_wrong":     round(sum(wrong)   / len(wrong),   2) if wrong   else 0.0,
+        "compound_return":      _compute_nav_compound([t for t, _ in entries]) or 0.0,
         "conviction_bands":     conviction_bands,
     }
 
@@ -995,31 +1442,15 @@ def compute_solo_method_performance() -> dict:
 
     results: dict = {}
     for method in _ALL_METHODS:
-        buy_dated:  list = []
-        sell_dated: list = []
-
-        for trade in closed:
-            score = trade["method_scores"].get(method, 0.0)
-            if abs(score) < _METHOD_AGREE_THRESHOLD:
-                continue
-            actual_return = trade.get("return_pct", 0.0)
-            actual_action = trade.get("action", "BUY")
-            solo_action   = "BUY" if score > 0 else "SELL"
-            hyp_return    = actual_return if solo_action == actual_action else -actual_return
-            entry = (trade.get("entry_date", ""), hyp_return)
-            if solo_action == "BUY":
-                buy_dated.append(entry)
-            else:
-                sell_dated.append(entry)
-
-        all_dated = buy_dated + sell_dated
-        if len(all_dated) < MIN_TRADES:
+        hyp = _hypothetical_trades_for_method(method, closed)
+        if len(hyp) < MIN_TRADES:
             continue
-
+        buys  = [t for t in hyp if t.get("action") == "BUY"]
+        sells = [t for t in hyp if t.get("action") == "SELL"]
         results[method] = {
-            "overall": _solo_stats(all_dated),
-            "buys":    _solo_stats(buy_dated),
-            "sells":   _solo_stats(sell_dated),
+            "overall": _solo_stats(hyp),
+            "buys":    _solo_stats(buys),
+            "sells":   _solo_stats(sells),
         }
 
     return results
@@ -1051,26 +1482,21 @@ def compute_method_eval_stats() -> dict:
 
     results: dict = {}
     for method in _ALL_METHODS:
-        buy_entries:  list = []
-        sell_entries: list = []
-
+        all_entries: List[tuple] = []
         for trade in closed:
             score = trade["method_scores"].get(method, 0.0)
             if abs(score) < _METHOD_AGREE_THRESHOLD:
                 continue
-            actual_return = trade.get("return_pct", 0.0)
             actual_action = trade.get("action", "BUY")
             solo_action   = "BUY" if score > 0 else "SELL"
-            hyp_return    = actual_return if solo_action == actual_action else -actual_return
-            entry = (abs(score), hyp_return)
-            if solo_action == "BUY":
-                buy_entries.append(entry)
-            else:
-                sell_entries.append(entry)
+            hyp_trade     = trade if solo_action == actual_action else _flip_trade(trade)
+            all_entries.append((hyp_trade, abs(score)))
 
-        all_entries = buy_entries + sell_entries
         if len(all_entries) < MIN_TRADES:
             continue
+
+        buy_entries  = [(t, s) for t, s in all_entries if t.get("action") == "BUY"]
+        sell_entries = [(t, s) for t, s in all_entries if t.get("action") == "SELL"]
 
         results[method] = {
             "overall": _eval_stats(all_entries),
@@ -1084,8 +1510,11 @@ def compute_method_eval_stats() -> dict:
 def get_performance_for_email() -> dict:
     """Return structured performance data for inclusion in the email report."""
     trades = _load_trades()
-    open_trades = [t for t in trades if t["status"] == "OPEN"]
+    open_trades   = [t for t in trades if t["status"] == "OPEN"]
     closed_trades = [t for t in trades if t["status"] == "CLOSED"]
+    # Open trades carry a current M2M return_pct (updated each run by update_open_trades()).
+    # Treat them as hypothetical exits so every live position is reflected in the stats.
+    all_trades = closed_trades + open_trades
 
     # Inception date — earliest entry across ALL trades (open + closed)
     all_dates = [t["entry_date"] for t in trades if t.get("entry_date")]
@@ -1108,49 +1537,68 @@ def get_performance_for_email() -> dict:
             "inception_days":   inception_days,
         }
 
-    if closed_trades:
-        returns = [t["return_pct"] for t in closed_trades]
-        multipliers = [t.get("position_size_multiplier", 1.0) for t in closed_trades]
+    # Headline metrics over ALL trades (closed final P&L + open M2M return_pct).
+    if all_trades:
+        returns = [t["return_pct"] for t in all_trades]
+        multipliers = [t.get("position_size_multiplier", 1.0) for t in all_trades]
         total_mul = sum(multipliers)
         weighted_avg = (
             sum(r * m for r, m in zip(returns, multipliers)) / total_mul
             if total_mul else sum(returns) / len(returns)
         )
-        # Compound return: treats each trade as sequentially re-investing the same unit.
-        # (1 + r1/100) × (1 + r2/100) × … − 1, sorted by entry date.
+        # Compound return: trades sorted by entry date, sequentially re-invested.
+        # Will be overwritten below by portfolio_metrics["compound_inception"] which
+        # uses the more accurate daily-batch model, but compute it as a fallback.
         sorted_returns = [
             t["return_pct"]
-            for t in sorted(closed_trades, key=lambda x: x.get("entry_date", ""))
+            for t in sorted(all_trades, key=lambda x: x.get("entry_date", ""))
         ]
         compound = 1.0
         for r in sorted_returns:
             compound *= (1 + r / 100)
 
         stats.update({
-            "win_rate":          round(len([r for r in returns if r > 0]) / len(returns) * 100, 1),
-            "avg_return":        round(sum(returns) / len(returns), 2),
+            "win_rate":            round(len([r for r in returns if r > 0]) / len(returns) * 100, 1),
+            "avg_return":          round(sum(returns) / len(returns), 2),
             "weighted_avg_return": round(weighted_avg, 2),
-            "compound_return":   round((compound - 1) * 100, 2),
-            "best":              round(max(returns), 2),
-            "worst":             round(min(returns), 2),
+            "compound_return":     round((compound - 1) * 100, 2),
+            "best":                round(max(returns), 2),
+            "worst":               round(min(returns), 2),
         })
 
-    attributed = [t for t in closed_trades if t.get("methods_agreeing")]
-    confidence_ranked    = _compute_confidence_ranked(closed_trades)
-    performance_table    = _compute_performance_table(closed_trades) if closed_trades else []
+    attributed = [t for t in all_trades if t.get("methods_agreeing")]
+    confidence_ranked    = _compute_confidence_ranked(closed_trades)          # realized P&L only
+    performance_table    = _compute_performance_table(all_trades) if all_trades else []
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
+    timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
     solo_method_perf     = compute_solo_method_performance()
     method_eval_stats    = compute_method_eval_stats()
+    portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)
+
+    # Keep stats["compound_return"] in sync with the authoritative portfolio_metrics value
+    # (both use _compute_nav_compound but portfolio_metrics also includes live M2M for open trades).
+    if portfolio_metrics and "compound_inception" in portfolio_metrics:
+        stats["compound_return"] = portfolio_metrics["compound_inception"]
+
+    # Methods ordered by overall win rate descending; no-data methods go to the bottom.
+    method_order_by_winrate = sorted(
+        list(_ALL_METHODS),
+        key=lambda m: solo_method_perf.get(m, {}).get("overall", {}).get("win_rate", -1),
+        reverse=True,
+    )
 
     return {
-        "open_trades":        sorted(open_trades,   key=lambda x: x["entry_date"],    reverse=True),
-        "closed_trades":      sorted(closed_trades, key=lambda x: x["exit_date"] or "", reverse=True),
-        "stats":              stats,
-        "confidence_ranked":  confidence_ranked,
-        "performance_table":  performance_table,
-        "attributed_count":   len(attributed),
-        "trades_svg":         trades_svg,
-        "solo_method_perf":   solo_method_perf,    # hypothetical per-method solo simulation
-        "method_eval_stats":  method_eval_stats,   # per-method accuracy + conviction calibration
-        "method_labels":      METHOD_LABELS,
+        "open_trades":              sorted(open_trades,   key=lambda x: x["entry_date"],    reverse=True),
+        "closed_trades":            sorted(closed_trades, key=lambda x: x["exit_date"] or "", reverse=True),
+        "stats":                    stats,
+        "portfolio_metrics":        portfolio_metrics,          # session-based compound + time windows
+        "confidence_ranked":        confidence_ranked,
+        "performance_table":        performance_table,
+        "attributed_count":         len(attributed),
+        "trades_svg":               trades_svg,
+        "timeline_svg":             timeline_svg,
+        "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
+        "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
+        "method_labels":            METHOD_LABELS,
+        "method_order_by_winrate":  method_order_by_winrate,   # methods ranked by solo win rate, no-data last
     }

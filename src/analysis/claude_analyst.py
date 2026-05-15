@@ -10,8 +10,11 @@ from config import settings
 from src.models import TickerSignal, Recommendation, InsiderTrade, MacroContext, COTContext, IPOContext, VIXContext, PutCallContext, EarningsContext, BreadthContext, HighsLowsContext, McClellanContext, MacroSurpriseContext, FedWatchContext, RevisionMomentumContext, WhisperContext, OpExContext, SeasonalityContext, BondInternalsContext, MOVEContext, GlobalMacroContext
 from src.data.insider_trades import build_insider_summary
 
+_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+_DEEPSEEK_ANALYST_MODEL = "deepseek-chat"   # DeepSeek V3 — fast, structured JSON, same API as sentiment.py
 
 _client = None
+_deepseek_analyst_client = None
 
 
 def _get_client() -> anthropic.Anthropic:
@@ -19,6 +22,41 @@ def _get_client() -> anthropic.Anthropic:
     if _client is None:
         _client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     return _client
+
+
+def _get_deepseek_analyst_client():
+    global _deepseek_analyst_client
+    if not settings.deepseek_api_key:
+        return None
+    if _deepseek_analyst_client is None:
+        from openai import OpenAI
+        _deepseek_analyst_client = OpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url=_DEEPSEEK_BASE_URL,
+        )
+    return _deepseek_analyst_client
+
+
+def _call_deepseek_analyst(prompt: str) -> str:
+    """Call DeepSeek V3 (deepseek-chat) as fallback analyst. Returns raw response text."""
+    client = _get_deepseek_analyst_client()
+    if client is None:
+        raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
+    logger.info(f"[claude] Falling back to DeepSeek V3 analyst: {_DEEPSEEK_ANALYST_MODEL}")
+    raw_parts: list[str] = []
+    with client.chat.completions.create(
+        model=_DEEPSEEK_ANALYST_MODEL,
+        max_tokens=32000,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+    ) as stream:
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                raw_parts.append(delta.content)
+    return "".join(raw_parts).strip()
 
 
 def generate_recommendations(
@@ -2284,6 +2322,9 @@ Output a JSON array where each element has:
 
 Return ALL tickers from the input. No markdown, JSON only."""
 
+    # ── Step 1: call primary analyst (Claude) ─────────────────────────────
+    raw: str | None = None
+    analyst_source = settings.analyst_model
     try:
         client = _get_client()
         logger.info(f"[claude] Using model: {settings.analyst_model}")
@@ -2303,49 +2344,85 @@ Return ALL tickers from the input. No markdown, JSON only."""
             for text in stream.text_stream:
                 raw_parts.append(text)
         raw = "".join(raw_parts).strip()
-        # Strip markdown fences if the model wrapped the response
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        logger.debug(f"Raw Claude response ({len(raw)} chars): {raw[:200]}")
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            # Response was likely truncated at the output token limit.
-            # Salvage every complete object by trimming to the last closing brace.
-            last_brace = raw.rfind("}")
-            if last_brace == -1:
-                raise
-            repaired = raw[:last_brace + 1].rstrip().rstrip(",") + "]"
-            if not repaired.startswith("["):
-                repaired = "[" + repaired
-            data = json.loads(repaired)
-            logger.warning(
-                f"[claude] Truncated response repaired — recovered {len(data)}/{len(signals)} tickers. "
-                f"Consider switching to a model with higher output limits."
-            )
-        now = now_et()
-        recommendations = [
-            Recommendation(
-                ticker=r["ticker"],
-                type=r.get("type", "STOCK"),
-                direction=r["direction"],
-                action=r["action"],
-                confidence=float(r["confidence"]),
-                time_horizon=r.get("time_horizon", "N/A"),
-                rationale=r["rationale"],
-                generated_at=now,
-            )
-            for r in data
-        ]
-        logger.info(f"Generated {len(recommendations)} recommendations")
-        return recommendations
+    except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+        # Covers 400 (credit exhausted / bad request), 401 (auth), 402 (payment),
+        # 403 (permission), 429 (rate limit), 5xx (server errors), and connection failures.
+        logger.warning(
+            f"[claude] Claude API unavailable ({type(e).__name__}: {e}) — "
+            f"switching to DeepSeek {_DEEPSEEK_ANALYST_MODEL}"
+        )
     except Exception as e:
-        logger.error(f"Claude recommendations failed: {e}")
-        # Fallback: convert signals directly to recommendations
-        return _fallback_recommendations(signals)
+        logger.warning(f"[claude] Unexpected Claude error: {e} — switching to DeepSeek")
+
+    # ── Step 2: DeepSeek fallback if Claude didn't produce output ──────────
+    if raw is None:
+        try:
+            raw = _call_deepseek_analyst(prompt)
+            analyst_source = _DEEPSEEK_ANALYST_MODEL
+        except Exception as ds_err:
+            logger.error(f"[claude] DeepSeek fallback also failed: {ds_err}")
+            return _fallback_recommendations(signals)
+
+    # ── Step 3: parse and build recommendations ────────────────────────────
+    # Strip markdown fences if the model wrapped the response
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    logger.debug(f"Raw {analyst_source} response ({len(raw)} chars): {raw[:200]}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Response was likely truncated at the output token limit.
+        # Salvage every complete object by trimming to the last closing brace.
+        last_brace = raw.rfind("}")
+        if last_brace == -1:
+            logger.error(f"[claude] Could not parse {analyst_source} response")
+            return _fallback_recommendations(signals)
+        repaired = raw[:last_brace + 1].rstrip().rstrip(",") + "]"
+        if not repaired.startswith("["):
+            repaired = "[" + repaired
+        try:
+            data = json.loads(repaired)
+        except json.JSONDecodeError:
+            logger.error(f"[claude] Could not repair {analyst_source} response")
+            return _fallback_recommendations(signals)
+        logger.warning(
+            f"[claude] {analyst_source} truncated response repaired — "
+            f"recovered {len(data)}/{len(signals)} tickers. "
+            f"Consider switching to a model with higher output limits."
+        )
+    now = now_et()
+    recommendations = [
+        Recommendation(
+            ticker=r["ticker"],
+            type=r.get("type", "STOCK"),
+            direction=r["direction"],
+            action=r["action"],
+            confidence=float(r["confidence"]),
+            time_horizon=r.get("time_horizon", "N/A"),
+            rationale=r["rationale"],
+            generated_at=now,
+        )
+        for r in data
+    ]
+
+    # Guarantee every signal ticker got a recommendation.
+    # Tickers dropped by truncation (or simply omitted) fall back to rule-based logic
+    # so open positions always receive a HOLD/SELL signal and nothing falls silent.
+    covered = {r.ticker for r in recommendations}
+    missing = [s for s in signals if s.ticker not in covered]
+    if missing:
+        fallback = _fallback_recommendations(missing)
+        recommendations += fallback
+        logger.warning(
+            f"[claude] {len(missing)} ticker(s) absent from {analyst_source} response "
+            f"— filled with rule-based fallback: {', '.join(s.ticker for s in missing)}"
+        )
+
+    logger.info(f"Generated {len(recommendations)} recommendations via {analyst_source}")
+    return recommendations
 
 
 def _fallback_recommendations(signals: List[TickerSignal]) -> List[Recommendation]:

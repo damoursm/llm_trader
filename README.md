@@ -1159,6 +1159,8 @@ All ticker signals plus every macro/breadth/volatility context block are passed 
 
 Claude acts as an elite portfolio manager with 22 numbered decision rules covering: conviction thresholds, smart money weighting, macro overlays, cluster handling, volatility regimes, breadth conditions, earnings event caution, and more. When no ticker clears the bar, it outputs HOLD/WATCH for all.
 
+**Automatic fallback chain:** If the Claude API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to **DeepSeek R1** (`deepseek-reasoner`) via the OpenAI-compatible streaming API. If DeepSeek also fails, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The active analyst model is logged at INFO level.
+
 ---
 
 ### Step 6 — Performance Tracking (`src/performance/tracker.py`)
@@ -1170,6 +1172,24 @@ Every actionable signal is recorded in `cache/trades.json`:
 3. **Auto-close** — positions are automatically closed after **5 calendar days**
 
 P&L is sign-aware: BUY profits when price rises; SELL (short) profits when price falls.
+
+**Price formatting (`fmt_price()`):** prices throughout the email and logs are formatted with `2`, `4`, or `6` decimal places depending on magnitude (`≥$1` → `$12.34`, `$0.01–$1` → `$0.0312`, `<$0.01` → `$0.003142`). Prevents sub-penny stocks and warrants from displaying as `$0.00`.
+
+**Dynamic bid-ask spread (`_dynamic_half_spread()`):** replaces the old fixed `SPREAD_PCT = 0.10%`. Half-spreads are price-tiered and asset-type-aware:
+
+| Asset type | Price tier | Half-spread |
+|---|---|---|
+| ETF (any price) | — | 1 bp |
+| Commodity (≥$100) | GLD, GDX-style | 1.5 bp |
+| Commodity (<$100) | SLV, CPER-style | 3 bp |
+| Stock ≥$50 | Large-cap | 2 bp |
+| Stock $10–$50 | Mid-cap | 4 bp |
+| Stock $1–$10 | Small-cap | 12.5 bp |
+| Stock $0.10–$1 | Micro-cap | 37.5 bp |
+| Stock $0.01–$0.10 | Penny | 100 bp |
+| Stock < $0.01 | Sub-penny / warrant | 250 bp |
+
+Entry and exit spreads are computed independently from their respective prices; `_pct_return()` accepts an `asset_type` parameter.
 
 **Confidence-Scaled Position Sizing**
 
@@ -1186,7 +1206,24 @@ Each trade is assigned a `position_size_multiplier` based on the signal's confid
 - Commodities (GLD, SLV, GDX …): grouped together as "COMMODITY"
 - Stocks: looked up in `_SECTOR_MAP`; unknown stocks each count independently
 
-**Reporting:** The email performance section shows a Size column (1×/1.5×/2×) on each position and reports both equal-weight avg return and size-adjusted **weighted avg return** — giving a more accurate picture of actual portfolio-level performance.
+**Sequential compound portfolio metrics (`compute_portfolio_metrics()`):** computes a true sequential compound return using a daily-batch model:
+
+1. Trades opened on the same calendar day form a **session batch**
+2. Each batch's return = dollar-weighted average of its trades (weighted by `position_size_multiplier`), so higher-conviction trades carry more weight within the day
+3. Session batches are **compounded chronologically** — 10 sessions each returning +5% produces ~+62.9%, not +5%
+
+Open positions are included at their current mark-to-market P&L (same dynamic spread as if exiting now), so `compound_inception` reflects real-time performance including unrealised gains/losses.
+
+| Key | Window |
+|---|---|
+| `compound_inception` | Sequential compound of all session batches ever |
+| `return_1w` | Sequential compound of batches entered in the last 7 days |
+| `return_2w` | Sequential compound of batches entered in the last 14 days |
+| `return_1m` | Sequential compound of batches entered in the last 30 days |
+
+The email **Portfolio Performance** card displays these as tile widgets alongside the since-inception compound number.
+
+**Reporting:** The email performance section shows a Size column (1×/1.5×/2×) on each position and reports both equal-weight avg return and size-adjusted **weighted avg return**. Signal method tables are sorted by solo win rate (best method first) via `method_order_by_winrate`.
 
 **Method Attribution Analytics**
 
@@ -1258,9 +1295,9 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 | Estimate revision | Analyst consensus trend per ticker |
 | Earnings whisper | Implied whisper vs. consensus per ticker |
 | Smart money | Insider/politician trades with cluster badges |
-| Portfolio | Win rate, P&L curve, open/closed trades |
+| Portfolio | 1w/2w/1m + since-inception dollar-weighted return tiles, P&L curve, open/closed trades with `fmt_price()` precision |
 
-**Email** — charts embedded as inline base64 PNG (no attachments). Degrades gracefully to text-only if `kaleido` is not installed.
+**Email** — charts embedded as inline base64 PNG (no attachments). Degrades gracefully to text-only if `kaleido` is not installed. Signal method performance tables are sorted by solo win rate (best signal first). Prices in trade tables use `fmt_price()` for sub-penny precision.
 
 ---
 
@@ -1268,11 +1305,13 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 
 | Task | Model | Fallback |
 |---|---|---|
-| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku |
+| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku 4.5 |
 | Technical analysis scoring | Computed locally (RSI, MACD, SMA, BB) | — |
-| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | Rule-based fallback |
+| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V3 (`deepseek-chat`) → rule-based fallback |
 
 To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env`.
+
+**DeepSeek R1 analyst fallback:** When the configured Claude model raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through `deepseek-reasoner` (DeepSeek R1) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If DeepSeek also fails, the pipeline falls back to a simple rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
 
 ---
 

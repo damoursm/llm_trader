@@ -186,7 +186,7 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
     return snapshots
 
 
-def get_history(ticker: str, period: str = "3mo") -> pd.DataFrame:
+def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -> pd.DataFrame:
     """
     Return OHLCV history for chart generation / technical analysis.
 
@@ -194,12 +194,17 @@ def get_history(ticker: str, period: str = "3mo") -> pd.DataFrame:
       1. Tries Polygon.io (no per-IP rate-limit concern).
       2. Falls back to yfinance with exponential-backoff retry.
     Saves successful fetches to the disk cache so callers don't re-fetch.
+
+    ``force_refresh``: bypass the cache and re-fetch even when the cached
+    last bar is within the 3-day TTL window. Used by the performance tracker
+    to keep open-trade OHLCV fully up to date so the daily-NAV walk has a
+    real close for every day the position was held.
     """
     from src.data.cache import load_ohlcv, save_ohlcv
     from datetime import date as _date
 
     cached = load_ohlcv(ticker)
-    if cached is not None and not cached.empty:
+    if cached is not None and not cached.empty and not force_refresh:
         last_bar = cached.index[-1].date()
         if (_date.today() - last_bar).days <= 3:
             logger.debug(f"[market_data] get_history: cache hit for {ticker} (last bar {last_bar})")

@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 from config import settings
 from src.models import NewsArticle, Recommendation, InsiderTrade, TickerSignal
 from src.utils import now_et, fmt_et, ET
+from src.performance.tracker import fmt_price
 from src.charts.builder import (
     build_signals_overview,
     build_stock_chart,
@@ -216,30 +217,47 @@ HTML_TEMPLATE = """
 {% if perf.trades_svg %}
 {{ perf.trades_svg | safe }}
 {% endif %}
+{% if perf.timeline_svg %}
+{{ perf.timeline_svg | safe }}
+{% endif %}
 {% if perf.stats %}
 {# ── Inception summary banner — shown whenever any trades exist ── #}
 {% if perf.stats.total_all %}
-{% set cret = perf.stats.compound_return if perf.stats.compound_return is defined else none %}
+{% set pm = perf.portfolio_metrics if perf.portfolio_metrics is defined else {} %}
+{% set cret = pm.compound_inception if (pm.compound_inception is defined and pm.compound_inception is not none) else (perf.stats.compound_return if perf.stats.compound_return is defined else none) %}
 {% set cret_color = '#4ade80' if (cret is not none and cret > 0) else ('#f87171' if (cret is not none and cret < 0) else '#60a5fa') %}
 <div class="card" style="border-left:4px solid {{ cret_color }};margin-bottom:10px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">
     <div>
-      <span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Since inception</span><br>
+      <span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Portfolio performance</span><br>
       <span style="font-size:12px;color:#94a3b8;">
         {% if perf.stats.first_trade_date %}{{ perf.stats.first_trade_date }}{% endif %}
-        {% if perf.stats.inception_days %}
-        &nbsp;&bull;&nbsp;{{ perf.stats.inception_days }} days
-        {% endif %}
-        &nbsp;&bull;&nbsp;{{ perf.stats.total_all }} total trades
+        {% if perf.stats.inception_days %}&nbsp;&bull;&nbsp;{{ perf.stats.inception_days }} days{% endif %}
+        &nbsp;&bull;&nbsp;{{ perf.stats.total_all }} trades
         ({{ perf.stats.total_closed }} closed, {{ perf.stats.total_open }} open)
       </span>
+      {# ── time-window row ── #}
+      {% if pm %}
+      <div style="margin-top:10px;display:flex;gap:20px;flex-wrap:wrap;">
+        {% set windows = [('1 week', pm.return_1w), ('2 weeks', pm.return_2w), ('1 month', pm.return_1m)] %}
+        {% for label, val in windows %}
+        <div>
+          <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:0.5px;">{{ label }}</div>
+          {% if val is not none %}
+          <div style="font-size:16px;font-weight:700;color:{{ '#4ade80' if val > 0 else '#f87171' if val < 0 else '#94a3b8' }};">{{ "%+.2f"|format(val) }}%</div>
+          {% else %}
+          <div style="font-size:14px;color:#334155;">&mdash;</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
     </div>
     <div style="text-align:right;">
       {% if cret is not none %}
-      <span style="font-size:11px;color:#64748b;">Compound return</span><br>
-      <span style="font-size:28px;font-weight:700;color:{{ cret_color }};">
-        {{ "%+.2f"|format(cret) }}%
-      </span>
+      <span style="font-size:11px;color:#64748b;">Since inception</span><br>
+      <span style="font-size:28px;font-weight:700;color:{{ cret_color }};">{{ "%+.2f"|format(cret) }}%</span>
+      <div style="font-size:10px;color:#475569;margin-top:2px;">session-weighted compound</div>
       {% else %}
       <span style="font-size:12px;color:#64748b;">No closed trades yet</span>
       {% endif %}
@@ -280,8 +298,8 @@ HTML_TEMPLATE = """
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.action }}</td>
       <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ "%.2f"|format(t.entry_price) }}</td>
-      <td>${{ "%.2f"|format(t.current_price) }}</td>
+      <td>${{ fmt_price(t.entry_price) }}</td>
+      <td>${{ fmt_price(t.current_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
         {{ "%+.2f"|format(t.return_pct) }}%
       </td>
@@ -310,8 +328,8 @@ HTML_TEMPLATE = """
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.action }}</td>
       <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ "%.2f"|format(t.entry_price) }}</td>
-      <td>${{ "%.2f"|format(t.exit_price) }}</td>
+      <td>${{ fmt_price(t.entry_price) }}</td>
+      <td>${{ fmt_price(t.exit_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
         {{ "%+.2f"|format(t.return_pct) }}%
       </td>
@@ -451,7 +469,7 @@ HTML_TEMPLATE = """
 </p>
 {% set solo = perf.solo_method_perf %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
 <table class="pt">
   <thead>
     <tr>
@@ -540,7 +558,7 @@ HTML_TEMPLATE = """
 </table>
 <p style="color:#475569;font-size:11px;margin:8px 0 0 0;">
   Each method shows its overall stats (header row) plus a BUY-signal row and a SELL-signal row separately.
-  Compound = sequential reinvestment assuming equal unit size per trade.
+  Compound = session-weighted sequential reinvestment (same-day signals averaged first, then compounded chronologically).
   Compare Avg Return to the Performance Breakdown above: a method beating the system avg contributes alpha; underperforming in one direction reveals where it adds noise.
 </p>
 {% else %}
@@ -563,7 +581,7 @@ HTML_TEMPLATE = """
 </p>
 {% set meval = perf.method_eval_stats %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
 {# ── conviction-band sub-table macro (inlined as a block for each direction) ── #}
 {% macro band_table(direction_stats) %}
 {% if direction_stats %}
@@ -574,6 +592,9 @@ HTML_TEMPLATE = """
 <div style="margin-bottom:4px;">
   <span style="font-size:12px;color:#94a3b8;">{{ ds.trades }} trade{{ 's' if ds.trades != 1 else '' }}</span>
   &nbsp;<span style="font-size:12px;color:{{ acc_c }};font-weight:700;">{{ ds.directional_accuracy }}% accurate</span>
+  {% if ds.compound_return is defined and ds.compound_return is not none %}
+  &nbsp;<span style="font-size:11px;color:{{ '#4ade80' if ds.compound_return > 0 else '#f87171' }};font-weight:700;">{{ "%+.2f"|format(ds.compound_return) }}% compound</span>
+  {% endif %}
   &nbsp;<span style="font-size:11px;color:{{ cor_c }};">&check; {{ "%+.2f"|format(ds.avg_return_correct) }}%</span>
   <span style="font-size:11px;color:{{ wrg_c }};">&nbsp;&times; {{ "%+.2f"|format(ds.avg_return_wrong) }}%</span>
 </div>
@@ -629,6 +650,9 @@ HTML_TEMPLATE = """
     <span style="font-size:14px;font-weight:700;color:#e2e8f0;">{{ label }}</span>
     <span style="font-size:12px;color:#64748b;">{{ ov.trades }} total</span>
     <span style="font-size:12px;color:{{ acc_c }};font-weight:700;">{{ ov.directional_accuracy }}% overall accuracy</span>
+    {% if ov.compound_return is defined and ov.compound_return is not none %}
+    <span style="font-size:12px;color:{{ '#4ade80' if ov.compound_return > 0 else '#f87171' }};">{{ "%+.2f"|format(ov.compound_return) }}% compound</span>
+    {% endif %}
   </div>
   {# ── BUY section ── #}
   {% if ev.buys %}
@@ -4220,6 +4244,7 @@ def send_recommendations(
 
     html_body = Template(HTML_TEMPLATE).render(
         fmt_et=fmt_et,
+        fmt_price=fmt_price,
         type_colors=TYPE_COLOR,
         generated_at=now_str,
         total=total_analysed or len(all_recs),
