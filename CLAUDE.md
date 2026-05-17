@@ -65,7 +65,7 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 4a. Sector Pairs         — sector_pairs.py → find_sector_pairs(): scans _SECTOR_MAP for stocks and their sector ETF having opposing non-NEUTRAL directions (both ≥35% confidence); forms market-neutral LONG/SHORT pair trades that isolate idiosyncratic alpha from sector beta; ETF_BULL_STOCK_BEAR or ETF_BEAR_STOCK_BULL setups; reported in email but not tracked in trades.json (pair-trade accounting differs from single-leg); no cache (instant)
 4. Signal aggregation    — aggregator.py → per-ticker combined score
 5. Recommendations       — claude_analyst.py → Claude generates BUY/SELL/HOLD/WATCH; DeepSeek V3 (`deepseek-chat`) auto-fallback on any Claude API failure (credits exhausted, 401/402/403/429/5xx, connection error); then rule-based _fallback_recommendations() as last resort
-6. Performance tracking  — tracker.py → paper trades in cache/trades.json; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; fmt_price() formats prices with 2/4/6 decimal places depending on magnitude (handles sub-penny stocks/warrants); _dynamic_half_spread() replaces fixed SPREAD_PCT with price-tiered, asset-type-aware bid-ask model (ETF=1bp, large-cap stock=2bp, penny=$0.01–$0.10→37.5bp, sub-penny→250bp); compute_portfolio_metrics() returns dollar-weighted portfolio return (compound_inception, return_1w, return_2w, return_1m) where each trade is funded by its position_size_multiplier; weighted avg return reported alongside equal-weight avg; method attribution: at entry each trade stores the 10 raw method scores + methods_agreeing list + dominant_method; get_performance_for_email() returns performance_table (unified breakdown rows), trades_svg (inline SVG equity curve + per-trade bars), portfolio_metrics (dollar-weighted time-window returns), method_order_by_winrate (methods ranked by solo win rate for sorted display), attributed_count, and solo_method_perf (hypothetical per-method standalone simulation)
+6. Performance tracking  — tracker.py + daily_nav.py → paper trades in cache/trades.json; entry/exit recorded with `entry_datetime`/`exit_datetime`/`current_price_datetime` (UTC ISO 8601) so every price is anchored to the wall-clock instant it was observed; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; fmt_price() formats prices with 2/4/6 decimal places depending on magnitude (handles sub-penny stocks/warrants); _dynamic_half_spread() replaces fixed SPREAD_PCT with price-tiered, asset-type-aware bid-ask model (ETF=1bp, large-cap stock=2bp, penny=$0.01–$0.10→37.5bp, sub-penny→250bp); **daily_nav.compute_compound_return()** walks every trade day-by-day through the real OHLCV cache (path-faithful: `r_d = sign × (mark_d − mark_{d−1}) / mark_{d−1}` with sign +1 long / −1 short; spread applied only at entry/exit anchors; no geometric interpolation or synthetic uniform-daily returns), capital-weights active positions per date, and compounds sequentially → 100% deterministic given (trades.json, OHLCV cache); compute_portfolio_metrics() returns these daily-walked compounds for `compound_inception`/`return_1w`/`return_2w`/`return_1m`; before the walk, `_refresh_open_trade_ohlcv()` force-refreshes the OHLCV cache for every open-trade ticker (bypassing the 3-day TTL via `get_history(force_refresh=True)`) so the daily walk has a real close for every day the position was held; `_normalize_closed_returns()` re-derives `return_pct` for every closed trade from its stored entry/exit prices through the current spread model each run so summary stats (avg/best/worst/win_rate) reconcile internally; method attribution: at entry each trade stores the 10 raw method scores + methods_agreeing list + dominant_method; `_flip_trade()` produces a same-ticker/same-dates trade dict with action inverted so hypothetical "what-if-this-method-had-decided" scenarios also walk the real daily prices instead of negating a stored number; get_performance_for_email() returns performance_table (unified breakdown rows), trades_svg (inline SVG equity curve + per-trade bars), portfolio_metrics (daily-walked time-window returns), method_order_by_winrate (methods ranked by solo win rate for sorted display), attributed_count, and solo_method_perf (hypothetical per-method standalone simulation)
 7. Charts + email        — charts/, email_sender.py
 ```
 
@@ -85,12 +85,76 @@ To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/s
 **Method attribution** (`tracker.py`): every new trade stores the 10 raw method scores (`news`, `tech`, `insider`, `put_call`, `max_pain`, `oi_skew`, `vwap`, `pattern`, `momentum`, `money_flow`) at entry time plus `methods_agreeing` and `dominant_method`. `get_performance_for_email()` returns:
 - `performance_table`: unified list of breakdown rows (columns: trades, win_rate, compound_return, avg_return, wtd_avg_return, best, worst) grouped as: **total** (All Trades) → **asset** (Stocks only / ETFs only / Commodities only) → **direction** (Longs only BUY / Shorts only SELL) → **method** (per signal method, ≥2 attributed trades required). Rows are rendered in the email "Performance Breakdown" section with visual dividers between groups. **Includes open trades at their current M2M `return_pct`** (maintained each run by `update_open_trades()`) — treated as hypothetical exits so every live position is reflected in the breakdown.
 - `trades_svg`: inline SVG (820×336px dark-theme) with equity curve (top panel) and per-trade return bars (bottom panel). Embedded directly in the email via `{{ perf.trades_svg | safe }}` — no kaleido/Plotly dependency.
-- `portfolio_metrics`: dict from `compute_portfolio_metrics()` — sequential compound portfolio return using a daily-batch model: trades opened on the same calendar day form a session batch whose dollar-weighted return (weighted by `position_size_multiplier`) is compounded in chronological order with all prior batches. 10 sessions of +5% → ~+62.9%, not +5%. Keys: `compound_inception` (all-time sequential compound), `return_1w`, `return_2w`, `return_1m` (sequential compound of batches entered within last 7/14/30 days; open trades included at M2M P&L). Replaces the naive parallel-average in `stats["compound_return"]`. Displayed in the email Portfolio Performance card as time-window tiles.
+- `portfolio_metrics`: dict from `compute_portfolio_metrics()` — delegates to `daily_nav.compute_compound_return()` (see [Performance calculation](#performance-calculation) below) for a path-faithful daily-walked compound over real OHLCV closes. For every calendar day with any active position the engine forms the capital-weighted average daily return across active trades (`Σ(r·w)/Σ(w)` with `w = position_size_multiplier`) and compounds sequentially. Keys: `compound_inception` (every trade ever), `return_1w`/`return_2w`/`return_1m` (trades with `entry_date >= today − N days`; open trades included at the live M2M end-anchor). Overwrites `stats["compound_return"]` so the headline number matches the tiles. Displayed in the email Portfolio Performance card as time-window tiles.
 - `method_order_by_winrate`: list of method keys sorted descending by solo win rate (no-data methods last). Used to order the solo performance and method eval tables in the email — best-performing signals appear first.
 - `attributed_count`: count of trades with `methods_agreeing` populated (used to decide whether method rows appear).
 - `solo_method_perf`: dict from `compute_solo_method_performance()` — for each closed trade with stored method_scores, asks "what direction would this method alone have signalled?" Same direction as actual → actual return; opposite → negated return; |score| < 0.10 (no view) → skipped. Rendered in email section 4b as a standalone table (trades, win_rate, compound_return, avg_return, best, worst per method). Distinct from `performance_table` method rows which only count trades where the method agreed with the aggregated direction.
 - `method_eval_stats`: dict from `compute_method_eval_stats()` — per-method directional accuracy and conviction calibration. For each method: overall directional_accuracy (% correct directions), avg_return_correct, avg_return_wrong, and conviction_bands (Low 0.10–0.35 / Medium 0.35–0.65 / High 0.65+) each with trades, accuracy, avg_return. Rendered in email section 4c as per-method cards. A well-calibrated signal shows rising accuracy Low→High; flat/declining accuracy suggests the method adds noise rather than genuine directional insight.
 Legacy trades without `methods_agreeing` are excluded from method rows but included in total/asset/direction rows.
+
+### Performance calculation
+
+Performance numbers come from two engines that work side-by-side, both rooted in the *real* observed prices stored on each trade — never interpolated, never synthesised.
+
+**Per-trade `return_pct` (buy-and-hold, spread-aware) — `tracker._pct_return()`**
+
+```
+half_in  = _dynamic_half_spread(entry_price, asset_type)
+half_out = _dynamic_half_spread(exit_or_current_price, asset_type)
+BUY  : eff_entry = entry × (1 + half_in);   eff_exit = exit × (1 − half_out)
+       return_pct = (eff_exit − eff_entry) / eff_entry × 100
+SELL : eff_entry = entry × (1 − half_in);   eff_exit = exit × (1 + half_out)
+       return_pct = (eff_entry − eff_exit) / eff_entry × 100
+```
+
+Bid-ask half-spread is **price-tiered and asset-type-aware** (ETF 1 bp; large-cap stock ≥ \$50 → 2 bp; \$10–\$50 → 4 bp; \$1–\$10 → 12.5 bp; \$0.10–\$1 → 37.5 bp; \$0.01–\$0.10 → 100 bp; sub-penny → 250 bp; commodity ≥ \$100 → 1.5 bp, < \$100 → 3 bp). Closed trades use `exit_price`; open trades use the live `current_price` (refreshed each tick by `update_open_trades()`, timestamped via `current_price_datetime`). For open trades this is a "what if you closed right now" mark — same convention as the email's M2M display. `_normalize_closed_returns()` recomputes this each pipeline tick from the stored entry/exit prices so every closed trade's `return_pct` reflects the current spread model.
+
+**Path-faithful daily compound — `daily_nav.compute_compound_return(trades)`**
+
+Per-trade walk:
+1. Load OHLCV closes for the ticker from `cache/ohlcv/<TICKER>.json` (force-refreshed for open-trade tickers via `tracker._refresh_open_trade_ohlcv()` so today−1's close exists).
+2. Build chronological marks: `(entry_date, eff_entry)` → every cached close strictly between → `(exit_date or today, eff_exit)`. Intermediate marks are raw closes, **no spread applied** — those days the position is marked-to-market, not traded.
+3. For each adjacent pair compute `r_d = sign × (mark_d − mark_{d−1}) / mark_{d−1}` with `sign = +1` for BUY, `−1` for SELL. The short formula is path-faithful (depends on adjacent days only), not the buy-and-hold formula — so a volatile short's daily compound legitimately differs from its `return_pct` (volatility decay for daily-rebalanced shorts).
+
+Portfolio aggregation:
+1. Collect every `(date, daily_return, weight)` tuple from every trade (`weight = position_size_multiplier`).
+2. Group by date; per-day portfolio return = `sum(r·w) / sum(w)` over active positions.
+3. Compound sequentially: `compound = ∏(1 + day_return) − 1`.
+
+This is **100% deterministic**: same `trades.json` + same `cache/ohlcv/*.json` produces bit-identical output. Time-window variants (`return_1w`/`return_2w`/`return_1m`) just filter trades by `entry_date >= today − N days` before aggregating.
+
+**Summary statistics — `tracker._compute_segment_stats()`**
+
+For any slice of trades (All / Stocks / ETFs / Commodities / Longs / Shorts / per-method):
+
+| Metric | Formula | Notes |
+|---|---|---|
+| `trades` | `len(trades)` | |
+| `win_rate` | `100 × count(t.return_pct > 0) / len(trades)` | Strictly positive on the spread-adjusted `return_pct`, so a flat round trip is a loss by the spread cost. |
+| `compound_return` | `daily_nav.compute_compound_return(trades)` | Path-faithful daily walk (the engine above). |
+| `avg_return` | `mean(t.return_pct)` | Equal-weighted across trades. |
+| `wtd_avg_return` | `Σ(t.return_pct · t.position_size_multiplier) / Σ(t.position_size_multiplier)` | Capital-weighted. |
+| `best` / `worst` | `max(t.return_pct)` / `min(t.return_pct)` | |
+
+Open trades' `return_pct` is the live M2M from `update_open_trades()` so they contribute to every metric (treated as hypothetical exits). The compound metric uses the daily walk; everything else uses the per-trade `return_pct`. These can diverge for shorts — by design, since path-faithful compound and buy-and-hold are different (both correct) measures.
+
+**Hypothetical solo & eval stats — `tracker._flip_trade()` / `_hypothetical_trades_for_method()`**
+
+For "what if only this method had decided" simulations:
+- If the method's sign matches the actual trade's action → use the trade verbatim (real walk, real `return_pct`).
+- If it disagrees → `_flip_trade()` returns a same-ticker/same-dates trade dict with `action`/`direction` inverted and `return_pct` re-derived via `_pct_return` for the flipped action. The daily-NAV engine then walks the **real OHLCV closes** in the opposite direction — no negation-of-stored-number tricks.
+
+Conviction bands (`_eval_stats`): Low `0.10–0.35`, Medium `0.35–0.65`, High `0.65+` on `|method_score|`. Each band reports `trades`, `accuracy` (% with `return_pct > 0`), `avg_return`, and `compound_return` (also via the daily-walked engine). A well-calibrated method shows rising accuracy Low → Medium → High.
+
+**Trade lifecycle — `tracker.py`**
+
+| Function | When | What it does |
+|---|---|---|
+| `record_new_trades()` | After Claude produces recommendations | Opens a trade per actionable BUY/SELL; stamps `entry_datetime` + `entry_price` together; enforces 3.0× per-sector cap; stores 10 raw method scores + `methods_agreeing` + `dominant_method`. |
+| `close_trades_on_signal_reversal()` | Before opening new trades, if today's actionable signal reverses an open position | Closes with `exit_datetime = current_price_datetime` (most recent live mark) — no second fetch. |
+| `_refresh_open_trade_ohlcv()` | First step of `update_open_trades()` | Force-refreshes OHLCV cache for every open-trade ticker (bypasses 3-day TTL) so the daily walk has a real close for every day held. |
+| `_normalize_closed_returns()` | Second step of `update_open_trades()` | Idempotently rederives `return_pct` for every closed trade through the current spread model. |
+| `update_open_trades()` | Each pipeline tick | Refreshes `current_price` + `current_price_datetime` + `return_pct` for every OPEN trade; auto-closes after `HOLDING_DAYS = 5` weekdays held. |
 
 ### Model routing
 

@@ -186,6 +186,39 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
     return snapshots
 
 
+def _merge_ohlcv(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.DataFrame:
+    """Combine cached bars with a fresh fetch, preferring fresh on overlap.
+
+    Rationale: a force-refresh fetch typically covers only the last 3 months,
+    but the cache may already hold years of older history.  Naive overwrite
+    would silently shrink the cache.  Merging keeps the longest possible
+    history while letting the fresh bars rule within their window so any
+    split / dividend rescaling is propagated forward — the cache stays
+    internally consistent on the new adjustment scale for everything in the
+    fresh window, and retains pre-fresh-window bars as-is.
+
+    Old rows whose dates fall inside the fresh window are dropped (the fresh
+    bars are the source of truth for that range — they reflect the current
+    adjustment scale).  Rows older than the fresh window's first bar are
+    kept untouched.
+    """
+    if fresh is None or fresh.empty:
+        return cached if cached is not None else pd.DataFrame()
+    if cached is None or cached.empty:
+        return fresh
+
+    fresh_dates = {ts.date() for ts in fresh.index}
+    keep_mask   = [ts.date() not in fresh_dates for ts in cached.index]
+    cached_kept = cached.iloc[keep_mask]
+    if cached_kept.empty:
+        return fresh
+    combined = pd.concat([cached_kept, fresh]).sort_index()
+    # Drop any accidental duplicate timestamps (defensive — shouldn't happen
+    # after the keep_mask filter, but tz-aware/naive mixes can sneak through).
+    combined = combined[~combined.index.duplicated(keep="last")]
+    return combined
+
+
 def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -> pd.DataFrame:
     """
     Return OHLCV history for chart generation / technical analysis.
@@ -193,12 +226,15 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
     Checks the OHLCV disk cache first (TTL 3 days).  On a cache miss:
       1. Tries Polygon.io (no per-IP rate-limit concern).
       2. Falls back to yfinance with exponential-backoff retry.
-    Saves successful fetches to the disk cache so callers don't re-fetch.
+    Successful fetches are **merged** with whatever was already cached
+    (`_merge_ohlcv`): fresh bars take precedence inside their window so any
+    split / dividend rescaling propagates, but older history outside the
+    fresh window is retained.  This prevents the force-refresh path from
+    silently truncating long-tail OHLCV history.
 
-    ``force_refresh``: bypass the cache and re-fetch even when the cached
-    last bar is within the 3-day TTL window. Used by the performance tracker
-    to keep open-trade OHLCV fully up to date so the daily-NAV walk has a
-    real close for every day the position was held.
+    ``force_refresh``: bypass the TTL check and re-fetch even when the
+    cached last bar is within the 3-day window. Used by the performance
+    tracker to keep open-trade OHLCV fully up to date.
     """
     from src.data.cache import load_ohlcv, save_ohlcv
     from datetime import date as _date
@@ -214,12 +250,16 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
         logger.debug(f"[market_data] ENABLE_FETCH_DATA=false — skipping history fetch for {ticker}")
         return cached if (cached is not None and not cached.empty) else pd.DataFrame()
 
-    # ── 1. Alpaca ─────────────────────────────────────────────────────────
+    # ── 1. Polygon ────────────────────────────────────────────────────────
     df = polygon_client.get_bars(ticker, period)
     if not df.empty:
-        save_ohlcv(ticker, df)
-        logger.debug(f"[market_data] get_history: fetched {len(df)} bars for {ticker} [polygon]")
-        return df
+        merged = _merge_ohlcv(cached, df)
+        save_ohlcv(ticker, merged)
+        logger.debug(
+            f"[market_data] get_history: fetched {len(df)} bars for {ticker} [polygon] "
+            f"(cache now {len(merged)} bars)"
+        )
+        return merged
 
     # ── 2. yfinance fallback ──────────────────────────────────────────────
     rl_hits = 0
@@ -227,14 +267,16 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
         try:
             df = yf.Ticker(ticker).history(period=period, interval="1d")
             if not df.empty:
-                save_ohlcv(ticker, df)
+                merged = _merge_ohlcv(cached, df)
+                save_ohlcv(ticker, merged)
                 time.sleep(INTER_TICKER)
                 logger.debug(
-                    f"[market_data] get_history: fetched {len(df)} bars for {ticker} [yfinance]"
+                    f"[market_data] get_history: fetched {len(df)} bars for {ticker} [yfinance] "
+                    f"(cache now {len(merged)} bars)"
                 )
-                return df
+                return merged
             logger.warning(f"[market_data] get_history: empty data for {ticker}")
-            return pd.DataFrame()
+            return cached if (cached is not None and not cached.empty) else pd.DataFrame()
 
         except Exception as e:
             if _is_rate_limit(e):

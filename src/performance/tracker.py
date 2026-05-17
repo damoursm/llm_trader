@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 from loguru import logger
 
 from src.models import Recommendation
+from src.performance.spread import _dynamic_half_spread, _pct_return, fmt_price
 from config import settings
 
 TRADES_FILE = Path("cache/trades.json")
@@ -43,8 +44,25 @@ def _load_trades() -> List[dict]:
 
 
 def _save_trades(trades: List[dict]) -> None:
+    """Persist trades to disk, but **skip the write when content is unchanged**.
+
+    ``update_open_trades`` and ``_normalize_closed_returns`` both call this
+    at the end of every pipeline tick — even when nothing actually changed
+    (e.g. ENABLE_FETCH_DATA=false, every closed trade's return_pct already
+    matches the current spread model).  The previous unconditional write
+    bumped trades.json's mtime on every run and showed it as dirty in
+    ``git status`` even when no field had moved.  Comparing the would-be
+    JSON to what's on disk first costs one read but eliminates that noise.
+    """
     TRADES_FILE.parent.mkdir(exist_ok=True)
-    TRADES_FILE.write_text(json.dumps(trades, indent=2, default=str), encoding="utf-8")
+    new_content = json.dumps(trades, indent=2, default=str)
+    if TRADES_FILE.exists():
+        try:
+            if TRADES_FILE.read_text(encoding="utf-8") == new_content:
+                return
+        except Exception:
+            pass  # any read failure → fall through and write
+    TRADES_FILE.write_text(new_content, encoding="utf-8")
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
@@ -68,99 +86,74 @@ def _fetch_price(ticker: str) -> Optional[float]:
 def _now_iso() -> str:
     """Return the current wall-clock instant as a UTC ISO 8601 string.
 
-    Stored on every entry/exit so the price used for the trade is anchored to
-    the exact moment it was fetched — no ambiguity about whether the value
-    is the prior close, a pre-market print, or an intraday mark.
+    Stored as ``decision_datetime`` on every entry/exit so the audit trail
+    captures the exact moment the pipeline made its call — even if the
+    actual fill would have happened later (see ``_execution_iso``).
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _trading_days_held(entry_date: str) -> int:
-    """Count weekdays (Mon–Fri) between entry_date (exclusive) and today (inclusive)."""
+def _execution_iso() -> str:
+    """Return the next realistic execution instant (ISO 8601 UTC).
+
+    Pipeline runs at 8 AM ET, but the equity market doesn't open until 9:30
+    AM ET — so the "8:00:23 AM at \\$77.03" audit line was misleading, no
+    fill could have happened then.  This helper snaps the timestamp forward
+    to the next NYSE session open (today's 9:30 AM ET if before, the next
+    trading day's open if after-close or on a weekend/holiday).  Used as
+    ``entry_datetime`` / ``exit_datetime`` so the recorded execution time
+    actually corresponds to a tradeable moment.
+    """
+    from src.performance.market_calendar import effective_execution_iso
+    return effective_execution_iso()
+
+
+def _reference_close(ticker: str) -> Optional[dict]:
+    """Snapshot the most recent cached OHLCV close for *ticker*.
+
+    Returned as ``{"date": YYYY-MM-DD, "close": float}`` (or ``None`` when
+    the ticker has no cached history).  Stored on every new trade entry and
+    on every exit so the daily-NAV walk can recover the **exact split /
+    dividend adjustment factor** later: if the cache is retroactively
+    rescaled by a corporate action, ``close_series[ref_date] / ref_close``
+    yields the multiplier that brings the recorded entry/exit price back
+    onto the current cache scale, eliminating the phantom-jump bug that
+    naked adjusted-close walks suffer through a split.
+    """
     try:
-        start = date.fromisoformat(entry_date)
-        end = date.today()
-        count = 0
-        current = start + timedelta(days=1)
-        while current <= end:
-            if current.weekday() < 5:  # 0–4 = Mon–Fri
-                count += 1
-            current += timedelta(days=1)
-        return count
+        from src.data.cache import load_ohlcv
+        df = load_ohlcv(ticker)
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+        last_close = float(df["Close"].iloc[-1])
+        if last_close <= 0:
+            return None
+        last_date = df.index[-1].date().isoformat()
+        return {"date": last_date, "close": last_close}
+    except Exception as e:
+        logger.debug(f"[tracker] _reference_close({ticker}) failed: {e}")
+        return None
+
+
+def _trading_days_held(entry_date: str) -> int:
+    """Count NYSE sessions in (entry_date, today] — exclusive of entry, inclusive of today.
+
+    Delegates to ``market_calendar`` so US market holidays (MLK Day, Good
+    Friday, Memorial Day, Juneteenth, Independence Day, Labor Day,
+    Thanksgiving, Christmas, …) are excluded.  The previous implementation
+    counted any weekday, so a trade held across a holiday auto-closed one
+    market day too early.
+    """
+    try:
+        from src.performance.market_calendar import market_days_between
+        return market_days_between(date.fromisoformat(entry_date), date.today())
     except Exception:
         return 0
 
 
-def fmt_price(p) -> str:
-    """Format a price with enough decimal places to show meaningful digits.
-
-    Handles sub-penny stocks/warrants (e.g. 0.003 → '$0.0030') without
-    rounding to '$0.00'.
-    """
-    if p is None:
-        return "N/A"
-    try:
-        p = float(p)
-    except (TypeError, ValueError):
-        return str(p)
-    if p >= 1.0:
-        return f"{p:.2f}"
-    if p >= 0.01:
-        return f"{p:.4f}"
-    return f"{p:.6f}"
-
-
-def _dynamic_half_spread(price: float, asset_type: str = "STOCK") -> float:
-    """One-way bid-ask half-spread as a fraction (not %).
-
-    Realistic tiers (conservative-but-not-pessimistic estimates):
-      ETF       → 1 bp  (sector SPDR ETFs, highly liquid)
-      COMMODITY → price ≥ $100: 1.5 bp (GLD/GDX); else 3 bp (SLV/CPER)
-      STOCK     → price-tiered:
-                   ≥ $50        →   2 bp   (large-cap, tight market)
-                   $10–$50      →   4 bp   (mid-cap)
-                   $1–$10       →  12.5 bp (small-cap / penny approach)
-                   $0.10–$1     →  37.5 bp (micro-cap)
-                   $0.01–$0.10  → 100 bp   (penny stock)
-                   < $0.01      → 250 bp   (sub-penny / warrant)
-    1 bp = 0.0001 fractional.
-    """
-    if asset_type == "ETF":
-        return 0.0001
-    if asset_type == "COMMODITY":
-        return 0.00015 if price >= 100 else 0.0003
-    # STOCK — price-tiered
-    if price >= 50:
-        return 0.0002
-    if price >= 10:
-        return 0.0004
-    if price >= 1:
-        return 0.00125
-    if price >= 0.10:
-        return 0.00375
-    if price >= 0.01:
-        return 0.0100
-    return 0.0250
-
-
-def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK") -> float:
-    """Positive = profitable regardless of direction.
-
-    Applies a realistic dynamic bid-ask spread based on asset type and price tier.
-    Entry and exit spreads are computed separately from their respective prices.
-    BUY:  paid the ask at entry (+half), receive bid at exit (-half).
-    SELL: shorted at the bid at entry (-half), covered at the ask at exit (+half).
-    """
-    entry_half = _dynamic_half_spread(entry, asset_type)
-    exit_half  = _dynamic_half_spread(current, asset_type)
-    if action == "BUY":
-        effective_entry = entry   * (1 + entry_half)
-        effective_exit  = current * (1 - exit_half)
-        return (effective_exit - effective_entry) / effective_entry * 100
-    else:  # SELL = short position
-        effective_entry = entry   * (1 - entry_half)
-        effective_exit  = current * (1 + exit_half)
-        return (effective_entry - effective_exit) / effective_entry * 100
+#   _dynamic_half_spread, _pct_return, and fmt_price live in
+#   src/performance/spread.py — both tracker.py and daily_nav.py import them
+#   from there to keep the dependency tree acyclic.
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
@@ -228,10 +221,13 @@ def _dominant_method(scores: dict, direction: str) -> str:
 def _compute_nav_compound(trades: list) -> Optional[float]:
     """Capital-weighted, time-weighted compound return over *trades* (in %).
 
-    Backed by ``daily_nav.compute_compound_return``: every daily return is
-    derived from the actual cached OHLCV close for that day, not from a
-    geometric split of the trade's total return. 100% deterministic — same
-    input trades always produce the same output.
+    Thin wrapper around ``daily_nav.compute_compound_return``: the engine
+    walks every trade through its real OHLCV closes (no interpolation,
+    no synthetic uniform-daily decomposition) and compounds the per-date
+    capital-weighted portfolio returns only on dates where at least one
+    position produced an event — weekends and market holidays drop out
+    naturally because no close exists for them.  100% deterministic given
+    ``(trades.json, cache/ohlcv/*.json)``.
 
     Accepts trade dicts directly (the previous (entry_str, exit_str, ret_pct,
     weight) tuple form was lossy — it threw away ticker/action/prices needed
@@ -598,16 +594,19 @@ def record_new_trades(
                 f"(sector '{sector}' cap)"
             )
 
-        # Capture the exact instant the price is observed.  Stored alongside
-        # the price so the audit trail is self-explanatory: which value was
-        # used, and when it was sampled.
-        fetched_at = _now_iso()
+        # Capture the exact fetch instant (decision_datetime) AND the
+        # realistic next-session-open (entry_datetime).  The pipeline runs
+        # at 8 AM ET which is BEFORE the equity market opens, so the audit
+        # trail tracks both: when the call was made, and when it could
+        # actually have been filled.
+        decision_at = _now_iso()
+        executed_at = _execution_iso()
         price = _fetch_price(rec.ticker)
         if price is None:
             logger.warning(f"[tracker] Skipping {rec.ticker} — could not fetch entry price")
             continue
         if price <= 0:
-            logger.warning(f"[tracker] Skipping {rec.ticker} — entry price is ${price:.4f} (warrant/delisted?)")
+            logger.warning(f"[tracker] Skipping {rec.ticker} — entry price is {fmt_price(price)} (warrant/delisted/negative?)")
             continue
 
         # Capture per-method scores for attribution analysis
@@ -615,6 +614,16 @@ def record_new_trades(
         agreed   = _methods_agreeing(mscores, rec.direction)
         dominant = _dominant_method(mscores, rec.direction)
 
+        # Reference close at trade time — frozen here so any future split or
+        # special dividend that rescales the cache can be detected and
+        # un-applied by the daily-NAV engine.  None for tickers without
+        # cached history; the walk falls back to a no-adjustment factor.
+        ref = _reference_close(rec.ticker)
+
+        # NOTE: prices are stored at full float64 precision (no round(price,4))
+        # so sub-penny stocks/warrants retain their genuine decimals — the old
+        # 4-decimal rounding lost up to ~5% of accuracy on names like TALKW.
+        # Display formatting is handled by fmt_price() at render time.
         trades.append({
             "ticker": rec.ticker,
             "type": rec.type,
@@ -624,17 +633,23 @@ def record_new_trades(
             "position_size_multiplier": multiplier,
             "sector_key": sector,
             "entry_date": today,
-            "entry_datetime": fetched_at,
-            "entry_price": round(price, 4),
+            "entry_datetime": executed_at,
+            "decision_datetime": decision_at,
+            "entry_price": float(price),
+            "entry_ref_close": ref["close"] if ref else None,
+            "entry_ref_close_date": ref["date"] if ref else None,
             "rationale": rec.rationale,
-            "current_price": round(price, 4),
-            "current_price_datetime": fetched_at,
+            "current_price": float(price),
+            "current_price_datetime": decision_at,
             "return_pct": 0.0,
             "weighted_return_pct": 0.0,
             "days_held": 0,
             "exit_date": None,
             "exit_datetime": None,
+            "exit_decision_datetime": None,
             "exit_price": None,
+            "exit_ref_close": None,
+            "exit_ref_close_date": None,
             "status": "OPEN",
             # Method attribution fields
             "method_scores":    mscores,
@@ -645,7 +660,7 @@ def record_new_trades(
         new_count += 1
         logger.info(
             f"[tracker] Opened {rec.action} {rec.ticker} @ {price:.2f} "
-            f"({fetched_at}) | size={multiplier}× (conf={rec.confidence:.0%})"
+            f"(decision={decision_at}, exec={executed_at}) | size={multiplier}× (conf={rec.confidence:.0%})"
         )
 
     _save_trades(trades)
@@ -685,28 +700,34 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
         # Reuse the most recent intraday mark when available; otherwise
         # capture a fresh sample now and timestamp it.
         if trade.get("current_price"):
-            exit_price = trade["current_price"]
-            exit_at    = trade.get("current_price_datetime") or _now_iso()
+            exit_price       = trade["current_price"]
+            exit_decision_at = trade.get("current_price_datetime") or _now_iso()
         else:
-            exit_at    = _now_iso()
-            exit_price = _fetch_price(trade["ticker"])
-        if not exit_price:
-            logger.warning(f"[tracker] Cannot close {trade['ticker']} on reversal — no price")
+            exit_decision_at = _now_iso()
+            exit_price       = _fetch_price(trade["ticker"])
+        exit_executed_at = _execution_iso()  # realistic next-session fill time
+        if not exit_price or exit_price <= 0:
+            logger.warning(f"[tracker] Cannot close {trade['ticker']} on reversal — no/non-positive price")
             continue
 
         ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"))
         mul = trade.get("position_size_multiplier", 1.0)
-        trade["status"]             = "CLOSED"
-        trade["exit_date"]          = today
-        trade["exit_datetime"]      = exit_at
-        trade["exit_price"]         = round(exit_price, 4)
-        trade["return_pct"]         = round(ret, 3)
-        trade["weighted_return_pct"]= round(ret * mul, 3)
-        trade["days_held"]          = _trading_days_held(trade["entry_date"])
+        exit_ref = _reference_close(trade["ticker"])
+        trade["status"]                 = "CLOSED"
+        trade["exit_date"]              = today
+        trade["exit_datetime"]          = exit_executed_at
+        trade["exit_decision_datetime"] = exit_decision_at
+        trade["exit_price"]             = float(exit_price)
+        trade["exit_ref_close"]         = exit_ref["close"] if exit_ref else None
+        trade["exit_ref_close_date"]    = exit_ref["date"] if exit_ref else None
+        trade["return_pct"]             = round(ret, 3)
+        trade["weighted_return_pct"]    = round(ret * mul, 3)
+        trade["days_held"]              = _trading_days_held(trade["entry_date"])
         closed += 1
         logger.info(
             f"[tracker] Signal reversal → closed {trade['action']} {trade['ticker']} "
-            f"@ {fmt_price(exit_price)} ({exit_at})  return={ret:+.2f}%  (new signal: {new_action})"
+            f"@ {fmt_price(exit_price)} (decision={exit_decision_at}, exec={exit_executed_at})  "
+            f"return={ret:+.2f}%  (new signal: {new_action})"
         )
 
     if closed:
@@ -801,35 +822,46 @@ def update_open_trades() -> None:
         if trade["status"] != "OPEN":
             continue
 
-        # Timestamp every live mark so the audit trail records WHEN the
-        # current_price was observed, not just its value.
-        fetched_at = _now_iso()
+        # Timestamp every live mark.  decision_at = actual fetch instant
+        # (audit truth); executed_at = next realistic fill time (used as
+        # exit_datetime if this refresh triggers auto-close).
+        decision_at = _now_iso()
         price = _fetch_price(trade["ticker"])
         if price is None:
+            continue
+        if price <= 0:
+            logger.warning(f"[tracker] Skipping mark for {trade['ticker']} — non-positive price {fmt_price(price)}")
             continue
 
         days = _trading_days_held(trade["entry_date"])
         ret = _pct_return(trade["action"], trade["entry_price"], price, trade.get("type", "STOCK"))
 
         mul = trade.get("position_size_multiplier", 1.0)
-        trade["current_price"] = round(price, 4)
-        trade["current_price_datetime"] = fetched_at
+        trade["current_price"] = float(price)
+        trade["current_price_datetime"] = decision_at
         trade["return_pct"] = round(ret, 3)
         trade["weighted_return_pct"] = round(ret * mul, 3)
         trade["days_held"] = days
         updated += 1
 
-        # Auto-close after HOLDING_DAYS
+        # Auto-close after HOLDING_DAYS market sessions (real NYSE calendar,
+        # holidays excluded).
         if days >= HOLDING_DAYS:
+            exit_ref = _reference_close(trade["ticker"])
+            executed_at = _execution_iso()
             trade["status"] = "CLOSED"
             trade["exit_date"] = today
-            trade["exit_datetime"] = fetched_at
-            trade["exit_price"] = round(price, 4)
+            trade["exit_datetime"] = executed_at
+            trade["exit_decision_datetime"] = decision_at
+            trade["exit_price"] = float(price)
+            trade["exit_ref_close"]      = exit_ref["close"] if exit_ref else None
+            trade["exit_ref_close_date"] = exit_ref["date"] if exit_ref else None
             closed += 1
             logger.info(
                 f"[tracker] Closed {trade['action']} {trade['ticker']} | "
-                f"entry={fmt_price(trade['entry_price'])} exit={fmt_price(price)} ({fetched_at}) "
-                f"return={ret:+.2f}% over {days}d"
+                f"entry={fmt_price(trade['entry_price'])} exit={fmt_price(price)} "
+                f"(decision={decision_at}, exec={executed_at}) "
+                f"return={ret:+.2f}% over {days} sessions"
             )
 
     _save_trades(trades)

@@ -30,19 +30,74 @@ from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
-# Imported lazily inside functions to avoid a circular import with tracker.py
-# (tracker imports daily_nav, daily_nav refers to tracker spread helper).
+from src.performance.spread import _dynamic_half_spread
 
 
 # ---------------------------------------------------------------------------
 # OHLCV reader
 # ---------------------------------------------------------------------------
 
+def _session_date(ts) -> Optional[date]:
+    """Map an OHLCV index timestamp to its NYSE *session* date.
+
+    Why this needs a dedicated helper:
+      * yfinance returns tz-aware Timestamps localised to ``America/New_York``
+        (midnight ET each session).  After JSON round-trip through the cache
+        these come back as UTC-localised Timestamps at 04:00/05:00 UTC.
+      * Polygon returns naive Timestamps at 00:00 UTC representing the
+        trading date directly (per Polygon's daily-aggregate convention).
+      * Mixing the two — e.g. a cache that was built with yfinance and then
+        refreshed with Polygon, which is exactly what ``_refresh_open_trade_
+        ohlcv`` triggers — used to give off-by-one dates depending on the
+        row's provenance.  The fix is to normalise here, on read.
+
+    Rules:
+      * tz-aware → convert to ``America/New_York`` and take ``.date()``.
+        This yields the session date for both ET-localised (yfinance) and
+        UTC-localised (post-round-trip yfinance) timestamps.
+      * tz-naive → use ``.date()`` directly: Polygon's t = midnight UTC of
+        the session date, so the UTC date equals the session date.
+    """
+    if ts is None:
+        return None
+    try:
+        tz = getattr(ts, "tzinfo", None) or getattr(ts, "tz", None)
+        if tz is not None:
+            try:
+                return ts.tz_convert("America/New_York").date()
+            except (TypeError, AttributeError):
+                return ts.astimezone(_NY_TZ).date()
+        return ts.date()
+    except Exception:
+        try:
+            return date.fromisoformat(str(ts)[:10])
+        except Exception:
+            return None
+
+
+# Imported once at module load — cheap, avoids re-resolving inside the loop.
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+except ImportError:  # pragma: no cover
+    from backports.zoneinfo import ZoneInfo as _ZoneInfo  # type: ignore
+_NY_TZ = _ZoneInfo("America/New_York")
+
+
 def _load_close_series(ticker: str) -> Dict[date, float]:
-    """Return {trading_date: close} for a ticker from the on-disk OHLCV cache.
+    """Return ``{session_date: close}`` for a ticker from the on-disk OHLCV cache.
 
     Returns ``{}`` when the ticker has no cached history.  Pure file read —
     no network access, no fallback.
+
+    Two important filters:
+      * Non-positive closes (corrupt rows, the rare negative-price futures
+        event) are skipped — ``mark / prev_mark`` is undefined there, the
+        daily walk must not produce NaN.
+      * Every timestamp goes through ``_session_date`` so dict keys are
+        always the NYSE trading day in ET, regardless of whether the row
+        came from yfinance (tz-aware) or Polygon (tz-naive).  This matches
+        the ET-localised ``date.today()`` the tracker uses on the user's
+        machine — no off-by-one between trade dates and OHLCV dates.
     """
     from src.data.cache import load_ohlcv
 
@@ -53,8 +108,12 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
     series: Dict[date, float] = {}
     for ts, close in zip(df.index, df["Close"].tolist()):
         try:
-            d = ts.date() if hasattr(ts, "date") else date.fromisoformat(str(ts)[:10])
-            series[d] = float(close)
+            d = _session_date(ts)
+            if d is None:
+                continue
+            c = float(close)
+            if c > 0:
+                series[d] = c
         except Exception:
             continue
     return series
@@ -66,8 +125,6 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
 
 def _effective_entry(entry_price: float, action: str, asset_type: str) -> float:
     """Cash basis paid (BUY) or received (SELL) per share, after the bid-ask half-spread."""
-    from src.performance.tracker import _dynamic_half_spread
-
     half = _dynamic_half_spread(entry_price, asset_type)
     if action == "BUY":
         return entry_price * (1 + half)
@@ -76,8 +133,6 @@ def _effective_entry(entry_price: float, action: str, asset_type: str) -> float:
 
 def _effective_exit(exit_price: float, action: str, asset_type: str) -> float:
     """Cash basis received (BUY exit) or paid (SELL cover) per share."""
-    from src.performance.tracker import _dynamic_half_spread
-
     half = _dynamic_half_spread(exit_price, asset_type)
     if action == "BUY":
         return exit_price * (1 - half)
@@ -89,6 +144,68 @@ def _direction_sign(action: str) -> int:
     return 1 if action == "BUY" else -1
 
 
+def _split_adjustment_factor(
+    ref_close: Optional[float],
+    ref_date_str: Optional[str],
+    close_series: Dict[date, float],
+) -> float:
+    """How much to scale a price recorded at *ref_date_str* into the current
+    cache adjustment scale.
+
+    Mechanism: the OHLCV cache is adjusted (Polygon ``adjusted=true``, yfinance
+    ``auto_adjust=True``), so every retroactive split or special dividend
+    rescales every prior close.  An ``entry_price`` recorded before such an
+    event is on the *old* scale; the walk would otherwise show a phantom price
+    jump on the ex-date.  By comparing the close we saw at trade time
+    (``ref_close``) to what the cache shows for the same date now
+    (``current_close_at_ref``) we recover the exact adjustment ratio and apply
+    it to the recorded price.
+
+    Returns ``1.0`` whenever we can't compute the ratio (no reference data on
+    the trade — legacy entry, missing cache row, non-positive values).  This
+    is the safest fallback: no adjustment is applied, equivalent to assuming
+    no corporate action has occurred.
+    """
+    if not ref_close or not ref_date_str:
+        return 1.0
+    try:
+        ref_d = date.fromisoformat(ref_date_str)
+    except Exception:
+        return 1.0
+    current = close_series.get(ref_d)
+    if current is None or current <= 0 or ref_close <= 0:
+        return 1.0
+    return current / float(ref_close)
+
+
+def _open_trade_end_anchor(
+    entry_d: date,
+    today: date,
+    close_series: Dict[date, float],
+) -> Optional[Tuple[date, float]]:
+    """Pick the deterministic end anchor for an OPEN trade.
+
+    Returns ``(date, close)`` for the most recent cached close in
+    ``[entry_d, today]``, or ``None`` if the cache has no close in that range
+    (e.g. a trade entered today before today's bar has been written).  The
+    intentional consequence: the open-trade compound depends only on which
+    closes are in the cache, not on the wall-clock time the pipeline ran.
+
+    The deliberate trade-off vs the prior ``current_price``-based anchor:
+    intraday moves on day ``today`` aren't reflected until tomorrow's bar
+    lands in the cache.  In exchange the compound is identical for every run
+    that sees the same cache state — i.e., genuinely deterministic given
+    ``(trades.json, cache/ohlcv/*.json)``.
+    """
+    if not close_series:
+        return None
+    candidates = [d for d in close_series if entry_d <= d <= today]
+    if not candidates:
+        return None
+    end_d = max(candidates)
+    return end_d, close_series[end_d]
+
+
 def _build_marks(
     trade: dict,
     today: date,
@@ -96,48 +213,76 @@ def _build_marks(
 ) -> List[Tuple[date, float]]:
     """Build the chronological (date, mark_price) anchor list for one trade.
 
-    First mark : entry_date with the effective entry price (post-spread).
-    Middle     : every cached trading-day close strictly between entry and the
-                 last anchor.
-    Last mark  : exit_date with effective_exit_price (CLOSED) OR
-                 today with the live current_price marked through the spread
-                 (OPEN, treated as a hypothetical close so the compound matches
-                 the stored M2M return_pct).
+    First mark : entry_date with the effective entry price (post-spread,
+                 split-adjusted to the current cache scale).
+    Middle     : every cached trading-day close strictly between entry and
+                 the last anchor.
+    Last mark  : exit_date with effective_exit_price (CLOSED, split-adjusted)
+                 OR the most recent cached close on/before today, marked
+                 through the spread (OPEN — see ``_open_trade_end_anchor``).
+
+    All anchor prices flow through a split-adjustment factor derived from the
+    reference closes recorded at trade time, so a corporate action that
+    happens after the trade is opened does not produce a phantom return.
+    Returns ``[]`` for trades we can't safely walk (missing/negative entry
+    price, missing exit data, no eligible end mark for open trade).
     """
     action     = trade.get("action", "BUY")
     asset_type = trade.get("type", "STOCK")
     entry_px   = trade.get("entry_price")
-    if entry_px is None:
+    if entry_px is None or float(entry_px) <= 0:
         return []
-    eff_entry = _effective_entry(float(entry_px), action, asset_type)
-
     try:
         entry_d = date.fromisoformat(trade["entry_date"])
     except Exception:
         return []
 
+    # Per-anchor split adjustments. Each one converts a price recorded on its
+    # own ref date into the current cache adjustment scale.  Without these,
+    # any split between trade-record-time and now puts the recorded entry/
+    # exit price on a different scale than the cached closes — the walk would
+    # then read a phantom 50%+ daily move on the ex-date.
+    entry_adj = _split_adjustment_factor(
+        trade.get("entry_ref_close"),
+        trade.get("entry_ref_close_date"),
+        close_series,
+    )
+    eff_entry = _effective_entry(float(entry_px), action, asset_type) * entry_adj
+
     # Determine end anchor (date + effective price)
     if trade.get("status") == "CLOSED":
         exit_px = trade.get("exit_price")
+        if exit_px is None or float(exit_px) <= 0:
+            return []
         try:
             end_d = date.fromisoformat(trade["exit_date"])
         except Exception:
             return []
-        if exit_px is None:
-            return []
-        end_mark = _effective_exit(float(exit_px), action, asset_type)
+        exit_adj = _split_adjustment_factor(
+            trade.get("exit_ref_close"),
+            trade.get("exit_ref_close_date"),
+            close_series,
+        )
+        end_mark = _effective_exit(float(exit_px), action, asset_type) * exit_adj
     else:
-        # OPEN: use current_price as the live mark, also through the spread
-        # so the per-trade compound reconciles with the trade's stored
-        # M2M return_pct from _pct_return().
-        cp = trade.get("current_price") or trade.get("entry_price")
-        if cp is None:
+        # OPEN: end at the most recent cached close on/before today. This is
+        # deterministic per calendar day regardless of when the pipeline runs.
+        anchor = _open_trade_end_anchor(entry_d, today, close_series)
+        if anchor is None:
+            # No eligible cached close yet (e.g. entered today, today's bar
+            # not in cache).  Without an end mark we can't compute any daily
+            # return event; the trade contributes nothing to the compound
+            # until the next cache refresh.
             return []
-        end_d    = today
-        end_mark = _effective_exit(float(cp), action, asset_type)
+        end_d, end_close = anchor
+        if end_close <= 0:
+            return []
+        end_mark = _effective_exit(float(end_close), action, asset_type)
 
     if end_d < entry_d:
         end_d = entry_d
+    if eff_entry <= 0 or end_mark <= 0:
+        return []
 
     marks: List[Tuple[date, float]] = [(entry_d, eff_entry)]
 
@@ -186,13 +331,21 @@ def _daily_returns_for_trade(
     weight = float(trade.get("position_size_multiplier", 1.0))
     sign   = _direction_sign(trade.get("action", "BUY"))
 
+    # Walk consecutive valid marks, skipping any non-positive value WITHOUT
+    # updating ``prev_mark``.  A single corrupt cache row (close = 0 / NaN /
+    # negative) used to set prev_mark = 0, which then silenced every
+    # subsequent r_d via the divide-by-zero guard — the trade's end-anchor
+    # return was lost entirely.  Now we just skip the bad row and the next
+    # valid mark compares against the last good price.
     results: List[Tuple[date, float, float]] = []
-    prev_mark = marks[0][1]
+    prev_mark = marks[0][1] if marks[0][1] and marks[0][1] > 0 else None
     for d, mark in marks[1:]:
-        if prev_mark == 0:
-            results.append((d, 0.0, weight))
-        else:
-            results.append((d, sign * (mark - prev_mark) / prev_mark, weight))
+        if mark is None or mark <= 0:
+            continue
+        if prev_mark is None or prev_mark <= 0:
+            prev_mark = mark
+            continue
+        results.append((d, sign * (mark - prev_mark) / prev_mark, weight))
         prev_mark = mark
     return results
 
@@ -208,12 +361,17 @@ def compute_compound_return(
     """Capital-weighted, time-weighted compound return over *trades* (in %).
 
     For each trade we compute the day-by-day MTM return series using actual
-    OHLCV closes (no interpolation). For every calendar day we capital-weight
-    those returns across the positions active that day, then compound the
-    daily portfolio returns sequentially.
+    OHLCV closes (no interpolation).  We then iterate **only the dates where
+    at least one trade produced an event** (i.e. trading days when some
+    position was active and the cache has a close).  On each such date the
+    daily portfolio return is the capital-weighted average of every active
+    position's daily return; those daily portfolio returns are compounded
+    sequentially.  Calendar days with no events contribute nothing (a no-op
+    in compounding), so the walk is automatically free of weekends and
+    holidays — they simply don't appear in ``by_day``.
 
     Returns ``None`` when no trade produces any daily-return event.
-    Values are rounded to two decimals (consistent with the previous engine).
+    Values are rounded to two decimals.
     """
     if not trades:
         return None
@@ -270,9 +428,13 @@ def daily_pnl_breakdown(
 
     sign = _direction_sign(trade.get("action", "BUY"))
     out: List[Tuple[date, float, float]] = []
-    prev_mark = marks[0][1]
+    prev_mark = marks[0][1] if marks[0][1] and marks[0][1] > 0 else None
     for d, mark in marks[1:]:
-        ret_pct = sign * (mark - prev_mark) / prev_mark * 100 if prev_mark else 0.0
-        out.append((d, mark, ret_pct))
+        if mark is None or mark <= 0:
+            continue
+        if prev_mark is None or prev_mark <= 0:
+            prev_mark = mark
+            continue
+        out.append((d, mark, sign * (mark - prev_mark) / prev_mark * 100))
         prev_mark = mark
     return out
