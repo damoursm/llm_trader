@@ -79,6 +79,7 @@ _BASE_WEIGHTS = {
     "pattern":    0.18,   # chart pattern recognition: historical win-rate based score
     "momentum":   0.18,   # perceived value: normalised 1m/3m price trend vs own history
     "money_flow": 0.15,   # accumulation/distribution: MFI + CMF + OBV slope composite
+    "pead":       0.15,   # Post-Earnings Announcement Drift: SUE × time-decay
 }
 
 # Put/call contrarian score mapping
@@ -561,6 +562,21 @@ def _gex_movement_modifier(gex_signal: str) -> float:
     return 1.0
 
 
+def _pead_score_for(ticker: str, pead_context) -> tuple[float, float, int]:
+    """Look up the PEAD signal for ``ticker``.
+
+    Returns ``(pead_score, surprise_pct, days_since_report)``. Defaults to
+    ``(0.0, 0.0, 0)`` when no entry exists — the ticker either has no recent
+    earnings report or its drift window has already decayed to zero.
+    """
+    if pead_context is None:
+        return 0.0, 0.0, 0
+    for sig in pead_context.signals:
+        if sig.ticker.upper() == ticker.upper():
+            return float(sig.pead_score), float(sig.surprise_pct), int(sig.days_since_report)
+    return 0.0, 0.0, 0
+
+
 def build_signals(
     tickers: List[str],
     articles: List[NewsArticle],
@@ -569,6 +585,7 @@ def build_signals(
     gex_context=None,         # Optional[GEXContext]
     market_mode_context=None, # Optional[MarketModeContext]
     opex_context=None,        # Optional[OpExContext]
+    pead_context=None,        # Optional[PEADContext]
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods."""
 
@@ -591,6 +608,8 @@ def build_signals(
     use_momentum   = settings.enable_price_momentum
     # Money flow uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
     use_money_flow = settings.enable_money_flow
+    # PEAD requires a precomputed context (per-ticker SUE × time-decay derived from earnings).
+    use_pead       = settings.enable_pead and pead_context is not None
 
     if not use_news and not use_tech and not use_insider and not use_put_call:
         logger.warning("All analysis methods disabled — no signals will be generated.")
@@ -641,6 +660,7 @@ def build_signals(
         "pattern":    use_pattern,
         "momentum":   use_momentum,
         "money_flow": use_money_flow,
+        "pead":       use_pead,
     }
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     active_count = sum(active_flags.values())
@@ -652,7 +672,8 @@ def build_signals(
         f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
         f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
-        f"momentum={weights['momentum']:.0%}  money_flow={weights['money_flow']:.0%}"
+        f"momentum={weights['momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
+        f"pead={weights['pead']:.0%}"
     )
 
     signals        = []
@@ -741,6 +762,16 @@ def build_signals(
         if use_money_flow:
             money_flow_score, mfi_value, cmf_value = compute_money_flow_score(ticker)
 
+        # ── Method 11: Post-Earnings Announcement Drift (PEAD) ───────────
+        # SUE × time-decay. Positive = bullish drift from recent earnings beat;
+        # negative = bearish drift from recent miss. Decays linearly to 0 over
+        # ``pead_decay_window_days`` (default 60) so signals fade naturally.
+        pead_score_v    = 0.0
+        pead_surprise   = 0.0
+        pead_days       = 0
+        if use_pead:
+            pead_score_v, pead_surprise, pead_days = _pead_score_for(ticker, pead_context)
+
         # ── Weighted combination ──────────────────────────────────────────
         combined = (
             weights["news"]       * sentiment_score +
@@ -752,7 +783,8 @@ def build_signals(
             weights["vwap"]       * vwap_score +
             weights["pattern"]    * pattern_score +
             weights["momentum"]   * momentum_score +
-            weights["money_flow"] * money_flow_score
+            weights["money_flow"] * money_flow_score +
+            weights["pead"]       * pead_score_v
         )
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -785,6 +817,7 @@ def build_signals(
             (use_pattern,    pattern_score),
             (use_momentum,   momentum_score),
             (use_money_flow, money_flow_score),
+            (use_pead,       pead_score_v),
         ]
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
 
@@ -824,6 +857,7 @@ def build_signals(
             ticker=ticker,
             direction=direction,
             confidence=confidence,
+            combined_score=round(combined, 4),
             sentiment_score=round(sentiment_score, 3),
             technical_score=round(technical_score, 3),
             insider_score=round(insider_sc, 3),
@@ -849,6 +883,9 @@ def build_signals(
             money_flow_score=round(money_flow_score, 3),
             mfi_value=round(mfi_value, 2),
             cmf_value=round(cmf_value, 4),
+            pead_score=round(pead_score_v, 3),
+            pead_surprise_pct=round(pead_surprise, 2),
+            pead_days_since_report=int(pead_days),
         ))
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
@@ -858,11 +895,12 @@ def build_signals(
         pat_str  = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
         mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
         mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
+        pead_str = f"  pead={pead_score_v:+.2f}({pead_surprise:+.1f}%/{pead_days}d)" if pead_score_v != 0.0 else ""
         cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}{pead_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

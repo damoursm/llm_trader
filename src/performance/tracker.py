@@ -157,7 +157,7 @@ def _trading_days_held(entry_date: str) -> int:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "money_flow")
+_ALL_METHODS = ("news", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "money_flow", "pead")
 _METHOD_AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as "having a view"
 
 # Category groupings: how methods map to higher-level signal families
@@ -166,6 +166,7 @@ METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Technical":   ["tech", "vwap", "pattern", "momentum", "money_flow"],
     "Smart Money": ["insider"],
     "Options":     ["put_call", "max_pain", "oi_skew"],
+    "Fundamental": ["pead"],
 }
 
 # Human-readable method labels for reports
@@ -180,6 +181,7 @@ METHOD_LABELS: Dict[str, str] = {
     "pattern":  "Pattern Recognition",
     "momentum":   "Price Momentum",
     "money_flow": "Money Flow (MFI+CMF+OBV)",
+    "pead":       "Post-Earnings Drift (PEAD)",
 }
 
 
@@ -202,6 +204,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "pattern":    getattr(sig, "pattern_score", 0.0),
         "momentum":   getattr(sig, "momentum_score", 0.0),
         "money_flow": getattr(sig, "money_flow_score", 0.0),
+        "pead":       getattr(sig, "pead_score", 0.0),
     }
 
 
@@ -614,6 +617,29 @@ def record_new_trades(
         agreed   = _methods_agreeing(mscores, rec.direction)
         dominant = _dominant_method(mscores, rec.direction)
 
+        # Snapshot the entry-time signal state so monitor_open_positions can
+        # later compare today's signal against it for decay detection.
+        sig_at_entry = None
+        pattern_at_entry: Optional[str] = None
+        pattern_score_at_entry: Optional[float] = None
+        if signals_by_ticker is not None:
+            sig = signals_by_ticker.get(rec.ticker)
+            if sig is not None:
+                sig_at_entry = {
+                    "combined_score":  round(float(getattr(sig, "combined_score", 0.0)), 4),
+                    "confidence":      round(float(sig.confidence), 4),
+                    "direction":       sig.direction,
+                    "methods_agreeing": list(agreed),
+                }
+                # Capture the chart pattern present at entry (if any) and the
+                # score it produced — feeds the live pattern registry on close
+                # so subsequent runs can blend live-trade outcomes into the
+                # per-ticker synthetic prior.
+                pn = getattr(sig, "pattern_name", "")
+                if pn:
+                    pattern_at_entry = pn
+                    pattern_score_at_entry = round(float(getattr(sig, "pattern_score", 0.0)), 3)
+
         # Reference close at trade time — frozen here so any future split or
         # special dividend that rescales the cache can be detected and
         # un-applied by the daily-NAV engine.  None for tickers without
@@ -650,11 +676,21 @@ def record_new_trades(
             "exit_price": None,
             "exit_ref_close": None,
             "exit_ref_close_date": None,
+            "exit_reason": None,
             "status": "OPEN",
             # Method attribution fields
             "method_scores":    mscores,
             "methods_agreeing": agreed,
             "dominant_method":  dominant,
+            # Open-position monitoring fields
+            "signal_at_entry":  sig_at_entry,
+            "max_favorable_excursion":  0.0,
+            "mfe_date":                 today,
+            "max_adverse_excursion":    0.0,
+            "mae_date":                 today,
+            # Pattern-registry fields (live outcome feedback loop)
+            "pattern_at_entry":       pattern_at_entry,
+            "pattern_score_at_entry": pattern_score_at_entry,
         })
         sector_exposure[sector] = current_exposure + multiplier
         new_count += 1
@@ -723,6 +759,7 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
         trade["return_pct"]             = round(ret, 3)
         trade["weighted_return_pct"]    = round(ret * mul, 3)
         trade["days_held"]              = _trading_days_held(trade["entry_date"])
+        trade["exit_reason"]            = "signal_reversal"
         closed += 1
         logger.info(
             f"[tracker] Signal reversal → closed {trade['action']} {trade['ticker']} "
@@ -733,6 +770,149 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
     if closed:
         _save_trades(trades)
     return closed
+
+
+# ---------------------------------------------------------------------------
+# Open-position monitoring — signal decay + regime exits
+# ---------------------------------------------------------------------------
+
+def _evaluate_decay(
+    trade: dict,
+    today_signal,
+    macro_regime_context,
+) -> Optional[str]:
+    """Return an ``exit_reason`` string when an open trade should be closed,
+    or ``None`` to keep it open.
+
+    Checks four triggers in priority order:
+      1. ``macro_regime_exit`` — long position while macro is PANIC/RISK_OFF.
+      2. ``signal_flipped``    — oriented combined score crossed against trade.
+      3. ``signal_decay``      — oriented (entry - today) > drop threshold.
+      4. ``confidence_loss``   — today's confidence < floor.
+
+    Trades that lack ``signal_at_entry`` (legacy data) can still trigger 1, 2,
+    and 4 — the decay check (3) needs the entry baseline so is silently skipped.
+    """
+    action = trade.get("action")
+    if action not in ("BUY", "SELL"):
+        return None
+
+    # 1. Macro regime exit (only blocks long positions, matching entry-side logic)
+    if (settings.signal_decay_regime_exit
+            and macro_regime_context is not None
+            and action == "BUY"
+            and getattr(macro_regime_context, "regime", "") in ("PANIC", "RISK_OFF")):
+        return "macro_regime_exit"
+
+    # Need today's signal for the remaining checks
+    if today_signal is None:
+        return None
+
+    today_combined = float(getattr(today_signal, "combined_score", 0.0))
+    today_confidence = float(getattr(today_signal, "confidence", 0.0))
+    direction_sign = 1 if action == "BUY" else -1
+    today_oriented = today_combined * direction_sign
+
+    # 2. Signal flipped — today's combined crossed against the trade
+    if today_oriented < settings.signal_decay_flip_threshold:
+        return "signal_flipped"
+
+    # 3. Signal decay — needs entry baseline
+    entry = trade.get("signal_at_entry") or {}
+    entry_combined = entry.get("combined_score")
+    if entry_combined is not None:
+        entry_oriented = float(entry_combined) * direction_sign
+        decay = entry_oriented - today_oriented
+        if decay > settings.signal_decay_drop_threshold:
+            return "signal_decay"
+
+    # 4. Confidence loss
+    if today_confidence < settings.signal_decay_confidence_floor:
+        return "confidence_loss"
+
+    return None
+
+
+def monitor_open_positions(
+    signals_by_ticker: Optional[dict] = None,
+    macro_regime_context=None,
+) -> int:
+    """For every open trade, compare today's signal to entry and close on
+    deterioration. Returns the number of trades closed.
+
+    Exit reasons it can set:
+      - macro_regime_exit  (PANIC/RISK_OFF while long)
+      - signal_flipped     (oriented combined crossed against the trade)
+      - signal_decay       (entry strength minus today's strength exceeds threshold)
+      - confidence_loss    (today's confidence below floor)
+
+    Designed to run AFTER ``update_open_trades`` (so ``current_price`` is fresh)
+    and BEFORE ``close_trades_on_signal_reversal`` (which still catches the
+    case where a counter-direction recommendation explicitly appeared in the
+    actionable list — that path remains the canonical "we have a new BUY on
+    a ticker we're short" exit).
+    """
+    if not settings.enable_signal_decay_exits:
+        return 0
+
+    trades = _load_trades()
+    today = date.today().isoformat()
+    closed_count = 0
+    decision_at = _now_iso()
+    executed_at = _execution_iso()
+
+    for trade in trades:
+        if trade.get("status") != "OPEN":
+            continue
+
+        today_signal = (signals_by_ticker or {}).get(trade["ticker"])
+        reason = _evaluate_decay(trade, today_signal, macro_regime_context)
+        if reason is None:
+            continue
+
+        # Use the live mark already on the trade (refreshed by update_open_trades).
+        exit_price = trade.get("current_price")
+        if not exit_price or exit_price <= 0:
+            # Try a fresh fetch as a last resort.
+            exit_price = _fetch_price(trade["ticker"])
+            if not exit_price or exit_price <= 0:
+                logger.warning(
+                    f"[monitor] Cannot close {trade['ticker']} ({reason}) — no usable price"
+                )
+                continue
+
+        mul = trade.get("position_size_multiplier", 1.0)
+        ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"))
+        exit_ref = _reference_close(trade["ticker"])
+
+        trade["status"]                 = "CLOSED"
+        trade["exit_date"]              = today
+        trade["exit_datetime"]          = executed_at
+        trade["exit_decision_datetime"] = trade.get("current_price_datetime") or decision_at
+        trade["exit_price"]             = float(exit_price)
+        trade["exit_ref_close"]         = exit_ref["close"] if exit_ref else None
+        trade["exit_ref_close_date"]    = exit_ref["date"] if exit_ref else None
+        trade["return_pct"]             = round(ret, 3)
+        trade["weighted_return_pct"]    = round(ret * mul, 3)
+        trade["days_held"]              = _trading_days_held(trade["entry_date"])
+        trade["exit_reason"]            = reason
+        closed_count += 1
+
+        # Decay logging: show entry vs today combined for context
+        entry = trade.get("signal_at_entry") or {}
+        ec = entry.get("combined_score")
+        tc = float(getattr(today_signal, "combined_score", 0.0)) if today_signal else None
+        cf = float(getattr(today_signal, "confidence", 0.0)) if today_signal else None
+        regime = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
+        logger.info(
+            f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
+            f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  "
+            f"entry_combined={ec}  today_combined={tc}  today_conf={cf}  regime={regime}"
+        )
+
+    if closed_count:
+        _save_trades(trades)
+    return closed_count
 
 
 def _normalize_closed_returns(trades: List[dict]) -> int:
@@ -844,6 +1024,31 @@ def update_open_trades() -> None:
         trade["days_held"] = days
         updated += 1
 
+        # ── MFE / MAE update (pure observability) ────────────────────────
+        # Legacy trades may lack these fields — initialise to current return
+        # so the high-water/low-water marks start from where we are now
+        # and only ratchet in the favourable / unfavourable direction from
+        # this tick forward. New trades come in at 0.0 so this is a no-op
+        # on the entry tick.
+        prev_mfe = trade.get("max_favorable_excursion")
+        prev_mae = trade.get("max_adverse_excursion")
+        if prev_mfe is None:
+            prev_mfe = ret
+            trade["mfe_date"] = today
+        if prev_mae is None:
+            prev_mae = ret
+            trade["mae_date"] = today
+        if ret > prev_mfe:
+            trade["max_favorable_excursion"] = round(ret, 3)
+            trade["mfe_date"] = today
+        else:
+            trade["max_favorable_excursion"] = round(prev_mfe, 3)
+        if ret < prev_mae:
+            trade["max_adverse_excursion"] = round(ret, 3)
+            trade["mae_date"] = today
+        else:
+            trade["max_adverse_excursion"] = round(prev_mae, 3)
+
         # Auto-close after HOLDING_DAYS market sessions (real NYSE calendar,
         # holidays excluded).
         if days >= HOLDING_DAYS:
@@ -856,6 +1061,7 @@ def update_open_trades() -> None:
             trade["exit_price"] = float(price)
             trade["exit_ref_close"]      = exit_ref["close"] if exit_ref else None
             trade["exit_ref_close_date"] = exit_ref["date"] if exit_ref else None
+            trade["exit_reason"]         = "holding_period"
             closed += 1
             logger.info(
                 f"[tracker] Closed {trade['action']} {trade['ticker']} | "
@@ -866,6 +1072,14 @@ def update_open_trades() -> None:
 
     _save_trades(trades)
     logger.info(f"[tracker] Updated {updated} open trade(s), closed {closed}")
+
+    # Feed the live pattern registry with any newly-closed trades that had a
+    # pattern_at_entry. Idempotent — already-registered trades are skipped.
+    try:
+        from src.signals.pattern_registry import record_batch as _pattern_record_batch
+        _pattern_record_batch(trades)
+    except Exception as e:
+        logger.debug(f"[tracker] pattern_registry update skipped: {e}")
 
 
 def log_performance_summary() -> None:

@@ -18,6 +18,7 @@ from src.data.google_trends import fetch_google_trends
 from src.data.reddit_sentiment import fetch_reddit_sentiment
 from src.data.analyst_ratings import fetch_analyst_ratings
 from src.data.earnings import fetch_earnings_surprises, fetch_earnings_context
+from src.data.pead import fetch_pead_context
 from src.data.short_interest import fetch_short_interest
 from src.data.options_flow import fetch_options_flow
 from src.data.sec_filings import fetch_sec_filings
@@ -53,7 +54,7 @@ from src.data.cluster_watchlist import (
 )
 from src.signals.sector_pairs import find_sector_pairs
 from src.notifications.email_sender import send_recommendations
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions
 from src.charts.report import save_html_report
 
 
@@ -241,6 +242,9 @@ def run_pipeline(send_email: bool = False) -> None:
                                       alpha_vantage_key=settings.alpha_vantage_key)
                           if settings.enable_earnings else None)
 
+        f_pead         = (pool.submit(_safe, "pead", fetch_pead_context, tickers)
+                          if settings.enable_pead else None)
+
         f_short        = (pool.submit(_safe, "short", fetch_short_interest, tickers)
                           if settings.enable_short_interest else None)
 
@@ -380,6 +384,7 @@ def run_pipeline(send_email: bool = False) -> None:
     rotation_drivers_context  = get(f_rotation_drivers)
     gex_context               = yf_options.get("gex")
     earnings_context = get(f_earnings_cal)
+    pead_context     = get(f_pead)
 
     # OpEx context — pure date math, computed synchronously (no I/O)
     opex_context = compute_opex_context() if settings.enable_opex else None
@@ -432,6 +437,7 @@ def run_pipeline(send_email: bool = False) -> None:
         gex_context=gex_context,
         market_mode_context=market_mode_context,
         opex_context=opex_context,
+        pead_context=pead_context,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
 
@@ -555,6 +561,15 @@ def run_pipeline(send_email: bool = False) -> None:
 
     # Performance tracking
     update_open_trades()
+    # Open-position monitor: signal-decay / regime-flip exits BEFORE the
+    # counter-recommendation exit path. Catches the case where a held
+    # ticker's thesis has deteriorated but no counter-direction BUY/SELL
+    # appeared in today's top-10 (so close_trades_on_signal_reversal would
+    # silently keep holding it).
+    monitor_open_positions(
+        signals_by_ticker=signals_by_ticker,
+        macro_regime_context=macro_regime_context,
+    )
     close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
     record_new_trades(actionable, signals_by_ticker=signals_by_ticker)
     log_performance_summary()
@@ -597,6 +612,7 @@ def run_pipeline(send_email: bool = False) -> None:
             revision_momentum_context=revision_momentum_context,
             whisper_context=whisper_context,
             earnings_context=earnings_context,
+            pead_context=pead_context,
             gex_context=gex_context,
             opex_context=opex_context,
             seasonality_context=seasonality_context,

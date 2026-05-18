@@ -192,6 +192,15 @@ class Settings(BaseSettings):
     # (cache/patterns/<TICKER>.json, TTL 7 days). Subsequent runs are instant (warm-cache lookup).
     enable_pattern_recognition: bool = True
 
+    # Pattern-registry feedback loop — record the outcome of every real
+    # BUY/SELL the system takes when a chart pattern is active at entry, then
+    # blend that live win rate into the synthetic per-ticker prior used by
+    # compute_pattern_score. Bayesian shrinkage with ``pattern_registry_prior_n``
+    # virtual trials on the synthetic side: live evidence only dominates once
+    # ``live_n >> prior_n``. Stored at ``cache/pattern_registry.json``.
+    enable_pattern_registry: bool = True
+    pattern_registry_prior_n: int = 10
+
     # Market Mode Switching — dynamically adjusts signal weights based on TRENDING/CHOPPY regime.
     # TRENDING (low VIX, healthy breadth): up-weights tech/news, down-weights vwap/put_call.
     # CHOPPY   (high VIX, mixed breadth):  up-weights vwap/put_call, down-weights tech.
@@ -232,6 +241,15 @@ class Settings(BaseSettings):
     # Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
     enable_money_flow: bool = True
 
+    # Post-Earnings Announcement Drift (PEAD) — one of the most-replicated cross-sectional
+    # anomalies in academic finance. Stocks that beat (miss) EPS estimates tend to continue
+    # drifting in the surprise direction for ~60 days as the market under-reacts. Score is
+    # tanh(surprise_pct / surprise_scale_pct) × max(0, 1 − days_since_report / decay_window).
+    # Uses yfinance earnings_dates (same source as enable_earnings); cached daily.
+    enable_pead: bool = True
+    pead_decay_window_days: int = 60       # days for the linear time-decay to reach zero
+    pead_surprise_scale_pct: float = 25.0  # tanh saturation point (±25% surprise -> ±0.76)
+
     # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
     # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the
     # already-fetched FRED macro context (regime, yield curve, inflation, unemployment).
@@ -243,6 +261,31 @@ class Settings(BaseSettings):
     #   2. OpEx Max-Pain Amplifier: boost max_pain weight during OpEx week (0.20) / Triple Witching (0.28)
     #   3. 8-K + Insider Buy: auto-elevate to WATCH when both signals coincide for the same ticker
     enable_catalyst_timing: bool = True
+
+    # ── Open-position monitoring: signal-decay exits + MFE/MAE tracking ──────
+    # For every open trade, every pipeline tick re-evaluates the per-ticker
+    # signal against today's data and exits early when the thesis has
+    # materially deteriorated — even when no counter-direction recommendation
+    # appears in the day's top-10 (which is the gap close_trades_on_signal_reversal
+    # leaves open). Exit triggers, in order of severity:
+    #
+    #   1. signal_flipped     — today's combined score crossed against the trade.
+    #                           For a BUY this means today's combined < flip_threshold
+    #                           (e.g., -0.10). For a SELL, > -flip_threshold.
+    #   2. signal_decay       — signal weakened by more than drop_threshold from entry.
+    #                           Sized in oriented combined-score space so a BUY at
+    #                           +0.65 dropping to +0.10 = 0.55 decay > 0.40 threshold.
+    #   3. confidence_loss    — today's confidence dropped below confidence_floor.
+    #   4. macro_regime_exit  — macro regime flipped to PANIC/RISK_OFF while long;
+    #                           mirrors the existing entry-side block.
+    #
+    # MFE (max favorable excursion) and MAE (max adverse excursion) are tracked
+    # passively on every tick — pure observability, doesn't trigger anything.
+    enable_signal_decay_exits: bool = True
+    signal_decay_flip_threshold: float = -0.10   # oriented combined < this -> flipped
+    signal_decay_drop_threshold: float = 0.40    # oriented (entry - today) > this -> decayed
+    signal_decay_confidence_floor: float = 0.60  # today's confidence < this -> exit
+    signal_decay_regime_exit: bool = True        # exit longs in PANIC/RISK_OFF
 
     # ── Adaptive signal weighting ────────────────────────────────────────────
     # Multiply each method's static weight in the aggregator by a per-method

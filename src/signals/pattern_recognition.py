@@ -317,17 +317,107 @@ def compute_pattern_score(ticker: str) -> Tuple[float, str]:
     inherent = _PATTERN_DIR[current]
     pstats   = library.get("patterns", {}).get(current)
 
+    # ── Synthetic per-ticker prior ──────────────────────────────────────────
     if pstats is None or pstats["count"] < _MIN_PATTERN_N:
-        score = round(_WEAK_PRIOR * inherent, 3)
-        logger.debug(f"[pattern] {ticker}: {current} — sparse history, prior score={score:+.3f}")
-        return score, current
+        syn_win_rate = 0.5 + (_WEAK_PRIOR / 2.0) * inherent   # implies a weak prior
+        syn_n = 0   # treated as no real evidence
+        syn_source = "weak_prior"
+    else:
+        syn_win_rate = float(pstats["win_rate"])
+        syn_n        = int(pstats["count"])
+        syn_source   = "synthetic"
 
-    win_rate = pstats["win_rate"]
-    edge     = (win_rate - 0.5) * 2.0
-    score    = round(max(-1.0, min(1.0, edge * inherent)), 3)
+    # ── Live registry overlay (Bayesian shrinkage) ─────────────────────────
+    blended_wr, blend_info = _blend_with_live_registry(
+        pattern_name=current,
+        ticker=ticker,
+        syn_win_rate=syn_win_rate,
+        syn_n=syn_n,
+    )
+
+    edge  = (blended_wr - 0.5) * 2.0
+    score = round(max(-1.0, min(1.0, edge * inherent)), 3)
 
     logger.debug(
-        f"[pattern] {ticker}: {current}  win_rate={win_rate:.0%}  "
-        f"edge={edge:+.2f}  score={score:+.3f}  (n={pstats['count']})"
+        f"[pattern] {ticker}: {current}  blended_wr={blended_wr:.0%}  "
+        f"edge={edge:+.2f}  score={score:+.3f}  "
+        f"(syn={syn_source} n={syn_n} wr={syn_win_rate:.0%}  {blend_info})"
     )
     return score, current
+
+
+# ── Live-registry blend ───────────────────────────────────────────────────────
+
+def _blend_with_live_registry(
+    pattern_name: str,
+    ticker: str,
+    syn_win_rate: float,
+    syn_n: int,
+) -> Tuple[float, str]:
+    """Blend the synthetic per-ticker prior with the live global win rate.
+
+    Returns ``(blended_win_rate, info_str)``. ``info_str`` is a short tag
+    summarising what was blended in, for the debug log.
+
+    Blending logic
+    ──────────────
+    Let live_n be the number of *real trades* the system has taken when this
+    pattern was active at entry (across all tickers), live_wr their win rate.
+
+      w_live = live_n / (live_n + PRIOR_N)
+      blended_wr = w_live × live_wr + (1 − w_live) × syn_win_rate
+
+    PRIOR_N controls how much live evidence is needed before it dominates the
+    synthetic prior. With PRIOR_N = 10:
+      live_n = 0   → blended = synthetic                   (no evidence yet)
+      live_n = 5   → blended = 0.33 × live + 0.67 × syn   (live has some pull)
+      live_n = 20  → blended = 0.67 × live + 0.33 × syn   (live is dominant)
+      live_n = 50  → blended = 0.83 × live + 0.17 × syn   (live wins)
+
+    If a per-(ticker, pattern) live row exists with n ≥ ``_MIN_TP_LIVE_N``,
+    use it instead of the global aggregate — that's a stronger signal for this
+    specific ticker and overrides the cross-ticker average.
+    """
+    from config import settings as _settings
+    if not getattr(_settings, "enable_pattern_registry", True):
+        return syn_win_rate, "registry_disabled"
+
+    try:
+        from src.signals.pattern_registry import pattern_stats, ticker_pattern_stats
+    except Exception:
+        return syn_win_rate, "registry_unavailable"
+
+    # Prefer per-(ticker, pattern) when meaningfully populated.
+    # NOTE: we use *pattern_accuracy* (did the price move in the pattern's
+    # inherent direction?), NOT *win_rate* (did the system's trade win?).
+    # The synthetic library measures pattern accuracy too, so the blend stays
+    # apples-to-apples. The two diverge when the system overrides the pattern
+    # direction via its other 9 signals (e.g., shorts a bullish pattern); in
+    # that case win_rate is irrelevant to the pattern's own predictive value.
+    tp = ticker_pattern_stats(ticker, pattern_name)
+    if tp is not None and int(tp.get("n", 0)) >= _MIN_TP_LIVE_N:
+        live_acc = tp.get("pattern_accuracy")
+        if live_acc is None:
+            live_acc = tp.get("win_rate") or 0.5   # schema-v1 fallback
+        live_acc = float(live_acc)
+        live_n   = int(tp.get("n", 0))
+        prior_n  = max(1, getattr(_settings, "pattern_registry_prior_n", 10))
+        w_live   = live_n / (live_n + prior_n)
+        blended  = w_live * live_acc + (1 - w_live) * syn_win_rate
+        return blended, f"live(per-ticker)_acc={live_acc:.0%} n={live_n} w={w_live:.2f}"
+
+    glb = pattern_stats(pattern_name)
+    if glb is None:
+        return syn_win_rate, "no_live_data"
+    live_acc = glb.get("pattern_accuracy")
+    if live_acc is None:
+        live_acc = glb.get("win_rate") or 0.5   # schema-v1 fallback
+    live_acc = float(live_acc)
+    live_n   = int(glb.get("n_trades", 0))
+    prior_n  = max(1, getattr(_settings, "pattern_registry_prior_n", 10))
+    w_live   = live_n / (live_n + prior_n)
+    blended  = w_live * live_acc + (1 - w_live) * syn_win_rate
+    return blended, f"live(global)_acc={live_acc:.0%} n={live_n} w={w_live:.2f}"
+
+
+_MIN_TP_LIVE_N = 3   # need at least this many per-(ticker,pattern) trades to override global

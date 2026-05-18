@@ -186,6 +186,26 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
     return snapshots
 
 
+def _normalize_index_tz(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Return a copy of df with the index normalised to tz-naive UTC.
+
+    Why: yfinance returns tz-aware timestamps (often America/New_York or, after
+    a JSON round-trip through the cache, UTC at 04:00/05:00); Polygon returns
+    tz-naive timestamps at midnight UTC of the session date. Mixing these in
+    a single concat triggers ``TypeError: Cannot compare tz-naive and tz-aware
+    timestamps`` on the subsequent sort. Both representations ultimately point
+    at the same NYSE session, so collapsing to tz-naive UTC is safe and gives
+    sort_index something it can actually compare.
+    """
+    if df is None or df.empty:
+        return df
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+        df = df.copy()
+        df.index = idx.tz_convert("UTC").tz_localize(None)
+    return df
+
+
 def _merge_ohlcv(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.DataFrame:
     """Combine cached bars with a fresh fetch, preferring fresh on overlap.
 
@@ -201,11 +221,17 @@ def _merge_ohlcv(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.Data
     bars are the source of truth for that range — they reflect the current
     adjustment scale).  Rows older than the fresh window's first bar are
     kept untouched.
+
+    Both inputs go through ``_normalize_index_tz`` first so a tz-aware cache
+    + tz-naive fresh fetch (or vice versa) doesn't crash the sort.
     """
     if fresh is None or fresh.empty:
         return cached if cached is not None else pd.DataFrame()
     if cached is None or cached.empty:
-        return fresh
+        return _normalize_index_tz(fresh)
+
+    cached = _normalize_index_tz(cached)
+    fresh = _normalize_index_tz(fresh)
 
     fresh_dates = {ts.date() for ts in fresh.index}
     keep_mask   = [ts.date() not in fresh_dates for ts in cached.index]

@@ -242,6 +242,40 @@ class EarningsContext(BaseModel):
     summary: str
 
 
+class PEADSignal(BaseModel):
+    """Per-ticker Post-Earnings Announcement Drift signal."""
+    ticker: str
+    report_date: date            # date of the latest earnings report
+    days_since_report: int       # 0 = today; signal decays linearly to 0 at decay_window
+    actual_eps: Optional[float] = None
+    estimated_eps: Optional[float] = None
+    surprise_pct: float          # (actual - estimate) / |estimate| * 100
+    sue_normalized: float        # tanh(surprise_pct / surprise_scale_pct), ∈ [-1, +1]
+    time_decay: float            # max(0, 1 - days_since_report / decay_window), ∈ [0, 1]
+    pead_score: float            # sue_normalized * time_decay, ∈ [-1, +1]
+    direction: str               # BULLISH | BEARISH | NEUTRAL
+    summary: str
+
+
+class PEADContext(BaseModel):
+    """Post-Earnings Announcement Drift signals across the universe.
+
+    PEAD is one of the most-replicated cross-sectional anomalies in academic
+    finance: stocks that beat (miss) earnings tend to continue drifting in
+    the surprise direction for ~60 days as the market under-reacts to the
+    information at announcement. Score = standardized unexpected earnings ×
+    time-decay so the signal fades to zero as the post-announcement window
+    closes.
+    """
+    signals: List[PEADSignal]
+    report_date: date
+    decay_window_days: int
+    surprise_scale_pct: float
+    top_drift_bullish: List[str] = []   # tickers with strongest positive scores
+    top_drift_bearish: List[str] = []   # tickers with strongest negative scores
+    summary: str
+
+
 class GEXSignal(BaseModel):
     """Gamma Exposure (GEX) signal for a single ticker."""
     ticker: str
@@ -836,6 +870,9 @@ class TickerSignal(BaseModel):
     ticker: str
     direction: Direction
     confidence: float           # 0.0 – 1.0
+    combined_score: float = 0.0 # -1.0 to +1.0 weighted sum of method scores (pre-confidence factors).
+                                # Stored so monitor_open_positions can compare today's signal
+                                # against signal_at_entry to detect thesis decay.
     sentiment_score: float      # -1.0 to +1.0  (news + all article-based sources)
     technical_score: float      # -1.0 to +1.0
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)
@@ -866,6 +903,10 @@ class TickerSignal(BaseModel):
     money_flow_score: float = 0.0  # [-1, +1] accumulation/distribution composite (MFI+CMF+OBV)
     mfi_value: float = 50.0        # raw MFI reading 0–100 (< 20 = accumulation, > 80 = distribution)
     cmf_value: float = 0.0         # raw CMF reading [-1, +1] (positive = accumulation)
+    # PEAD (Post-Earnings Announcement Drift) — populated when enable_pead=true
+    pead_score: float = 0.0          # [-1, +1] SUE × time-decay
+    pead_surprise_pct: float = 0.0   # most recent EPS surprise %
+    pead_days_since_report: int = 0  # 0 = today; signal fades to 0 at decay_window
 
 
 class Recommendation(BaseModel):
