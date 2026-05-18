@@ -105,6 +105,83 @@ _SECTOR_ALIGN_PENALTY = 0.75
 _AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as having a view
 
 
+# ── Adaptive weight multipliers (data-informed reweighting) ──────────────────
+
+def _adaptive_weight_multipliers() -> dict:
+    """Return ``{method: multiplier}`` derived from each method's solo win rate.
+
+    Pulls per-method standalone performance from
+    ``tracker.compute_solo_method_performance`` (which is "what direction
+    would this method alone have signalled? was that direction right?") and
+    maps each win rate to a multiplier centred at 1.0× for a 50% (coin-flip)
+    win rate.
+
+    Bayesian shrinkage with ``adaptive_weight_prior_n`` virtual trials at 50%
+    keeps a method that's only fired a few times from getting an outsized
+    boost or cut — a 3-for-3 method gets a much smaller boost than a 30-for-
+    30 one, since the second one is much harder to do by chance.
+
+      shrunk_wr  = (wins + 0.5 × prior_n) / (n + prior_n)
+      raw_mult   = shrunk_wr / 0.5            → 1.0 at 50% WR
+      multiplier = clip(raw_mult, min_mult, max_mult)
+
+    Returns ``{method: 1.0}`` for every method when:
+      * the feature flag is off,
+      * the tracker has no attribution data yet, or
+      * the perf lookup raises (unavailable cache, import failure, …).
+
+    The result is meant to be multiplied into the active weight profile
+    *before* normalisation, so it composes with regime overrides and the
+    OpEx amplifier instead of overriding them.
+    """
+    default = {m: 1.0 for m in _BASE_WEIGHTS}
+    if not settings.enable_adaptive_weights:
+        return default
+
+    try:
+        from src.performance.tracker import compute_solo_method_performance
+        perf = compute_solo_method_performance()
+    except Exception as e:
+        logger.debug(f"[aggregator] adaptive weights — solo perf unavailable: {e}")
+        return default
+    if not perf:
+        return default
+
+    prior_n = max(0, settings.adaptive_weight_prior_n)
+    min_m = settings.adaptive_weight_min_multiplier
+    max_m = settings.adaptive_weight_max_multiplier
+
+    multipliers = {}
+    for method in _BASE_WEIGHTS:
+        overall = perf.get(method, {}).get("overall", {})
+        n = int(overall.get("trades", 0) or 0)
+        wr_pct = float(overall.get("win_rate", 50.0) or 50.0)
+        wins = n * (wr_pct / 100.0)
+        # Bayesian shrinkage toward the 50% prior
+        shrunk_wr = (wins + 0.5 * prior_n) / (n + prior_n) if (n + prior_n) > 0 else 0.5
+        raw_mult = shrunk_wr / 0.5  # 1.0 at 50% WR; 2.0 at 100% WR; 0.0 at 0% WR
+        multipliers[method] = round(max(min_m, min(max_m, raw_mult)), 3)
+
+    return multipliers
+
+
+def _apply_adaptive_multipliers(weight_profile: dict) -> tuple[dict, dict]:
+    """Multiply every weight in ``weight_profile`` by its adaptive multiplier.
+
+    Returns ``(new_profile, multipliers)`` so the caller can log which
+    methods got boosted or cut. When adaptivity is off or yields all-1.0
+    multipliers, the profile is returned unchanged.
+    """
+    mults = _adaptive_weight_multipliers()
+    if all(abs(m - 1.0) < 1e-6 for m in mults.values()):
+        return dict(weight_profile), mults
+    new_profile = {
+        m: weight_profile.get(m, 0.0) * mults.get(m, 1.0)
+        for m in weight_profile
+    }
+    return new_profile, mults
+
+
 # ── Per-method score helpers ──────────────────────────────────────────────────
 
 def _detect_insider_cluster(ticker: str, trades: List[InsiderTrade]) -> tuple[bool, int]:
@@ -525,6 +602,21 @@ def build_signals(
             and market_mode_context is not None
             and market_mode_context.mode != "NEUTRAL"):
         weight_profile = market_mode_context.weight_profile
+
+    # Adaptive reweighting — multiply each method's weight by a multiplier
+    # derived from its rolling solo win rate. Composes with whichever profile
+    # is active (base or market-mode override); the OpEx amplifier below
+    # still overrides max_pain explicitly.
+    if settings.enable_adaptive_weights:
+        base_for_adaptive = dict(weight_profile or _BASE_WEIGHTS)
+        weight_profile, adaptive_mults = _apply_adaptive_multipliers(base_for_adaptive)
+        non_trivial = {m: v for m, v in adaptive_mults.items() if abs(v - 1.0) >= 0.05}
+        if non_trivial:
+            ranked = sorted(non_trivial.items(), key=lambda kv: -kv[1])
+            logger.info(
+                "Adaptive weights — solo-WR multipliers: "
+                + "  ".join(f"{m}={v:.2f}x" for m, v in ranked)
+            )
 
     # OpEx max-pain amplifier — boost max_pain weight during OpEx / Triple Witching week
     if (settings.enable_catalyst_timing

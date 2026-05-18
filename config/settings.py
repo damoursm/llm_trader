@@ -244,6 +244,28 @@ class Settings(BaseSettings):
     #   3. 8-K + Insider Buy: auto-elevate to WATCH when both signals coincide for the same ticker
     enable_catalyst_timing: bool = True
 
+    # ── Adaptive signal weighting ────────────────────────────────────────────
+    # Multiply each method's static weight in the aggregator by a per-method
+    # multiplier derived from its rolling solo win rate (data from
+    # ``tracker.compute_solo_method_performance``). Methods that have been
+    # right historically get up-weighted; methods that have underperformed
+    # 50% get down-weighted. Bayesian shrinkage with ``prior_n`` virtual
+    # trials at 50% smooths small-sample noise so 3-for-3 doesn't immediately
+    # blow up to 2× weight.
+    #
+    # Formula:
+    #   shrunk_wr = (wins + 0.5 × prior_n) / (n + prior_n)         in [0, 1]
+    #   raw_mult  = shrunk_wr / 0.5                                 → 1.0 at 50% WR
+    #   final     = clip(raw_mult, min_multiplier, max_multiplier)
+    #
+    # The multiplier is applied on top of whichever weight_profile is active
+    # (base, market-mode override, or opex amplifier). So adaptivity composes
+    # with regime-aware weighting rather than overriding it.
+    enable_adaptive_weights: bool = True
+    adaptive_weight_prior_n: int = 10              # virtual trades at 50% WR (Bayesian prior)
+    adaptive_weight_min_multiplier: float = 0.5    # floor: a bad method keeps at least half its baseline
+    adaptive_weight_max_multiplier: float = 2.0    # cap:   a great method gets at most double
+
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 

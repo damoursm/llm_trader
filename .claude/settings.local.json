@@ -17,7 +17,11 @@
       "Bash(del _move_attribution.py)",
       "PowerShell(\\(Get-Content C:\\\\Users\\\\mathi\\\\PycharmProjects\\\\llm_trader\\\\src\\\\performance\\\\tracker.py | Measure-Object -Line\\).Lines)",
       "Bash(awk NR>=1300 && NR<=1500 *)",
-      "Bash(awk NR>=1500 && NR<=1700 *)"
+      "Bash(awk NR>=1500 && NR<=1700 *)",
+      "Bash(git restore *)",
+      "Bash(git check-ignore *)",
+      "Bash(ls scripts *)",
+      "Bash(ls src/performance/risk.py)"
     ]
   }
 }
