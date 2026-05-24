@@ -1068,6 +1068,28 @@ When `ENABLE_SENTIMENT_VELOCITY=true`, computes the **rate of change** of news t
 
 ---
 
+### Step 3M — Trend Strength (`src/signals/trend_strength.py`)
+
+When `ENABLE_TREND_STRENGTH=true`, computes a trend-**quality** signal for each ticker by combining two of the most empirically durable technical systems. It answers a question the rest of the stack doesn't: *is price in a strong, confirmed directional trend, and which way?* — distinct from price momentum (which measures the *size* of the return) and from RSI/Bollinger (which measure overbought/oversold). Uses the OHLCV chart cache first (works with `ENABLE_FETCH_DATA=false`); minimum 50 bars.
+
+**1. ADX / DMI (Welles Wilder, 1978).** `+DI` and `-DI` measure upward vs downward directional movement (Wilder-smoothed); **ADX** measures trend strength independent of direction:
+
+| ADX | Meaning |
+|---|---|
+| < 20 | No trend (chop) — directional signals unreliable; score is dampened toward 0 |
+| 25–40 | Established trend |
+| > 40 | Very strong trend |
+
+Direction = `(+DI − -DI) / (+DI + -DI)` ∈ [−1, +1], scaled by `clip((ADX − 15)/30, 0, 1)`.
+
+**2. Donchian channel breakout (the "Turtle" system).** A close above the prior 20-day high is a long breakout (+1); below the prior 20-day low, a short breakout (−1); between the bands, a mild lean toward the nearer band.
+
+**Composite score** ∈ [−1, +1]: `score = clip(0.60 × adx_dir + 0.40 × donchian, -1, +1)`. Positive = confirmed uptrend; negative = confirmed downtrend; near zero = chop (dampened by design rather than guessing). A `trend_strength_label` (`STRONG_UPTREND`, `BREAKOUT_UP`, `NO_TREND`, …) is stored for display.
+
+**Aggregator integration:** method `trend_strength`, base weight **0.15**, on `TickerSignal.trend_strength_score` (+ `adx_value`, `trend_strength_label`). Tracked in performance attribution under **Technical**. Claude receives a per-ticker `TrendStrength` line and instruction **16b** (treat it as a trend-following confirmation/gate: lean into strong aligned trends and 20-day breakouts; in ADX < 20 chop, prefer mean-reversion setups). Email: per-ticker row + a **Trend Strength Leaderboard** (strongest confirmed up/down trends). Tunable via `TREND_ADX_PERIOD` (14) and `TREND_DONCHIAN_PERIOD` (20). Disable with `ENABLE_TREND_STRENGTH=false`.
+
+---
+
 ### Step 3E — Price Momentum / Perceived Value (`src/signals/price_momentum.py`)
 
 When `ENABLE_PRICE_MOMENTUM=true`, computes a normalised multi-period price momentum score for each ticker. **Academic basis:** Jegadeesh & Titman (1993) showed that stocks outperforming over 3–12 months continue to outperform over the next 3–12 months — one of the most replicated factors in finance. The underlying mechanism is perceived value: as prices rise, investors perceive higher intrinsic value, attracting further capital and reinforcing the trend.

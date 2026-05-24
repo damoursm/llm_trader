@@ -472,7 +472,7 @@ HTML_TEMPLATE = """
 </p>
 {% set solo = perf.solo_method_perf %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'trend_strength', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
 <table class="pt">
   <thead>
     <tr>
@@ -584,7 +584,7 @@ HTML_TEMPLATE = """
 </p>
 {% set meval = perf.method_eval_stats %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'trend_strength', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
 {# ── conviction-band sub-table macro (inlined as a block for each direction) ── #}
 {% macro band_table(direction_stats) %}
 {% if direction_stats %}
@@ -1021,6 +1021,30 @@ HTML_TEMPLATE = """
         {% else %}Balanced money flow — no clear institutional conviction.{% endif %}
         {% if mfi < 20 %} MFI &lt; 20 = oversold/accumulation zone.{% elif mfi > 80 %} MFI &gt; 80 = overbought/distribution zone.{% endif %}
         <span style="color:#64748b;font-size:10px;"> (MFI 14-period + CMF 20-period + OBV slope)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Trend Strength (ADX/DMI + Donchian) -->
+    {% if enable_trend_strength and sig.trend_strength_score is defined and sig.trend_strength_score != 0 %}
+    {% set tss = sig.trend_strength_score %}
+    {% set adxv = sig.adx_value if sig.adx_value is defined else 0 %}
+    {% set tlbl = sig.trend_strength_label if sig.trend_strength_label is defined else '' %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Trend Strength</span>
+        <span class="mscore {{ 'sp' if tss > 0 else 'sn' }}">{{ "%+.2f"|format(tss) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">ADX={{ '%.0f'|format(adxv) }} | {{ tlbl.replace('_', ' ') }}</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (tss|abs * 100)|int }}%;background:{{ '#16a34a' if tss >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if adxv < 20 %}ADX &lt; 20 — no trend (chop); trend signal dampened, mean-reversion setups more reliable here.
+        {% elif tss > 0.3 %}Confirmed uptrend (ADX={{ '%.0f'|format(adxv) }}) — trend-following buy bias; pullbacks buyable.
+        {% elif tss < -0.3 %}Confirmed downtrend (ADX={{ '%.0f'|format(adxv) }}) — rallies sellable; confirms short theses.
+        {% else %}Developing/weak trend — direction not yet decisively confirmed.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (Wilder ADX/DMI + Donchian 20-day breakout)</span>
       </div>
     </div>
     {% endif %}
@@ -4241,6 +4265,55 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5y — TREND STRENGTH LEADERBOARD
+     ══════════════════════════════════════ -->
+{% set ts_signals = signals | selectattr('trend_strength_score', 'defined') | selectattr('trend_strength_score', 'ne', 0) | list if signals else [] %}
+{% set ts_leaders = ts_signals | sort(attribute='trend_strength_score', reverse=true) | list %}
+{% set top_ts = ts_leaders[:5] %}
+{% set bot_ts = ts_leaders[-5:] | reverse | list %}
+{% if top_ts %}
+<h2>Trend Strength <span style="font-size:13px;font-weight:400;color:#94a3b8;">(ADX/DMI + Donchian breakout — trend quality &amp; direction)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 14px 0;">
+    Wilder's ADX/DMI (trend direction × strength) + the 20-day Donchian (Turtle) breakout. Score &gt; 0 = confirmed uptrend, &lt; 0 = confirmed downtrend; ADX &lt; 20 = no trend (chop) and the score is dampened toward 0.
+  </p>
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Strongest Confirmed Uptrends</div>
+      {% for s in top_ts if s.trend_strength_score > 0 %}
+      {% set bar_w = [(s.trend_strength_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.trend_strength_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">ADX={{ '%.0f'|format(s.adx_value) }} | {{ s.trend_strength_label.replace('_', ' ') }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Strongest Confirmed Downtrends</div>
+      {% for s in bot_ts if s.trend_strength_score < 0 %}
+      {% set bar_w = [(s.trend_strength_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.trend_strength_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">ADX={{ '%.0f'|format(s.adx_value) }} | {{ s.trend_strength_label.replace('_', ' ') }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Aggregator weight 0.15. Trend-following / breakout confirmation — strongest when ADX ≥ 25 and aligned with news, technical, and flow. In ADX &lt; 20 chop, prefer mean-reversion setups.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5z — MONEY FLOW LEADERBOARD
      ══════════════════════════════════════ -->
 {% set mf_signals = signals | selectattr('money_flow_score', 'defined') | selectattr('money_flow_score', 'ne', 0) | list if signals else [] %}
@@ -4651,6 +4724,7 @@ def send_recommendations(
     )
     active_methods = sum([
         use_news,
+        settings.enable_sentiment_velocity,
         use_tech,
         use_insider,
         settings.enable_put_call,
@@ -4660,6 +4734,7 @@ def send_recommendations(
         settings.enable_pattern_recognition,
         settings.enable_price_momentum,
         settings.enable_money_flow,
+        settings.enable_trend_strength,
         settings.enable_pead,
         settings.enable_iv_rank,
         settings.enable_iv_expr and settings.enable_gex,  # iv_expr requires GEX
@@ -4786,6 +4861,7 @@ def send_recommendations(
         use_pattern=settings.enable_pattern_recognition,
         enable_price_momentum=settings.enable_price_momentum,
         enable_money_flow=settings.enable_money_flow,
+        enable_trend_strength=settings.enable_trend_strength,
         enable_pead=settings.enable_pead,
         enable_iv_rank=settings.enable_iv_rank,
         enable_iv_expr=settings.enable_iv_expr,
@@ -4950,7 +5026,7 @@ def send_recommendations(
                 "news": "News", "tech": "Technical", "insider": "Smart Money",
                 "put_call": "Put/Call", "max_pain": "Max Pain", "oi_skew": "OI Skew",
                 "vwap": "VWAP", "pattern": "Pattern",
-                "momentum": "Price Momentum", "money_flow": "Money Flow",
+                "momentum": "Price Momentum", "money_flow": "Money Flow", "trend_strength": "Trend Strength",
                 "pead": "PEAD", "iv_rank": "IV Rank", "iv_expr": "IV Expression",
                 "coint": "Cointegration",
             }

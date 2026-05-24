@@ -52,6 +52,7 @@ from src.signals.vwap import compute_vwap_score
 from src.signals.pattern_recognition import compute_pattern_score
 from src.signals.price_momentum import compute_price_momentum_score
 from src.signals.money_flow import compute_money_flow_score
+from src.signals.trend_strength import compute_trend_strength_score
 from src.signals.iv_rank import compute_iv_rank_score
 from src.signals.iv_expr import compute_iv_expr_score
 
@@ -83,6 +84,7 @@ _BASE_WEIGHTS = {
     "pattern":    0.18,   # chart pattern recognition: historical win-rate based score
     "momentum":   0.18,   # perceived value: normalised 1m/3m price trend vs own history
     "money_flow": 0.15,   # accumulation/distribution: MFI + CMF + OBV slope composite
+    "trend_strength": 0.15,  # ADX/DMI trend quality + Donchian breakout (trend-following)
     "pead":       0.15,   # Post-Earnings Announcement Drift: SUE × time-decay
     "iv_rank":    0.13,   # IV Rank + directional: regime-aware contrarian / trend bias from RV percentile
     "iv_expr":    0.12,   # IV Expression: stock-vs-options bias from real chain IV + oi_skew
@@ -713,6 +715,8 @@ def build_signals(
     use_momentum   = settings.enable_price_momentum
     # Money flow uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
     use_money_flow = settings.enable_money_flow
+    # Trend strength (ADX/DMI + Donchian) is cache-first too; works with ENABLE_FETCH_DATA=false.
+    use_trend_strength = settings.enable_trend_strength
     # PEAD requires a precomputed context (per-ticker SUE × time-decay derived from earnings).
     use_pead       = settings.enable_pead and pead_context is not None
     # IV Rank uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
@@ -772,6 +776,7 @@ def build_signals(
         "pattern":    use_pattern,
         "momentum":   use_momentum,
         "money_flow": use_money_flow,
+        "trend_strength": use_trend_strength,
         "pead":       use_pead,
         "iv_rank":    use_iv_rank,
         "iv_expr":    use_iv_expr,
@@ -788,6 +793,7 @@ def build_signals(
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
         f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
         f"momentum={weights['momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
+        f"trend={weights['trend_strength']:.0%}  "
         f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
         f"coint={weights['coint']:.0%}"
     )
@@ -898,6 +904,16 @@ def build_signals(
         if use_money_flow:
             money_flow_score, mfi_value, cmf_value = compute_money_flow_score(ticker)
 
+        # ── Method 10b: Trend Strength (ADX/DMI + Donchian breakout) ─────
+        # Wilder directional movement scaled by ADX trend strength + Turtle
+        # 20-day channel breakout. Positive = confirmed uptrend; negative =
+        # confirmed downtrend; ~0 = chop (signal intentionally dampened).
+        trend_strength_score = 0.0
+        adx_value            = 0.0
+        trend_label          = "NO_DATA"
+        if use_trend_strength:
+            trend_strength_score, adx_value, trend_label = compute_trend_strength_score(ticker)
+
         # ── Method 11: Post-Earnings Announcement Drift (PEAD) ───────────
         # SUE × time-decay. Positive = bullish drift from recent earnings beat;
         # negative = bearish drift from recent miss. Decays linearly to 0 over
@@ -951,6 +967,7 @@ def build_signals(
             weights["pattern"]    * pattern_score +
             weights["momentum"]   * momentum_score +
             weights["money_flow"] * money_flow_score +
+            weights["trend_strength"] * trend_strength_score +
             weights["pead"]       * pead_score_v +
             weights["iv_rank"]    * iv_rank_score_v +
             weights["iv_expr"]    * iv_expr_score_v +
@@ -988,6 +1005,7 @@ def build_signals(
             (use_pattern,    pattern_score),
             (use_momentum,   momentum_score),
             (use_money_flow, money_flow_score),
+            (use_trend_strength, trend_strength_score),
             (use_pead,       pead_score_v),
             (use_iv_rank,    iv_rank_score_v),
             (use_iv_expr,    iv_expr_score_v),
@@ -1063,6 +1081,9 @@ def build_signals(
             money_flow_score=round(money_flow_score, 3),
             mfi_value=round(mfi_value, 2),
             cmf_value=round(cmf_value, 4),
+            trend_strength_score=round(trend_strength_score, 3),
+            adx_value=round(adx_value, 2),
+            trend_strength_label=trend_label,
             pead_score=round(pead_score_v, 3),
             pead_surprise_pct=round(pead_surprise, 2),
             pead_days_since_report=int(pead_days),
@@ -1084,6 +1105,7 @@ def build_signals(
         pat_str  = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
         mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
         mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
+        ts_str   = f"  trend={trend_strength_score:+.2f}(adx={adx_value:.0f},{trend_label})" if trend_strength_score != 0.0 else ""
         pead_str = f"  pead={pead_score_v:+.2f}({pead_surprise:+.1f}%/{pead_days}d)" if pead_score_v != 0.0 else ""
         ivr_str  = f"  ivr={iv_rank_score_v:+.2f}(ir={iv_rank_v:.0f},{iv_rank_label_v})" if iv_rank_score_v != 0.0 else ""
         ivx_str  = f"  ivx={iv_expr_score_v:+.2f}(ir={iv_expr_rank_v:.0f},{iv_expr_label_v})" if iv_expr_score_v != 0.0 else ""
@@ -1094,7 +1116,7 @@ def build_signals(
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}{pead_str}{ivr_str}{ivx_str}{coint_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

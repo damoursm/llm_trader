@@ -174,6 +174,11 @@ def generate_recommendations(
         cmf_val  = getattr(s, "cmf_value", 0.0)
         if mf_score:
             parts.append(f"  MoneyFlow_score={mf_score:+.2f} (MFI={mfi_val:.0f}, CMF={cmf_val:+.2f})  (>0=accumulation, <0=distribution)")
+        ts_score = getattr(s, "trend_strength_score", 0.0)
+        ts_lbl   = getattr(s, "trend_strength_label", "")
+        if ts_score or (ts_lbl and ts_lbl not in ("NO_DATA", "NO_TREND")):
+            adx_v = getattr(s, "adx_value", 0.0)
+            parts.append(f"  TrendStrength_score={ts_score:+.2f} (ADX={adx_v:.0f}, {ts_lbl}; >0=confirmed uptrend, <0=downtrend, ADX<20=chop→dampened)")
         pead_sc = getattr(s, "pead_score", 0.0)
         if pead_sc:
             psurp = getattr(s, "pead_surprise_pct", 0.0)
@@ -227,6 +232,8 @@ def generate_recommendations(
         active_methods.append("price momentum / perceived value (1m/2m returns normalised vs own trailing history)")
     if settings.enable_money_flow:
         active_methods.append("money flow indicators (MFI 14-period, CMF 20-period, OBV slope — accumulation vs distribution)")
+    if settings.enable_trend_strength:
+        active_methods.append("trend strength (ADX/DMI directional movement + Donchian 20-day breakout — trend quality & confirmation)")
     if settings.enable_pead:
         active_methods.append("post-earnings drift / PEAD (standardized EPS surprise × time-decay)")
     if settings.enable_iv_rank:
@@ -2431,6 +2438,21 @@ Regime guide:
     - High MFI (> 80) alone is not bearish — it can persist in strong trends. Weight CMF and OBV equally.
     - In early-stage breakouts, CMF turning positive before price fully breaks out is an early warning signal."""
 
+    # Trend strength (ADX/DMI + Donchian breakout) instruction
+    trend_strength_instructions = ""
+    if any(getattr(s, "trend_strength_score", 0.0) for s in signals_for_claude):
+        trend_strength_instructions = """
+16b. Trend Strength overlay — ADX/DMI directional movement + Donchian breakout:
+    TrendStrength_score combines Wilder's ADX/DMI (trend direction × strength) with a 20-day Donchian (Turtle) breakout.
+    It answers "is this a strong, CONFIRMED trend, and which way?" — distinct from momentum (return size) and RSI (overbought/oversold).
+    - ADX < 20 = NO TREND (chop): score is intentionally dampened toward 0. In chop, mean-reversion setups (VWAP, Bollinger, high IV-rank fades)
+      are more reliable than breakout/trend entries — do NOT force a trend trade.
+    - ADX ≥ 25 with score > +0.3 = STRONG_UPTREND: trend-following BUY tailwind; pullbacks are buyable, favour SWING/POSITION horizons.
+    - ADX ≥ 25 with score < -0.3 = STRONG_DOWNTREND: confirms SELL/short theses; rallies are sellable.
+    - BREAKOUT_UP / BREAKOUT_DOWN (close through the 20-day high/low) = fresh trend initiation — strongest entry TIMING when it agrees with news/technical/flow.
+    - Use trend strength as a GATE: a directional thesis backed by a strong, aligned ADX trend is far more reliable than the same thesis in a no-trend chop.
+      Confirmation overlay only — never a standalone BUY/SELL."""
+
     # PEAD (post-earnings drift) instruction
     pead_instructions = ""
     if any(getattr(s, "pead_score", 0.0) for s in signals_for_claude):
@@ -2521,7 +2543,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
+{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

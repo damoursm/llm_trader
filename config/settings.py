@@ -266,6 +266,15 @@ class Settings(BaseSettings):
     # Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
     enable_money_flow: bool = True
 
+    # Trend Strength — ADX/DMI directional movement (Welles Wilder) + Donchian channel breakout
+    # (the "Turtle" system). Measures trend QUALITY/strength + breakout confirmation — a dimension
+    # not captured by momentum (return size) or RSI/Bollinger (overbought/oversold). ADX<20 = chop
+    # (signal dampened); strong +DI/-DI separation with high ADX or a 20-day breakout = confirmed
+    # trend. Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
+    enable_trend_strength: bool = True
+    trend_adx_period: int = 14        # Wilder ADX/DMI smoothing period
+    trend_donchian_period: int = 20   # Donchian breakout channel lookback (Turtle = 20)
+
     # Post-Earnings Announcement Drift (PEAD) — one of the most-replicated cross-sectional
     # anomalies in academic finance. Stocks that beat (miss) EPS estimates tend to continue
     # drifting in the surprise direction for ~60 days as the market under-reacts. Score is

@@ -997,6 +997,11 @@ class TickerSignal(BaseModel):
     money_flow_score: float = 0.0  # [-1, +1] accumulation/distribution composite (MFI+CMF+OBV)
     mfi_value: float = 50.0        # raw MFI reading 0–100 (< 20 = accumulation, > 80 = distribution)
     cmf_value: float = 0.0         # raw CMF reading [-1, +1] (positive = accumulation)
+    # Trend strength — populated when enable_trend_strength=true.
+    # ADX/DMI directional movement × strength + Donchian 20-day breakout.
+    trend_strength_score: float = 0.0   # [-1, +1] confirmed uptrend (+) / downtrend (−); ~0 = chop
+    adx_value: float = 0.0              # raw ADX (trend strength: <20 chop, >25 trend, >40 strong)
+    trend_strength_label: str = "NO_DATA"  # NO_TREND|UPTREND|STRONG_UPTREND|BREAKOUT_UP|…|DOWN…
     # PEAD (Post-Earnings Announcement Drift) — populated when enable_pead=true
     pead_score: float = 0.0          # [-1, +1] SUE × time-decay
     pead_surprise_pct: float = 0.0   # most recent EPS surprise %
