@@ -144,8 +144,14 @@ PRECISION MANDATE — false positives are more costly than false negatives:
 - Scores ±0.3–0.6: clear but moderate catalyst — analyst upgrade/downgrade with PT, supply chain disruption, contract win/loss.
 - Scores ±0.1–0.2: minor directional catalyst — relevant but unlikely to move price significantly.
 - Score 0.0 if: news is noise, recycled information, or there is no clear directional catalyst.
+- Score ONLY news materially about {ticker} itself — ignore passing mentions, sector round-ups, or macro pieces that merely list the ticker; those are not {ticker}-specific catalysts.
+- If catalysts conflict, NET them by magnitude and recency — do not mechanically average to 0; the dominant, most recent, highest-impact catalyst drives the sign.
 - Recency matters: articles marked "1h ago" or "6h ago" carry much more weight than "3d ago" or "5d ago".
 - When in doubt, output 0.0. A missed opportunity is better than a wrong call.
+
+SOURCE WEIGHTING — the digest below mixes hard catalysts with soft sentiment; weight them differently. Each article is tagged "[source | age]":
+- HARD sources move price directly and can justify scores up to ±1.0: SEC 8-K filings, earnings/EPS surprises, analyst rating & price-target changes, and primary financial news (M&A, FDA, guidance, legal/regulatory).
+- SOFT sources are attention/positioning, NOT catalysts, and cap at ±0.2 on their own: Reddit/WSB social sentiment, Google Trends search spikes, short-interest shifts. They are corroborating color, never a standalone thesis. A soft source ALIGNED with a hard catalyst modestly amplifies conviction; if it CONTRADICTS the hard catalyst, discount it.
 
 <news>
 {digest}
@@ -155,7 +161,9 @@ Respond with a JSON object with exactly these fields:
 - "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral
 - "rationale": one to three sentences explaining (1) the specific catalyst and (2) the exact price mechanism. If score is 0.0, state why no actionable catalyst was identified.
 
-Example: {{"score": 0.6, "rationale": "Strong earnings beat and raised guidance dominate headlines."}}
+Examples:
+{{"score": 0.6, "rationale": "Q3 earnings beat with raised FY guidance (hard catalyst) reprices forward estimates over the next few sessions."}}
+{{"score": 0.0, "rationale": "Only a Reddit mention spike and a generic sector round-up; no {ticker}-specific hard catalyst identified."}}
 
 Respond with JSON only, no markdown."""
 

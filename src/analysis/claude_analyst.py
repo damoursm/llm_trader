@@ -174,6 +174,26 @@ def generate_recommendations(
         cmf_val  = getattr(s, "cmf_value", 0.0)
         if mf_score:
             parts.append(f"  MoneyFlow_score={mf_score:+.2f} (MFI={mfi_val:.0f}, CMF={cmf_val:+.2f})  (>0=accumulation, <0=distribution)")
+        pead_sc = getattr(s, "pead_score", 0.0)
+        if pead_sc:
+            psurp = getattr(s, "pead_surprise_pct", 0.0)
+            pdays = getattr(s, "pead_days_since_report", 0)
+            parts.append(f"  PEAD_score={pead_sc:+.2f} (EPS surprise {psurp:+.1f}%, {pdays}d since report; post-earnings drift, >0=beat→drift up)")
+        ivr_sc  = getattr(s, "iv_rank_score", 0.0)
+        ivr_lbl = getattr(s, "iv_rank_label", "NEUTRAL")
+        if ivr_sc or (ivr_lbl and ivr_lbl != "NEUTRAL"):
+            ivr_val = getattr(s, "iv_rank", 50.0)
+            parts.append(f"  IVRank_score={ivr_sc:+.2f} (IV-rank {ivr_val:.0f}, {ivr_lbl}; high-IV→contrarian/fade, low-IV→trend-confirm)")
+        ivx_sc  = getattr(s, "iv_expr_score", 0.0)
+        ivx_lbl = getattr(s, "iv_expr_label", "NEUTRAL")
+        if ivx_sc or (ivx_lbl and ivx_lbl not in ("NEUTRAL", "NO_OPTIONS_DATA")):
+            parts.append(f"  IVExpr_score={ivx_sc:+.2f} ({ivx_lbl}; options-chain IV vs own history + OI skew)")
+        coint_sc = getattr(s, "coint_score", 0.0)
+        if coint_sc:
+            parts.append(f"  Coint_score={coint_sc:+.2f} (stat-arb pair lean; >0=cheap/long leg, <0=rich/short leg)")
+        cs_sc = getattr(s, "cross_sectional_score", 0.0)
+        if cs_sc:
+            parts.append(f"  CrossSectional_score={cs_sc:+.2f} (rank vs universe; >0=standout, <0=laggard)")
         signal_lines.append("\n".join(parts))
 
     signals_text = "\n\n".join(signal_lines)
@@ -184,7 +204,9 @@ def generate_recommendations(
     # Build the active-methods description for the prompt
     active_methods = []
     if use_news:
-        active_methods.append("news/sentiment (LLM-scored headlines, RSS, social)")
+        active_methods.append("news/sentiment LEVEL (LLM-scored headlines, RSS, social)")
+    if settings.enable_sentiment_velocity:
+        active_methods.append("sentiment VELOCITY (Δ news tone, recent vs prior window — leads short-horizon moves)")
     if use_tech:
         active_methods.append("technical analysis (RSI, MACD, SMA50, SMA200, Bollinger Bands)")
     if use_insider:
@@ -205,6 +227,16 @@ def generate_recommendations(
         active_methods.append("price momentum / perceived value (1m/2m returns normalised vs own trailing history)")
     if settings.enable_money_flow:
         active_methods.append("money flow indicators (MFI 14-period, CMF 20-period, OBV slope — accumulation vs distribution)")
+    if settings.enable_pead:
+        active_methods.append("post-earnings drift / PEAD (standardized EPS surprise × time-decay)")
+    if settings.enable_iv_rank:
+        active_methods.append("IV Rank + directional (realized-vol percentile regime: high→contrarian, low→trend-confirming)")
+    if settings.enable_iv_expr and use_gex_signal:
+        active_methods.append("IV Expression (real options-chain IV vs own history + OI skew: cheap→confirm, rich→fade)")
+    if settings.enable_cointegration:
+        active_methods.append("cointegration pairs (market-neutral stat-arb lean: long cheap leg / short rich leg)")
+    if settings.enable_cross_sectional:
+        active_methods.append("cross-sectional rank (per-method z-score vs universe — relative standout)")
     methods_desc = ", ".join(active_methods) if active_methods else "combined signals"
 
     # Insider-specific instructions
@@ -2399,6 +2431,56 @@ Regime guide:
     - High MFI (> 80) alone is not bearish — it can persist in strong trends. Weight CMF and OBV equally.
     - In early-stage breakouts, CMF turning positive before price fully breaks out is an early warning signal."""
 
+    # PEAD (post-earnings drift) instruction
+    pead_instructions = ""
+    if any(getattr(s, "pead_score", 0.0) for s in signals_for_claude):
+        pead_instructions = """
+17. Post-Earnings Announcement Drift (PEAD) overlay:
+    PEAD_score = standardized EPS surprise × time-decay (fades to 0 ~60 days after the report). One of the most
+    replicated anomalies in finance: stocks that BEAT tend to keep drifting UP, and MISSES keep drifting DOWN, for
+    weeks as the market under-reacts to the surprise.
+    - PEAD_score > +0.3 (recent beat): genuine tailwind for a BULLISH thesis; the drift is the edge, strongest within ~2 weeks of the report.
+    - PEAD_score < -0.3 (recent miss): tailwind for a BEARISH thesis; do NOT bottom-fish a fresh miss too early.
+    - Larger |score| AND fewer days-since-report = stronger, fresher drift. As days-since-report grows the edge decays — discount it accordingly.
+    - PEAD CONFIRMS a directional thesis; it is not a standalone BUY/SELL."""
+
+    # IV Rank (volatility-regime directional bias) instruction
+    iv_rank_instructions = ""
+    if any(getattr(s, "iv_rank_score", 0.0) for s in signals_for_claude):
+        iv_rank_instructions = """
+18. IV Rank overlay — volatility-regime directional bias:
+    IVRank uses the 21-day realized-vol percentile (vs the ticker's own trailing year) as an IV-Rank proxy, combined with
+    a normalised 5-day return. Read it by REGIME via the label:
+    - HIGH IV-rank (≥70) is CONTRARIAN: CAPITULATION_BUY (oversold panic → fade the DOWN move, lean BULLISH) /
+      FADE_EXTREME (overbought spike → fade the UP move, lean BEARISH). Do not chase; fade the extreme.
+    - LOW IV-rank (≤30) is TREND-CONFIRMING: CALM_UPTREND / CALM_DOWNTREND — the quiet trend tends to persist.
+    - MID IV-rank: mild trend-following only.
+    Use IVRank to decide whether to FADE or FOLLOW a move other signals flagged — it sharpens timing, not standalone direction."""
+
+    # IV Expression (stock-vs-options, real chain) instruction
+    iv_expr_instructions = ""
+    if any(getattr(s, "iv_expr_score", 0.0) for s in signals_for_claude):
+        iv_expr_instructions = """
+19. IV Expression overlay — stock-vs-options expression (real options chain):
+    Compares live options-chain implied vol (vs the ticker's own IV history) with the OI directional skew to judge whether
+    the options market is pricing the move cheaply or richly:
+    - CHEAP_DIRECTIONAL_LONG / CHEAP_DIRECTIONAL_SHORT (low IV + decisive skew): options under-price a directional move → CONFIRM the thesis.
+    - FADE_PREMIUM (high IV + strong skew): options over-price the move → contrarian; prefer the stock over rich premium and be wary of chasing.
+    - NO_OPTIONS_DATA: no chain — ignore.
+    Confirmation / timing overlay on names that already carry a directional signal — never standalone."""
+
+    # Relative-value overlays (cross-sectional rank + cointegration pairs)
+    relative_value_instructions = ""
+    if any(getattr(s, "cross_sectional_score", 0.0) or getattr(s, "coint_score", 0.0) for s in signals_for_claude):
+        relative_value_instructions = """
+20. Relative-value overlays — cross-sectional rank & cointegration pairs:
+    - CrossSectional_score ranks each ticker's per-method scores against the whole universe (z-score). >0 = a genuine STANDOUT
+      vs peers today; <0 = a laggard. Between two names with similar absolute scores, prefer the standout for a BUY and the
+      laggard for a SELL. It keeps you calibrated when a regime pushes every absolute score the same way.
+    - Coint_score is a market-neutral statistical-arbitrage lean: >0 = the ticker is the CHEAP (long) leg of one or more
+      stretched cointegrated pairs; <0 = the RICH (short) leg, betting the spread mean-reverts. Treat it as a relative, hedged
+      tie-breaker that adds conviction when it agrees with the outright thesis — not a standalone outright BUY/SELL."""
+
     commodity_tickers = ", ".join(settings.commodities_list) or "GLD, SLV, IAU, GDX, PPLT, PALL, CPER"
 
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.
@@ -2434,12 +2516,12 @@ YOUR TASK:
    - confidence < 0.55 → WATCH only.
    - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.
    - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.
-   - The pre-computed confidence already reflects: recency-weighted sentiment, article count (thin news = lower score), source diversity, volume conviction on technicals, and sector ETF alignment. Trust it — do not override upward without explicit multi-source justification.
+   - The pre-computed confidence already reflects: every enabled method score combined by weight, cross-method coherence (how strongly the methods agree, magnitude-weighted), movement potential (ATR + Bollinger-band width), volume confirmation, cross-sectional rank vs the universe, and sector-ETF alignment. It also bakes in recency-weighted sentiment, article count, and source diversity inside the news score. Trust it — do not override upward without explicit multi-source justification.
 
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
+{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.
