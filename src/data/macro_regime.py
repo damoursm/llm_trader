@@ -1,7 +1,8 @@
 """Macro Regime Filter — composite top-down overlay across all macro context objects.
 
-Reads VIX, MOVE, bond internals, global macro, FRED, breadth, and credit to produce
-a single PANIC | RISK_OFF | CAUTION | NEUTRAL | RISK_ON regime classification.
+Reads VIX, MOVE, bond internals, global macro, FRED, breadth, credit, and the Dark
+Pool Index (DIX) to produce a single PANIC | RISK_OFF | CAUTION | NEUTRAL | RISK_ON
+regime classification.
 
 Regime effects in the pipeline
 ────────────────────────────────
@@ -84,6 +85,16 @@ _CREDIT_SCORES = {
     "UNKNOWN":         0,
 }
 
+# Dark Pool Index — hidden institutional accumulation (bullish-tilted flow signal)
+_DIX_SCORES = {
+    "STRONG_ACCUMULATION":  1,
+    "ACCUMULATION":         0.5,
+    "NEUTRAL":              0,
+    "DISTRIBUTION":        -1,
+    "STRONG_DISTRIBUTION": -2,
+    "UNKNOWN":             0,
+}
+
 # VIX and MOVE are the fastest-moving signals and deserve more weight
 _WEIGHTS = {
     "vix":          2.0,
@@ -92,6 +103,7 @@ _WEIGHTS = {
     "global_macro": 1.0,
     "fred":         1.0,
     "breadth":      1.0,
+    "dix":          1.0,
     "credit":       0.5,
 }
 
@@ -120,6 +132,7 @@ def compute_macro_regime(
     macro_context=None,
     breadth_context=None,
     credit_context=None,
+    dix_context=None,
 ) -> MacroRegimeContext:
     """Compute a composite macro regime from all available macro inputs.
 
@@ -156,6 +169,8 @@ def compute_macro_regime(
         _add("BREADTH",breadth_context.signal,               _BREADTH_SCORES,     _WEIGHTS["breadth"])
     if credit_context is not None:
         _add("CREDIT", credit_context.signal,                _CREDIT_SCORES,      _WEIGHTS["credit"])
+    if dix_context is not None:
+        _add("DIX",    dix_context.signal,                   _DIX_SCORES,         _WEIGHTS["dix"])
 
     norm = weighted_score / total_weight if total_weight > 0 else 0.0
 

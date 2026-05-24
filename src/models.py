@@ -680,6 +680,44 @@ class MOVEContext(BaseModel):
     summary: str
 
 
+class DIXContext(BaseModel):
+    """Dark Pool Index (DIX) + market-wide Gamma Exposure (GEX) — SqueezeMetrics feed.
+
+    DIX measures the dollar- and volume-weighted short-volume across off-exchange
+    (dark pool) venues — a proxy for *hidden institutional accumulation*. Because
+    large buyers route through dark pools to avoid moving the lit market, a high DIX
+    means strong concealed buying pressure and is historically bullish for forward
+    S&P returns (it leads price by ~1–4 weeks).
+
+    The market-wide GEX here is distinct from the per-ticker dealer gamma computed in
+    gamma_exposure.py: it is the whole-index dealer gamma. High/positive GEX = vol
+    suppression (pinning, mean-reversion); low/negative GEX = vol expansion (moves get
+    amplified). The classic SqueezeMetrics bull setup is **high DIX + low GEX**:
+    hidden buying with room to run.
+    """
+    # Dark Pool Index
+    dix: Optional[float] = None              # latest DIX as a 0–1 fraction
+    dix_pct: Optional[float] = None          # DIX × 100 for display
+    dix_5d_avg: Optional[float] = None
+    dix_20d_avg: Optional[float] = None
+    dix_percentile_1y: Optional[float] = None  # 0–100 percentile of latest DIX in trailing ~252 obs
+    dix_trend: str = "FLAT"                   # RISING | FLAT | FALLING (5-day change)
+
+    # Market-wide Gamma Exposure (whole-index, from the same feed)
+    gex: Optional[float] = None               # latest GEX ($ notional)
+    gex_percentile_1y: Optional[float] = None # 0–100 percentile
+    gex_regime: str = "UNKNOWN"               # VOL_SUPPRESSION | NEUTRAL | VOL_EXPANSION
+
+    spx_price: Optional[float] = None         # SPX close from the same feed
+    obs_count: int = 0                        # rows in the percentile window
+
+    signal: str = "UNKNOWN"     # STRONG_ACCUMULATION | ACCUMULATION | NEUTRAL | DISTRIBUTION | STRONG_DISTRIBUTION
+    direction: str = "NEUTRAL"  # BULLISH | NEUTRAL | BEARISH (equity implication)
+    source: str = "SqueezeMetrics DIX.csv"
+    report_date: date
+    summary: str
+
+
 class MarketModeContext(BaseModel):
     """Market mode classification for dynamic signal weight switching."""
     mode: str                    # TRENDING | NEUTRAL | CHOPPY
@@ -724,6 +762,52 @@ class SectorPair(BaseModel):
 class SectorPairsContext(BaseModel):
     """All sector-pair relative-value opportunities detected in the current run."""
     pairs: List[SectorPair]
+    summary: str
+
+
+class CointPair(BaseModel):
+    """A statistically cointegrated pair trade (Engle-Granger ADF + z-score).
+
+    Unlike SectorPair (which keys off opposing directional *signals*), this is a
+    pure statistical-arbitrage relationship: two price series whose linear
+    combination (spread = log(A) − β·log(B)) is mean-reverting (stationary).
+    When the spread deviates far from its mean (|z| ≥ entry), long the cheap leg
+    and short the expensive leg, betting the spread reverts. Market-neutral by
+    construction — the hedge ratio β removes shared market beta.
+    """
+    ticker_a: str               # dependent leg (Y) in the cointegrating regression
+    ticker_b: str               # independent leg (X)
+    hedge_ratio: float          # β: log(A) ≈ α + β·log(B); units of B per unit of A
+    adf_stat: float             # ADF t-statistic on the spread (more negative = more stationary)
+    adf_pvalue: float           # approximate p-value of the ADF stat
+    adf_crit_5pct: float        # 5% critical value used for the cointegration decision
+    is_cointegrated: bool       # adf_stat <= critical value at the configured level
+    half_life_days: float       # OU mean-reversion half-life (lower = faster reversion)
+    correlation: float          # log-price correlation (sanity check)
+    spread_mean: float          # mean of the spread over the lookback
+    spread_std: float           # std of the spread over the lookback
+    spread_zscore: float        # current (spread − mean) / std
+    long_leg: str               # ticker to go long (the relatively cheap leg)
+    short_leg: str              # ticker to go short (the relatively expensive leg)
+    signal: str                 # ENTRY | STRETCHED | MONITOR | NEUTRAL
+    lookback_days: int          # number of overlapping observations used
+    rationale: str
+
+
+class CointPairsContext(BaseModel):
+    """Cointegration-based statistical-arbitrage pairs across the universe.
+
+    Cointegration pairs trading is a classic market-neutral alpha strategy:
+    test economically-linked candidate pairs for a stationary (mean-reverting)
+    spread via the Engle-Granger two-step (OLS hedge ratio → ADF test on the
+    residual), then trade z-score extremes of the spread. Distinct from the
+    direction-based sector_pairs overlay.
+    """
+    pairs: List[CointPair]                  # tradeable pairs (cointegrated, sorted by |z|)
+    candidates_tested: int                  # how many candidate pairs were evaluated
+    cointegrated_count: int                 # how many passed the ADF test
+    ticker_scores: Dict[str, float] = {}    # per-ticker net directional lean ∈ [-1, +1]
+    report_date: date
     summary: str
 
 
@@ -873,7 +957,12 @@ class TickerSignal(BaseModel):
     combined_score: float = 0.0 # -1.0 to +1.0 weighted sum of method scores (pre-confidence factors).
                                 # Stored so monitor_open_positions can compare today's signal
                                 # against signal_at_entry to detect thesis decay.
-    sentiment_score: float      # -1.0 to +1.0  (news + all article-based sources)
+    sentiment_score: float      # -1.0 to +1.0  (news + all article-based sources; the LEVEL)
+    # Sentiment velocity (Δsentiment, not level) — populated when enable_sentiment_velocity=true.
+    # = recent-window news tone − prior-window news tone; the rate of change leads short-horizon moves.
+    sentiment_velocity_score: float = 0.0  # -1.0 to +1.0  (tanh-normalised Δ tone)
+    sentiment_recent: float = 0.0          # mean lexical tone of the recent window
+    sentiment_prior: float = 0.0           # mean lexical tone of the prior window
     technical_score: float      # -1.0 to +1.0
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)
     put_call_score: float = 0.0 # -1.0 to +1.0  (per-ticker options put/call sentiment)
@@ -892,6 +981,11 @@ class TickerSignal(BaseModel):
     # Insider cluster fields — populated when ≥3 different insiders buy within 5 days
     insider_cluster_detected: bool = False
     insider_cluster_size: int = 0
+    # Insider persistence fields — populated when the SAME insider buys on multiple
+    # separate days within the lookback window (depth of conviction, vs. cluster's breadth).
+    insider_persistence_detected: bool = False
+    insider_persistence_count: int = 0       # max distinct buy days by a single insider
+    insider_persistence_buyer: str = ""       # name of the most-persistent repeat buyer
     # Pattern recognition fields — populated when enable_pattern_recognition=true
     pattern_score: float = 0.0   # [-1, +1] historical win-rate based pattern signal
     pattern_name: str = ""        # detected pattern (e.g. "double_bottom", "head_shoulders")
@@ -907,6 +1001,30 @@ class TickerSignal(BaseModel):
     pead_score: float = 0.0          # [-1, +1] SUE × time-decay
     pead_surprise_pct: float = 0.0   # most recent EPS surprise %
     pead_days_since_report: int = 0  # 0 = today; signal fades to 0 at decay_window
+    # IV Rank + Directional — populated when enable_iv_rank=true.
+    # iv_rank_score uses RV (realized vol) percentile as proxy for IV Rank, combined
+    # with directional 5-day return / ATR to derive regime-aware contrarian / trend bias.
+    iv_rank_score: float = 0.0       # [-1, +1] regime-aware directional bias
+    iv_rank: float = 50.0            # 0–100 percentile of current 21d RV in 252d distribution
+    iv_rank_ret_5d_pct: float = 0.0  # raw 5-day return %
+    iv_rank_label: str = "NEUTRAL"   # CAPITULATION_BUY|FADE_EXTREME|CALM_UPTREND|CALM_DOWNTREND|TREND_FOLLOWING|EVENT_CAUTION|NEUTRAL
+    # IV Expression — populated when enable_iv_expr=true.
+    # Uses true market-implied vol from the options chain (gex_context.expected_move_pct)
+    # ranked against the ticker's own trailing GEX-cache history; combines with oi_skew
+    # to derive a stock-vs-options expression directional bias.
+    iv_expr_score: float = 0.0          # [-1, +1] expression bias from real options chain
+    iv_expr_rank: float = 50.0          # 0–100 percentile of current market-implied IV
+    iv_expr_oi_skew: float = 0.0        # raw OI-weighted directional skew used as input
+    iv_expr_label: str = "NEUTRAL"      # FADE_PREMIUM|EXPENSIVE_NEUTRAL|CHEAP_DIRECTIONAL_LONG|CHEAP_DIRECTIONAL_SHORT|CHEAP_COMPLACENT|MID_IV_DIRECTIONAL|NEUTRAL|NO_OPTIONS_DATA
+    # Cross-sectional ranking — populated when enable_cross_sectional=true.
+    # Mean of per-method universe z-scores (capped at zcap) divided by zcap,
+    # clipped to [-1, +1]. Positive = ticker stands out vs universe; negative =
+    # lags. Composes additively into combined_score with cross_sectional_weight.
+    cross_sectional_score: float = 0.0
+    # Cointegration pairs — populated when enable_cointegration=true.
+    # Net directional lean derived from the ticker's role (cheap/long vs expensive/short)
+    # across all cointegrated pairs it belongs to, weighted by spread z-score extremity.
+    coint_score: float = 0.0
 
 
 class Recommendation(BaseModel):

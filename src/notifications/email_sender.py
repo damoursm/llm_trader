@@ -112,6 +112,9 @@ HTML_TEMPLATE = """
   .cluster-badge { display: inline-block; background: #7c3aed22; border: 1px solid #7c3aed;
                    color: #a78bfa; font-size: 11px; font-weight: bold; padding: 2px 8px;
                    border-radius: 4px; margin-left: 8px; letter-spacing: .03em; }
+  .persist-badge { display: inline-block; background: #0d948822; border: 1px solid #0d9488;
+                   color: #2dd4bf; font-size: 11px; font-weight: bold; padding: 2px 8px;
+                   border-radius: 4px; margin-left: 8px; letter-spacing: .03em; }
 
   /* Performance */
   .pt    { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
@@ -469,7 +472,7 @@ HTML_TEMPLATE = """
 </p>
 {% set solo = perf.solo_method_perf %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
 <table class="pt">
   <thead>
     <tr>
@@ -581,7 +584,7 @@ HTML_TEMPLATE = """
 </p>
 {% set meval = perf.method_eval_stats %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
 {# ── conviction-band sub-table macro (inlined as a block for each direction) ── #}
 {% macro band_table(direction_stats) %}
 {% if direction_stats %}
@@ -784,6 +787,26 @@ HTML_TEMPLATE = """
         {% endfor %}
       </div>
       {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- Sentiment Velocity (Δsentiment, not level) -->
+    {% if enable_sentiment_velocity and sig.sentiment_velocity_score is defined and sig.sentiment_velocity_score != 0 %}
+    {% set sv = sig.sentiment_velocity_score %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Sentiment Velocity <span style="color:#64748b;font-weight:400;">(Δ tone)</span></span>
+        <span class="mscore {{ 'sp' if sv > 0.05 else ('sn' if sv < -0.05 else 'sz') }}">
+          {{ "%+.2f"|format(sv) }}
+        </span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (sv|abs * 100)|int }}%;background:{{ '#16a34a' if sv >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        Recent tone {{ "%+.2f"|format(sig.sentiment_recent) }} vs prior {{ "%+.2f"|format(sig.sentiment_prior) }} —
+        news mood {{ 'accelerating ▲' if sv > 0 else 'deteriorating ▼' }} (leads 1–5d moves).
+      </div>
     </div>
     {% endif %}
 
@@ -998,6 +1021,81 @@ HTML_TEMPLATE = """
         {% else %}Balanced money flow — no clear institutional conviction.{% endif %}
         {% if mfi < 20 %} MFI &lt; 20 = oversold/accumulation zone.{% elif mfi > 80 %} MFI &gt; 80 = overbought/distribution zone.{% endif %}
         <span style="color:#64748b;font-size:10px;"> (MFI 14-period + CMF 20-period + OBV slope)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- IV Rank + Directional -->
+    {% if enable_iv_rank and sig.iv_rank_score is defined and sig.iv_rank_score != 0 %}
+    {% set ivr = sig.iv_rank_score %}
+    {% set ir  = sig.iv_rank if sig.iv_rank is defined else 50 %}
+    {% set ret5d = sig.iv_rank_ret_5d_pct if sig.iv_rank_ret_5d_pct is defined else 0 %}
+    {% set lbl = sig.iv_rank_label if sig.iv_rank_label is defined else 'NEUTRAL' %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">IV Rank + Directional</span>
+        <span class="mscore {{ 'sp' if ivr > 0 else 'sn' }}">{{ "%+.2f"|format(ivr) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">IR={{ '%.0f'|format(ir) }} | 5d={{ '%+.1f'|format(ret5d) }}% | {{ lbl }}</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (ivr|abs * 100)|int }}%;background:{{ '#16a34a' if ivr >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if lbl == 'CAPITULATION_BUY' %}High IV Rank + sharp drop — fear / capitulation regime; contrarian long bias as vol mean-reverts.
+        {% elif lbl == 'FADE_EXTREME' %}High IV Rank + euphoric chase — expensive options + crowded long; fade the move.
+        {% elif lbl == 'EVENT_CAUTION' %}High IV Rank without a decisive move — market pricing event risk; small directional bias only.
+        {% elif lbl == 'CALM_UPTREND' %}Low IV Rank + steady up-trend — calm regime, cheap options; room for vol expansion higher.
+        {% elif lbl == 'CALM_DOWNTREND' %}Low IV Rank + drift lower — complacency in decline; downtrend not yet feared.
+        {% elif lbl == 'TREND_FOLLOWING' %}Mid IV Rank — modest trend-following bias from 5-day price action.
+        {% else %}Neutral IV-Rank regime — no actionable directional read.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (21d realized-vol percentile vs 252d; ret/ATR directional input)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- IV Expression (real options chain) -->
+    {% if enable_iv_expr and sig.iv_expr_score is defined and sig.iv_expr_score != 0 %}
+    {% set ivx = sig.iv_expr_score %}
+    {% set ivx_rank = sig.iv_expr_rank if sig.iv_expr_rank is defined else 50 %}
+    {% set ivx_skew = sig.iv_expr_oi_skew if sig.iv_expr_oi_skew is defined else 0 %}
+    {% set ivx_lbl  = sig.iv_expr_label if sig.iv_expr_label is defined else 'NEUTRAL' %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">IV Expression</span>
+        <span class="mscore {{ 'sp' if ivx > 0 else 'sn' }}">{{ "%+.2f"|format(ivx) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">IV%={{ '%.0f'|format(ivx_rank) }} | OI-skew={{ '%+.2f'|format(ivx_skew) }} | {{ ivx_lbl }}</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (ivx|abs * 100)|int }}%;background:{{ '#16a34a' if ivx >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if ivx_lbl == 'FADE_PREMIUM' %}Expensive options + strong directional skew — options market over-pricing the move; contrarian fade, stock preferred over long premium.
+        {% elif ivx_lbl == 'EXPENSIVE_NEUTRAL' %}Expensive options without conviction — event being priced; mild directional caution.
+        {% elif ivx_lbl == 'CHEAP_DIRECTIONAL_LONG' %}Cheap options + bullish OI skew — high-conviction long expression; both stock and calls work.
+        {% elif ivx_lbl == 'CHEAP_DIRECTIONAL_SHORT' %}Cheap options + bearish OI skew — high-conviction short expression; both stock and puts work.
+        {% elif ivx_lbl == 'CHEAP_COMPLACENT' %}Cheap options but weak positioning — low-conviction trend bias only.
+        {% elif ivx_lbl == 'MID_IV_DIRECTIONAL' %}Mid-IV regime — modest directional bias from options market positioning.
+        {% else %}Neutral options-market expression — no clear directional read.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (real options-chain IV vs trailing GEX-cache history; oi_skew directional input)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Cointegration pairs -->
+    {% if enable_cointegration and sig.coint_score is defined and sig.coint_score != 0 %}
+    {% set cs = sig.coint_score %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Cointegration Pairs</span>
+        <span class="mscore {{ 'sp' if cs > 0 else 'sn' }}">{{ "%+.2f"|format(cs) }}</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (cs|abs * 100)|int }}%;background:{{ '#16a34a' if cs >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if cs > 0 %}Cheap (long) leg of one or more stretched cointegrated pairs — statistical-arbitrage mean-reversion bet favours this name.
+        {% else %}Rich (short) leg of one or more stretched cointegrated pairs — spread expected to revert against this name.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (Engle-Granger ADF + spread z-score; see Cointegration Pairs section)</span>
       </div>
     </div>
     {% endif %}
@@ -1962,7 +2060,7 @@ HTML_TEMPLATE = """
         </tr>
       </thead>
       <tbody>
-      {% for s in wc.signals | sort(attribute='days_until_earnings') if s.days_until_earnings is not none %}
+      {% for s in (wc.signals | selectattr('days_until_earnings', 'ne', None) | list) | sort(attribute='days_until_earnings') %}
       {% set sc = sig_color_w.get(s.signal, '#94a3b8') %}
         <tr style="border-top:1px solid #1e293b;">
           <td style="padding:6px 8px;color:#e2e8f0;font-weight:600;">{{ s.ticker }}</td>
@@ -2014,7 +2112,7 @@ HTML_TEMPLATE = """
           </td>
         </tr>
       {% endfor %}
-      {% for s in wc.signals | sort(attribute='avg_eps_surprise_pct', reverse=True) if s.days_until_earnings is none %}
+      {% for s in (wc.signals | selectattr('days_until_earnings', 'eq', None) | selectattr('avg_eps_surprise_pct', 'ne', None) | list) | sort(attribute='avg_eps_surprise_pct', reverse=True) %}
       {% set sc = sig_color_w.get(s.signal, '#94a3b8') %}
         <tr style="border-top:1px solid #1e293b;opacity:0.75;">
           <td style="padding:6px 8px;color:#94a3b8;font-weight:600;">{{ s.ticker }}</td>
@@ -2311,6 +2409,90 @@ HTML_TEMPLATE = """
     Source: {{ move_context.source }}.
     Typical range 60–130 (normal). Readings above 120 precede equity weakness.
     MOVE/VIX ratio normally 4–7×; above 8× indicates bond market pricing stress equities haven't reflected.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a3 — DARK POOL INDEX (DIX / GEX)
+     ══════════════════════════════════════ -->
+{% if dix_context and dix_context.dix is not none %}
+{% set dix_sig_color = {
+    'STRONG_ACCUMULATION': '#22c55e',
+    'ACCUMULATION':        '#4ade80',
+    'NEUTRAL':             '#94a3b8',
+    'DISTRIBUTION':        '#fb923c',
+    'STRONG_DISTRIBUTION': '#f87171',
+    'UNKNOWN':             '#475569'
+} %}
+{% set dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171', 'NEUTRAL': '#94a3b8'} %}
+<h2>21b. Dark Pool Index <span style="font-size:13px;font-weight:400;color:#94a3b8;">(DIX · off-exchange institutional accumulation · leads price ~1–4 weeks)</span></h2>
+<div class="card" style="border-left: 4px solid {{ dix_sig_color.get(dix_context.signal, '#94a3b8') }};">
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+
+    <!-- DIX gauge -->
+    <div style="background:#0f172a;border-radius:8px;padding:12px 18px;text-align:center;min-width:110px;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">DIX</div>
+      <div style="font-size:30px;font-weight:800;color:{{ dix_sig_color.get(dix_context.signal, '#e2e8f0') }};margin:4px 0;">
+        {{ "%.1f"|format(dix_context.dix_pct) }}%
+      </div>
+      <div style="font-size:11px;font-weight:700;color:{{ dix_sig_color.get(dix_context.signal, '#94a3b8') }};">
+        {{ dix_context.signal.replace('_', ' ') }}
+      </div>
+      <div style="font-size:11px;color:{{ dir_color.get(dix_context.direction, '#94a3b8') }};margin-top:3px;">
+        {{ '▲ BULLISH' if dix_context.direction == 'BULLISH' else ('▼ BEARISH' if dix_context.direction == 'BEARISH' else '→ NEUTRAL') }} for equities
+      </div>
+    </div>
+
+    <!-- trailing-year percentile + trend -->
+    {% if dix_context.dix_percentile_1y is not none %}
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:130px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">1-Yr Percentile</div>
+      <div style="font-size:20px;font-weight:800;color:{{ '#4ade80' if dix_context.dix_percentile_1y >= 58 else ('#f87171' if dix_context.dix_percentile_1y <= 42 else '#94a3b8') }};">
+        {{ "%.0f"|format(dix_context.dix_percentile_1y) }}th
+      </div>
+      <div style="font-size:11px;color:#94a3b8;margin-top:3px;">trend: {{ dix_context.dix_trend }}</div>
+    </div>
+    {% endif %}
+
+    <!-- 5d avg DIX -->
+    {% if dix_context.dix_5d_avg is not none %}
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:120px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">5d Avg DIX</div>
+      <div style="font-size:20px;font-weight:800;color:#94a3b8;">{{ "%.1f"|format(dix_context.dix_5d_avg * 100) }}%</div>
+    </div>
+    {% endif %}
+
+    <!-- market-wide GEX regime -->
+    {% if dix_context.gex is not none %}
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;min-width:150px;text-align:center;">
+      <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Market GEX</div>
+      <div style="font-size:20px;font-weight:800;color:{{ '#f87171' if dix_context.gex_regime == 'VOL_EXPANSION' else ('#4ade80' if dix_context.gex_regime == 'VOL_SUPPRESSION' else '#94a3b8') }};">
+        {{ "%+.2f"|format(dix_context.gex / 1000000000.0) }}Bn
+      </div>
+      <div style="font-size:10px;color:#94a3b8;margin-top:3px;">{{ dix_context.gex_regime.replace('_', ' ') }}</div>
+    </div>
+    {% endif %}
+
+  </div>
+
+  {% if dix_context.direction == 'BULLISH' and dix_context.gex_regime == 'VOL_EXPANSION' %}
+  <div style="background:#052e16;border:1px solid #22c55e;border-radius:6px;
+              padding:8px 14px;margin-bottom:10px;font-size:13px;color:#4ade80;font-weight:700;">
+    ⭐ HIGH DIX + LOW GEX — hidden accumulation with room to run (classic bullish setup).
+  </div>
+  {% elif dix_context.direction == 'BEARISH' and dix_context.gex_regime == 'VOL_EXPANSION' %}
+  <div style="background:#450a0a;border:1px solid #f87171;border-radius:6px;
+              padding:8px 14px;margin-bottom:10px;font-size:13px;color:#f87171;font-weight:700;">
+    ⚠ LOW DIX + LOW GEX — no hidden support and dealers amplify moves; downside-vol risk elevated.
+  </div>
+  {% endif %}
+
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 6px 0;">{{ dix_context.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:0;">
+    Source: {{ dix_context.source }}. DIX = volume-weighted off-exchange short volume (hidden-buying proxy);
+    high DIX leads positive S&P returns by ~1–4 weeks. Market GEX is whole-index dealer gamma (low/negative = vol expansion).
   </p>
 </div>
 {% endif %}
@@ -3829,6 +4011,64 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5w — SENTIMENT VELOCITY LEADERBOARD
+     ══════════════════════════════════════ -->
+{% set sv_signals = signals | selectattr('sentiment_velocity_score', 'defined') | selectattr('sentiment_velocity_score', 'ne', 0) | list if signals else [] %}
+{% set sv_leaders = sv_signals | sort(attribute='sentiment_velocity_score', reverse=true) | list %}
+{% set top_sv = sv_leaders[:5] %}
+{% set bot_sv = sv_leaders[-5:] | reverse | list %}
+{% if top_sv %}
+<h2>34a. Sentiment Velocity <span style="font-size:13px;font-weight:400;color:#94a3b8;">(Δsentiment · news tone turning · leads short-horizon moves)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 14px 0;">
+    The <em>change</em> in news tone (recent window − prior window) leads 1–5 day moves better than the static level.
+    Score &gt; 0 = mood accelerating up; score &lt; 0 = mood deteriorating. Deterministic lexical polarity, recency-bucketed.
+  </p>
+
+  <div style="display:flex;gap:14px;flex-wrap:wrap;">
+
+    <!-- Improving tone -->
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Sentiment Accelerating Up</div>
+      {% for s in top_sv %}
+      {% set bar_w = [(s.sentiment_velocity_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.sentiment_velocity_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ '%+.2f'|format(s.sentiment_recent) }} vs {{ '%+.2f'|format(s.sentiment_prior) }}</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Deteriorating tone -->
+    {% if bot_sv %}
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Sentiment Deteriorating</div>
+      {% for s in bot_sv %}
+      {% set bar_w = [(s.sentiment_velocity_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.sentiment_velocity_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ '%+.2f'|format(s.sentiment_recent) }} vs {{ '%+.2f'|format(s.sentiment_prior) }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Velocity = recent news tone − prior news tone (lexical polarity, recency-bucketed). Aggregator weight 0.12. Short-horizon timing overlay.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5x — PRICE MOMENTUM LEADERBOARD
      ══════════════════════════════════════ -->
 {% set mom_signals = signals | selectattr('momentum_score', 'defined') | selectattr('momentum_score', 'ne', 0) | list if signals else [] %}
@@ -3892,6 +4132,115 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5pb — CROSS-SECTIONAL RANKING LEADERBOARD
+     ══════════════════════════════════════ -->
+{% if enable_cross_sectional and signals %}
+{% set cs_signals = signals | selectattr('cross_sectional_score', 'defined') | selectattr('cross_sectional_score', 'ne', 0) | list %}
+{% set cs_leaders = cs_signals | sort(attribute='cross_sectional_score', reverse=true) | list %}
+{% set top_cs = cs_leaders[:5] %}
+{% set bot_cs = cs_leaders[-5:] | reverse | list %}
+{% if top_cs or bot_cs %}
+<h2>34d. Cross-Sectional Ranking
+  <span style="font-size:13px;font-weight:400;color:#94a3b8;">
+    (avg per-method z-score vs universe — relative-value lens)
+  </span>
+</h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">
+    Each ticker's score is the mean of per-method z-scores against the universe (capped at ±2.5σ).
+    Positive = stands out vs peers on most active methods; negative = lags. Composes additively into
+    <code style="color:#cbd5e1;">combined_score</code> so the absolute aggregation stays intact.
+  </p>
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Strongest Standouts (above universe avg)</div>
+      {% for s in top_cs if s.cross_sectional_score > 0 %}
+      {% set bar_w = [(s.cross_sectional_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.cross_sectional_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ s.direction }} · conf={{ '%.0f'|format(s.confidence * 100) }}%</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Strongest Laggards (below universe avg)</div>
+      {% for s in bot_cs if s.cross_sectional_score < 0 %}
+      {% set bar_w = [(s.cross_sectional_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.cross_sectional_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ s.direction }} · conf={{ '%.0f'|format(s.confidence * 100) }}%</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    In a regime where most absolute scores skew the same way (bull-tape news/momentum, or bear-tape sentiment),
+    the cross-sectional view surfaces tickers that genuinely lead/lag the pack — robust to the regime bias.
+  </p>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5pa — POST-EARNINGS ANNOUNCEMENT DRIFT (PEAD)
+     ══════════════════════════════════════ -->
+{% if pead_context and pead_context.signals %}
+{% set pead_sorted = pead_context.signals | sort(attribute='pead_score', reverse=true) | list %}
+{% set top_pead = pead_sorted[:5] %}
+{% set bot_pead = pead_sorted[-5:] | reverse | list %}
+<h2>34c. Post-Earnings Drift (PEAD)
+  <span style="font-size:13px;font-weight:400;color:#94a3b8;">
+    (SUE × time-decay over {{ pead_context.decay_window_days }}d)
+  </span>
+</h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 12px 0;">{{ pead_context.summary }}</p>
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Strongest Bullish Drift (Recent Beats)</div>
+      {% for s in top_pead if s.pead_score > 0 %}
+      {% set bar_w = [(s.pead_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.pead_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ '%+.1f'|format(s.surprise_pct) }}% · {{ s.days_since_report }}d ago</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Strongest Bearish Drift (Recent Misses)</div>
+      {% for s in bot_pead if s.pead_score < 0 %}
+      {% set bar_w = [(s.pead_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.pead_score) }}</div>
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">{{ '%+.1f'|format(s.surprise_pct) }}% · {{ s.days_since_report }}d ago</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Post-earnings drift is one of the most-replicated cross-sectional anomalies in academic finance: stocks that beat (miss) EPS estimates tend to drift in the surprise direction for ~60 days as the market under-reacts to the news.
+    Score formula: tanh(surprise%/{{ '%.0f'|format(pead_context.surprise_scale_pct) }}) × max(0, 1 − days/{{ pead_context.decay_window_days }}).
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5z — MONEY FLOW LEADERBOARD
      ══════════════════════════════════════ -->
 {% set mf_signals = signals | selectattr('money_flow_score', 'defined') | selectattr('money_flow_score', 'ne', 0) | list if signals else [] %}
@@ -3937,6 +4286,109 @@ HTML_TEMPLATE = """
   </div>
   <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
     MFI &lt; 20 = accumulation zone; MFI &gt; 80 = distribution zone. CMF positive = buyers in control. OBV slope z-score confirms the trend direction.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5zz — IV RANK + DIRECTIONAL LEADERBOARD
+     ══════════════════════════════════════ -->
+{% set ivr_signals = signals | selectattr('iv_rank_score', 'defined') | selectattr('iv_rank_score', 'ne', 0) | list if signals else [] %}
+{% set ivr_leaders = ivr_signals | sort(attribute='iv_rank_score', reverse=true) | list %}
+{% set top_ivr = ivr_leaders[:5] %}
+{% set bot_ivr = ivr_leaders[-5:] | reverse | list %}
+{% if top_ivr %}
+<h2>IV Rank + Directional <span style="font-size:13px;font-weight:400;color:#94a3b8;">(realized-vol percentile × 5-day return/ATR — regime-aware bias)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Strongest Bullish IV-Rank Bias</div>
+      {% for s in top_ivr if s.iv_rank_score > 0 %}
+      {% set bar_w = [(s.iv_rank_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.iv_rank_score) }}</div>
+        {% set ir = s.iv_rank if s.iv_rank is defined else 50 %}
+        {% set lbl = s.iv_rank_label if s.iv_rank_label is defined else 'NEUTRAL' %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">IR={{ '%.0f'|format(ir) }} · {{ lbl }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Strongest Bearish IV-Rank Bias</div>
+      {% for s in bot_ivr if s.iv_rank_score < 0 %}
+      {% set bar_w = [(s.iv_rank_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.iv_rank_score) }}</div>
+        {% set ir = s.iv_rank if s.iv_rank is defined else 50 %}
+        {% set lbl = s.iv_rank_label if s.iv_rank_label is defined else 'NEUTRAL' %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">IR={{ '%.0f'|format(ir) }} · {{ lbl }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Uses 21-day realized-vol percentile (vs trailing 252d) as IV-Rank proxy combined with 5-day return / ATR.
+    High IR ≥ 70 + extreme move → contrarian (capitulation buy or fade extreme). Low IR ≤ 30 + trend → confirmation (calm uptrend/downtrend). Robust to regime shifts because both inputs are self-normalised to each ticker.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5zzz — IV EXPRESSION (REAL OPTIONS CHAIN) LEADERBOARD
+     ══════════════════════════════════════ -->
+{% set ivx_signals = signals | selectattr('iv_expr_score', 'defined') | selectattr('iv_expr_score', 'ne', 0) | list if signals else [] %}
+{% set ivx_leaders = ivx_signals | sort(attribute='iv_expr_score', reverse=true) | list %}
+{% set top_ivx = ivx_leaders[:5] %}
+{% set bot_ivx = ivx_leaders[-5:] | reverse | list %}
+{% if top_ivx %}
+<h2>IV Expression <span style="font-size:13px;font-weight:400;color:#94a3b8;">(real options-chain IV × OI directional skew — stock vs options expression)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▲ Cheap-Directional / Confirmation Bias</div>
+      {% for s in top_ivx if s.iv_expr_score > 0 %}
+      {% set bar_w = [(s.iv_expr_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#4ade80;border-radius:3px;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#4ade80;font-weight:700;">{{ '%+.2f'|format(s.iv_expr_score) }}</div>
+        {% set ir_r = s.iv_expr_rank if s.iv_expr_rank is defined else 50 %}
+        {% set lbl = s.iv_expr_label if s.iv_expr_label is defined else 'NEUTRAL' %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">IV%={{ '%.0f'|format(ir_r) }} · {{ lbl }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <div style="color:#f87171;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">▼ Fade-Premium / Contrarian Bias</div>
+      {% for s in bot_ivx if s.iv_expr_score < 0 %}
+      {% set bar_w = [(s.iv_expr_score * 100)|abs|int, 100]|min %}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="width:42px;font-size:12px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</div>
+        <div style="flex:1;background:#1e293b;border-radius:3px;height:10px;overflow:hidden;">
+          <div style="width:{{ bar_w }}%;height:10px;background:#f87171;border-radius:3px;margin-left:auto;"></div>
+        </div>
+        <div style="width:36px;text-align:right;font-size:11px;color:#f87171;font-weight:700;">{{ '%+.2f'|format(s.iv_expr_score) }}</div>
+        {% set ir_r = s.iv_expr_rank if s.iv_expr_rank is defined else 50 %}
+        {% set lbl = s.iv_expr_label if s.iv_expr_label is defined else 'NEUTRAL' %}
+        <div style="font-size:10px;color:#64748b;white-space:nowrap;">IV%={{ '%.0f'|format(ir_r) }} · {{ lbl }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Uses live <code>expected_move_pct</code> from each ticker's options chain (via GEX context) ranked against the ticker's own trailing IV history (reconstructed from prior gex_*.json caches). Combined with OI-weighted directional skew to decide expression:
+    <strong>cheap IV + strong skew</strong> → confirm directional thesis (stock or long options work);
+    <strong>expensive IV + strong skew</strong> → fade premium, prefer stock or spreads.
   </p>
 </div>
 {% endif %}
@@ -3999,6 +4451,65 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5y2 — COINTEGRATION PAIRS (STAT-ARB)
+     ══════════════════════════════════════ -->
+{% if cointegration_context and cointegration_context.pairs %}
+<h2>35b. Cointegration Pairs <span style="font-size:13px;font-weight:400;color:#94a3b8;">(statistical arbitrage — ADF + z-score)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 4px 0;">
+    Engle-Granger cointegration: spread = log(A) − β·log(B) is mean-reverting (ADF-stationary).
+    When the spread stretches past ±{{ "%.1f"|format(cointegration_context.pairs[0].spread_zscore | abs if cointegration_context.pairs else 2) }}σ, Long the cheap leg / Short the rich leg and bet on reversion. Market-neutral via the hedge ratio.
+  </p>
+  <p style="color:#475569;font-size:11px;margin:0 0 12px 0;">{{ cointegration_context.summary }}</p>
+  <div style="display:flex;flex-direction:column;gap:10px;">
+  {% for pair in cointegration_context.pairs %}
+  {% set z = pair.spread_zscore %}
+  {% set accent = '#4ade80' if pair.signal == 'ENTRY' else '#fbbf24' %}
+  <div style="background:#0f172a;border-radius:8px;padding:12px 14px;border-left:3px solid {{ accent }};">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+      <div style="display:flex;align-items:center;gap:5px;">
+        <span style="font-size:10px;font-weight:700;color:#4ade80;background:#052e16;padding:2px 6px;border-radius:3px;border:1px solid #4ade80;">LONG</span>
+        <span class="ticker" style="font-size:14px;color:#e2e8f0;">{{ pair.long_leg }}</span>
+      </div>
+      <span style="color:#475569;font-size:13px;">/</span>
+      <div style="display:flex;align-items:center;gap:5px;">
+        <span style="font-size:10px;font-weight:700;color:#f87171;background:#450a0a;padding:2px 6px;border-radius:3px;border:1px solid #f87171;">SHORT</span>
+        <span class="ticker" style="font-size:14px;color:#e2e8f0;">{{ pair.short_leg }}</span>
+      </div>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+        <span class="badge" style="background:#1e293b;color:{{ accent }};border:1px solid {{ accent }};">{{ pair.signal }}</span>
+        <span style="font-size:12px;color:#64748b;">z={{ "%+.2f"|format(z) }}</span>
+      </span>
+    </div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10px;color:#64748b;margin-bottom:8px;">
+      <span>β (hedge): <strong style="color:#cbd5e1;">{{ "%.2f"|format(pair.hedge_ratio) }}</strong></span>
+      <span>ADF: <strong style="color:#cbd5e1;">{{ "%.2f"|format(pair.adf_stat) }}</strong> (crit {{ "%.2f"|format(pair.adf_crit_5pct) }})</span>
+      <span>p≈<strong style="color:#cbd5e1;">{{ "%.3f"|format(pair.adf_pvalue) }}</strong></span>
+      <span>half-life: <strong style="color:#cbd5e1;">{{ "%.0f"|format(pair.half_life_days) }}d</strong></span>
+      <span>corr: <strong style="color:#cbd5e1;">{{ "%+.2f"|format(pair.correlation) }}</strong></span>
+      <span>n={{ pair.lookback_days }}</span>
+    </div>
+    {# z-score bar centered at 0 #}
+    <div style="position:relative;background:#1e293b;border-radius:2px;height:6px;margin-bottom:8px;">
+      <div style="position:absolute;left:50%;top:0;width:1px;height:6px;background:#475569;"></div>
+      {% set zpct = [[(z * 20)|round|int, 50]|min, -50]|max %}
+      {% if zpct >= 0 %}
+      <div style="position:absolute;left:50%;height:6px;background:#f87171;border-radius:2px;width:{{ zpct }}%;"></div>
+      {% else %}
+      <div style="position:absolute;right:50%;height:6px;background:#4ade80;border-radius:2px;width:{{ -zpct }}%;"></div>
+      {% endif %}
+    </div>
+    <div style="font-size:11px;color:#94a3b8;line-height:1.5;">{{ pair.rationale }}</div>
+  </div>
+  {% endfor %}
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    ADF more negative than the critical value ⇒ spread is stationary ⇒ pair is cointegrated. Half-life is the OU mean-reversion speed (lower = faster). Distinct from Sector Pairs (which keys off opposing directional signals): this is a pure statistical relationship.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
@@ -4010,7 +4521,7 @@ HTML_TEMPLATE = """
 {% endif %}
 {% for ticker, trades in (insider_trades or {}).items() %}
 {% set _sig = signals_by_ticker.get(ticker) %}
-<div class="card" style="border-left: 4px solid {% if _sig and _sig.insider_cluster_detected %}#a78bfa{% else %}#7c3aed{% endif %};">
+<div class="card" style="border-left: 4px solid {% if _sig and _sig.insider_cluster_detected %}#a78bfa{% elif _sig and _sig.insider_persistence_detected %}#2dd4bf{% else %}#7c3aed{% endif %};">
   <span class="ticker">{{ ticker }}</span>
   {% if ticker in rec_actions %}
   <span class="badge"
@@ -4020,6 +4531,9 @@ HTML_TEMPLATE = """
   {% endif %}
   {% if _sig and _sig.insider_cluster_detected %}
   <span class="cluster-badge">CLUSTER &bull; {{ _sig.insider_cluster_size }} insiders / 5d</span>
+  {% endif %}
+  {% if _sig and _sig.insider_persistence_detected %}
+  <span class="persist-badge">PERSISTENT &bull; {{ _sig.insider_persistence_buyer }} &times;{{ _sig.insider_persistence_count }}</span>
   {% endif %}
   <br><br>
   {% for t in trades %}
@@ -4095,17 +4609,20 @@ def send_recommendations(
     revision_momentum_context=None,  # Optional[RevisionMomentumContext]     — avoid circular import
     whisper_context=None,            # Optional[WhisperContext]              — avoid circular import
     earnings_context=None,           # Optional[EarningsContext]             — avoid circular import
+    pead_context=None,               # Optional[PEADContext]                 — avoid circular import
     gex_context=None,            # Optional[GEXContext]             — avoid circular import
     opex_context=None,           # Optional[OpExContext]            — avoid circular import
     seasonality_context=None,    # Optional[SeasonalityContext]     — avoid circular import
     bond_internals_context=None, # Optional[BondInternalsContext]   — avoid circular import
     move_context=None,           # Optional[MOVEContext]            — avoid circular import
+    dix_context=None,            # Optional[DIXContext]             — avoid circular import
     global_macro_context=None,   # Optional[GlobalMacroContext]     — avoid circular import
     macro_regime_context=None,   # Optional[MacroRegimeContext]     — avoid circular import
     market_mode_context=None,    # Optional[MarketModeContext]      — avoid circular import
     catalyst_timing_context=None,   # Optional[CatalystTimingContext]   — avoid circular import
     cluster_watchlist_context=None, # Optional[ClusterWatchlistContext] — avoid circular import
     sector_pairs_context=None,      # Optional[SectorPairsContext]      — avoid circular import
+    cointegration_context=None,     # Optional[CointPairsContext]       — avoid circular import
     sector_rotation_context=None,   # Optional[SectorRotationContext]   — avoid circular import
     rotation_drivers_context=None,  # Optional[RotationDriversContext]  — avoid circular import
     business_cycle_context=None,    # Optional[BusinessCycleContext]    — avoid circular import
@@ -4143,6 +4660,10 @@ def send_recommendations(
         settings.enable_pattern_recognition,
         settings.enable_price_momentum,
         settings.enable_money_flow,
+        settings.enable_pead,
+        settings.enable_iv_rank,
+        settings.enable_iv_expr and settings.enable_gex,  # iv_expr requires GEX
+        settings.enable_cointegration,
     ])
 
     # ── All recs sorted: BUY/SELL first, then by confidence desc ──────────
@@ -4258,12 +4779,18 @@ def send_recommendations(
         signals_by_ticker=signals_by_ticker,
         articles_by_ticker=articles_by_ticker,
         use_news=use_news,
+        enable_sentiment_velocity=settings.enable_sentiment_velocity,
         use_tech=use_tech,
         use_insider=use_insider,
         use_put_call=settings.enable_put_call,
         use_pattern=settings.enable_pattern_recognition,
         enable_price_momentum=settings.enable_price_momentum,
         enable_money_flow=settings.enable_money_flow,
+        enable_pead=settings.enable_pead,
+        enable_iv_rank=settings.enable_iv_rank,
+        enable_iv_expr=settings.enable_iv_expr,
+        enable_cointegration=settings.enable_cointegration,
+        enable_cross_sectional=settings.enable_cross_sectional,
         enable_gex=settings.enable_gex,
         active_methods=active_methods,
         # smart money
@@ -4309,6 +4836,8 @@ def send_recommendations(
         whisper_context=whisper_context,
         # Earnings calendar
         earnings_context=earnings_context,
+        # Post-Earnings Announcement Drift (per-ticker SUE x time-decay)
+        pead_context=pead_context,
         # Gamma Exposure (GEX)
         gex_context=gex_context,
         # OpEx calendar (pure date math)
@@ -4319,6 +4848,8 @@ def send_recommendations(
         bond_internals_context=bond_internals_context,
         # MOVE Index (ICE BofA Treasury vol)
         move_context=move_context,
+        # Dark Pool Index (DIX) + market-wide GEX
+        dix_context=dix_context,
         # Global macro: DXY + Copper/Gold ratio
         global_macro_context=global_macro_context,
         # Macro Regime Filter composite regime
@@ -4331,6 +4862,7 @@ def send_recommendations(
         cluster_watchlist_context=cluster_watchlist_context,
         # Sector Pairs / Relative Value
         sector_pairs_context=sector_pairs_context,
+        cointegration_context=cointegration_context,
         # Sector Rotation / Ebb and Flow
         sector_rotation_context=sector_rotation_context,
         # Rotation Drivers (rate-cycle phase)
@@ -4376,6 +4908,18 @@ def send_recommendations(
                 mfi = getattr(sig, "mfi_value", 50)
                 cmf = getattr(sig, "cmf_value", 0)
                 lines.append(f"Money flow score:{sig.money_flow_score:+.2f} (MFI={mfi:.0f} CMF={cmf:+.2f})")
+            if settings.enable_iv_rank and getattr(sig, "iv_rank_score", 0) != 0:
+                ir = getattr(sig, "iv_rank", 50)
+                ret5d = getattr(sig, "iv_rank_ret_5d_pct", 0)
+                lbl = getattr(sig, "iv_rank_label", "NEUTRAL")
+                lines.append(f"IV rank score:   {sig.iv_rank_score:+.2f} (IR={ir:.0f} 5d={ret5d:+.1f}% {lbl})")
+            if settings.enable_iv_expr and getattr(sig, "iv_expr_score", 0) != 0:
+                ivx_r = getattr(sig, "iv_expr_rank", 50)
+                ivx_s = getattr(sig, "iv_expr_oi_skew", 0)
+                ivx_l = getattr(sig, "iv_expr_label", "NEUTRAL")
+                lines.append(f"IV expr score:   {sig.iv_expr_score:+.2f} (IV%={ivx_r:.0f} skew={ivx_s:+.2f} {ivx_l})")
+            if settings.enable_cointegration and getattr(sig, "coint_score", 0) != 0:
+                lines.append(f"Cointegration:   {sig.coint_score:+.2f} (stat-arb pair lean)")
         lines.append(f"Claude's synthesis: {rec.rationale}")
         lines.append("")
     if insider_by_ticker:
@@ -4407,6 +4951,8 @@ def send_recommendations(
                 "put_call": "Put/Call", "max_pain": "Max Pain", "oi_skew": "OI Skew",
                 "vwap": "VWAP", "pattern": "Pattern",
                 "momentum": "Price Momentum", "money_flow": "Money Flow",
+                "pead": "PEAD", "iv_rank": "IV Rank", "iv_expr": "IV Expression",
+                "coint": "Cointegration",
             }
             sorted_methods = sorted(
                 performance["method_stats"].items(), key=lambda x: x[1]["win_rate"], reverse=True

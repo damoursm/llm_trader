@@ -45,12 +45,15 @@ from typing import List, Optional
 from config import settings
 from src.models import NewsArticle, Direction, TickerSignal, InsiderTrade
 from src.analysis.sentiment import analyse_sentiment, filter_relevant_articles
+from src.signals.sentiment_velocity import compute_sentiment_velocity
 from src.data.insider_trades import build_insider_summary
 from src.analysis.technical import TechnicalResult, EMPTY_RESULT, compute_technical_score
 from src.signals.vwap import compute_vwap_score
 from src.signals.pattern_recognition import compute_pattern_score
 from src.signals.price_momentum import compute_price_momentum_score
 from src.signals.money_flow import compute_money_flow_score
+from src.signals.iv_rank import compute_iv_rank_score
+from src.signals.iv_expr import compute_iv_expr_score
 
 
 # ── Smart-money signal direction + strength ──────────────────────────────────
@@ -70,6 +73,7 @@ _TX_SCORE: dict = {
 # Base weights — normalised across active methods at runtime
 _BASE_WEIGHTS = {
     "news":      0.40,
+    "sent_velocity": 0.12,  # Δsentiment (rate of change of news tone) — short-horizon timing overlay
     "tech":      0.30,
     "insider":   0.30,
     "put_call":  0.15,
@@ -80,6 +84,9 @@ _BASE_WEIGHTS = {
     "momentum":   0.18,   # perceived value: normalised 1m/3m price trend vs own history
     "money_flow": 0.15,   # accumulation/distribution: MFI + CMF + OBV slope composite
     "pead":       0.15,   # Post-Earnings Announcement Drift: SUE × time-decay
+    "iv_rank":    0.13,   # IV Rank + directional: regime-aware contrarian / trend bias from RV percentile
+    "iv_expr":    0.12,   # IV Expression: stock-vs-options bias from real chain IV + oi_skew
+    "coint":      0.12,   # Cointegration pairs: per-ticker lean from stat-arb spread z-scores
 }
 
 # Put/call contrarian score mapping
@@ -219,17 +226,84 @@ def _detect_insider_cluster(ticker: str, trades: List[InsiderTrade]) -> tuple[bo
     return max_cluster >= 3, max_cluster
 
 
-def _insider_score(ticker: str, trades: List[InsiderTrade]) -> tuple[float, bool, int]:
+def _detect_insider_persistence(ticker: str, trades: List[InsiderTrade]) -> tuple[bool, int, str]:
+    """
+    Detect whether the SAME insider bought ``ticker`` on multiple DISTINCT days
+    within the lookback window — repeated accumulation by one name signals far
+    stronger conviction than a one-off purchase.
+
+    Distinct from ``_detect_insider_cluster`` (which measures *breadth* — many
+    DIFFERENT insiders buying at once). This measures *depth* — one insider's
+    sustained, repeated buying over time, escalating personal capital at risk.
+
+    Only counts corporate_insider and politician purchases (not options flow,
+    13F institutional, or bare Form 4 filings whose direction is unknown — same
+    filter as the cluster detector, for consistency).
+
+    Returns ``(persistence_detected, max_distinct_buy_days, top_buyer_name)``.
+    """
+    from collections import defaultdict
+
+    min_buys = max(2, settings.insider_persistence_min_buys)
+
+    buys = [
+        t for t in trades
+        if t.ticker.upper() == ticker.upper()
+        and "purchase" in t.transaction_type
+        and t.trader_type in ("corporate_insider", "politician")
+    ]
+    if len(buys) < min_buys:
+        return False, 0, ""
+
+    # Count DISTINCT transaction dates per insider (case-insensitive name key)
+    # so a single multi-line filing on one day counts once, not as repetition.
+    dates_by_name: dict = defaultdict(set)
+    display_name: dict = {}
+    for t in buys:
+        key = t.trader_name.strip().lower()
+        if not key:
+            continue
+        dates_by_name[key].add(t.transaction_date)
+        display_name[key] = t.trader_name.strip()
+
+    if not dates_by_name:
+        return False, 0, ""
+
+    top_key      = max(dates_by_name, key=lambda k: len(dates_by_name[k]))
+    max_distinct = len(dates_by_name[top_key])
+    if max_distinct < min_buys:
+        return False, max_distinct, ""
+
+    return True, max_distinct, display_name.get(top_key, "")
+
+
+def _persistence_factor(count: int) -> float:
+    """Map distinct repeat-buy days to a score amplifier.
+
+    2 buys → 1.25×, 3 → 1.50×, 4+ → 1.75× (capped at the same ceiling as the
+    cluster amplifier so a single conviction tell can't dominate the score).
+    """
+    return min(1.75, 1.0 + 0.25 * max(0, count - 1))
+
+
+def _insider_score(
+    ticker: str, trades: List[InsiderTrade]
+) -> tuple[float, bool, int, bool, int, str]:
     """Derive a [-1, +1] score from all smart money signals for a ticker.
 
-    Returns (score, cluster_detected, cluster_size).
-    When ≥3 different corporate insiders/politicians buy within 5 days, a 1.75×
-    amplifier is applied to the raw score — simultaneous independent buying is
-    far more predictive than any single insider purchase.
+    Returns ``(score, cluster_detected, cluster_size,
+               persistence_detected, persistence_count, persistence_buyer)``.
+
+    Two independent conviction amplifiers can stack on a positive base score:
+      • Cluster (breadth) — ≥3 DIFFERENT insiders buying within 5 days → 1.75×.
+      • Persistence (depth) — the SAME insider buying on multiple separate days
+        → up to 1.75× (scales with repeat count).
+    Both are applied only when the base score is bullish (insider buying is far
+    more informative than insider selling), and the result is clamped to +1.0.
     """
     relevant = [t for t in trades if t.ticker.upper() == ticker.upper()]
     if not relevant:
-        return 0.0, False, 0
+        return 0.0, False, 0, False, 0, ""
     from src.data.insider_trades import _amount_weight
     total = 0.0
     for t in relevant:
@@ -254,7 +328,23 @@ def _insider_score(ticker: str, trades: List[InsiderTrade]) -> tuple[float, bool
         )
         base_score = amplified
 
-    return base_score, cluster_detected, cluster_size
+    # Persistence amplifier — the SAME insider buying repeatedly across distinct days
+    persistence_detected, persistence_count, persistence_buyer = False, 0, ""
+    if settings.enable_insider_persistence:
+        persistence_detected, persistence_count, persistence_buyer = (
+            _detect_insider_persistence(ticker, trades)
+        )
+        if persistence_detected and base_score > 0:
+            pf = _persistence_factor(persistence_count)
+            amplified = round(min(1.0, base_score * pf), 3)
+            logger.debug(
+                f"[persistence] {ticker}: {persistence_buyer} bought {persistence_count}× "
+                f"on separate days — score {base_score:+.3f} → {amplified:+.3f} ({pf:.2f}×)"
+            )
+            base_score = amplified
+
+    return (base_score, cluster_detected, cluster_size,
+            persistence_detected, persistence_count, persistence_buyer)
 
 
 def _put_call_score_for(ticker: str, put_call_context) -> float:
@@ -562,6 +652,18 @@ def _gex_movement_modifier(gex_signal: str) -> float:
     return 1.0
 
 
+def _coint_score_for(ticker: str, coint_context) -> float:
+    """Look up the per-ticker cointegration directional lean ∈ [-1, +1].
+
+    Positive = ticker is the *cheap/long* leg of one or more stretched
+    cointegrated pairs (bullish mean-reversion bet). Negative = the *rich/short*
+    leg. Zero when the ticker is in no tradeable pair.
+    """
+    if coint_context is None:
+        return 0.0
+    return float(coint_context.ticker_scores.get(ticker.upper(), 0.0))
+
+
 def _pead_score_for(ticker: str, pead_context) -> tuple[float, float, int]:
     """Look up the PEAD signal for ``ticker``.
 
@@ -586,10 +688,13 @@ def build_signals(
     market_mode_context=None, # Optional[MarketModeContext]
     opex_context=None,        # Optional[OpExContext]
     pead_context=None,        # Optional[PEADContext]
+    coint_context=None,       # Optional[CointPairsContext]
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods."""
 
     use_news      = settings.enable_news_sentiment
+    # Sentiment velocity reuses article timestamps; no live fetch / LLM call required.
+    use_sent_velocity = settings.enable_sentiment_velocity
     use_tech      = settings.enable_technical_analysis and settings.enable_fetch_data
     use_insider   = (
         (settings.enable_insider_trades or
@@ -610,6 +715,12 @@ def build_signals(
     use_money_flow = settings.enable_money_flow
     # PEAD requires a precomputed context (per-ticker SUE × time-decay derived from earnings).
     use_pead       = settings.enable_pead and pead_context is not None
+    # IV Rank uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
+    use_iv_rank    = settings.enable_iv_rank
+    # IV Expression reads the GEX context's real options-chain IV — requires GEX context.
+    use_iv_expr    = settings.enable_iv_expr and gex_context is not None
+    # Cointegration reads per-ticker directional leans from a precomputed pairs context.
+    use_coint      = settings.enable_cointegration and coint_context is not None
 
     if not use_news and not use_tech and not use_insider and not use_put_call:
         logger.warning("All analysis methods disabled — no signals will be generated.")
@@ -651,6 +762,7 @@ def build_signals(
 
     active_flags = {
         "news":       use_news,
+        "sent_velocity": use_sent_velocity,
         "tech":       use_tech,
         "insider":    use_insider,
         "put_call":   use_put_call,
@@ -661,6 +773,9 @@ def build_signals(
         "momentum":   use_momentum,
         "money_flow": use_money_flow,
         "pead":       use_pead,
+        "iv_rank":    use_iv_rank,
+        "iv_expr":    use_iv_expr,
+        "coint":      use_coint,
     }
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     active_count = sum(active_flags.values())
@@ -668,12 +783,13 @@ def build_signals(
     mode_label = f" [{market_mode_context.mode}]" if market_mode_context else ""
     logger.info(
         f"Signal weights{mode_label} — "
-        f"news={weights['news']:.0%}  tech={weights['tech']:.0%}  "
+        f"news={weights['news']:.0%}  sv={weights['sent_velocity']:.0%}  tech={weights['tech']:.0%}  "
         f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
         f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
         f"momentum={weights['momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
-        f"pead={weights['pead']:.0%}"
+        f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
+        f"coint={weights['coint']:.0%}"
     )
 
     signals        = []
@@ -681,12 +797,28 @@ def build_signals(
 
     for ticker in tickers:
 
-        # ── Method 1: News sentiment ──────────────────────────────────────
+        # ── Method 1: News sentiment (the LEVEL) ──────────────────────────
         sentiment_score = 0.0
         news_rationale  = "News sentiment disabled."
+        relevant_articles: list = []
+        if use_news or use_sent_velocity:
+            relevant_articles = filter_relevant_articles(ticker, articles)
         if use_news:
-            relevant = filter_relevant_articles(ticker, articles)
-            sentiment_score, news_rationale = analyse_sentiment(ticker, relevant)
+            sentiment_score, news_rationale = analyse_sentiment(ticker, relevant_articles)
+
+        # ── Method 1b: Sentiment velocity (Δsentiment, not level) ─────────
+        # Rate of change of news tone (recent window − prior window). The change
+        # leads short-horizon moves better than the static level. Deterministic,
+        # no extra LLM/API cost — reuses the article timestamps already stored.
+        sent_velocity_score = 0.0
+        sent_recent         = 0.0
+        sent_prior          = 0.0
+        if use_sent_velocity:
+            sent_velocity_score, sent_recent, sent_prior, _sv_n = compute_sentiment_velocity(
+                ticker, relevant_articles,
+                recent_hours=settings.sentiment_velocity_recent_hours,
+                prior_hours=settings.sentiment_velocity_prior_hours,
+            )
 
         # ── Method 2: Technical analysis ─────────────────────────────────
         tech_result: TechnicalResult = EMPTY_RESULT
@@ -698,12 +830,16 @@ def build_signals(
         bb_width_pct    = tech_result.bb_width_pct
 
         # ── Method 3: Smart money ─────────────────────────────────────────
-        insider_sc       = 0.0
-        insider_summary  = ""
-        cluster_detected = False
-        cluster_size     = 0
+        insider_sc          = 0.0
+        insider_summary     = ""
+        cluster_detected    = False
+        cluster_size        = 0
+        persist_detected    = False
+        persist_count       = 0
+        persist_buyer       = ""
         if use_insider:
-            insider_sc, cluster_detected, cluster_size = _insider_score(ticker, insider_trades)
+            (insider_sc, cluster_detected, cluster_size,
+             persist_detected, persist_count, persist_buyer) = _insider_score(ticker, insider_trades)
             insider_summary = build_insider_summary(ticker, insider_trades)
 
         # ── Method 4: Put/call ratio (contrarian) ─────────────────────────
@@ -772,9 +908,40 @@ def build_signals(
         if use_pead:
             pead_score_v, pead_surprise, pead_days = _pead_score_for(ticker, pead_context)
 
+        # ── Method 12: IV Rank + Directional ─────────────────────────────
+        # Uses 21-day realized vol percentile as a proxy for IV Rank.
+        # High IR + extreme move → contrarian; low IR + trend → confirmation.
+        # Self-normalised inputs make this robust to regime shifts.
+        iv_rank_score_v   = 0.0
+        iv_rank_v         = 50.0
+        iv_rank_ret5d     = 0.0
+        iv_rank_label_v   = "NEUTRAL"
+        if use_iv_rank:
+            iv_rank_score_v, iv_rank_v, iv_rank_ret5d, iv_rank_label_v = compute_iv_rank_score(ticker)
+
+        # ── Method 13: IV Expression (real options chain) ────────────────
+        # Reads true market-implied vol from the options chain (via gex_context)
+        # and combines with options-market oi_skew to decide stock-vs-options
+        # expression. Cheap options + strong directional skew → confirm; expensive
+        # options + strong skew → fade. Uses historical gex caches for rank.
+        iv_expr_score_v = 0.0
+        iv_expr_rank_v  = 50.0
+        iv_expr_skew_v  = 0.0
+        iv_expr_label_v = "NEUTRAL"
+        if use_iv_expr:
+            iv_expr_score_v, iv_expr_rank_v, iv_expr_skew_v, iv_expr_label_v = compute_iv_expr_score(ticker, gex_context)
+
+        # ── Method 14: Cointegration pairs (statistical arbitrage) ───────
+        # Per-ticker net directional lean from the ticker's cheap/rich role across
+        # stretched cointegrated pairs. Positive = long (cheap) leg; negative = short.
+        coint_score_v = 0.0
+        if use_coint:
+            coint_score_v = _coint_score_for(ticker, coint_context)
+
         # ── Weighted combination ──────────────────────────────────────────
         combined = (
             weights["news"]       * sentiment_score +
+            weights["sent_velocity"] * sent_velocity_score +
             weights["tech"]       * technical_score +
             weights["insider"]    * insider_sc +
             weights["put_call"]   * pc_score +
@@ -784,7 +951,10 @@ def build_signals(
             weights["pattern"]    * pattern_score +
             weights["momentum"]   * momentum_score +
             weights["money_flow"] * money_flow_score +
-            weights["pead"]       * pead_score_v
+            weights["pead"]       * pead_score_v +
+            weights["iv_rank"]    * iv_rank_score_v +
+            weights["iv_expr"]    * iv_expr_score_v +
+            weights["coint"]      * coint_score_v
         )
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -808,6 +978,7 @@ def build_signals(
         # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
         method_scores = [
             (use_news,       sentiment_score),
+            (use_sent_velocity, sent_velocity_score),
             (use_tech,       technical_score),
             (use_insider,    insider_sc),
             (use_put_call,   pc_score),
@@ -818,6 +989,9 @@ def build_signals(
             (use_momentum,   momentum_score),
             (use_money_flow, money_flow_score),
             (use_pead,       pead_score_v),
+            (use_iv_rank,    iv_rank_score_v),
+            (use_iv_expr,    iv_expr_score_v),
+            (use_coint,      coint_score_v),
         ]
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
 
@@ -859,6 +1033,9 @@ def build_signals(
             confidence=confidence,
             combined_score=round(combined, 4),
             sentiment_score=round(sentiment_score, 3),
+            sentiment_velocity_score=round(sent_velocity_score, 3),
+            sentiment_recent=round(sent_recent, 3),
+            sentiment_prior=round(sent_prior, 3),
             technical_score=round(technical_score, 3),
             insider_score=round(insider_sc, 3),
             put_call_score=round(pc_score, 3),
@@ -875,6 +1052,9 @@ def build_signals(
             expected_move_pct=expected_move_pct,
             insider_cluster_detected=cluster_detected,
             insider_cluster_size=cluster_size,
+            insider_persistence_detected=persist_detected,
+            insider_persistence_count=persist_count,
+            insider_persistence_buyer=persist_buyer,
             pattern_score=round(pattern_score, 3),
             pattern_name=pattern_name,
             momentum_score=round(momentum_score, 3),
@@ -886,6 +1066,15 @@ def build_signals(
             pead_score=round(pead_score_v, 3),
             pead_surprise_pct=round(pead_surprise, 2),
             pead_days_since_report=int(pead_days),
+            iv_rank_score=round(iv_rank_score_v, 3),
+            iv_rank=round(iv_rank_v, 1),
+            iv_rank_ret_5d_pct=round(iv_rank_ret5d, 2),
+            iv_rank_label=iv_rank_label_v,
+            iv_expr_score=round(iv_expr_score_v, 3),
+            iv_expr_rank=round(iv_expr_rank_v, 1),
+            iv_expr_oi_skew=round(iv_expr_skew_v, 3),
+            iv_expr_label=iv_expr_label_v,
+            coint_score=round(coint_score_v, 3),
         ))
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
@@ -896,17 +1085,74 @@ def build_signals(
         mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
         mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
         pead_str = f"  pead={pead_score_v:+.2f}({pead_surprise:+.1f}%/{pead_days}d)" if pead_score_v != 0.0 else ""
+        ivr_str  = f"  ivr={iv_rank_score_v:+.2f}(ir={iv_rank_v:.0f},{iv_rank_label_v})" if iv_rank_score_v != 0.0 else ""
+        ivx_str  = f"  ivx={iv_expr_score_v:+.2f}(ir={iv_expr_rank_v:.0f},{iv_expr_label_v})" if iv_expr_score_v != 0.0 else ""
+        coint_str = f"  coint={coint_score_v:+.2f}" if coint_score_v != 0.0 else ""
         cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
+        persist_str = f"  PERSIST({persist_count}×)" if persist_detected else ""
+        sv_str      = f"  sv={sent_velocity_score:+.2f}" if sent_velocity_score != 0.0 else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
-            f"news={sentiment_score:+.2f}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}{pead_str}  combined={combined:+.2f} | "
+            f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
+            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}{pead_str}{ivr_str}{ivx_str}{coint_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"
         )
 
-    # ── Second pass: sector alignment ────────────────────────────────────────
+    # ── Second pass: cross-sectional ranking overlay ─────────────────────────
+    # Computes how each ticker's per-method scores deviate from the universe
+    # mean (z-score per method), averages them, and adds the result × weight
+    # to combined_score. Adds a relative-value view on top of the absolute
+    # aggregation so the system stays calibrated when one regime makes every
+    # absolute score skew the same way.
+    cs_scores: dict = {}
+    if settings.enable_cross_sectional and len(signals) >= 3:
+        from src.signals.cross_sectional import compute_cross_sectional_scores
+        cs_scores = compute_cross_sectional_scores(
+            signals, zcap=settings.cross_sectional_zcap,
+        )
+        if cs_scores:
+            cs_w = float(settings.cross_sectional_weight)
+            updated_signals = []
+            for sig in signals:
+                cs = float(cs_scores.get(sig.ticker, 0.0))
+                if abs(cs) < 1e-4:
+                    updated_signals.append(sig.model_copy(update={"cross_sectional_score": 0.0}))
+                    combined_scores[sig.ticker] = sig.combined_score
+                    continue
+                new_combined = sig.combined_score + cs_w * cs
+                new_combined = max(-2.0, min(2.0, new_combined))
+                # Re-derive direction + confidence on the adjusted combined
+                if new_combined >= 0.15:
+                    new_direction: Direction = "BULLISH"
+                elif new_combined <= -0.15:
+                    new_direction = "BEARISH"
+                else:
+                    new_direction = "NEUTRAL"
+                # confidence is derived from |combined| / 0.5 in the original
+                # build; reapply the same mapping but keep the existing
+                # coherence/movement/volume factors baked into sig.confidence
+                # by scaling proportionally to the change in |combined|.
+                old_abs = max(abs(sig.combined_score), 0.05)
+                scale = abs(new_combined) / old_abs
+                new_conf = round(min(1.0, sig.confidence * scale), 2)
+                updated_signals.append(sig.model_copy(update={
+                    "combined_score":         round(new_combined, 4),
+                    "cross_sectional_score":  round(cs, 4),
+                    "direction":              new_direction,
+                    "confidence":             new_conf,
+                }))
+                combined_scores[sig.ticker] = new_combined
+                if abs(cs) >= 0.20:
+                    logger.debug(
+                        f"[cross_sectional] {sig.ticker}: cs={cs:+.3f}  "
+                        f"combined {sig.combined_score:+.3f} -> {new_combined:+.3f}  "
+                        f"conf {sig.confidence:.2f} -> {new_conf:.2f}"
+                    )
+            signals = updated_signals
+
+    # ── Third pass: sector alignment ─────────────────────────────────────────
     signals_by_ticker = {s.ticker: s for s in signals}
     final_signals = []
     for sig in signals:

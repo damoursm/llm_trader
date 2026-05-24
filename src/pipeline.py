@@ -41,6 +41,7 @@ from src.data.opex import compute_opex_context
 from src.data.seasonality import compute_seasonality_context
 from src.data.bond_internals import fetch_bond_internals_context
 from src.data.move import fetch_move_context
+from src.data.dix import fetch_dix_context
 from src.data.global_macro import fetch_global_macro_context
 from src.data.sector_rotation import fetch_sector_rotation_context
 from src.data.rotation_drivers import fetch_rotation_drivers_context
@@ -53,6 +54,7 @@ from src.data.cluster_watchlist import (
     update_cluster_watchlist, build_cluster_watchlist_context,
 )
 from src.signals.sector_pairs import find_sector_pairs
+from src.signals.cointegration import find_cointegrated_pairs
 from src.notifications.email_sender import send_recommendations
 from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions
 from src.charts.report import save_html_report
@@ -293,6 +295,9 @@ def run_pipeline(send_email: bool = False) -> None:
         f_move           = (pool.submit(_safe, "move", fetch_move_context)
                             if settings.enable_move else None)
 
+        f_dix            = (pool.submit(_safe, "dix", fetch_dix_context)
+                            if settings.enable_dix else None)
+
         f_global_macro   = (pool.submit(_safe, "global_macro", fetch_global_macro_context)
                             if settings.enable_global_macro else None)
 
@@ -379,6 +384,7 @@ def run_pipeline(send_email: bool = False) -> None:
     whisper_context           = get(f_whisper)
     bond_internals_context    = get(f_bond_internals)
     move_context              = get(f_move)
+    dix_context               = get(f_dix)
     global_macro_context      = get(f_global_macro)
     sector_rotation_context   = get(f_sector_rotation)
     rotation_drivers_context  = get(f_rotation_drivers)
@@ -425,7 +431,15 @@ def run_pipeline(send_email: bool = False) -> None:
             macro_context=macro_context,
             breadth_context=breadth_context,
             credit_context=credit_context,
+            dix_context=dix_context,
         )
+
+    # Cointegration pairs: statistical-arbitrage spreads (ADF + z-score).
+    # Computed before build_signals so its per-ticker directional leans feed the aggregator.
+    coint_context = None
+    if settings.enable_cointegration:
+        logger.info("Step 3.9: Testing cointegration pairs...")
+        coint_context = find_cointegrated_pairs(all_tickers)
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
@@ -438,6 +452,7 @@ def run_pipeline(send_email: bool = False) -> None:
         market_mode_context=market_mode_context,
         opex_context=opex_context,
         pead_context=pead_context,
+        coint_context=coint_context,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
 
@@ -476,6 +491,7 @@ def run_pipeline(send_email: bool = False) -> None:
         seasonality_context=seasonality_context,
         bond_internals_context=bond_internals_context,
         move_context=move_context,
+        dix_context=dix_context,
         global_macro_context=global_macro_context,
         sector_rotation_context=sector_rotation_context,
         rotation_drivers_context=rotation_drivers_context,
@@ -618,12 +634,14 @@ def run_pipeline(send_email: bool = False) -> None:
             seasonality_context=seasonality_context,
             bond_internals_context=bond_internals_context,
             move_context=move_context,
+            dix_context=dix_context,
             global_macro_context=global_macro_context,
             macro_regime_context=macro_regime_context,
             market_mode_context=market_mode_context,
             catalyst_timing_context=catalyst_timing_context,
             cluster_watchlist_context=cluster_watchlist_context,
             sector_pairs_context=sector_pairs_context,
+            cointegration_context=coint_context,
             sector_rotation_context=sector_rotation_context,
             rotation_drivers_context=rotation_drivers_context,
             business_cycle_context=business_cycle_context,

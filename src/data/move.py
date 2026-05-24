@@ -254,6 +254,6 @@ def fetch_move_context(today: Optional[date] = None) -> Optional[MOVEContext]:
     logger.info(
         f"[move] MOVE={move:.1f} ({signal}) | "
         f"5d change={spike_5d:+.1f}pt | "
-        f"source={source} | spiking={is_spiking}"
+        f"source={ctx.source} | spiking={is_spiking}"
     )
     return ctx

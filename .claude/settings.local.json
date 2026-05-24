@@ -21,7 +21,14 @@
       "Bash(git restore *)",
       "Bash(git check-ignore *)",
       "Bash(ls scripts *)",
-      "Bash(ls src/performance/risk.py)"
+      "Bash(ls src/performance/risk.py)",
+      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA\" ENABLE_CHARTS=false timeout 300 python main.py)",
+      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA\" ENABLE_CHARTS=false timeout 360 python main.py)",
+      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA\" ENABLE_CHARTS=false timeout 420 python main.py)",
+      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA,INTC,AMD\" ENABLE_CHARTS=false timeout 420 python main.py)",
+      "Bash(grep -nE \"3K\\\\. Cointegration|Step 3K|\\\\| Cointegration \\\\||\\\\| \\\\`coint\\\\` \\\\|\" README.md)",
+      "Bash(,)",
+      "Bash(grep -nE \"3K\\\\. Cointegration|coint`, `cross_sectional|Cointegration Pairs, Smart Money\" CLAUDE.md)"
     ]
   }
 }

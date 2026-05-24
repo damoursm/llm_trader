@@ -7,7 +7,7 @@ from typing import List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
 from src.utils import now_et, fmt_et
 from config import settings
-from src.models import TickerSignal, Recommendation, InsiderTrade, MacroContext, COTContext, IPOContext, VIXContext, PutCallContext, EarningsContext, BreadthContext, HighsLowsContext, McClellanContext, MacroSurpriseContext, FedWatchContext, RevisionMomentumContext, WhisperContext, OpExContext, SeasonalityContext, BondInternalsContext, MOVEContext, GlobalMacroContext
+from src.models import TickerSignal, Recommendation, InsiderTrade, MacroContext, COTContext, IPOContext, VIXContext, PutCallContext, EarningsContext, BreadthContext, HighsLowsContext, McClellanContext, MacroSurpriseContext, FedWatchContext, RevisionMomentumContext, WhisperContext, OpExContext, SeasonalityContext, BondInternalsContext, MOVEContext, GlobalMacroContext, DIXContext
 from src.data.insider_trades import build_insider_summary
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -82,6 +82,7 @@ def generate_recommendations(
     seasonality_context: Optional["SeasonalityContext"] = None,
     bond_internals_context: Optional["BondInternalsContext"] = None,
     move_context: Optional["MOVEContext"] = None,
+    dix_context: Optional["DIXContext"] = None,
     global_macro_context: Optional["GlobalMacroContext"] = None,
     sector_rotation_context=None,   # Optional[SectorRotationContext]
     rotation_drivers_context=None,  # Optional[RotationDriversContext]
@@ -127,12 +128,23 @@ def generate_recommendations(
         parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, sources_agreeing={s.sources_agreeing}"]
         if use_news:
             parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
+        if getattr(s, "sentiment_velocity_score", 0.0):
+            parts.append(
+                f"  Sentiment VELOCITY={s.sentiment_velocity_score:+.2f} "
+                f"(Δ tone: recent {s.sentiment_recent:+.2f} vs prior {s.sentiment_prior:+.2f}; "
+                f"news mood {'accelerating up' if s.sentiment_velocity_score > 0 else 'deteriorating'} — short-horizon timing)"
+            )
         if use_tech:
             parts.append(f"  Technical score={s.technical_score:+.2f}")
         if use_insider and s.insider_cluster_detected:
             parts.append(
                 f"  *** INSIDER CLUSTER: {s.insider_cluster_size} different insiders bought within 5 days "
                 f"(insider_score already amplified 1.75×) ***"
+            )
+        if use_insider and getattr(s, "insider_persistence_detected", False):
+            parts.append(
+                f"  *** INSIDER PERSISTENCE: {s.insider_persistence_buyer} bought {s.insider_persistence_count}× "
+                f"on separate days (insider_score amplified for repeated single-name conviction) ***"
             )
         if use_insider and s.insider_summary:
             parts.append(f"  Insider activity: {s.insider_summary}")
@@ -497,6 +509,80 @@ MOVE/VIX ratio >8×: bond market pricing stress that equities have not yet price
       * Both elevated: confirmed fear across all asset classes → strongest BEARISH regime backdrop
       * MOVE elevated, VIX calm: divergence → equities complacent; increase BEARISH weight
       * MOVE calm, VIX elevated: equity-specific fear (not systemic) → easier to fade individual stock SELLs"""
+
+    # Build Dark Pool Index (DIX) context block for the prompt
+    dix_block        = ""
+    dix_instructions = ""
+    if dix_context and dix_context.dix is not None:
+        dx = dix_context
+        dir_arrow = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "→"}.get(dx.direction, "→")
+        pct_line = (
+            f"  Trailing-year percentile: {dx.dix_percentile_1y:.0f}th\n"
+            if dx.dix_percentile_1y is not None else ""
+        )
+        gex_line = (
+            f"  Market-wide GEX: {dx.gex / 1e9:+.2f}Bn → {dx.gex_regime.replace('_', ' ')}\n"
+            if dx.gex is not None else ""
+        )
+        avg_line = f"  5d avg DIX: {dx.dix_5d_avg * 100:.1f}%" if dx.dix_5d_avg is not None else ""
+
+        dix_block = f"""
+<dark_pool_index_context>
+Dark Pool Index (off-exchange institutional flow): {dx.dix_pct:.1f}%  →  {dx.signal.replace('_', ' ')}  {dir_arrow} {dx.direction}  [trend: {dx.dix_trend}]
+{dx.summary}
+
+{pct_line}{gex_line}{avg_line}
+What DIX measures:
+  DIX = volume-weighted off-exchange (dark pool) short volume. Institutions accumulate in
+  dark pools to avoid moving the lit market, so a HIGH DIX = hidden BUYING pressure. It is a
+  LEADING indicator — dark-pool accumulation precedes price by ~1–4 weeks.
+
+Signal guide (percentile of DIX vs its own trailing year):
+  ≥ 75th  STRONG_ACCUMULATION → strong hidden buying; BULLISH forward bias
+  ≥ 58th  ACCUMULATION        → above-average hidden buying; mild BULLISH
+  42–58th NEUTRAL             → no edge
+  ≤ 42nd  DISTRIBUTION        → below-average hidden buying; mild BEARISH
+  ≤ 25th  STRONG_DISTRIBUTION → little hidden support; BEARISH forward bias
+
+Market-wide GEX = whole-index dealer gamma (distinct from the per-ticker GEX block):
+  VOL_SUPPRESSION (high gamma) → dealers dampen moves; expect a grind / mean-reversion.
+  VOL_EXPANSION   (low/neg gamma) → dealers amplify moves; trends and gaps run further.
+  HIGH DIX + VOL_EXPANSION is the classic "hidden buying with room to run" bullish setup.
+</dark_pool_index_context>
+"""
+
+        combo_clause = ""
+        if dx.direction == "BULLISH" and dx.gex_regime == "VOL_EXPANSION":
+            combo_clause = (
+                "\n    HIGH DIX + LOW GEX: hidden accumulation with room to run — among the most reliable bullish "
+                "macro backdrops. Lean INTO high-conviction BUY setups; prefer SWING/POSITION horizons."
+            )
+        elif dx.direction == "BEARISH" and dx.gex_regime == "VOL_EXPANSION":
+            combo_clause = (
+                "\n    LOW DIX + LOW GEX: no hidden buying support AND dealers amplify moves — downside-volatility "
+                "risk is elevated. Trim BUY conviction; treat broad-market SELLs more seriously."
+            )
+        elif dx.direction == "BULLISH" and dx.gex_regime == "VOL_SUPPRESSION":
+            combo_clause = (
+                "\n    DIX accumulation but high gamma (pinning): expect a slow grind higher, not a sharp rally. "
+                "Favour mean-reversion entries over breakout chasing."
+            )
+
+        dix_instructions = f"""
+11c. Dark Pool Index (DIX) overlay — hidden institutional accumulation:
+    Current: DIX={dx.dix_pct:.1f}% ({dx.signal.replace('_', ' ')}), direction = {dx.direction}, trend = {dx.dix_trend}, GEX regime = {dx.gex_regime.replace('_', ' ')}.{combo_clause}
+
+    Core principles:
+    - DIX is a LEADING, market-wide flow signal: high dark-pool buying historically precedes positive
+      S&P returns by ~1–4 weeks. It is a regime tailwind/headwind, NOT a per-ticker signal.
+    - HIGH DIX (STRONG_ACCUMULATION): apply a +0.03–0.05 confidence nudge to BULLISH BUY candidates that
+      already have multi-method support — hidden buyers provide a persistent bid beneath the tape.
+    - LOW DIX (STRONG_DISTRIBUTION): apply a −0.03–0.05 haircut to new BUY conviction — a tape rising WITHOUT
+      hidden institutional support is fragile. Raise the bar for fresh longs.
+    - RISING DIX confirms accumulation even at mid-range levels; FALLING DIX warns hidden support is fading.
+    - Combine with VIX/MOVE: high DIX during a VIX spike is a powerful contrarian BULLISH tell (institutions
+      buying the fear). Low DIX on a calm tape is a complacency warning.
+    - DIX does NOT override company-specific catalysts (earnings, M&A, fraud) — those are idiosyncratic."""
 
     # Build global macro context block (DXY + Copper/Gold ratio)
     global_macro_block        = ""
@@ -1668,7 +1754,7 @@ Interpretation:
             relevant = wc.signals  # fallback: include all
 
         rows = []
-        for s in sorted(relevant, key=lambda x: (x.days_until_earnings or 999, -abs(s.avg_eps_surprise_pct))):
+        for s in sorted(relevant, key=lambda x: (x.days_until_earnings or 999, -abs(x.avg_eps_surprise_pct))):
             date_str = f" [{s.earnings_date} ({s.days_until_earnings}d)]" if s.earnings_date else ""
             whisper_str = (
                 f"  implied_whisper=${s.implied_whisper:.2f} ({s.whisper_gap_pct:+.1f}%)"
@@ -1734,7 +1820,7 @@ Avoid chasing pre-earnings longs on NEUTRAL/MISS tickers even if news is bullish
       * This company has a well-established pattern of exceeding estimates.
       * If other signals (technical, news, insider) are positive → mild confidence boost (+0.03) for pre-earnings BUY.
       * BUT this pattern is also PRICED IN — the stock must beat the implied whisper, not just consensus.
-        Tag as SWING only (earnings day gap risk), note "whisper is ${avg_surprise}% above consensus."
+        Tag as SWING only (earnings day gap risk), note "whisper is $X% above consensus" where X is the ticker's avg_eps_surprise_pct.
     - BEAT_POSSIBLE: constructive setup. No confidence change vs. base case, but note "beat history" in rationale.
     - NEUTRAL: no whisper edge. Treat as binary event; follow earnings_calendar caution rules above.
     - MISS_POSSIBLE (beat_rate < 45% or consensus being revised down):
@@ -1780,6 +1866,55 @@ Avoid chasing pre-earnings longs on NEUTRAL/MISS tickers even if news is bullish
     - A cluster on its own, with no other confirming signal, is NOT sufficient for a BUY —
       it is a very strong WATCH / monitor signal. Two or more methods agreeing (cluster + news
       or cluster + technical) qualifies for BUY."""
+
+    # Build insider buying-persistence instruction
+    persistence_instruction = ""
+    if use_insider:
+        persist_sigs = [
+            s for s in signals_for_claude
+            if getattr(s, "insider_persistence_detected", False)
+        ]
+        if persist_sigs:
+            persist_str = ", ".join(
+                f"{s.ticker} ({s.insider_persistence_buyer} ×{s.insider_persistence_count})"
+                for s in persist_sigs
+            )
+            persistence_instruction = f"""
+22b. Insider buying persistence (HIGH CONVICTION single-name tell):
+    Repeated buying detected on: {persist_str}.
+    Persistence = the SAME insider buying the same stock on multiple SEPARATE days within the
+    lookback window. This is the *depth* counterpart to the cluster signal's *breadth*:
+    - One-off insider buy: could be scheduled diversification, an option exercise, or a single view.
+    - Same insider buying again and again: escalating personal conviction — they keep putting more
+      capital at risk as the thesis develops. Repeat buyers are typically early and right; they act
+      before the catalyst becomes public.
+
+    How to apply:
+    - Persistent buyer + positive news/technical → strong BUY candidate; upgrade confidence +0.04–0.06.
+    - Persistent buyer + mixed/neutral signals → high-priority WATCH ("insider accumulating on
+      repeated buys — await technical/news confirmation").
+    - Persistent buyer + negative external signals → flag the conflict explicitly; the insider may be
+      seeing through the noise. Do NOT let negative news alone override repeated insider conviction.
+    - The insider_score already reflects the persistence amplifier (up to 1.75× for 4+ repeat buys).
+    - Persistence + cluster on the SAME ticker is the highest-conviction insider configuration available.
+    - Persistence alone, with no other confirming method, is a WATCH — never a standalone BUY."""
+
+    # Build sentiment-velocity instruction (Δsentiment, not level)
+    velocity_instruction = ""
+    if any(getattr(s, "sentiment_velocity_score", 0.0) for s in signals_for_claude):
+        velocity_instruction = """
+1b. Sentiment VELOCITY overlay (Δsentiment, not level — short-horizon timing):
+    Some tickers carry a sentiment_velocity = (recent news tone) − (prior news tone). The CHANGE in
+    sentiment leads 1–5 day price moves better than the static level:
+    - Improving from very negative toward neutral (velocity > 0) often rallies even while the level is
+      still mildly negative — the second derivative turned up.
+    - Fading from very positive (velocity < 0) often sells off even while the level is still net-positive.
+    How to apply:
+    - Strong positive velocity + confirming technical/flow → favour SWING / SHORT-TERM BUY; the news cycle is turning up.
+    - Strong negative velocity on a name you'd otherwise BUY → demand extra confirmation; the news trend is against you.
+    - Velocity AGREEING with the sentiment level = the strongest news configuration. Velocity OPPOSING the level
+      is an early warning that the level is about to mean-revert.
+    - Velocity is a timing overlay, never a standalone BUY/SELL reason."""
 
     # Build OpEx calendar context block and instruction
     opex_block        = ""
@@ -2273,7 +2408,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
+{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -2304,7 +2439,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{cluster_instruction}{opex_instructions}{seasonality_instructions}
+{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

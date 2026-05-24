@@ -44,12 +44,29 @@ class Settings(BaseSettings):
 
     # Analysis method flags (at least one should be true)
     enable_news_sentiment: bool = True    # method 1: LLM sentiment from news/RSS
+
+    # Sentiment velocity (Δsentiment, not level) — the rate of change of news tone leads
+    # short-horizon (1–5 day) moves better than the absolute level. Deterministic lexical
+    # polarity per article, bucketed by published_at into a recent vs prior window;
+    # velocity = recent_tone − prior_tone. No extra LLM/API cost (reuses stored timestamps).
+    enable_sentiment_velocity: bool = True
+    sentiment_velocity_recent_hours: int = 24   # "recent" window: articles ≤ N hours old
+    sentiment_velocity_prior_hours: int = 96    # "prior" window: from recent_hours to N hours old
+
     enable_technical_analysis: bool = True  # method 2: RSI, MACD, SMA, Bollinger Bands
     enable_insider_trades: bool = True    # method 3: politician + corporate insider trades
 
     # Insider trades config
     insider_lookback_days: int = 90      # how far back to look for trades
     smart_money_top_tickers: int = 5     # max number of ticker groups shown in smart money section
+
+    # Insider buying persistence — amplify insider_score when the SAME insider buys the same
+    # ticker on multiple SEPARATE days within the lookback window. Repeated accumulation by one
+    # name (depth of conviction) is a stronger tell than a one-off purchase; distinct from the
+    # cluster amplifier (which measures breadth — many DIFFERENT insiders buying at once).
+    # Amplifier scales 1.0 + 0.25×(distinct_buys − 1), capped at 1.75× (mirrors the cluster ceiling).
+    enable_insider_persistence: bool = True
+    insider_persistence_min_buys: int = 2   # min distinct buy days by one insider to qualify
     # Comma-separated names to prioritise (empty = include all politicians)
     tracked_politicians: str = (
         "Nancy Pelosi,Paul Pelosi,Austin Scott,Michael McCaul,"
@@ -182,6 +199,14 @@ class Settings(BaseSettings):
     # ^MOVE primary ticker; VXTLT fallback. Spikes precede equity dislocations by 1–5 days.
     enable_move: bool = True
 
+    # Dark Pool Index (DIX) + market-wide GEX — SqueezeMetrics free CSV (no API key required).
+    # DIX = dollar/volume-weighted off-exchange short volume → proxy for hidden institutional
+    # accumulation; high DIX is historically bullish for forward S&P returns (leads ~1–4 weeks).
+    # Market-wide GEX gauges whole-index dealer gamma (low/negative = vol expansion). High DIX +
+    # low GEX = classic "hidden buying with room to run". Macro-context overlay (not per-ticker);
+    # feeds the Claude prompt and the Macro Regime Filter. Cached daily.
+    enable_dix: bool = True
+
     # Global macro cross-asset regime — DXY strength (DX-Y.NYB) + Copper/Gold ratio (HG=F / GC=F)
     # DXY: strong dollar = headwind for EM, commodities, multinationals.
     # Copper/Gold: rising ratio = risk-on expansion; declining = risk-off contraction.
@@ -249,6 +274,43 @@ class Settings(BaseSettings):
     enable_pead: bool = True
     pead_decay_window_days: int = 60       # days for the linear time-decay to reach zero
     pead_surprise_scale_pct: float = 25.0  # tanh saturation point (±25% surprise -> ±0.76)
+
+    # IV Rank + Directional — volatility-regime-aware directional bias.
+    # Uses 21-day realized vol percentile (vs trailing 252-day distribution) as a proxy
+    # for IV Rank, combined with 5-day return / ATR to switch between contrarian (high IR)
+    # and trend-confirming (low IR) directional scoring. Robust to regime shifts because
+    # both inputs are self-normalised against each ticker's own vol footprint.
+    # Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
+    enable_iv_rank: bool = True
+
+    # IV Expression — stock-vs-options expression decision from the real options chain.
+    # Pulls live market-implied vol (expected_move_pct from GEX context) and ranks it
+    # against the ticker's own trailing IV history (reconstructed from prior gex_*.json
+    # caches). Combines with options-market oi_skew to derive expression bias:
+    # cheap options + strong skew → CHEAP_DIRECTIONAL (confirm);
+    # expensive options + strong skew → FADE_PREMIUM (contrarian).
+    # No new data fetching — reuses the already-fetched GEX context.
+    enable_iv_expr: bool = True
+
+    # Cointegration Pairs — statistical-arbitrage market-neutral alpha (beyond sector_pairs).
+    # Engle-Granger two-step: OLS hedge ratio on log prices → native (numpy) ADF test on
+    # the residual spread. Cointegrated pairs whose spread z-score is stretched past the
+    # entry band become market-neutral LONG-cheap / SHORT-rich trades. Also derives a
+    # per-ticker directional lean fed into the aggregator. Cache-first OHLCV (works with
+    # ENABLE_FETCH_DATA=false). No statsmodels dependency.
+    enable_cointegration: bool = True
+    cointegration_entry_z: float = 2.0     # |z| at/above which a pair is an actionable ENTRY
+    cointegration_exit_z: float = 0.5      # |z| below which a pair is fair-value / no edge
+    cointegration_pvalue: float = 0.05     # ADF significance level (0.01 | 0.05 | 0.10)
+
+    # Cross-sectional ranking — measures how each ticker's per-method scores deviate from
+    # the universe mean on each method, then averages the (capped) z-scores into a single
+    # "stand-out" score per ticker. Composes additively into combined_score so the absolute
+    # aggregation stays intact while the cross-sectional view adds a relative-value dimension
+    # (robust to bull/bear regimes where absolute scores all skew one way).
+    enable_cross_sectional: bool = True
+    cross_sectional_weight: float = 0.20   # how strongly cs_score adjusts combined_score
+    cross_sectional_zcap: float = 2.5      # cap individual z-scores to this magnitude
 
     # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
     # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the

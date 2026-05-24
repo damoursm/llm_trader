@@ -157,21 +157,23 @@ def _trading_days_held(entry_date: str) -> int:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "money_flow", "pead")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "money_flow", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional")
 _METHOD_AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as "having a view"
 
 # Category groupings: how methods map to higher-level signal families
 METHOD_CATEGORIES: Dict[str, List[str]] = {
-    "Sentiment":   ["news"],
-    "Technical":   ["tech", "vwap", "pattern", "momentum", "money_flow"],
+    "Sentiment":   ["news", "sent_velocity"],
+    "Technical":   ["tech", "vwap", "pattern", "momentum", "money_flow", "iv_rank"],
     "Smart Money": ["insider"],
-    "Options":     ["put_call", "max_pain", "oi_skew"],
+    "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr"],
     "Fundamental": ["pead"],
+    "Relative":    ["cross_sectional", "coint"],
 }
 
 # Human-readable method labels for reports
 METHOD_LABELS: Dict[str, str] = {
     "news":     "News Sentiment",
+    "sent_velocity": "Sentiment Velocity (Δ)",
     "tech":     "Technical Analysis",
     "insider":  "Smart Money / Insider",
     "put_call": "Put/Call Ratio",
@@ -182,6 +184,10 @@ METHOD_LABELS: Dict[str, str] = {
     "momentum":   "Price Momentum",
     "money_flow": "Money Flow (MFI+CMF+OBV)",
     "pead":       "Post-Earnings Drift (PEAD)",
+    "iv_rank":    "IV Rank + Directional",
+    "iv_expr":    "IV Expression (Options Chain)",
+    "coint":      "Cointegration Pairs",
+    "cross_sectional": "Cross-Sectional Ranking",
 }
 
 
@@ -195,6 +201,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         return empty
     return {
         "news":      sig.sentiment_score,
+        "sent_velocity": getattr(sig, "sentiment_velocity_score", 0.0),
         "tech":      sig.technical_score,
         "insider":   sig.insider_score,
         "put_call":  sig.put_call_score,
@@ -205,6 +212,10 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "momentum":   getattr(sig, "momentum_score", 0.0),
         "money_flow": getattr(sig, "money_flow_score", 0.0),
         "pead":       getattr(sig, "pead_score", 0.0),
+        "iv_rank":    getattr(sig, "iv_rank_score", 0.0),
+        "iv_expr":    getattr(sig, "iv_expr_score", 0.0),
+        "coint":      getattr(sig, "coint_score", 0.0),
+        "cross_sectional": getattr(sig, "cross_sectional_score", 0.0),
     }
 
 

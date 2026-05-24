@@ -47,6 +47,16 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │                              252-bar history; volume-confirmed tanh score  │
 │  3F. Money Flow           — MFI + CMF + OBV slope composite:             │
 │                              accumulation vs distribution signal           │
+│  3G. PEAD                 — Post-Earnings Announcement Drift: SUE × time-│
+│                              decay; 40-year-replicated drift anomaly        │
+│  3H. Cross-Sectional Rank — per-method universe z-scores averaged;        │
+│                              relative-value overlay robust to regime bias  │
+│  3I. IV Rank + Directional — 21d RV percentile (IV-Rank proxy) × 5d ret/  │
+│                              ATR; contrarian at high IR, trend-follow at low│
+│  3J. IV Expression        — real options-chain IV × OI skew; cheap+skew → │
+│                              confirm, expensive+skew → fade premium         │
+│  3K. Cointegration Pairs  — Engle-Granger ADF on log-price spread;       │
+│                             market-neutral stat-arb mean-reversion       │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
 │  5.  Recommendations      — Claude: BUY / SELL / HOLD / WATCH           │
 │  6.  Performance Tracking — paper trades, P&L, method attribution        │
@@ -601,6 +611,36 @@ The MOVE Index is to Treasury bonds what VIX is to S&P 500 equities. It is const
 
 ---
 
+### Step 3v2 — Dark Pool Index (DIX) + market-wide GEX (`src/data/dix.py`)
+
+When `ENABLE_DIX=true`, fetches the free SqueezeMetrics `DIX.csv` (`date, price, dix, gex`) via httpx — no API key required. Cache-first (`cache/dix_*.json`, daily); any feed/parse failure returns `None` and the run continues unaffected.
+
+**What DIX measures:**
+
+The Dark Pool Index is the dollar- and volume-weighted short volume across **off-exchange (dark pool) venues**, expressed as a fraction (~0.38–0.48). Large institutions route through dark pools to accumulate *without moving the lit market*, so a **high DIX is a proxy for hidden institutional buying** — and it is a **leading** indicator, preceding S&P price by roughly **1–4 weeks**. This is the "institutional accumulation off-exchange" signal.
+
+**Signal classification** (percentile of current DIX vs its own trailing year; absolute-level fallback when <1y of history):
+
+| DIX percentile | Signal | Equity implication |
+|---|---|---|
+| ≥ 75th | `STRONG_ACCUMULATION` | Strong hidden buying — BULLISH |
+| ≥ 58th | `ACCUMULATION` | Above-average hidden buying — mild BULLISH |
+| 42–58th | `NEUTRAL` | No edge |
+| ≤ 42nd | `DISTRIBUTION` | Below-average hidden buying — mild BEARISH |
+| ≤ 25th | `STRONG_DISTRIBUTION` | Little hidden support — BEARISH |
+
+A 5-day `RISING`/`FALLING`/`FLAT` trend (±0.5pp threshold) confirms or warns on the level.
+
+**Market-wide GEX (from the same feed):** the *whole-index* dealer gamma, distinct from the per-ticker dealer gamma in `gamma_exposure.py`. Low/negative GEX = `VOL_EXPANSION` (dealers amplify moves; trends and gaps run further); high GEX = `VOL_SUPPRESSION` (dealers pin price; expect a grind/mean-reversion). The classic SqueezeMetrics bull setup is **high DIX + low GEX** — "hidden buying with room to run".
+
+**Integration (two paths, so it genuinely steers recommendations):**
+- **Claude prompt** (block + instruction 11c): a market-wide overlay (never per-ticker). `STRONG_ACCUMULATION` → +0.03–0.05 confidence nudge on already-supported BULLISH BUYs; `STRONG_DISTRIBUTION` → −0.03–0.05 haircut on fresh longs. High DIX during a VIX spike is flagged as a powerful contrarian bullish tell.
+- **Macro Regime Filter** (`macro_regime.py`): contributes to the composite regime score (`_DIX_SCORES`, weight 1.0 — same tier as breadth/FRED), so strong accumulation/distribution shifts the actionable confidence threshold and the BUY gate alongside VIX/MOVE/credit.
+
+DIX is rendered in the email report (section 21b) as a gauge card (DIX %, trailing-year percentile, 5d trend, market GEX regime) with the high-DIX+low-GEX / low-DIX+low-GEX combo callouts. Disable with `ENABLE_DIX=false`.
+
+---
+
 ### Step 3w — Global Macro Cross-Asset Regime (`src/data/global_macro.py`)
 
 When `ENABLE_GLOBAL_MACRO=true`, fetches DXY, Copper/Gold, WTI crude oil, and TLT via yfinance and computes three independent cross-asset macro regime signals. No API key required. Cached daily.
@@ -814,6 +854,24 @@ The watchlist survives pipeline restarts (JSON file on disk) and adds no network
 
 ---
 
+### Step 3r2 — Insider Buying Persistence (`src/signals/aggregator.py`)
+
+Computed as part of signal aggregation (no separate data fetch step) — the depth counterpart to the cluster's breadth.
+
+**Definition:** Persistence is detected when the **same** insider (by name) purchases the same stock on **multiple separate days** within the lookback window. The cluster signal measures *how many different people* bought at once; persistence measures *how repeatedly one person* keeps buying.
+
+**Why repeated buying by one name beats a one-off:**
+- A single insider buy can be a scheduled 10b5-1 plan, diversification, or an option exercise — noisy.
+- The same insider buying again and again is escalating personal conviction: they keep putting more capital at risk as the thesis develops. Repeat buyers tend to be early and right, acting before the catalyst is public.
+
+**Implementation:** `_detect_insider_persistence()` filters the ticker's corporate-insider and politician purchases (same filter as the cluster detector — options flow, 13F, and bare Form 4 filings are excluded), groups them by case-insensitive `trader_name`, and counts the number of **distinct transaction dates** per name (so a single multi-line filing on one day counts once, not as repetition). Persistence fires when the most-active buyer's distinct-day count ≥ `insider_persistence_min_buys` (default 2).
+
+**Amplifier:** When persistence is detected AND the baseline `insider_score` is positive, the score is multiplied by `_persistence_factor(count) = min(1.75, 1.0 + 0.25 × (count − 1))` — so 2 days → 1.25×, 3 → 1.50×, 4+ → 1.75× (capped, applied after the cluster amplifier and clamped to +1.0). The `TickerSignal` stores `insider_persistence_detected=True`, `insider_persistence_count=N`, and `insider_persistence_buyer="<name>"`. Claude receives an explicit `*** INSIDER PERSISTENCE ***` flag in the signals block and instruction #22b. The email Smart Money card shows a teal `PERSISTENT • <name> ×N` badge.
+
+Because persistence amplifies `insider_score`, it is automatically reflected in performance attribution under the existing **Smart Money / insider** method — no separate attribution key. Persistence + cluster on the same ticker is the highest-conviction insider configuration available. Disable with `ENABLE_INSIDER_PERSISTENCE=false`.
+
+---
+
 ### Step 3A — Pattern Recognition (`src/signals/pattern_recognition.py`)
 
 Detects 8 classical chart patterns in recent price action and converts each detection into a `[-1, +1]` signal score driven by the **ticker's own historical win rate** for that pattern type.
@@ -989,6 +1047,27 @@ When `ENABLE_BUSINESS_CYCLE_ROTATION=true`, derives the current structural econo
 
 ---
 
+### Step 3L — Sentiment Velocity (`src/signals/sentiment_velocity.py`)
+
+When `ENABLE_SENTIMENT_VELOCITY=true`, computes the **rate of change** of news tone for each ticker — Δsentiment, *not* the level. **Why velocity beats level for short horizons:** the static sentiment level is largely priced in, but the *change* in tone is the new information. A stock improving from very negative toward neutral often rallies even while its level is still mildly negative (the second derivative turned up); a stock fading from very positive often sells off even while still net-positive. The change leads 1–5 day price moves better than the level.
+
+**Zero extra cost:** this reuses the article timestamps already stored on every `NewsArticle` (`published_at`) and a deterministic financial **lexical polarity** scorer — no additional LLM or API calls. (The LLM sentiment in Step 1 provides the *level*; this provides the *velocity*.)
+
+**Score derivation:**
+
+1. Filter to the ticker's relevant articles (same keyword filter as news sentiment).
+2. Score each article's tone ∈ [−1, +1] from a positive/negative financial keyword balance: `(pos − neg) / (pos + neg)`.
+3. Bucket by recency: **recent** window = articles ≤ `SENTIMENT_VELOCITY_RECENT_HOURS` old (default 24h); **prior** window = from there to `SENTIMENT_VELOCITY_PRIOR_HOURS` (default 96h).
+4. `velocity = mean_tone(recent) − mean_tone(prior)` ∈ [−2, +2].
+5. `score = tanh(velocity / 0.6) × confidence`, clamped to [−1, +1], where `confidence` damps thin windows (log-scaled by article count in each window).
+6. Returns 0 when either window is empty (no change can be measured).
+
+**Aggregator integration:** folded in as method `sent_velocity` with base weight **0.12**, stored on `TickerSignal.sentiment_velocity_score` (plus `sentiment_recent` / `sentiment_prior`). Tracked in performance attribution under the **Sentiment** category — so the system measures whether velocity adds alpha over the level. Claude sees a per-ticker `Sentiment VELOCITY` line and instruction **1b** (treat it as a short-horizon timing overlay: velocity agreeing with the level is the strongest news configuration; velocity opposing the level warns the level is about to mean-revert).
+
+**Email:** a per-ticker "Sentiment Velocity" row in the signal breakdown and section 34a **Sentiment Velocity Leaderboard** (tone accelerating up vs deteriorating). Disable with `ENABLE_SENTIMENT_VELOCITY=false`.
+
+---
+
 ### Step 3E — Price Momentum / Perceived Value (`src/signals/price_momentum.py`)
 
 When `ENABLE_PRICE_MOMENTUM=true`, computes a normalised multi-period price momentum score for each ticker. **Academic basis:** Jegadeesh & Titman (1993) showed that stocks outperforming over 3–12 months continue to outperform over the next 3–12 months — one of the most replicated factors in finance. The underlying mechanism is perceived value: as prices rise, investors perceive higher intrinsic value, attracting further capital and reinforcing the trend.
@@ -1090,9 +1169,127 @@ ENABLE_MONEY_FLOW=true
 
 ---
 
+### Step 3I — IV Rank + Directional (`src/signals/iv_rank.py`)
+
+A **regime-aware directional bias** built from each ticker's own volatility footprint. True historical implied volatility per ticker isn't stored, so realized volatility is used as a proxy — RV and IV are tightly correlated, and the **rank** of current vol within a ticker's own trailing distribution carries the same regime information as IV Rank.
+
+**IV-Rank proxy:**
+```
+RV_21d       = stdev(log_returns_21d) × √252
+IV_Rank ≈ percentile_rank(RV_21d, trailing_252_RV_21d)  ∈ [0, 100]
+```
+
+**Directional input:** 5-day return ÷ ATR%. This is "how many average daily ranges did this stock cover this week" — self-normalised against the ticker's own volatility so the same threshold works across the universe.
+
+**Scoring switches by IR band:**
+
+| Band | Logic | Score |
+|---|---|---|
+| **IR ≥ 70** + 5d move strongly negative (z_ret ≤ −1) | Capitulation regime — vol mean-reverts, fear bottoms | `+0.55` `CAPITULATION_BUY` |
+| **IR ≥ 70** + 5d move strongly positive (z_ret ≥ +1) | Euphoric chase — expensive options + crowded long | `-0.55` `FADE_EXTREME` |
+| **IR ≥ 70** + mild move | Event being priced in — small directional caution | `-0.20 × sign(z_ret)` `EVENT_CAUTION` |
+| **IR ≤ 30** + positive trend | Cheap options + steady uptrend — room for vol expansion | `+0.40 × tanh(z_ret/1.5)` `CALM_UPTREND` |
+| **IR ≤ 30** + negative trend | Complacency in decline — downtrend not yet feared | `-0.40 × tanh(|z_ret|/1.5)` `CALM_DOWNTREND` |
+| **Mid IR (30 < IR < 70)** | Mild trend-following bias only | `0.30 × tanh(z_ret/1.5)` `TREND_FOLLOWING` |
+
+**Robustness to regime shifts:** Both inputs are self-normalised — IR ranks against the ticker's own RV history; z_ret normalises the return by the ticker's own ATR. The same thresholds work across high-vol names (NVDA, TSLA) and low-vol names (SPY, XLP) without retuning.
+
+**Cache strategy:** Uses the OHLCV chart cache first (works with `ENABLE_FETCH_DATA=false`). Falls back to `get_history(18mo)` on cold cache. Minimum 65 bars required.
+
+**Weight in aggregator:** 0.13 (base). Tracked in performance attribution under the **Technical** category.
+
+**Email per-ticker mrow + Leaderboard:** Score + IR + 5-day return + regime label per actionable ticker; leaderboard shows top 5 bullish / bottom 5 bearish biases with IR and regime annotations.
+
+**`.env` flag:**
+```env
+ENABLE_IV_RANK=true
+```
+
+---
+
+### Step 3J — IV Expression (`src/signals/iv_expr.py`)
+
+A **stock-vs-options expression decision** built from the **real options chain** — distinct from `iv_rank`, which uses a realized-vol proxy. This method reads true market-implied volatility straight from the options chain that's already fetched for GEX, then decides whether a directional thesis should be expressed in stock, in long options, or faded entirely.
+
+**Inputs (all reused from the day's GEX context — zero new fetches):**
+
+| Input | Meaning |
+|---|---|
+| `expected_move_pct` | Market-implied ±1σ move (ATM straddle ÷ spot) — the live IV reading |
+| `oi_skew` | OI-weighted directional positioning ∈ [−1, +1]; +1 = call OI piled above spot |
+| `gex_signal` | Dealer gamma regime: PINNED / AMPLIFIED / NEUTRAL |
+
+**Real IV Rank (no synthetic proxy):** `expected_move_pct` is volatile in absolute terms (2% on SPY is sleepy; 19% on a single name is an event), so it's *ranked* against the ticker's own recent history — reconstructed by reading prior `cache/gex_*.json` files on disk (60-day window). With ≥6 historical readings the current IV is ranked by percentile; with fewer, a universe-median-relative fallback keeps the signal alive on cold-cache days.
+
+**Score logic (expression decision):**
+
+| Regime | Logic | Score |
+|---|---|---|
+| **IV rank ≥ 75** + strong skew (\|skew\| ≥ 0.50) | Rich premium + directional crowd → vol mean-reverts | `−0.55 × sign(skew)` `FADE_PREMIUM` |
+| **IV rank ≥ 75** + weak skew | Event being priced, no conviction | `−0.20 × sign(skew)` `EXPENSIVE_NEUTRAL` |
+| **IV rank ≤ 25** + strong skew | Cheap options + decisive positioning → high-conviction expression | `+0.55 × sign(skew)` `CHEAP_DIRECTIONAL_LONG/SHORT` |
+| **IV rank ≤ 25** + weak skew | Cheap but unconvinced | `+0.20 × sign(skew)` `CHEAP_COMPLACENT` |
+| **Mid IV (25–75)** | Options market's directional view, un-amplified | `0.30 × oi_skew` `MID_IV_DIRECTIONAL` |
+
+**AMPLIFIED dealer-gamma adjustment:** when dealers are short gamma (moves accelerate), add `+0.10 × sign(score)` to push further in the favourable direction. PINNED gets no boost (dealers are suppressing vol).
+
+**Why this differs from `iv_rank`:** `iv_rank` answers "what's the directional thesis given the vol regime?" using realized vol. `iv_expr` answers "given the options market's *own* positioning and *true* implied vol, should I express this in stock or options, and is the premium worth paying?" — it can act as a contrarian counterweight when the options market is over-pricing a crowded directional move (e.g. XLK with rich IV + heavy put skew → `FADE_PREMIUM` long counterweight).
+
+**Cache strategy:** No cache of its own — reads the live GEX context for current values and the on-disk GEX caches for history. **Requires `ENABLE_GEX=true`** (`gex_context` must be present); tickers without a GEX entry return `NO_OPTIONS_DATA` and contribute nothing.
+
+**Weight in aggregator:** 0.12 (base). Tracked in performance attribution under the **Options** category.
+
+**Email per-ticker mrow + Leaderboard:** Score + IV-rank + OI-skew + expression label per ticker; leaderboard shows top 5 cheap-directional / bottom 5 fade-premium biases.
+
+**`.env` flag:**
+```env
+ENABLE_IV_EXPR=true
+```
+
+---
+
+### Step 3K — Cointegration Pairs (`src/signals/cointegration.py`)
+
+A **statistical-arbitrage, market-neutral** overlay that goes beyond Sector Pairs (which keys off opposing directional *signals*). It tests whether two economically-linked price series are *cointegrated* — i.e. a linear combination of them is stationary (mean-reverting) even though each series individually wanders (has a unit root). When a cointegrated spread stretches far from its mean, Long the cheap leg / Short the rich leg and bet on reversion; the hedge ratio removes the shared market beta.
+
+**Engle-Granger two-step (native numpy — no `statsmodels` dependency):**
+
+1. OLS the log prices: `log(A) = α + β·log(B) + ε`. β is the hedge ratio; ε is the spread (residual).
+2. ADF-test the residual spread for a unit root. Rejecting the null (stat below the critical value) ⇒ the spread is stationary ⇒ A and B are cointegrated. Critical values are the Engle-Granger residual-based MacKinnon values — more demanding than plain ADF because the spread is an *estimated* residual: **1% −3.90, 5% −3.34, 10% −3.04**.
+
+**Candidate pairs:** a curated list of economically-linked securities (gold trackers GLD/IAU/SLV/GDX, index ETFs SPY/IVV/QQQ/XLK, semis AMD/NVDA/INTC/AVGO, mega-cap tech, payments V/MA, banks JPM/BAC/GS/MS, energy XOM/CVX, retail HD/LOW, autos F/GM, telecom T/VZ, …) plus same-sector combinations drawn from the aggregator's `_SECTOR_MAP`, restricted to today's universe. Only pairs whose **both** legs have enough cached/fetchable history are tested.
+
+**Trade signal (spread z-score = (spread − mean) ÷ std):**
+
+| z-score | Meaning | Action |
+|---|---|---|
+| `z ≥ +entry` | spread rich (A expensive vs B) | SHORT A / LONG B |
+| `z ≤ −entry` | spread cheap | LONG A / SHORT B |
+| `\|z\| < exit` | near fair value | no edge |
+
+Defaults: `entry = 2.0σ`, `exit = 0.5σ`. An **Ornstein-Uhlenbeck half-life** filter (regress Δs on s₋₁ ⇒ half-life = −ln2/λ) drops pairs that revert too slowly to trade (> 60 days). A pair is `ENTRY` when cointegrated **and** `\|z\| ≥ entry` **and** the half-life is fast; `STRETCHED` if cointegrated and stretched but slow-reverting; `MONITOR`/`NEUTRAL` otherwise.
+
+**Per-ticker directional lean:** although the natural output is *pairs*, each tradeable pair also implies a single-name view — its cheap (long) leg earns a bullish nudge, its rich (short) leg a bearish one, scaled by how far the spread is stretched past the entry threshold (tanh-saturated). These are averaged across every pair a ticker belongs to into `ticker_scores ∈ [−1, +1]`, which the aggregator folds into the per-ticker `combined_score` like any other method.
+
+**Cache strategy:** No cache of its own — cache-first via `load_ohlcv()` (works with `ENABLE_FETCH_DATA=false`); falls back to `get_history(period="1y", force_refresh=True)` only when the cache is shorter than 180 bars and fetching is enabled (cointegration needs a long window for statistical power).
+
+**Weight in aggregator:** 0.12 (base). Tracked in performance attribution under the **Relative** category (alongside Cross-Sectional Ranking).
+
+**Email section 35b + per-ticker mrow:** the Cointegration Pairs section lists each tradeable pair (β, ADF vs critical value, half-life, z-score, LONG/SHORT legs, rationale); each affected ticker also gets a row in its signal breakdown. Distinct from Sector Pairs — this is a pure statistical relationship, not a directional-signal divergence.
+
+**`.env` flags:**
+```env
+ENABLE_COINTEGRATION=true
+COINTEGRATION_ENTRY_Z=2.0      # |z| at/above which a pair is an actionable ENTRY
+COINTEGRATION_EXIT_Z=0.5       # |z| below which a pair is fair-value / no edge
+COINTEGRATION_PVALUE=0.05      # ADF significance level (0.01 | 0.05 | 0.10)
+```
+
+---
+
 ### Step 4 — Signal Aggregation (`src/signals/aggregator.py`)
 
-Combines up to ten signal methods with dynamically normalized weights:
+Combines up to fourteen signal methods with dynamically normalized weights:
 
 | Method | Base weight | Source |
 |---|---|---|
@@ -1106,6 +1303,10 @@ Combines up to ten signal methods with dynamically normalized weights:
 | Pattern recognition | 18% | Historical win rate for current chart pattern |
 | Price momentum | 18% | 1m/2m normalised returns vs own 252-bar history |
 | Money flow | 15% | MFI + CMF + OBV slope composite accumulation/distribution |
+| PEAD | 15% | SUE × time-decay drift from earnings surprises |
+| IV Rank + Directional | 13% | 21d RV percentile × 5d return/ATR, regime-aware switching |
+| IV Expression | 12% | Real options-chain IV percentile × OI skew, stock-vs-options decision |
+| Cointegration | 12% | Engle-Granger ADF + spread z-score; per-ticker lean from stat-arb pairs |
 
 Weights are re-normalized at runtime based on which methods are enabled — they always sum to 100%.
 
@@ -1333,11 +1534,16 @@ Every *new* trade stores ten raw method scores at entry time:
 | `pattern` | Chart pattern recognition |
 | `momentum` | Price Momentum (Perceived Value) |
 | `money_flow` | Money Flow (MFI + CMF + OBV) |
+| `pead` | Post-Earnings Announcement Drift (SUE × time-decay) |
+| `iv_rank` | IV Rank + Directional (RV percentile × 5d return/ATR) |
+| `iv_expr` | IV Expression (real options-chain IV percentile × OI skew) |
+| `coint` | Cointegration Pairs (Engle-Granger ADF + spread z-score) |
+| `cross_sectional` | Cross-Sectional Ranking (avg per-method z-score vs universe) |
 
 Plus `methods_agreeing` (the subset with `|score| > 0.10` in the trade direction) and `dominant_method` (highest absolute score). After sufficient attributed trades accumulate, the email section **Signal Method Attribution** shows four analytics tables:
 
 1. **Individual Methods** — win rate, avg return, size-adjusted weighted avg return; sorted descending by win rate; color-coded green ≥55%, amber 45–55%, red <45%.
-2. **Method Categories** — rolls individual methods up into four groups: Sentiment (news), Technical (tech, vwap, pattern, momentum, money_flow), Smart Money (insider), Options (put_call, max_pain, oi_skew).
+2. **Method Categories** — rolls individual methods up into six groups: Sentiment (news), Technical (tech, vwap, pattern, momentum, money_flow, iv_rank), Smart Money (insider), Options (put_call, max_pain, oi_skew, iv_expr), Fundamental (pead), Relative (cross_sectional).
 3. **Signal Convergence** — performance grouped by how many methods agreed (1 / 2 / 3 / 4+); validates whether the coherence multiplier in the aggregator is actually improving outcomes.
 4. **Lead Signal** — which single method had the highest score in the trade direction; shows which signal type tends to lead profitable setups.
 
@@ -1437,6 +1643,9 @@ To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env
 | Business Cycle Rotation | — | none (instant synthesis) | no cache |
 | Price Momentum | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
 | Money Flow | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
+| IV Rank + Directional | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
+| IV Expression | — | reuses GEX caches | `cache/gex_*.json` |
+| Cointegration | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
 | Trades ledger | — | permanent | `cache/trades.json` |
 
 ---
