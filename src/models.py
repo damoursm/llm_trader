@@ -913,6 +913,40 @@ class ClusterWatchlistContext(BaseModel):
     summary: str
 
 
+class ScreenHit(BaseModel):
+    """A ticker surfaced by the opportunity screener (one or more technical setups)."""
+    ticker: str
+    direction: str                 # BULLISH | BEARISH (net of the directional screens)
+    screens: List[str]             # e.g. ["NEW_52W_HIGH", "UNUSUAL_VOLUME", "STRONG_RS"]
+    last_price: float = 0.0
+    vol_ratio: float = 0.0         # today volume / 20-day average
+    rs_excess_pct: float = 0.0     # excess return vs SPY over the RS lookback (pp)
+    note: str = ""                 # short human-readable setup description
+
+
+class ScreenerContext(BaseModel):
+    """Opportunity-screener output — proactive setup discovery across a liquid universe."""
+    hits: List[ScreenHit]
+    universe_size: int = 0         # candidates evaluated
+    fetched: int = 0               # cold OHLCV fetches performed this run
+    report_date: date
+    summary: str = ""
+
+
+class MacroDiscoveryContext(BaseModel):
+    """Macro → discovery loop: top holdings of the favored sector/factor ETFs.
+
+    Closes the loop between the macro/regime modules (sector rotation, business cycle,
+    DIX) and stock selection — biasing the universe toward where macro money is flowing.
+    """
+    favored_etfs: List[str] = []           # ETFs whose holdings were pulled
+    etf_reasons: Dict[str, str] = {}       # etf → why it's favored (inflow / cycle leader / DIX tilt)
+    by_etf: Dict[str, List[str]] = {}      # etf → contributed constituent tickers
+    tickers: List[str] = []                # deduped, capped constituents injected into the universe
+    report_date: date
+    summary: str = ""
+
+
 class CatalystSetup(BaseModel):
     """A ticker with both a recent 8-K filing and an insider buy — highest-conviction pre-signal setup."""
     ticker: str

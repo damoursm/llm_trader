@@ -115,6 +115,16 @@ def _load_ticker_cik_map() -> Dict[str, str]:
     return _ticker_cik
 
 
+def get_valid_tickers() -> frozenset:
+    """Return the set of all valid US ticker symbols from the SEC reference map.
+
+    Loaded once per process (cached). Used by the open-vocabulary ticker
+    extractor to validate candidate symbols mined from headlines / social posts.
+    Returns an empty frozenset if the SEC map is unavailable.
+    """
+    return frozenset(_load_ticker_cik_map().keys())
+
+
 # ---------------------------------------------------------------------------
 # Submissions fetch and parse
 # ---------------------------------------------------------------------------

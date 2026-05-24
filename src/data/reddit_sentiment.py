@@ -19,6 +19,7 @@ import httpx
 from loguru import logger
 
 from src.models import NewsArticle
+from src.data.ticker_extract import extract_candidate_tickers
 
 CACHE_DIR = Path("cache")
 _REQUEST_DELAY = 0.5   # Reddit rate limit: 60 req/min for OAuth apps
@@ -181,6 +182,56 @@ def _build_article(ticker: str, mention_count: int, weighted_score: float, subre
         source="Reddit/WSB",
         published_at=now,
     )
+
+
+def discover_wsb_tickers(
+    user_agent: str = "llm_trader/1.0 (stock analysis bot)",
+    limit: int = 75,
+    min_mentions: int = 3,
+) -> List[str]:
+    """Discover the most-mentioned valid tickers across WSB / stocks / investing.
+
+    Uses Reddit's PUBLIC JSON endpoints (``hot.json`` + ``rising.json``) — no OAuth
+    or API credentials required — so discovery works even when Reddit keys are not
+    configured. Each post's title + body is mined OPEN-VOCABULARY: $cashtags and
+    capitalized tokens are resolved against the SEC ticker universe (via
+    ``ticker_extract``). Returns tickers appearing in ≥ ``min_mentions`` distinct
+    posts, sorted by mention count (top 20). Fail-graceful: returns [] on error.
+    """
+    from collections import Counter
+
+    counts: Counter = Counter()
+    headers = {"User-Agent": user_agent or "llm_trader/1.0 (stock analysis bot)"}
+    posts_scanned = 0
+    try:
+        with httpx.Client(headers=headers, timeout=15, follow_redirects=True) as client:
+            for sub in _SUBREDDITS:
+                for feed in ("hot", "rising"):
+                    url = f"https://www.reddit.com/r/{sub}/{feed}.json?limit={limit}"
+                    try:
+                        resp = client.get(url)
+                        resp.raise_for_status()
+                        children = resp.json().get("data", {}).get("children", [])
+                    except Exception as e:
+                        logger.debug(f"[reddit] discovery fetch failed ({url}): {e}")
+                        continue
+                    for child in children:
+                        post = child.get("data", {})
+                        text = f"{post.get('title', '')} {post.get('selftext', '')[:500]}"
+                        for t in extract_candidate_tickers(text):
+                            counts[t] += 1
+                        posts_scanned += 1
+                    time.sleep(_REQUEST_DELAY)
+    except Exception as e:
+        logger.warning(f"[reddit] WSB discovery failed: {e}")
+        return []
+
+    hot = [t for t, c in counts.most_common() if c >= min_mentions]
+    logger.info(
+        f"[reddit] WSB discovery: scanned {posts_scanned} posts → "
+        f"{len(hot)} ticker(s) ≥{min_mentions} mentions: {hot[:20]}"
+    )
+    return hot[:20]
 
 
 def fetch_reddit_sentiment(

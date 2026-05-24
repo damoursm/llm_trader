@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # News sources
     newsapi_key: str = ""
     alpha_vantage_key: str = ""
+    # Financial Modeling Prep — market-wide analyst upgrades/downgrades feed (Section E catalyst
+    # discovery). Free key: https://site.financialmodelingprep.com/developer/docs . Empty → the
+    # market-wide analyst discovery source is skipped (yfinance analyst data is per-ticker only).
+    fmp_api_key: str = ""
 
     # Email (all optional — only needed when running with --email)
     smtp_host: str = "smtp.gmail.com"
@@ -80,12 +84,24 @@ class Settings(BaseSettings):
     # SEC EDGAR filings (strategies 5, 6, 7)
     enable_sec_filings: bool = True     # 13D/13G activist stakes, Form 144, 13F
     sec_filings_lookback_days: int = 30  # lookback window for 13D/13G and Form 144
-    # Comma-separated institution names for 13F superinvestor tracking.
-    # The pipeline resolves CIKs dynamically from EDGAR — no manual lookup needed.
+    # Comma-separated institution names for 13F superinvestor tracking (broader = stronger
+    # consensus when multiple filers buy the same name). The pipeline resolves CIKs dynamically
+    # from EDGAR — no manual lookup needed. Each adds EDGAR calls, so keep the list reasonable.
     tracked_institutions: str = (
         "Berkshire Hathaway,Pershing Square Capital Management,"
-        "Appaloosa Management,Baupost Group"
+        "Appaloosa Management,Baupost Group,Scion Asset Management,"
+        "Greenlight Capital,Third Point,Icahn Capital,"
+        "Tiger Global Management,Duquesne Family Office"
     )
+
+    # Market-wide Form 4 open-market-buy scan — surfaces insider ACCUMULATION everywhere (not
+    # just the watchlist). Parses recent Form 4 XML for transaction code "P" (open-market
+    # purchase); these become corporate_insider "purchase" records that feed the insider CLUSTER
+    # + PERSISTENCE detectors and discovery. Open-market buys are only ~1-2% of all Form 4s, so
+    # the scan parses a bounded number of the most recent filings (cached daily). enable_sec_filings.
+    enable_form4_scan: bool = True
+    form4_scan_lookback_days: int = 3
+    form4_scan_max_filings: int = 150     # recent Form 4 filings parsed per run (cached daily)
 
     # FRED (Federal Reserve of St. Louis) — macro regime context
     # Free API key: https://fred.stlouisfed.org/docs/api/api_key.html
@@ -175,6 +191,89 @@ class Settings(BaseSettings):
 
     # Google Trends — search interest spike/drop as retail attention proxy (no API key required)
     enable_google_trends: bool = True   # uses pytrends (unofficial API); cached daily
+
+    # Ticker discovery — extra sources that widen the analysis universe (Step 0, fail-graceful).
+    # WSB cashtag discovery: most-mentioned valid tickers across r/wallstreetbets, r/stocks,
+    # r/investing hot/rising posts via Reddit's public JSON (no key) — validated against the SEC
+    # ticker universe. NewsAPI/headline discovery is open-vocabulary via the same SEC map.
+    # StockTwits trending is implemented but its public API is Cloudflare-gated (403 without a
+    # browser/token), so it's OFF by default — enable only if you have working access.
+    enable_stocktwits_discovery: bool = False
+    enable_wsb_discovery: bool = True
+    wsb_discovery_min_mentions: int = 3   # min distinct hot/rising posts mentioning a ticker
+
+    # Opportunity Screener — PROACTIVE setup discovery over a broad liquid universe.
+    # Shifts discovery from "what's trending" to "what's technically set up". Screens a
+    # curated liquid universe (+ everything already in the OHLCV cache) cache-first for:
+    # unusual volume, 52-week breakouts / new-low reversals, relative strength vs SPY, and
+    # golden/death crosses — then injects qualifying names into the analysis universe. Reuses
+    # the OHLCV cache (works offline once warm); a bounded warm-up fetch primes the cache.
+    enable_opportunity_screener: bool = True
+    screen_volume_ratio: float = 2.0           # today vol / 20d avg ≥ this → unusual volume
+    screen_rs_lookback_days: int = 63          # ~3 months for relative strength vs SPY
+    screen_rs_threshold_pct: float = 10.0      # excess return vs SPY (pp) → strong/weak RS
+    screen_cross_lookback: int = 5             # bars within which a 50/200 SMA cross is "fresh"
+    screen_near_high_pct: float = 2.0          # within this % of the 52-week high → breakout-watch
+    screen_min_price: float = 5.0               # liquidity gate: minimum last close ($)
+    screen_min_dollar_volume: float = 20_000_000  # liquidity gate: min 20d avg $ volume (filters thin pumps)
+    screen_max_fetch_per_run: int = 30         # cap cold OHLCV fetches per run (cache warms over time)
+    screen_max_results: int = 20               # max setups the screener injects into the universe
+
+    # Macro → Discovery loop — closes the gap between the macro/regime modules and stock selection.
+    # The sector-rotation (top inflows), business-cycle (phase leaders), and DIX (regime → factor
+    # tilt) modules identify FAVORED sector/factor ETFs; this auto-pulls their top holdings as
+    # candidates so the analysis universe is biased toward where macro money is flowing. Holdings
+    # come from yfinance funds_data (cached daily) with a static SPDR fallback.
+    enable_macro_discovery: bool = True
+    macro_discovery_top_sectors: int = 3       # favored ETFs to pull from each source (rotation / cycle)
+    macro_discovery_holdings_per_etf: int = 8  # top N holdings pulled per favored ETF
+    macro_discovery_max: int = 25              # max constituent names injected into the universe
+
+    # ── Section E: Catalyst & relationship expansion ──────────────────────────────
+    # Widen the universe along three axes the static watchlist misses: (1) market-wide CATALYST
+    # discovery — names with imminent earnings or fresh analyst rating changes ANYWHERE in the
+    # market (not just the watchlist); (2) RELATIONSHIP discovery — pull the partner leg of a
+    # cointegrated pair when one leg is already in the universe; (3) a richer factor/thematic ETF
+    # universe. All fail-graceful and capped; discovered names are injected at Step 0 so the
+    # existing per-ticker enrichment (analyst ratings, earnings, signal stack) picks them up.
+
+    # Earnings-calendar discovery — inject names reporting within the window (market-wide via the
+    # Alpha Vantage EARNINGS_CALENDAR feed; yfinance has no market-wide calendar). Needs
+    # alpha_vantage_key; skipped without it.
+    enable_earnings_discovery: bool = True
+    earnings_discovery_window_days: int = 7    # report within N days to be injected
+    earnings_discovery_max: int = 15           # cap names injected per run
+
+    # Analyst-ratings discovery — inject names with fresh upgrades/downgrades anywhere in the market
+    # (Financial Modeling Prep upgrades-downgrades RSS feed). Needs fmp_api_key; skipped without it.
+    enable_analyst_discovery: bool = True
+    analyst_discovery_lookback_days: int = 3   # rating change within N days
+    analyst_discovery_min_firms: int = 1       # min distinct firms acting on a name to inject
+    analyst_discovery_max: int = 15            # cap names injected per run
+
+    # Cointegration peer-expansion — when a tradeable cointegrated pair has one leg in the universe
+    # and the partner outside it, pull the partner in so the relationship is tradeable both ways.
+    enable_coint_peer_discovery: bool = True
+    coint_peer_max: int = 10                   # cap partner legs injected per run
+
+    # Factor / thematic ETF universe — pinned ETFs (like commodities) broadening coverage beyond the
+    # 11 GICS sectors: style factors (momentum/quality/value/size/low-vol/growth) + high-interest
+    # themes (semis, software, biotech, defense, clean energy, homebuilders, airlines, regional banks).
+    enable_factor_etfs: bool = True
+    factor_etfs: str = "MTUM,QUAL,VLUE,SIZE,USMV,IWF,IWD"
+    thematic_etfs: str = "SMH,IGV,XBI,ITA,TAN,LIT,IBB,XHB,JETS,KRE"
+
+    # ── Section F: Discovery liquidity gate ───────────────────────────────────────
+    # A uniform quality floor on EVERY discovered candidate (trending/open-vocab, screener,
+    # macro→discovery, market-wide earnings/analyst catalysts, cointegration peers) so widening the
+    # funnel (Sections A–E) doesn't inject untradeable microcaps — the names the tracker's bid-ask
+    # model charges up to 250 bp a side. NEVER gates the pinned universe (watchlist, sector ETFs,
+    # commodities, factor/thematic ETFs) or open-trade tickers. Cache-first with a bounded warm-up
+    # fetch; a name whose liquidity can't be verified is dropped (fail-closed).
+    enable_discovery_liquidity_gate: bool = True
+    discovery_min_price: float = 5.0                 # minimum last close ($)
+    discovery_min_dollar_volume: float = 20_000_000  # minimum 20-day average dollar volume ($)
+    discovery_gate_max_fetch: int = 25               # cap cold OHLCV fetches per run for the gate
 
     # Reddit social sentiment — r/wallstreetbets, r/stocks, r/investing
     # Free Reddit API credentials: https://www.reddit.com/prefs/apps (create "script" app)
@@ -406,6 +505,20 @@ class Settings(BaseSettings):
     @property
     def commodities_list(self) -> List[str]:
         return [s.strip() for s in self.commodity_etfs.split(",") if s.strip()]
+
+    @property
+    def factor_list(self) -> List[str]:
+        """Merged, de-duplicated factor + thematic ETF universe (empty when disabled)."""
+        if not self.enable_factor_etfs:
+            return []
+        out: List[str] = []
+        seen: set = set()
+        for s in f"{self.factor_etfs},{self.thematic_etfs}".split(","):
+            sym = s.strip().upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+        return out
 
     model_config = SettingsConfigDict(
         env_file=".env",

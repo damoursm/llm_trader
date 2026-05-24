@@ -28,7 +28,10 @@
       "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA,INTC,AMD\" ENABLE_CHARTS=false timeout 420 python main.py)",
       "Bash(grep -nE \"3K\\\\. Cointegration|Step 3K|\\\\| Cointegration \\\\||\\\\| \\\\`coint\\\\` \\\\|\" README.md)",
       "Bash(,)",
-      "Bash(grep -nE \"3K\\\\. Cointegration|coint`, `cross_sectional|Cointegration Pairs, Smart Money\" CLAUDE.md)"
+      "Bash(grep -nE \"3K\\\\. Cointegration|coint`, `cross_sectional|Cointegration Pairs, Smart Money\" CLAUDE.md)",
+      "Bash(PYTHONUTF8=1 python -)",
+      "Bash(powershell -NoProfile -Command 'Get-ChildItem -Recurse -File -Path . -Exclude *.pyc | Where-Object { $_.FullName -notmatch '\\\\''\\\\\\\\.git\\\\\\\\|\\\\\\\\cache\\\\\\\\|\\\\\\\\logs\\\\\\\\|__pycache__|\\\\\\\\.venv\\\\\\\\|\\\\\\\\venv\\\\\\\\'\\\\'' -and $_.LastWriteTime -gt \\(Get-Date\\).AddDays\\(-3\\) } | Sort-Object LastWriteTime -Descending | Select-Object -First 40 LastWriteTime, FullName | Format-Table -AutoSize -Wrap')",
+      "Bash(.venv/Scripts/python.exe *)"
     ]
   }
 }

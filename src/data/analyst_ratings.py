@@ -275,3 +275,111 @@ def fetch_analyst_ratings(
     logger.info(f"[analyst] {len(articles)} analyst articles from {len(tickers)} tickers")
     _save_cache(articles)
     return articles
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market-wide analyst discovery  (→ List[str])  — Section E
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _discovery_path() -> Path:
+    return CACHE_DIR / f"analyst_discovery_{date.today().isoformat()}.json"
+
+
+def _parse_fmp_date(value) -> Optional[datetime]:
+    """Parse an FMP publishedDate ('YYYY-MM-DD HH:MM:SS' / ISO / date) → aware UTC datetime."""
+    if not value:
+        return None
+    txt = str(value).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(txt[:19] if " " in txt else txt, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def discover_analyst_tickers(
+    lookback_days: int = 3,
+    min_firms: int = 1,
+    max_results: int = 15,
+    pages: int = 3,
+) -> List[str]:
+    """Return tickers with fresh analyst upgrades/downgrades — MARKET-WIDE.
+
+    yfinance ``upgrades_downgrades`` is per-ticker only, so market-wide discovery
+    uses the Financial Modeling Prep ``upgrades-downgrades-rss-feed`` (all symbols,
+    newest-first, paginated). Names with an upgrade/downgrade within ``lookback_days``
+    from ≥ ``min_firms`` distinct firms are returned (validated against the SEC
+    universe, ranked by firm count then recency, capped, cached daily). The per-ticker
+    analyst step then builds the actual rating article for each injected name. Returns
+    [] when no FMP key is configured. Fail-graceful: any error → [] (run continues).
+    """
+    path = _discovery_path()
+    if path.exists():
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            logger.info(f"[analyst_disc] Loaded {len(cached)} discovered ticker(s) from cache")
+            return cached
+        except Exception as e:
+            logger.warning(f"[analyst_disc] Cache load failed: {e}")
+
+    if not settings.fmp_api_key:
+        logger.debug("[analyst_disc] No FMP key — market-wide analyst discovery skipped")
+        return []
+
+    import httpx
+    from collections import defaultdict
+    from src.data.eight_k import get_valid_tickers
+
+    valid = get_valid_tickers()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    actionable = {"upgrade", "downgrade"}
+    firms_by_sym: dict = defaultdict(set)
+    latest_by_sym: dict = {}
+
+    try:
+        for page in range(max(1, pages)):
+            resp = httpx.get(
+                "https://financialmodelingprep.com/api/v4/upgrades-downgrades-rss-feed",
+                params={"page": page, "apikey": settings.fmp_api_key},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            rows = resp.json() or []
+            if not rows:
+                break
+            reached_old = False
+            for row in rows:
+                pub = _parse_fmp_date(row.get("publishedDate"))
+                if pub is not None and pub < cutoff:
+                    reached_old = True   # feed is newest-first → the rest is older
+                    continue
+                if (row.get("action") or "").lower().strip() not in actionable:
+                    continue
+                sym = (row.get("symbol") or "").upper().strip()
+                if not sym or "." in sym:
+                    continue
+                if valid and sym not in valid:
+                    continue
+                firm = (row.get("gradingCompany") or "").strip()
+                firms_by_sym[sym].add(firm or row.get("action", ""))
+                if pub is not None and sym not in latest_by_sym:
+                    latest_by_sym[sym] = pub
+            if reached_old:
+                break
+    except Exception as e:
+        logger.warning(f"[analyst_disc] FMP upgrades-downgrades feed failed: {e}")
+        return []
+
+    qualified = [(s, f) for s, f in firms_by_sym.items() if len(f) >= min_firms]
+    qualified.sort(key=lambda kv: (-len(kv[1]), -latest_by_sym.get(kv[0], cutoff).timestamp()))
+    tickers = [s for s, _ in qualified[:max_results]]
+
+    CACHE_DIR.mkdir(exist_ok=True)
+    try:
+        path.write_text(json.dumps(tickers, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"[analyst_disc] Cache save failed: {e}")
+
+    logger.info(f"[analyst_disc] {len(tickers)} name(s) with fresh ratings: {tickers}")
+    return tickers

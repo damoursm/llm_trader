@@ -396,3 +396,86 @@ def _fetch_av_calendar(
         logger.warning(f"[earnings] Alpha Vantage EARNINGS_CALENDAR failed: {e}")
 
     return events
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market-wide earnings discovery  (→ List[str])  — Section E
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _discovery_path() -> Path:
+    return CACHE_DIR / f"earnings_discovery_{_day_key()}.json"
+
+
+def discover_earnings_tickers(
+    window_days: int = 7,
+    max_results: int = 15,
+) -> List[str]:
+    """Return tickers reporting earnings within ``window_days`` — MARKET-WIDE.
+
+    A Step-0 discovery source: an imminent earnings date is a binary catalyst
+    worth scoring even for names off the static watchlist. Uses the Alpha Vantage
+    EARNINGS_CALENDAR feed (the whole market, not a per-ticker query — yfinance has
+    no market-wide calendar), filtered to the next ``window_days``, validated
+    against the SEC ticker universe, capped, and cached daily. Returns [] when no
+    Alpha Vantage key is configured. Fail-graceful: any error → [] (run continues).
+    """
+    path = _discovery_path()
+    if path.exists():
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            logger.info(f"[earnings_disc] Loaded {len(cached)} discovered ticker(s) from cache")
+            return cached
+        except Exception as e:
+            logger.warning(f"[earnings_disc] Cache load failed: {e}")
+
+    if not settings.alpha_vantage_key:
+        logger.debug("[earnings_disc] No Alpha Vantage key — market-wide earnings discovery skipped")
+        return []
+
+    import csv
+    import io
+    import requests
+    from src.data.eight_k import get_valid_tickers
+
+    valid = get_valid_tickers()
+    today = date.today()
+    cutoff = today + timedelta(days=window_days)
+    found: List[tuple] = []   # (report_date, symbol) — sorted soonest-first below
+    seen: set = set()
+
+    try:
+        url = (
+            "https://www.alphavantage.co/query"
+            f"?function=EARNINGS_CALENDAR&horizon=3month&apikey={settings.alpha_vantage_key}"
+        )
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        for row in reader:
+            sym = (row.get("symbol") or "").upper().strip()
+            if not sym or "." in sym or sym in seen:
+                continue
+            if valid and sym not in valid:   # SEC-universe gate (skip if map unavailable)
+                continue
+            try:
+                rdate = date.fromisoformat(row["reportDate"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if today <= rdate <= cutoff:
+                found.append((rdate, sym))
+                seen.add(sym)
+    except Exception as e:
+        logger.warning(f"[earnings_disc] Alpha Vantage EARNINGS_CALENDAR failed: {e}")
+        return []
+
+    found.sort(key=lambda x: x[0])
+    tickers = [sym for _, sym in found[:max_results]]
+
+    CACHE_DIR.mkdir(exist_ok=True)
+    try:
+        path.write_text(json.dumps(tickers, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"[earnings_disc] Cache save failed: {e}")
+
+    logger.info(f"[earnings_disc] {len(tickers)} name(s) reporting within {window_days}d: {tickers}")
+    return tickers

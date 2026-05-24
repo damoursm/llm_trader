@@ -5,6 +5,8 @@ import httpx
 from loguru import logger
 from typing import List
 from config import settings
+from src.data.ticker_extract import extract_candidate_tickers
+from src.data.reddit_sentiment import discover_wsb_tickers
 
 
 # ---------------------------------------------------------------------------
@@ -86,36 +88,16 @@ def _alpha_vantage_movers() -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Source 3: NewsAPI — extract most-mentioned tickers in recent headlines
+# Source 3: NewsAPI — OPEN-VOCABULARY ticker discovery from recent headlines
 # ---------------------------------------------------------------------------
 
-_KNOWN_TICKERS = {
-    # Mega-cap / popular
-    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "GOOG"
-    "NFLX", "AMD", "INTC", "QCOM", "AVGO", "MU", "ARM", "SMCI",
-    # Finance
-    "JPM", "GS", "MS", "BAC", "C", "WFC", "BLK", "V", "MA", "PYPL",
-    # Energy
-    "XOM", "CVX", "COP", "OXY", "SLB",
-    # Health
-    "JNJ", "LLY", "PFE", "MRK", "ABBV", "UNH", "MRNA", "GILD",
-    # Consumer
-    "AMZN", "WMT", "TGT", "COST", "NKE", "SBUX", "MCD",
-    # Industrial / defence
-    "CAT", "BA", "LMT", "RTX", "GE", "HON",
-    # Crypto-adjacent
-    "COIN", "MSTR", "HOOD", "BTBT",
-    # ETFs of interest
-    "SPY", "QQQ", "IWM", "GLD", "SLV", "TLT", "HYG", "ARKK",
-    # Leveraged / speculative
-    "NRGU", "AGQ", "FNGU", "SOXL", "TQQQ",
-}
-
-
-def _newsapi_mentioned_tickers() -> List[str]:
+def _newsapi_discovered_tickers() -> List[str]:
     """
-    Query NewsAPI for 'stock market' headlines and count ticker mentions.
-    Returns tickers that appear in ≥2 articles.
+    Query NewsAPI business headlines and mine tickers OPEN-VOCABULARY: every
+    $cashtag / capitalized token is resolved against the full SEC ticker universe
+    (via ticker_extract), not a hardcoded allowlist — so ANY listed name can be
+    discovered, not just a curated set of mega-caps. Returns tickers appearing in
+    ≥2 distinct articles.
     """
     if not settings.newsapi_key:
         return []
@@ -134,16 +116,44 @@ def _newsapi_mentioned_tickers() -> List[str]:
         articles = resp.json().get("articles", [])
         counts: dict[str, int] = {}
         for art in articles:
-            text = f"{art.get('title', '')} {art.get('description', '')}".upper()
-            for t in _KNOWN_TICKERS:
-                if re.search(rf'\b{re.escape(t)}\b', text):
-                    counts[t] = counts.get(t, 0) + 1
-        # Keep those mentioned in ≥2 articles
+            text = f"{art.get('title', '')} {art.get('description', '')}"
+            for t in extract_candidate_tickers(text):
+                counts[t] = counts.get(t, 0) + 1
+        # Keep those mentioned in ≥2 distinct articles
         hot = [t for t, c in sorted(counts.items(), key=lambda x: -x[1]) if c >= 2]
-        logger.info(f"NewsAPI most-mentioned tickers: {hot[:20]}")
+        logger.info(f"NewsAPI discovered tickers (open-vocab): {hot[:20]}")
         return hot[:20]
     except Exception as e:
         logger.warning(f"NewsAPI ticker extraction failed: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Source 5: StockTwits trending symbols (public JSON, no key required)
+# ---------------------------------------------------------------------------
+
+def _stocktwits_trending() -> List[str]:
+    """Return symbols currently trending on StockTwits (social-momentum signal).
+
+    Note: the StockTwits public API is Cloudflare-gated and typically returns 403
+    to non-browser clients, so this source is OFF by default. Kept (and fail-graceful)
+    in case access is available via a token or allowlisted IP.
+    """
+    url = "https://api.stocktwits.com/api/2/trending/symbols.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        resp = httpx.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        symbols = resp.json().get("symbols", [])
+        tickers = [s.get("symbol", "") for s in symbols if s.get("symbol")]
+        logger.info(f"StockTwits trending: {tickers}")
+        return tickers
+    except Exception as e:
+        logger.warning(f"StockTwits trending unavailable (Cloudflare-gated): {e}")
         return []
 
 
@@ -192,8 +202,20 @@ def get_trending_tickers(base_tickers: List[str], base_sectors: List[str]) -> Li
     discovered: List[str] = []
     discovered.extend(_yahoo_trending())
     discovered.extend(_alpha_vantage_movers())
-    discovered.extend(_newsapi_mentioned_tickers())
+    discovered.extend(_newsapi_discovered_tickers())
     discovered.extend(_alpha_vantage_news_tickers())
+
+    # Social-momentum discovery (fail-graceful, gated by flags)
+    if settings.enable_stocktwits_discovery:
+        discovered.extend(_stocktwits_trending())
+    if settings.enable_wsb_discovery:
+        try:
+            discovered.extend(discover_wsb_tickers(
+                user_agent=settings.reddit_user_agent,
+                min_mentions=settings.wsb_discovery_min_mentions,
+            ))
+        except Exception as e:
+            logger.warning(f"WSB discovery failed: {e}")
 
     discovered = _clean_tickers(discovered)
 

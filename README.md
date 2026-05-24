@@ -57,6 +57,10 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │                              confirm, expensive+skew → fade premium         │
 │  3K. Cointegration Pairs  — Engle-Granger ADF on log-price spread;       │
 │                             market-neutral stat-arb mean-reversion       │
+│  3L. Sentiment Velocity   — Δ news tone (recent − prior); rate-of-       │
+│                             change leads 1–5 day moves over the level    │
+│  3M. Trend Strength       — ADX/DMI trend quality + Donchian 20-day      │
+│                             breakout — confirmed-trend direction         │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
 │  5.  Recommendations      — Claude: BUY / SELL / HOLD / WATCH           │
 │  6.  Performance Tracking — paper trades, P&L, method attribution        │
@@ -70,16 +74,79 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 
 ### Step 0 — Ticker Discovery (`src/data/trending.py`)
 
-Builds a **dynamic ticker universe** by merging four sources before any news is fetched:
+Builds a **dynamic ticker universe** by merging several sources before any news is fetched:
 
 | Source | Method |
 |---|---|
 | Yahoo Finance trending | Public JSON endpoint — top 20 tickers currently trending |
 | Alpha Vantage movers | `TOP_GAINERS_LOSERS` — top 5 gainers, losers, most-traded |
-| NewsAPI business headlines | Scans top US business headlines; returns tickers in ≥2 articles |
+| NewsAPI business headlines | **Open-vocabulary** — mines `$cashtags`/capitalized tokens from top US business headlines and resolves them against the full SEC ticker universe; returns tickers in ≥2 articles |
 | Alpha Vantage news feed | `NEWS_SENTIMENT` — tickers in the most news items today |
+| WSB cashtag discovery | Reddit **public JSON** (`hot`/`rising` for r/wallstreetbets, r/stocks, r/investing — no key); most-mentioned valid tickers (≥`WSB_DISCOVERY_MIN_MENTIONS`, default 3) |
+| StockTwits trending | `trending/symbols.json` — social-momentum symbols. **Off by default**: the public API is Cloudflare-gated (403 without a browser/token) |
 
-Up to 30 discovered tickers are appended after the static `STOCK_WATCHLIST` and `SECTOR_ETFS`. **Pinned commodities** (`COMMODITY_ETFS`) are always included in every run regardless of trending.
+**Open-vocabulary resolution (`src/data/ticker_extract.py`):** instead of a hardcoded allowlist, headline/social text is scanned for `$cashtags` and capitalized tokens and validated against the ~10k-symbol SEC reference map (`company_tickers.json`, loaded once by `eight_k.py`). `$cashtags` are accepted on validity alone; bare ALL-CAPS tokens must also clear a stopword set (common English words + finance/WSB acronyms that collide with real tickers — ALL, ARE, ON, CASH, OPEN, CEO, GDP, …). This lets discovery surface **any** listed name (e.g., RKLB, ASTS, NBIS, QBTS), not just mega-caps.
+
+Up to 30 discovered tickers are appended after the static `STOCK_WATCHLIST` and `SECTOR_ETFS`. **Pinned commodities** (`COMMODITY_ETFS`) are always included regardless of trending. All discovery sources are fail-graceful (a source erroring out never blocks the run). Flags: `ENABLE_WSB_DISCOVERY` (default on), `ENABLE_STOCKTWITS_DISCOVERY` (default off).
+
+---
+
+### Step 0b — Opportunity Screener (`src/data/screener.py`)
+
+When `ENABLE_OPPORTUNITY_SCREENER=true`, runs a **proactive** technical scan that shifts discovery from "what's trending" to "what's *set up*". It screens a broad, liquid universe — a curated large/mega-cap + ETF list **∪ every ticker already in the OHLCV cache** — **cache-first** (works offline once warm; a bounded `SCREEN_MAX_FETCH_PER_RUN` warm-up fetch primes the cache over a few runs).
+
+**Four screens** (a name surfaces if it fires ≥1):
+
+| Screen | Logic |
+|---|---|
+| Unusual volume | today's volume ÷ trailing 20-day avg ≥ `SCREEN_VOLUME_RATIO` (2.0) — often *precedes* news |
+| 52-week range | new 52-week high (breakout) / within `SCREEN_NEAR_HIGH_PCT` of it / new 52-week low (reversal watch) |
+| Relative strength | trailing `SCREEN_RS_LOOKBACK_DAYS` (63) return minus SPY's ≥ `SCREEN_RS_THRESHOLD_PCT` (±10pp) |
+| Golden / death cross | 50-day SMA crossing the 200-day within the last `SCREEN_CROSS_LOOKBACK` (5) bars |
+
+A **liquidity gate** (`SCREEN_MIN_PRICE` $5 + `SCREEN_MIN_DOLLAR_VOLUME` $20M avg dollar volume) keeps illiquid micro-pumps out, so widening the funnel doesn't lower quality. The top `SCREEN_MAX_RESULTS` (20) setups — ranked by screen confluence, then relative strength, then volume surge — are **injected into the analysis universe**, where each then receives the full signal stack. This pairs directly with **Trend Strength**: a screener 52-week/Donchian breakout is both the discovery trigger *and* a scoring signal. Surfaced in the email's **Opportunity Screener** section (ticker · bias · setups). Fail-graceful; disable with `ENABLE_OPPORTUNITY_SCREENER=false`.
+
+---
+
+### Step 0c — Macro → Discovery Loop (`src/data/macro_discovery.py`)
+
+When `ENABLE_MACRO_DISCOVERY=true`, closes the loop between the macro/regime modules and stock selection. The pipeline already identifies *favored regimes/sectors* — but discovery used to ignore them. This auto-pulls the **top holdings of the favored sector/factor ETFs** into the analysis universe, biasing it toward where macro money is flowing. (Executes after the parallel fetch, once the macro contexts exist, and before cointegration/`build_signals` so injected names receive the full signal stack.)
+
+**Favored ETFs** are drawn from all three macro modules:
+
+| Source | Favored ETFs |
+|---|---|
+| Sector rotation | `top_inflow` SPDR sectors (real-time cross-sector money flow) |
+| Business cycle | `top_cycle_leaders` (structural phase leadership) |
+| DIX regime | factor tilt — bullish (accumulation) → `MTUM` (momentum); bearish (distribution) → `USMV` (low-vol/defensive) |
+
+Top `MACRO_DISCOVERY_HOLDINGS_PER_ETF` (8) holdings of each favored ETF are fetched from **yfinance `funds_data`** (cached daily in `cache/etf_holdings_*.json`, with a static SPDR fallback), deduplicated, capped at `MACRO_DISCOVERY_MAX` (25), and injected into the universe — each then scored by the full signal stack. Surfaced in the email's **Macro → Discovery** section (favored ETF · why · holdings pulled). Fail-graceful; disable with `ENABLE_MACRO_DISCOVERY=false`.
+
+---
+
+### Step 0d — Catalyst & Relationship Expansion (Section E)
+
+Four independent, fail-graceful sources that widen the universe along axes the static watchlist misses. Catalyst and factor names are injected at **Step 0**; cointegration peers at **Step 3.9**. Every injected name then receives the full per-ticker signal stack.
+
+**Market-wide earnings discovery** (`earnings.discover_earnings_tickers`) — an imminent earnings date is a binary catalyst worth scoring even for off-watchlist names. Reads the **whole-market** Alpha Vantage `EARNINGS_CALENDAR` feed (yfinance has no market-wide calendar), injects names reporting within `EARNINGS_DISCOVERY_WINDOW_DAYS` (7), validated against the SEC ticker universe, capped at `EARNINGS_DISCOVERY_MAX` (15), cached daily. **Requires `ALPHA_VANTAGE_KEY`** — skipped without it. `ENABLE_EARNINGS_DISCOVERY`.
+
+**Market-wide analyst discovery** (`analyst_ratings.discover_analyst_tickers`) — yfinance `upgrades_downgrades` is per-ticker only, so market-wide discovery uses the **Financial Modeling Prep** `upgrades-downgrades-rss-feed` (all symbols, newest-first, paginated). Injects names with an upgrade/downgrade from ≥ `ANALYST_DISCOVERY_MIN_FIRMS` (1) distinct firms within `ANALYST_DISCOVERY_LOOKBACK_DAYS` (3), SEC-validated, ranked by firm count then recency, capped at `ANALYST_DISCOVERY_MAX` (15), cached daily. **Requires a new `FMP_API_KEY`** ([free tier](https://site.financialmodelingprep.com/developer/docs)) — skipped without it. `ENABLE_ANALYST_DISCOVERY`.
+
+Both catalyst sources inject at Step 0, so the existing per-ticker enrichment — analyst ratings (1e), EPS surprises (1f), earnings calendar (3i) — and the full signal stack pick the new names up automatically; no separate scoring path is needed.
+
+**Cointegration peer-expansion** (`cointegration.get_coint_peer_tickers`) — a tradeable cointegrated pair implies a directional view on *both* legs, but if only one leg is in the universe the relationship is half-expressed. After `find_cointegrated_pairs` runs, any tradeable (ENTRY/STRETCHED) pair with **exactly one** leg in the universe has its partner injected (capped at `COINT_PEER_MAX`, 10) before `build_signals`. The partner already carries a cointegration score, so once in the universe it gets a full `TickerSignal` and can become a recommendation. `ENABLE_COINT_PEER_DISCOVERY`.
+
+**Richer factor/thematic ETF universe** — `FACTOR_ETFS` (style factors: `MTUM`, `QUAL`, `VLUE`, `SIZE`, `USMV`, `IWF`, `IWD`) and `THEMATIC_ETFS` (`SMH`, `IGV`, `XBI`, `ITA`, `TAN`, `LIT`, `IBB`, `XHB`, `JETS`, `KRE`) are pinned every run like commodities, broadening coverage beyond the 11 GICS sectors. `ENABLE_FACTOR_ETFS`.
+
+---
+
+### Step 0e — Discovery Liquidity Gate (Section F)
+
+Steps 0–0d widen the discovery funnel; this applies one **uniform quality floor** to every *discovered* candidate before it enters the analysis universe, so breadth doesn't translate into untradeable microcaps — the names the tracker's price-tiered bid-ask model (`_dynamic_half_spread`) charges up to **250 bp a side**, which silently erodes realised P&L.
+
+`liquidity.apply_liquidity_gate()` keeps a candidate only when its **last close ≥ `DISCOVERY_MIN_PRICE`** ($5) **and** its **20-day average dollar volume ≥ `DISCOVERY_MIN_DOLLAR_VOLUME`** ($20M). Data is loaded **cache-first** with a bounded warm-up fetch (`DISCOVERY_GATE_MAX_FETCH`, a single shared budget per run); a name whose liquidity cannot be verified is **dropped (fail-closed)** — the base watchlist is never affected, and a genuinely liquid name re-appears next run once its OHLCV cache is warm.
+
+**Never gated** (pinned/intentional): the static watchlist, sector ETFs, commodities, factor/thematic ETFs, and open-trade tickers. The gate runs as one pass at the end of Step 0 (covering trending, market-wide earnings/analyst catalysts, and cluster-watch injections) and again at the macro→discovery (Step 3.85) and cointegration-peer (Step 3.9) injection points. The opportunity screener (Step 0b) applies the same price/dollar-volume floor internally. Disable with `ENABLE_DISCOVERY_LIQUIDITY_GATE=false`.
 
 ---
 
@@ -196,9 +263,8 @@ When `ENABLE_INSIDER_TRADES=true`, fetches from three sources filtered to the la
 |---|---|
 | House Stock Watcher | US House representatives' stock disclosures |
 | Senate Stock Watcher | US Senate members' stock disclosures |
-| SEC EDGAR Form 4 | Corporate insider filings (officers, directors, >10% holders) |
 
-Politician trades are filtered to `TRACKED_POLITICIANS`. Newly discovered tickers are added to the analysis universe automatically.
+Politician trades are filtered to `TRACKED_POLITICIANS`; newly discovered tickers are added to the universe automatically (congressional buys feed discovery on ≥1 occurrence when the politician list is curated, ≥2 when it's open). Corporate-insider **Form 4 buys are now captured market-wide in Step 3c** — the old watchlist-capped (first 20 tickers, non-directional) Form 4 scan here was removed.
 
 ---
 
@@ -219,7 +285,10 @@ Filings disclosing >5% ownership within `SEC_FILINGS_LOOKBACK_DAYS` (default: 30
 Pre-sale disclosures by officers and directors before selling restricted shares. Bearish signal — insider planning to distribute.
 
 **Strategy 3 — Form 13F-HR (Superinvestor Quarterly Holdings)**
-For each institution in `TRACKED_INSTITUTIONS`, diffs the two most recent 13F filings quarter-over-quarter to detect new positions, exits, and significant size changes (>10%). CIKs are resolved dynamically from EDGAR — no manual lookup needed. Carries a ~45-day reporting lag.
+For each institution in `TRACKED_INSTITUTIONS` (broadened to ~10 well-known superinvestors — Buffett, Ackman, Burry, Einhorn, Loeb, Icahn, Tiger Global, Druckenmiller, … — so **consensus** emerges when multiple filers buy the same name), diffs the two most recent 13F filings quarter-over-quarter to detect new positions, exits, and significant size changes (>10%). CIKs are resolved dynamically from EDGAR. Carries a ~45-day reporting lag.
+
+**Strategy 4 — Market-Wide Form 4 Open-Market Buys (`fetch_form4_open_market_buys`)**
+A **market-wide** scan (not watchlist-capped) of recent Form 4 filings, parsing each filing's XML for **transaction code "P"** — an *open-market purchase*, the high-signal insider action (vs. grants/option exercises/sales). Emits real `corporate_insider` **purchase** records that feed the **insider cluster + persistence** detectors (Steps 3r/3r2) and universe discovery — surfacing insider accumulation *everywhere*, not just the watchlist. Open-market buys are only ~1–2% of all Form 4s, so it parses a bounded `FORM4_SCAN_MAX_FILINGS` (default 150) most-recent filings via paginated EDGAR full-text search, cached daily in `cache/form4_buys_*.json`. Enable/disable with `ENABLE_FORM4_SCAN`.
 
 ---
 
@@ -1311,11 +1380,12 @@ COINTEGRATION_PVALUE=0.05      # ADF significance level (0.01 | 0.05 | 0.10)
 
 ### Step 4 — Signal Aggregation (`src/signals/aggregator.py`)
 
-Combines up to fourteen signal methods with dynamically normalized weights:
+Combines up to sixteen signal methods with dynamically normalized weights:
 
 | Method | Base weight | Source |
 |---|---|---|
 | News sentiment | 40% | DeepSeek V3 LLM scoring of all article-type sources |
+| Sentiment velocity | 12% | Δ news tone (recent − prior window) — rate of change, not level |
 | Technical analysis | 30% | RSI, MACD, SMA20/50, Bollinger Bands |
 | Smart money / insider | 30% | Insider trades + options flow + SEC filings |
 | Put/call ratio | 15% | Per-ticker CBOE options volume |
@@ -1325,6 +1395,7 @@ Combines up to fourteen signal methods with dynamically normalized weights:
 | Pattern recognition | 18% | Historical win rate for current chart pattern |
 | Price momentum | 18% | 1m/2m normalised returns vs own 252-bar history |
 | Money flow | 15% | MFI + CMF + OBV slope composite accumulation/distribution |
+| Trend strength | 15% | ADX/DMI directional movement + Donchian 20-day breakout |
 | PEAD | 15% | SUE × time-decay drift from earnings surprises |
 | IV Rank + Directional | 13% | 21d RV percentile × 5d return/ATR, regime-aware switching |
 | IV Expression | 12% | Real options-chain IV percentile × OI skew, stock-vs-options decision |

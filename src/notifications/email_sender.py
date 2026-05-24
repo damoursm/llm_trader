@@ -4583,6 +4583,56 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5s — OPPORTUNITY SCREENER (proactive setup discovery)
+     ══════════════════════════════════════ -->
+{% if screener_context and screener_context.hits %}
+{% set scr_dir_color = {'BULLISH': '#4ade80', 'BEARISH': '#f87171'} %}
+<h2>Opportunity Screener <span style="font-size:13px;font-weight:400;color:#94a3b8;">(proactive setups across {{ screener_context.universe_size }} liquid names — unusual volume · 52w breakouts · RS vs SPY · MA cross)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">{{ screener_context.summary }}</p>
+  <table class="ctbl">
+    <tr><th>Ticker</th><th>Bias</th><th>Last</th><th>Setups</th></tr>
+    {% for h in screener_context.hits %}
+    <tr>
+      <td style="font-weight:700;color:#e2e8f0;">{{ h.ticker }}</td>
+      <td style="color:{{ scr_dir_color.get(h.direction, '#94a3b8') }};font-weight:700;">
+        {{ '▲' if h.direction == 'BULLISH' else '▼' }} {{ h.direction }}
+      </td>
+      <td style="color:#cbd5e1;">${{ '%.2f'|format(h.last_price) }}</td>
+      <td style="color:#94a3b8;font-size:12px;">{{ h.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    Proactive technical scan (cache-first) — surfaces names that are <em>set up</em> even when not trending. Each is injected into the analysis universe and receives the full signal stack before any BUY/SELL decision.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5t — MACRO → DISCOVERY (favored-sector holdings)
+     ══════════════════════════════════════ -->
+{% if macro_discovery_context and macro_discovery_context.tickers %}
+<h2>Macro → Discovery <span style="font-size:13px;font-weight:400;color:#94a3b8;">(top holdings of the favored sector/factor ETFs — where macro money is flowing)</span></h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">{{ macro_discovery_context.summary }}</p>
+  <table class="ctbl">
+    <tr><th>Favored ETF</th><th>Why</th><th>Top holdings pulled</th></tr>
+    {% for etf in macro_discovery_context.favored_etfs %}
+    <tr>
+      <td style="font-weight:700;color:#e2e8f0;">{{ etf }}</td>
+      <td style="color:#4ade80;font-size:12px;">{{ macro_discovery_context.etf_reasons.get(etf, '') }}</td>
+      <td style="color:#cbd5e1;font-size:12px;">{{ macro_discovery_context.by_etf.get(etf, []) | join(', ') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p style="color:#475569;font-size:11px;margin:10px 0 0 0;">
+    Closes the macro→discovery loop: the sector-rotation, business-cycle, and DIX modules pick the favored ETFs; their top holdings are injected into the analysis universe and scored by the full signal stack.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      6 — SMART MONEY SIGNALS
      ══════════════════════════════════════ -->
 {% if insider_trades is not none %}
@@ -4694,6 +4744,8 @@ def send_recommendations(
     market_mode_context=None,    # Optional[MarketModeContext]      — avoid circular import
     catalyst_timing_context=None,   # Optional[CatalystTimingContext]   — avoid circular import
     cluster_watchlist_context=None, # Optional[ClusterWatchlistContext] — avoid circular import
+    screener_context=None,          # Optional[ScreenerContext] — avoid circular import
+    macro_discovery_context=None,   # Optional[MacroDiscoveryContext] — avoid circular import
     sector_pairs_context=None,      # Optional[SectorPairsContext]      — avoid circular import
     cointegration_context=None,     # Optional[CointPairsContext]       — avoid circular import
     sector_rotation_context=None,   # Optional[SectorRotationContext]   — avoid circular import
@@ -4936,6 +4988,8 @@ def send_recommendations(
         catalyst_timing_context=catalyst_timing_context,
         # Insider Cluster Watchlist (cross-run 10-day tracking)
         cluster_watchlist_context=cluster_watchlist_context,
+        screener_context=screener_context,
+        macro_discovery_context=macro_discovery_context,
         # Sector Pairs / Relative Value
         sector_pairs_context=sector_pairs_context,
         cointegration_context=cointegration_context,

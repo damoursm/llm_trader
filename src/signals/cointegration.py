@@ -459,3 +459,34 @@ def find_cointegrated_pairs(tickers: List[str]) -> CointPairsContext:
         report_date=date.today(),
         summary=summary,
     )
+
+
+def get_coint_peer_tickers(
+    context: Optional[CointPairsContext],
+    universe: List[str],
+    max_peers: int = 10,
+) -> List[str]:
+    """Partner legs of tradeable pairs not yet in the universe (Section E peer-expansion).
+
+    A tradeable (ENTRY/STRETCHED) pair implies a directional view on BOTH legs, but if
+    only one leg is being analysed the relationship is half-expressed. When exactly one
+    leg of such a pair is in ``universe``, return the other leg so the caller can inject
+    it — it already carries a cointegration score in ``context.ticker_scores``, so once
+    in the universe it gets a full TickerSignal and can become a tradeable recommendation.
+    Deduplicated and capped at ``max_peers``. Empty when there are no tradeable pairs.
+    """
+    if context is None or not context.pairs:
+        return []
+    in_universe = {t.upper() for t in universe}
+    peers: List[str] = []
+    seen: set = set()
+    for p in context.pairs:
+        legs = [p.ticker_a.upper(), p.ticker_b.upper()]
+        present = [leg for leg in legs if leg in in_universe]
+        if len(present) != 1:   # both in (nothing to pull) or both out (no anchor) → skip
+            continue
+        for leg in legs:
+            if leg not in in_universe and leg not in seen:
+                seen.add(leg)
+                peers.append(leg)
+    return peers[:max_peers]

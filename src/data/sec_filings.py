@@ -12,10 +12,12 @@ All data is public. No API key required.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -495,6 +497,198 @@ def fetch_13f_positions() -> List[InsiderTrade]:
 
 
 # ---------------------------------------------------------------------------
+# Strategy 4: Market-wide Form 4 open-market BUYS (transaction code "P")
+# ---------------------------------------------------------------------------
+
+_CACHE_DIR = Path("cache")
+
+
+def _form4_cache_path(today: date) -> Path:
+    return _CACHE_DIR / f"form4_buys_{today.isoformat()}.json"
+
+
+def _load_form4_cache(today: date) -> Optional[List[InsiderTrade]]:
+    p = _form4_cache_path(today)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return [InsiderTrade.model_validate(d) for d in data]
+    except Exception:
+        return None
+
+
+def _save_form4_cache(today: date, trades: List[InsiderTrade]) -> None:
+    try:
+        _CACHE_DIR.mkdir(exist_ok=True)
+        _form4_cache_path(today).write_text(
+            json.dumps([t.model_dump(mode="json") for t in trades], indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.debug(f"[form4] cache save failed: {e}")
+
+
+def _fetch_form4_xml(hit: dict) -> Optional[str]:
+    """Fetch a Form 4 filing's XML document. Tries each associated CIK for the archive path."""
+    _id = hit.get("_id", "")
+    if ":" not in _id:
+        return None
+    src   = hit.get("_source", {})
+    accn  = src.get("adsh") or _id.split(":")[0]
+    fname = _id.split(":", 1)[1]
+    accn_nodash = accn.replace("-", "")
+    for cik in src.get("ciks", []):
+        try:
+            url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accn_nodash}/{fname}"
+            resp = httpx.get(url, headers=_HEADERS, timeout=15)
+            if resp.status_code == 200 and "<ownershipDocument" in resp.text:
+                return resp.text
+        except Exception:
+            continue
+    return None
+
+
+def _parse_form4_buy(xml_text: str, ticker_index: Dict[str, str]) -> Optional[dict]:
+    """Return {ticker, owner, role, notional, date} if the Form 4 has an open-market BUY (code P)."""
+    try:
+        clean = re.sub(r'\sxmlns[^"]*"[^"]*"', "", xml_text)
+        root  = ET.fromstring(clean)
+    except Exception:
+        return None
+
+    total_shares = 0.0
+    total_notional = 0.0
+    tx_date: Optional[date] = None
+    for tx in root.iter("nonDerivativeTransaction"):
+        code = (tx.findtext(".//transactionCoding/transactionCode") or "").strip()
+        aord = (tx.findtext(".//transactionAcquiredDisposedCode/value") or "").strip()
+        if code != "P" or aord != "A":          # P = open-market purchase, A = acquired
+            continue
+        try:
+            shares = float((tx.findtext(".//transactionShares/value") or "0").replace(",", ""))
+            price  = float((tx.findtext(".//transactionPricePerShare/value") or "0").replace(",", ""))
+        except ValueError:
+            shares = price = 0.0
+        total_shares   += shares
+        total_notional += shares * price
+        d = _parse_date(tx.findtext(".//transactionDate/value") or "")
+        if d and (tx_date is None or d > tx_date):
+            tx_date = d
+
+    if total_shares <= 0:
+        return None
+
+    ticker = (root.findtext(".//issuerTradingSymbol") or "").strip().upper()
+    if not ticker:
+        ticker = _ticker_from_name(root.findtext(".//issuerName") or "", ticker_index) or ""
+    if not ticker:
+        return None
+
+    owner = (root.findtext(".//reportingOwner/reportingOwnerId/rptOwnerName") or "Insider").strip()
+    rel   = root.find(".//reportingOwner/reportingOwnerRelationship")
+    role  = "Insider"
+    if rel is not None:
+        if (rel.findtext("isOfficer") or "0") in ("1", "true", "True"):
+            role = (rel.findtext("officerTitle") or "Officer").strip() or "Officer"
+        elif (rel.findtext("isDirector") or "0") in ("1", "true", "True"):
+            role = "Director"
+        elif (rel.findtext("isTenPercentOwner") or "0") in ("1", "true", "True"):
+            role = "10% Owner"
+
+    return {
+        "ticker": ticker, "owner": owner[:80], "role": role[:40],
+        "notional": total_notional, "date": tx_date or date.today(),
+    }
+
+
+def fetch_form4_open_market_buys() -> List[InsiderTrade]:
+    """
+    Market-wide scan of recent Form 4 filings for OPEN-MARKET PURCHASES (code "P").
+
+    Replaces the old watchlist-capped Form 4 scan: surfaces insider accumulation across the
+    WHOLE market, and — unlike the previous non-directional "form_4_filing" records — emits
+    real ``purchase`` records that feed the insider cluster + persistence detectors and
+    universe discovery. Open-market buys are only ~1-2% of all Form 4s, so it parses a bounded
+    number of the most recent filings; cached daily.
+    """
+    if not settings.enable_form4_scan:
+        return []
+
+    today  = date.today()
+    cached = _load_form4_cache(today)
+    if cached is not None:
+        logger.info(f"[form4] Loaded {len(cached)} open-market buy(s) from cache")
+        return cached
+
+    ticker_index = _load_ticker_index()
+    start = (today - timedelta(days=max(1, settings.form4_scan_lookback_days))).isoformat()
+    end   = today.isoformat()
+    max_filings = max(0, settings.form4_scan_max_filings)
+
+    # Collect the most recent Form 4 hits (paginated, deduped by accession+doc id)
+    hits: List[dict] = []
+    seen_ids: set = set()
+    frm = 0
+    for _ in range(10):  # hard page cap
+        if len(hits) >= max_filings:
+            break
+        try:
+            resp = httpx.get(
+                _EDGAR_SEARCH,
+                params={"forms": "4", "dateRange": "custom", "startdt": start, "enddt": end, "from": frm},
+                headers=_HEADERS, timeout=20,
+            )
+            resp.raise_for_status()
+            page = resp.json().get("hits", {}).get("hits", [])
+        except Exception as e:
+            logger.warning(f"[form4] efts search failed: {e}")
+            break
+        new = [h for h in page if h.get("_id") not in seen_ids]
+        for h in new:
+            seen_ids.add(h.get("_id"))
+        hits.extend(new)
+        time.sleep(_REQUEST_DELAY)
+        if len(page) < 10 or not new:   # last/repeating page
+            break
+        frm += len(page)
+    hits = hits[:max_filings]
+
+    buys: List[InsiderTrade] = []
+    seen: set = set()
+    for hit in hits:
+        xml_text = _fetch_form4_xml(hit)
+        time.sleep(_REQUEST_DELAY)
+        if not xml_text:
+            continue
+        parsed = _parse_form4_buy(xml_text, ticker_index)
+        if not parsed:
+            continue
+        key = (parsed["ticker"], parsed["owner"].lower(), parsed["date"])
+        if key in seen:
+            continue
+        seen.add(key)
+        buys.append(InsiderTrade(
+            ticker=parsed["ticker"],
+            trader_name=parsed["owner"],
+            trader_type="corporate_insider",
+            role=parsed["role"],
+            transaction_type="purchase",
+            amount_range=_notional_to_amount_range(parsed["notional"]),
+            transaction_date=parsed["date"],
+            disclosure_date=parsed["date"],
+            notes=f"Form 4 open-market purchase (~${parsed['notional']:,.0f})",
+        ))
+
+    logger.info(
+        f"[form4] Market-wide scan: {len(buys)} open-market buy(s) across "
+        f"{len({t.ticker for t in buys})} ticker(s) (parsed {len(hits)} filings)"
+    )
+    _save_form4_cache(today, buys)
+    return buys
+
+
+# ---------------------------------------------------------------------------
 # Public aggregate function
 # ---------------------------------------------------------------------------
 
@@ -508,6 +702,7 @@ def fetch_sec_filings() -> List[InsiderTrade]:
     all_trades.extend(fetch_activist_stakes())
     all_trades.extend(fetch_form144_sales())
     all_trades.extend(fetch_13f_positions())
+    all_trades.extend(fetch_form4_open_market_buys())
 
     seen:   set                 = set()
     unique: List[InsiderTrade]  = []

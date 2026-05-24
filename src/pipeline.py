@@ -174,6 +174,55 @@ def run_pipeline(send_email: bool = False) -> None:
         all_tickers = all_tickers + new_commodities
         logger.info(f"Step 0: Pinned commodities: {new_commodities}")
 
+    # Factor / thematic ETFs — pinned like commodities (Section E): broaden coverage beyond the
+    # 11 GICS sectors with style-factor (momentum/quality/value/size/low-vol/growth) and
+    # high-interest-theme (semis, software, biotech, defense, clean energy, …) ETFs.
+    new_factors = [t for t in settings.factor_list if t not in all_tickers]
+    if new_factors:
+        all_tickers = all_tickers + new_factors
+        logger.info(f"Step 0: Pinned factor/thematic ETFs: {new_factors}")
+
+    # Opportunity screener — proactive setup discovery over a broad liquid universe
+    # (unusual volume, 52w breakouts/reversals, relative strength, golden/death cross).
+    # Cache-first; injects qualifying setups into the analysis universe.
+    screener_context = None
+    if settings.enable_opportunity_screener:
+        from src.data.screener import run_screener
+        screener_context = run_screener()
+        if screener_context and screener_context.hits:
+            new_from_screen = [h.ticker for h in screener_context.hits if h.ticker not in all_tickers]
+            if new_from_screen:
+                all_tickers = all_tickers + new_from_screen
+                logger.info(
+                    f"[screener] Injecting {len(new_from_screen)} setup(s) into universe: {new_from_screen}"
+                )
+
+    # Catalyst discovery (Section E) — MARKET-WIDE names with imminent earnings or fresh analyst
+    # rating changes (not just the watchlist). Injected at Step 0 so the per-ticker enrichment
+    # (analyst ratings, earnings calendar/surprises, full signal stack) picks them up downstream.
+    if settings.enable_earnings_discovery:
+        from src.data.earnings import discover_earnings_tickers
+        _earn_disc = discover_earnings_tickers(
+            window_days=settings.earnings_discovery_window_days,
+            max_results=settings.earnings_discovery_max,
+        )
+        _new_earn = [t for t in _earn_disc if t not in all_tickers]
+        if _new_earn:
+            all_tickers = all_tickers + _new_earn
+            logger.info(f"[earnings_disc] Injecting {len(_new_earn)} earnings name(s): {_new_earn}")
+
+    if settings.enable_analyst_discovery:
+        from src.data.analyst_ratings import discover_analyst_tickers
+        _analyst_disc = discover_analyst_tickers(
+            lookback_days=settings.analyst_discovery_lookback_days,
+            min_firms=settings.analyst_discovery_min_firms,
+            max_results=settings.analyst_discovery_max,
+        )
+        _new_analyst = [t for t in _analyst_disc if t not in all_tickers]
+        if _new_analyst:
+            all_tickers = all_tickers + _new_analyst
+            logger.info(f"[analyst_disc] Injecting {len(_new_analyst)} analyst name(s): {_new_analyst}")
+
     # Load cluster watchlist and inject still-active tickers into the universe
     # so they are re-evaluated every day for the full 10-day window even if they
     # have dropped off the trending/discovery list.
@@ -200,6 +249,24 @@ def run_pipeline(send_email: bool = False) -> None:
     if new_from_trades:
         all_tickers = all_tickers + new_from_trades
         logger.info(f"[tracker] Pinning open-trade tickers into universe: {new_from_trades}")
+
+    # ── Section F: discovery liquidity gate ───────────────────────────────────
+    # Drop untradeable microcaps (below the price or 20-day avg dollar-volume floor) from every
+    # DISCOVERED name before the universe is processed, so the widened funnel (Sections A–E) doesn't
+    # add names the tracker's bid-ask model charges up to 250 bp a side. The pinned/intentional
+    # universe is NEVER gated: static watchlist, sector ETFs, commodities, factor/thematic ETFs, and
+    # open-trade tickers. gate_budget is a shared cold-fetch allowance reused by the later
+    # macro-discovery and cointegration-peer injections.
+    gate_budget = {"n": max(0, settings.discovery_gate_max_fetch)}
+    from src.data.liquidity import apply_liquidity_gate
+    _protected = {s.upper() for s in (list(tickers) + list(sectors) + list(commodities)
+                                      + settings.factor_list + list(open_trade_tickers))}
+    _discovered = [t for t in all_tickers if t.upper() not in _protected]
+    _kept = set(apply_liquidity_gate(_discovered, source="step0 discovery", budget=gate_budget))
+    _before = len(all_tickers)
+    all_tickers = [t for t in all_tickers if t.upper() in _protected or t.upper() in _kept]
+    if len(all_tickers) != _before:
+        logger.info(f"[liquidity] Step 0 universe gated: {_before} → {len(all_tickers)} tickers")
 
     # ── Steps 1–3: Parallel data fetch ────────────────────────────────────
     #
@@ -434,12 +501,44 @@ def run_pipeline(send_email: bool = False) -> None:
             dix_context=dix_context,
         )
 
+    # Macro → discovery loop: pull top holdings of the favored sector/factor ETFs (sector-rotation
+    # inflows + business-cycle leaders + DIX factor tilt) into the universe so the macro/regime
+    # analysis actually drives single-name selection. Runs here (after the macro contexts exist)
+    # and before cointegration/build_signals so the injected names get the full signal stack.
+    macro_discovery_context = None
+    if settings.enable_macro_discovery:
+        from src.data.macro_discovery import run_macro_discovery
+        macro_discovery_context = run_macro_discovery(
+            sector_rotation_context=sector_rotation_context,
+            business_cycle_context=business_cycle_context,
+            dix_context=dix_context,
+        )
+        if macro_discovery_context and macro_discovery_context.tickers:
+            new_from_macro = [t for t in macro_discovery_context.tickers if t not in all_tickers]
+            new_from_macro = apply_liquidity_gate(new_from_macro, source="macro_discovery", budget=gate_budget)
+            if new_from_macro:
+                all_tickers = all_tickers + new_from_macro
+                logger.info(
+                    f"[macro_discovery] Injecting {len(new_from_macro)} favored-sector name(s): {new_from_macro}"
+                )
+
     # Cointegration pairs: statistical-arbitrage spreads (ADF + z-score).
     # Computed before build_signals so its per-ticker directional leans feed the aggregator.
     coint_context = None
     if settings.enable_cointegration:
         logger.info("Step 3.9: Testing cointegration pairs...")
         coint_context = find_cointegrated_pairs(all_tickers)
+
+        # Peer-expansion (Section E): pull the partner leg of a tradeable pair when only one leg
+        # is in the universe, so the relationship is tradeable both ways. The partner already
+        # carries a cointegration score; injecting it before build_signals gives it a TickerSignal.
+        if settings.enable_coint_peer_discovery and coint_context:
+            from src.signals.cointegration import get_coint_peer_tickers
+            _peers = get_coint_peer_tickers(coint_context, all_tickers, max_peers=settings.coint_peer_max)
+            _peers = apply_liquidity_gate(_peers, source="coint_peer", budget=gate_budget)
+            if _peers:
+                all_tickers = all_tickers + _peers
+                logger.info(f"[coint_peer] Injecting {len(_peers)} cointegration peer leg(s): {_peers}")
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
@@ -640,6 +739,8 @@ def run_pipeline(send_email: bool = False) -> None:
             market_mode_context=market_mode_context,
             catalyst_timing_context=catalyst_timing_context,
             cluster_watchlist_context=cluster_watchlist_context,
+            screener_context=screener_context,
+            macro_discovery_context=macro_discovery_context,
             sector_pairs_context=sector_pairs_context,
             cointegration_context=coint_context,
             sector_rotation_context=sector_rotation_context,

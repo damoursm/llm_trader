@@ -175,63 +175,11 @@ def _fetch_senate_trades(cutoff: date, tracked: List[str]) -> List[InsiderTrade]
 # ---------------------------------------------------------------------------
 # Source 3: SEC EDGAR Form 4 (corporate insiders)
 # ---------------------------------------------------------------------------
-
-_EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
-
-
-def _fetch_edgar_trades(tickers: List[str], cutoff: date) -> List[InsiderTrade]:
-    """
-    Query EDGAR full-text search for recent Form 4 filings for each ticker.
-    Parses the summary to extract buy/sell direction and officer role.
-    Limited to tickers explicitly in the analysis universe to keep API calls low.
-    """
-    trades: List[InsiderTrade] = []
-    start_str = cutoff.isoformat()
-    end_str   = date.today().isoformat()
-
-    for ticker in tickers[:20]:   # cap to avoid flooding EDGAR
-        try:
-            params = {
-                "q": f'"{ticker}"',
-                "dateRange": "custom",
-                "startdt": start_str,
-                "enddt": end_str,
-                "forms": "4",
-                "_source": "filing-index",
-                "hits.hits.total.value": 1,
-                "hits.hits._source.period_of_report": 1,
-            }
-            resp = httpx.get(_EDGAR_SEARCH, params=params, timeout=15,
-                             headers={"User-Agent": "llm-trader research@example.com"})
-            resp.raise_for_status()
-            hits = resp.json().get("hits", {}).get("hits", [])
-
-            for hit in hits[:5]:   # max 5 filings per ticker
-                src = hit.get("_source", {})
-                period = _parse_date(src.get("period_of_report", ""))
-                if period is None or period < cutoff:
-                    continue
-
-                entity   = src.get("entity_name") or src.get("display_names") or ""
-                filed    = _parse_date(src.get("file_date", "")) or period
-                form_text = src.get("form_type", "4")
-
-                trades.append(InsiderTrade(
-                    ticker=ticker,
-                    trader_name=str(entity)[:80],
-                    trader_type="corporate_insider",
-                    role="Officer/Director",
-                    transaction_type="form_4_filing",
-                    amount_range="see filing",
-                    transaction_date=period,
-                    disclosure_date=filed,
-                    notes=f"EDGAR {form_text} filing",
-                ))
-        except Exception as e:
-            logger.debug(f"[insider] EDGAR Form 4 failed for {ticker}: {e}")
-
-    logger.info(f"[insider] EDGAR Form 4: {len(trades)} filings found")
-    return trades
+# The old per-ticker Form 4 scan was capped to the first 20 watchlist tickers and produced
+# only non-directional "form_4_filing" records. It has been replaced by a MARKET-WIDE
+# open-market-BUY scan in sec_filings.fetch_form4_open_market_buys(), which parses Form 4 XML
+# for transaction code "P" and emits real corporate-insider ``purchase`` records (feeding the
+# insider cluster + persistence detectors). Those flow into smart_money via the SEC path.
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +198,8 @@ def fetch_insider_trades(tickers: List[str]) -> List[InsiderTrade]:
     all_trades: List[InsiderTrade] = []
     all_trades.extend(_fetch_house_trades(cutoff, tracked))
     all_trades.extend(_fetch_senate_trades(cutoff, tracked))
-    all_trades.extend(_fetch_edgar_trades(tickers, cutoff))
+    # Corporate-insider Form 4 buys are captured market-wide by
+    # sec_filings.fetch_form4_open_market_buys() and merged via the smart_money / SEC path.
 
     # Deduplicate by (ticker, trader, date, type)
     seen: set = set()
@@ -304,8 +253,9 @@ def get_tickers_from_smart_money(trades: List[InsiderTrade]) -> List[str]:
     - Form 144 planned sales → added (bearish signal worth monitoring)
     """
     from collections import Counter
-    discovered: set    = set()
-    pol_buys: Counter  = Counter()
+    discovered: set       = set()
+    pol_buys: Counter     = Counter()
+    insider_buys: Counter = Counter()   # distinct corporate-insider open-market buys per ticker
 
     # High-conviction source types that are always added
     _instant_types = {
@@ -320,10 +270,20 @@ def get_tickers_from_smart_money(trades: List[InsiderTrade]) -> List[str]:
             discovered.add(t.ticker)
         elif t.trader_type == "politician" and t.is_bullish:
             pol_buys[t.ticker] += 1
+        elif t.trader_type == "corporate_insider" and "purchase" in t.transaction_type:
+            insider_buys[t.ticker] += 1
 
+    # Congressional buys: a CURATED politician list means each buy is signal (≥1);
+    # an open list (all politicians) needs corroboration (≥2) to filter noise.
+    pol_threshold = 1 if settings.tracked_politicians_list else 2
     for ticker, count in pol_buys.items():
-        if count >= 2:
+        if count >= pol_threshold:
             discovered.add(ticker)
+
+    # Corporate-insider OPEN-MARKET buys (from the market-wide Form 4 scan): each is a genuine
+    # code-P purchase, so surface on ≥1 — "insider accumulation everywhere" feeds discovery.
+    for ticker in insider_buys:
+        discovered.add(ticker)
 
     return list(discovered)
 
