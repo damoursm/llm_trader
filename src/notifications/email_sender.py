@@ -388,6 +388,116 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     3B — HYPOTHETICAL ALWAYS-OPEN BOOK
+     Isolated reference book, NOT mixed with real trades above.
+     ══════════════════════════════════════ -->
+{% if hyp_perf and hyp_perf.config %}
+<h2>3b. Hypothetical Always-Open Book
+  <span style="font-size:13px;font-weight:400;color:#94a3b8;">
+    (reference baseline &mdash; isolated from real-trade stats)
+  </span>
+</h2>
+<p style="color:#64748b;font-size:12px;margin:0 0 10px 0;">
+  Each ticker is held in a permanent open position (BUY or SELL) configured via
+  <code>HYPOTHETICAL_TRADES</code>. M2M return uses the same spread model as real trades.
+  These positions <strong style="color:#f59e0b;">do not contribute</strong> to the
+  Portfolio Performance, Performance Breakdown, Solo Method, or Method Evaluation tables above.
+</p>
+{% if hyp_perf.trades %}
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Ticker</th>
+      <th>Action</th>
+      <th>Entry Date</th>
+      <th>Entry</th>
+      <th>Current</th>
+      <th style="text-align:right;">P&amp;L</th>
+      <th style="text-align:right;">Days</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in hyp_perf.trades %}
+    {% set act = t.action or t.direction %}
+    <tr>
+      <td><strong>{{ t.ticker }}</strong>
+        {% if t.type and t.type != 'STOCK' %}
+        <span style="font-size:10px;padding:1px 5px;border-radius:3px;margin-left:5px;
+                     background:{{ type_colors.get(t.type,'#334155') }};color:#e2e8f0;">
+          {{ t.type }}
+        </span>
+        {% endif %}
+      </td>
+      <td>
+        <span class="badge" style="background:{{ colors.get(act, '#334155') }};font-size:11px;">
+          {{ act }}
+        </span>
+      </td>
+      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
+      <td>${{ fmt_price(t.entry_price) }}</td>
+      <td>${{ fmt_price(t.current_price) }}</td>
+      <td class="{{ 'pos' if t.return_pct > 0 else ('neg' if t.return_pct < 0 else '') }}"
+          style="text-align:right;font-weight:700;">
+        {{ "%+.2f"|format(t.return_pct) }}%
+      </td>
+      <td style="text-align:right;color:#94a3b8;">{{ t.days_held }}d</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="card" style="border-left:4px solid #334155;">
+  <span style="color:#64748b;font-size:13px;">
+    Hypothetical book configured ({{ hyp_perf.config | length }} ticker{{ 's' if hyp_perf.config | length != 1 else '' }})
+    but no prices fetched yet &mdash; entries will appear on the next live run.
+  </span>
+</div>
+{% endif %}
+
+{% if hyp_perf.total %}
+<h3 style="color:#94a3b8;font-size:13px;margin:16px 0 6px;">Aggregate Stats</h3>
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Segment</th>
+      <th style="text-align:right;">Trades</th>
+      <th style="text-align:right;">Win Rate</th>
+      <th style="text-align:right;">Compound</th>
+      <th style="text-align:right;">Avg Return</th>
+      <th style="text-align:right;">Best</th>
+      <th style="text-align:right;">Worst</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% set _segments = [('All', hyp_perf.total, 'total'), ('BUY only', hyp_perf.buys, 'sub'), ('SELL only', hyp_perf.sells, 'sub')] %}
+  {% for label, seg, grp in _segments %}
+  {% if seg %}
+  {% set wr_c = '#4ade80' if seg.win_rate >= 55 else '#f59e0b' if seg.win_rate >= 45 else '#f87171' %}
+  {% set cp_c = '#4ade80' if seg.compound_return > 0 else '#f87171' %}
+  {% set av_c = '#4ade80' if seg.avg_return > 0 else '#f87171' %}
+  <tr style="{{ 'font-weight:700;background:#1e293b;' if grp == 'total' else '' }}">
+    <td>
+      {% if grp == 'total' %}
+        <strong style="color:#e2e8f0;">{{ label }}</strong>
+      {% else %}
+        <span style="padding-left:10px;color:#94a3b8;">{{ label }}</span>
+      {% endif %}
+    </td>
+    <td style="text-align:right;color:#94a3b8;">{{ seg.trades }}</td>
+    <td style="text-align:right;color:{{ wr_c }};font-weight:700;">{{ seg.win_rate }}%</td>
+    <td style="text-align:right;color:{{ cp_c }};font-weight:{{ '700' if grp == 'total' else '400' }};">{{ "%+.2f"|format(seg.compound_return) }}%</td>
+    <td style="text-align:right;color:{{ av_c }};">{{ "%+.2f"|format(seg.avg_return) }}%</td>
+    <td style="text-align:right;color:#4ade80;font-size:11px;">{{ "%+.2f"|format(seg.best) }}%</td>
+    <td style="text-align:right;color:#f87171;font-size:11px;">{{ "%+.2f"|format(seg.worst) }}%</td>
+  </tr>
+  {% endif %}
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+
+<!-- ══════════════════════════════════════
      4 — PERFORMANCE BREAKDOWN
      ══════════════════════════════════════ -->
 {% if perf and perf.performance_table %}
@@ -4713,6 +4823,7 @@ def send_recommendations(
     recommendations: List[Recommendation],
     total_analysed: int = 0,
     performance: Optional[dict] = None,
+    hypothetical_performance: Optional[dict] = None,
     all_recommendations: Optional[List[Recommendation]] = None,
     insider_trades: Optional[List[InsiderTrade]] = None,
     signals: Optional[List[TickerSignal]] = None,
@@ -4930,6 +5041,8 @@ def send_recommendations(
         equity_png=equity_png,
         # performance
         perf=performance,
+        # hypothetical always-open trades (isolated reference book)
+        hyp_perf=hypothetical_performance,
         # analyst ratings / EPS surprises / alternative data
         analyst_articles=analyst_articles,
         eps_articles=eps_articles,

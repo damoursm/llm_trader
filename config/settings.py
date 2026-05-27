@@ -479,6 +479,17 @@ class Settings(BaseSettings):
     adaptive_weight_min_multiplier: float = 0.5    # floor: a bad method keeps at least half its baseline
     adaptive_weight_max_multiplier: float = 2.0    # cap:   a great method gets at most double
 
+    # ── Hypothetical always-open trades ──────────────────────────────────────
+    # A separate, isolated category of trades where the listed tickers are ALWAYS
+    # in an open position (BUY or SELL) — used as a baseline / reference book
+    # alongside the real signal-driven trades. Each entry is "TICKER:BUY" or
+    # "TICKER:SELL" (default BUY if no direction given; legacy LONG/SHORT are
+    # accepted and normalised to BUY/SELL). Stored in
+    # cache/hypothetical_trades.json — completely separate from cache/trades.json
+    # so they NEVER contaminate real-trade performance metrics.
+    enable_hypothetical_trades: bool = True
+    hypothetical_trades: str = "GLD:BUY,SLV:BUY,GDX:BUY,NVDA:BUY"
+
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 
@@ -505,6 +516,35 @@ class Settings(BaseSettings):
     @property
     def commodities_list(self) -> List[str]:
         return [s.strip() for s in self.commodity_etfs.split(",") if s.strip()]
+
+    @property
+    def hypothetical_trades_list(self) -> List[tuple]:
+        """Parsed [(ticker, action)] list for the always-open hypothetical book.
+
+        Action is 'BUY' or 'SELL' (default BUY when unspecified). Legacy
+        'LONG'/'SHORT' values are accepted and normalised to 'BUY'/'SELL'
+        for convenience. Empty list when the feature is disabled.
+        """
+        if not self.enable_hypothetical_trades:
+            return []
+        _aliases = {"LONG": "BUY", "SHORT": "SELL", "BUY": "BUY", "SELL": "SELL"}
+        pairs: List[tuple] = []
+        seen: set = set()
+        for spec in self.hypothetical_trades.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            if ":" in spec:
+                tk, action = spec.split(":", 1)
+                tk = tk.strip().upper()
+                action = _aliases.get(action.strip().upper(), "BUY")
+            else:
+                tk = spec.upper()
+                action = "BUY"
+            if tk and tk not in seen:
+                seen.add(tk)
+                pairs.append((tk, action))
+        return pairs
 
     @property
     def factor_list(self) -> List[str]:

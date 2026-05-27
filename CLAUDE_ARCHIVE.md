@@ -1,0 +1,267 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Running the pipeline
+
+```bash
+python main.py                # Run once, console output only
+python main.py --email        # Run once and send email report
+python main.py --schedule     # Start APScheduler (8:00 AM ET, Mon–Fri, sends email)
+```
+
+Logs go to `logs/llm_trader_YYYY-MM-DD.log` (7-day rotation). The HTML report (when `ENABLE_CHARTS=true`) is saved to `logs/report_YYYY-MM-DD_HHMM.html`.
+
+To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/snapshots_*.json`. The OHLCV cache (`cache/ohlcv/`) and trades ledger (`cache/trades.json`) should never be deleted casually.
+
+## Architecture
+
+### Pipeline flow (`src/pipeline.py`)
+
+`run_pipeline()` is the single entry point. Steps execute in sequence:
+
+```
+0. Ticker discovery      — trending.py → expands universe beyond static watchlist. Sources: Yahoo trending, Alpha Vantage movers + news feed, NewsAPI headlines (OPEN-VOCABULARY — $cashtags/caps tokens resolved against the full SEC ticker map via ticker_extract.py, not a hardcoded allowlist), WSB cashtag discovery (reddit_sentiment.discover_wsb_tickers() over Reddit public JSON hot/rising, no key; ENABLE_WSB_DISCOVERY), and StockTwits trending (ENABLE_STOCKTWITS_DISCOVERY, default off — Cloudflare-gated). All fail-graceful; ≤30 extras appended after watchlist+sectors
+0b. Opportunity screener — screener.py → run_screener(): PROACTIVE setup discovery ("what's set up" vs "what's trending"). Screens a curated broad liquid universe (_SCREEN_UNIVERSE) ∪ everything in the OHLCV cache (cache-first; bounded warm-up fetch of ≤SCREEN_MAX_FETCH_PER_RUN cold names) for: unusual volume (today vs 20d avg), 52-week breakout/near-high/new-low reversal, relative strength vs SPY (SCREEN_RS_LOOKBACK_DAYS), and 50/200 golden/death cross. Liquidity gate (SCREEN_MIN_PRICE + SCREEN_MIN_DOLLAR_VOLUME, default $20M) keeps illiquid pumps out. Top SCREEN_MAX_RESULTS setups (ScreenHit: ticker/direction/screens/note) injected into the analysis universe → each then gets the full signal stack (a 52w breakout here is confirmed by the Trend Strength Donchian signal). Email "Opportunity Screener" section. ENABLE_OPPORTUNITY_SCREENER=true
+0c. Macro → discovery loop — macro_discovery.py → run_macro_discovery(): closes the loop between the macro/regime modules and stock selection. Runs AFTER the parallel fetch (Step 3.85, once sector_rotation/business_cycle/DIX exist) and before cointegration/build_signals so injected names get the full signal stack. Favored ETFs = sector_rotation.top_inflow ∪ business_cycle.top_cycle_leaders ∪ DIX factor tilt (BULLISH→MTUM momentum / BEARISH→USMV low-vol). Pulls top MACRO_DISCOVERY_HOLDINGS_PER_ETF holdings of each via yfinance funds_data (cached daily in cache/etf_holdings_*.json; static SPDR fallback), dedups, caps at MACRO_DISCOVERY_MAX, injects into the universe. MacroDiscoveryContext (favored_etfs/etf_reasons/by_etf/tickers); email "Macro → Discovery" section. ENABLE_MACRO_DISCOVERY=true
+0d. Catalyst & relationship expansion (Section E) — widens the universe along axes the static watchlist misses; all fail-graceful + capped, injected at Step 0 so the per-ticker analyst/earnings steps + full signal stack enrich the new names. (1) Factor/thematic ETFs: settings.factor_list (style factors MTUM/QUAL/VLUE/SIZE/USMV/IWF/IWD + themes SMH/IGV/XBI/ITA/TAN/LIT/IBB/XHB/JETS/KRE) pinned like commodities — ENABLE_FACTOR_ETFS. (2) Market-wide EARNINGS discovery: earnings.discover_earnings_tickers() reads the whole-market Alpha Vantage EARNINGS_CALENDAR and injects names reporting within EARNINGS_DISCOVERY_WINDOW_DAYS (SEC-validated, cached daily; needs alpha_vantage_key — yfinance has no market-wide calendar) — ENABLE_EARNINGS_DISCOVERY. (3) Market-wide ANALYST discovery: analyst_ratings.discover_analyst_tickers() reads the FMP upgrades-downgrades-rss-feed (yfinance analyst data is per-ticker only) and injects names with fresh upgrades/downgrades from ≥ANALYST_DISCOVERY_MIN_FIRMS firms within ANALYST_DISCOVERY_LOOKBACK_DAYS (needs FMP_API_KEY) — ENABLE_ANALYST_DISCOVERY. (4) Cointegration peer-expansion runs at Step 3.9 (see signal aggregation). Each ENABLE_* flag is independent.
+0e. Discovery liquidity gate (Section F) — liquidity.apply_liquidity_gate() applies one uniform quality floor (DISCOVERY_MIN_PRICE + DISCOVERY_MIN_DOLLAR_VOLUME = 20d avg dollar volume) to EVERY discovered candidate before the universe is processed, so the widened funnel (Steps 0/0b/0c/0d) doesn't inject untradeable microcaps — the names tracker._dynamic_half_spread() charges up to 250 bp a side. Cache-first via load_ohlcv + a bounded warm-up fetch (DISCOVERY_GATE_MAX_FETCH, one shared budget per run); FAIL-CLOSED (a name whose price/volume can't be verified is dropped). NEVER gates the pinned/intentional universe: static watchlist, sector ETFs, commodities, factor/thematic ETFs, open-trade tickers. Applied as one pass at the end of Step 0 (covering trending/earnings/analyst/cluster injections) and again at the macro-discovery (3.85) and cointegration-peer (3.9) injection points; the opportunity screener (0b) applies the same price/$-volume floor internally. ENABLE_DISCOVERY_LIQUIDITY_GATE=true
+1. News fetch            — news_fetcher.py → RSS + NewsAPI, cached hourly
+1b. SEC 8-K filings      — eight_k.py → always fresh, appended to articles list
+1c. Google Trends        — google_trends.py → search interest spikes, cached daily
+1d. Reddit sentiment     — reddit_sentiment.py → WSB/stocks/investing, cached hourly
+1e. Analyst ratings      — analyst_ratings.py → upgrades/downgrades/PT changes, cached daily
+1f. EPS surprises        — earnings.py → recent beat/miss articles, cached daily
+1g. Short interest       — short_interest.py → FINRA Reg SHO + yfinance squeeze/covering, cached daily
+2. Market snapshots      — market_data.py → polygon_client.py (single batch REST call) primary, yfinance fallback for anything Polygon doesn't cover (indices, futures, OTC), cached hourly
+3a. Insider/pol trades   — insider_trades.py → House/Senate congressional watchers (the old watchlist-capped EDGAR Form 4 scan was removed — see 3c)
+3b. Options flow         — options_flow.py → yfinance sweep detection
+3c. SEC EDGAR filings    — sec_filings.py → 13D/13G, Form 144, 13F superinvestors (broadened tracked_institutions list → stronger consensus), and a MARKET-WIDE Form 4 open-market-buy scan: fetch_form4_open_market_buys() parses recent Form 4 XML for transaction code "P" (open-market purchase) across the whole market (efts, paginated, bounded by FORM4_SCAN_MAX_FILINGS, cached daily in cache/form4_buys_*.json) and emits real corporate_insider "purchase" records — which feed the insider CLUSTER + PERSISTENCE detectors and universe discovery (get_tickers_from_smart_money surfaces corporate-insider buys + congressional buys ≥1 when the politician list is curated). ENABLE_FORM4_SCAN=true
+3d. FRED macro context   — fred.py → yield curve, CPI, unemployment, credit spreads
+3e. CFTC COT             — cot.py → weekly futures positioning, cached by ISO week
+3f. IPO pipeline         — ipo_pipeline.py → S-1/S-11 sector demand signal, cached daily
+3g. VIX & term structure  — vix.py → ^VIX/^VXN/^VVIX/^VIX3M/^VXMT, cached daily
+3h. Put/call ratio        — put_call.py → CBOE market-wide + per-ticker extremes, cached daily
+3i. Earnings calendar     — earnings.py → upcoming dates + IV warning, cached daily
+3j. Credit market         — credit.py → HYG vs SPY divergence, leading indicator, cached daily
+3k. Market breadth        — breadth.py → % of sector ETFs above 200d SMA, thrust detection, cached daily
+3l. McClellan Oscillator  — mcclellan.py → EMA19−EMA39 of NYSE A/D, Summation Index, zero-cross, cached daily
+3m. New 52-week highs/lows — highs_lows.py → HL Spread = %near-highs − %near-lows, divergence detection, cached daily
+3n. Macro Surprise Index  — macro_surprise.py → CESI-style: actual FRED vs trailing 3-period avg, composite z-score, cached daily
+3o. Fed Rate Expectations — fedwatch.py → T-bill spread proxy for CME FedWatch: implied cuts/hikes bp, P(cut/hold/hike) at next FOMC, rate-trend shift, cached daily
+3p. Revision Momentum     — revision_momentum.py → analyst PT/rating trend: recent (0-30d) vs prior (31-60d) upgrade/downgrade delta, momentum score per ticker, cached daily
+3q. Earnings Whisper      — earnings_whisper.py → implied whisper = consensus × (1 + avg_historical_beat%); beat-rate, eps_trend direction, net revisions; cached daily
+3r. Insider cluster       — aggregator.py → _detect_insider_cluster(): ≥3 different insiders buying within 5 days → 1.75× amplifier on insider_score; cluster_detected/size stored on TickerSignal; cluster_watchlist.py → persists detections to cache/cluster_watchlist.json and injects active tickers into the analysis universe for 10 days (lead-indicator window; clusters historically precede moves by 5–20 days)
+3r2. Insider buying persistence — aggregator.py → _detect_insider_persistence(): the SAME insider buying the same ticker on multiple DISTINCT days within the lookback window (depth of conviction, vs. cluster's breadth). Filters corporate-insider + politician purchases (same exclusions as cluster), groups by case-insensitive trader_name, counts distinct transaction dates per name; fires when the top buyer's distinct-day count ≥ insider_persistence_min_buys (default 2). _persistence_factor(count)=min(1.75, 1.0+0.25×(count−1)) amplifies a positive insider_score (2d→1.25×, 3d→1.50×, 4d+→1.75×, applied after the cluster amplifier, clamped to +1.0). Stored on TickerSignal as insider_persistence_detected/count/buyer; Claude gets a *** INSIDER PERSISTENCE *** flag + instruction 22b; email Smart Money card shows a teal PERSISTENT • <name> ×N badge. Rides on insider_score → no separate performance-attribution key. ENABLE_INSIDER_PERSISTENCE=true (INSIDER_PERSISTENCE_MIN_BUYS)
+3s. OpEx calendar         — opex.py → compute_opex_context(): pure date math; 3rd-Friday detection, Triple Witching flag, POST_OPEX window; amplifies/discounts max_pain_score confidence in Claude prompt
+3t. Seasonality calendar  — seasonality.py → compute_seasonality_context(): pure date math; monthly historical biases (April strongest, September weakest, Sell in May), end-of-month/quarter rebalancing windows, January effect (small-cap IWM), quarterly window dressing; STRONG_TAILWIND→STRONG_HEADWIND composite signal
+3u. Bond market internals — bond_internals.py → 10Y-3M yield curve (recession predictor), TLT/IEF/TIP/LQD 1/4/8-week momentum, real yield, IG credit; bond-equity divergence (TLT vs SPY 5d return — EQUITY_CATCHUP_LIKELY when bonds rally hard while equities hold); RISK_OFF→RISK_ON composite regime; cached daily
+3v. MOVE Index            — move.py → ICE BofA Treasury implied vol (^MOVE primary, VXTLT fallback); CALM→PANIC signal, 5d spike detection, MOVE/VIX ratio divergence; cached daily
+3v2. Dark Pool Index (DIX) — dix.py → fetch_dix_context(): SqueezeMetrics free DIX.csv (date,price,dix,gex; no API key). DIX = volume-weighted off-exchange (dark pool) short volume → proxy for HIDDEN institutional accumulation; high DIX historically leads positive S&P returns by ~1–4 weeks. Classifies by DIX percentile vs its own trailing year (≥75th STRONG_ACCUMULATION → BULLISH … ≤25th STRONG_DISTRIBUTION → BEARISH; absolute-level fallback when history <1y) plus 5-day RISING/FALLING trend. Same feed carries market-wide GEX (whole-index dealer gamma, distinct from per-ticker gamma_exposure.py): low/negative = VOL_EXPANSION, high = VOL_SUPPRESSION; HIGH DIX + VOL_EXPANSION = classic "hidden buying with room to run". Market-wide macro overlay (NOT per-ticker): feeds the Claude prompt (block + instruction 11c) AND the Macro Regime Filter (_DIX_SCORES, weight 1.0). Cache-first; cached daily; ENABLE_DIX=true
+3w. Global macro          — global_macro.py → DXY strength (DX-Y.NYB: strong dollar = headwind for EM/commodities/multinationals) + Copper/Gold ratio (HG=F/GC=F: Dr. Copper growth barometer) + Oil/Bond divergence (CL=F vs TLT: co-rally = POLICY_PIVOT_SIGNAL; oil up + bonds down = STAGFLATION_RISK; oil down + bonds up = GROWTH_FEAR_RISK_OFF); RISK_OFF→RISK_ON composite; cached daily
+3x. Macro Regime Filter   — macro_regime.py → compute_macro_regime(): composite of VIX+MOVE+bond+global+FRED+breadth+credit into PANIC|RISK_OFF|CAUTION|NEUTRAL|RISK_ON; gates BUY entries and adjusts actionable threshold (PANIC=88%, RISK_OFF=82%, CAUTION=80%, NEUTRAL=78%, RISK_ON=72%); no cache (instant, pure computation from already-fetched contexts)
+3y. Market Mode Switching — market_mode.py → compute_market_mode(): VIX+breadth+HL+McClellan composite into TRENDING|NEUTRAL|CHOPPY; dynamically adjusts aggregator signal weights: TRENDING up-weights tech/news (momentum bias), down-weights vwap/put_call; CHOPPY up-weights vwap/put_call (mean-reversion bias), down-weights tech; passed to build_signals() as weight_profile override; no cache (instant)
+3z. Catalyst Timing      — catalyst_timing.py → three event-driven guards applied after recommendations are ranked: (1) Earnings Blackout: tickers within 2 days of earnings are removed from actionable BUY/SELL set (IV crush/gap risk); (2) OpEx Max-Pain Amplifier: during OpEx week, max_pain weight in aggregator boosted 0.12→0.20; Triple Witching (Mar/Jun/Sep/Dec) → 0.28; (3) 8-K + Insider Buy WATCH elevation: when both a recent 8-K filing and an insider purchase coincide for the same ticker, the ticker is auto-elevated from HOLD→WATCH or injected as a new WATCH if not yet in the top-10; no cache (instant, uses already-fetched contexts)
+3A. Pattern Recognition  — pattern_recognition.py → compute_pattern_score(): detects 8 classical chart patterns (double_bottom, inv_head_shoulders, ascending_triangle, bull_flag, double_top, head_shoulders, descending_triangle, bear_flag) using local extrema on the last 60 bars; scores each detection by its historical win rate on that specific ticker (cold path: fetches 2y of history, scans 40-bar sliding windows with step=5, records 5d/10d forward returns — library cached 7 days in cache/patterns/<TICKER>.json; warm path: instant lookup + current detection); score = (win_rate − 0.5) × 2 × inherent_direction ∈ [−1, +1]; falls back to weak prior (±0.25) when fewer than 3 historical occurrences exist; base weight 0.18 in aggregator
+3B. Sector Rotation      — sector_rotation.py → fetch_sector_rotation_context(): "Ebb and Flow" mechanism — tracks where money is entering and exiting across all 11 SPDR sector ETFs; computes excess return vs SPY (1w/1m/3m), volume ratio (5d/20d), and a cross-sectional z-score rotation_score ∈ [-1,+1]; volume modifier amplifies conviction; classifies STRONG_INFLOW/INFLOW/NEUTRAL/OUTFLOW/STRONG_OUTFLOW per sector; derives cyclical vs defensive avg spread → RISK_ON/NEUTRAL/RISK_OFF regime; surfaces explicit rotation pairs (e.g., "XLK → XLP") and top 3 inflow/outflow sectors; cached daily in cache/sector_rotation_YYYY-MM-DD.json
+3C. Rotation Drivers     — rotation_drivers.py → fetch_rotation_drivers_context(): rate-cycle phase from FRED DFF trajectory (3m/12m bp change) + CPIAUCSL inflation trend; real rate = DFF − CPI; classifies EARLY_TIGHTENING|PEAK_TIGHTENING|TIGHTENING_PAUSE|PIVOT_IMMINENT|EASING_CYCLE|NEUTRAL; maps each phase to favoured/avoid asset lists (e.g., PIVOT_IMMINENT → favour TLT/XLRE/XLU, avoid XLE); Claude instruction 27c applies ±0.03–0.04 confidence adjustments per phase; optionally enhanced by FedWatch implied_cuts_12m_bp for PIVOT_IMMINENT detection; cached daily in cache/rotation_drivers_YYYY-MM-DD.json; requires FRED_API_KEY
+3D. Business Cycle Rotation — business_cycle_rotation.py → compute_business_cycle_context(): Fidelity-style structural economic cycle phase derived from already-fetched FRED macro context (regime, yield_curve_signal, inflation_signal, unemployment_trend — no new API calls); phases: EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION|UNKNOWN; maps each phase to per-sector cycle scores ∈ [-1,+1] (EARLY: XLF/XLRE/XLY lead; MID: XLK/XLI lead; LATE: XLE/XLB lead; LATE_CYCLE/CONTRACTION: XLV/XLP/XLU lead); convergence check vs Ebb-and-Flow real-time inflows; Claude instruction 27d applies ±0.03 confidence adjustments per cycle phase and surfaces sector-leadership guidance; no cache (instant, pure synthesis); ENABLE_BUSINESS_CYCLE_ROTATION=true
+3E. Price Momentum (Perceived Value) — price_momentum.py → compute_price_momentum_score(): 1m (21-bar) and 2m (42-bar) returns normalised against the ticker's own trailing 252-bar return distribution (rolling std of 21-bar returns); z_composite = 0.6×z_1m + 0.4×z_2m; volume-confirmation adjustment ±0.10 (uptrend+rising vol → +0.10; downtrend+rising vol → -0.10; thin vol → -0.05×sign); tanh(z/1.5) + vol_adj clamped to [-1,+1]; weight 0.18 in aggregator; OHLCV cache-first (load_ohlcv() → works with ENABLE_FETCH_DATA=false); falls back to get_history(18mo); minimum 50 bars; tracked in performance attribution under "Technical" category; email section 5x: Price Momentum Leaderboard (top 5 chased / bottom 5 sold); ENABLE_PRICE_MOMENTUM=true
+3F. Money Flow Indicators — money_flow.py → compute_money_flow_score(): three complementary volume-based indicators combined into a single accumulation/distribution score; MFI 14-period (volume-weighted RSI: <20=accumulation zone, >80=distribution zone; contrarian score = tanh((50−MFI)/20)); CMF 20-period (Chaikin Money Flow: positive=buyers in control, negative=sellers; score = tanh(CMF/0.15)); OBV 21-bar linear-regression slope z-score (rising=sustained buying, score = tanh(obv_z)); composite = 0.40×mfi_score + 0.40×cmf_score + 0.20×obv_score, final = tanh(composite/0.6) clamped to [-1,+1]; weight 0.15 in aggregator; OHLCV cache-first (works with ENABLE_FETCH_DATA=false); falls back to get_history(18mo); minimum 30 bars; tracked in performance attribution under "Technical" category; email section 5z: Money Flow Leaderboard (top 5 accumulation / bottom 5 distribution); ENABLE_MONEY_FLOW=true
+3G. Post-Earnings Announcement Drift (PEAD) — pead.py → fetch_pead_context(): per-ticker SUE × time-decay score derived from yfinance earnings_dates (same source as enable_earnings); for each ticker, finds the most recent reported EPS within PEAD_DECAY_WINDOW_DAYS (default 60), computes sue_normalized = tanh(surprise_pct / PEAD_SURPRISE_SCALE_PCT) (default scale 25 → ±25% saturates at ±0.76), time_decay = max(0, 1 - days_since_report / decay_window), pead_score = sue_normalized × time_decay ∈ [-1, +1]; weight 0.15 in aggregator; tracked in performance attribution under "Fundamental" category; cached daily in cache/pead_YYYY-MM-DD.json; email section 34c: Post-Earnings Drift Leaderboard (top 5 bullish drift from beats / top 5 bearish drift from misses); ENABLE_PEAD=true
+3I. IV Rank + Directional — iv_rank.py → compute_iv_rank_score(): volatility-regime-aware directional bias. Uses 21-day realized-vol percentile (vs trailing 252-day distribution) as a proxy for IV Rank — RV and IV are tightly correlated, and the *rank* within a ticker's own history carries the same regime information as true IV Rank. Combined with normalised 5-day return (return ÷ ATR%) so both inputs are self-normalised → robust to regime shifts and tradable across the universe with one rule. Scoring switches by IR band: HIGH IR (≥70) is contrarian (CAPITULATION_BUY +0.55 / FADE_EXTREME -0.55 / EVENT_CAUTION ±0.20 on mild moves); LOW IR (≤30) is trend-confirming (CALM_UPTREND / CALM_DOWNTREND up to ±0.40); MID IR is mild trend-following (±0.30 × tanh(z_ret/1.5)). Weight 0.13 in aggregator; tracked in performance attribution under "Technical" category; no cache (computed each run from the OHLCV cache, works with ENABLE_FETCH_DATA=false); minimum 65 bars required; email per-ticker mrow + IV Rank Leaderboard (top 5 bullish/bearish biases with IR + regime label); ENABLE_IV_RANK=true
+3J. IV Expression — iv_expr.py → compute_iv_expr_score(ticker, gex_context): stock-vs-options expression decision from the REAL options chain (distinct from iv_rank's RV proxy). Reads live market-implied vol straight from the options chain already fetched for GEX (gex_context.signals[*].expected_move_pct = ATM straddle ÷ spot) and ranks it against the ticker's own trailing IV history reconstructed by reading prior cache/gex_*.json files (60-day window; ≥6 readings → percentile mode, else universe-median-relative fallback). Combines IV rank with the options market's own directional positioning (oi_skew) to decide expression: HIGH IV (≥75) + strong skew → FADE_PREMIUM (contrarian -0.55×sign, options over-pricing the move, prefer stock over long premium); LOW IV (≤25) + strong skew → CHEAP_DIRECTIONAL_LONG/SHORT (confirm +0.55×sign, cheap optionality + decisive positioning); MID IV → 0.30×oi_skew; AMPLIFIED dealer gamma adds ±0.10 in the favourable direction. Tickers without a GEX entry return NO_OPTIONS_DATA (score 0, no contribution). Weight 0.12 in aggregator; tracked in performance attribution under "Options" category; no cache of its own (reuses GEX caches); requires enable_gex=true (gex_context must be present); email per-ticker mrow + IV Expression Leaderboard; ENABLE_IV_EXPR=true
+3H. Cross-Sectional Ranking — cross_sectional.py → compute_cross_sectional_scores(signals): SECOND PASS overlay after the per-ticker loop in build_signals; for each of the 11 base methods, collects per-ticker scores across the universe, drops near-zero readings (a method that did not fire on a ticker shouldn't pull that ticker's z-score toward the mean), computes universe-wide μ and σ, derives per-ticker z-scores clipped to ±CROSS_SECTIONAL_ZCAP (default 2.5σ); cross_sectional_score = mean(z-scores) / zcap clipped to [-1, +1]; composes additively into combined_score with CROSS_SECTIONAL_WEIGHT (default 0.20), direction and confidence re-derived after the adjustment; tracked in performance attribution under "Relative" category; no cache (computed in-memory from the universe each run); email section 34d: Cross-Sectional Ranking Leaderboard (top 5 standouts above universe avg / top 5 laggards below); ENABLE_CROSS_SECTIONAL=true
+3K. Cointegration Pairs  — cointegration.py → find_cointegrated_pairs(tickers): statistical-arbitrage market-neutral alpha, run at pipeline Step 3.9 (before build_signals so its per-ticker leans feed the aggregator). Engle-Granger two-step on a curated set of economically-linked candidate pairs (gold trackers, index ETFs, semis, mega-cap tech, payments, banks, energy, retail, autos, telecom, …) plus same-sector combinations from _SECTOR_MAP restricted to the universe: (1) OLS hedge ratio β on log prices log(A)=α+β·log(B); (2) native numpy ADF test on the residual spread (no statsmodels dependency), compared against Engle-Granger residual-based MacKinnon critical values (constant, N=2: {0.01:-3.90, 0.05:-3.34, 0.10:-3.04}). Cointegrated when ADF stat ≤ critical value at COINTEGRATION_PVALUE (default 0.05). Spread z-score = (spread − mean)/std; OU mean-reversion half-life filters slow reverters (≤ 60d). A pair is an ENTRY when cointegrated AND |z| ≥ COINTEGRATION_ENTRY_Z (default 2.0) AND half-life is fast; STRETCHED if cointegrated + stretched but slow; MONITOR/NEUTRAL otherwise. Each tradeable pair nudges its cheap (long) leg bullish and rich (short) leg bearish, magnitude = tanh growth past the entry threshold, aggregated across all pairs into per-ticker ticker_scores ∈ [-1,+1]; _coint_score_for() folds these into the aggregator as method "coint" (base weight 0.12) and onto TickerSignal.coint_score; tracked in performance attribution under "Relative" category. Data: cache-first via load_ohlcv (works with ENABLE_FETCH_DATA=false); falls back to get_history(period="1y", force_refresh=True) only when the cache is shorter than 180 bars and fetching is enabled. No cache of its own (computed each run). Distinct from Sector Pairs (which keys off opposing directional signals) — this is a pure statistical relationship. Email section 35b: Cointegration Pairs (pair cards: β, ADF vs crit, half-life, z, LONG/SHORT) + per-ticker row in the signal breakdown; ENABLE_COINTEGRATION=true (COINTEGRATION_ENTRY_Z, COINTEGRATION_EXIT_Z, COINTEGRATION_PVALUE). **Section E peer-expansion:** get_coint_peer_tickers(context, universe) returns the partner leg of any tradeable (ENTRY/STRETCHED) pair when EXACTLY one leg is in the universe; pipeline.py injects those legs into all_tickers right after find_cointegrated_pairs and before build_signals, so the partner (which already carries a coint ticker_score) gets a full TickerSignal and can become a recommendation. Capped at COINT_PEER_MAX; ENABLE_COINT_PEER_DISCOVERY=true
+3L. Sentiment Velocity   — sentiment_velocity.py → compute_sentiment_velocity(): Δsentiment, NOT level. The rate of change of news tone leads short-horizon (1–5 day) moves better than the absolute level. Deterministic financial lexical polarity per article (no LLM/API cost — reuses NewsArticle.published_at), bucketed by recency into a recent window (≤ SENTIMENT_VELOCITY_RECENT_HOURS, default 24h) and a prior window (recent→SENTIMENT_VELOCITY_PRIOR_HOURS, default 96h); velocity = mean_tone(recent) − mean_tone(prior); score = tanh(Δ/0.6) × count-confidence ∈ [-1,+1]; 0 when either window is empty. Folded into the aggregator as method "sent_velocity" (base weight 0.12) on TickerSignal.sentiment_velocity_score (+ sentiment_recent/sentiment_prior); tracked in performance attribution under "Sentiment" category; Claude gets a per-ticker VELOCITY line + instruction 1b. Email: per-ticker mrow + section 34a Sentiment Velocity Leaderboard. ENABLE_SENTIMENT_VELOCITY=true (SENTIMENT_VELOCITY_RECENT_HOURS, SENTIMENT_VELOCITY_PRIOR_HOURS)
+3M. Trend Strength       — trend_strength.py → compute_trend_strength_score(): trend QUALITY + breakout confirmation, a dimension not captured by momentum (return size) or RSI/Bollinger (overbought/oversold). Combines Wilder's ADX/DMI (direction = (+DI−−DI)/(+DI+−DI) ∈ [-1,+1], scaled by ADX strength = clip((ADX−15)/30, 0,1) — ADX<20 = chop, signal dampened toward 0) with a 20-day Donchian (Turtle) channel breakout (+1 close above prior 20d high / −1 below prior 20d low / else mild positional lean). score = clip(0.60×adx_dir + 0.40×donchian, -1, +1); label NO_TREND|UPTREND|STRONG_UPTREND|BREAKOUT_UP|DOWNTREND|STRONG_DOWNTREND|BREAKOUT_DOWN. Folded into the aggregator as method "trend_strength" (base weight 0.15) on TickerSignal.trend_strength_score (+ adx_value, trend_strength_label); tracked in performance attribution under "Technical" category; Claude gets a per-ticker TrendStrength line + instruction 16b. OHLCV cache-first (works with ENABLE_FETCH_DATA=false); min 50 bars. Email: per-ticker mrow + Trend Strength Leaderboard. ENABLE_TREND_STRENGTH=true (TREND_ADX_PERIOD, TREND_DONCHIAN_PERIOD)
+4a. Sector Pairs         — sector_pairs.py → find_sector_pairs(): scans _SECTOR_MAP for stocks and their sector ETF having opposing non-NEUTRAL directions (both ≥35% confidence); forms market-neutral LONG/SHORT pair trades that isolate idiosyncratic alpha from sector beta; ETF_BULL_STOCK_BEAR or ETF_BEAR_STOCK_BULL setups; reported in email but not tracked in trades.json (pair-trade accounting differs from single-leg); no cache (instant)
+4. Signal aggregation    — aggregator.py → per-ticker combined score
+5. Recommendations       — claude_analyst.py → Claude generates BUY/SELL/HOLD/WATCH; DeepSeek V3 (`deepseek-chat`) auto-fallback on any Claude API failure (credits exhausted, 401/402/403/429/5xx, connection error); then rule-based _fallback_recommendations() as last resort
+6. Performance tracking  — tracker.py + daily_nav.py → paper trades in cache/trades.json; entry/exit recorded with `entry_datetime`/`exit_datetime`/`current_price_datetime` (UTC ISO 8601) so every price is anchored to the wall-clock instant it was observed; confidence-scaled position sizing (1×/1.5×/2×) with per-sector cap of 3×; fmt_price() formats prices with 2/4/6 decimal places depending on magnitude (handles sub-penny stocks/warrants); _dynamic_half_spread() replaces fixed SPREAD_PCT with price-tiered, asset-type-aware bid-ask model (ETF=1bp, large-cap stock=2bp, penny=$0.01–$0.10→37.5bp, sub-penny→250bp); **daily_nav.compute_compound_return()** walks every trade day-by-day through the real OHLCV cache (path-faithful: `r_d = sign × (mark_d − mark_{d−1}) / mark_{d−1}` with sign +1 long / −1 short; spread applied only at entry/exit anchors; no geometric interpolation or synthetic uniform-daily returns), capital-weights active positions per date, and compounds sequentially → 100% deterministic given (trades.json, OHLCV cache); compute_portfolio_metrics() returns these daily-walked compounds for `compound_inception`/`return_1w`/`return_2w`/`return_1m`; before the walk, `_refresh_open_trade_ohlcv()` force-refreshes the OHLCV cache for every open-trade ticker (bypassing the 3-day TTL via `get_history(force_refresh=True)`) so the daily walk has a real close for every day the position was held; `_normalize_closed_returns()` re-derives `return_pct` for every closed trade from its stored entry/exit prices through the current spread model each run so summary stats (avg/best/worst/win_rate) reconcile internally; method attribution: at entry each trade stores the 17 raw method scores + methods_agreeing list + dominant_method; `_flip_trade()` produces a same-ticker/same-dates trade dict with action inverted so hypothetical "what-if-this-method-had-decided" scenarios also walk the real daily prices instead of negating a stored number; get_performance_for_email() returns performance_table (unified breakdown rows), trades_svg (inline SVG equity curve + per-trade bars), portfolio_metrics (daily-walked time-window returns), method_order_by_winrate (methods ranked by solo win rate for sorted display), attributed_count, and solo_method_perf (hypothetical per-method standalone simulation)
+7. Charts + email        — charts/, email_sender.py
+```
+
+### Data flow design
+
+**Two tiers of data:**
+- **Per-ticker signals** (news, sentiment velocity, technical, trend strength, insider): scored `[-1.0, +1.0]`, combined in `aggregator.py` with configurable weights into a `TickerSignal`. News sentiment is the *level*; sentiment velocity is the *rate of change* (Δ recent−prior tone) — distinct methods, distinct weights. Trend strength (ADX/DMI + Donchian) measures trend *quality* and is distinct from price momentum (return *size*). Convergence multiplier (1.25× when ≥2 methods agree, 0.60× when only 1 does) prevents single-source BUY/SELL calls.
+- **Macro context** (FRED, COT): not per-ticker. Passed as structured context blocks directly into the Claude prompt. Claude applies regime overlays (recession → avoid POSITION longs; EXTREME_LONG COT → cap BUY conviction on that asset).
+- **Macro Regime Filter** (`macro_regime.py`): hard pre-filter applied after Claude runs. Reads VIX, MOVE, bond internals, global macro, FRED, breadth, credit, and the Dark Pool Index (DIX) contexts; computes a weighted composite regime (PANIC|RISK_OFF|CAUTION|NEUTRAL|RISK_ON) that gates actionable signals by raising the confidence threshold and blocking BUY entries during PANIC/RISK_OFF. This is the top-down overlay that prevents buying into market crashes.
+- **Market Mode Switching** (`market_mode.py`): adjusts the aggregator's signal weight profile based on market structure. TRENDING (low VIX, healthy breadth) → up-weight `tech`/`news` (momentum), down-weight `vwap`/`put_call`. CHOPPY (high VIX, mixed breadth) → up-weight `vwap`/`put_call` (mean-reversion/contrarian), down-weight `tech`. Computed from VIX, breadth, highs/lows, and McClellan before `build_signals()` runs.
+- **Catalyst Timing** (`catalyst_timing.py`): event-driven post-processing layer applied after recommendations are ranked. Three mechanisms: (1) Earnings Blackout removes tickers within 2 days of earnings from the actionable set; (2) OpEx Amplifier boosts `max_pain` weight in the aggregator during OpEx week; (3) 8-K + Insider Buy WATCH elevation promotes or injects WATCH recommendations when material catalyst + insider conviction coincide.
+
+**8-K filings, Google Trends, Reddit sentiment, analyst ratings, EPS surprises, and short interest are treated as news** — all return `List[NewsArticle]` and are scored by the same DeepSeek sentiment pipeline as RSS articles. Google Trends articles describe search interest spikes/drops; Reddit articles summarise mention count and upvote-weighted sentiment across r/wallstreetbets, r/stocks, and r/investing. Short interest articles surface squeeze setups, bearish positioning builds, and short covering signals.
+
+**Smart money signals** (insider trades, options flow, SEC filings) all return `List[InsiderTrade]` and are combined into a single `insider_score` per ticker in the aggregator.
+
+**Method attribution** (`tracker.py`): every new trade stores the raw method scores (`news`, `sent_velocity`, `tech`, `insider`, `put_call`, `max_pain`, `oi_skew`, `vwap`, `pattern`, `momentum`, `money_flow`, `trend_strength`, `pead`, `iv_rank`, `iv_expr`, `coint`, `cross_sectional`) at entry time plus `methods_agreeing` and `dominant_method`. `get_performance_for_email()` returns:
+- `performance_table`: unified list of breakdown rows (columns: trades, win_rate, compound_return, avg_return, wtd_avg_return, best, worst) grouped as: **total** (All Trades) → **asset** (Stocks only / ETFs only / Commodities only) → **direction** (Longs only BUY / Shorts only SELL) → **method** (per signal method, ≥2 attributed trades required). Rows are rendered in the email "Performance Breakdown" section with visual dividers between groups. **Includes open trades at their current M2M `return_pct`** (maintained each run by `update_open_trades()`) — treated as hypothetical exits so every live position is reflected in the breakdown.
+- `trades_svg`: inline SVG (820×336px dark-theme) with equity curve (top panel) and per-trade return bars (bottom panel). Embedded directly in the email via `{{ perf.trades_svg | safe }}` — no kaleido/Plotly dependency.
+- `portfolio_metrics`: dict from `compute_portfolio_metrics()` — delegates to `daily_nav.compute_compound_return()` (see [Performance calculation](#performance-calculation) below) for a path-faithful daily-walked compound over real OHLCV closes. For every calendar day with any active position the engine forms the capital-weighted average daily return across active trades (`Σ(r·w)/Σ(w)` with `w = position_size_multiplier`) and compounds sequentially. Keys: `compound_inception` (every trade ever), `return_1w`/`return_2w`/`return_1m` (trades with `entry_date >= today − N days`; open trades included at the live M2M end-anchor). Overwrites `stats["compound_return"]` so the headline number matches the tiles. Displayed in the email Portfolio Performance card as time-window tiles.
+- `method_order_by_winrate`: list of method keys sorted descending by solo win rate (no-data methods last). Used to order the solo performance and method eval tables in the email — best-performing signals appear first.
+- `attributed_count`: count of trades with `methods_agreeing` populated (used to decide whether method rows appear).
+- `solo_method_perf`: dict from `compute_solo_method_performance()` — for each closed trade with stored method_scores, asks "what direction would this method alone have signalled?" Same direction as actual → actual return; opposite → negated return; |score| < 0.10 (no view) → skipped. Rendered in email section 4b as a standalone table (trades, win_rate, compound_return, avg_return, best, worst per method). Distinct from `performance_table` method rows which only count trades where the method agreed with the aggregated direction.
+- `method_eval_stats`: dict from `compute_method_eval_stats()` — per-method directional accuracy and conviction calibration. For each method: overall directional_accuracy (% correct directions), avg_return_correct, avg_return_wrong, and conviction_bands (Low 0.10–0.35 / Medium 0.35–0.65 / High 0.65+) each with trades, accuracy, avg_return. Rendered in email section 4c as per-method cards. A well-calibrated signal shows rising accuracy Low→High; flat/declining accuracy suggests the method adds noise rather than genuine directional insight.
+Legacy trades without `methods_agreeing` are excluded from method rows but included in total/asset/direction rows.
+
+### Performance calculation
+
+Performance numbers come from two engines that work side-by-side, both rooted in the *real* observed prices stored on each trade — never interpolated, never synthesised.
+
+**Per-trade `return_pct` (buy-and-hold, spread-aware) — `tracker._pct_return()`**
+
+```
+half_in  = _dynamic_half_spread(entry_price, asset_type)
+half_out = _dynamic_half_spread(exit_or_current_price, asset_type)
+BUY  : eff_entry = entry × (1 + half_in);   eff_exit = exit × (1 − half_out)
+       return_pct = (eff_exit − eff_entry) / eff_entry × 100
+SELL : eff_entry = entry × (1 − half_in);   eff_exit = exit × (1 + half_out)
+       return_pct = (eff_entry − eff_exit) / eff_entry × 100
+```
+
+Bid-ask half-spread is **price-tiered and asset-type-aware** (ETF 1 bp; large-cap stock ≥ \$50 → 2 bp; \$10–\$50 → 4 bp; \$1–\$10 → 12.5 bp; \$0.10–\$1 → 37.5 bp; \$0.01–\$0.10 → 100 bp; sub-penny → 250 bp; commodity ≥ \$100 → 1.5 bp, < \$100 → 3 bp). Closed trades use `exit_price`; open trades use the live `current_price` (refreshed each tick by `update_open_trades()`, timestamped via `current_price_datetime`). For open trades this is a "what if you closed right now" mark — same convention as the email's M2M display. `_normalize_closed_returns()` recomputes this each pipeline tick from the stored entry/exit prices so every closed trade's `return_pct` reflects the current spread model.
+
+**Path-faithful daily compound — `daily_nav.compute_compound_return(trades)`**
+
+Per-trade walk:
+1. Load OHLCV closes for the ticker from `cache/ohlcv/<TICKER>.json` (force-refreshed for open-trade tickers via `tracker._refresh_open_trade_ohlcv()` so today−1's close exists).
+2. Build chronological marks: `(entry_date, eff_entry)` → every cached close strictly between → `(exit_date or today, eff_exit)`. Intermediate marks are raw closes, **no spread applied** — those days the position is marked-to-market, not traded.
+3. For each adjacent pair compute `r_d = sign × (mark_d − mark_{d−1}) / mark_{d−1}` with `sign = +1` for BUY, `−1` for SELL. The short formula is path-faithful (depends on adjacent days only), not the buy-and-hold formula — so a volatile short's daily compound legitimately differs from its `return_pct` (volatility decay for daily-rebalanced shorts).
+
+Portfolio aggregation:
+1. Collect every `(date, daily_return, weight)` tuple from every trade (`weight = position_size_multiplier`).
+2. Group by date; per-day portfolio return = `sum(r·w) / sum(w)` over active positions.
+3. Compound sequentially: `compound = ∏(1 + day_return) − 1`.
+
+This is **100% deterministic**: same `trades.json` + same `cache/ohlcv/*.json` produces bit-identical output. Time-window variants (`return_1w`/`return_2w`/`return_1m`) just filter trades by `entry_date >= today − N days` before aggregating.
+
+**Summary statistics — `tracker._compute_segment_stats()`**
+
+For any slice of trades (All / Stocks / ETFs / Commodities / Longs / Shorts / per-method):
+
+| Metric | Formula | Notes |
+|---|---|---|
+| `trades` | `len(trades)` | |
+| `win_rate` | `100 × count(t.return_pct > 0) / len(trades)` | Strictly positive on the spread-adjusted `return_pct`, so a flat round trip is a loss by the spread cost. |
+| `compound_return` | `daily_nav.compute_compound_return(trades)` | Path-faithful daily walk (the engine above). |
+| `avg_return` | `mean(t.return_pct)` | Equal-weighted across trades. |
+| `wtd_avg_return` | `Σ(t.return_pct · t.position_size_multiplier) / Σ(t.position_size_multiplier)` | Capital-weighted. |
+| `best` / `worst` | `max(t.return_pct)` / `min(t.return_pct)` | |
+
+Open trades' `return_pct` is the live M2M from `update_open_trades()` so they contribute to every metric (treated as hypothetical exits). The compound metric uses the daily walk; everything else uses the per-trade `return_pct`. These can diverge for shorts — by design, since path-faithful compound and buy-and-hold are different (both correct) measures.
+
+**Hypothetical solo & eval stats — `tracker._flip_trade()` / `_hypothetical_trades_for_method()`**
+
+For "what if only this method had decided" simulations:
+- If the method's sign matches the actual trade's action → use the trade verbatim (real walk, real `return_pct`).
+- If it disagrees → `_flip_trade()` returns a same-ticker/same-dates trade dict with `action`/`direction` inverted and `return_pct` re-derived via `_pct_return` for the flipped action. The daily-NAV engine then walks the **real OHLCV closes** in the opposite direction — no negation-of-stored-number tricks.
+
+Conviction bands (`_eval_stats`): Low `0.10–0.35`, Medium `0.35–0.65`, High `0.65+` on `|method_score|`. Each band reports `trades`, `accuracy` (% with `return_pct > 0`), `avg_return`, and `compound_return` (also via the daily-walked engine). A well-calibrated method shows rising accuracy Low → Medium → High.
+
+**Trade lifecycle — `tracker.py`**
+
+| Function | When | What it does |
+|---|---|---|
+| `record_new_trades()` | After Claude produces recommendations | Opens a trade per actionable BUY/SELL; stamps `entry_datetime` + `entry_price` together; enforces 3.0× per-sector cap; stores 17 raw method scores + `methods_agreeing` + `dominant_method`. |
+| `close_trades_on_signal_reversal()` | Before opening new trades, if today's actionable signal reverses an open position | Closes with `exit_datetime = current_price_datetime` (most recent live mark) — no second fetch. |
+| `_refresh_open_trade_ohlcv()` | First step of `update_open_trades()` | Force-refreshes OHLCV cache for every open-trade ticker (bypasses 3-day TTL) so the daily walk has a real close for every day held. |
+| `_normalize_closed_returns()` | Second step of `update_open_trades()` | Idempotently rederives `return_pct` for every closed trade through the current spread model. |
+| `update_open_trades()` | Each pipeline tick | Refreshes `current_price` + `current_price_datetime` + `return_pct` for every OPEN trade; auto-closes after `HOLDING_DAYS = 5` weekdays held. |
+
+### Model routing
+
+| Task | Model | Fallback |
+|---|---|---|
+| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku 4.5 |
+| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V3 (`deepseek-chat`) on any Claude API error, then rule-based `_fallback_recommendations()` |
+
+Available analyst models (set in `.env`):
+- `claude-haiku-4-5-20251001` — fastest, cheapest; 8 192 output tokens
+- `claude-sonnet-4-6` — higher quality; 64 000 output tokens
+- `claude-opus-4-7` — highest quality; 32 000 output tokens
+
+**Claude API calls use streaming** (`client.messages.stream`) to avoid SDK timeout errors on large prompts (40+ tickers can take >10 minutes non-streaming). Text chunks are accumulated into a single string before JSON parsing.
+
+**DeepSeek analyst fallback** (`_call_deepseek_analyst()` in `claude_analyst.py`): triggered automatically when Claude raises `anthropic.APIStatusError` (HTTP 400/401/402/403/429/5xx — covers credits exhausted, bad key, payment required, rate limit, server errors) or `anthropic.APIConnectionError`. Uses `deepseek-reasoner` (DeepSeek R1) with the identical prompt via the OpenAI-compatible streaming API. Requires `DEEPSEEK_API_KEY`. If DeepSeek also fails, falls back to rule-based `_fallback_recommendations()`. The source model name is logged at INFO level (`via <model>`).
+
+### Caching strategy
+
+| Cache | Key | TTL | Location |
+|---|---|---|---|
+| News + 8-K | `YYYY-MM-DD_HH` | 1 hour | `cache/news_*.json` |
+| Snapshots | `YYYY-MM-DD_HH` | 1 hour | `cache/snapshots_*.json` |
+| Reddit sentiment | `YYYY-MM-DD_HH` | 1 hour | `cache/reddit_*.json` |
+| Google Trends | `YYYY-MM-DD` | 1 day | `cache/trends_*.json` |
+| IPO pipeline | `YYYY-MM-DD` | 1 day | `cache/ipo_*.json` |
+| VIX & term structure | `YYYY-MM-DD` | 1 day | `cache/vix_*.json` |
+| Credit market (HYG/SPY) | `YYYY-MM-DD` | 1 day | `cache/credit_*.json` |
+| Put/call ratio | `YYYY-MM-DD` | 1 day | `cache/put_call_*.json` |
+| Analyst ratings | `YYYY-MM-DD` | 1 day | `cache/analyst_ratings_*.json` |
+| Earnings surprises | `YYYY-MM-DD` | 1 day | `cache/earnings_surprises_*.json` |
+| Earnings calendar | `YYYY-MM-DD` | 1 day | `cache/earnings_calendar_*.json` |
+| Earnings discovery (Section E) | `YYYY-MM-DD` | 1 day | `cache/earnings_discovery_*.json` |
+| Analyst discovery (Section E) | `YYYY-MM-DD` | 1 day | `cache/analyst_discovery_*.json` |
+| PEAD signals | `YYYY-MM-DD` | 1 day | `cache/pead_*.json` |
+| Short interest | `YYYY-MM-DD` | 1 day | `cache/short_interest_*.json` |
+| Market breadth | `YYYY-MM-DD` | 1 day | `cache/breadth_*.json` |
+| New 52w highs/lows | `YYYY-MM-DD` | 1 day | `cache/highs_lows_*.json` |
+| McClellan Oscillator | `YYYY-MM-DD` | 1 day | `cache/mcclellan_*.json` |
+| Macro Surprise Index | `YYYY-MM-DD` | 1 day | `cache/macro_surprise_*.json` |
+| Fed Rate Expectations | `YYYY-MM-DD` | 1 day | `cache/fedwatch_*.json` |
+| Revision Momentum | `YYYY-MM-DD` | 1 day | `cache/revision_momentum_*.json` |
+| Earnings Whisper | `YYYY-MM-DD` | 1 day | `cache/whisper_*.json` |
+| Bond market internals | `YYYY-MM-DD` | 1 day | `cache/bond_internals_*.json` |
+| MOVE Index | `YYYY-MM-DD` | 1 day | `cache/move_*.json` |
+| Dark Pool Index (DIX) | `YYYY-MM-DD` | 1 day | `cache/dix_*.json` |
+| Global macro (DXY + Cu/Au) | `YYYY-MM-DD` | 1 day | `cache/global_macro_*.json` |
+| Sector rotation (Ebb & Flow) | `YYYY-MM-DD` | 1 day | `cache/sector_rotation_*.json` |
+| Rotation Drivers (rate cycle) | `YYYY-MM-DD` | 1 day | `cache/rotation_drivers_*.json` |
+| OHLCV (charts) | per ticker | incremental | `cache/ohlcv/*.json` |
+| COT positioning | ISO week | 1 week | `cache/cot_YYYY_WW.json` |
+| Insider cluster watchlist | ticker | 10 days | `cache/cluster_watchlist.json` |
+| Pattern libraries | per ticker | 7 days | `cache/patterns/<TICKER>.json` |
+| Trades ledger | — | permanent | `cache/trades.json` |
+
+**Important:** The news cache includes 8-K articles only on the run that fetches them (8-K fetch always runs fresh and appends to whichever articles list is active — from cache or live). COT data is cached by ISO week, so the first run each week downloads from CFTC; subsequent runs within the week are instant.
+
+### Adding a new data source
+
+Three patterns depending on what the source produces:
+
+1. **Per-ticker signal** (like sentiment/technical/insider): implement `[-1.0, +1.0]` scorer, add weight in `aggregator.py`, add `enable_*` flag in `settings.py`.
+2. **Smart money signal** (like options flow, SEC filings): return `List[InsiderTrade]` from a new module, call from pipeline in the Step 3 block, extend `smart_money` list.
+3. **Macro context** (like FRED, COT): return a new Pydantic model, pass to `generate_recommendations()` as an optional parameter, build a prompt block + instruction section in `claude_analyst.py`, render in email HTML template.
+
+### Key constraints
+
+**Polygon.io client** (`src/data/polygon_client.py`): wraps the Polygon REST API. `get_snapshots_batch()` fetches all tickers in two calls (snapshots + prev-close). `get_bars()` fetches OHLCV history. Falls back gracefully when `POLYGON_API_KEY` is absent — `is_available()` returns False and `market_data.py` routes everything through yfinance instead. Free Polygon tier covers all US equity/ETF tickers; indices (^VIX etc.) and futures (GC=F etc.) must use yfinance directly.
+
+**SEC EDGAR rate limit:** 10 requests/second. All EDGAR calls use `_REQUEST_DELAY = 0.12–0.15s`. The `_ticker_index` (name→ticker) and `_ticker_cik` (ticker→CIK) maps are module-level globals populated once per process — never re-fetch them in a loop.
+
+**yfinance rate limits:** When a 429 is returned, `market_data.py` applies exponential backoff (60s → 120s → 240s). After 3 failures the loop stops early. Options chain scanning (`options_flow.py`) is silent-fail per ticker.
+
+**CFTC downloads:** The COT ZIP files are ~5–10 MB each. Both current and previous year are fetched if the current year has insufficient history. Always check the cache first.
+
+**Actionable signal threshold:** Baseline is `confidence ≥ 0.78` AND `sources_agreeing ≥ 2`. The Macro Regime Filter adjusts this dynamically: RISK_ON → 72%, CAUTION → 80%, RISK_OFF → 82%, PANIC → 88%. BUY entries are additionally blocked entirely during PANIC and RISK_OFF regimes. A single strong signal source never produces a BUY/SELL regardless of score.
+
+### Email HTML template
+
+The HTML is a Jinja2 template string (`HTML_TEMPLATE`) embedded directly in `email_sender.py` — there is no separate `.html` file. When adding new sections, follow the existing comment convention (`<!-- ══ N — SECTION NAME ══ -->`) and pass new variables through the `Template(...).render(...)` call.
+
+**Chart embedding:**
+- Per-ticker OHLCV charts (when `ENABLE_CHARTS=true`): base64 PNG embedded as `cid:chart_<TICKER>` MIME parts.
+- Signal overview chart (when `ENABLE_CHARTS=true`): base64 PNG embedded as `cid:overview_chart`.
+- Equity curve + trade bars: **inline SVG** generated by `_build_trades_svg()` in `tracker.py`, embedded via `{{ perf.trades_svg | safe }}` — no kaleido or Plotly required.
+
+**Email sections (current order):**
+1. Aggregated Recommendations (BUY/SELL)
+2. Portfolio Performance (stats + time-window tiles: 1w/2w/1m dollar-weighted returns + since-inception compound + inline SVG equity curve)
+3. Performance Breakdown (unified table: total/asset/direction/method rows; methods ordered by solo win rate descending)
+4. Trade Details (BUY/SELL only; prices formatted via `fmt_price()` for sub-penny precision)
+5. Monitor List (HOLD/WATCH)
+6. Analyst Ratings, EPS Surprises, Macro Regime Filter, Market Mode, Catalyst Timing, FRED, COT, VIX, McClellan, Highs/Lows, Breadth, Macro Surprise, FedWatch, Credit, MOVE, Dark Pool Index (DIX), Bond Internals, Global Macro, Seasonality, OpEx, Put/Call, Short Interest, GEX, Revision Momentum, Earnings Whisper, IPO Pipeline, Reddit, Sector Pairs, Cointegration Pairs, Smart Money Signals
+
+### Configuration
+
+All settings live in `config/settings.py` as a `pydantic-settings` `BaseSettings` class. Every field maps directly to an environment variable (uppercase). Add new fields with defaults there; they become available as `settings.field_name` everywhere. Never read `.env` directly — always go through `settings`.

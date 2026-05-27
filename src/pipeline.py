@@ -57,6 +57,7 @@ from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
 from src.notifications.email_sender import send_recommendations
 from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions
+from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 from src.charts.report import save_html_report
 
 
@@ -250,6 +251,14 @@ def run_pipeline(send_email: bool = False) -> None:
         all_tickers = all_tickers + new_from_trades
         logger.info(f"[tracker] Pinning open-trade tickers into universe: {new_from_trades}")
 
+    # Pin hypothetical always-open trade tickers so their OHLCV cache stays
+    # current — the daily-NAV compound walk needs a fresh close per held day.
+    hypothetical_tickers = [t for t, _ in settings.hypothetical_trades_list]
+    new_from_hyp = [t for t in hypothetical_tickers if t not in all_tickers]
+    if new_from_hyp:
+        all_tickers = all_tickers + new_from_hyp
+        logger.info(f"[hypothetical] Pinning always-open tickers into universe: {new_from_hyp}")
+
     # ── Section F: discovery liquidity gate ───────────────────────────────────
     # Drop untradeable microcaps (below the price or 20-day avg dollar-volume floor) from every
     # DISCOVERED name before the universe is processed, so the widened funnel (Sections A–E) doesn't
@@ -260,7 +269,8 @@ def run_pipeline(send_email: bool = False) -> None:
     gate_budget = {"n": max(0, settings.discovery_gate_max_fetch)}
     from src.data.liquidity import apply_liquidity_gate
     _protected = {s.upper() for s in (list(tickers) + list(sectors) + list(commodities)
-                                      + settings.factor_list + list(open_trade_tickers))}
+                                      + settings.factor_list + list(open_trade_tickers)
+                                      + list(hypothetical_tickers))}
     _discovered = [t for t in all_tickers if t.upper() not in _protected]
     _kept = set(apply_liquidity_gate(_discovered, source="step0 discovery", budget=gate_budget))
     _before = len(all_tickers)
@@ -690,6 +700,11 @@ def run_pipeline(send_email: bool = False) -> None:
     log_performance_summary()
     perf = get_performance_for_email()
 
+    # Hypothetical always-open book — fully isolated from the real-trade
+    # ledger above. Update marks then snapshot for the email section.
+    update_hypothetical_trades()
+    hypothetical_perf = get_hypothetical_performance_for_email()
+
     if settings.enable_charts:
         logger.info("Generating charts and HTML report...")
         ts_label = start.strftime("%Y-%m-%d_%H%M")
@@ -708,6 +723,7 @@ def run_pipeline(send_email: bool = False) -> None:
             actionable,
             total_analysed=len(all_tickers),
             performance=perf,
+            hypothetical_performance=hypothetical_perf,
             all_recommendations=recommendations,
             insider_trades=insider_trades,
             signals=signals,
