@@ -12,4 +12,5 @@ cache/
 dist/
 build/
 .env
+.env.backup
 logs/
