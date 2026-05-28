@@ -95,15 +95,46 @@ _DIX_SCORES = {
     "UNKNOWN":             0,
 }
 
-# VIX and MOVE are the fastest-moving signals and deserve more weight
+# Macro news regime — geopolitics / oil / tariffs / policy / black-swan.
+# Asymmetric weighting: a CRISIS-grade headline routinely sets the market tone
+# in a way that VIX and credit only catch hours/days later, so we treat CRISIS
+# as a -3 panic-tier input. STABLE adds no information.
+_MACRO_NEWS_SCORES = {
+    "STABLE":         0,
+    "WATCH":         -0.5,
+    "ELEVATED_RISK": -1.5,
+    "CRISIS":        -3,
+    "UNKNOWN":        0,
+}
+
+# Intermarket divergence (broad index ETFs vs SPY) — small-cap-led RISK_OFF
+# carries asymmetric weight: when IWM + RSP both lag SPY it's one of the
+# strongest distribution warnings in the macro stack, so we score it slightly
+# more aggressively in the negative direction than in the positive.
+_INTERMARKET_SCORES = {
+    "BROAD_EXPANSION":  1,
+    "BROAD_HEALTHY":    0.5,
+    "NEUTRAL":          0,
+    "NARROW_CAUTION":  -1,
+    "NARROW_RISK_OFF": -2,
+    "UNKNOWN":          0,
+}
+
+# VIX and MOVE are the fastest-moving signals and deserve more weight.
+# Macro news gets weight = 1.5 because narrative-driven moves (wars, OPEC
+# decisions, tariff announcements) reliably lead the numeric macro stack
+# by hours to days, but it's also the noisiest input (LLM classification
+# variance) so we don't push it as high as VIX/MOVE.
 _WEIGHTS = {
     "vix":          2.0,
     "move":         2.0,
     "bond":         1.5,
+    "macro_news":   1.5,
     "global_macro": 1.0,
     "fred":         1.0,
     "breadth":      1.0,
     "dix":          1.0,
+    "intermarket":  1.0,
     "credit":       0.5,
 }
 
@@ -133,6 +164,8 @@ def compute_macro_regime(
     breadth_context=None,
     credit_context=None,
     dix_context=None,
+    intermarket_context=None,
+    macro_news_context=None,
 ) -> MacroRegimeContext:
     """Compute a composite macro regime from all available macro inputs.
 
@@ -171,6 +204,16 @@ def compute_macro_regime(
         _add("CREDIT", credit_context.signal,                _CREDIT_SCORES,      _WEIGHTS["credit"])
     if dix_context is not None:
         _add("DIX",    dix_context.signal,                   _DIX_SCORES,         _WEIGHTS["dix"])
+    if intermarket_context is not None:
+        _add("INTERMARKET", intermarket_context.composite_signal,
+             _INTERMARKET_SCORES, _WEIGHTS["intermarket"])
+    if macro_news_context is not None:
+        _add("MACRO_NEWS", macro_news_context.composite_signal,
+             _MACRO_NEWS_SCORES, _WEIGHTS["macro_news"])
+        # CRISIS in macro news should be able to trigger PANIC by itself —
+        # mirrors the VIX/MOVE PANIC short-circuit logic.
+        if macro_news_context.composite_signal == "CRISIS":
+            has_panic = True
 
     norm = weighted_score / total_weight if total_weight > 0 else 0.0
 

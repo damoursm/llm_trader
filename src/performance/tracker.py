@@ -7,6 +7,7 @@ Trades are stored in cache/trades.json. Each daily run:
   4. Logs a full performance summary.
 """
 
+import hashlib
 import json
 import yfinance as yf
 from datetime import date, datetime, timedelta, timezone
@@ -156,14 +157,58 @@ def _trading_days_held(entry_date: str) -> int:
 #   from there to keep the dependency tree acyclic.
 
 
+# ── Out-of-sample train/holdout split (deterministic, NOT walk-forward) ──────
+#
+# Each closed trade is permanently assigned to "train" or "holdout" via a
+# deterministic hash of (seed, ticker, entry_date). The split is computed on
+# the fly (no persistence) so legacy trades without a stored bucket get a
+# stable assignment too, and so changing oos_split_seed reshuffles cleanly.
+# This is a fixed partition, NOT a walk-forward — there is no rolling window
+# and no time-ordered re-training. Adaptive weights use "train" only; the
+# email surfaces "holdout" stats alongside so overfit is visible.
+
+def _trade_split(trade: dict) -> str:
+    """Return ``"train"`` or ``"holdout"`` for *trade*.
+
+    Hash key = ``settings.oos_split_seed + "|" + ticker + "|" + entry_date``.
+    A SHA-256 of the key, taken modulo 100, partitions trades into buckets:
+    ``hash_pct < oos_holdout_pct`` → holdout, else train.
+
+    Returns ``"train"`` unconditionally when the feature is disabled or the
+    trade has no ``entry_date``/``ticker`` to hash.
+    """
+    if not settings.enable_oos_validation:
+        return "train"
+    holdout_pct = max(0, min(50, int(settings.oos_holdout_pct or 0)))
+    if holdout_pct <= 0:
+        return "train"
+    ticker = (trade.get("ticker") or "").upper()
+    entry  = trade.get("entry_date") or ""
+    if not ticker or not entry:
+        return "train"
+    key = f"{settings.oos_split_seed}|{ticker}|{entry}".encode("utf-8")
+    digest = hashlib.sha256(key).hexdigest()
+    bucket = int(digest[:8], 16) % 100
+    return "holdout" if bucket < holdout_pct else "train"
+
+
+def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
+    """Return *trades* filtered to a given split, or unchanged for ``None``."""
+    if split is None:
+        return trades
+    if split not in ("train", "holdout"):
+        return trades
+    return [t for t in trades if _trade_split(t) == split]
+
+
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional")
 _METHOD_AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as "having a view"
 
 # Category groupings: how methods map to higher-level signal families
 METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Sentiment":   ["news", "sent_velocity"],
-    "Technical":   ["tech", "vwap", "pattern", "momentum", "money_flow", "trend_strength", "iv_rank"],
+    "Technical":   ["tech", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "iv_rank"],
     "Smart Money": ["insider"],
     "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr"],
     "Fundamental": ["pead"],
@@ -182,6 +227,7 @@ METHOD_LABELS: Dict[str, str] = {
     "vwap":     "VWAP Distance",
     "pattern":  "Pattern Recognition",
     "momentum":   "Price Momentum",
+    "sector_momentum": "Sector-Relative Momentum",
     "money_flow": "Money Flow (MFI+CMF+OBV)",
     "trend_strength": "Trend Strength (ADX/DMI+Donchian)",
     "pead":       "Post-Earnings Drift (PEAD)",
@@ -211,6 +257,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "vwap":      sig.vwap_score,
         "pattern":    getattr(sig, "pattern_score", 0.0),
         "momentum":   getattr(sig, "momentum_score", 0.0),
+        "sector_momentum": getattr(sig, "sector_momentum_score", 0.0),
         "money_flow": getattr(sig, "money_flow_score", 0.0),
         "trend_strength": getattr(sig, "trend_strength_score", 0.0),
         "pead":       getattr(sig, "pead_score", 0.0),
@@ -584,6 +631,17 @@ def record_new_trades(
             key = t.get("sector_key", f"STOCK/{t['ticker']}")
             sector_exposure[key] = sector_exposure.get(key, 0.0) + t.get("position_size_multiplier", 1.0)
 
+    # Running per-direction list of OPEN positions for correlation sizing.
+    # Includes both pre-existing opens AND any trades opened earlier in this
+    # same loop iteration, so the second candidate in a batch sees the first
+    # as a same-direction peer.
+    opens_by_direction: Dict[str, List[dict]] = {"BUY": [], "SELL": []}
+    for t in trades:
+        if t.get("status") == "OPEN" and t.get("action") in ("BUY", "SELL"):
+            opens_by_direction[t["action"]].append(t)
+
+    from src.performance.correlation import correlation_haircut
+
     new_count = 0
     for rec in recommendations:
         if rec.action not in ("BUY", "SELL"):
@@ -591,11 +649,30 @@ def record_new_trades(
         if rec.ticker in already_open:
             continue
 
-        # Compute base multiplier from confidence tier
-        multiplier = _position_multiplier(rec.confidence)
+        # ── Step 1: confidence tier (base size) ───────────────────────────
+        conf_multiplier = _position_multiplier(rec.confidence)
         sector = _sector_key(rec)
 
-        # Enforce sector cap
+        # ── Step 2: correlation haircut against same-direction open peers ─
+        same_dir_peers = opens_by_direction.get(rec.action, [])
+        corr_multiplier, corr_diag = correlation_haircut(rec.ticker, same_dir_peers)
+        if corr_diag.get("portfolio_cap_hit"):
+            logger.info(
+                f"[tracker] Skipping {rec.ticker} — correlated-exposure cap hit "
+                f"(Σ|ρ|·size={corr_diag['weighted_exposure']:.2f} > "
+                f"{settings.correlation_portfolio_cap:.2f}); peers={list(corr_diag['per_ticker'].keys())}"
+            )
+            continue
+        multiplier = round(conf_multiplier * corr_multiplier, 3)
+        if corr_multiplier < 0.999 and corr_diag.get("mean_corr") is not None:
+            logger.info(
+                f"[tracker] {rec.ticker}: correlation haircut "
+                f"{conf_multiplier:.2f}× × {corr_multiplier:.2f}× = {multiplier:.2f}×  "
+                f"(mean ρ={corr_diag['mean_corr']:+.2f} across {corr_diag['n_pairs']} "
+                f"{rec.action} peer{'s' if corr_diag['n_pairs'] != 1 else ''})"
+            )
+
+        # ── Step 3: sector cap (hard ceiling) ─────────────────────────────
         current_exposure = sector_exposure.get(sector, 0.0)
         if current_exposure >= SECTOR_CAP:
             logger.info(
@@ -663,13 +740,19 @@ def record_new_trades(
         # so sub-penny stocks/warrants retain their genuine decimals — the old
         # 4-decimal rounding lost up to ~5% of accuracy on names like TALKW.
         # Display formatting is handled by fmt_price() at render time.
-        trades.append({
+        new_trade = {
             "ticker": rec.ticker,
             "type": rec.type,
             "action": rec.action,
             "direction": rec.direction,
             "confidence": rec.confidence,
             "position_size_multiplier": multiplier,
+            "confidence_size_multiplier": conf_multiplier,
+            "correlation_size_multiplier": corr_multiplier,
+            "correlation_mean_corr":      corr_diag.get("mean_corr"),
+            "correlation_max_corr":       corr_diag.get("max_corr"),
+            "correlation_weighted_exposure": corr_diag.get("weighted_exposure", 0.0),
+            "correlation_peers":          corr_diag.get("per_ticker", {}),
             "sector_key": sector,
             "entry_date": today,
             "entry_datetime": executed_at,
@@ -704,12 +787,23 @@ def record_new_trades(
             # Pattern-registry fields (live outcome feedback loop)
             "pattern_at_entry":       pattern_at_entry,
             "pattern_score_at_entry": pattern_score_at_entry,
-        })
+        }
+        trades.append(new_trade)
+        # Register the just-opened trade as a same-direction peer so the next
+        # candidate in this batch sees it for correlation purposes.
+        opens_by_direction.setdefault(rec.action, []).append(new_trade)
         sector_exposure[sector] = current_exposure + multiplier
         new_count += 1
+        corr_log = ""
+        if corr_diag.get("mean_corr") is not None:
+            corr_log = (
+                f", mean ρ={corr_diag['mean_corr']:+.2f}/{corr_diag['n_pairs']} peer"
+                f"{'s' if corr_diag['n_pairs'] != 1 else ''}"
+            )
         logger.info(
             f"[tracker] Opened {rec.action} {rec.ticker} @ {price:.2f} "
-            f"(decision={decision_at}, exec={executed_at}) | size={multiplier}× (conf={rec.confidence:.0%})"
+            f"(decision={decision_at}, exec={executed_at}) | size={multiplier}× "
+            f"(conf={rec.confidence:.0%}{corr_log})"
         )
 
     _save_trades(trades)
@@ -1674,7 +1768,7 @@ def _eval_stats(entries: list) -> dict:
     }
 
 
-def compute_solo_method_performance() -> dict:
+def compute_solo_method_performance(split: Optional[str] = None) -> dict:
     """Simulate performance for each signal method used in isolation, split by direction.
 
     For each closed trade with stored method_scores, each method is asked:
@@ -1686,6 +1780,10 @@ def compute_solo_method_performance() -> dict:
       same direction as actual trade  → actual return_pct
       opposite direction              → −actual return_pct
 
+    When ``split`` is ``"train"`` or ``"holdout"``, only trades assigned to
+    that bucket via the deterministic ``_trade_split`` hash are included.
+    Pass ``split=None`` for the in-sample union (legacy behaviour).
+
     Returns dict: method_name → {
         "overall": {trades, win_rate, avg_return, compound_return, best, worst},
         "buys":    {same fields, only BUY-signal trades}   — {} if none,
@@ -1696,6 +1794,7 @@ def compute_solo_method_performance() -> dict:
     MIN_TRADES = 1
     trades = _load_trades()
     closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
+    closed = _filter_by_split(closed, split)
     if not closed:
         return {}
 
@@ -1715,7 +1814,7 @@ def compute_solo_method_performance() -> dict:
     return results
 
 
-def compute_method_eval_stats() -> dict:
+def compute_method_eval_stats(split: Optional[str] = None) -> dict:
     """Per-method directional accuracy and conviction calibration, split by direction.
 
     For each signal method, across all closed trades with stored method_scores:
@@ -1724,6 +1823,9 @@ def compute_method_eval_stats() -> dict:
       - Conviction bands (Low/Medium/High |score|): trades, accuracy, avg_return
 
     Results are split into "overall", "buys" (score > 0), and "sells" (score < 0).
+
+    When ``split`` is ``"train"`` or ``"holdout"``, only trades assigned to
+    that bucket via the deterministic ``_trade_split`` hash are included.
 
     Returns dict: method_name → {
         "overall": {trades, directional_accuracy, avg_return_correct, avg_return_wrong,
@@ -1736,6 +1838,7 @@ def compute_method_eval_stats() -> dict:
     MIN_TRADES = 1
     trades = _load_trades()
     closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
+    closed = _filter_by_split(closed, split)
     if not closed:
         return {}
 
@@ -1764,6 +1867,89 @@ def compute_method_eval_stats() -> dict:
         }
 
     return results
+
+
+def compute_oos_comparison() -> dict:
+    """Side-by-side per-method comparison: train (in-sample) vs holdout (OOS).
+
+    Returns a payload the email template can render directly:
+
+        {
+          "enabled":      True/False,
+          "holdout_pct":  int,
+          "split_counts": {"train": int, "holdout": int},
+          "rows":         [
+            {
+              "method":         str,
+              "train_trades":   int,
+              "train_acc":      float,   # %  — directional accuracy on train
+              "holdout_trades": int,
+              "holdout_acc":    float,   # %  — directional accuracy on holdout
+              "delta":          float,   # holdout − train (pp); large negative = overfit
+            }, …
+          ],
+        }
+
+    Honest evaluation rule: a method whose holdout accuracy is materially
+    below its train accuracy is overfit to the sample — its weight should be
+    discounted (the adaptive-weight machinery already trains on the train
+    slice, so this table is the report-card on whether that decision was
+    right).
+
+    Returns ``{"enabled": False}`` when the feature is off so the email
+    template can hide the section.
+    """
+    if not settings.enable_oos_validation:
+        return {"enabled": False}
+
+    trades = _load_trades()
+    closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
+    if not closed:
+        return {
+            "enabled":      True,
+            "holdout_pct":  max(0, min(50, int(settings.oos_holdout_pct or 0))),
+            "split_counts": {"train": 0, "holdout": 0},
+            "rows":         [],
+        }
+
+    train_eval   = compute_method_eval_stats(split="train")
+    holdout_eval = compute_method_eval_stats(split="holdout")
+
+    rows: List[dict] = []
+    for method in _ALL_METHODS:
+        tr = train_eval.get(method, {}).get("overall", {})
+        ho = holdout_eval.get(method, {}).get("overall", {})
+        tr_n = int(tr.get("trades", 0) or 0)
+        ho_n = int(ho.get("trades", 0) or 0)
+        if tr_n == 0 and ho_n == 0:
+            continue
+        tr_acc = float(tr.get("directional_accuracy", 0.0) or 0.0)
+        ho_acc = float(ho.get("directional_accuracy", 0.0) or 0.0)
+        # delta is meaningful only when both sides have any trades
+        delta = round(ho_acc - tr_acc, 1) if (tr_n > 0 and ho_n > 0) else None
+        rows.append({
+            "method":         method,
+            "train_trades":   tr_n,
+            "train_acc":      round(tr_acc, 1),
+            "holdout_trades": ho_n,
+            "holdout_acc":    round(ho_acc, 1),
+            "delta":          delta,
+        })
+
+    # Sort by holdout accuracy desc (methods passing OOS surface first), then
+    # by train trades to break ties consistently.
+    rows.sort(key=lambda r: (-(r["holdout_acc"] if r["holdout_trades"] else -1),
+                             -r["train_trades"]))
+
+    train_n   = sum(1 for t in closed if _trade_split(t) == "train")
+    holdout_n = sum(1 for t in closed if _trade_split(t) == "holdout")
+
+    return {
+        "enabled":      True,
+        "holdout_pct":  max(0, min(50, int(settings.oos_holdout_pct or 0))),
+        "split_counts": {"train": train_n, "holdout": holdout_n},
+        "rows":         rows,
+    }
 
 
 def get_performance_for_email() -> dict:
@@ -1832,6 +2018,7 @@ def get_performance_for_email() -> dict:
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
     solo_method_perf     = compute_solo_method_performance()
     method_eval_stats    = compute_method_eval_stats()
+    oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)
 
     # Keep stats["compound_return"] in sync with the authoritative portfolio_metrics value
@@ -1858,6 +2045,7 @@ def get_performance_for_email() -> dict:
         "timeline_svg":             timeline_svg,
         "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
+        "oos_comparison":           oos_comparison,            # train vs holdout accuracy (honest OOS)
         "method_labels":            METHOD_LABELS,
         "method_order_by_winrate":  method_order_by_winrate,   # methods ranked by solo win rate, no-data last
     }

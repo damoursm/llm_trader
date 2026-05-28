@@ -358,6 +358,29 @@ class Settings(BaseSettings):
     # Uses OHLCV chart cache first (works with ENABLE_FETCH_DATA=false); falls back to yfinance.
     enable_price_momentum: bool = True
 
+    # Market-Relative Momentum — diagnostic ticker − SPY residual.
+    # Answers "is this name lagging the broad market?" independently of its
+    # sector. NOT added to the weighted aggregator combo (would double-count
+    # beta against the sector-relative score, since market_rel = sector_rel +
+    # (sector − market)). The email/prompt surface it side-by-side with the
+    # sector-relative reading so divergences are visible:
+    #   sector_rel positive, market_rel negative → best-of-a-bad-sector
+    #   sector_rel ≈ 0,      market_rel negative → "beta drag" (riding weak sector)
+    #   sector_rel negative, market_rel positive → stock-specific weakness in a
+    #                                              strong sector
+    enable_market_relative_momentum: bool = True
+
+    # Sector-Relative Momentum — beta-stripped alpha factor (ticker − sector ETF).
+    # The classic absolute momentum signal mixes idiosyncratic alpha with sector
+    # beta — if the whole sector is ripping, every constituent looks like it has
+    # momentum even though none is genuinely outperforming. This module subtracts
+    # the benchmark return to leave only the residual: did NVDA *beat* tech, or
+    # just ride the wave? Resolved benchmark: sector ETF for stocks (via the
+    # aggregator map + yfinance lookup, SPY fallback), SPY for ETFs, no benchmark
+    # for commodities. Uses cached OHLCV; falls back to a one-shot fetch when
+    # the benchmark's series is missing.
+    enable_sector_relative_momentum: bool = True
+
     # Money Flow Indicators — accumulation/distribution composite (MFI + CMF + OBV slope).
     # MFI (14-period): volume-weighted RSI; < 20 = accumulation, > 80 = distribution.
     # CMF (20-period): Chaikin Money Flow; positive = institutional buying.
@@ -478,6 +501,89 @@ class Settings(BaseSettings):
     adaptive_weight_prior_n: int = 10              # virtual trades at 50% WR (Bayesian prior)
     adaptive_weight_min_multiplier: float = 0.5    # floor: a bad method keeps at least half its baseline
     adaptive_weight_max_multiplier: float = 2.0    # cap:   a great method gets at most double
+
+    # ── Macro News Regime (geopolitics / oil / tariffs / policy) ────────────
+    # Scans the day's news flow for macro-level themes (active wars and
+    # geopolitical escalation, trade / tariff actions, oil/energy shocks,
+    # central-bank surprises, fiscal/policy events, black swans) and produces
+    # a composite regime read with sector implications. The composite feeds
+    # the Macro Regime Filter so a CRISIS-grade headline actually tightens
+    # the BUY threshold (and blocks longs during PANIC), and is passed to the
+    # Claude analyst so geopolitical narrative gets folded into BUY/SELL/HOLD.
+    #
+    # Uses the news articles already fetched in step 1 — no extra feed cost.
+    # Classification: a single DeepSeek call when ``DEEPSEEK_API_KEY`` is set,
+    # otherwise a deterministic keyword-density heuristic (lower fidelity but
+    # still useful). Cached hourly matching the news cache.
+    enable_macro_news: bool = True
+    macro_news_max_articles: int = 60   # cap for LLM payload size
+    macro_news_min_articles: int = 3    # below this count, skip (not enough signal)
+
+    # ── Intermarket Divergence (broad index ETFs vs SPY) ─────────────────────
+    # Cross-market regime detector — tracks whether IWM (small-caps), RSP (equal-
+    # weight S&P), QQQ (NASDAQ-100), DIA (Dow), MDY (mid-caps), EFA (developed
+    # ex-US), EEM (emerging markets), IWF (growth), and IWD (value) are leading
+    # or lagging SPY over 1m / 3m windows.
+    #
+    # Named regime labels surface canonical intermarket tells:
+    #   NARROW_LEADERSHIP   — IWM + RSP both lag → mega-cap dependence, classic
+    #                         late-cycle / distribution warning
+    #   BROAD_PARTICIPATION — IWM + RSP both lead → healthy rally
+    #   GROWTH_ROTATION     — QQQ + IWF lead vs IWD
+    #   VALUE_ROTATION      — IWD leads vs IWF + QQQ
+    #   US_EXCEPTIONALISM   — EFA + EEM both lag → dollar strength regime
+    #   INTERNATIONAL_STRENGTH — EFA or EEM leading → softer dollar / global growth
+    #
+    # The composite intermarket_health ∈ [-1, +1] feeds the Macro Regime Filter
+    # alongside VIX/MOVE/credit/breadth, so narrow leadership tightens the BUY
+    # confidence threshold and broad participation relaxes it. Also passed to
+    # the Claude analyst as macro context so it can synthesise the regime read
+    # into the BUY/SELL/HOLD/WATCH decision.
+    enable_intermarket: bool = True
+
+    # ── Correlation-aware position sizing ────────────────────────────────────
+    # The existing per-sector cap (tracker.SECTOR_CAP) catches GICS-sector
+    # concentration but misses cross-sector factor concentration: three
+    # high-beta semis (NVDA + AVGO + SMH) load the same factor even though
+    # SMH is an ETF in a different sector bucket; three "high-beta growth"
+    # names rated independently move together when the growth factor rolls.
+    #
+    # At trade-open time we compute realized pairwise correlations from the
+    # last N trading days of OHLCV closes between the candidate and every
+    # OPEN same-direction trade. Same-direction matters: a long-X / short-Y
+    # pair is a hedge, not concentration — so opposite-direction positions
+    # do NOT count toward the haircut.
+    #
+    # Multiplier scales linearly from 1.0× at mean_corr ≤ low_threshold to
+    # min_multiplier at mean_corr ≥ high_threshold. A separate portfolio cap
+    # caps the SUM of pairwise-correlation-weighted exposure across all
+    # open same-direction positions — when adding the candidate would push
+    # that sum over the cap, the trade is skipped entirely.
+    enable_correlation_sizing: bool = True
+    correlation_lookback_days: int = 60
+    correlation_low_threshold: float = 0.30   # ρ̄ ≤ this → no haircut (1.0×)
+    correlation_high_threshold: float = 0.80  # ρ̄ ≥ this → full haircut to min_multiplier
+    correlation_min_multiplier: float = 0.25  # deepest soft haircut applied to the candidate
+    correlation_portfolio_cap: float = 2.5    # Σ(size·ρ) hard skip threshold per direction
+    correlation_min_overlap_days: int = 20    # minimum overlapping bars to trust a pair ρ
+
+    # ── Out-of-sample validation (deterministic hash split) ──────────────────
+    # Every closed trade is permanently assigned to "train" or "holdout" via a
+    # deterministic hash of (seed, ticker, entry_date). Adaptive weights and
+    # any other fit-on-history machinery use train ONLY — the holdout slice is
+    # reserved for honest evaluation so a method that looks great on the data
+    # it was tuned against can be seen failing on data it never touched.
+    #
+    # NOTE: this is a fixed train/holdout PARTITION, not a walk-forward (no
+    # rolling window, no time-ordered re-training). The split is stable across
+    # runs so a given trade is always evaluated the same way.
+    #
+    # Increase oos_split_seed to ANY new string to reshuffle the split (e.g.
+    # after a strategy revamp where you want fresh evaluation). Setting
+    # oos_holdout_pct=0 disables the holdout (degenerate: all data is train).
+    enable_oos_validation: bool = True
+    oos_holdout_pct: int = 30        # % of trades reserved as holdout (clamped 0..50)
+    oos_split_seed: str = "llm_trader_v1"
 
     # ── Hypothetical always-open trades ──────────────────────────────────────
     # A separate, isolated category of trades where the listed tickers are ALWAYS

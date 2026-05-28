@@ -68,6 +68,7 @@ _METHODS_FOR_RANKING: Tuple[str, ...] = (
     "vwap_score",        # vwap
     "pattern_score",     # pattern
     "momentum_score",    # momentum
+    "sector_momentum_score",  # sector-relative momentum (beta-stripped alpha)
     "money_flow_score",  # money_flow
     "pead_score",        # pead
 )

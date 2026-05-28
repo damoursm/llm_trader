@@ -827,6 +827,79 @@ class SectorRotationEntry(BaseModel):
     direction: str = "NEUTRAL"           # BULLISH | NEUTRAL | BEARISH
 
 
+class MacroNewsTheme(BaseModel):
+    """One macro / geopolitical theme detected in the day's news flow.
+
+    Categories:
+      geopolitical_conflict — active wars, military escalations, ceasefires
+      trade_tariffs         — tariff announcements, retaliations, trade deals
+      energy_shock          — OPEC moves, sanctions, refinery outages, oil shock
+      central_bank          — surprise hikes/cuts, hawkish/dovish pivots, FX intervention
+      fiscal_policy         — shutdown threats, debt ceiling, major spending bills
+      black_swan            — pandemics, natural disasters, major cyberattacks
+      other                 — anything systemically important that doesn't fit above
+    """
+    category: str                       # see categories above
+    severity: str                       # LOW | MEDIUM | HIGH | EXTREME
+    direction: str = "NEUTRAL"          # BULLISH | NEUTRAL | BEARISH for risk assets
+    headline: str = ""                  # one representative headline
+    summary: str = ""                   # 1–2 sentence theme summary
+    article_count: int = 0              # number of contributing articles
+    sector_implications: List[str] = []  # e.g. ["XLE+", "ITA+", "GLD+", "EEM-"]
+
+
+class MacroNewsContext(BaseModel):
+    """Composite macro-news regime read used as a top-down overlay.
+
+    The ``composite_signal`` is the headline regime label (STABLE / WATCH /
+    ELEVATED_RISK / CRISIS) consumed by ``compute_macro_regime``. The
+    ``macro_news_score`` is a continuous ∈[-1, +1] suitable for weighting
+    or for downstream consumers that want a numeric input.
+    """
+    themes: List[MacroNewsTheme]                # sorted by severity descending
+    composite_signal: str = "STABLE"            # STABLE | WATCH | ELEVATED_RISK | CRISIS
+    macro_news_score: float = 0.0               # ∈[-1, +1]; <0 = stressed/bearish risk assets
+    sector_tilts: dict = {}                      # {"XLE": +1, "ITA": +1, "GLD": +1, "EEM": -1, ...}
+    articles_scanned: int = 0
+    used_llm: bool = False                       # True when DeepSeek classified; False = heuristic
+    report_date: date
+    summary: str
+
+
+class IntermarketEntry(BaseModel):
+    """One leg of the intermarket leaderboard — an index ETF benchmarked vs SPY.
+
+    Raw return diffs in percentage points (pp). signal labels the residual:
+    LEADING, NEUTRAL, or LAGGING. The direction tag interprets that residual
+    in regime terms (BULLISH = healthy participation, BEARISH = warning).
+    """
+    etf: str
+    name: str
+    return_1m_pct: Optional[float] = None
+    return_3m_pct: Optional[float] = None
+    relative_1m_pct: Optional[float] = None  # ticker_1m_return − SPY_1m_return
+    relative_3m_pct: Optional[float] = None
+    signal: str = "NEUTRAL"     # LEADING | NEUTRAL | LAGGING
+    direction: str = "NEUTRAL"  # BULLISH | NEUTRAL | BEARISH
+
+
+class IntermarketContext(BaseModel):
+    """Intermarket divergence — broad-index ETFs vs SPY.
+
+    Catches cross-market regime tells the per-stock signals and per-sector
+    rotation miss: narrow leadership (small-cap lag), US exceptionalism
+    (international lag), growth/value rotation, etc.
+    """
+    entries: List[IntermarketEntry]      # all configured ETFs, sorted by relative_1m desc
+    regime_labels: List[str]             # named regimes that fired (e.g. ["NARROW_LEADERSHIP"])
+    leaders: List[str]                   # ETFs strongly above SPY
+    laggards: List[str]                  # ETFs strongly below SPY
+    intermarket_health: float = 0.0      # composite ∈ [-1, +1]; >0 broad/healthy, <0 narrow/risk-off
+    composite_signal: str = "NEUTRAL"    # BROAD_EXPANSION | BROAD_HEALTHY | NEUTRAL | NARROW_CAUTION | NARROW_RISK_OFF
+    report_date: date
+    summary: str
+
+
 class SectorRotationContext(BaseModel):
     """Cross-sector money flow rotation — 'Ebb and Flow' mechanism."""
     sectors: List[SectorRotationEntry]   # all 11 SPDR sectors, sorted by score desc
@@ -1027,6 +1100,22 @@ class TickerSignal(BaseModel):
     momentum_score: float = 0.0  # [-1, +1] Perceived Value: normalised multi-period price trend
     momentum_1m_pct: float = 0.0 # raw 1-month return %
     momentum_3m_pct: float = 0.0 # raw 3-month return %
+    # Sector-relative momentum — populated when enable_sector_relative_momentum=true.
+    # Strips out sector beta: ticker return − benchmark return, normalised against
+    # the ticker's own residual-return distribution. Cleaner alpha factor than the
+    # raw momentum above (which mixes idiosyncratic and sector moves).
+    sector_momentum_score: float = 0.0     # [-1, +1] residual momentum vs benchmark
+    sector_benchmark: str = ""             # benchmark ETF used (e.g. "XLK", "SPY")
+    sector_momentum_1m_pct: float = 0.0    # raw 1m relative return (pp)
+    sector_momentum_3m_pct: float = 0.0    # raw 3m relative return (pp)
+    # Market-relative momentum — DIAGNOSTIC, not in the weighted combo.
+    # Always benchmarked vs SPY. Reading this alongside sector_momentum reveals
+    # whether a lagging ticker is held back by stock-specific weakness, a weak
+    # sector, or both. See enable_market_relative_momentum docstring for the
+    # divergence interpretation table.
+    market_momentum_score: float = 0.0     # [-1, +1] residual momentum vs SPY
+    market_momentum_1m_pct: float = 0.0    # raw 1m ticker − SPY return (pp)
+    market_momentum_3m_pct: float = 0.0    # raw 3m ticker − SPY return (pp)
     # Money flow fields — populated when enable_money_flow=true
     money_flow_score: float = 0.0  # [-1, +1] accumulation/distribution composite (MFI+CMF+OBV)
     mfi_value: float = 50.0        # raw MFI reading 0–100 (< 20 = accumulation, > 80 = distribution)

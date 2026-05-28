@@ -45,6 +45,8 @@ from src.data.dix import fetch_dix_context
 from src.data.global_macro import fetch_global_macro_context
 from src.data.sector_rotation import fetch_sector_rotation_context
 from src.data.rotation_drivers import fetch_rotation_drivers_context
+from src.data.intermarket import fetch_intermarket_context
+from src.data.macro_news import fetch_macro_news_context
 from src.data.macro_regime import compute_macro_regime
 from src.data.market_mode import compute_market_mode
 from src.data.business_cycle_rotation import compute_business_cycle_context
@@ -384,6 +386,9 @@ def run_pipeline(send_email: bool = False) -> None:
         f_rotation_drivers = (pool.submit(_safe, "rotation_drivers", fetch_rotation_drivers_context)
                               if settings.enable_rotation_drivers else None)
 
+        f_intermarket    = (pool.submit(_safe, "intermarket", fetch_intermarket_context)
+                            if settings.enable_intermarket else None)
+
         # Group B: yfinance options — options_flow then GEX, sequential in one thread
         # Both modules scan yfinance options chains; running them concurrently causes
         # 429 rate-limit errors on every ticker. One thread keeps the combined rate safe.
@@ -415,6 +420,20 @@ def run_pipeline(send_email: bool = False) -> None:
             logger.info(f"  [{label}] +{len(chunk)} article(s)")
 
     logger.info(f"Steps 1–3: {len(articles)} total articles assembled")
+
+    # Macro-news scan — derives a geopolitical / oil / tariff / policy regime
+    # read from the SAME article flow (no extra fetch cost). Caches hourly to
+    # match the news cache TTL. Skipped when the flag is off or article count
+    # is too thin to read.
+    macro_news_context = None
+    if settings.enable_macro_news:
+        macro_news_context = _safe("macro_news", fetch_macro_news_context, articles)
+        if macro_news_context:
+            logger.info(
+                f"[macro_news] {macro_news_context.composite_signal}  "
+                f"score={macro_news_context.macro_news_score:+.2f}  "
+                f"themes={len(macro_news_context.themes)}"
+            )
 
     snapshots = get(f_snapshots) or []
 
@@ -465,6 +484,7 @@ def run_pipeline(send_email: bool = False) -> None:
     global_macro_context      = get(f_global_macro)
     sector_rotation_context   = get(f_sector_rotation)
     rotation_drivers_context  = get(f_rotation_drivers)
+    intermarket_context       = get(f_intermarket)
     gex_context               = yf_options.get("gex")
     earnings_context = get(f_earnings_cal)
     pead_context     = get(f_pead)
@@ -509,6 +529,8 @@ def run_pipeline(send_email: bool = False) -> None:
             breadth_context=breadth_context,
             credit_context=credit_context,
             dix_context=dix_context,
+            intermarket_context=intermarket_context,
+            macro_news_context=macro_news_context,
         )
 
     # Macro → discovery loop: pull top holdings of the favored sector/factor ETFs (sector-rotation
@@ -605,6 +627,8 @@ def run_pipeline(send_email: bool = False) -> None:
         sector_rotation_context=sector_rotation_context,
         rotation_drivers_context=rotation_drivers_context,
         business_cycle_context=business_cycle_context,
+        intermarket_context=intermarket_context,
+        macro_news_context=macro_news_context,
     )
 
     # Keep only the top 10 recommendations by conviction:
@@ -762,6 +786,8 @@ def run_pipeline(send_email: bool = False) -> None:
             sector_rotation_context=sector_rotation_context,
             rotation_drivers_context=rotation_drivers_context,
             business_cycle_context=business_cycle_context,
+            intermarket_context=intermarket_context,
+            macro_news_context=macro_news_context,
         )
     else:
         logger.info("Email not configured — skipping.")

@@ -87,6 +87,8 @@ def generate_recommendations(
     sector_rotation_context=None,   # Optional[SectorRotationContext]
     rotation_drivers_context=None,  # Optional[RotationDriversContext]
     business_cycle_context=None,    # Optional[BusinessCycleContext]
+    intermarket_context=None,       # Optional[IntermarketContext]
+    macro_news_context=None,        # Optional[MacroNewsContext]
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -169,6 +171,37 @@ def generate_recommendations(
         if mom_score:
             mom_ret = f" (1m:{mom_1m:+.1f}%, 3m:{mom_3m:+.1f}%)" if mom_1m else ""
             parts.append(f"  Momentum_score={mom_score:+.2f}{mom_ret}  (perceived-value trend vs own history)")
+        smom_score = getattr(s, "sector_momentum_score", 0.0)
+        smom_bench = getattr(s, "sector_benchmark", "")
+        smom_1m    = getattr(s, "sector_momentum_1m_pct", 0.0)
+        smom_3m    = getattr(s, "sector_momentum_3m_pct", 0.0)
+        if smom_score and smom_bench:
+            smom_ret = f" (1m:{smom_1m:+.1f}pp, 3m:{smom_3m:+.1f}pp vs {smom_bench})" if smom_1m else f" vs {smom_bench}"
+            parts.append(f"  SectorRelativeMomentum_score={smom_score:+.2f}{smom_ret}  (beta-stripped: ticker minus sector ETF; >0 = outperforming peers)")
+        mmom_score = getattr(s, "market_momentum_score", 0.0)
+        mmom_1m    = getattr(s, "market_momentum_1m_pct", 0.0)
+        mmom_3m    = getattr(s, "market_momentum_3m_pct", 0.0)
+        if mmom_score:
+            # Spell out the divergence so the model has the interpretation
+            # ready without having to reason about three numbers from scratch.
+            mmom_ret = f" (1m:{mmom_1m:+.1f}pp, 3m:{mmom_3m:+.1f}pp vs SPY)" if mmom_1m else " vs SPY"
+            divergence = ""
+            # Sector-masked cases — the most subtle (and most informative) signal:
+            # a stock whose underperformance or alpha is being hidden by sector beta.
+            if smom_score <= -0.4 and abs(mmom_score) < 0.15:
+                divergence = " [SECTOR-MASKED WEAKNESS: lagging peers severely but market-neutral — strong sector is hiding the weakness. If the sector rolls over this name leads the decline.]"
+            elif smom_score >= 0.4 and abs(mmom_score) < 0.15:
+                divergence = " [SECTOR-MASKED ALPHA: strongly beating peers but market-neutral — weak sector is hiding genuine alpha. If the sector recovers this name leads.]"
+            elif smom_score and abs(smom_score - mmom_score) >= 0.3:
+                if smom_score > 0.15 and mmom_score < -0.15:
+                    divergence = " [DIVERGENT: outperforming a weak sector — sector itself lags SPY]"
+                elif smom_score < -0.15 and mmom_score > 0.15:
+                    divergence = " [DIVERGENT: stock-specific weakness in a sector that's beating SPY]"
+                elif abs(smom_score) < 0.15 and mmom_score < -0.15:
+                    divergence = " [BETA DRAG: tracking sector but sector is dragging stock down vs SPY]"
+                elif abs(smom_score) < 0.15 and mmom_score > 0.15:
+                    divergence = " [BETA TAILWIND: tracking sector and sector is pulling stock above SPY]"
+            parts.append(f"  MarketRelativeMomentum_score={mmom_score:+.2f}{mmom_ret}  (DIAGNOSTIC, not weighted; >0 = outperforming SPY){divergence}")
         mf_score = getattr(s, "money_flow_score", 0.0)
         mfi_val  = getattr(s, "mfi_value", 50.0)
         cmf_val  = getattr(s, "cmf_value", 0.0)
@@ -1067,6 +1100,117 @@ Convergence with Ebb-and-Flow: {convergence_str}
       on cyclicals are appropriate. No new POSITION-horizon BUYs on cyclical names.
     - This is a MEDIUM-TERM signal (months). A strong near-term catalyst (M&A, earnings beat,
       product launch) can override the cycle bias for SWING-horizon calls."""
+
+    # ── Intermarket Divergence (broad-index ETFs vs SPY) ──────────────
+    intermarket_block        = ""
+    intermarket_instructions = ""
+    if intermarket_context and intermarket_context.entries:
+        im = intermarket_context
+        rows = "\n".join(
+            f"  {e.etf:<5}  {e.name:<26}  rel_1m={e.relative_1m_pct:+.2f}pp   rel_3m={(e.relative_3m_pct if e.relative_3m_pct is not None else 0):+.2f}pp   {e.signal}"
+            for e in im.entries
+            if e.relative_1m_pct is not None
+        )
+        label_str   = ", ".join(im.regime_labels) if im.regime_labels else "no canonical regime label"
+        leaders_str = ", ".join(im.leaders)  if im.leaders  else "—"
+        laggard_str = ", ".join(im.laggards) if im.laggards else "—"
+        intermarket_block = f"""
+<intermarket_context>
+Intermarket Divergence (broad-index ETFs vs SPY, 1m / 3m residual returns):
+{rows}
+
+Composite intermarket_health: {im.intermarket_health:+.2f}  →  {im.composite_signal}
+Leaders (above SPY):  {leaders_str}
+Laggards (below SPY): {laggard_str}
+Active regime labels: {label_str}
+
+{im.summary}
+</intermarket_context>
+"""
+
+        intermarket_instructions = f"""
+27e. Intermarket Divergence — composite intermarket_health={im.intermarket_health:+.2f}, signal={im.composite_signal}.
+    This is the cross-market regime overlay (small vs large, US vs international, growth vs value). It captures
+    risk-appetite tells the sector-rotation overlay misses. The composite already feeds the Macro Regime Filter
+    (adjusts the actionable confidence threshold), so use these labels for TILT, not for primary direction:
+
+    - NARROW_LEADERSHIP (IWM + RSP lag): late-cycle distribution warning. Apply −0.04 confidence haircut on
+      every new BUY this turn — mega-cap-only rallies routinely roll over. Bias HOLD over BUY when borderline.
+    - BROAD_PARTICIPATION (IWM + RSP lead): healthy rally backdrop. +0.03 confidence boost on BUY calls in
+      cyclical / small-cap / mid-cap names.
+    - GROWTH_ROTATION (QQQ + IWF lead): bias BUY on growth-style names; reduce conviction on value-heavy laggards.
+    - VALUE_ROTATION (IWD lead, QQQ flat/lagging): bias BUY on value / cyclical names; reduce growth conviction.
+    - US_EXCEPTIONALISM (EFA + EEM lag): dollar-strength regime. Multinationals with heavy ex-US revenue (KO,
+      MCD, PG) face FX headwinds — slight conviction haircut on POSITION-horizon BUYs there.
+    - INTERNATIONAL_STRENGTH (EFA or EEM lead): softer dollar / better global growth → tail wind for
+      multinationals and exporters; commodities (esp. copper, materials) get a small bullish tilt.
+    - MID_CAP_LEADERSHIP / CYCLICAL_LEAD: confirms healthy participation; treat as supporting evidence
+      rather than the primary read.
+
+    Convergence rule: when intermarket_health AND breadth AND credit all agree on the same regime, the
+    confidence adjustment doubles in size. When intermarket disagrees with the rest of the macro stack,
+    HOLD any borderline calls and document the divergence in the rationale."""
+
+    # ── Macro News Regime (geopolitics / oil / tariffs / policy) ─────
+    macro_news_block        = ""
+    macro_news_instructions = ""
+    if macro_news_context and (macro_news_context.themes or macro_news_context.composite_signal != "STABLE"):
+        mn = macro_news_context
+        theme_rows = "\n".join(
+            f"  [{t.severity:<7}] {t.category:<22}  ({t.article_count} article{'s' if t.article_count != 1 else ''})  →  "
+            f"{', '.join(t.sector_implications) if t.sector_implications else 'no explicit sector tilt'}\n"
+            f"    headline: {t.headline}\n"
+            f"    {t.summary}"
+            for t in mn.themes
+        )
+        tilts_summary = (
+            ", ".join(f"{etf}{'+' if v > 0 else '-'}{abs(v) if abs(v) > 1 else ''}" for etf, v in sorted(mn.sector_tilts.items(), key=lambda kv: -abs(kv[1])))
+            if mn.sector_tilts else "—"
+        )
+        macro_news_block = f"""
+<macro_news_context>
+Macro-news regime: {mn.composite_signal}   macro_news_score={mn.macro_news_score:+.2f}   themes={len(mn.themes)}   articles_scanned={mn.articles_scanned}
+
+Active themes:
+{theme_rows or '  (no qualifying themes — neutral tape)'}
+
+Aggregated sector tilts: {tilts_summary}
+
+{mn.summary}
+</macro_news_context>
+"""
+
+        macro_news_instructions = f"""
+27f. Macro News Regime — composite signal={mn.composite_signal}, macro_news_score={mn.macro_news_score:+.2f}.
+    Use this for top-down narrative context — the geopolitical / energy / tariff / policy backdrop the
+    numeric macro stack (VIX, MOVE, credit, FRED) lags by hours to days. Apply tilts at the SECTOR level
+    rather than rerating individual names:
+
+    - STABLE       → no narrative overlay; proceed on signals alone.
+    - WATCH        → small confidence tilt (±0.02) following the per-theme sector implications.
+    - ELEVATED_RISK → ±0.04 confidence tilt; bias HOLD on borderline cyclical / EM longs; favour defense
+                      (ITA), energy (XLE), gold (GLD/GDX), and short-volatility laggards (TLT) for new BUYs.
+    - CRISIS       → blocks new BUYs that conflict with the regime; allow defensive BUYs (GLD, ITA, XLE,
+                      consumer staples). This is the macro_news contribution to PANIC inside the Macro
+                      Regime Filter — respect it, don't override.
+
+    Sector-tilt rule: when a theme says "XLE+, GLD+, EEM-", treat the +/- as confidence nudges (±0.03)
+    applied to existing actionable BUY/SELL signals on those sectors. Do NOT manufacture new
+    recommendations from macro tilts alone — tilts confirm or de-risk existing signal-driven calls.
+
+    Theme-specific guidance:
+    - geopolitical_conflict (EXTREME): expect oil spike, defense rally, EM/EFA pressure, USD strength,
+      flight to gold. Bias BUY on XLE/ITA/GLD if signal allows; SELL/HOLD on EEM/EFA and consumer-disc.
+    - trade_tariffs (HIGH+): hits multinationals with revenue exposure to the affected region; favour
+      domestic-focused names; bias SELL on KRE/EEM if escalation is bilateral.
+    - energy_shock (HIGH+): structural BUY on XLE, GLD; SELL bias on transportation (JETS), retail (XLY),
+      airlines, refiners depending on direction of shock.
+    - central_bank surprise hawkish: SELL bias on long-duration (TLT, XLRE, IWF growth); BUY bias on XLF.
+    - central_bank surprise dovish: opposite — BUY on TLT, growth (IWF, XLK), gold.
+    - fiscal_policy (shutdown / debt-ceiling impasse): risk-off; BUY GLD, TLT; SELL bias on regulated
+      sectors (XLV defense contractors, federal contractors).
+    - black_swan (EXTREME): maximum defensive posture; CRISIS-level threshold; new BUYs only on
+      defensives + safe-haven assets."""
 
     # Build credit market context block for the prompt
     credit_block        = ""
@@ -2512,7 +2656,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
+{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -2543,7 +2687,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
+{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

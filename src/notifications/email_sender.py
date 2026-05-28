@@ -291,12 +291,14 @@ HTML_TEMPLATE = """
   <thead>
     <tr>
       <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
-      <th>Current</th><th>P&amp;L</th><th>Size</th><th>Days</th>
+      <th>Current</th><th>P&amp;L</th><th>Size</th><th>Corr</th><th>Days</th>
     </tr>
   </thead>
   <tbody>
     {% for t in perf.open_trades %}
     {% set mul = t.position_size_multiplier if t.position_size_multiplier is defined else 1.0 %}
+    {% set corr_mul = t.correlation_size_multiplier if t.correlation_size_multiplier is defined else 1.0 %}
+    {% set mean_corr = t.correlation_mean_corr if t.correlation_mean_corr is defined else None %}
     <tr>
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.action }}</td>
@@ -308,6 +310,19 @@ HTML_TEMPLATE = """
       </td>
       <td style="color:{% if mul >= 2.0 %}#4ade80{% elif mul >= 1.5 %}#60a5fa{% else %}#94a3b8{% endif %};">
         {{ mul }}×
+      </td>
+      <td style="font-size:11px;">
+        {% if mean_corr is not none %}
+          {% set corr_col = '#f87171' if mean_corr >= 0.6 else ('#f59e0b' if mean_corr >= 0.3 else '#94a3b8') %}
+          <span style="color:{{ corr_col }};" title="Mean pairwise correlation to same-direction open peers at entry">
+            ρ̄ {{ "%+.2f"|format(mean_corr) }}
+          </span>
+          {% if corr_mul < 0.999 %}
+          <br><span style="color:#475569;font-size:10px;">−{{ "%.0f"|format((1 - corr_mul) * 100) }}% haircut</span>
+          {% endif %}
+        {% else %}
+          <span style="color:#475569;">&mdash;</span>
+        {% endif %}
       </td>
       <td>{{ t.days_held }}d</td>
     </tr>
@@ -582,7 +597,7 @@ HTML_TEMPLATE = """
 </p>
 {% set solo = perf.solo_method_perf %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'trend_strength', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'sector_momentum', 'money_flow', 'trend_strength', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
 <table class="pt">
   <thead>
     <tr>
@@ -694,7 +709,7 @@ HTML_TEMPLATE = """
 </p>
 {% set meval = perf.method_eval_stats %}
 {% set labels = perf.method_labels if perf.method_labels is defined else {} %}
-{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'money_flow', 'trend_strength', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
+{% set method_order = perf.method_order_by_winrate if perf.method_order_by_winrate is defined else ['news', 'sent_velocity', 'tech', 'insider', 'put_call', 'max_pain', 'oi_skew', 'vwap', 'pattern', 'momentum', 'sector_momentum', 'money_flow', 'trend_strength', 'pead', 'iv_rank', 'iv_expr', 'coint'] %}
 {# ── conviction-band sub-table macro (inlined as a block for each direction) ── #}
 {% macro band_table(direction_stats) %}
 {% if direction_stats %}
@@ -807,6 +822,92 @@ HTML_TEMPLATE = """
 <div class="card" style="border-left:4px solid #334155;">
   <span style="color:#64748b;font-size:13px;">No trades with stored method scores yet — this section will populate once attribution-enabled trades are closed.</span>
 </div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     4D — OUT-OF-SAMPLE VALIDATION
+     Train vs holdout accuracy — honest test of whether each method
+     generalises beyond the data the adaptive weights were fit on.
+     ══════════════════════════════════════ -->
+{% if perf and perf.oos_comparison and perf.oos_comparison.enabled %}
+{% set oos = perf.oos_comparison %}
+<h2>4d. Out-of-Sample Validation
+  <span style="font-size:13px;font-weight:400;color:#94a3b8;">
+    (train vs holdout &mdash; honest OOS check)
+  </span>
+</h2>
+<p style="color:#64748b;font-size:12px;margin:0 0 10px 0;">
+  Every closed trade is permanently assigned to <strong style="color:#94a3b8;">train</strong>
+  (used to fit adaptive weights) or <strong style="color:#94a3b8;">holdout</strong>
+  (reserved for honest evaluation) via a deterministic hash of
+  <code>(seed, ticker, entry_date)</code>. This is a fixed partition, not a walk-forward.
+  Holdout split: <strong style="color:#94a3b8;">{{ oos.holdout_pct }}%</strong> &nbsp;|&nbsp;
+  Counts:
+  <strong style="color:#94a3b8;">{{ oos.split_counts.train }}</strong> train,
+  <strong style="color:#94a3b8;">{{ oos.split_counts.holdout }}</strong> holdout.
+  A large negative &Delta; means the method&rsquo;s training-set accuracy didn&rsquo;t carry to data it never touched
+  &mdash; the signal is fitting noise.
+</p>
+{% if oos.rows %}
+{% set labels = perf.method_labels if perf.method_labels is defined else {} %}
+<table class="pt">
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th style="text-align:right;">Train Trades</th>
+      <th style="text-align:right;">Train Accuracy</th>
+      <th style="text-align:right;">Holdout Trades</th>
+      <th style="text-align:right;">Holdout Accuracy</th>
+      <th style="text-align:right;">&Delta; (Holdout &minus; Train)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in oos.rows %}
+  {% set tr_c = '#4ade80' if row.train_acc >= 60 else '#f59e0b' if row.train_acc >= 45 else '#f87171' %}
+  {% if row.holdout_trades %}
+    {% set ho_c = '#4ade80' if row.holdout_acc >= 60 else '#f59e0b' if row.holdout_acc >= 45 else '#f87171' %}
+  {% else %}
+    {% set ho_c = '#334155' %}
+  {% endif %}
+  {% if row.delta is none %}
+    {% set d_c = '#334155' %}
+  {% elif row.delta <= -10 %}
+    {% set d_c = '#f87171' %}
+  {% elif row.delta < 0 %}
+    {% set d_c = '#f59e0b' %}
+  {% else %}
+    {% set d_c = '#4ade80' %}
+  {% endif %}
+  <tr>
+    <td>{{ labels.get(row.method, row.method) }}</td>
+    <td style="text-align:right;color:#94a3b8;">{{ row.train_trades }}</td>
+    <td style="text-align:right;color:{{ tr_c }};font-weight:700;">
+      {% if row.train_trades %}{{ "%.1f"|format(row.train_acc) }}%{% else %}&mdash;{% endif %}
+    </td>
+    <td style="text-align:right;color:#94a3b8;">{{ row.holdout_trades }}</td>
+    <td style="text-align:right;color:{{ ho_c }};font-weight:700;">
+      {% if row.holdout_trades %}{{ "%.1f"|format(row.holdout_acc) }}%{% else %}&mdash;{% endif %}
+    </td>
+    <td style="text-align:right;color:{{ d_c }};font-weight:700;">
+      {% if row.delta is not none %}{{ "%+.1f"|format(row.delta) }} pp{% else %}&mdash;{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p style="color:#475569;font-size:11px;margin:6px 0 0 0;">
+  Adaptive weights are fit on <em>train only</em> &mdash; this table is the report card on whether that fit
+  generalises. With small samples both numbers are noisy; treat &Delta; as a directional read until you have
+  ~20+ holdout trades per method.
+</p>
+{% else %}
+<div class="card" style="border-left:4px solid #334155;">
+  <span style="color:#64748b;font-size:13px;">
+    Not enough attribution-enabled closed trades yet &mdash; this section will populate once both
+    train and holdout buckets have trades.
+  </span>
+</div>
+{% endif %}
 {% endif %}
 
 <!-- ══════════════════════════════════════
@@ -1105,6 +1206,83 @@ HTML_TEMPLATE = """
         {% elif ms < -0.2 %}Mild negative momentum — mild headwind; trend tilted lower.
         {% else %}Neutral momentum — price tracking within its own historical baseline.{% endif %}
         <span style="color:#64748b;font-size:10px;"> (tanh z-score of 1m/3m returns vs 252-bar history)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Sector-Relative Momentum (beta-stripped alpha factor) -->
+    {% if enable_sector_relative_momentum and sig.sector_momentum_score is defined and sig.sector_momentum_score != 0 %}
+    {% set sms = sig.sector_momentum_score %}
+    {% set sbench = sig.sector_benchmark if sig.sector_benchmark is defined else '' %}
+    {% set sm1 = sig.sector_momentum_1m_pct if sig.sector_momentum_1m_pct is defined else 0 %}
+    {% set sm3 = sig.sector_momentum_3m_pct if sig.sector_momentum_3m_pct is defined else 0 %}
+    {% set abs_ms = sig.momentum_score if sig.momentum_score is defined else 0 %}
+    {% set mms = sig.market_momentum_score if sig.market_momentum_score is defined else 0 %}
+    {% set mm1 = sig.market_momentum_1m_pct if sig.market_momentum_1m_pct is defined else 0 %}
+    {% set mm3 = sig.market_momentum_3m_pct if sig.market_momentum_3m_pct is defined else 0 %}
+    {# Divergence label: stock vs sector vs market — the three-way read. #}
+    {% set div_label = '' %}{% set div_color = '#94a3b8' %}
+    {% if mms != 0 or sms != 0 %}
+      {% if sms <= -0.4 and mms|abs < 0.15 %}
+        {# Stock catastrophically lagging sector but market-neutral — sector is hiding the weakness #}
+        {% set div_label = 'SECTOR-MASKED WEAKNESS (strong sector hiding underperformance)' %}{% set div_color = '#f59e0b' %}
+      {% elif sms >= 0.4 and mms|abs < 0.15 %}
+        {# Stock strongly outperforming sector but market-neutral — weak sector is masking the alpha #}
+        {% set div_label = 'SECTOR-MASKED ALPHA (weak sector hiding outperformance)' %}{% set div_color = '#60a5fa' %}
+      {% elif sms > 0.15 and mms > 0.15 %}
+        {% set div_label = 'ALPHA LEADER' %}{% set div_color = '#4ade80' %}
+      {% elif sms < -0.15 and mms < -0.15 %}
+        {% set div_label = 'TRUE LAGGARD' %}{% set div_color = '#f87171' %}
+      {% elif sms > 0.15 and mms < -0.15 %}
+        {% set div_label = 'BEST OF A WEAK SECTOR' %}{% set div_color = '#f59e0b' %}
+      {% elif sms < -0.15 and mms > 0.15 %}
+        {% set div_label = 'STOCK-SPECIFIC DRAG' %}{% set div_color = '#f87171' %}
+      {% elif sms|abs < 0.15 and mms < -0.15 %}
+        {% set div_label = 'BETA DRAG (sector pulling it below SPY)' %}{% set div_color = '#f59e0b' %}
+      {% elif sms|abs < 0.15 and mms > 0.15 %}
+        {% set div_label = 'BETA TAILWIND (sector lifting it above SPY)' %}{% set div_color = '#60a5fa' %}
+      {% endif %}
+    {% endif %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Sector-Relative Momentum
+          {% if sbench %}<span style="color:#64748b;font-weight:400;font-size:10px;">(vs {{ sbench }})</span>{% endif %}
+        </span>
+        <span class="mscore {{ 'sp' if sms > 0 else 'sn' }}">{{ "%+.2f"|format(sms) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">{{ '%+.1f'|format(sm1) }}pp 1m | {{ '%+.1f'|format(sm3) }}pp 3m</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (sms|abs * 100)|int }}%;background:{{ '#16a34a' if sms >= 0 else '#dc2626' }};"></div>
+      </div>
+      {# Market-relative diagnostic row — same visual scale, smaller font. #}
+      {% if enable_market_relative_momentum and mms != 0 %}
+      <div style="margin-top:6px;padding-top:6px;border-top:1px dashed #1e293b;">
+        <div class="mhdr" style="margin-bottom:3px;">
+          <span style="font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;">
+            Market-Relative <span style="color:#64748b;font-weight:400;font-size:10px;">(vs SPY · diagnostic)</span>
+          </span>
+          <span class="mscore {{ 'sp' if mms > 0 else 'sn' }}" style="font-size:11px;">{{ "%+.2f"|format(mms) }}</span>
+          <span style="font-size:10px;color:#94a3b8;margin-left:6px;">{{ '%+.1f'|format(mm1) }}pp 1m | {{ '%+.1f'|format(mm3) }}pp 3m</span>
+        </div>
+        <div class="bar-wrap" style="height:3px;">
+          <div class="bar" style="width:{{ (mms|abs * 100)|int }}%;background:{{ '#16a34a' if mms >= 0 else '#dc2626' }};opacity:0.7;"></div>
+        </div>
+      </div>
+      {% endif %}
+      <div class="mtext">
+        {% if div_label %}
+        <div style="font-size:11px;font-weight:700;color:{{ div_color }};margin-bottom:4px;">{{ div_label }}</div>
+        {% endif %}
+        {% if sms > 0.5 %}Strongly outperforming {{ sbench or 'benchmark' }} — idiosyncratic alpha, not just sector beta.
+        {% elif sms > 0.2 %}Mild outperformance vs {{ sbench or 'benchmark' }} — modest stock-specific tailwind.
+        {% elif sms < -0.5 %}Strongly underperforming {{ sbench or 'benchmark' }} — ticker is lagging its peers; beware sector-driven rallies masking weakness.
+        {% elif sms < -0.2 %}Mild underperformance vs {{ sbench or 'benchmark' }} — lagging slightly.
+        {% else %}Tracking {{ sbench or 'benchmark' }} — no idiosyncratic edge in either direction.{% endif %}
+        {# Divergence with absolute momentum is a useful tell — call it out. #}
+        {% if abs_ms != 0 and ((abs_ms > 0.2 and sms < -0.1) or (abs_ms < -0.2 and sms > 0.1)) %}
+        <br><span style="color:#f59e0b;">⚠ Absolute momentum {{ "%+.2f"|format(abs_ms) }} disagrees with sector-relative — the price move was likely sector-driven beta, not stock-specific alpha.</span>
+        {% endif %}
+        <span style="color:#64748b;font-size:10px;"> (ticker − benchmark, tanh z-score vs own residual history)</span>
       </div>
     </div>
     {% endif %}
@@ -2812,6 +2990,160 @@ HTML_TEMPLATE = """
   {% endif %}
 
   <p style="color:#cbd5e1;font-size:13px;margin:0;">{{ gm.summary }}</p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a3b — INTERMARKET DIVERGENCE (broad indices vs SPY)
+     ══════════════════════════════════════ -->
+{% if intermarket_context %}
+{% set im = intermarket_context %}
+{% set im_sig_colors = {
+    'BROAD_EXPANSION':  '#4ade80',
+    'BROAD_HEALTHY':    '#86efac',
+    'NEUTRAL':          '#94a3b8',
+    'NARROW_CAUTION':   '#f59e0b',
+    'NARROW_RISK_OFF':  '#f87171',
+} %}
+{% set im_col = im_sig_colors.get(im.composite_signal, '#94a3b8') %}
+<h2>6a3b. Intermarket Divergence
+  <span style="font-size:12px;font-weight:400;color:#94a3b8;">(broad index ETFs vs SPY)</span>
+</h2>
+<div class="card" style="border-left:4px solid {{ im_col }};">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">
+    <div>
+      <span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Composite</span>
+      <div style="font-size:18px;font-weight:700;color:{{ im_col }};">{{ im.composite_signal }}</div>
+      <div style="font-size:11px;color:#94a3b8;">
+        intermarket_health = <strong style="color:#cbd5e1;">{{ "%+.2f"|format(im.intermarket_health) }}</strong>
+      </div>
+    </div>
+    <div style="text-align:right;font-size:12px;color:#94a3b8;">
+      {% if im.regime_labels %}
+      <div style="margin-bottom:4px;">
+        {% for lbl in im.regime_labels %}
+        <span style="display:inline-block;background:#1e293b;border:1px solid #475569;padding:2px 7px;border-radius:3px;margin:1px;font-size:10px;font-weight:600;color:#cbd5e1;letter-spacing:.04em;">{{ lbl }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if im.leaders %}<div style="color:#4ade80;">Leaders: {{ im.leaders|join(', ') }}</div>{% endif %}
+      {% if im.laggards %}<div style="color:#f87171;">Laggards: {{ im.laggards|join(', ') }}</div>{% endif %}
+    </div>
+  </div>
+  <table class="pt" style="margin-top:12px;">
+    <thead>
+      <tr>
+        <th>ETF</th><th>Tracks</th>
+        <th style="text-align:right;">1m vs SPY</th>
+        <th style="text-align:right;">3m vs SPY</th>
+        <th style="text-align:right;">Signal</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for e in im.entries %}
+    {% set sig_col = '#4ade80' if e.signal == 'LEADING' else ('#f87171' if e.signal == 'LAGGING' else '#94a3b8') %}
+    {% set rel1 = e.relative_1m_pct if e.relative_1m_pct is not none else 0 %}
+    {% set rel3 = e.relative_3m_pct if e.relative_3m_pct is not none else 0 %}
+    <tr>
+      <td><strong>{{ e.etf }}</strong></td>
+      <td style="color:#94a3b8;">{{ e.name }}</td>
+      <td style="text-align:right;color:{{ '#4ade80' if rel1 > 0 else '#f87171' if rel1 < 0 else '#94a3b8' }};font-weight:700;">
+        {% if e.relative_1m_pct is not none %}{{ "%+.2f"|format(rel1) }}pp{% else %}&mdash;{% endif %}
+      </td>
+      <td style="text-align:right;color:{{ '#4ade80' if rel3 > 0 else '#f87171' if rel3 < 0 else '#94a3b8' }};">
+        {% if e.relative_3m_pct is not none %}{{ "%+.2f"|format(rel3) }}pp{% else %}&mdash;{% endif %}
+      </td>
+      <td style="text-align:right;color:{{ sig_col }};font-weight:700;font-size:11px;">{{ e.signal }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p style="color:#cbd5e1;font-size:12px;margin:10px 0 0 0;">{{ im.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:6px 0 0 0;">
+    Composite intermarket_health feeds the Macro Regime Filter — narrow leadership tightens
+    the actionable confidence threshold; broad participation relaxes it.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     6a3c — MACRO NEWS REGIME (geopolitics / oil / tariffs / policy)
+     ══════════════════════════════════════ -->
+{% if macro_news_context %}
+{% set mn = macro_news_context %}
+{% set mn_colors = {
+    'STABLE':        '#4ade80',
+    'WATCH':         '#86efac',
+    'ELEVATED_RISK': '#f59e0b',
+    'CRISIS':        '#f87171',
+} %}
+{% set mn_col = mn_colors.get(mn.composite_signal, '#94a3b8') %}
+{% set sev_colors = {
+    'EXTREME': '#f87171',
+    'HIGH':    '#fb923c',
+    'MEDIUM':  '#f59e0b',
+    'LOW':     '#94a3b8',
+} %}
+<h2>6a3c. Macro News Regime
+  <span style="font-size:12px;font-weight:400;color:#94a3b8;">(geopolitics · trade · oil · policy)</span>
+</h2>
+<div class="card" style="border-left:4px solid {{ mn_col }};">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">
+    <div>
+      <span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Composite</span>
+      <div style="font-size:18px;font-weight:700;color:{{ mn_col }};">{{ mn.composite_signal }}</div>
+      <div style="font-size:11px;color:#94a3b8;">
+        macro_news_score = <strong style="color:#cbd5e1;">{{ "%+.2f"|format(mn.macro_news_score) }}</strong>
+        &nbsp;·&nbsp; {{ mn.articles_scanned }} article{{ 's' if mn.articles_scanned != 1 else '' }} scanned
+        &nbsp;·&nbsp; <span style="color:#64748b;">{{ 'DeepSeek' if mn.used_llm else 'heuristic' }}</span>
+      </div>
+    </div>
+    {% if mn.sector_tilts %}
+    <div style="text-align:right;font-size:11px;color:#94a3b8;">
+      <div style="margin-bottom:3px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Sector tilts</div>
+      {% for etf, v in mn.sector_tilts|dictsort(by='value', reverse=true) %}
+        {% set tilt_col = '#4ade80' if v > 0 else ('#f87171' if v < 0 else '#94a3b8') %}
+        <span style="display:inline-block;background:#1e293b;border:1px solid {{ tilt_col }};padding:2px 7px;border-radius:3px;margin:1px;font-size:11px;font-weight:600;color:{{ tilt_col }};">{{ etf }}{% if v > 0 %}+{% else %}{% endif %}{{ v if v != 0 else '' }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  {% if mn.themes %}
+  <div style="margin-top:14px;">
+  {% for t in mn.themes %}
+  {% set sev_col = sev_colors.get(t.severity, '#94a3b8') %}
+  {% set dir_col = '#4ade80' if t.direction == 'BULLISH' else ('#f87171' if t.direction == 'BEARISH' else '#94a3b8') %}
+  <div style="margin-bottom:10px;padding:10px 12px;background:#0f172a55;border-left:3px solid {{ sev_col }};border-radius:4px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px;">
+      <div>
+        <span style="display:inline-block;background:#1e293b;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700;color:{{ sev_col }};letter-spacing:.05em;">{{ t.severity }}</span>
+        <span style="font-size:13px;font-weight:600;color:#cbd5e1;margin-left:6px;">{{ t.category | replace('_', ' ') | title }}</span>
+        <span style="font-size:11px;color:{{ dir_col }};margin-left:6px;font-weight:700;">{{ t.direction }}</span>
+      </div>
+      <span style="font-size:10px;color:#475569;">{{ t.article_count }} article{{ 's' if t.article_count != 1 else '' }}</span>
+    </div>
+    {% if t.headline %}<div style="font-size:11px;color:#94a3b8;margin-bottom:3px;font-style:italic;">&ldquo;{{ t.headline }}&rdquo;</div>{% endif %}
+    {% if t.summary %}<div style="font-size:12px;color:#cbd5e1;line-height:1.5;">{{ t.summary }}</div>{% endif %}
+    {% if t.sector_implications %}
+    <div style="margin-top:5px;font-size:10px;color:#64748b;">
+      Implications:
+      {% for s in t.sector_implications %}
+        {% set s_col = '#4ade80' if '+' in s else ('#f87171' if '-' in s else '#94a3b8') %}
+        <span style="color:{{ s_col }};font-weight:600;">{{ s }}</span>{% if not loop.last %},{% endif %}
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  </div>
+  {% endif %}
+  <p style="color:#cbd5e1;font-size:12px;margin:10px 0 0 0;">{{ mn.summary }}</p>
+  <p style="color:#475569;font-size:11px;margin:6px 0 0 0;">
+    macro_news_score feeds the Macro Regime Filter (weight 1.5) — a CRISIS read can trigger
+    PANIC by itself, blocking new BUY entries. Sector tilts are passed to the Claude analyst
+    as confidence nudges (±0.03) on existing signal-driven calls.
+  </p>
 </div>
 {% endif %}
 
@@ -4862,6 +5194,8 @@ def send_recommendations(
     sector_rotation_context=None,   # Optional[SectorRotationContext]   — avoid circular import
     rotation_drivers_context=None,  # Optional[RotationDriversContext]  — avoid circular import
     business_cycle_context=None,    # Optional[BusinessCycleContext]    — avoid circular import
+    intermarket_context=None,       # Optional[IntermarketContext]       — avoid circular import
+    macro_news_context=None,        # Optional[MacroNewsContext]         — avoid circular import
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -4896,6 +5230,7 @@ def send_recommendations(
         settings.enable_vwap,
         settings.enable_pattern_recognition,
         settings.enable_price_momentum,
+        settings.enable_sector_relative_momentum,
         settings.enable_money_flow,
         settings.enable_trend_strength,
         settings.enable_pead,
@@ -5023,6 +5358,8 @@ def send_recommendations(
         use_put_call=settings.enable_put_call,
         use_pattern=settings.enable_pattern_recognition,
         enable_price_momentum=settings.enable_price_momentum,
+        enable_sector_relative_momentum=settings.enable_sector_relative_momentum,
+        enable_market_relative_momentum=settings.enable_market_relative_momentum,
         enable_money_flow=settings.enable_money_flow,
         enable_trend_strength=settings.enable_trend_strength,
         enable_pead=settings.enable_pead,
@@ -5112,6 +5449,10 @@ def send_recommendations(
         rotation_drivers_context=rotation_drivers_context,
         # Business Cycle Rotation (structural economic phase)
         business_cycle_context=business_cycle_context,
+        # Intermarket Divergence (broad-index ETFs vs SPY)
+        intermarket_context=intermarket_context,
+        # Macro News Regime (geopolitics / oil / tariffs / policy)
+        macro_news_context=macro_news_context,
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────
@@ -5147,6 +5488,15 @@ def send_recommendations(
                 m1 = getattr(sig, "momentum_1m_pct", 0)
                 m3 = getattr(sig, "momentum_3m_pct", 0)
                 lines.append(f"Momentum score:  {sig.momentum_score:+.2f} (1m:{m1:+.1f}% 3m:{m3:+.1f}%)")
+            if settings.enable_sector_relative_momentum and getattr(sig, "sector_momentum_score", 0) != 0:
+                sb  = getattr(sig, "sector_benchmark", "")
+                s1  = getattr(sig, "sector_momentum_1m_pct", 0)
+                s3  = getattr(sig, "sector_momentum_3m_pct", 0)
+                lines.append(f"Sector-rel mom:  {sig.sector_momentum_score:+.2f} vs {sb} (1m:{s1:+.1f}pp 3m:{s3:+.1f}pp)")
+            if settings.enable_market_relative_momentum and getattr(sig, "market_momentum_score", 0) != 0:
+                m1 = getattr(sig, "market_momentum_1m_pct", 0)
+                m3 = getattr(sig, "market_momentum_3m_pct", 0)
+                lines.append(f"Market-rel mom:  {sig.market_momentum_score:+.2f} vs SPY (1m:{m1:+.1f}pp 3m:{m3:+.1f}pp)  [diagnostic]")
             if settings.enable_money_flow and getattr(sig, "money_flow_score", 0) != 0:
                 mfi = getattr(sig, "mfi_value", 50)
                 cmf = getattr(sig, "cmf_value", 0)
@@ -5193,7 +5543,8 @@ def send_recommendations(
                 "news": "News", "tech": "Technical", "insider": "Smart Money",
                 "put_call": "Put/Call", "max_pain": "Max Pain", "oi_skew": "OI Skew",
                 "vwap": "VWAP", "pattern": "Pattern",
-                "momentum": "Price Momentum", "money_flow": "Money Flow", "trend_strength": "Trend Strength",
+                "momentum": "Price Momentum", "sector_momentum": "Sector-Relative Momentum",
+                "money_flow": "Money Flow", "trend_strength": "Trend Strength",
                 "pead": "PEAD", "iv_rank": "IV Rank", "iv_expr": "IV Expression",
                 "coint": "Cointegration",
             }

@@ -51,6 +51,10 @@ from src.analysis.technical import TechnicalResult, EMPTY_RESULT, compute_techni
 from src.signals.vwap import compute_vwap_score
 from src.signals.pattern_recognition import compute_pattern_score
 from src.signals.price_momentum import compute_price_momentum_score
+from src.signals.sector_relative_momentum import (
+    compute_sector_relative_momentum_score,
+    compute_market_relative_momentum_score,
+)
 from src.signals.money_flow import compute_money_flow_score
 from src.signals.trend_strength import compute_trend_strength_score
 from src.signals.iv_rank import compute_iv_rank_score
@@ -83,6 +87,7 @@ _BASE_WEIGHTS = {
     "vwap":      0.12,   # mean-reversion: price vs rolling 20-day VWAP
     "pattern":    0.18,   # chart pattern recognition: historical win-rate based score
     "momentum":   0.18,   # perceived value: normalised 1m/3m price trend vs own history
+    "sector_momentum": 0.20,  # sector-relative momentum: ticker − sector ETF (cleaner alpha factor)
     "money_flow": 0.15,   # accumulation/distribution: MFI + CMF + OBV slope composite
     "trend_strength": 0.15,  # ADX/DMI trend quality + Donchian breakout (trend-following)
     "pead":       0.15,   # Post-Earnings Announcement Drift: SUE × time-decay
@@ -150,7 +155,12 @@ def _adaptive_weight_multipliers() -> dict:
 
     try:
         from src.performance.tracker import compute_solo_method_performance
-        perf = compute_solo_method_performance()
+        # Train on the OOS train slice only so the holdout slice remains an
+        # honest evaluation set. When OOS validation is disabled (or the
+        # holdout pct is 0) the helper treats every trade as "train" so the
+        # call still returns the full sample — no behaviour change.
+        split = "train" if settings.enable_oos_validation else None
+        perf = compute_solo_method_performance(split=split)
     except Exception as e:
         logger.debug(f"[aggregator] adaptive weights — solo perf unavailable: {e}")
         return default
@@ -713,6 +723,11 @@ def build_signals(
     use_pattern   = settings.enable_pattern_recognition
     # Price momentum uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
     use_momentum   = settings.enable_price_momentum
+    # Sector-relative momentum: ticker − benchmark ETF. Same cache strategy as
+    # price momentum; benchmark resolution is cached forever.
+    use_sector_momentum = settings.enable_sector_relative_momentum
+    # Market-relative momentum: ticker − SPY (diagnostic only, not weighted).
+    use_market_momentum = settings.enable_market_relative_momentum
     # Money flow uses OHLCV chart cache first; works with ENABLE_FETCH_DATA=false.
     use_money_flow = settings.enable_money_flow
     # Trend strength (ADX/DMI + Donchian) is cache-first too; works with ENABLE_FETCH_DATA=false.
@@ -775,6 +790,7 @@ def build_signals(
         "vwap":       use_vwap,
         "pattern":    use_pattern,
         "momentum":   use_momentum,
+        "sector_momentum": use_sector_momentum,
         "money_flow": use_money_flow,
         "trend_strength": use_trend_strength,
         "pead":       use_pead,
@@ -792,7 +808,8 @@ def build_signals(
         f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
         f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
-        f"momentum={weights['momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
+        f"momentum={weights['momentum']:.0%}  "
+        f"sector_mom={weights['sector_momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
         f"trend={weights['trend_strength']:.0%}  "
         f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
         f"coint={weights['coint']:.0%}"
@@ -894,6 +911,34 @@ def build_signals(
         if use_momentum:
             momentum_score, momentum_1m_pct, momentum_3m_pct = compute_price_momentum_score(ticker)
 
+        # ── Method 9b: Sector-Relative Momentum (beta-stripped alpha) ────
+        # Same multi-period structure as absolute momentum, but on residual
+        # returns: ticker − sector ETF. Strips out sector beta so a strong
+        # sector tailwind doesn't masquerade as ticker-level alpha. The
+        # benchmark resolution is asset-type aware (sector ETF for stocks,
+        # SPY for ETFs, none for commodities).
+        sector_momentum_score   = 0.0
+        sector_momentum_1m_pct  = 0.0
+        sector_momentum_3m_pct  = 0.0
+        sector_benchmark_used   = ""
+        if use_sector_momentum:
+            (sector_momentum_score, sector_momentum_1m_pct,
+             sector_momentum_3m_pct, sector_benchmark_used) = compute_sector_relative_momentum_score(ticker)
+
+        # ── Method 9c: Market-Relative Momentum (DIAGNOSTIC) ─────────────
+        # Ticker − SPY residual. Stored on the signal for the email / Claude
+        # prompt so divergences from sector_momentum are visible, but NOT
+        # added to the weighted combo: market_rel = sector_rel + (sector −
+        # market), so weighting it would double-count beta. Acts purely as a
+        # diagnostic — answers "is this name lagging the market?" alongside
+        # the sector-specific read.
+        market_momentum_score   = 0.0
+        market_momentum_1m_pct  = 0.0
+        market_momentum_3m_pct  = 0.0
+        if use_market_momentum:
+            (market_momentum_score, market_momentum_1m_pct,
+             market_momentum_3m_pct, _) = compute_market_relative_momentum_score(ticker)
+
         # ── Method 10: Money Flow Indicators ─────────────────────────────
         # Composite of MFI (14-period volume-weighted RSI), CMF (20-period
         # Chaikin Money Flow), and OBV slope z-score.
@@ -966,6 +1011,7 @@ def build_signals(
             weights["vwap"]       * vwap_score +
             weights["pattern"]    * pattern_score +
             weights["momentum"]   * momentum_score +
+            weights["sector_momentum"] * sector_momentum_score +
             weights["money_flow"] * money_flow_score +
             weights["trend_strength"] * trend_strength_score +
             weights["pead"]       * pead_score_v +
@@ -1004,6 +1050,7 @@ def build_signals(
             (use_vwap,       vwap_score),
             (use_pattern,    pattern_score),
             (use_momentum,   momentum_score),
+            (use_sector_momentum, sector_momentum_score),
             (use_money_flow, money_flow_score),
             (use_trend_strength, trend_strength_score),
             (use_pead,       pead_score_v),
@@ -1078,6 +1125,13 @@ def build_signals(
             momentum_score=round(momentum_score, 3),
             momentum_1m_pct=round(momentum_1m_pct, 2),
             momentum_3m_pct=round(momentum_3m_pct, 2),
+            sector_momentum_score=round(sector_momentum_score, 3),
+            sector_benchmark=sector_benchmark_used,
+            sector_momentum_1m_pct=round(sector_momentum_1m_pct, 2),
+            sector_momentum_3m_pct=round(sector_momentum_3m_pct, 2),
+            market_momentum_score=round(market_momentum_score, 3),
+            market_momentum_1m_pct=round(market_momentum_1m_pct, 2),
+            market_momentum_3m_pct=round(market_momentum_3m_pct, 2),
             money_flow_score=round(money_flow_score, 3),
             mfi_value=round(mfi_value, 2),
             cmf_value=round(cmf_value, 4),
@@ -1104,6 +1158,14 @@ def build_signals(
         vwap_str    = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
         pat_str  = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
         mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
+        sm_str   = (
+            f"  smom={sector_momentum_score:+.2f}(vs {sector_benchmark_used} {sector_momentum_1m_pct:+.1f}pp/1m)"
+            if sector_momentum_score != 0.0 else ""
+        )
+        mm_str   = (
+            f"  mmom={market_momentum_score:+.2f}(vs SPY {market_momentum_1m_pct:+.1f}pp/1m)"
+            if market_momentum_score != 0.0 else ""
+        )
         mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
         ts_str   = f"  trend={trend_strength_score:+.2f}(adx={adx_value:.0f},{trend_label})" if trend_strength_score != 0.0 else ""
         pead_str = f"  pead={pead_score_v:+.2f}({pead_surprise:+.1f}%/{pead_days}d)" if pead_score_v != 0.0 else ""
@@ -1116,7 +1178,7 @@ def build_signals(
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

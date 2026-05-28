@@ -31,7 +31,11 @@
       "Bash(grep -nE \"3K\\\\. Cointegration|coint`, `cross_sectional|Cointegration Pairs, Smart Money\" CLAUDE.md)",
       "Bash(PYTHONUTF8=1 python -)",
       "Bash(powershell -NoProfile -Command 'Get-ChildItem -Recurse -File -Path . -Exclude *.pyc | Where-Object { $_.FullName -notmatch '\\\\''\\\\\\\\.git\\\\\\\\|\\\\\\\\cache\\\\\\\\|\\\\\\\\logs\\\\\\\\|__pycache__|\\\\\\\\.venv\\\\\\\\|\\\\\\\\venv\\\\\\\\'\\\\'' -and $_.LastWriteTime -gt \\(Get-Date\\).AddDays\\(-3\\) } | Sort-Object LastWriteTime -Descending | Select-Object -First 40 LastWriteTime, FullName | Format-Table -AutoSize -Wrap')",
-      "Bash(.venv/Scripts/python.exe *)"
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(grep -nE \"RECOMMENDATIONS|---|conf=|^[[:space:]]+[A-Z]{2,6} [A-Z]+\" \"C:\\\\Users\\\\mathi\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-mathi-PycharmProjects-llm-trader\\\\09e95595-9aca-4cc2-984a-dde3f727041f\\\\tasks\\\\b1aeu1hqv.output\")",
+      "Bash(awk NR>=540 && NR<=580 *)",
+      "Bash(awk NR>=575 && NR<=603 *)",
+      "Bash(awk NR>=363 && NR<=445 *)"
     ]
   }
 }
