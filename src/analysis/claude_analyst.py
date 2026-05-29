@@ -12,6 +12,9 @@ from src.data.insider_trades import build_insider_summary
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _DEEPSEEK_ANALYST_MODEL = "deepseek-chat"   # DeepSeek V3 — fast, structured JSON, same API as sentiment.py
+# Fixed seed for the DeepSeek analyst fallback; combined with temperature=0
+# this gets us near-deterministic synthesis across identical-prompt runs.
+_DEEPSEEK_ANALYST_SEED = 4242
 
 _client = None
 _deepseek_analyst_client = None
@@ -44,11 +47,15 @@ def _call_deepseek_analyst(prompt: str) -> str:
         raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
     logger.info(f"[claude] Falling back to DeepSeek V3 analyst: {_DEEPSEEK_ANALYST_MODEL}")
     raw_parts: list[str] = []
+    # Determinism: temperature=0 + fixed seed so two runs on the same prompt
+    # produce near-identical synthesis (slight provider-side variance only).
     with client.chat.completions.create(
         model=_DEEPSEEK_ANALYST_MODEL,
         max_tokens=32000,
         messages=[{"role": "user", "content": prompt}],
         stream=True,
+        temperature=0,
+        seed=_DEEPSEEK_ANALYST_SEED,
     ) as stream:
         for chunk in stream:
             if not chunk.choices:
@@ -2718,11 +2725,15 @@ Return ALL tickers from the input. No markdown, JSON only."""
             _max_tokens = 32000
         else:
             _max_tokens = 64000   # Sonnet 4.6
+        # Determinism: temperature=0 so identical prompts produce near-identical
+        # synthesis. Anthropic SDK does not expose a seed parameter; this is
+        # the strongest determinism Anthropic supports today.
         raw_parts: list[str] = []
         with client.messages.stream(
             model=settings.analyst_model,
             max_tokens=_max_tokens,
             messages=[{"role": "user", "content": prompt}],
+            temperature=0,
         ) as stream:
             for text in stream.text_stream:
                 raw_parts.append(text)

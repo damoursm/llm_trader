@@ -116,7 +116,7 @@ Conviction bands (`_eval_stats`): Low `0.10–0.35`, Medium `0.35–0.65`, High 
 
 | Function | When | What it does |
 |---|---|---|
-| `record_new_trades()` | After Claude produces recommendations | Opens a trade per actionable BUY/SELL; stamps `entry_datetime` + `entry_price` together; enforces 3.0× per-sector cap; stores 17 raw method scores + `methods_agreeing` + `dominant_method`. |
+| `record_new_trades()` | After Claude produces recommendations | Opens a trade per actionable BUY/SELL; stamps `entry_datetime` + `entry_price` together; applies the correlation-aware sizing haircut (continuous scale-down vs same-direction open peers, hard skip when correlated-exposure cap is hit); stores 17 raw method scores + `methods_agreeing` + `dominant_method`. |
 | `close_trades_on_signal_reversal()` | Before opening new trades, if today's actionable signal reverses an open position | Closes with `exit_datetime = current_price_datetime` (most recent live mark) — no second fetch. |
 | `_refresh_open_trade_ohlcv()` | First step of `update_open_trades()` | Force-refreshes OHLCV cache for every open-trade ticker (bypasses 3-day TTL) so the daily walk has a real close for every day held. |
 | `_normalize_closed_returns()` | Second step of `update_open_trades()` | Idempotently rederives `return_pct` for every closed trade through the current spread model. |

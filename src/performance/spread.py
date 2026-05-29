@@ -125,3 +125,29 @@ def fmt_price(p) -> str:
     if p >= 0.01:
         return f"{p:.4f}"
     return f"{p:.6f}"
+
+
+def fmt_price_full(p) -> str:
+    """Show the price at its full stored precision (up to 6 decimals).
+
+    Different from ``fmt_price`` which truncates large prices to 2 decimals
+    (typical penny ticks). Used in trade tables where the user wants to see
+    the EXACT stored entry/exit value, including any sub-penny precision the
+    underlying float carries (some data providers return prices like
+    106.31999...). Trailing zeros are stripped but at least 2 decimals are
+    always retained so the cents are obvious.
+    """
+    if p is None:
+        return "N/A"
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return str(p)
+    # 6 decimals captures any sub-penny precision; strip trailing zeros so
+    # 106.32 doesn't render as 106.320000.
+    s = f"{p:.6f}".rstrip("0")
+    if s.endswith("."):
+        s += "00"
+    elif "." in s and len(s.split(".")[1]) == 1:
+        s += "0"
+    return s

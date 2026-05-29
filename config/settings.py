@@ -477,7 +477,23 @@ class Settings(BaseSettings):
     enable_signal_decay_exits: bool = True
     signal_decay_flip_threshold: float = -0.10   # oriented combined < this -> flipped
     signal_decay_drop_threshold: float = 0.40    # oriented (entry - today) > this -> decayed
-    signal_decay_confidence_floor: float = 0.60  # today's confidence < this -> exit
+    # ── Confidence-loss floor — entry-relative with absolute backstop ──
+    # Effective floor = max(signal_decay_confidence_floor,
+    #                       signal_decay_confidence_floor_relative × entry_confidence)
+    # where entry_confidence is the aggregator-confidence captured at trade entry
+    # (signal_at_entry.confidence, NOT Claude's adjusted confidence — apples-to-apples
+    # with today's aggregator confidence).
+    #
+    # Why entry-relative: a fixed 0.60 floor was firing on routine day-to-day signal
+    # variance (78% entries decaying to 55% next day is normal noise), causing every
+    # trade to exit on confidence_loss before the thesis got room to develop. Tying
+    # the floor to entry conviction means a high-conviction trade (0.92 entry) gets
+    # a tighter floor (~0.60) and must really collapse to trigger exit, while a
+    # borderline 0.78 entry gets a looser floor (~0.51) that tolerates routine
+    # variance. The absolute backstop only catches catastrophic drops for legacy /
+    # very-low-conviction trades.
+    signal_decay_confidence_floor: float = 0.45          # absolute hard backstop
+    signal_decay_confidence_floor_relative: float = 0.65  # factor × entry_confidence
     signal_decay_regime_exit: bool = True        # exit longs in PANIC/RISK_OFF
 
     # ── Adaptive signal weighting ────────────────────────────────────────────
@@ -542,11 +558,11 @@ class Settings(BaseSettings):
     enable_intermarket: bool = True
 
     # ── Correlation-aware position sizing ────────────────────────────────────
-    # The existing per-sector cap (tracker.SECTOR_CAP) catches GICS-sector
-    # concentration but misses cross-sector factor concentration: three
-    # high-beta semis (NVDA + AVGO + SMH) load the same factor even though
-    # SMH is an ETF in a different sector bucket; three "high-beta growth"
-    # names rated independently move together when the growth factor rolls.
+    # Replaces the legacy hard per-sector cap, which caught only GICS-sector
+    # concentration and missed cross-sector factor exposure: three high-beta
+    # semis (NVDA + AVGO + SMH) load the same factor even though SMH is an
+    # ETF in a different sector bucket; three "high-beta growth" names rated
+    # independently move together when the growth factor rolls.
     #
     # At trade-open time we compute realized pairwise correlations from the
     # last N trading days of OHLCV closes between the candidate and every

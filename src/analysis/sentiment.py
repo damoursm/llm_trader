@@ -28,6 +28,12 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"       # DeepSeek V3
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
+# Fixed seed for OpenAI-compatible APIs (DeepSeek). Combined with temperature=0
+# this gives near-deterministic output across runs for the same prompt — the
+# user requirement is that two pipeline runs over the same cached inputs
+# produce only marginally different recommendations.
+_LLM_SEED = 1729
+
 # Recency decay: articles older than this many hours get progressively down-weighted
 _DECAY_HALF_LIFE_HOURS = 36   # score halves every 36 hours
 
@@ -68,8 +74,14 @@ def _recency_weight(article: NewsArticle) -> float:
     Exponential decay based on article age.
     24h → ~0.87,  36h → 0.50,  72h → 0.25,  7d → ~0.06
     Articles older than 7 days are excluded entirely (weight ≈ 0).
+
+    Time-quantised to the hour: the "now" used for age calculation is bucketed
+    to the top of the current UTC hour so two pipeline runs within the same
+    hour produce identical recency weights. Without this, two back-to-back
+    runs could flip the top-20 article cutoff on borderline-stale articles
+    and feed the LLM a different digest, producing different sentiment scores.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     age_hours = (now - article.published_at).total_seconds() / 3600
     if age_hours > 168:   # 7 days — too stale to be relevant
         return 0.0
@@ -171,6 +183,9 @@ Respond with JSON only, no markdown."""
     rationale = "Analysis unavailable."
 
     # --- Primary: DeepSeek V3 ---
+    # temperature=0 + a stable seed give near-deterministic output across runs
+    # for the same article digest, which is what we want so two pipeline runs
+    # within the same news-cache hour produce the same per-ticker sentiment.
     deepseek = _get_deepseek()
     if deepseek is not None:
         try:
@@ -178,6 +193,8 @@ Respond with JSON only, no markdown."""
                 model=DEEPSEEK_MODEL,
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                seed=_LLM_SEED,
             )
             raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (deepseek-v3, {len(to_score)} articles)")
@@ -185,6 +202,8 @@ Respond with JSON only, no markdown."""
             logger.warning(f"{ticker} DeepSeek failed, falling back to Haiku: {e}")
 
     # --- Fallback: Claude Haiku ---
+    # Anthropic SDK doesn't expose a seed parameter, but temperature=0 + the
+    # cached prompt gives the highest determinism Anthropic supports.
     if raw_score is None:
         try:
             client = _get_haiku()
@@ -192,6 +211,7 @@ Respond with JSON only, no markdown."""
                 model=HAIKU_MODEL,
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
+                temperature=0,
             )
             raw_score, rationale = _parse_response(message.content[0].text.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (haiku-fallback, {len(to_score)} articles)")

@@ -117,7 +117,7 @@ _SECTOR_MAP: dict = {
 _SECTOR_ALIGN_BOOST   = 1.10
 _SECTOR_ALIGN_PENALTY = 0.75
 
-_AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as having a view
+_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 
 # ── Adaptive weight multipliers (data-informed reweighting) ──────────────────
@@ -411,6 +411,24 @@ def _coherence_factor(combined: float, method_scores: list) -> tuple[float, floa
 
 # ── Movement potential ────────────────────────────────────────────────────────
 
+def _interp(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
+    """Linear interpolation with clamping at the endpoints.
+
+    Used by the movement / volume factors to convert what used to be coarse
+    band lookups into smooth piecewise-linear functions. Endpoints below x0
+    return y0; above x1 return y1; in between scale linearly. The previous
+    band-based implementations had discrete jumps at the boundaries (e.g.
+    ATR 1.99% → 1.00, ATR 2.00% → 1.10) that this function smooths out
+    while preserving the same anchor values.
+    """
+    if x <= x0:
+        return y0
+    if x >= x1:
+        return y1
+    t = (x - x0) / (x1 - x0)
+    return y0 + t * (y1 - y0)
+
+
 def _movement_factor(atr_pct: float, bb_width_pct: float) -> float:
     """
     Answers: "if a signal fires, how likely is this stock to actually move?"
@@ -425,28 +443,41 @@ def _movement_factor(atr_pct: float, bb_width_pct: float) -> float:
     A stock in a vol squeeze (narrow BB) may be about to move — but the
     direction is unknown, so we don't boost; we leave it neutral. The boost
     only applies when ATR confirms the stock already moves meaningfully.
-    """
-    # ATR-based score: 5 bands → [0.80, 1.20]
-    if atr_pct >= 0.030:
-        atr_score = 1.20
-    elif atr_pct >= 0.020:
-        atr_score = 1.10
-    elif atr_pct >= 0.010:
-        atr_score = 1.00
-    elif atr_pct >= 0.005:
-        atr_score = 0.90
-    else:
-        atr_score = 0.80
 
-    # BB-width score: wide band means stock is already in motion
-    if bb_width_pct >= 0.12:
-        bb_score = 1.10
-    elif bb_width_pct >= 0.06:
-        bb_score = 1.00
-    elif bb_width_pct >= 0.03:
-        bb_score = 0.95
+    Both sub-scores are piecewise-linear functions of their input (previously
+    quantized into 4-5 discrete bands). Anchor points preserve the original
+    band values so the overall behaviour is unchanged at the band centres.
+    """
+    # ATR-based score: continuous in [0.80, 1.20] anchored to the previous bands.
+    # The anchor map is: 0.5% → 0.80, 1.0% → 0.90, 1.5% → 1.00, 2.5% → 1.10, 3.0%+ → 1.20.
+    # Interpolating between adjacent anchors gives a smooth ATR→score curve.
+    if atr_pct <= 0.005:
+        atr_score = 0.80
+    elif atr_pct <= 0.010:
+        atr_score = _interp(atr_pct, 0.005, 0.010, 0.80, 0.90)
+    elif atr_pct <= 0.015:
+        atr_score = _interp(atr_pct, 0.010, 0.015, 0.90, 1.00)
+    elif atr_pct <= 0.025:
+        atr_score = _interp(atr_pct, 0.015, 0.025, 1.00, 1.10)
+    elif atr_pct <= 0.030:
+        atr_score = _interp(atr_pct, 0.025, 0.030, 1.10, 1.20)
     else:
-        bb_score = 0.88    # very tight BB (squeeze) — movement imminent but direction unclear
+        atr_score = 1.20
+
+    # BB-width score: continuous in [0.88, 1.10].
+    # Anchors: 2% → 0.88 (squeeze), 4.5% → 0.95, 9% → 1.00, 12%+ → 1.10.
+    # The squeeze region remains dampened (direction unclear) — only the
+    # quantization is removed.
+    if bb_width_pct <= 0.02:
+        bb_score = 0.88
+    elif bb_width_pct <= 0.045:
+        bb_score = _interp(bb_width_pct, 0.02, 0.045, 0.88, 0.95)
+    elif bb_width_pct <= 0.09:
+        bb_score = _interp(bb_width_pct, 0.045, 0.09, 0.95, 1.00)
+    elif bb_width_pct <= 0.12:
+        bb_score = _interp(bb_width_pct, 0.09, 0.12, 1.00, 1.10)
+    else:
+        bb_score = 1.10
 
     # Average the two, clamp to [0.80, 1.20]
     raw = (atr_score + bb_score) / 2
@@ -463,19 +494,43 @@ def _volume_factor(vol_ratio: float, abs_combined: float, coherence_ratio: float
     That one shapes the *technical sub-score*. This one asks: given that multiple
     methods are pointing in the same direction, is the market actually trading on it?
 
-    Only applies a meaningful boost when:
-      - Volume is elevated (vol_ratio >= 1.5)
-      - The combined signal is non-trivial (abs_combined >= 0.25)
-      - Methods are at least moderately coherent (coherence_ratio >= 0.5)
-    Otherwise applies a mild dampening for low-volume signals.
+    Smooth implementation (previously a 4-step tier function):
+      - The volume-only base scales linearly from 0.92 (suspiciously low, ≤0.5×)
+        to 1.00 (normal) to 1.15 (boost potential at ≥2×).
+      - The *boost* portion (any contribution above 1.00) is then gated by a
+        quality factor = signal_strength × coherence_quality. The original
+        intent — boosts only apply when volume, signal, AND coherence all
+        line up — is preserved continuously: weak signal or scattered methods
+        smoothly fade the boost back toward 1.00 instead of cliff-edging it.
+      - The dampening side (vol_ratio < 1.0) applies unconditionally, same
+        as before.
+
+    Anchor points preserve the prior tier values: 0.5× vol → 0.92,
+    2.0× vol + strong signal + coherent methods → 1.15.
     """
-    if vol_ratio >= 2.0 and abs_combined >= 0.30 and coherence_ratio >= 0.5:
-        return 1.15
-    if vol_ratio >= 1.5 and abs_combined >= 0.25 and coherence_ratio >= 0.5:
-        return 1.08
+    # Volume-only base — symmetric ramp around 1.0× volume.
     if vol_ratio <= 0.5:
-        return 0.92   # suspiciously low volume — signal may not be market-confirmed
-    return 1.00
+        base = 0.92
+    elif vol_ratio < 1.0:
+        base = _interp(vol_ratio, 0.5, 1.0, 0.92, 1.00)
+    elif vol_ratio < 2.0:
+        base = _interp(vol_ratio, 1.0, 2.0, 1.00, 1.15)
+    else:
+        base = 1.15
+
+    # Below 1.0× volume — dampening applies regardless of signal quality
+    # (the market simply isn't trading on it).
+    if base <= 1.00:
+        return round(base, 3)
+
+    # Above 1.0× — gate the boost magnitude by signal/coherence quality.
+    # signal_q ramps 0 → 1 over abs_combined ∈ [0.20, 0.35]
+    signal_q = _interp(abs_combined,    0.20, 0.35, 0.0, 1.0)
+    # coh_q   ramps 0 → 1 over coherence_ratio ∈ [0.40, 0.60]
+    coh_q    = _interp(coherence_ratio, 0.40, 0.60, 0.0, 1.0)
+    quality  = signal_q * coh_q                            # multiplicative AND
+    boost    = (base - 1.00) * quality
+    return round(1.00 + boost, 3)
 
 
 # ── Interaction adjustments ───────────────────────────────────────────────────

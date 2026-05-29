@@ -677,27 +677,50 @@ def run_pipeline(send_email: bool = False) -> None:
             commodities_list=settings.commodities_list,
         )
 
-    actionable = [
-        r for r in recommendations
-        if r.action in ("BUY", "SELL")
-        and r.confidence >= _confidence_threshold
-        and (r.action != "BUY" or _allow_buys)
-        # Earnings blackout: don't open new positions within 2 days of earnings
-        and (
-            catalyst_timing_context is None
-            or r.ticker not in catalyst_timing_context.earnings_blackout_tickers
+    # ── Actionable filter with per-gate counters ─────────────────────────
+    # Each rec is checked against every gate in order; rejections increment
+    # the corresponding counter so we can see at end-of-run which constraints
+    # are doing the actual filtering vs which never fire.
+    earnings_blackout = (catalyst_timing_context.earnings_blackout_tickers
+                         if catalyst_timing_context else set())
+
+    gate_diag: dict = {
+        "buy_sell_candidates":          0,
+        "dropped_below_threshold":      0,
+        "dropped_buy_blocked":          0,
+        "dropped_earnings_blackout":    0,
+        "actionable_survivors":         0,
+        "confidence_threshold":         round(_confidence_threshold, 2),
+        "allow_buys":                   _allow_buys,
+        "regime":                       (macro_regime_context.regime
+                                          if macro_regime_context else "NEUTRAL"),
+    }
+
+    actionable: List = []
+    for r in recommendations:
+        if r.action not in ("BUY", "SELL"):
+            continue
+        gate_diag["buy_sell_candidates"] += 1
+        # Gate 1 — regime-tightened confidence threshold
+        if r.confidence < _confidence_threshold:
+            gate_diag["dropped_below_threshold"] += 1
+            continue
+        # Gate 2 — BUY block (PANIC / RISK_OFF)
+        if r.action == "BUY" and not _allow_buys:
+            gate_diag["dropped_buy_blocked"] += 1
+            continue
+        # Gate 3 — earnings blackout window
+        if r.ticker in earnings_blackout:
+            gate_diag["dropped_earnings_blackout"] += 1
+            continue
+        actionable.append(r)
+        gate_diag["actionable_survivors"] += 1
+
+    if gate_diag["dropped_earnings_blackout"]:
+        logger.warning(
+            f"[catalyst] Earnings blackout blocked "
+            f"{gate_diag['dropped_earnings_blackout']} actionable(s)"
         )
-    ]
-    if catalyst_timing_context and catalyst_timing_context.earnings_blackout_tickers:
-        blocked = [
-            r.ticker for r in recommendations
-            if r.action in ("BUY", "SELL")
-            and r.ticker in catalyst_timing_context.earnings_blackout_tickers
-        ]
-        if blocked:
-            logger.warning(
-                f"[catalyst] Earnings blackout blocked {len(blocked)} actionable(s): {blocked}"
-            )
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     logger.info(
@@ -720,7 +743,34 @@ def run_pipeline(send_email: bool = False) -> None:
         macro_regime_context=macro_regime_context,
     )
     close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
-    record_new_trades(actionable, signals_by_ticker=signals_by_ticker)
+    trade_diag = record_new_trades(actionable, signals_by_ticker=signals_by_ticker) or {}
+    # Merge per-gate counters from the actionable filter + the trade-entry path
+    # into one diagnostic blob so the user can see at a glance which constraints
+    # are doing the work and which are passive backstops.
+    gate_diag.update({
+        "trade_considered":             int(trade_diag.get("considered", 0)),
+        "trade_skipped_already_open":   int(trade_diag.get("skipped_already_open", 0)),
+        "trade_skipped_correlation_cap": int(trade_diag.get("skipped_correlation_cap", 0)),
+        "trade_skipped_no_price":       int(trade_diag.get("skipped_no_price", 0)),
+        "trade_haircut_applied":        int(trade_diag.get("haircut_applied", 0)),
+        "trade_opened":                 int(trade_diag.get("opened", 0)),
+    })
+    logger.info(
+        "[gates] "
+        f"regime={gate_diag['regime']} threshold={gate_diag['confidence_threshold']:.0%} "
+        f"allow_buys={gate_diag['allow_buys']} | "
+        f"actionable filter: {gate_diag['buy_sell_candidates']} BUY/SELL → "
+        f"survived={gate_diag['actionable_survivors']} "
+        f"(rejected by threshold={gate_diag['dropped_below_threshold']}, "
+        f"BUY-block={gate_diag['dropped_buy_blocked']}, "
+        f"earnings-blackout={gate_diag['dropped_earnings_blackout']}) | "
+        f"trade entry: {gate_diag['trade_considered']} considered → "
+        f"opened={gate_diag['trade_opened']} "
+        f"(already_open={gate_diag['trade_skipped_already_open']}, "
+        f"corr_cap={gate_diag['trade_skipped_correlation_cap']}, "
+        f"no_price={gate_diag['trade_skipped_no_price']}, "
+        f"corr_haircut_applied={gate_diag['trade_haircut_applied']})"
+    )
     log_performance_summary()
     perf = get_performance_for_email()
 
@@ -788,6 +838,7 @@ def run_pipeline(send_email: bool = False) -> None:
             business_cycle_context=business_cycle_context,
             intermarket_context=intermarket_context,
             macro_news_context=macro_news_context,
+            gate_diag=gate_diag,
         )
     else:
         logger.info("Email not configured — skipping.")

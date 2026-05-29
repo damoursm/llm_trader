@@ -39,6 +39,12 @@ from config import settings
 from src.models import MacroNewsContext, MacroNewsTheme, NewsArticle
 
 
+# Fixed seed for the DeepSeek macro-news classifier (OpenAI-compatible API
+# supports the ``seed`` parameter). Combined with temperature=0 this gives
+# near-deterministic regime labels across two runs over the same article set.
+_MACRO_NEWS_SEED = 31337
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache (hourly — matches news cache TTL)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,10 +342,13 @@ def _deepseek_classify(
     )
 
     try:
+        # Determinism: temperature=0 + fixed seed so two runs on the same
+        # filtered headline set produce the same theme classification.
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=0,
+            seed=_MACRO_NEWS_SEED,
             max_tokens=2400,
             response_format={"type": "json_object"},
         )

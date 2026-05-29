@@ -24,9 +24,14 @@ HOLDING_DAYS = 5   # auto-close after this many trading days (Mon–Fri, weekend
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 # Confidence-scaled Kelly-inspired tiers: allocate more capital to higher conviction.
+# The hard per-sector cap was removed in favour of the correlation-aware
+# haircut (see src/performance/correlation.py), which handles cross-sector
+# factor concentration that the GICS-bucket cap missed (e.g. NVDA + AVGO + SMH
+# all loading semis even though SMH lives in the ETF bucket). The sector_key
+# field is still computed on every new trade as a diagnostic — useful for
+# slicing the performance breakdown by sector — but no longer gates entry.
 SIZE_TIER_HALF  = 0.85   # below this → 1.0× (baseline)
 SIZE_TIER_FULL  = 0.92   # 0.85–0.92 → 1.5×; above → 2.0×
-SECTOR_CAP      = 3.0    # max total size units per sector in open positions
 
 
 
@@ -203,7 +208,7 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 # ── Method attribution ────────────────────────────────────────────────────────
 _ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional")
-_METHOD_AGREE_THRESHOLD = 0.10   # minimum |score| to count a method as "having a view"
+_METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
 METHOD_CATEGORIES: Dict[str, List[str]] = {
@@ -561,28 +566,49 @@ def _compute_confidence_ranked(closed_trades: List[dict]) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 def _position_multiplier(confidence: float) -> float:
-    """Map confidence to a position-size multiplier using three tiers.
+    """Map confidence to a position-size multiplier — continuous in [1.0, 2.0].
 
-    Tier    Confidence range   Multiplier
-    ───     ────────────────   ──────────
-    Base    0.78 – 0.85        1.0×
-    Mid     0.85 – 0.92        1.5×
-    High    > 0.92             2.0×
+    Replaces the previous three-tier step function (1.0× / 1.5× / 2.0×)
+    with a piecewise-linear interpolation that pins the same anchor points
+    so the headline endpoints (the lowest actionable conf and the highest
+    realistic conf) still produce 1.0× and 2.0×, but a confidence of 0.86
+    no longer jumps a full 0.5× over 0.85.
+
+        conf ≤ 0.78  → 1.0× (baseline; anything below would have been
+                            filtered out by the actionable gate anyway)
+        conf = 0.85  → 1.50× (former Mid-tier midpoint)
+        conf = 0.92  → 1.85× (former High-tier entry)
+        conf ≥ 0.95  → 2.00× (cap)
+
+    Linear interpolation inside each of those three segments. The result
+    is rounded to 2 decimals for storage stability and so the multiplier
+    composes cleanly with the correlation haircut downstream.
     """
-    if confidence > SIZE_TIER_FULL:
-        return 2.0
-    if confidence > SIZE_TIER_HALF:
-        return 1.5
-    return 1.0
+    if confidence <= 0.78:
+        return 1.00
+    if confidence >= 0.95:
+        return 2.00
+    if confidence <= SIZE_TIER_HALF:        # 0.78 → 0.85 ramps 1.00 → 1.50
+        t = (confidence - 0.78) / (SIZE_TIER_HALF - 0.78)
+        return round(1.00 + t * 0.50, 2)
+    if confidence <= SIZE_TIER_FULL:        # 0.85 → 0.92 ramps 1.50 → 1.85
+        t = (confidence - SIZE_TIER_HALF) / (SIZE_TIER_FULL - SIZE_TIER_HALF)
+        return round(1.50 + t * 0.35, 2)
+    # 0.92 → 0.95 ramps 1.85 → 2.00
+    t = (confidence - SIZE_TIER_FULL) / (0.95 - SIZE_TIER_FULL)
+    return round(1.85 + t * 0.15, 2)
 
 
 def _sector_key(rec: Recommendation) -> str:
-    """Return a sector grouping key for per-sector cap enforcement.
+    """Return a sector grouping key, stored on every new trade as a passive
+    diagnostic (useful for sector-level performance slicing). The per-sector
+    cap that previously consumed this value was removed in favour of the
+    correlation-aware haircut, which catches cross-sector factor concentration
+    (e.g. NVDA + AVGO + SMH) the GICS bucket cap missed.
 
     - Sector ETFs (XLK, XLF …):  the ETF ticker itself (each ETF = its own sector)
     - Commodities (GLD, SLV …):  "COMMODITY"
-    - Stocks:  look up in aggregator._SECTOR_MAP; fall back to "STOCK/<ticker>"
-               so unknown stocks each count independently (no cross-stock cap).
+    - Stocks:  look up in aggregator._SECTOR_MAP; fall back to "STOCK/<ticker>".
     """
     ticker = rec.ticker.upper()
     if rec.type == "COMMODITY" or ticker in [
@@ -611,11 +637,21 @@ def _sector_key(rec: Recommendation) -> str:
 def record_new_trades(
     recommendations: List[Recommendation],
     signals_by_ticker: Optional[dict] = None,
-) -> None:
+) -> dict:
     """Open a new trade for each BUY/SELL recommendation not already open today.
 
-    Position size is confidence-scaled (1×/1.5×/2×) with a per-sector cap of
-    SECTOR_CAP units across all currently open positions.
+    Sizing chain:
+      1. Confidence tier → 1.0× / 1.5× / 2.0× base multiplier.
+      2. Correlation haircut against same-direction open peers (continuous
+         scale-down based on realized pairwise correlations; portfolio-wide
+         hard skip when Σ|ρ|·size exceeds correlation_portfolio_cap).
+
+    The legacy per-sector cap was removed because the correlation haircut
+    handles cross-sector factor concentration better (the GICS bucket cap
+    missed combos like NVDA + AVGO + SMH that share factor exposure across
+    sector boundaries). sector_key is still computed and stored on each
+    trade as a passive diagnostic for sector-level performance slicing.
+
     Per-method signal scores are stored for later attribution analysis.
     """
     trades = _load_trades()
@@ -623,13 +659,6 @@ def record_new_trades(
 
     # Prevent stacking: skip any ticker that already has an OPEN position.
     already_open = {t["ticker"] for t in trades if t["status"] == "OPEN"}
-
-    # Current sector exposure from open positions (sum of size multipliers per sector)
-    sector_exposure: Dict[str, float] = {}
-    for t in trades:
-        if t["status"] == "OPEN":
-            key = t.get("sector_key", f"STOCK/{t['ticker']}")
-            sector_exposure[key] = sector_exposure.get(key, 0.0) + t.get("position_size_multiplier", 1.0)
 
     # Running per-direction list of OPEN positions for correlation sizing.
     # Includes both pre-existing opens AND any trades opened earlier in this
@@ -642,21 +671,35 @@ def record_new_trades(
 
     from src.performance.correlation import correlation_haircut
 
+    # Per-gate counters — surfaced by the pipeline as the run's diagnostic
+    # so the user can see which sizing constraints are actually firing.
+    diag = {
+        "considered":           0,   # BUY/SELL recs received
+        "skipped_already_open": 0,
+        "skipped_correlation_cap": 0,
+        "skipped_no_price":     0,
+        "haircut_applied":      0,   # informational — size reduced, not skipped
+        "opened":               0,
+    }
+
     new_count = 0
     for rec in recommendations:
         if rec.action not in ("BUY", "SELL"):
             continue
+        diag["considered"] += 1
         if rec.ticker in already_open:
+            diag["skipped_already_open"] += 1
             continue
 
         # ── Step 1: confidence tier (base size) ───────────────────────────
         conf_multiplier = _position_multiplier(rec.confidence)
-        sector = _sector_key(rec)
+        sector = _sector_key(rec)  # stored on the trade as a passive diagnostic
 
         # ── Step 2: correlation haircut against same-direction open peers ─
         same_dir_peers = opens_by_direction.get(rec.action, [])
         corr_multiplier, corr_diag = correlation_haircut(rec.ticker, same_dir_peers)
         if corr_diag.get("portfolio_cap_hit"):
+            diag["skipped_correlation_cap"] += 1
             logger.info(
                 f"[tracker] Skipping {rec.ticker} — correlated-exposure cap hit "
                 f"(Σ|ρ|·size={corr_diag['weighted_exposure']:.2f} > "
@@ -665,26 +708,12 @@ def record_new_trades(
             continue
         multiplier = round(conf_multiplier * corr_multiplier, 3)
         if corr_multiplier < 0.999 and corr_diag.get("mean_corr") is not None:
+            diag["haircut_applied"] += 1
             logger.info(
                 f"[tracker] {rec.ticker}: correlation haircut "
                 f"{conf_multiplier:.2f}× × {corr_multiplier:.2f}× = {multiplier:.2f}×  "
                 f"(mean ρ={corr_diag['mean_corr']:+.2f} across {corr_diag['n_pairs']} "
                 f"{rec.action} peer{'s' if corr_diag['n_pairs'] != 1 else ''})"
-            )
-
-        # ── Step 3: sector cap (hard ceiling) ─────────────────────────────
-        current_exposure = sector_exposure.get(sector, 0.0)
-        if current_exposure >= SECTOR_CAP:
-            logger.info(
-                f"[tracker] Skipping {rec.ticker} — sector '{sector}' at cap "
-                f"({current_exposure:.1f}× / {SECTOR_CAP}×)"
-            )
-            continue
-        if current_exposure + multiplier > SECTOR_CAP:
-            multiplier = round(SECTOR_CAP - current_exposure, 2)
-            logger.info(
-                f"[tracker] {rec.ticker}: size reduced to {multiplier}× "
-                f"(sector '{sector}' cap)"
             )
 
         # Capture the exact fetch instant (decision_datetime) AND the
@@ -696,9 +725,11 @@ def record_new_trades(
         executed_at = _execution_iso()
         price = _fetch_price(rec.ticker)
         if price is None:
+            diag["skipped_no_price"] += 1
             logger.warning(f"[tracker] Skipping {rec.ticker} — could not fetch entry price")
             continue
         if price <= 0:
+            diag["skipped_no_price"] += 1
             logger.warning(f"[tracker] Skipping {rec.ticker} — entry price is {fmt_price(price)} (warrant/delisted/negative?)")
             continue
 
@@ -792,8 +823,8 @@ def record_new_trades(
         # Register the just-opened trade as a same-direction peer so the next
         # candidate in this batch sees it for correlation purposes.
         opens_by_direction.setdefault(rec.action, []).append(new_trade)
-        sector_exposure[sector] = current_exposure + multiplier
         new_count += 1
+        diag["opened"] += 1
         corr_log = ""
         if corr_diag.get("mean_corr") is not None:
             corr_log = (
@@ -808,6 +839,7 @@ def record_new_trades(
 
     _save_trades(trades)
     logger.info(f"[tracker] {new_count} new trade(s) recorded")
+    return diag
 
 
 def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> int:
@@ -933,8 +965,25 @@ def _evaluate_decay(
         if decay > settings.signal_decay_drop_threshold:
             return "signal_decay"
 
-    # 4. Confidence loss
-    if today_confidence < settings.signal_decay_confidence_floor:
+    # 4. Confidence loss — entry-relative floor with absolute backstop.
+    #
+    # effective_floor = max(absolute_floor, relative_factor × entry_confidence)
+    #
+    # Entry confidence comes from signal_at_entry.confidence (the AGGREGATOR
+    # confidence captured at trade open), which is the right apples-to-apples
+    # comparator with today's aggregator confidence. Trade dict's "confidence"
+    # field is Claude's post-tilt number and is NOT used here.
+    #
+    # Legacy trades without signal_at_entry fall back to the absolute floor
+    # only (old behaviour).
+    entry_conf_raw = (entry or {}).get("confidence")
+    relative_factor = float(settings.signal_decay_confidence_floor_relative)
+    absolute_floor  = float(settings.signal_decay_confidence_floor)
+    if entry_conf_raw is None:
+        effective_floor = absolute_floor
+    else:
+        effective_floor = max(absolute_floor, relative_factor * float(entry_conf_raw))
+    if today_confidence < effective_floor:
         return "confidence_loss"
 
     return None
@@ -1005,16 +1054,29 @@ def monitor_open_positions(
         trade["exit_reason"]            = reason
         closed_count += 1
 
-        # Decay logging: show entry vs today combined for context
+        # Decay logging: show entry vs today combined + effective conf floor for context
         entry = trade.get("signal_at_entry") or {}
         ec = entry.get("combined_score")
+        ef_conf = entry.get("confidence")
         tc = float(getattr(today_signal, "combined_score", 0.0)) if today_signal else None
         cf = float(getattr(today_signal, "confidence", 0.0)) if today_signal else None
         regime = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
+        # Recompute the effective confidence floor for this trade so the log line
+        # explains why confidence_loss fired (or what it was tested against).
+        if ef_conf is None:
+            eff_floor = float(settings.signal_decay_confidence_floor)
+            floor_kind = "abs"
+        else:
+            rel_floor = float(settings.signal_decay_confidence_floor_relative) * float(ef_conf)
+            abs_floor = float(settings.signal_decay_confidence_floor)
+            eff_floor = max(abs_floor, rel_floor)
+            floor_kind = "rel" if rel_floor >= abs_floor else "abs"
         logger.info(
             f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
             f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  "
-            f"entry_combined={ec}  today_combined={tc}  today_conf={cf}  regime={regime}"
+            f"entry_combined={ec}  today_combined={tc}  "
+            f"entry_conf={ef_conf}  today_conf={cf}  "
+            f"conf_floor={eff_floor:.2f}({floor_kind})  regime={regime}"
         )
 
     if closed_count:
@@ -1696,7 +1758,11 @@ def _hypothetical_trades_for_method(method: str, closed: List[dict]) -> List[dic
     out: List[dict] = []
     for trade in closed:
         score = trade.get("method_scores", {}).get(method, 0.0)
-        if abs(score) < _METHOD_AGREE_THRESHOLD:
+        # Skip methods with no view: either exactly zero (degenerate "no opinion")
+        # or below the configured floor. The exact-zero guard is required because
+        # _METHOD_AGREE_THRESHOLD = 0 would otherwise pass score == 0.0 through
+        # to the BUY/SELL solo classifier and mis-tag it as SELL.
+        if score == 0.0 or abs(score) < _METHOD_AGREE_THRESHOLD:
             continue
         actual = trade.get("action", "BUY")
         solo   = "BUY" if score > 0 else "SELL"
@@ -1847,7 +1913,10 @@ def compute_method_eval_stats(split: Optional[str] = None) -> dict:
         all_entries: List[tuple] = []
         for trade in closed:
             score = trade["method_scores"].get(method, 0.0)
-            if abs(score) < _METHOD_AGREE_THRESHOLD:
+            # Same exact-zero guard as _hypothetical_trades_for_method —
+            # required when _METHOD_AGREE_THRESHOLD = 0 so a literal zero
+            # (no view) doesn't get mis-tagged as a SELL signal below.
+            if score == 0.0 or abs(score) < _METHOD_AGREE_THRESHOLD:
                 continue
             actual_action = trade.get("action", "BUY")
             solo_action   = "BUY" if score > 0 else "SELL"

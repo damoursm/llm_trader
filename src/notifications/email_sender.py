@@ -24,8 +24,9 @@ from typing import Dict, List, Optional
 
 from config import settings
 from src.models import NewsArticle, Recommendation, InsiderTrade, TickerSignal
-from src.utils import now_et, fmt_et, ET
+from src.utils import now_et, fmt_et, fmt_iso_et, ET
 from src.performance.tracker import fmt_price
+from src.performance.spread import fmt_price_full
 from src.charts.builder import (
     build_signals_overview,
     build_stock_chart,
@@ -290,8 +291,8 @@ HTML_TEMPLATE = """
 <table class="pt">
   <thead>
     <tr>
-      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
-      <th>Current</th><th>P&amp;L</th><th>Size</th><th>Corr</th><th>Days</th>
+      <th>Ticker</th><th>Action</th><th>Entry (date / time ET)</th><th>Entry Px</th>
+      <th>Mark (time ET)</th><th>Current Px</th><th>P&amp;L</th><th>Size</th><th>Corr</th><th>Days</th>
     </tr>
   </thead>
   <tbody>
@@ -302,9 +303,16 @@ HTML_TEMPLATE = """
     <tr>
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.action }}</td>
-      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ fmt_price(t.entry_price) }}</td>
-      <td>${{ fmt_price(t.current_price) }}</td>
+      <td style="color:#94a3b8;font-size:11px;">
+        {{ t.entry_date }}
+        {% if t.entry_datetime %}<br><span style="color:#64748b;font-size:10px;">exec {{ fmt_iso_et(t.entry_datetime, include_date=false) }}</span>{% endif %}
+        {% if t.decision_datetime %}<br><span style="color:#475569;font-size:10px;">decided {{ fmt_iso_et(t.decision_datetime, include_date=false) }}</span>{% endif %}
+      </td>
+      <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.entry_price) }}</td>
+      <td style="color:#94a3b8;font-size:11px;">
+        {% if t.current_price_datetime %}{{ fmt_iso_et(t.current_price_datetime, include_date=false) }}{% else %}&mdash;{% endif %}
+      </td>
+      <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.current_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
         {{ "%+.2f"|format(t.return_pct) }}%
       </td>
@@ -335,8 +343,10 @@ HTML_TEMPLATE = """
 <table class="pt">
   <thead>
     <tr>
-      <th>Ticker</th><th>Action</th><th>Date</th><th>Entry</th>
-      <th>Exit</th><th>P&amp;L</th><th>Size</th><th>Days</th>
+      <th>Ticker</th><th>Action</th>
+      <th>Entry (date / time ET)</th><th>Entry Px</th>
+      <th>Exit (date / time ET)</th><th>Exit Px</th>
+      <th>P&amp;L</th><th>Size</th><th>Days</th><th>Reason</th>
     </tr>
   </thead>
   <tbody>
@@ -345,9 +355,18 @@ HTML_TEMPLATE = """
     <tr>
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.action }}</td>
-      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ fmt_price(t.entry_price) }}</td>
-      <td>${{ fmt_price(t.exit_price) }}</td>
+      <td style="color:#94a3b8;font-size:11px;">
+        {{ t.entry_date }}
+        {% if t.entry_datetime %}<br><span style="color:#64748b;font-size:10px;">exec {{ fmt_iso_et(t.entry_datetime, include_date=false) }}</span>{% endif %}
+        {% if t.decision_datetime %}<br><span style="color:#475569;font-size:10px;">decided {{ fmt_iso_et(t.decision_datetime, include_date=false) }}</span>{% endif %}
+      </td>
+      <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.entry_price) }}</td>
+      <td style="color:#94a3b8;font-size:11px;">
+        {{ t.exit_date }}
+        {% if t.exit_datetime %}<br><span style="color:#64748b;font-size:10px;">exec {{ fmt_iso_et(t.exit_datetime, include_date=false) }}</span>{% endif %}
+        {% if t.exit_decision_datetime %}<br><span style="color:#475569;font-size:10px;">decided {{ fmt_iso_et(t.exit_decision_datetime, include_date=false) }}</span>{% endif %}
+      </td>
+      <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.exit_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
         {{ "%+.2f"|format(t.return_pct) }}%
       </td>
@@ -355,6 +374,7 @@ HTML_TEMPLATE = """
         {{ mul }}×
       </td>
       <td>{{ t.days_held }}d</td>
+      <td style="color:#64748b;font-size:11px;">{{ t.exit_reason if t.exit_reason else '—' }}</td>
     </tr>
     {% endfor %}
   </tbody>
@@ -448,9 +468,12 @@ HTML_TEMPLATE = """
           {{ act }}
         </span>
       </td>
-      <td style="color:#94a3b8;">{{ t.entry_date }}</td>
-      <td>${{ fmt_price(t.entry_price) }}</td>
-      <td>${{ fmt_price(t.current_price) }}</td>
+      <td style="color:#94a3b8;font-size:11px;">
+        {{ t.entry_date }}
+        {% if t.entry_datetime %}<br><span style="color:#64748b;font-size:10px;">opened {{ fmt_iso_et(t.entry_datetime, include_date=false) }}</span>{% endif %}
+      </td>
+      <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.entry_price) }}</td>
+      <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.current_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else ('neg' if t.return_pct < 0 else '') }}"
           style="text-align:right;font-weight:700;">
         {{ "%+.2f"|format(t.return_pct) }}%
@@ -1624,6 +1647,56 @@ HTML_TEMPLATE = """
     <span style="font-size:12px;color:#64748b;">score={{ "%.2f"|format(mrc.composite_score) }} &bull; threshold={{ "%.0f"|format(mrc.confidence_threshold * 100) }}%</span>
   </div>
   <div class="synth">{{ mrc.summary }}</div>
+
+  {# ── Gate Diagnostics — which constraints actually fired this run ── #}
+  {% if gate_diag %}
+  <div style="margin-top:14px;padding-top:12px;border-top:1px dashed #334155;">
+    <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">
+      Gate Diagnostics — what filtered this run
+    </div>
+    {# helpers #}
+    {% set gd = gate_diag %}
+    {% macro chip(label, count, info=False) -%}
+      {% set on = count > 0 %}
+      {% if info %}
+        {% set color = '#60a5fa' if on else '#475569' %}
+      {% else %}
+        {% set color = '#f87171' if on else '#475569' %}
+      {% endif %}
+      <span style="display:inline-block;margin:2px 4px 2px 0;padding:3px 9px;border-radius:4px;
+                   border:1px solid {{ color }};background:#0f172a;font-size:11px;
+                   color:{{ color }};font-weight:{{ '700' if on else '500' }};">
+        {{ label }}: <strong>{{ count }}</strong>
+      </span>
+    {%- endmacro %}
+    <div style="font-size:11px;color:#64748b;margin-bottom:4px;">
+      <strong style="color:#94a3b8;">Actionable filter</strong>
+      &nbsp;({{ gd.buy_sell_candidates }} BUY/SELL candidates &rarr;
+      <strong style="color:#4ade80;">{{ gd.actionable_survivors }}</strong> survived;
+      threshold {{ "%.0f"|format(gd.confidence_threshold * 100) }}%, allow_buys={{ gd.allow_buys }}):
+    </div>
+    <div>
+      {{ chip("conf < threshold", gd.dropped_below_threshold) }}
+      {{ chip("BUYs blocked (PANIC/RISK_OFF)", gd.dropped_buy_blocked) }}
+      {{ chip("earnings blackout", gd.dropped_earnings_blackout) }}
+    </div>
+    <div style="font-size:11px;color:#64748b;margin:10px 0 4px 0;">
+      <strong style="color:#94a3b8;">Trade entry</strong>
+      &nbsp;({{ gd.trade_considered }} candidates &rarr;
+      <strong style="color:#4ade80;">{{ gd.trade_opened }}</strong> opened):
+    </div>
+    <div>
+      {{ chip("ticker already open", gd.trade_skipped_already_open) }}
+      {{ chip("correlation cap hit (Σ|ρ|·size > cap)", gd.trade_skipped_correlation_cap) }}
+      {{ chip("no entry price", gd.trade_skipped_no_price) }}
+      {{ chip("correlation haircut applied", gd.trade_haircut_applied, info=True) }}
+    </div>
+    <div style="font-size:10px;color:#475569;margin-top:8px;">
+      Red chip = candidate rejected. Blue chip = applied but did not reject. Use these to spot
+      which constraints are load-bearing day to day vs which are passive backstops.
+    </div>
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -5196,6 +5269,7 @@ def send_recommendations(
     business_cycle_context=None,    # Optional[BusinessCycleContext]    — avoid circular import
     intermarket_context=None,       # Optional[IntermarketContext]       — avoid circular import
     macro_news_context=None,        # Optional[MacroNewsContext]         — avoid circular import
+    gate_diag: Optional[dict] = None,  # per-run gate-rejection counters
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -5338,7 +5412,9 @@ def send_recommendations(
 
     html_body = Template(HTML_TEMPLATE).render(
         fmt_et=fmt_et,
+        fmt_iso_et=fmt_iso_et,
         fmt_price=fmt_price,
+        fmt_price_full=fmt_price_full,
         type_colors=TYPE_COLOR,
         generated_at=now_str,
         total=total_analysed or len(all_recs),
@@ -5453,6 +5529,8 @@ def send_recommendations(
         intermarket_context=intermarket_context,
         # Macro News Regime (geopolitics / oil / tariffs / policy)
         macro_news_context=macro_news_context,
+        # Per-run gate-rejection diagnostics
+        gate_diag=gate_diag or {},
     )
 
     # ── Plain-text fallback ────────────────────────────────────────────────
