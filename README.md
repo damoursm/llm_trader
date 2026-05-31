@@ -80,6 +80,13 @@ python main.py --email
 python main.py --schedule
 ```
 
+**Show how past recommendations actually performed**
+
+```bash
+python main.py --report            # print the performance scorecard
+python main.py --report --email    # also email the scorecard
+```
+
 ## Output
 
 Each run prints a summary to the console and (optionally) sends an HTML email with:
@@ -87,6 +94,23 @@ Each run prints a summary to the console and (optionally) sends an HTML email wi
 - Ticker, recommended action (BUY/SELL/HOLD/WATCH), and confidence score
 - Rationale combining sentiment and technical signals
 - Color-coded action badges
+- A **performance section** showing the *realized* returns of past recommendations (see below)
+
+## Performance Tracking
+
+Every recommendation is logged to a local SQLite database (`data/performance.db`)
+along with the live price and the sentiment/technical scores that drove it. On
+each run, any past recommendation that has "matured" is graded against its
+**realized close-to-close forward return** at 1- and 5-trading-day horizons.
+
+Returns are *signed by the call* — a BUY counts as a hit when the price rises, a
+SELL when it falls — so a positive number always means the call was directionally
+right. These measured returns are what appear in the console summary, the email,
+and `python main.py --report`. Nothing is estimated or hard-coded: the numbers
+come straight from observed prices, giving you an honest hit rate to judge (and
+later tune) the signal logic against.
+
+> The database is git-ignored and created automatically on first run.
 
 ## Logs
 
@@ -113,6 +137,9 @@ llm_trader/
     │   └── claude_analyst.py   # Final LLM recommendations
     ├── signals/
     │   └── aggregator.py       # Combines sentiment + technical
+    ├── performance/
+    │   ├── store.py            # SQLite recommendation/return log
+    │   └── scorer.py           # Grades past calls vs realized returns
     ├── scheduler/
     │   └── runner.py           # APScheduler automation
     └── notifications/

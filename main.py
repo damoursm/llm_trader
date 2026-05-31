@@ -6,6 +6,8 @@ Usage:
     python main.py              # Run once now (no email)
     python main.py --email      # Run once now (with email)
     python main.py --schedule   # Start scheduled runner
+    python main.py --report     # Show realized performance of past calls
+    python main.py --report --email   # ...and email the performance report
 """
 
 import argparse
@@ -34,9 +36,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LLM Trader — AI-powered market analysis")
     parser.add_argument("--email", action="store_true", help="Send email after analysis")
     parser.add_argument("--schedule", action="store_true", help="Run on schedule (market hours)")
+    parser.add_argument("--report", action="store_true", help="Show realized performance of past recommendations")
     args = parser.parse_args()
 
-    if args.schedule:
+    if args.report:
+        from src.performance.scorer import score_matured, build_scorecard
+        from src.pipeline import _print_scorecard
+        score_matured()
+        scorecard = build_scorecard()
+        print("\n" + "=" * 60)
+        print("  LLM TRADER — PERFORMANCE REPORT")
+        print("=" * 60)
+        _print_scorecard(scorecard)
+        if args.email:
+            from src.notifications.email_sender import send_performance_report
+            send_performance_report(scorecard)
+    elif args.schedule:
         from src.scheduler.runner import start_scheduler
         start_scheduler()
     else:

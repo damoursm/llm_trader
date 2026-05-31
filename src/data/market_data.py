@@ -72,3 +72,23 @@ def get_history(ticker: str, period: str = "1mo") -> pd.DataFrame:
             time.sleep(2.0)
     logger.warning(f"get_history failed for {ticker} after retries")
     return pd.DataFrame()
+
+
+def get_history_range(ticker: str, start, end) -> pd.DataFrame:
+    """Return daily OHLCV history between ``start`` and ``end`` (date or str).
+
+    Used by the performance scorer to grade past recommendations against their
+    realized close-to-close forward return.
+    """
+    for attempt in range(3):
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(start=start, end=end, interval="1d")
+            if not df.empty:
+                return df
+        except Exception as e:
+            logger.debug(f"get_history_range {ticker} attempt {attempt + 1} failed: {e}")
+        if attempt < 2:
+            time.sleep(2.0)
+    logger.warning(f"get_history_range failed for {ticker} after retries")
+    return pd.DataFrame()

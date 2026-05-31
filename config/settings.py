@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     schedule_midday: str = "0 12 * * 1-5"
     schedule_close: str = "30 16 * * 1-5"
 
+    # Performance tracking (Priority 0 feedback loop)
+    performance_db_path: str = "data/performance.db"
+
     @property
     def recipients_list(self) -> List[str]:
         return [r.strip() for r in self.email_recipients.split(",") if r.strip()]
