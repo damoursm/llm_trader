@@ -1,41 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv/Scripts/pip install:*)",
-      "Bash(python -c \":*)",
-      "Read(//mnt/c/Users/mathi/PycharmProjects/**)",
-      "Bash(python -c \"from src.data.fred import fetch_macro_context; from src.models import MacroContext; print\\('OK'\\)\")",
-      "Bash(python -c \"from src.pipeline import run_pipeline; from src.analysis.claude_analyst import generate_recommendations; print\\('OK'\\)\")",
-      "Bash(python -c ':*)",
-      "Bash(python:*)",
-      "Bash(ls cache/gex_*.json)",
-      "Bash(ls /mnt/c/Users/mathi/PycharmProjects/llm_trader/cache/credit_*.json)",
-      "Bash(del \"cache\\\\bond_internals_2026-04-18.json\")",
-      "Bash(ENABLE_FETCH_DATA=false python main.py)",
-      "Bash(wait)",
-      "Bash(Remove-Item *)",
-      "Bash(del _move_attribution.py)",
-      "PowerShell(\\(Get-Content C:\\\\Users\\\\mathi\\\\PycharmProjects\\\\llm_trader\\\\src\\\\performance\\\\tracker.py | Measure-Object -Line\\).Lines)",
-      "Bash(awk NR>=1300 && NR<=1500 *)",
-      "Bash(awk NR>=1500 && NR<=1700 *)",
-      "Bash(git restore *)",
-      "Bash(git check-ignore *)",
-      "Bash(ls scripts *)",
-      "Bash(ls src/performance/risk.py)",
-      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA\" ENABLE_CHARTS=false timeout 300 python main.py)",
-      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA\" ENABLE_CHARTS=false timeout 360 python main.py)",
-      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA\" ENABLE_CHARTS=false timeout 420 python main.py)",
-      "Bash(STOCK_WATCHLIST=\"MSFT,AAPL,TSLA,NVDA,INTC,AMD\" ENABLE_CHARTS=false timeout 420 python main.py)",
-      "Bash(grep -nE \"3K\\\\. Cointegration|Step 3K|\\\\| Cointegration \\\\||\\\\| \\\\`coint\\\\` \\\\|\" README.md)",
-      "Bash(,)",
-      "Bash(grep -nE \"3K\\\\. Cointegration|coint`, `cross_sectional|Cointegration Pairs, Smart Money\" CLAUDE.md)",
-      "Bash(PYTHONUTF8=1 python -)",
-      "Bash(powershell -NoProfile -Command 'Get-ChildItem -Recurse -File -Path . -Exclude *.pyc | Where-Object { $_.FullName -notmatch '\\\\''\\\\\\\\.git\\\\\\\\|\\\\\\\\cache\\\\\\\\|\\\\\\\\logs\\\\\\\\|__pycache__|\\\\\\\\.venv\\\\\\\\|\\\\\\\\venv\\\\\\\\'\\\\'' -and $_.LastWriteTime -gt \\(Get-Date\\).AddDays\\(-3\\) } | Sort-Object LastWriteTime -Descending | Select-Object -First 40 LastWriteTime, FullName | Format-Table -AutoSize -Wrap')",
       "Bash(.venv/Scripts/python.exe *)",
-      "Bash(grep -nE \"RECOMMENDATIONS|---|conf=|^[[:space:]]+[A-Z]{2,6} [A-Z]+\" \"C:\\\\Users\\\\mathi\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-mathi-PycharmProjects-llm-trader\\\\09e95595-9aca-4cc2-984a-dde3f727041f\\\\tasks\\\\b1aeu1hqv.output\")",
-      "Bash(awk NR>=540 && NR<=580 *)",
-      "Bash(awk NR>=575 && NR<=603 *)",
-      "Bash(awk NR>=363 && NR<=445 *)"
+      "Bash(git --no-pager diff --stat)",
+      "Bash(git --no-pager diff -- main.py config/settings.py src/analysis/claude_analyst.py src/analysis/sentiment.py)",
+      "PowerShell(try { $pids = \\(Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction Stop\\).OwningProcess | Select-Object -Unique; $pids | ForEach-Object { Stop-Process -Id $_ -Force; \"stopped dashboard PID $_\" } } catch { \"no listener on 8050 \\(already stopped\\)\" })",
+      "Bash(curl -s --retry 40 --retry-delay 1 --retry-connrefused -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/)"
     ]
   }
 }

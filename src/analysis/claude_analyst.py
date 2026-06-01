@@ -19,6 +19,20 @@ _DEEPSEEK_ANALYST_SEED = 4242
 _client = None
 _deepseek_analyst_client = None
 
+# Records which engine produced the most recent synthesis, for run metadata.
+# provider ∈ {"anthropic", "deepseek", "rule-based", None}; model is the exact id.
+_LAST_SYNTHESIS_META: dict = {"provider": None, "model": None}
+
+
+def get_last_synthesis_meta() -> dict:
+    """Return the engine that generated the most recent recommendations."""
+    return dict(_LAST_SYNTHESIS_META)
+
+
+def _set_synthesis_meta(provider: Optional[str], model: Optional[str] = None) -> None:
+    global _LAST_SYNTHESIS_META
+    _LAST_SYNTHESIS_META = {"provider": provider, "model": model}
+
 
 def _get_client() -> anthropic.Anthropic:
     global _client
@@ -2755,6 +2769,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
             analyst_source = _DEEPSEEK_ANALYST_MODEL
         except Exception as ds_err:
             logger.error(f"[claude] DeepSeek fallback also failed: {ds_err}")
+            _set_synthesis_meta("rule-based")
             return _fallback_recommendations(signals)
 
     # ── Step 3: parse and build recommendations ────────────────────────────
@@ -2773,6 +2788,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
         last_brace = raw.rfind("}")
         if last_brace == -1:
             logger.error(f"[claude] Could not parse {analyst_source} response")
+            _set_synthesis_meta("rule-based")
             return _fallback_recommendations(signals)
         repaired = raw[:last_brace + 1].rstrip().rstrip(",") + "]"
         if not repaired.startswith("["):
@@ -2781,6 +2797,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
             data = json.loads(repaired)
         except json.JSONDecodeError:
             logger.error(f"[claude] Could not repair {analyst_source} response")
+            _set_synthesis_meta("rule-based")
             return _fallback_recommendations(signals)
         logger.warning(
             f"[claude] {analyst_source} truncated response repaired — "
@@ -2815,6 +2832,10 @@ Return ALL tickers from the input. No markdown, JSON only."""
             f"— filled with rule-based fallback: {', '.join(s.ticker for s in missing)}"
         )
 
+    _set_synthesis_meta(
+        "deepseek" if analyst_source == _DEEPSEEK_ANALYST_MODEL else "anthropic",
+        analyst_source,
+    )
     logger.info(f"Generated {len(recommendations)} recommendations via {analyst_source}")
     return recommendations
 

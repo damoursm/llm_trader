@@ -12,11 +12,12 @@ Precision controls:
 
 import json
 import math
+import threading
 import anthropic
 from datetime import datetime, timezone
 from openai import OpenAI
 from loguru import logger
-from typing import List
+from typing import List, Optional
 from config import settings
 from src.models import NewsArticle
 
@@ -27,6 +28,34 @@ _haiku_client = None
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"       # DeepSeek V3
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+# Thread-safe tally of which provider answered each per-ticker sentiment call this
+# run (sentiment runs concurrently across tickers). Surfaced to the pipeline as the
+# run's llm_sentiment_provider so silent DeepSeek→Haiku fallbacks are observable.
+_PROVIDER_COUNTS: dict = {}
+_PROVIDER_LOCK = threading.Lock()
+
+
+def reset_sentiment_providers() -> None:
+    with _PROVIDER_LOCK:
+        _PROVIDER_COUNTS.clear()
+
+
+def _record_sentiment_provider(provider: str) -> None:
+    with _PROVIDER_LOCK:
+        _PROVIDER_COUNTS[provider] = _PROVIDER_COUNTS.get(provider, 0) + 1
+
+
+def get_sentiment_provider_summary() -> Optional[str]:
+    """Compact summary of providers used this run, e.g. 'deepseek×40, anthropic×2'.
+
+    Returns None when no per-ticker sentiment LLM call was made this run.
+    """
+    with _PROVIDER_LOCK:
+        if not _PROVIDER_COUNTS:
+            return None
+        items = sorted(_PROVIDER_COUNTS.items(), key=lambda kv: -kv[1])
+        return ", ".join(f"{name}×{n}" for name, n in items)
 
 # Fixed seed for OpenAI-compatible APIs (DeepSeek). Combined with temperature=0
 # this gives near-deterministic output across runs for the same prompt — the
@@ -198,6 +227,7 @@ Respond with JSON only, no markdown."""
             )
             raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (deepseek-v3, {len(to_score)} articles)")
+            _record_sentiment_provider("deepseek")
         except Exception as e:
             logger.warning(f"{ticker} DeepSeek failed, falling back to Haiku: {e}")
 
@@ -215,8 +245,10 @@ Respond with JSON only, no markdown."""
             )
             raw_score, rationale = _parse_response(message.content[0].text.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (haiku-fallback, {len(to_score)} articles)")
+            _record_sentiment_provider("anthropic")
         except Exception as e:
             logger.error(f"Sentiment analysis failed for {ticker}: {e}")
+            _record_sentiment_provider("none")
             return 0.0, f"Analysis error: {e}"
 
     # --- Precision adjustments ---

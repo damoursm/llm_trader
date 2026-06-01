@@ -21,6 +21,12 @@ ta==0.11.0
 plotly==5.24.1
 kaleido==0.2.1
 
+# Database (single source of truth: trades, recommendations, run metadata)
+duckdb==1.5.3
+
+# Monitoring dashboard
+dash==4.1.0
+
 # Scheduling
 apscheduler==3.11.0
 

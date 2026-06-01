@@ -30,6 +30,7 @@ from loguru import logger
 import yfinance as yf
 
 from config import settings
+from src.db import repo
 from src.performance.daily_nav import compute_compound_return
 from src.performance.spread import _pct_return, fmt_price
 
@@ -83,26 +84,28 @@ def _normalize_loaded(trades: List[dict]) -> List[dict]:
 
 
 def _load() -> List[dict]:
-    if not HYPOTHETICAL_FILE.exists():
-        return []
+    """Load the hypothetical book from DuckDB (source of truth).
+
+    One-time safety net: seed from the legacy ``cache/hypothetical_trades.json``
+    if the DB table is empty (mirrors ``tracker._load_trades``).
+    """
     try:
-        return _normalize_loaded(json.loads(HYPOTHETICAL_FILE.read_text(encoding="utf-8")))
+        trades = repo.load_hypothetical()
+        if not trades and HYPOTHETICAL_FILE.exists():
+            legacy = json.loads(HYPOTHETICAL_FILE.read_text(encoding="utf-8"))
+            if legacy:
+                repo.save_hypothetical(legacy)
+                logger.info(f"[hypothetical] Seeded DuckDB from {HYPOTHETICAL_FILE} ({len(legacy)} trades)")
+                return _normalize_loaded(legacy)
+        return _normalize_loaded(trades)
     except Exception as e:
         logger.warning(f"[hypothetical] Could not load: {e}")
         return []
 
 
 def _save(trades: List[dict]) -> None:
-    """Persist hypothetical trades, skipping the write when content is unchanged."""
-    HYPOTHETICAL_FILE.parent.mkdir(exist_ok=True)
-    new_content = json.dumps(trades, indent=2, default=str)
-    if HYPOTHETICAL_FILE.exists():
-        try:
-            if HYPOTHETICAL_FILE.read_text(encoding="utf-8") == new_content:
-                return
-        except Exception:
-            pass
-    HYPOTHETICAL_FILE.write_text(new_content, encoding="utf-8")
+    """Persist hypothetical trades to DuckDB (full-replace of the table)."""
+    repo.save_hypothetical(trades)
 
 
 def _now_iso() -> str:

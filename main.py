@@ -6,6 +6,7 @@ Usage:
     python main.py              # Run once now (no email)
     python main.py --email      # Run once now (with email)
     python main.py --schedule   # Start scheduled runner
+    python main.py --dashboard  # Launch the monitoring dashboard (rationale · methods · returns)
 """
 
 import argparse
@@ -40,9 +41,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LLM Trader — AI-powered market analysis")
     parser.add_argument("--email", action="store_true", help="Send email after analysis")
     parser.add_argument("--schedule", action="store_true", help="Run on schedule (market hours)")
+    parser.add_argument("--dashboard", action="store_true", help="Launch the monitoring dashboard (Plotly Dash)")
     args = parser.parse_args()
 
-    if args.schedule:
+    if args.dashboard:
+        from dashboard.app import run as run_dashboard
+        run_dashboard()
+    elif args.schedule:
         from src.scheduler.runner import start_scheduler
         start_scheduler()
     else:

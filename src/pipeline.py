@@ -1,5 +1,8 @@
 """Main analysis pipeline: fetch → analyse → recommend → notify."""
 
+import hashlib
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 from datetime import datetime, timezone
@@ -11,7 +14,7 @@ from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
 from src.data.trending import get_trending_tickers
 from src.signals.aggregator import build_signals
-from src.analysis.claude_analyst import generate_recommendations
+from src.analysis.claude_analyst import generate_recommendations, get_last_synthesis_meta
 from src.data.insider_trades import fetch_insider_trades, get_tickers_from_smart_money
 from src.data.eight_k import fetch_8k_articles
 from src.data.google_trends import fetch_google_trends
@@ -57,23 +60,114 @@ from src.data.cluster_watchlist import (
 )
 from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
+from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary
 from src.notifications.email_sender import send_recommendations
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions, _method_scores_from_signal, _methods_agreeing, _dominant_method
+from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
-from src.charts.report import save_html_report
 
 
 # ---------------------------------------------------------------------------
 # Fetch helpers (one per data source, called from the thread pool)
 # ---------------------------------------------------------------------------
 
+# Per-run record of every data source touched via _safe — the "APIs used" log.
+# Thread-safe because _safe runs inside the data-fetch ThreadPoolExecutor.
+_SOURCE_LOG: list = []
+_SOURCE_LOCK = threading.Lock()
+
+
+def _reset_source_log() -> None:
+    global _SOURCE_LOG
+    with _SOURCE_LOCK:
+        _SOURCE_LOG = []
+
+
+def _snapshot_source_log() -> list:
+    with _SOURCE_LOCK:
+        return list(_SOURCE_LOG)
+
+
 def _safe(label: str, fn, *args, **kwargs):
-    """Run fn; log warning and return None on any exception."""
+    """Run fn; log warning and return None on any exception.
+
+    Records the per-source outcome (ok / error / duration) into the per-run
+    source log so the run's 'APIs used' record can be persisted to DuckDB.
+    """
+    t0 = time.time()
+    ok, err, result = True, None, None
     try:
-        return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
     except Exception as e:
+        ok, err = False, str(e)
         logger.warning(f"[{label}] fetch failed: {e}")
-        return None
+    finally:
+        with _SOURCE_LOCK:
+            _SOURCE_LOG.append({
+                "label": label,
+                "ok": ok,
+                "error": err,
+                "duration_s": round(time.time() - t0, 3),
+            })
+    return result
+
+
+def _persist_run(run_id, start, finished, all_tickers, recommendations, actionable,
+                 gate_diag, market_mode_context, macro_regime_context,
+                 confidence_threshold, allow_buys, signals_by_ticker) -> None:
+    """Write the run, its per-source 'APIs used' record, and every recommendation
+    (with method attribution + the LLM provider that synthesised it) to DuckDB."""
+    try:
+        actionable_ids = {id(r) for r in actionable}
+        provider = get_last_synthesis_meta().get("provider")
+
+        rec_rows = []
+        for r in recommendations:
+            scores = _method_scores_from_signal(r.ticker, r.direction, signals_by_ticker)
+            gen_at = r.generated_at
+            rec_rows.append({
+                "rec_id": hashlib.sha1(f"{run_id}|{r.ticker}".encode("utf-8")).hexdigest()[:16],
+                "run_id": run_id,
+                "generated_at": gen_at.isoformat() if hasattr(gen_at, "isoformat") else str(gen_at),
+                "ticker": r.ticker,
+                "type": r.type,
+                "direction": r.direction,
+                "action": r.action,
+                "confidence": r.confidence,
+                "time_horizon": r.time_horizon,
+                "rationale": r.rationale,
+                "actionable": id(r) in actionable_ids,
+                "dominant_method": _dominant_method(scores, r.direction),
+                "methods_agreeing": _methods_agreeing(scores, r.direction),
+                "contributing_scores": scores,
+                "llm_provider": provider,
+            })
+
+        repo.insert_run({
+            "run_id": run_id,
+            "started_at": start.isoformat(),
+            "finished_at": finished.isoformat(),
+            "elapsed_s": (finished - start).total_seconds(),
+            "market_mode": getattr(market_mode_context, "mode", None),
+            "macro_regime": getattr(macro_regime_context, "regime", None),
+            "confidence_threshold": confidence_threshold,
+            "allow_buys": allow_buys,
+            "universe_size": len(all_tickers),
+            "n_recommendations": len(recommendations),
+            "n_actionable": len(actionable),
+            "llm_synthesis_provider": provider,
+            "llm_sentiment_provider": get_sentiment_provider_summary(),
+            "gate_diag": gate_diag,
+        })
+        sources = _snapshot_source_log()
+        repo.insert_run_sources(run_id, sources)
+        repo.insert_recommendations(rec_rows)
+        logger.info(
+            f"[db] Persisted run {run_id}: {len(rec_rows)} recommendation(s), "
+            f"{len(sources)} source(s) → DuckDB"
+        )
+    except Exception as e:
+        logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
 
 
 def _fetch_news(tickers, sectors):
@@ -163,6 +257,9 @@ def _run_edgar_tasks(all_tickers):
 def run_pipeline(send_email: bool = False) -> None:
     """Execute the full analysis pipeline."""
     start = datetime.now(timezone.utc)
+    run_id = start.strftime("%Y-%m-%d_%H%M%S")
+    _reset_source_log()
+    reset_sentiment_providers()
     logger.info(f"Pipeline started at {fmt_et(start)}")
 
     tickers     = settings.stocks_list
@@ -743,7 +840,7 @@ def run_pipeline(send_email: bool = False) -> None:
         macro_regime_context=macro_regime_context,
     )
     close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
-    trade_diag = record_new_trades(actionable, signals_by_ticker=signals_by_ticker) or {}
+    trade_diag = record_new_trades(actionable, signals_by_ticker=signals_by_ticker, run_id=run_id) or {}
     # Merge per-gate counters from the actionable filter + the trade-entry path
     # into one diagnostic blob so the user can see at a glance which constraints
     # are doing the work and which are passive backstops.
@@ -779,15 +876,16 @@ def run_pipeline(send_email: bool = False) -> None:
     update_hypothetical_trades()
     hypothetical_perf = get_hypothetical_performance_for_email()
 
-    if settings.enable_charts:
-        logger.info("Generating charts and HTML report...")
-        ts_label = start.strftime("%Y-%m-%d_%H%M")
-        report_path = save_html_report(recommendations, performance=perf, label=ts_label,
-                                       signals_by_ticker=signals_by_ticker)
-        if report_path:
-            logger.info(f"Report: {report_path.resolve()}")
-    else:
-        logger.info("Charts disabled (ENABLE_CHARTS=false) — skipping HTML report")
+    # The per-run static HTML report has been retired in favour of the live
+    # Plotly Dash dashboard (python main.py --dashboard), backed by DuckDB.
+    logger.info("Monitor performance + rationale in the dashboard: python main.py --dashboard")
+
+    # Persist run + 'APIs used' + every recommendation (with attribution) to DuckDB.
+    _persist_run(
+        run_id, start, datetime.now(timezone.utc), all_tickers, recommendations, actionable,
+        gate_diag, market_mode_context, macro_regime_context,
+        _confidence_threshold, _allow_buys, signals_by_ticker,
+    )
 
     _print_summary(actionable, smart_money or [])
 

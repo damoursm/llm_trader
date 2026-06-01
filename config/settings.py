@@ -615,6 +615,15 @@ class Settings(BaseSettings):
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 
+    # ── Database (DuckDB — single source of truth for trades / recs / run meta) ──
+    # One embedded file. The daily pipeline is the sole writer; the dashboard
+    # reads it read-only. Created on first run (parent dir auto-made).
+    db_path: str = "data/llm_trader.db"
+
+    # ── Dashboard (Plotly Dash monitoring app: rationale · methods · returns) ──
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8050
+
     @property
     def tracked_politicians_list(self) -> List[str]:
         return [p.strip() for p in self.tracked_politicians.split(",") if p.strip()]

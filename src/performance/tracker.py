@@ -17,6 +17,7 @@ from loguru import logger
 
 from src.models import Recommendation
 from src.performance.spread import _dynamic_half_spread, _pct_return, fmt_price
+from src.db import repo
 from config import settings
 
 TRADES_FILE = Path("cache/trades.json")
@@ -40,35 +41,29 @@ SIZE_TIER_FULL  = 0.92   # 0.85–0.92 → 1.5×; above → 2.0×
 # ---------------------------------------------------------------------------
 
 def _load_trades() -> List[dict]:
-    if not TRADES_FILE.exists():
-        return []
+    """Load the trade ledger from DuckDB (the single source of truth).
+
+    One-time safety net: if the DB is empty but the legacy ``cache/trades.json``
+    still exists, seed the DB from it so the JSON→DuckDB cutover never loses
+    history (even if the pipeline runs before ``python -m src.db.migrate``).
+    """
     try:
-        return json.loads(TRADES_FILE.read_text(encoding="utf-8"))
+        trades = repo.load_trades()
+        if not trades and TRADES_FILE.exists():
+            legacy = json.loads(TRADES_FILE.read_text(encoding="utf-8"))
+            if legacy:
+                repo.save_trades(legacy)
+                logger.info(f"[tracker] Seeded DuckDB from {TRADES_FILE} ({len(legacy)} trades)")
+                return legacy
+        return trades
     except Exception as e:
-        logger.warning(f"[tracker] Could not load trades: {e}")
+        logger.warning(f"[tracker] Could not load trades from DuckDB: {e}")
         return []
 
 
 def _save_trades(trades: List[dict]) -> None:
-    """Persist trades to disk, but **skip the write when content is unchanged**.
-
-    ``update_open_trades`` and ``_normalize_closed_returns`` both call this
-    at the end of every pipeline tick — even when nothing actually changed
-    (e.g. ENABLE_FETCH_DATA=false, every closed trade's return_pct already
-    matches the current spread model).  The previous unconditional write
-    bumped trades.json's mtime on every run and showed it as dirty in
-    ``git status`` even when no field had moved.  Comparing the would-be
-    JSON to what's on disk first costs one read but eliminates that noise.
-    """
-    TRADES_FILE.parent.mkdir(exist_ok=True)
-    new_content = json.dumps(trades, indent=2, default=str)
-    if TRADES_FILE.exists():
-        try:
-            if TRADES_FILE.read_text(encoding="utf-8") == new_content:
-                return
-        except Exception:
-            pass  # any read failure → fall through and write
-    TRADES_FILE.write_text(new_content, encoding="utf-8")
+    """Persist the full trade ledger to DuckDB (full-replace of the trades table)."""
+    repo.save_trades(trades)
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
@@ -637,6 +632,7 @@ def _sector_key(rec: Recommendation) -> str:
 def record_new_trades(
     recommendations: List[Recommendation],
     signals_by_ticker: Optional[dict] = None,
+    run_id: Optional[str] = None,
 ) -> dict:
     """Open a new trade for each BUY/SELL recommendation not already open today.
 
@@ -773,6 +769,11 @@ def record_new_trades(
         # Display formatting is handled by fmt_price() at render time.
         new_trade = {
             "ticker": rec.ticker,
+            "run_id": run_id,
+            "recommendation_id": (
+                hashlib.sha1(f"{run_id}|{rec.ticker}".encode("utf-8")).hexdigest()[:16]
+                if run_id else None
+            ),
             "type": rec.type,
             "action": rec.action,
             "direction": rec.direction,
