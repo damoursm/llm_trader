@@ -1218,7 +1218,7 @@ After signal aggregation, `find_sector_pairs()` scans `_SECTOR_MAP` for divergen
 
 **Why it works:** when XLK is BULLISH but INTC is BEARISH, the sector tailwind is not lifting INTC. That idiosyncratic weakness is the alpha. Going Long XLK / Short INTC captures both the sector momentum and the relative underperformance, while the XLK long hedges away broad-tech beta from the short.
 
-**Note:** pairs are reported in the email but are **not** fed into `cache/trades.json` — pair-trade P&L accounting (two legs, correlated moves) requires different tracking than single-leg signals.
+**Note:** pairs are reported in the email but are **not** fed into the trade ledger — pair-trade P&L accounting (two legs, correlated moves) requires different tracking than single-leg signals.
 
 ---
 
@@ -1459,7 +1459,7 @@ Claude acts as an elite portfolio manager with 22 numbered decision rules coveri
 
 ### Step 6 — Performance Tracking (`src/performance/tracker.py` + `src/performance/daily_nav.py`)
 
-Every actionable signal is recorded in `cache/trades.json`. Each trade carries:
+Every actionable signal is recorded in the **DuckDB** trade ledger (`data/llm_trader.db`; the legacy `cache/trades.json` is now import-only — see [Database & Dashboard](#database--dashboard)). Each trade carries:
 
 | Field | Purpose |
 |---|---|
@@ -1579,7 +1579,7 @@ The walk is **path-faithful**: each day's return depends only on two adjacent ob
    ```
 3. Compound sequentially across dates: `compound = ∏(1 + day_return) − 1`, expressed as a percent.
 
-**Determinism guarantee:** same `cache/trades.json` + same `cache/ohlcv/*.json` produces bit-identical output. No network call, no random seed, no time-of-day dependency. Verified by running `get_performance_for_email()` twice and comparing the full JSON payload.
+**Determinism guarantee:** same DuckDB trades (`data/llm_trader.db`) + same `cache/ohlcv/*.json` produces bit-identical output. No network call, no random seed, no time-of-day dependency. Verified by running `get_performance_for_email()` twice and comparing the full JSON payload.
 
 Time-window variants just filter the trade list before aggregating:
 
@@ -1706,6 +1706,44 @@ To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env
 
 ---
 
+## Database & Dashboard
+
+### DuckDB — single source of truth (`src/db/`)
+
+Trades, recommendations, and run history live in a single embedded **DuckDB** file (`data/llm_trader.db`), created automatically on first run. It replaces the legacy `cache/trades.json` / `cache/hypothetical_trades.json` ledgers, which are now **import-only**.
+
+| Table | Contents |
+|---|---|
+| `runs` | One row per pipeline invocation — market mode, macro regime, confidence threshold, universe size, LLM providers, timing |
+| `run_sources` | Per-source "APIs used" record for each run (ok / error / duration) |
+| `recommendations` | Every recommendation with rationale, attribution (`dominant_method`, `methods_agreeing`), and the actionable flag |
+| `trades` | The real signal-driven trade ledger — full dict in a JSON `data` column + projected scalar columns |
+| `hypothetical_trades` | The always-open paper book |
+
+**Concurrency:** DuckDB allows a single read-write handle *or* many read-only handles across processes. The pipeline is the **sole writer** and holds the write lock only momentarily (open → write → close); it persists run metadata, sources, and recommendations at the end of every run, wrapped so a database hiccup never aborts a run. The dashboard connects **read-only**.
+
+**Migration:** import an existing JSON ledger once with `python -m src.db.migrate` (idempotent; pass `--force` to overwrite). As a safety net the tracker also self-seeds the database from `cache/trades.json` when the DB is empty, so the cutover never loses history.
+
+### Monitoring dashboard (`dashboard/`)
+
+A read-only [Plotly Dash](https://dash.plotly.com/) app for inspecting the database:
+
+```bash
+python main.py --dashboard      # http://127.0.0.1:8050 by default
+```
+
+Three tabs:
+
+| Tab | Shows |
+|---|---|
+| Recommendations & Rationale | Per-run data sources used (✓/✗) and the run's recommendations with rationale |
+| Method Performance | Solo win-rate per signal method (bar chart + table) |
+| Returns | KPI tiles (compound, win rate, best/worst), equity curve, and open/closed trades |
+
+The page auto-refreshes every two minutes. It is served by **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows, where gunicorn doesn't run) — wrapped in an auto-restart supervisor loop so it stays alive for always-on use (it falls back to the Dash dev server only if waitress isn't installed). All database access is read-only with exponential-backoff retry around the brief daily write-lock window, and the heavy performance computation is cached for 60 seconds. Host and port are configurable via `DASHBOARD_HOST` / `DASHBOARD_PORT`.
+
+---
+
 ## Caching Strategy
 
 | Cache | Key | TTL | Location |
@@ -1739,7 +1777,7 @@ To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env
 | IV Rank + Directional | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
 | IV Expression | — | reuses GEX caches | `cache/gex_*.json` |
 | Cointegration | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
-| Trades ledger | — | permanent | `cache/trades.json` |
+| Trades · hypotheticals · runs · recs | — | permanent | **DuckDB** `data/llm_trader.db` |
 
 ---
 
@@ -1847,6 +1885,7 @@ SCHEDULE_DAILY=0 8 * * 1-5
 python main.py             # Run once, console output only
 python main.py --email     # Run once and send email report
 python main.py --schedule  # Start APScheduler (8:00 AM ET, Mon-Fri)
+python main.py --dashboard # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
 ```
 
 ---
@@ -1860,8 +1899,13 @@ llm_trader/
 ├── .env
 ├── cache/
 ├── logs/
+├── data/                            # DuckDB database (single source of truth)
 ├── config/
 │   └── settings.py
+├── dashboard/                       # Read-only Plotly Dash monitoring app (served via waitress)
+│   ├── app.py                       # 3 tabs: rationale · method performance · returns
+│   ├── data.py                      # Read-only DuckDB access + retry + 60s perf cache
+│   └── figures.py                   # Plotly figures (win-rate bars, equity curve)
 └── src/
     ├── pipeline.py
     ├── models.py                     # All Pydantic models
@@ -1906,7 +1950,13 @@ llm_trader/
     │   ├── aggregator.py             # Weighted combination + coherence + cluster
     │   └── vwap.py                   # Rolling 20-day VWAP distance score
     ├── performance/
-    │   └── tracker.py                # Paper trades, P&L, auto-close
+    │   ├── tracker.py                # Paper trades, P&L, auto-close
+    │   └── daily_nav.py              # Path-faithful daily-compound NAV engine
+    ├── db/
+    │   ├── connection.py             # Short-lived DuckDB connections (read-write / read-only)
+    │   ├── schema.py                 # Idempotent table DDL (runs, recs, trades, …)
+    │   ├── repo.py                   # Read/write API (trades, runs, recommendations)
+    │   └── migrate.py                # One-time JSON → DuckDB import
     ├── scheduler/
     │   └── runner.py                 # APScheduler daily automation
     ├── charts/

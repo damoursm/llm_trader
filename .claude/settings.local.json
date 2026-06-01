@@ -5,7 +5,10 @@
       "Bash(git --no-pager diff --stat)",
       "Bash(git --no-pager diff -- main.py config/settings.py src/analysis/claude_analyst.py src/analysis/sentiment.py)",
       "PowerShell(try { $pids = \\(Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction Stop\\).OwningProcess | Select-Object -Unique; $pids | ForEach-Object { Stop-Process -Id $_ -Force; \"stopped dashboard PID $_\" } } catch { \"no listener on 8050 \\(already stopped\\)\" })",
-      "Bash(curl -s --retry 40 --retry-delay 1 --retry-connrefused -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/)"
+      "Bash(curl -s --retry 40 --retry-delay 1 --retry-connrefused -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/)",
+      "Bash(\"C:/Users/mathi/PycharmProjects/llm_trader/.venv/Scripts/python.exe\" -m pip install waitress)",
+      "Bash(C:/Users/mathi/PycharmProjects/llm_trader/.venv/Scripts/python.exe *)",
+      "PowerShell($conn = Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue; if \\($conn\\) { $conn | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Write-Output \"Stopping PID $_\"; Stop-Process -Id $_ -Force } } else { Write-Output \"No listener on 8050\" })"
     ]
   }
 }

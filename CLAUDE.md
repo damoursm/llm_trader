@@ -8,11 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python main.py                # Run once, console output only
 python main.py --email        # Run once and send email report
 python main.py --schedule     # Start APScheduler (8:00 AM ET, Mon–Fri, sends email)
+python main.py --dashboard    # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
 ```
 
 Logs go to `logs/llm_trader_YYYY-MM-DD.log` (7-day rotation). The HTML report (when `ENABLE_CHARTS=true`) is saved to `logs/report_YYYY-MM-DD_HHMM.html`.
 
-To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/snapshots_*.json`. The OHLCV cache (`cache/ohlcv/`) and trades ledger (`cache/trades.json`) should never be deleted casually.
+To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/snapshots_*.json`. The OHLCV cache (`cache/ohlcv/`) and the DuckDB database (`data/llm_trader.db` — trades, recommendations, run history) should never be deleted casually.
 
 ## Architecture
 
@@ -87,7 +88,7 @@ Portfolio aggregation:
 2. Group by date; per-day portfolio return = `sum(r·w) / sum(w)` over active positions.
 3. Compound sequentially: `compound = ∏(1 + day_return) − 1`.
 
-This is **100% deterministic**: same `trades.json` + same `cache/ohlcv/*.json` produces bit-identical output. Time-window variants (`return_1w`/`return_2w`/`return_1m`) just filter trades by `entry_date >= today − N days` before aggregating.
+This is **100% deterministic**: same DuckDB trades (`data/llm_trader.db`) + same `cache/ohlcv/*.json` produces bit-identical output. Time-window variants (`return_1w`/`return_2w`/`return_1m`) just filter trades by `entry_date >= today − N days` before aggregating.
 
 **Summary statistics — `tracker._compute_segment_stats()`**
 
@@ -121,6 +122,25 @@ Conviction bands (`_eval_stats`): Low `0.10–0.35`, Medium `0.35–0.65`, High 
 | `_refresh_open_trade_ohlcv()` | First step of `update_open_trades()` | Force-refreshes OHLCV cache for every open-trade ticker (bypasses 3-day TTL) so the daily walk has a real close for every day held. |
 | `_normalize_closed_returns()` | Second step of `update_open_trades()` | Idempotently rederives `return_pct` for every closed trade through the current spread model. |
 | `update_open_trades()` | Each pipeline tick | Refreshes `current_price` + `current_price_datetime` + `return_pct` for every OPEN trade; auto-closes after `HOLDING_DAYS = 5` weekdays held. |
+
+### Database (DuckDB)
+
+`data/llm_trader.db` is the **single source of truth** for trades, recommendations, and run history — it replaces the old `cache/trades.json` / `cache/hypothetical_trades.json` ledgers (now import-only). All access goes through `src/db/`:
+
+- **`connection.py`** — `connect(read_only=False)` yields a short-lived DuckDB handle and closes it on exit. Read-write opens `ensure_schema()` first; read-only opens require the file to already exist (raise `FileNotFoundError` otherwise).
+- **`schema.py`** — idempotent `CREATE TABLE IF NOT EXISTS` for five tables: `runs`, `run_sources`, `recommendations`, `trades`, `hypothetical_trades`. Each trade / hypothetical row stores the **full dict in a JSON `data` column** (so `tracker.py` round-trips byte-identical dicts, exactly as the old JSON files did) alongside projected scalar columns used for SQL and the dashboard.
+- **`repo.py`** — the typed read/write API: `load_trades()` / `save_trades()` (full-replace, matching the old whole-file rewrite semantics), `insert_run()`, `insert_run_sources()`, `insert_recommendations()`, and `fetch_df()` (DataFrame reads for the dashboard). `set_read_only(True)` flips every read path to open read-only — the dashboard sets this so it never takes the write lock.
+- **`migrate.py`** — one-time `python -m src.db.migrate` imports the legacy JSON ledgers; idempotent (skips populated tables unless `--force`). As a safety net, `tracker._load_trades()` self-seeds the DB from `cache/trades.json` if the DB is empty, so the cutover never loses history even if migration is skipped.
+
+**Concurrency model:** DuckDB allows a single read-write handle OR many read-only handles across processes. The pipeline is the **sole writer** and holds the write lock only momentarily (open → write → close); at the end of every run it persists `runs` + `run_sources` + `recommendations` (`pipeline.py`, wrapped in try/except so a DB hiccup never aborts the run). The dashboard connects **read-only** and retries with exponential backoff across the brief window the writer holds the lock.
+
+### Monitoring dashboard (`dashboard/`)
+
+A read-only Plotly Dash app for inspecting the database. Launch with `python main.py --dashboard` (host/port from `settings.dashboard_host` / `dashboard_port`, default `127.0.0.1:8050`).
+
+- **`app.py`** — three tabs: **Recommendations & Rationale** (per-run data sources + recommendations), **Method Performance** (solo win-rate bars + per-method table), **Returns** (KPI tiles + equity curve + open/closed trades). A `dcc.Interval` re-renders every 120 s; `render_tab` swallows data errors so a transient hiccup shows a message instead of a blank page. `run()` serves through **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows; gunicorn doesn't run there) — wrapped in an **auto-restart supervisor loop** so a crash self-heals; it falls back to the Dash dev server only if waitress isn't installed.
+- **`data.py`** — read-only accessors over `repo.fetch_df()`. Sets `repo.set_read_only(True)` at import, wraps every read in exponential-backoff retry (`_retry`, ~11 s budget) for the daily write-lock window, and caches the heavy `get_performance_for_email()` result for 60 s so tab switches stay responsive.
+- **`figures.py`** — Plotly figures (method win-rate bars; equity curve via `src.charts.builder`).
 
 ### Model routing
 
@@ -174,9 +194,9 @@ Available analyst models (set in `.env`):
 | COT positioning | ISO week | 1 week | `cache/cot_YYYY_WW.json` |
 | Insider cluster watchlist | ticker | 10 days | `cache/cluster_watchlist.json` |
 | Pattern libraries | per ticker | 7 days | `cache/patterns/<TICKER>.json` |
-| Trades ledger | — | permanent | `cache/trades.json` |
+| Trades · hypotheticals · runs · recs | — | permanent | **DuckDB** (`data/llm_trader.db`) |
 
-**Important:** The news cache includes 8-K articles only on the run that fetches them (8-K fetch always runs fresh and appends to whichever articles list is active — from cache or live). COT data is cached by ISO week, so the first run each week downloads from CFTC; subsequent runs within the week are instant.
+**Important:** The news cache includes 8-K articles only on the run that fetches them (8-K fetch always runs fresh and appends to whichever articles list is active — from cache or live). COT data is cached by ISO week, so the first run each week downloads from CFTC; subsequent runs within the week are instant. The DuckDB database (`data/llm_trader.db`) is **not** a cache — it is the permanent single source of truth (see [Database (DuckDB)](#database-duckdb)), never auto-expired; the legacy `cache/trades.json` is import-only.
 
 ### Adding a new data source
 

@@ -7,6 +7,8 @@ Single source of truth is DuckDB (read-only here). Launch with:
 
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 from dash import Dash, Input, Output, dash_table, dcc, html
 from loguru import logger
@@ -246,12 +248,47 @@ def _returns_tab():
     ])
 
 
+def _serve_once(host: str, port: int) -> None:
+    """Serve the WSGI app once.
+
+    Prefers ``waitress`` — a production-grade, multi-threaded, cross-platform WSGI
+    server (the right choice on Windows, where gunicorn does not run). It stays
+    responsive for always-on use, recycles stuck connections, and won't fall over
+    the way the Werkzeug development server does. Falls back to the Dash dev server
+    only when waitress isn't installed.
+    """
+    try:
+        from waitress import serve
+    except ImportError:
+        logger.warning(
+            "waitress not installed — using the Dash dev server, which is less "
+            "robust for always-on use. Install it with `pip install waitress`."
+        )
+        app.run(host=host, port=port, debug=False)
+        return
+
+    # A few worker threads so a slow performance() render can't block the whole UI;
+    # channel_timeout reaps connections that go quiet instead of leaking them.
+    serve(app.server, host=host, port=port, threads=8, channel_timeout=120)
+
+
 def run() -> None:
-    logger.info(
-        f"Dashboard starting at http://{settings.dashboard_host}:{settings.dashboard_port}  "
-        f"(Ctrl+C to stop)"
-    )
-    app.run(host=settings.dashboard_host, port=settings.dashboard_port, debug=False)
+    """Run the dashboard, auto-restarting on an unexpected crash so it stays alive."""
+    host, port = settings.dashboard_host, settings.dashboard_port
+    logger.info(f"Dashboard starting at http://{host}:{port}  (Ctrl+C to stop)")
+
+    backoff = 2
+    while True:
+        try:
+            _serve_once(host, port)
+            return  # clean shutdown
+        except KeyboardInterrupt:
+            logger.info("Dashboard stopped.")
+            return
+        except Exception as e:  # pragma: no cover — last-resort supervisor
+            logger.error(f"Dashboard server crashed: {e!r} — restarting in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":

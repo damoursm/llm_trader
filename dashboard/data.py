@@ -19,20 +19,24 @@ from src.db import repo
 # The dashboard is a read-only consumer of the database.
 repo.set_read_only(True)
 
-_RETRY_ATTEMPTS = 4
-_RETRY_DELAY = 0.5
+_RETRY_ATTEMPTS = 6
+_RETRY_BASE_DELAY = 0.4  # exponential backoff: 0.4, 0.8, 1.6, 3.2, 5.0, … (~11s total)
+_RETRY_MAX_DELAY = 5.0
 
 
 def _retry(fn, what: str = ""):
     last = None
-    for _ in range(_RETRY_ATTEMPTS):
+    delay = _RETRY_BASE_DELAY
+    for attempt in range(_RETRY_ATTEMPTS):
         try:
             return fn()
         except FileNotFoundError:
             raise
         except Exception as e:  # most likely a transient DuckDB lock during a run
             last = e
-            time.sleep(_RETRY_DELAY)
+            if attempt < _RETRY_ATTEMPTS - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, _RETRY_MAX_DELAY)
     logger.warning(f"[dashboard] read failed ({what}): {last}")
     raise last
 

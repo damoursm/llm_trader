@@ -26,6 +26,7 @@ duckdb==1.5.3
 
 # Monitoring dashboard
 dash==4.1.0
+waitress==3.0.2          # production WSGI server — keeps the dashboard alive for always-on use
 
 # Scheduling
 apscheduler==3.11.0
