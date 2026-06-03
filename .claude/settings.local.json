@@ -20,7 +20,9 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from config.settings import settings; k=settings.fred_api_key; print\\('fred enabled:', settings.enable_fred\\); print\\('key set:', bool\\(k\\)\\); print\\('key len:', len\\(k\\) if k else 0\\)\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from config.settings import settings; from src.data.fred import fetch_macro_context; ctx = fetch_macro_context\\(settings.fred_api_key\\); print\\('RESULT:', 'None' if ctx is None else 'MacroContext OK'\\); print\\('regime:', getattr\\(ctx,'regime',None\\)\\)\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _fred_debug.py)",
-      "PowerShell(Remove-Item *)"
+      "PowerShell(Remove-Item *)",
+      "Bash(grep -rnE 'logger\\\\.\\(info|warning|debug|error\\).*\\\\{[a-z_]+:[-+]?[.,0-9]*[fd%]' src/data/ src/analysis/ src/performance/)",
+      "Bash(grep -vE 'is not None|or 0|:\\\\.0f\\\\}%? *\\\\\"?\\\\\\)? *$')"
     ]
   }
 }

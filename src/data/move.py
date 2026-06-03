@@ -251,9 +251,10 @@ def fetch_move_context(today: Optional[date] = None) -> Optional[MOVEContext]:
         summary=summary,
     )
     _save_cache(ctx)
+    spike_str = f"{spike_5d:+.1f}pt" if spike_5d is not None else "n/a"
     logger.info(
         f"[move] MOVE={move:.1f} ({signal}) | "
-        f"5d change={spike_5d:+.1f}pt | "
+        f"5d change={spike_str} | "
         f"source={ctx.source} | spiking={is_spiking}"
     )
     return ctx

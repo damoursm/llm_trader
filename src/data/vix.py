@@ -195,9 +195,10 @@ def fetch_vix_context() -> Optional[VIXContext]:
         summary=" ".join(parts),
     )
     _save_cache(ctx)
+    slope_str = f"{slope:+.1f}pt" if slope is not None else "n/a"
     logger.info(
         f"[vix] VIX={vix:.1f} ({vix_signal}) | "
-        f"Term={term_structure} (slope={slope:+.1f}pt) | "
+        f"Term={term_structure} (slope={slope_str}) | "
         f"VVIX={vvix or 'N/A'}"
     )
     return ctx
