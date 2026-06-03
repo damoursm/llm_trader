@@ -13,6 +13,8 @@ import argparse
 import sys
 from loguru import logger
 
+from src.log_redaction import redaction_filter
+
 # Ensure UTF-8 output on Windows terminals (needed for ▲/▼ arrows)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -22,16 +24,21 @@ if hasattr(sys.stderr, "reconfigure"):
 
 def setup_logging() -> None:
     logger.remove()
+    # redaction_filter scrubs API keys/tokens from every record before it reaches
+    # a sink, so log files never contain plaintext credentials (e.g. the api_key
+    # leaked in upstream httpx exception URLs).
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
         level="INFO",
+        filter=redaction_filter,
     )
     logger.add(
         "logs/llm_trader_{time:YYYY-MM-DD}.log",
         rotation="1 day",
         retention="7 days",
         level="DEBUG",
+        filter=redaction_filter,
     )
 
 

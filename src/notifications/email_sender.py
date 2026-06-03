@@ -147,6 +147,15 @@ HTML_TEMPLATE = """
 </div>
 {% endif %}
 
+{% if llm_health and llm_health.down %}
+<div style="background:#78350f;border:1px solid #b45309;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fde68a;font-size:13px;">
+  &#129302; <b>LLM layer degraded this run</b> &mdash; {{ llm_health.message }}.
+  <div style="margin-top:6px;color:#fcd34d;line-height:1.7;">
+  These recommendations are rule-based, not AI-generated. Check Anthropic &amp; DeepSeek API credits and keys.
+  </div>
+</div>
+{% endif %}
+
 <!-- ══════════════════════════════════════
      SIGNAL OVERVIEW CHART
      ══════════════════════════════════════ -->
@@ -5280,6 +5289,7 @@ def send_recommendations(
     macro_news_context=None,        # Optional[MacroNewsContext]         — avoid circular import
     gate_diag: Optional[dict] = None,  # per-run gate-rejection counters
     source_health: Optional[list] = None,  # failed data sources this run (label/error dicts)
+    llm_health: Optional[dict] = None,     # LLM-layer health verdict this run (down/message)
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -5428,6 +5438,7 @@ def send_recommendations(
         type_colors=TYPE_COLOR,
         generated_at=now_str,
         source_health=source_health or [],
+        llm_health=llm_health,
         total=total_analysed or len(all_recs),
         colors=ACTION_COLOR,
         # recommendation lists
@@ -5662,6 +5673,9 @@ def send_recommendations(
 
     if source_health:
         subject = f"⚠ API ISSUES ({len(source_health)}) | " + subject
+
+    if llm_health and llm_health.get("down"):
+        subject = "🤖 LLM DOWN | " + subject
 
     try:
         # Outer wrapper: multipart/related so inline CID images are recognised

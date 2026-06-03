@@ -197,6 +197,50 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
 
 
+def _assess_llm_health() -> dict:
+    """Assess whether the LLM layer functioned this run, for alerting.
+
+    Both per-ticker sentiment scoring and final synthesis run on Claude/DeepSeek.
+    When credits are exhausted or keys are invalid the failure is *silent*:
+    sentiment returns a neutral 0.0 and synthesis falls through to the rule-based
+    last resort. This collapses the two existing provider signals into a single
+    'down' verdict so the degradation can be surfaced (CRITICAL log + email
+    banner) instead of scrolling past in the logs.
+
+    Returns a dict: {down, synthesis_down, sentiment_down, synthesis_provider,
+    sentiment_summary, message}.
+    """
+    synth_provider = (get_last_synthesis_meta() or {}).get("provider")
+    sent_summary   = get_sentiment_provider_summary()   # e.g. "deepseek×40, none×2" | "none×42" | None
+
+    # Synthesis is down only when it fell all the way to the rule-based engine
+    # (both Claude and the DeepSeek fallback failed). A DeepSeek-served run is
+    # still a working LLM layer.
+    synthesis_down = synth_provider == "rule-based"
+
+    # Sentiment is down when calls were attempted but *none* used a real model
+    # (every per-ticker call recorded the "none" provider). No attempts at all
+    # (sent_summary is None — e.g. no tickers had news) is not a degradation.
+    sentiment_attempted = sent_summary is not None
+    sentiment_ok        = bool(sent_summary) and ("deepseek" in sent_summary or "anthropic" in sent_summary)
+    sentiment_down      = sentiment_attempted and not sentiment_ok
+
+    parts = []
+    if synthesis_down:
+        parts.append("final synthesis fell through to the rule-based engine (recommendations are NOT LLM-generated)")
+    if sentiment_down:
+        parts.append(f"per-ticker sentiment scoring failed for every ticker ({sent_summary})")
+
+    return {
+        "down":               synthesis_down or sentiment_down,
+        "synthesis_down":     synthesis_down,
+        "sentiment_down":     sentiment_down,
+        "synthesis_provider": synth_provider,
+        "sentiment_summary":  sent_summary,
+        "message":            "; ".join(parts),
+    }
+
+
 def _fetch_news(tickers, sectors):
     articles = load_news()
     if articles is None:
@@ -915,6 +959,15 @@ def run_pipeline(send_email: bool = False) -> None:
         _confidence_threshold, _allow_buys, signals_by_ticker,
     )
 
+    # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:
+    # a CRITICAL log line here, plus an email banner + subject tag below.
+    llm_health = _assess_llm_health()
+    if llm_health["down"]:
+        logger.critical(
+            f"[llm] LLM LAYER DEGRADED — {llm_health['message']}. "
+            f"Top up / check Anthropic + DeepSeek API credits and keys."
+        )
+
     _print_summary(actionable, smart_money or [])
 
     email_configured = bool(settings.smtp_user and settings.email_recipients)
@@ -966,6 +1019,7 @@ def run_pipeline(send_email: bool = False) -> None:
             macro_news_context=macro_news_context,
             gate_diag=gate_diag,
             source_health=[s for s in _collect_sources() if not s.get("ok")],
+            llm_health=llm_health,
         )
     else:
         logger.info("Email not configured — skipping.")
