@@ -7,13 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python main.py                # Run once, console output only
 python main.py --email        # Run once and send email report
-python main.py --schedule     # Start APScheduler (8:00 AM ET, Mon–Fri, sends email)
+python main.py --schedule     # Start APScheduler (every 30 min, 9:30–16:00 ET, Mon–Fri; emails at the 16:00 close)
 python main.py --dashboard    # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
 ```
 
 Logs go to `logs/llm_trader_YYYY-MM-DD.log` (7-day rotation). The HTML report (when `ENABLE_CHARTS=true`) is saved to `logs/report_YYYY-MM-DD_HHMM.html`.
 
 To force a fresh run ignoring caches, delete `cache/news_*.json` and/or `cache/snapshots_*.json`. The OHLCV cache (`cache/ohlcv/`) and the DuckDB database (`data/llm_trader.db` — trades, recommendations, run history) should never be deleted casually.
+
+**Intraday operation (no unclosed-bar look-ahead).** The scheduled runner ticks **every 30 min, 9:30–16:00 ET** (Mon–Fri). The pipeline marks and fills on **live** prices (`_fetch_price` → `fast_info.last_price`); the daily OHLCV feeding the indicators is **completed-bars-only** — `market_data._drop_forming_bar` removes the still-forming current-session bar until the 16:00 close, so no indicator or NAV walk ever reads an unclosed daily bar. Open-position NAV is **marked to the live price each tick** (`daily_nav._build_marks` uses `current_price` as the open-trade end anchor). A **Hybrid** intraday-timing overlay (`src/signals/intraday_timing.py`) affects entry/exit *timing* only: it defers an entry whose 30-min momentum strongly opposes it (`enable_intraday_timing`, default on) and can close on a hard intraday reversal (`enable_intraday_exit`, opt-in → `exit_reason = "intraday_reversal"`). It never changes the daily-signal direction.
 
 ## Architecture
 
@@ -121,7 +123,8 @@ Conviction bands (`_eval_stats`): Low `0.10–0.35`, Medium `0.35–0.65`, High 
 | `close_trades_on_signal_reversal()` | Before opening new trades, if today's actionable signal reverses an open position | Closes with `exit_datetime = current_price_datetime` (most recent live mark) — no second fetch. |
 | `_refresh_open_trade_ohlcv()` | First step of `update_open_trades()` | Force-refreshes OHLCV cache for every open-trade ticker (bypasses 3-day TTL) so the daily walk has a real close for every day held. |
 | `_normalize_closed_returns()` | Second step of `update_open_trades()` | Idempotently rederives `return_pct` for every closed trade through the current spread model. |
-| `update_open_trades()` | Each pipeline tick | Refreshes `current_price` + `current_price_datetime` + `return_pct` for every OPEN trade; auto-closes after `HOLDING_DAYS = 5` weekdays held. |
+| `update_open_trades()` | Each pipeline tick | Refreshes `current_price` + `current_price_datetime` + `return_pct` for every OPEN trade. **No time cap** — positions are never closed on age. |
+| `monitor_open_positions()` | Each tick, after `update_open_trades` | The primary exit: closes a position when its thesis deteriorates — `macro_regime_exit` (long in PANIC/RISK_OFF), `signal_flipped`, `signal_decay` (entry vs today strength), or `confidence_loss` (today's confidence below an entry-relative floor). Toggle with `enable_signal_decay_exits`. |
 
 ### Database (DuckDB)
 
@@ -138,7 +141,7 @@ Conviction bands (`_eval_stats`): Low `0.10–0.35`, Medium `0.35–0.65`, High 
 
 A read-only Plotly Dash app for inspecting the database. Launch with `python main.py --dashboard` (host/port from `settings.dashboard_host` / `dashboard_port`, default `127.0.0.1:8050`).
 
-- **`app.py`** — three tabs: **Recommendations & Rationale** (per-run data sources + recommendations), **Method Performance** (solo win-rate bars + per-method table), **Returns** (KPI tiles + equity curve + open/closed trades). A `dcc.Interval` re-renders every 120 s; `render_tab` swallows data errors so a transient hiccup shows a message instead of a blank page. `run()` serves through **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows; gunicorn doesn't run there) — wrapped in an **auto-restart supervisor loop** so a crash self-heals; it falls back to the Dash dev server only if waitress isn't installed.
+- **`app.py`** — three tabs: **Recommendations & Rationale** (per-run data sources + recommendations), **Method Performance** (solo win-rate bars, per-method table, and an *LLM models used* breakdown — the exact synthesis & sentiment models per run, including DeepSeek / rule-based fallbacks), **Returns** (KPI tiles + equity curve + open/closed trades). Each tab's content is embedded as that `dcc.Tab`'s `children`, so the Tabs component swaps content **client-side** with no `tabs.value`→callback round trip (that round trip proved unreliable in the browser — every tab showed the first-rendered one). `app.layout` is the `serve_layout` **function**, rebuilt per page load so a long-running dashboard always reflects the latest run; the selected tab is persisted across reloads and `_safe()` wraps each tab body so a data hiccup shows a message instead of a blank page. Tables are sortable (click a header; shift-click for multi-sort), carry a per-column filter row, use human-readable headers, format numeric columns (kept numeric so they sort correctly), and render timestamps in Eastern time (`_fmt_et`). Every column header, KPI tile, and section heading carries a hover tooltip (`tooltip_header` / HTML `title`) explaining the metric. `run()` serves through **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows; gunicorn doesn't run there) — wrapped in an **auto-restart supervisor loop** so a crash self-heals; it falls back to the Dash dev server only if waitress isn't installed.
 - **`data.py`** — read-only accessors over `repo.fetch_df()`. Sets `repo.set_read_only(True)` at import, wraps every read in exponential-backoff retry (`_retry`, ~11 s budget) for the daily write-lock window, and caches the heavy `get_performance_for_email()` result for 60 s so tab switches stay responsive.
 - **`figures.py`** — Plotly figures (method win-rate bars; equity curve via `src.charts.builder`).
 
@@ -156,7 +159,7 @@ Available analyst models (set in `.env`):
 
 **Claude API calls use streaming** (`client.messages.stream`) to avoid SDK timeout errors on large prompts (40+ tickers can take >10 minutes non-streaming). Text chunks are accumulated into a single string before JSON parsing.
 
-**DeepSeek analyst fallback** (`_call_deepseek_analyst()` in `claude_analyst.py`): triggered automatically when Claude raises `anthropic.APIStatusError` (HTTP 400/401/402/403/429/5xx — covers credits exhausted, bad key, payment required, rate limit, server errors) or `anthropic.APIConnectionError`. Uses `deepseek-reasoner` (DeepSeek R1) with the identical prompt via the OpenAI-compatible streaming API. Requires `DEEPSEEK_API_KEY`. If DeepSeek also fails, falls back to rule-based `_fallback_recommendations()`. The source model name is logged at INFO level (`via <model>`).
+**DeepSeek analyst fallback** (`_call_deepseek_analyst()` in `claude_analyst.py`): triggered automatically when Claude raises `anthropic.APIStatusError` (HTTP 400/401/402/403/429/5xx — covers credits exhausted, bad key, payment required, rate limit, server errors) or `anthropic.APIConnectionError`. Uses `deepseek-chat` (DeepSeek V3) with the identical prompt via the OpenAI-compatible streaming API. Requires `DEEPSEEK_API_KEY`. If DeepSeek also fails, falls back to rule-based `_fallback_recommendations()`. The source model name is logged at INFO level (`via <model>`).
 
 ### Caching strategy
 

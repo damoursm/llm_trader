@@ -8,7 +8,19 @@
       "Bash(curl -s --retry 40 --retry-delay 1 --retry-connrefused -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/)",
       "Bash(\"C:/Users/mathi/PycharmProjects/llm_trader/.venv/Scripts/python.exe\" -m pip install waitress)",
       "Bash(C:/Users/mathi/PycharmProjects/llm_trader/.venv/Scripts/python.exe *)",
-      "PowerShell($conn = Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue; if \\($conn\\) { $conn | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Write-Output \"Stopping PID $_\"; Stop-Process -Id $_ -Force } } else { Write-Output \"No listener on 8050\" })"
+      "PowerShell($conn = Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue; if \\($conn\\) { $conn | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Write-Output \"Stopping PID $_\"; Stop-Process -Id $_ -Force } } else { Write-Output \"No listener on 8050\" })",
+      "PowerShell($c = Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue; if \\($c\\) { $c | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Write-Output \"Stopping PID $_\"; Stop-Process -Id $_ -Force } } else { Write-Output \"No listener on 8050\" })",
+      "PowerShell($c = Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue; if \\($c\\) { $c | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Write-Output \"Stopping old instance PID $_\"; Stop-Process -Id $_ -Force } } else { Write-Output \"No listener on 8050\" })",
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(foreach \\($p in @\\(\".venv\\\\Scripts\\\\python.exe\",\"venv\\\\Scripts\\\\python.exe\",\".venv\\\\Scripts\\\\Activate.ps1\"\\)\\) { if \\(Test-Path $p\\) { \"FOUND: $p\" } }; \"---\"; \\(Get-Command python -ErrorAction SilentlyContinue\\).Source)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe main.py --dashboard)",
+      "PowerShell($ok=$false; for\\($i=0;$i -lt 15;$i++\\){ $c=Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue; if\\($c\\){ $ok=$true; break }; Start-Sleep -Milliseconds 800 }; if\\($ok\\){ \"LISTENING on 8050 \\(PID $\\($c.OwningProcess\\)\\)\" } else { \"NOT yet listening after wait\" })",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from config.settings import settings; k=settings.fred_api_key; print\\('fred enabled:', settings.enable_fred\\); print\\('key set:', bool\\(k\\)\\); print\\('key len:', len\\(k\\) if k else 0\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from config.settings import settings; from src.data.fred import fetch_macro_context; ctx = fetch_macro_context\\(settings.fred_api_key\\); print\\('RESULT:', 'None' if ctx is None else 'MacroContext OK'\\); print\\('regime:', getattr\\(ctx,'regime',None\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _fred_debug.py)",
+      "PowerShell(Remove-Item *)"
     ]
   }
 }

@@ -615,6 +615,19 @@ class Settings(BaseSettings):
     # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
     schedule_daily: str = "0 8 * * 1-5"
 
+    # Intraday scheduling — the runner ticks every 30 min and only acts inside
+    # the regular session window below (ET, Mon-Fri). Combined with live prices
+    # and completed-only daily bars, there is no dependency on an unclosed bar.
+    intraday_session_start: str = "09:30"
+    intraday_session_end: str = "16:00"
+
+    # Intraday timing overlay (Hybrid: daily trend decides direction; a 30-min
+    # momentum read only gates entry/exit *timing*).
+    enable_intraday_timing: bool = True
+    intraday_timing_defer_threshold: float = 0.50   # |opposing 30-min momentum| above this defers an entry
+    enable_intraday_exit: bool = False               # close a position on a strong intraday reversal against it
+    intraday_exit_threshold: float = 0.60
+
     # ── Database (DuckDB — single source of truth for trades / recs / run meta) ──
     # One embedded file. The daily pipeline is the sole writer; the dashboard
     # reads it read-only. Created on first run (parent dir auto-made).

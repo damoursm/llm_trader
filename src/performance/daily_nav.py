@@ -24,7 +24,7 @@ Public entry point: ``compute_compound_return(trades, today=None)``.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -206,6 +206,24 @@ def _open_trade_end_anchor(
     return end_d, close_series[end_d]
 
 
+def _et_date_of_iso(iso_str) -> Optional[date]:
+    """ET session date for an ISO 8601 datetime (e.g. ``current_price_datetime``).
+
+    The live mark is timestamped in UTC; the NAV walk keys marks by NYSE session
+    date, so convert to America/New_York first. Returns ``None`` if unparseable.
+    """
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_str))
+    except (TypeError, ValueError):
+        return None
+    try:
+        return dt.astimezone(_NY_TZ).date() if dt.tzinfo is not None else dt.date()
+    except Exception:
+        return None
+
+
 def _build_marks(
     trade: dict,
     today: date,
@@ -265,19 +283,29 @@ def _build_marks(
         )
         end_mark = _effective_exit(float(exit_px), action, asset_type) * exit_adj
     else:
-        # OPEN: end at the most recent cached close on/before today. This is
-        # deterministic per calendar day regardless of when the pipeline runs.
-        anchor = _open_trade_end_anchor(entry_d, today, close_series)
-        if anchor is None:
-            # No eligible cached close yet (e.g. entered today, today's bar
-            # not in cache).  Without an end mark we can't compute any daily
-            # return event; the trade contributes nothing to the compound
-            # until the next cache refresh.
-            return []
-        end_d, end_close = anchor
-        if end_close <= 0:
-            return []
-        end_mark = _effective_exit(float(end_close), action, asset_type)
+        # OPEN: prefer the live current mark so the equity curve reflects the
+        # latest intraday (30-min) price the pipeline marked the position at.
+        # Falls back to the most recent completed cached close when no live mark
+        # is stored (legacy trades). Both paths stay grounded in observed prices
+        # — never a future bar (the live mark is clamped to <= today).
+        cur_px = trade.get("current_price")
+        if cur_px is not None and float(cur_px) > 0:
+            end_d = _et_date_of_iso(trade.get("current_price_datetime")) or today
+            if end_d > today:
+                end_d = today
+            if end_d < entry_d:
+                end_d = entry_d
+            end_mark = _effective_exit(float(cur_px), action, asset_type)
+        else:
+            anchor = _open_trade_end_anchor(entry_d, today, close_series)
+            if anchor is None:
+                # No live mark and no eligible cached close yet (e.g. entered
+                # today, today's bar not in cache). Nothing to walk yet.
+                return []
+            end_d, end_close = anchor
+            if end_close <= 0:
+                return []
+            end_mark = _effective_exit(float(end_close), action, asset_type)
 
     if end_d < entry_d:
         end_d = entry_d

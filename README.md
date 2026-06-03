@@ -253,6 +253,8 @@ When `ENABLE_SHORT_INTEREST=true`, combines two free sources to detect squeeze s
 
 Price snapshots for every ticker via yfinance, with four-level cache fallback. When a 429 rate-limit is detected: exponential backoff (60s → 120s → 240s), stops after 3 consecutive failures.
 
+**Intraday operation (no unclosed-bar look-ahead):** the pipeline runs every 30 min during market hours on **live** prices, and the daily OHLCV history used by the indicators is **completed-bars-only** — the still-forming current-session bar is dropped until the 16:00 ET close (`market_data._drop_forming_bar`). So no indicator or return calculation ever reads an unclosed daily bar; the live price is used for fills and mark-to-market, the completed daily bars for the multi-day signals (Hybrid model).
+
 ---
 
 ### Step 3a — Insider & Politician Trades (`src/data/insider_trades.py`)
@@ -1453,7 +1455,7 @@ All ticker signals plus every macro/breadth/volatility context block are passed 
 
 Claude acts as an elite portfolio manager with 22 numbered decision rules covering: conviction thresholds, smart money weighting, macro overlays, cluster handling, volatility regimes, breadth conditions, earnings event caution, and more. When no ticker clears the bar, it outputs HOLD/WATCH for all.
 
-**Automatic fallback chain:** If the Claude API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to **DeepSeek R1** (`deepseek-reasoner`) via the OpenAI-compatible streaming API. If DeepSeek also fails, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The active analyst model is logged at INFO level.
+**Automatic fallback chain:** If the Claude API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to **DeepSeek V3** (`deepseek-chat`) via the OpenAI-compatible streaming API. If DeepSeek also fails, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The active analyst model is logged at INFO level.
 
 ---
 
@@ -1474,10 +1476,10 @@ Every actionable signal is recorded in the **DuckDB** trade ledger (`data/llm_tr
 
 Lifecycle:
 
-1. **Open** (`record_new_trades`) — entry price fetched at recommendation time and stamped together with `entry_datetime = datetime.now(UTC)`; position-size multiplier set from confidence tier; per-sector exposure cap enforced.
-2. **Reversal close** (`close_trades_on_signal_reversal`) — if today's actionable signal flips the direction of an open position, it closes with `exit_datetime = current_price_datetime` (re-uses the most recent live mark, no extra fetch) and the new leg is opened immediately after.
-3. **Refresh** (`update_open_trades`) — every tick re-fetches the live price, updates `current_price`/`current_price_datetime`/`return_pct`/`weighted_return_pct`/`days_held` for every open trade.
-4. **Auto-close** — when `days_held >= HOLDING_DAYS` (5 weekdays, Mon–Fri), the trade is closed at the just-fetched price with `exit_datetime` matching.
+1. **Open** (`record_new_trades`) — entry price fetched **live** at recommendation time and stamped together with `entry_datetime`; position-size multiplier set from confidence tier; correlation haircut applied. The **intraday timing gate** (`enable_intraday_timing`, default on) defers an entry whose 30-min momentum is strongly against it — the next 30-min tick re-checks, so the position waits for a less hostile entry.
+2. **Refresh / mark** (`update_open_trades`) — every tick re-fetches the live price and updates `current_price`/`current_price_datetime`/`return_pct`/`weighted_return_pct`/`days_held` for every open trade. **There is no time cap** — a position is held as long as its thesis holds (`days_held` is observability only).
+3. **Thesis-decay close** (`monitor_open_positions`) — closes a position when its rationale deteriorates, checked in priority order: `macro_regime_exit` (holding a long while macro = PANIC/RISK_OFF), `signal_flipped` (today's oriented combined score crosses against the trade), `signal_decay` (entry strength minus today's strength exceeds the drop threshold), `confidence_loss` (today's aggregator confidence below `max(absolute_floor, relative_factor × entry_confidence)`). Toggle with `enable_signal_decay_exits` (default on). With `enable_intraday_exit` (opt-in) it also closes on a hard 30-min reversal against the position (`intraday_reversal`).
+4. **Reversal close** (`close_trades_on_signal_reversal`) — if today's actionable signal flips the direction of an open position, it closes with `exit_datetime = current_price_datetime` (re-uses the most recent live mark, no extra fetch) and the new leg is opened immediately after.
 
 Before either refresh runs, `update_open_trades` does two preparatory passes that make every downstream metric deterministic and current:
 
@@ -1702,7 +1704,7 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 
 To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env`.
 
-**DeepSeek R1 analyst fallback:** When the configured Claude model raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through `deepseek-reasoner` (DeepSeek R1) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If DeepSeek also fails, the pipeline falls back to a simple rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
+**DeepSeek V3 analyst fallback:** When the configured Claude model raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through `deepseek-chat` (DeepSeek V3) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If DeepSeek also fails, the pipeline falls back to a simple rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
 
 ---
 
@@ -1737,10 +1739,10 @@ Three tabs:
 | Tab | Shows |
 |---|---|
 | Recommendations & Rationale | Per-run data sources used (✓/✗) and the run's recommendations with rationale |
-| Method Performance | Solo win-rate per signal method (bar chart + table) |
+| Method Performance | Solo win-rate per signal method (bar chart + table), plus an *LLM models used* table — the exact synthesis & sentiment models that ran (including DeepSeek / rule-based fallbacks) |
 | Returns | KPI tiles (compound, win rate, best/worst), equity curve, and open/closed trades |
 
-The page auto-refreshes every two minutes. It is served by **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows, where gunicorn doesn't run) — wrapped in an auto-restart supervisor loop so it stays alive for always-on use (it falls back to the Dash dev server only if waitress isn't installed). All database access is read-only with exponential-backoff retry around the brief daily write-lock window, and the heavy performance computation is cached for 60 seconds. Host and port are configurable via `DASHBOARD_HOST` / `DASHBOARD_PORT`.
+Each tab's content is embedded directly in the tab, so switching is instant and handled client-side; the page is rebuilt with fresh data on each load (reload to refresh — the selected tab is remembered). Tables are sortable (click a column header, shift-click for multi-sort) and filterable (per-column search box), with human-readable headers and Eastern-time timestamps. Hover any column header, metric tile, or section heading for a plain-English explanation. It is served by **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows, where gunicorn doesn't run) — wrapped in an auto-restart supervisor loop so it stays alive for always-on use (it falls back to the Dash dev server only if waitress isn't installed). All database access is read-only with exponential-backoff retry around the brief daily write-lock window, and the heavy performance computation is cached for 60 seconds. Host and port are configurable via `DASHBOARD_HOST` / `DASHBOARD_PORT`.
 
 ---
 
@@ -1873,8 +1875,9 @@ TRACKED_POLITICIANS=Nancy Pelosi,Paul Pelosi,Austin Scott,Tommy Tuberville,...
 SEC_FILINGS_LOOKBACK_DAYS=30
 TRACKED_INSTITUTIONS=Berkshire Hathaway,Pershing Square Capital Management,...
 
-# Scheduler (cron, US/Eastern)
-SCHEDULE_DAILY=0 8 * * 1-5
+# Scheduler — intraday runner ticks every 30 min inside the session window (ET, Mon-Fri)
+INTRADAY_SESSION_START=09:30
+INTRADAY_SESSION_END=16:00
 ```
 
 ---
@@ -1884,7 +1887,7 @@ SCHEDULE_DAILY=0 8 * * 1-5
 ```bash
 python main.py             # Run once, console output only
 python main.py --email     # Run once and send email report
-python main.py --schedule  # Start APScheduler (8:00 AM ET, Mon-Fri)
+python main.py --schedule  # Start APScheduler (every 30 min, 9:30-16:00 ET, Mon-Fri; emails at close)
 python main.py --dashboard # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
 ```
 
@@ -1958,7 +1961,7 @@ llm_trader/
     │   ├── repo.py                   # Read/write API (trades, runs, recommendations)
     │   └── migrate.py                # One-time JSON → DuckDB import
     ├── scheduler/
-    │   └── runner.py                 # APScheduler daily automation
+    │   └── runner.py                 # APScheduler intraday automation (every 30 min, 9:30-16:00 ET)
     ├── charts/
     │   ├── builder.py                # Plotly figures
     │   └── report.py                 # Self-contained HTML report

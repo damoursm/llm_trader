@@ -3,7 +3,9 @@
 Trades are stored in cache/trades.json. Each daily run:
   1. Opens new trades for today's BUY/SELL recommendations.
   2. Fetches current prices for all open trades and marks unrealised P&L.
-  3. Auto-closes trades that have been held for HOLDING_DAYS trading days.
+  3. Closes positions whose thesis has deteriorated (signal decay / regime /
+     reversal). There is no fixed time cap — a position is held as long as its
+     rationale holds.
   4. Logs a full performance summary.
 """
 
@@ -21,7 +23,27 @@ from src.db import repo
 from config import settings
 
 TRADES_FILE = Path("cache/trades.json")
-HOLDING_DAYS = 5   # auto-close after this many trading days (Mon–Fri, weekends excluded)
+
+# Live-price-fetch health for the current run — surfaced to the dashboard + email
+# as a "Live price feed" data source so a broken feed is visible. yfinance is
+# tried first, Polygon second; a ticker that fails both lands in ``failed``.
+_PRICE_HEALTH: dict = {"yfinance": 0, "polygon": 0, "failed": []}
+
+
+def reset_price_health() -> None:
+    """Clear the live-price health counters (call once at the start of a run)."""
+    _PRICE_HEALTH["yfinance"] = 0
+    _PRICE_HEALTH["polygon"] = 0
+    _PRICE_HEALTH["failed"] = []
+
+
+def get_price_health() -> dict:
+    """Snapshot of this run's live-price fetch outcomes."""
+    return {
+        "yfinance": _PRICE_HEALTH["yfinance"],
+        "polygon": _PRICE_HEALTH["polygon"],
+        "failed": list(_PRICE_HEALTH["failed"]),
+    }
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 # Confidence-scaled Kelly-inspired tiers: allocate more capital to higher conviction.
@@ -67,21 +89,37 @@ def _save_trades(trades: List[dict]) -> None:
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
-    """Fetch the latest available price.
+    """Fetch the latest live price for *ticker* — yfinance first, Polygon fallback.
 
-    NOTE: the pipeline runs at 8:00 AM ET — 90 min before market open.
-    At that time fast_info.last_price returns the previous close or a thin
-    pre-market print, NOT the actual next-open tradeable price.  Performance
-    numbers will therefore understate slippage on gap-open news catalysts.
+    The pipeline runs intraday (every 30 min, 09:30–16:00 ET), so this returns a
+    genuine live last-trade price. yfinance ``fast_info.last_price`` is tried
+    first (no API key, per-ticker); on any failure we fall back to Polygon's
+    snapshot. The success source and any total failure are recorded in
+    ``_PRICE_HEALTH`` so a broken feed surfaces in the dashboard and email.
     """
     if not settings.enable_fetch_data:
         return None
+    # 1) yfinance live last price
     try:
-        info = yf.Ticker(ticker).fast_info
-        return float(info.last_price)
+        px = float(yf.Ticker(ticker).fast_info.last_price)
+        if px > 0:
+            _PRICE_HEALTH["yfinance"] += 1
+            return px
     except Exception as e:
-        logger.warning(f"[tracker] Could not fetch price for {ticker}: {e}")
-        return None
+        logger.debug(f"[tracker] yfinance price failed for {ticker}: {e}")
+    # 2) Polygon fallback
+    try:
+        from src.data import polygon_client
+        px = polygon_client.get_last_price(ticker)
+        if px and float(px) > 0:
+            _PRICE_HEALTH["polygon"] += 1
+            logger.info(f"[tracker] {ticker}: live price via Polygon fallback (yfinance unavailable)")
+            return float(px)
+    except Exception as e:
+        logger.debug(f"[tracker] Polygon price failed for {ticker}: {e}")
+    _PRICE_HEALTH["failed"].append(ticker)
+    logger.warning(f"[tracker] Could not fetch price for {ticker} — yfinance + Polygon both failed")
+    return None
 
 
 def _now_iso() -> str:
@@ -675,6 +713,7 @@ def record_new_trades(
         "skipped_correlation_cap": 0,
         "skipped_no_price":     0,
         "haircut_applied":      0,   # informational — size reduced, not skipped
+        "deferred_intraday_timing": 0,
         "opened":               0,
     }
 
@@ -728,6 +767,23 @@ def record_new_trades(
             diag["skipped_no_price"] += 1
             logger.warning(f"[tracker] Skipping {rec.ticker} — entry price is {fmt_price(price)} (warrant/delisted/negative?)")
             continue
+
+        # ── Intraday timing gate ──────────────────────────────────────────
+        # Hybrid model: the daily stack decided the DIRECTION; here a 30-min
+        # momentum read only times the ENTRY. Defer (don't open this tick) when
+        # intraday momentum is strongly against the trade; the next 30-min tick
+        # re-evaluates, so the position simply waits for a less hostile entry.
+        if settings.enable_intraday_timing:
+            from src.signals.intraday_timing import compute_intraday_timing, opposes_entry
+            timing = compute_intraday_timing(rec.ticker)
+            if opposes_entry(rec.action, timing, settings.intraday_timing_defer_threshold):
+                diag["deferred_intraday_timing"] += 1
+                logger.info(
+                    f"[tracker] Deferring {rec.action} {rec.ticker} — intraday "
+                    f"{timing['classification']} (30-min score {timing['score']:+.2f}) "
+                    f"opposes entry; will re-check next tick"
+                )
+                continue
 
         # Capture per-method scores for attribution analysis
         mscores  = _method_scores_from_signal(rec.ticker, rec.direction, signals_by_ticker)
@@ -1024,6 +1080,17 @@ def monitor_open_positions(
 
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
         reason = _evaluate_decay(trade, today_signal, macro_regime_context)
+        # Opt-in intraday exit: close when the 30-min trend has reversed hard
+        # against the position (Hybrid model — intraday only times the exit).
+        if reason is None and settings.enable_intraday_exit:
+            from src.signals.intraday_timing import compute_intraday_timing, reverses_position
+            timing = compute_intraday_timing(trade["ticker"])
+            if reverses_position(trade["action"], timing, settings.intraday_exit_threshold):
+                reason = "intraday_reversal"
+                logger.info(
+                    f"[monitor] intraday reversal on {trade['action']} {trade['ticker']} "
+                    f"(30-min score {timing['score']:+.2f}) → closing"
+                )
         if reason is None:
             continue
 
@@ -1151,11 +1218,15 @@ def _refresh_open_trade_ohlcv(trades: List[dict]) -> None:
 
 
 def update_open_trades() -> None:
-    """Refresh current prices and P&L for all open trades; close expired ones."""
+    """Refresh current prices and unrealised P&L for all open trades.
+
+    Positions are never closed here on a time basis — exits are thesis-driven
+    (``monitor_open_positions`` for signal decay / regime, and
+    ``close_trades_on_signal_reversal`` for an opposite-direction signal).
+    """
     trades = _load_trades()
     today = date.today().isoformat()
     updated = 0
-    closed = 0
 
     # Keep OHLCV current for every open-trade ticker so the daily-NAV walk
     # has a real close for each day the position was held (no synthetic
@@ -1219,29 +1290,12 @@ def update_open_trades() -> None:
         else:
             trade["max_adverse_excursion"] = round(prev_mae, 3)
 
-        # Auto-close after HOLDING_DAYS market sessions (real NYSE calendar,
-        # holidays excluded).
-        if days >= HOLDING_DAYS:
-            exit_ref = _reference_close(trade["ticker"])
-            executed_at = _execution_iso()
-            trade["status"] = "CLOSED"
-            trade["exit_date"] = today
-            trade["exit_datetime"] = executed_at
-            trade["exit_decision_datetime"] = decision_at
-            trade["exit_price"] = float(price)
-            trade["exit_ref_close"]      = exit_ref["close"] if exit_ref else None
-            trade["exit_ref_close_date"] = exit_ref["date"] if exit_ref else None
-            trade["exit_reason"]         = "holding_period"
-            closed += 1
-            logger.info(
-                f"[tracker] Closed {trade['action']} {trade['ticker']} | "
-                f"entry={fmt_price(trade['entry_price'])} exit={fmt_price(price)} "
-                f"(decision={decision_at}, exec={executed_at}) "
-                f"return={ret:+.2f}% over {days} sessions"
-            )
+        # No time-based exit — a position is held until its thesis deteriorates
+        # (monitor_open_positions) or an opposite signal appears
+        # (close_trades_on_signal_reversal). days_held above is kept for display.
 
     _save_trades(trades)
-    logger.info(f"[tracker] Updated {updated} open trade(s), closed {closed}")
+    logger.info(f"[tracker] Updated {updated} open trade(s)")
 
     # Feed the live pattern registry with any newly-closed trades that had a
     # pattern_at_entry. Idempotent — already-registered trades are skipped.

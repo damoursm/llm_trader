@@ -76,6 +76,19 @@ def run_sources_df(run_id: str) -> pd.DataFrame:
         "WHERE run_id = ? ORDER BY ok, source_label", [run_id]), "sources")
 
 
+def latest_run_failures() -> list:
+    """Failed data sources (ok = false) for the most recent run — powers the
+    dashboard health banner. Returns ``[]`` when there are none or no runs."""
+    rid = latest_run_id()
+    if not rid:
+        return []
+    df = run_sources_df(rid)
+    if df.empty or "ok" not in df.columns:
+        return []
+    failed = df[~df["ok"].astype(bool)]
+    return failed.to_dict("records")
+
+
 # performance() is heavy (NAV walk + per-method solo simulation) — cache briefly.
 _perf_cache = {"ts": 0.0, "data": None}
 _PERF_TTL = 60.0

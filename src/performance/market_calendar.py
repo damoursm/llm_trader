@@ -94,9 +94,9 @@ def is_market_day(d: date) -> bool:
 def market_days_between(start: date, end: date) -> int:
     """Count NYSE sessions in (start, end] — exclusive of start, inclusive of end.
 
-    Used to drive ``HOLDING_DAYS`` auto-close logic.  Walking calendar days
-    here is fine: the holding window is short (5–20 days max) so the loop is
-    cheap and the implementation needs no external dependency.
+    Used to populate each trade's ``days_held`` field (display / observability).
+    Walking calendar days here is fine: the loop is cheap and the implementation
+    needs no external dependency.
     """
     if end <= start:
         return 0

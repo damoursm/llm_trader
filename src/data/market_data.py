@@ -19,11 +19,60 @@ Rate-limit handling (yfinance fallback only)
 import time
 import yfinance as yf
 import pandas as pd
+from datetime import datetime as _datetime, time as _dtime
 from loguru import logger
 from typing import List, Optional, Tuple
 from config import settings
 from src.models import TickerSnapshot
 from src.data import polygon_client
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+except ImportError:  # pragma: no cover
+    from backports.zoneinfo import ZoneInfo as _ZoneInfo  # type: ignore
+_NY_TZ = _ZoneInfo("America/New_York")
+_MARKET_CLOSE = _dtime(16, 0)
+
+
+def _bar_session_date(ts):
+    """Map an OHLCV index timestamp to its NYSE session date (ET)."""
+    tz = getattr(ts, "tzinfo", None) or getattr(ts, "tz", None)
+    if tz is not None:
+        try:
+            return ts.tz_convert("America/New_York").date()
+        except (TypeError, AttributeError):
+            try:
+                return ts.astimezone(_NY_TZ).date()
+            except Exception:
+                return None
+    try:
+        return ts.date()
+    except Exception:
+        return None
+
+
+def _drop_forming_bar(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Remove the current session's still-forming daily bar.
+
+    The pipeline runs intraday (every 30 min, 09:30–16:00 ET), so a freshly
+    fetched daily bar dated *today* is incomplete until the 16:00 ET close —
+    feeding it to a daily indicator (or the NAV walk) would read a price that
+    is still moving (look-ahead within the day). Before the close we drop
+    today's bar so all daily history is completed-bars-only; after the close it
+    is final and kept. Live prices for fills / marks come from the live quote
+    (``_fetch_price`` → ``fast_info.last_price``), never from this
+    intentionally-lagged daily history.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    now_et = _datetime.now(_NY_TZ)
+    if now_et.time() >= _MARKET_CLOSE:
+        return df  # regular session closed — today's daily bar is complete
+    today = now_et.date()
+    mask = [_bar_session_date(ts) != today for ts in df.index]
+    if all(mask):
+        return df
+    return df[mask]
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +319,7 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
         last_bar = cached.index[-1].date()
         if (_date.today() - last_bar).days <= 3:
             logger.debug(f"[market_data] get_history: cache hit for {ticker} (last bar {last_bar})")
-            return cached
+            return _drop_forming_bar(cached)
 
     if not settings.enable_fetch_data:
         logger.debug(f"[market_data] ENABLE_FETCH_DATA=false — skipping history fetch for {ticker}")
@@ -279,7 +328,7 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
     # ── 1. Polygon ────────────────────────────────────────────────────────
     df = polygon_client.get_bars(ticker, period)
     if not df.empty:
-        merged = _merge_ohlcv(cached, df)
+        merged = _drop_forming_bar(_merge_ohlcv(cached, df))
         save_ohlcv(ticker, merged)
         logger.debug(
             f"[market_data] get_history: fetched {len(df)} bars for {ticker} [polygon] "
@@ -293,7 +342,7 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
         try:
             df = yf.Ticker(ticker).history(period=period, interval="1d")
             if not df.empty:
-                merged = _merge_ohlcv(cached, df)
+                merged = _drop_forming_bar(_merge_ohlcv(cached, df))
                 save_ohlcv(ticker, merged)
                 time.sleep(INTER_TICKER)
                 logger.debug(

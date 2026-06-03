@@ -62,7 +62,7 @@ from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary
 from src.notifications.email_sender import send_recommendations
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions, _method_scores_from_signal, _methods_agreeing, _dominant_method
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -86,6 +86,33 @@ def _reset_source_log() -> None:
 def _snapshot_source_log() -> list:
     with _SOURCE_LOCK:
         return list(_SOURCE_LOG)
+
+
+def _collect_sources() -> list:
+    """Per-run data-source health: the timed fetchers' log plus a synthetic
+    'Live price feed' entry reflecting the yfinance→Polygon price-fetch outcomes.
+
+    The dashboard banner and the email both read this, so a failing API is
+    reported in both places from one source of truth.
+    """
+    sources = _snapshot_source_log()
+    try:
+        ph = get_price_health()
+        attempts = ph.get("yfinance", 0) + ph.get("polygon", 0)
+        failed = ph.get("failed") or []
+        if attempts or failed:
+            n = len(failed)
+            shown = ", ".join(failed[:8]) + ("…" if n > 8 else "")
+            sources.append({
+                "label": "Live price feed (yfinance→Polygon)",
+                "enabled": True,
+                "ok": n == 0,
+                "error": f"{n} ticker(s) had no price: {shown}" if n else None,
+                "duration_s": None,
+            })
+    except Exception:
+        pass
+    return sources
 
 
 def _safe(label: str, fn, *args, **kwargs):
@@ -159,7 +186,7 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
             "llm_sentiment_provider": get_sentiment_provider_summary(),
             "gate_diag": gate_diag,
         })
-        sources = _snapshot_source_log()
+        sources = _collect_sources()
         repo.insert_run_sources(run_id, sources)
         repo.insert_recommendations(rec_rows)
         logger.info(
@@ -260,6 +287,7 @@ def run_pipeline(send_email: bool = False) -> None:
     run_id = start.strftime("%Y-%m-%d_%H%M%S")
     _reset_source_log()
     reset_sentiment_providers()
+    reset_price_health()
     logger.info(f"Pipeline started at {fmt_et(start)}")
 
     tickers     = settings.stocks_list
@@ -937,6 +965,7 @@ def run_pipeline(send_email: bool = False) -> None:
             intermarket_context=intermarket_context,
             macro_news_context=macro_news_context,
             gate_diag=gate_diag,
+            source_health=[s for s in _collect_sources() if not s.get("ok")],
         )
     else:
         logger.info("Email not configured — skipping.")

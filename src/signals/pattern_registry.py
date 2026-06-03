@@ -28,7 +28,7 @@ A single JSON file ``cache/pattern_registry.json`` with this shape::
           "trades": [
             {"ticker": "MSFT", "entry": "2026-04-15", "exit": "2026-04-22",
              "action": "BUY", "ret_pct": 5.2, "won": true,
-             "exit_reason": "holding_period"},
+             "exit_reason": "signal_decay"},
             ...
           ]
         },

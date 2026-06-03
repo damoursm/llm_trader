@@ -155,6 +155,30 @@ def get_snapshots_batch(tickers: List[str]) -> Dict[str, dict]:
     return result
 
 
+def get_last_price(ticker):
+    """Last-trade price for a single ticker via Polygon — used as a live-price
+    fallback when yfinance is unavailable.
+
+    Returns ``None`` when Polygon is unavailable or has no price for the ticker
+    (the caller then has no usable price and records the failure).
+    """
+    if not is_available() or not ticker:
+        return None
+    j = _get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}", {})
+    if not j or j.get("status") not in ("OK", "NotFound"):
+        return None
+    t = j.get("ticker") or {}
+    last_trade = t.get("lastTrade") or {}
+    day = t.get("day") or {}
+    prev = t.get("prevDay") or {}
+    price = last_trade.get("p") or day.get("c") or prev.get("c")
+    try:
+        price = float(price)
+        return price if price > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def get_bars(ticker: str, period: str = "3mo") -> pd.DataFrame:
     """
     Fetch daily OHLCV bars for *ticker* covering *period*.

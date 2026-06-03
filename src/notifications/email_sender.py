@@ -138,6 +138,15 @@ HTML_TEMPLATE = """
   &bull; {{ actionable_recs|length }} actionable signal(s)
 </div>
 
+{% if source_health %}
+<div style="background:#7f1d1d;border:1px solid #b91c1c;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fecaca;font-size:13px;">
+  &#9888; <b>{{ source_health|length }} data source(s) failed this run</b> &mdash; results may be incomplete:
+  <div style="margin-top:6px;color:#fca5a5;line-height:1.7;">
+  {% for s in source_health %}&bull; {{ s.label }}{% if s.error %} &mdash; {{ s.error }}{% endif %}<br>{% endfor %}
+  </div>
+</div>
+{% endif %}
+
 <!-- ══════════════════════════════════════
      SIGNAL OVERVIEW CHART
      ══════════════════════════════════════ -->
@@ -5270,6 +5279,7 @@ def send_recommendations(
     intermarket_context=None,       # Optional[IntermarketContext]       — avoid circular import
     macro_news_context=None,        # Optional[MacroNewsContext]         — avoid circular import
     gate_diag: Optional[dict] = None,  # per-run gate-rejection counters
+    source_health: Optional[list] = None,  # failed data sources this run (label/error dicts)
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -5417,6 +5427,7 @@ def send_recommendations(
         fmt_price_full=fmt_price_full,
         type_colors=TYPE_COLOR,
         generated_at=now_str,
+        source_health=source_health or [],
         total=total_analysed or len(all_recs),
         colors=ACTION_COLOR,
         # recommendation lists
@@ -5648,6 +5659,9 @@ def send_recommendations(
         )
     else:
         subject = f"LLM Trader | {now_str} | No actionable signals — daily report"
+
+    if source_health:
+        subject = f"⚠ API ISSUES ({len(source_health)}) | " + subject
 
     try:
         # Outer wrapper: multipart/related so inline CID images are recognised

@@ -16,6 +16,7 @@ returns None and the pipeline continues without macro context.
 """
 from __future__ import annotations
 
+import time
 from datetime import date, timedelta
 from typing import Optional
 
@@ -26,27 +27,47 @@ from src.models import MacroContext
 
 _BASE = "https://api.stlouisfed.org/fred/series/observations"
 _TIMEOUT = 15
+_MAX_RETRIES = 3      # FRED intermittently 429s under full-pipeline concurrency
+_RETRY_BASE = 0.5     # seconds; exponential backoff between retries
 
 
 def _fetch(series_id: str, api_key: str, limit: int = 13) -> list[dict]:
-    """Return the `limit` most-recent observations for a FRED series (newest first)."""
-    try:
-        resp = httpx.get(
-            _BASE,
-            params={
-                "series_id":  series_id,
-                "api_key":    api_key,
-                "file_type":  "json",
-                "sort_order": "desc",
-                "limit":      limit,
-            },
-            timeout=_TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.json().get("observations", [])
-    except Exception as e:
-        logger.warning(f"[fred] {series_id} fetch failed: {e}")
-        return []
+    """Return the `limit` most-recent observations for a FRED series (newest first).
+
+    Retries with exponential backoff on HTTP 429 (rate limit) and 5xx / transient
+    network errors. The pipeline fetches all FRED series inside a concurrent thread
+    pool, so under load FRED intermittently rate-limits individual series; without
+    a retry a dropped series would blank the whole macro context. Permanent errors
+    (bad key 4xx, malformed JSON) fail fast — retrying them only wastes time.
+    """
+    params = {
+        "series_id":  series_id,
+        "api_key":    api_key,
+        "file_type":  "json",
+        "sort_order": "desc",
+        "limit":      limit,
+    }
+    last_err: Optional[Exception] = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = httpx.get(_BASE, params=params, timeout=_TIMEOUT)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BASE * (2 ** attempt)
+                logger.debug(f"[fred] {series_id} HTTP {resp.status_code}; retry {attempt + 1} in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json().get("observations", [])
+        except httpx.RequestError as e:          # connection/timeout — transient, retry
+            last_err = e
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_RETRY_BASE * (2 ** attempt))
+                continue
+        except Exception as e:                   # 4xx, JSON decode — permanent, don't retry
+            last_err = e
+            break
+    logger.warning(f"[fred] {series_id} fetch failed: {last_err}")
+    return []
 
 
 def _latest(obs: list[dict]) -> Optional[float]:
@@ -279,11 +300,18 @@ def fetch_macro_context(api_key: str) -> Optional[MacroContext]:
     )
     ctx = ctx.model_copy(update={"summary": _build_summary(ctx)})
 
+    # None-safe formatting: under partial fetches (a 429'd series) any of these
+    # can be None. A bare numeric format spec on None raises TypeError, which would
+    # escape and make _safe discard the whole (otherwise valid) context.
+    spread_str = f"{yield_spread:+.2f}%" if yield_spread is not None else "n/a"
+    hy_str     = f"{hy_spread:.2f}%"     if hy_spread   is not None else "n/a"
+    cpi_str    = f"{cpi_yoy:+.1f}%"      if cpi_yoy     is not None else "n/a"
+    unemp_str  = f"{unemployment:.1f}%"  if unemployment is not None else "n/a"
     logger.info(
         f"[fred] Regime: {macro_regime} | "
-        f"Curve: {yield_curve} ({yield_spread:+.2f}% spread) | "
-        f"Credit: {credit} (HY {hy_spread:.2f}%) | "
-        f"CPI YoY: {cpi_yoy:+.1f}% | "
-        f"Unemployment: {unemployment:.1f}% ({unemp_trend})"
+        f"Curve: {yield_curve} ({spread_str} spread) | "
+        f"Credit: {credit} (HY {hy_str}) | "
+        f"CPI YoY: {cpi_str} | "
+        f"Unemployment: {unemp_str} ({unemp_trend})"
     )
     return ctx
