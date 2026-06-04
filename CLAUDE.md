@@ -149,8 +149,8 @@ A read-only Plotly Dash app for inspecting the database. Launch with `python mai
 
 | Task | Model | Fallback |
 |---|---|---|
-| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku 4.5 |
-| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V3 (`deepseek-chat`) on any Claude API error, then rule-based `_fallback_recommendations()` |
+| Per-ticker sentiment scoring | DeepSeek V4-Flash (`deepseek-v4-flash`, non-thinking) | Claude Haiku 4.5 |
+| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V4-Flash (`deepseek-v4-flash`) on any Claude API error, then rule-based `_fallback_recommendations()` |
 
 Available analyst models (set in `.env`):
 - `claude-haiku-4-5-20251001` — fastest, cheapest; 8 192 output tokens
@@ -159,7 +159,7 @@ Available analyst models (set in `.env`):
 
 **Claude API calls use streaming** (`client.messages.stream`) to avoid SDK timeout errors on large prompts (40+ tickers can take >10 minutes non-streaming). Text chunks are accumulated into a single string before JSON parsing.
 
-**DeepSeek analyst fallback** (`_call_deepseek_analyst()` in `claude_analyst.py`): triggered automatically when Claude raises `anthropic.APIStatusError` (HTTP 400/401/402/403/429/5xx — covers credits exhausted, bad key, payment required, rate limit, server errors) or `anthropic.APIConnectionError`. Uses `deepseek-chat` (DeepSeek V3) with the identical prompt via the OpenAI-compatible streaming API. Requires `DEEPSEEK_API_KEY`. If DeepSeek also fails, falls back to rule-based `_fallback_recommendations()`. The source model name is logged at INFO level (`via <model>`).
+**DeepSeek analyst fallback** (`_call_deepseek_analyst()` in `claude_analyst.py`): triggered automatically when Claude raises `anthropic.APIStatusError` (HTTP 400/401/402/403/429/5xx — covers credits exhausted, bad key, payment required, rate limit, server errors) or `anthropic.APIConnectionError`. Uses `deepseek-v4-flash` (DeepSeek V4-Flash, non-thinking mode — cheapest/latest) with the identical prompt via the OpenAI-compatible streaming API. Requires `DEEPSEEK_API_KEY`. If DeepSeek also fails, falls back to rule-based `_fallback_recommendations()`. The source model name is logged at INFO level (`via <model>`).
 
 ### Caching strategy
 
@@ -237,6 +237,19 @@ The HTML is a Jinja2 template string (`HTML_TEMPLATE`) embedded directly in `ema
 4. Trade Details (BUY/SELL only; prices formatted via `fmt_price()` for sub-penny precision)
 5. Monitor List (HOLD/WATCH)
 6. Analyst Ratings, EPS Surprises, Macro Regime Filter, Market Mode, Catalyst Timing, FRED, COT, VIX, McClellan, Highs/Lows, Breadth, Macro Surprise, FedWatch, Credit, MOVE, Dark Pool Index (DIX), Bond Internals, Global Macro, Seasonality, OpEx, Put/Call, Short Interest, GEX, Revision Momentum, Earnings Whisper, IPO Pipeline, Reddit, Sector Pairs, Cointegration Pairs, Smart Money Signals
+
+### Broker integration (paper-first live execution)
+
+`src/broker/` adds a real **execution leg** alongside the internal NAV simulator — a "shadow & reconcile" design for moving toward live trading. Gated by `settings.broker_mode`; **`off` (default) makes zero broker calls** (behavior unchanged).
+
+- **Modes:** `off` | `dry_run` (log intended orders, submit nothing) | `ibkr_paper` | `ibkr_live`. Paper vs live is the configured `ibkr_port` (IB Gateway 4002/4001); the factory refuses to start `ibkr_paper` on a known live port.
+- **Broker = Interactive Brokers** via `ib_async` → IB Gateway. It's the only API broker that lets a Canadian resident paper *and* live trade US securities (CIRO blocks API orders only for Canadian-listed names; the tradeable universe is 100% US stocks/ETFs). `ib_async` is imported lazily, so the package imports fine without it (off/dry_run paths).
+- **Single hook point — `reconcile.sync()`** runs once per tick in `pipeline.run_pipeline()` right after `record_new_trades` (the ledger is final there). Idempotent and self-healing: internal OPEN trades without a `broker_order_id` → sized entry submitted; internal CLOSED trades still holding a broker position → close submitted; broker positions with no matching OPEN trade → reported as drift. Every broker call is exception-safe — a failure logs and degrades to report-only, never breaking the run. The internal NAV sim stays the source of truth for analytics. **`tracker.py` is not modified.**
+- **Sizing** (`sizing.py`): `shares = floor(equity × broker_base_position_pct × position_size_multiplier / price)`, with max-positions and max-gross-exposure caps. Reuses the existing 1.0/1.5/2.0× confidence multiplier.
+- **Reuse, not rebuild:** `broker_*` fields ride along in the DuckDB JSON `data` column (no migration); `recommendation_id` is the idempotent IBKR `orderRef`; a broker-health verdict (`_assess_broker_health` in `pipeline.py`) mirrors `_assess_llm_health` → CRITICAL log + email banner (`broker_health` var) + `🔔 BROKER` subject tag on drift/rejects, plus a green "N entries / M exits / slippage" line when healthy.
+- **Ops:** IB Gateway must run alongside the scheduler and needs a ~daily re-login (use IBKR auto-restart + IBController). Before enabling: `python -m src.broker.smoketest` (connectivity), then `--order` for a 1-share round trip.
+
+Phased rollout: `dry_run` → `ibkr_paper` + reconcile (run weeks; measure slippage / tracking-error / rejects) → flip to `ibkr_live` (port 4001) with a capital cap. Plan: `~/.claude/plans/snuggly-munching-piglet.md`.
 
 ### Configuration
 

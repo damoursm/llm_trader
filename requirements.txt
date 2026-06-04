@@ -28,6 +28,10 @@ duckdb==1.5.3
 dash==4.1.0
 waitress==3.0.2          # production WSGI server — keeps the dashboard alive for always-on use
 
+# Broker / live execution (paper-first via Interactive Brokers; only needed when
+# broker_mode=ibkr_paper / ibkr_live — requires IB Gateway running)
+ib_async==2.1.0
+
 # Scheduling
 apscheduler==3.11.0
 

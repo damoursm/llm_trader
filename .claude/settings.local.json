@@ -22,7 +22,9 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _fred_debug.py)",
       "PowerShell(Remove-Item *)",
       "Bash(grep -rnE 'logger\\\\.\\(info|warning|debug|error\\).*\\\\{[a-z_]+:[-+]?[.,0-9]*[fd%]' src/data/ src/analysis/ src/performance/)",
-      "Bash(grep -vE 'is not None|or 0|:\\\\.0f\\\\}%? *\\\\\"?\\\\\\)? *$')"
+      "Bash(grep -vE 'is not None|or 0|:\\\\.0f\\\\}%? *\\\\\"?\\\\\\)? *$')",
+      "WebFetch(domain:api-docs.deepseek.com)",
+      "WebSearch"
     ]
   }
 }

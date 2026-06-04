@@ -345,12 +345,13 @@ def _deepseek_classify(
         # Determinism: temperature=0 + fixed seed so two runs on the same
         # filtered headline set produce the same theme classification.
         resp = client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             seed=_MACRO_NEWS_SEED,
             max_tokens=2400,
             response_format={"type": "json_object"},
+            extra_body={"thinking": {"type": "disabled"}},  # non-thinking: cheap/fast/deterministic
         )
         raw = resp.choices[0].message.content or ""
     except Exception as e:

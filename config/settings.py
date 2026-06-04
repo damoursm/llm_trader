@@ -637,6 +637,30 @@ class Settings(BaseSettings):
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8050
 
+    # ── Broker / live execution (paper-first; OFF by default → no broker calls) ──
+    # Pre-production: drive a real broker's PAPER account in parallel with the
+    # internal NAV sim ("shadow & reconcile"), then flip to live with a port swap.
+    # IBKR is the only API broker offering a Canadian resident both paper and live
+    # for US securities (CIRO blocks API only for Canadian-listed names, which this
+    # system never trades — the universe is 100% US stocks/ETFs). See src/broker/.
+    #   off        — no broker calls; internal simulation only (default; unchanged behavior)
+    #   dry_run    — log the orders that WOULD be placed (sizing + idempotency); submit nothing
+    #   ibkr_paper — submit to IB Gateway PAPER account
+    #   ibkr_live  — submit to IB Gateway LIVE account  [gated: only after paper validation]
+    broker_mode: str = "off"
+    ibkr_host: str = "127.0.0.1"
+    ibkr_port: int = 4002              # IB Gateway: 4002 paper / 4001 live  (TWS: 7497 / 7496)
+    ibkr_client_id: int = 11           # any stable int unique to this API connection
+    ibkr_account: str = ""             # optional: pin a specific IBKR account id (else the sole/first)
+    ibkr_connect_timeout: int = 15     # seconds to wait for the Gateway socket
+    # Position sizing — shares = floor(equity × base_pct × size_multiplier / price),
+    # where size_multiplier is the existing 1.0/1.5/2.0× confidence tier on each trade.
+    broker_base_position_pct: float = 0.05        # 5% of account equity per 1.0× position
+    broker_max_positions: int = 20                # hard cap on concurrent broker positions
+    broker_max_gross_exposure_pct: float = 1.0    # cap on Σ|notional| / equity (1.0 = no leverage)
+    broker_order_type: str = "MKT"                # MKT (market) — RTH-only via the scheduler window
+    broker_paper_equity: float = 100000.0         # used for sizing in dry_run; live reads real equity
+
     @property
     def tracked_politicians_list(self) -> List[str]:
         return [p.strip() for p in self.tracked_politicians.split(",") if p.strip()]

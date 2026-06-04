@@ -1386,7 +1386,7 @@ Combines up to sixteen signal methods with dynamically normalized weights:
 
 | Method | Base weight | Source |
 |---|---|---|
-| News sentiment | 40% | DeepSeek V3 LLM scoring of all article-type sources |
+| News sentiment | 40% | DeepSeek V4-Flash LLM scoring of all article-type sources |
 | Sentiment velocity | 12% | Δ news tone (recent − prior window) — rate of change, not level |
 | Technical analysis | 30% | RSI, MACD, SMA20/50, Bollinger Bands |
 | Smart money / insider | 30% | Insider trades + options flow + SEC filings |
@@ -1455,7 +1455,7 @@ All ticker signals plus every macro/breadth/volatility context block are passed 
 
 Claude acts as an elite portfolio manager with 22 numbered decision rules covering: conviction thresholds, smart money weighting, macro overlays, cluster handling, volatility regimes, breadth conditions, earnings event caution, and more. When no ticker clears the bar, it outputs HOLD/WATCH for all.
 
-**Automatic fallback chain:** If the Claude API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to **DeepSeek V3** (`deepseek-chat`) via the OpenAI-compatible streaming API. If DeepSeek also fails, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The active analyst model is logged at INFO level.
+**Automatic fallback chain:** If the Claude API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to **DeepSeek V4-Flash** (`deepseek-v4-flash`, non-thinking) via the OpenAI-compatible streaming API. If DeepSeek also fails, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The active analyst model is logged at INFO level.
 
 ---
 
@@ -1698,13 +1698,13 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 
 | Task | Model | Fallback |
 |---|---|---|
-| Per-ticker sentiment scoring | DeepSeek V3 (`deepseek-chat`) | Claude Haiku 4.5 |
+| Per-ticker sentiment scoring | DeepSeek V4-Flash (`deepseek-v4-flash`, non-thinking) | Claude Haiku 4.5 |
 | Technical analysis scoring | Computed locally (RSI, MACD, SMA, BB) | — |
-| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V3 (`deepseek-chat`) → rule-based fallback |
+| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V4-Flash (`deepseek-v4-flash`) → rule-based fallback |
 
 To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env`.
 
-**DeepSeek V3 analyst fallback:** When the configured Claude model raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through `deepseek-chat` (DeepSeek V3) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If DeepSeek also fails, the pipeline falls back to a simple rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
+**DeepSeek V4-Flash analyst fallback:** When the configured Claude model raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through `deepseek-v4-flash` (DeepSeek V4-Flash, non-thinking) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If DeepSeek also fails, the pipeline falls back to a simple rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
 
 ---
 
@@ -1946,7 +1946,7 @@ llm_trader/
     │   ├── business_cycle_rotation.py # Fidelity-style economic phase → sector leadership biases
     │   └── cache.py                  # Hourly cache + incremental OHLCV
     ├── analysis/
-    │   ├── sentiment.py              # DeepSeek V3 / Haiku sentiment scoring
+    │   ├── sentiment.py              # DeepSeek V4-Flash / Haiku sentiment scoring
     │   ├── technical.py              # RSI, MACD, SMA, Bollinger Bands
     │   └── claude_analyst.py         # Final recommendations (22 decision rules)
     ├── signals/

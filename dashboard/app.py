@@ -181,15 +181,15 @@ _METHOD_HEADER_TIPS = {
 # ── LLM model usage (Method Performance tab → "LLM models used" section) ──────
 # Exact model ids per provider. Sources of truth in the code:
 #   synthesis Claude   → settings.analyst_model
-#   synthesis DeepSeek → claude_analyst._DEEPSEEK_ANALYST_MODEL  ("deepseek-chat", V3)
-#   sentiment DeepSeek → sentiment.DEEPSEEK_MODEL                ("deepseek-chat", V3)
+#   synthesis DeepSeek → claude_analyst._DEEPSEEK_ANALYST_MODEL  ("deepseek-v4-flash")
+#   sentiment DeepSeek → sentiment.DEEPSEEK_MODEL                ("deepseek-v4-flash")
 #   sentiment Claude   → sentiment.HAIKU_MODEL                   ("claude-haiku-4-5-20251001")
 _PROVIDER_LABEL = {
     "anthropic": "Anthropic (Claude)", "deepseek": "DeepSeek",
     "rule-based": "Rule-based", "none": "—", "": "—",
 }
 _SENTIMENT_MODEL = {
-    "deepseek": "deepseek-chat",
+    "deepseek": "deepseek-v4-flash",
     "anthropic": "claude-haiku-4-5-20251001",
     "none": "(none — cached / no LLM call)",
 }
@@ -201,7 +201,7 @@ def _synthesis_model(provider) -> str:
     if p == "anthropic":
         return settings.analyst_model           # the configured Claude model
     if p == "deepseek":
-        return "deepseek-chat"                   # DeepSeek V3 analyst fallback
+        return "deepseek-v4-flash"               # DeepSeek V4-Flash analyst fallback
     if p == "rule-based":
         return "rule-based (no LLM)"
     return "—"
@@ -386,10 +386,75 @@ def _rationale_body(run_id):
     ])
 
 
+# ── Time-window toggle (shared by the Method Performance & Returns tabs) ─────
+_WINDOW_OPTIONS = [
+    {"label": "1 Week", "value": "7"},
+    {"label": "1 Month", "value": "30"},
+    {"label": "Inception", "value": "all"},
+]
+
+
+def _window_toggle(component_id: str) -> html.Div:
+    """A 1-week / 1-month / inception selector. The tab's metrics and plots
+    recompute against trades ENTERED within the chosen window ('Inception' = every
+    trade ever). Defaults to Inception so the initial view shows the full book."""
+    return html.Div(
+        [
+            html.Label("Window:  ",
+                       title="Filter the metrics and plots in this tab to trades entered in the last week, the last month, or since inception (every trade).",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_WINDOW_OPTIONS, value="all", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _window_days(value):
+    """RadioItems value → window_days int, or None for inception (all trades)."""
+    return None if value in (None, "all") else int(value)
+
+
+def _window_label(value) -> str:
+    """RadioItems value → human label for tile captions."""
+    return {"7": "1 week", "30": "1 month"}.get(str(value), "inception")
+
+
 # ── Tab 2: Method Performance ──────────────────────────────────────────────
 
 def _methods_tab():
-    perf = data.performance()
+    # The LLM-models-used table is run-based (not trade-windowed), so it lives
+    # outside the windowed body. The per-method performance section (bar + table)
+    # is filled by _methods_body() against the selected time window.
+    runs = data.runs_df()
+    model_rows = _models_used_rows(runs) if not runs.empty else []
+    models_table = dash_table.DataTable(
+        data=model_rows,
+        columns=[{"name": c, "id": c} for c in ["Role", "Model", "API", "Runs", "Calls"]],
+        tooltip_header=_MODELS_HEADER_TIPS,
+        **_TABLE_KW,
+    ) if model_rows else html.Div("No runs recorded yet.", style={"color": "#6b7280"})
+
+    return html.Div([
+        _window_toggle("methods-window"),
+        dcc.Loading(html.Div(id="methods-body")),
+        _h3("LLM models used (synthesis & sentiment)",
+            "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
+        models_table,
+    ])
+
+
+@app.callback(Output("methods-body", "children"), Input("methods-window", "value"))
+def _methods_body(window_value):
+    return _safe(lambda: _methods_perf_section(_window_days(window_value)))
+
+
+def _methods_perf_section(window_days):
+    perf = data.performance(window_days=window_days)
     solo = perf.get("solo_method_perf") or {}
     labels = perf.get("method_labels") or {}
     order = perf.get("method_order_by_winrate") or list(solo.keys())
@@ -411,25 +476,13 @@ def _methods_tab():
         columns=[{"name": c, "id": c} for c in ["Method", "Win rate %", "Trades", "Avg return %"]],
         tooltip_header=_METHOD_HEADER_TIPS,
         **_TABLE_KW,
-    ) if rows else html.Div("No per-method stats yet.", style={"color": "#6b7280"})
-
-    runs = data.runs_df()
-    model_rows = _models_used_rows(runs) if not runs.empty else []
-    models_table = dash_table.DataTable(
-        data=model_rows,
-        columns=[{"name": c, "id": c} for c in ["Role", "Model", "API", "Runs", "Calls"]],
-        tooltip_header=_MODELS_HEADER_TIPS,
-        **_TABLE_KW,
-    ) if model_rows else html.Div("No runs recorded yet.", style={"color": "#6b7280"})
+    ) if rows else html.Div("No per-method stats in this window yet.", style={"color": "#6b7280"})
 
     return html.Div([
         dcc.Graph(figure=figures.method_winrate_fig(perf)),
         _h3("Per-method stats (solo simulation)",
             "How each signal method would have performed on its own. 'Solo simulation' = for each closed trade, ask what the result would be if only this method had decided the direction. Hover the column headers for details."),
         table,
-        _h3("LLM models used (synthesis & sentiment)",
-            "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Hover a column header for details."),
-        models_table,
     ])
 
 
@@ -459,28 +512,41 @@ def _trades_table(trades: list):
 
 
 def _returns_tab():
-    perf = data.performance()
+    return html.Div([
+        _window_toggle("returns-window"),
+        dcc.Loading(html.Div(id="returns-body")),
+    ])
+
+
+@app.callback(Output("returns-body", "children"), Input("returns-window", "value"))
+def _returns_body(window_value):
+    return _safe(lambda: _returns_section(window_value))
+
+
+def _returns_section(window_value):
+    perf = data.performance(window_days=_window_days(window_value))
     stats = perf.get("stats") or {}
     pm = perf.get("portfolio_metrics") or {}
+    wlabel = _window_label(window_value)
 
     compound = pm.get("compound_inception", stats.get("compound_return"))
     cards = html.Div(
         [
-            _kpi("Compound (inception)", _pct(compound, signed=True),
+            _kpi(f"Compound ({wlabel})", _pct(compound, signed=True),
                  figures.POS if (compound or 0) >= 0 else figures.NEG,
-                 tooltip="Path-faithful compound return over every trade since inception: each day's capital-weighted return across active positions, chained over real closing prices. Open positions are included at their live mark."),
+                 tooltip="Path-faithful compound return over the selected window: each day's capital-weighted return across active positions, chained over real closing prices. Counts trades ENTERED within the window; open positions are included at their live mark."),
             _kpi("Win rate", _pct(stats.get("win_rate")),
                  tooltip="Share of trades with a positive spread-adjusted return. A flat round-trip is a loss (you pay the bid-ask spread). Open positions count at their live mark."),
             _kpi("Avg return", _pct(stats.get("avg_return"), signed=True),
-                 tooltip="Mean per-trade % return, equal-weighted across all trades (open trades at their live mark)."),
+                 tooltip="Mean per-trade % return, equal-weighted across all trades in the window (open trades at their live mark)."),
             _kpi("Weighted avg", _pct(stats.get("weighted_avg_return"), signed=True),
                  tooltip="Per-trade % return weighted by position size (the confidence-tier multiplier), so larger positions count more."),
             _kpi("Best", _pct(stats.get("best"), signed=True), figures.POS,
-                 tooltip="Best single-trade % return in the book."),
+                 tooltip="Best single-trade % return in the window."),
             _kpi("Worst", _pct(stats.get("worst"), signed=True), figures.NEG,
-                 tooltip="Worst single-trade % return in the book."),
+                 tooltip="Worst single-trade % return in the window."),
             _kpi("Closed / Open", f"{stats.get('total_closed', 0)} / {stats.get('total_open', 0)}",
-                 tooltip="Number of closed (realised) trades vs. positions currently open."),
+                 tooltip="Number of closed (realised) trades vs. positions currently open, within the selected window."),
         ],
         style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
     )
@@ -488,9 +554,9 @@ def _returns_tab():
     return html.Div([
         cards,
         dcc.Graph(figure=figures.equity_curve_fig(perf)),
-        _h3("Open positions", "Positions currently held, marked to the latest price — the return shown is live mark-to-market ('what if you closed now')."),
+        _h3("Open positions", "Positions currently held, marked to the latest price — the return shown is live mark-to-market ('what if you closed now'). Filtered to the selected entry window."),
         _trades_table(perf.get("open_trades") or []),
-        _h3("Closed trades", "Realised round-trips, with their final spread-adjusted return."),
+        _h3("Closed trades", "Realised round-trips, with their final spread-adjusted return. Filtered to the selected entry window."),
         _trades_table(perf.get("closed_trades") or []),
     ])
 

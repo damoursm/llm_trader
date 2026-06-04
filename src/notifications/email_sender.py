@@ -156,6 +156,19 @@ HTML_TEMPLATE = """
 </div>
 {% endif %}
 
+{% if broker_health and broker_health.down %}
+<div style="background:#7c2d12;border:1px solid #c2410c;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fed7aa;font-size:13px;">
+  &#128276; <b>Broker execution issue ({{ broker_health.mode }})</b> &mdash; {{ broker_health.message }}.
+  <div style="margin-top:6px;color:#fdba74;line-height:1.7;">
+  Paper orders may not reflect the model this run &mdash; check IB Gateway connectivity and the broker order log.
+  </div>
+</div>
+{% elif broker_health %}
+<div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
+  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.slippage %} &middot; avg entry slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps{% endif %}.
+</div>
+{% endif %}
+
 <!-- ══════════════════════════════════════
      SIGNAL OVERVIEW CHART
      ══════════════════════════════════════ -->
@@ -5290,6 +5303,7 @@ def send_recommendations(
     gate_diag: Optional[dict] = None,  # per-run gate-rejection counters
     source_health: Optional[list] = None,  # failed data sources this run (label/error dicts)
     llm_health: Optional[dict] = None,     # LLM-layer health verdict this run (down/message)
+    broker_health: Optional[dict] = None,  # broker/execution reconcile verdict this run
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -5439,6 +5453,7 @@ def send_recommendations(
         generated_at=now_str,
         source_health=source_health or [],
         llm_health=llm_health,
+        broker_health=broker_health,
         total=total_analysed or len(all_recs),
         colors=ACTION_COLOR,
         # recommendation lists
@@ -5676,6 +5691,9 @@ def send_recommendations(
 
     if llm_health and llm_health.get("down"):
         subject = "🤖 LLM DOWN | " + subject
+
+    if broker_health and broker_health.get("down"):
+        subject = "🔔 BROKER | " + subject
 
     try:
         # Outer wrapper: multipart/related so inline CID images are recognised

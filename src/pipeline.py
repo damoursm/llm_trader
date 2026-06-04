@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from loguru import logger
 from datetime import datetime, timezone
 
@@ -238,6 +239,34 @@ def _assess_llm_health() -> dict:
         "synthesis_provider": synth_provider,
         "sentiment_summary":  sent_summary,
         "message":            "; ".join(parts),
+    }
+
+
+def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
+    """Turn a broker reconcile report into a health verdict for the CRITICAL log
+    and the email banner. Returns None when broker_mode=off / no report."""
+    if not report or report.get("mode") in (None, "off"):
+        return None
+    problems = []
+    if not report.get("connected"):
+        problems.append("broker NOT connected — orders were not placed")
+    if report.get("rejects"):
+        problems.append(f"{report['rejects']} order(s) rejected")
+    if report.get("drift"):
+        names = ", ".join(d["ticker"] for d in report["drift"][:6])
+        problems.append(f"{len(report['drift'])} position(s) drifted from the ledger ({names})")
+    if not report.get("ok") and report.get("errors"):
+        problems.append("reconcile error")
+    return {
+        "down":      bool(problems),
+        "mode":      report.get("mode"),
+        "connected": report.get("connected"),
+        "entries":   report.get("entries_submitted", 0),
+        "exits":     report.get("exits_submitted", 0),
+        "rejects":   report.get("rejects", 0),
+        "drift":     report.get("drift", []),
+        "slippage":  report.get("slippage", []),
+        "message":   "; ".join(problems),
     }
 
 
@@ -913,6 +942,19 @@ def run_pipeline(send_email: bool = False) -> None:
     )
     close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
     trade_diag = record_new_trades(actionable, signals_by_ticker=signals_by_ticker, run_id=run_id) or {}
+
+    # Broker shadow execution (paper-first): once the internal ledger is final for
+    # this tick, reconcile a real broker (IBKR paper) against it — submit entries
+    # for new opens, close exits, report slippage/drift. No-op when broker_mode=off;
+    # the reconciler is exception-safe and never breaks the run.
+    broker_report = None
+    if settings.broker_mode and settings.broker_mode != "off":
+        from src.broker.reconcile import sync as _broker_sync
+        try:
+            broker_report = _broker_sync()
+        except Exception as e:
+            logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
+
     # Merge per-gate counters from the actionable filter + the trade-entry path
     # into one diagnostic blob so the user can see at a glance which constraints
     # are doing the work and which are passive backstops.
@@ -968,6 +1010,14 @@ def run_pipeline(send_email: bool = False) -> None:
             f"Top up / check Anthropic + DeepSeek API credits and keys."
         )
 
+    # Surface broker/execution problems (not connected, rejects, position drift)
+    # the same way — CRITICAL log here, email banner + subject tag below.
+    broker_health = _assess_broker_health(broker_report)
+    if broker_health and broker_health["down"]:
+        logger.critical(
+            f"[broker] EXECUTION ISSUE ({broker_health['mode']}) — {broker_health['message']}."
+        )
+
     _print_summary(actionable, smart_money or [])
 
     email_configured = bool(settings.smtp_user and settings.email_recipients)
@@ -1020,6 +1070,7 @@ def run_pipeline(send_email: bool = False) -> None:
             gate_diag=gate_diag,
             source_health=[s for s in _collect_sources() if not s.get("ok")],
             llm_health=llm_health,
+            broker_health=broker_health,
         )
     else:
         logger.info("Email not configured — skipping.")

@@ -1,6 +1,6 @@
 """LLM-based sentiment analysis of news articles.
 
-Primary:  DeepSeek V3 (deepseek-chat) — fast and cheap for per-ticker scoring
+Primary:  DeepSeek V4-Flash (deepseek-v4-flash, non-thinking) — fast and cheap for per-ticker scoring
 Fallback: Claude Haiku — used if DeepSeek is unavailable or errors
 
 Precision controls:
@@ -26,7 +26,11 @@ _deepseek_client = None
 _haiku_client = None
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"       # DeepSeek V3
+DEEPSEEK_MODEL = "deepseek-v4-flash"   # DeepSeek V4-Flash — cheapest/latest (replaces deprecated deepseek-chat)
+# v4-flash defaults to thinking ENABLED; force it OFF so bulk sentiment scoring stays
+# cheap, fast, and deterministic (no chain-of-thought output tokens). Passed via the
+# OpenAI SDK's extra_body since `thinking` is a DeepSeek-specific parameter.
+_DEEPSEEK_THINKING_OFF = {"thinking": {"type": "disabled"}}
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 # Thread-safe tally of which provider answered each per-ticker sentiment call this
@@ -49,7 +53,7 @@ def _record_sentiment_provider(provider: str) -> None:
 def get_sentiment_provider_summary() -> Optional[str]:
     """Compact summary of providers used this run, e.g. 'deepseek×40, anthropic×2'.
 
-    Returns None when no per-ticker sentiment LLM call was made this run.
+    Returns None when no per-tickerAdd sentiment LLM call was made this run.
     """
     with _PROVIDER_LOCK:
         if not _PROVIDER_COUNTS:
@@ -211,7 +215,7 @@ Respond with JSON only, no markdown."""
     raw_score = None
     rationale = "Analysis unavailable."
 
-    # --- Primary: DeepSeek V3 ---
+    # --- Primary: DeepSeek V4-Flash ---
     # temperature=0 + a stable seed give near-deterministic output across runs
     # for the same article digest, which is what we want so two pipeline runs
     # within the same news-cache hour produce the same per-ticker sentiment.
@@ -224,6 +228,7 @@ Respond with JSON only, no markdown."""
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
                 seed=_LLM_SEED,
+                extra_body=_DEEPSEEK_THINKING_OFF,
             )
             raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (deepseek-v3, {len(to_score)} articles)")

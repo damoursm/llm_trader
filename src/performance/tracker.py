@@ -1889,7 +1889,7 @@ def _eval_stats(entries: list) -> dict:
     }
 
 
-def compute_solo_method_performance(split: Optional[str] = None) -> dict:
+def compute_solo_method_performance(split: Optional[str] = None, window_days: Optional[int] = None) -> dict:
     """Simulate performance for each signal method used in isolation, split by direction.
 
     For each closed trade with stored method_scores, each method is asked:
@@ -1916,6 +1916,9 @@ def compute_solo_method_performance(split: Optional[str] = None) -> dict:
     trades = _load_trades()
     closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
     closed = _filter_by_split(closed, split)
+    if window_days is not None:
+        _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+        closed = [t for t in closed if (t.get("entry_date") or "") >= _cutoff]
     if not closed:
         return {}
 
@@ -2076,9 +2079,18 @@ def compute_oos_comparison() -> dict:
     }
 
 
-def get_performance_for_email() -> dict:
-    """Return structured performance data for inclusion in the email report."""
+def get_performance_for_email(window_days: Optional[int] = None) -> dict:
+    """Return structured performance data for inclusion in the email report.
+
+    When ``window_days`` is set, only trades ENTERED within the last N calendar
+    days are included (1w = 7, 1m = 30); ``None`` = inception (every trade ever).
+    The dashboard's time-window toggle passes 7 / 30 / None so its metrics and
+    plots recompute against the windowed trade set.
+    """
     trades = _load_trades()
+    if window_days is not None:
+        _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+        trades = [t for t in trades if (t.get("entry_date") or "") >= _cutoff]
     open_trades   = [t for t in trades if t["status"] == "OPEN"]
     closed_trades = [t for t in trades if t["status"] == "CLOSED"]
     # Open trades carry a current M2M return_pct (updated each run by update_open_trades()).
@@ -2140,7 +2152,7 @@ def get_performance_for_email() -> dict:
     performance_table    = _compute_performance_table(all_trades) if all_trades else []
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
-    solo_method_perf     = compute_solo_method_performance()
+    solo_method_perf     = compute_solo_method_performance(window_days=window_days)
     method_eval_stats    = compute_method_eval_stats()
     oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)

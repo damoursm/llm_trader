@@ -11,7 +11,10 @@ from src.models import TickerSignal, Recommendation, InsiderTrade, MacroContext,
 from src.data.insider_trades import build_insider_summary
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-_DEEPSEEK_ANALYST_MODEL = "deepseek-chat"   # DeepSeek V3 — fast, structured JSON, same API as sentiment.py
+_DEEPSEEK_ANALYST_MODEL = "deepseek-v4-flash"   # DeepSeek V4-Flash — cheapest/latest (replaces deprecated deepseek-chat)
+# v4-flash defaults to thinking ENABLED; force it OFF — non-thinking is cheaper, faster,
+# and more deterministic (no chain-of-thought tokens) for structured-JSON synthesis.
+_DEEPSEEK_THINKING_OFF = {"thinking": {"type": "disabled"}}
 # Fixed seed for the DeepSeek analyst fallback; combined with temperature=0
 # this gets us near-deterministic synthesis across identical-prompt runs.
 _DEEPSEEK_ANALYST_SEED = 4242
@@ -55,11 +58,11 @@ def _get_deepseek_analyst_client():
 
 
 def _call_deepseek_analyst(prompt: str) -> str:
-    """Call DeepSeek V3 (deepseek-chat) as fallback analyst. Returns raw response text."""
+    """Call DeepSeek V4-Flash (non-thinking) as fallback analyst. Returns raw response text."""
     client = _get_deepseek_analyst_client()
     if client is None:
         raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
-    logger.info(f"[claude] Falling back to DeepSeek V3 analyst: {_DEEPSEEK_ANALYST_MODEL}")
+    logger.info(f"[claude] Falling back to DeepSeek analyst: {_DEEPSEEK_ANALYST_MODEL}")
     raw_parts: list[str] = []
     # Determinism: temperature=0 + fixed seed so two runs on the same prompt
     # produce near-identical synthesis (slight provider-side variance only).
@@ -70,6 +73,7 @@ def _call_deepseek_analyst(prompt: str) -> str:
         stream=True,
         temperature=0,
         seed=_DEEPSEEK_ANALYST_SEED,
+        extra_body=_DEEPSEEK_THINKING_OFF,
     ) as stream:
         for chunk in stream:
             if not chunk.choices:

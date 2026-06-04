@@ -89,17 +89,21 @@ def latest_run_failures() -> list:
     return failed.to_dict("records")
 
 
-# performance() is heavy (NAV walk + per-method solo simulation) — cache briefly.
-_perf_cache = {"ts": 0.0, "data": None}
+# performance() is heavy (NAV walk + per-method solo simulation) — cache briefly,
+# keyed by time window so the dashboard's 1w / 1m / inception toggle stays snappy.
+_perf_cache: dict = {}          # window key -> {"ts": float, "data": dict}
 _PERF_TTL = 60.0
 
 
-def performance(force: bool = False) -> dict:
+def performance(window_days: Optional[int] = None, force: bool = False) -> dict:
+    """Windowed performance bundle. ``window_days`` = 7 / 30 filters to trades
+    entered in that window; ``None`` = inception (every trade)."""
+    key = "all" if window_days is None else int(window_days)
     now = time.time()
-    cached = _perf_cache["data"]
-    if not force and cached is not None and (now - _perf_cache["ts"]) < _PERF_TTL:
-        return cached
+    entry = _perf_cache.get(key)
+    if not force and entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
     from src.performance.tracker import get_performance_for_email
-    data = _retry(get_performance_for_email, "performance")
-    _perf_cache.update(ts=now, data=data)
-    return data
+    result = _retry(lambda: get_performance_for_email(window_days=window_days), "performance")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
