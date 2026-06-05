@@ -74,6 +74,22 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None) -
         acct_ccy = acct.currency if acct else "USD"
         report["account_equity"] = equity
         report["account_currency"] = acct_ccy
+        report["account_id"] = acct.account_id if acct else None
+
+        # SAFETY: in paper mode, only ever trade a paper account. IBKR paper account
+        # numbers are D-prefixed (e.g. DU…); live accounts are U-prefixed. A non-D
+        # account here means TWS/Gateway is logged into the wrong login — refuse to
+        # place ANY orders rather than risk trading a live account.
+        if settings.broker_mode == "ibkr_paper" and acct and not str(acct.account_id).upper().startswith("D"):
+            report["ok"] = False
+            report["errors"].append(
+                f"paper mode but connected account {acct.account_id} is not a paper (D…) account")
+            logger.critical(
+                f"[broker] SAFETY STOP — broker_mode=ibkr_paper but connected account is "
+                f"{acct.account_id} (not a paper/D… account). NO orders placed — check your TWS/Gateway login."
+            )
+            return report
+
         # Everything below sizes in USD (US securities are USD-priced). Convert the
         # account equity and the (CAD) base notional to USD via live FX.
         equity_usd = equity * usd_per_unit(acct_ccy)

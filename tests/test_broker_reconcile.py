@@ -14,9 +14,10 @@ from src.broker.base import AccountSnapshot, Broker, OrderResult, Position
 class FakeBroker(Broker):
     name = "fake"
 
-    def __init__(self, positions=None, equity=100_000.0):
+    def __init__(self, positions=None, equity=100_000.0, account_id="DU0000001"):
         self._positions = positions or []
         self._equity = equity
+        self._account_id = account_id
         self.orders = []
 
     def connect(self):
@@ -26,7 +27,7 @@ class FakeBroker(Broker):
         return True
 
     def get_account(self):
-        return AccountSnapshot(self._equity, self._equity, self._equity, "FAKE")
+        return AccountSnapshot(self._equity, self._equity, self._equity, self._account_id)
 
     def get_positions(self):
         return list(self._positions)
@@ -116,6 +117,16 @@ def test_drift_reported(repo_store):
     b = FakeBroker(positions=[Position("NVDA", 5, 100.0)])
     r = rec.sync(broker=b)
     assert any(d["ticker"] == "NVDA" for d in r["drift"])
+
+
+def test_safety_stop_on_non_paper_account(repo_store):
+    # broker_mode=ibkr_paper but connected to a live (U-prefixed) account → refuse all orders.
+    repo_store["trades"] = [_open_trade("AAPL")]
+    b = FakeBroker(account_id="U26348620")
+    r = rec.sync(broker=b)
+    assert r["ok"] is False
+    assert r["entries_submitted"] == 0
+    assert b.orders == []
 
 
 def test_off_mode_is_noop(monkeypatch):
