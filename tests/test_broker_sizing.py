@@ -3,7 +3,7 @@
 import pytest
 
 from config.settings import settings
-from src.broker.sizing import shares_for, within_caps
+from src.broker.sizing import shares_for, shares_for_notional, within_caps
 
 
 @pytest.mark.parametrize("equity,price,mult,base,expected", [
@@ -38,3 +38,28 @@ def test_within_caps_gross_exposure(monkeypatch):
     assert within_caps(0, 90_000, 100_000)[0] is True
     allowed, reason = within_caps(0, 110_000, 100_000)
     assert allowed is False and "exposure" in reason
+
+
+@pytest.mark.parametrize("notional,fx,price,mult,expected", [
+    (500, 0.73, 50.0, 1.0, 7),     # 365 USD / $50 = 7.3 → 7
+    (500, 0.73, 50.0, 2.0, 14),    # 730 USD / $50 = 14.6 → 14 (floor)
+    (500, 1.0, 50.0, 1.0, 10),     # USD base (fx 1.0): 500 / 50
+    (500, 0.73, 500.0, 1.0, 0),    # high-priced name → 0 under floor (caller skips)
+    (500, 0.73, 50.0, 0.0, 0),     # zero multiplier
+    (500, 0.0, 50.0, 1.0, 0),      # bad fx
+    (0, 0.73, 50.0, 1.0, 0),       # zero notional
+])
+def test_shares_for_notional_floor(notional, fx, price, mult, expected):
+    assert shares_for_notional(notional, fx, price, mult, rounding="floor") == expected
+
+
+@pytest.mark.parametrize("price,expected", [
+    (50.0, 7),      # 7.3 → 7
+    (24.0, 15),     # 365/24 = 15.2 → 15
+    (500.0, 1),     # 0.73 share → 1 (nearest places it; floor would skip)
+    (800.0, 0),     # 0.46 share → 0 (too pricey even for nearest: < ½ share)
+])
+def test_shares_for_notional_nearest(price, expected):
+    # IBKR's API can't do fractional equity, so "nearest" rounds to whole shares,
+    # placing reasonably-priced names a small floored budget would skip.
+    assert shares_for_notional(500, 0.73, price, 1.0, rounding="nearest") == expected

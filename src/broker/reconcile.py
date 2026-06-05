@@ -23,7 +23,8 @@ from loguru import logger
 
 from config.settings import settings
 from src.broker import Broker, OrderRequest, get_broker
-from src.broker.sizing import shares_for, within_caps
+from src.broker.fx import usd_per_unit
+from src.broker.sizing import shares_for, shares_for_notional, within_caps
 from src.db import repo
 
 
@@ -70,7 +71,13 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None) -
     try:
         acct = broker.get_account()
         equity = acct.equity if acct else float(settings.broker_paper_equity)
+        acct_ccy = acct.currency if acct else "USD"
         report["account_equity"] = equity
+        report["account_currency"] = acct_ccy
+        # Everything below sizes in USD (US securities are USD-priced). Convert the
+        # account equity and the (CAD) base notional to USD via live FX.
+        equity_usd = equity * usd_per_unit(acct_ccy)
+        fx_notional = usd_per_unit(settings.broker_base_notional_ccy)
         positions = {p.ticker: p for p in broker.get_positions()}
 
         trades = trades if trades is not None else repo.load_trades()
@@ -87,12 +94,16 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None) -
             if t.get("broker_order_id"):
                 continue  # idempotent — already submitted
             price = float(t.get("entry_price") or t.get("current_price") or 0.0)
-            qty = shares_for(equity, price, t.get("position_size_multiplier", 1.0))
+            mult = t.get("position_size_multiplier", 1.0)
+            if settings.broker_sizing_mode == "equity_pct":
+                qty = shares_for(equity_usd, price, mult)
+            else:
+                qty = shares_for_notional(settings.broker_base_notional, fx_notional, price, mult)
             if qty <= 0:
                 t["broker_status"] = "SKIPPED_ZERO_QTY"
                 changed = True
                 continue
-            ok, reason = within_caps(n_open, gross + qty * price, equity)
+            ok, reason = within_caps(n_open, gross + qty * price, equity_usd)
             if not ok:
                 logger.info(f"[broker] entry {t['ticker']} skipped — {reason}")
                 t["broker_status"] = f"SKIPPED_CAP: {reason}"

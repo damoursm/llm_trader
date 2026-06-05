@@ -46,6 +46,10 @@ def repo_store(monkeypatch):
     monkeypatch.setattr(rec.repo, "load_trades", lambda: store["trades"])
     monkeypatch.setattr(rec.repo, "save_trades", lambda t: store.update(trades=t))
     monkeypatch.setattr(settings, "broker_mode", "ibkr_paper")
+    monkeypatch.setattr(settings, "broker_sizing_mode", "notional")
+    monkeypatch.setattr(settings, "broker_base_notional", 500.0)
+    # Patch FX so tests never hit the network (1.0 = treat base notional as USD).
+    monkeypatch.setattr(rec, "usd_per_unit", lambda ccy: 1.0)
     return store
 
 
@@ -95,6 +99,16 @@ def test_short_entry_then_cover(repo_store):
     repo_store["trades"][0]["status"] = "CLOSED"
     rec.sync(broker=b)
     assert b.orders[-1].side == "BUY"             # covering the short
+
+
+def test_notional_sizing_quantity(repo_store, monkeypatch):
+    monkeypatch.setattr(rec, "usd_per_unit", lambda ccy: 0.73)   # CAD→USD
+    t = _open_trade("AAPL")
+    t["entry_price"] = 50.0
+    repo_store["trades"] = [t]
+    b = FakeBroker()
+    rec.sync(broker=b)
+    assert b.orders[0].quantity == 7      # floor(500 × 0.73 / 50) = 7
 
 
 def test_drift_reported(repo_store):

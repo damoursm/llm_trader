@@ -653,13 +653,28 @@ class Settings(BaseSettings):
     ibkr_client_id: int = 11           # any stable int unique to this API connection
     ibkr_account: str = ""             # optional: pin a specific IBKR account id (else the sole/first)
     ibkr_connect_timeout: int = 15     # seconds to wait for the Gateway socket
-    # Position sizing — shares = floor(equity × base_pct × size_multiplier / price),
-    # where size_multiplier is the existing 1.0/1.5/2.0× confidence tier on each trade.
-    broker_base_position_pct: float = 0.05        # 5% of account equity per 1.0× position
+    # Position sizing. Two modes (broker_sizing_mode), each × the 1.0/1.5/2.0×
+    # confidence tier already on every trade:
+    #   "notional"   — fixed base order size: broker_base_notional in broker_base_notional_ccy.
+    #                  US securities are USD-priced, so a non-USD base is converted to a USD share
+    #                  budget via live FX (src/broker/fx.py); broker_fx_fallback_cad_usd is used
+    #                  only if the live quote is unavailable.
+    #   "equity_pct" — broker_base_position_pct of account equity.
+    # shares = floor(budget_in_USD × size_multiplier / price).
+    broker_sizing_mode: str = "notional"          # "notional" | "equity_pct"
+    broker_base_notional: float = 1000.0          # base order size per 1.0× position (notional mode)
+    broker_base_notional_ccy: str = "CAD"         # currency of broker_base_notional (matches the account)
+    broker_fx_fallback_cad_usd: float = 0.73      # CAD→USD, used only if the live FX quote is unavailable
+    broker_base_position_pct: float = 0.05        # equity_pct mode: 5% of equity per 1.0× position
+    # IBKR's API can't place FRACTIONAL equity orders (error 10243 — GUI-only), so a small
+    # base is rounded to whole shares. "nearest" rounds half-up (a name still places as long
+    # as it's ≥ half a share, i.e. priced up to ~2× the budget); "floor" sticks to the budget
+    # (skips any name priced above one position's worth). "nearest" avoids needless skips.
+    broker_share_rounding: str = "nearest"        # "nearest" | "floor"
     broker_max_positions: int = 20                # hard cap on concurrent broker positions
-    broker_max_gross_exposure_pct: float = 1.0    # cap on Σ|notional| / equity (1.0 = no leverage)
+    broker_max_gross_exposure_pct: float = 1.0    # cap on Σ|notional_usd| / equity_usd (1.0 = no leverage)
     broker_order_type: str = "MKT"                # MKT (market) — RTH-only via the scheduler window
-    broker_paper_equity: float = 100000.0         # used for sizing in dry_run; live reads real equity
+    broker_paper_equity: float = 100000.0         # USD equity used for the exposure cap in dry_run
 
     @property
     def tracked_politicians_list(self) -> List[str]:
