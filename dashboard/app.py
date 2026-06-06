@@ -424,6 +424,40 @@ def _window_label(value) -> str:
     return {"7": "1 week", "30": "1 month"}.get(str(value), "inception")
 
 
+# ── Trading-session toggle (RTH / extended / overnight) ──────────────────────
+_SESSION_OPTIONS = [
+    {"label": "All sessions", "value": "all"},
+    {"label": "RTH", "value": "rth"},
+    {"label": "Extended", "value": "extended"},
+    {"label": "Overnight", "value": "overnight"},
+]
+
+
+def _session_toggle(component_id: str) -> html.Div:
+    """RTH / extended-hours / overnight selector. Filters the tab's metrics and
+    plots to trades ENTERED in that US-market session. The scheduler currently
+    trades RTH only, so Extended/Overnight are empty until you trade those."""
+    return html.Div(
+        [
+            html.Label("Session:  ",
+                       title="Filter to trades entered during Regular hours (09:30–16:00 ET), Extended hours (pre-market 04:00–09:30 + after-hours 16:00–20:00), or Overnight (20:00–04:00). The bot currently trades RTH only, so the other two are empty.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_SESSION_OPTIONS, value="all", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _session_value(value):
+    """RadioItems value → session string ('rth'|'extended'|'overnight'), or None for all."""
+    return None if value in (None, "all") else value
+
+
 # ── Tab 2: Method Performance ──────────────────────────────────────────────
 
 def _methods_tab():
@@ -441,6 +475,7 @@ def _methods_tab():
 
     return html.Div([
         _window_toggle("methods-window"),
+        _session_toggle("methods-session"),
         dcc.Loading(html.Div(id="methods-body")),
         _h3("LLM models used (synthesis & sentiment)",
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
@@ -448,13 +483,14 @@ def _methods_tab():
     ])
 
 
-@app.callback(Output("methods-body", "children"), Input("methods-window", "value"))
-def _methods_body(window_value):
-    return _safe(lambda: _methods_perf_section(_window_days(window_value)))
+@app.callback(Output("methods-body", "children"),
+              Input("methods-window", "value"), Input("methods-session", "value"))
+def _methods_body(window_value, session_value):
+    return _safe(lambda: _methods_perf_section(_window_days(window_value), _session_value(session_value)))
 
 
-def _methods_perf_section(window_days):
-    perf = data.performance(window_days=window_days)
+def _methods_perf_section(window_days, session=None):
+    perf = data.performance(window_days=window_days, session=session)
     solo = perf.get("solo_method_perf") or {}
     labels = perf.get("method_labels") or {}
     order = perf.get("method_order_by_winrate") or list(solo.keys())
@@ -514,17 +550,19 @@ def _trades_table(trades: list):
 def _returns_tab():
     return html.Div([
         _window_toggle("returns-window"),
+        _session_toggle("returns-session"),
         dcc.Loading(html.Div(id="returns-body")),
     ])
 
 
-@app.callback(Output("returns-body", "children"), Input("returns-window", "value"))
-def _returns_body(window_value):
-    return _safe(lambda: _returns_section(window_value))
+@app.callback(Output("returns-body", "children"),
+              Input("returns-window", "value"), Input("returns-session", "value"))
+def _returns_body(window_value, session_value):
+    return _safe(lambda: _returns_section(window_value, session_value))
 
 
-def _returns_section(window_value):
-    perf = data.performance(window_days=_window_days(window_value))
+def _returns_section(window_value, session_value=None):
+    perf = data.performance(window_days=_window_days(window_value), session=_session_value(session_value))
     stats = perf.get("stats") or {}
     pm = perf.get("portfolio_metrics") or {}
     wlabel = _window_label(window_value)

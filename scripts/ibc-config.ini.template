@@ -1,0 +1,40 @@
+# ============================================================================
+#  IBC config.ini — TEMPLATE for keeping TWS (paper) logged in + auto-restarting
+#
+#  This is a REFERENCE of the fields that matter for this project. Start from
+#  IBC's shipped sample config.ini and set/override these. Then place the real
+#  file at:  %USERPROFILE%\Documents\IBC\config.ini   (NOT in this repo —
+#  it holds your password; keep it out of git).
+#
+#  Full reference: https://github.com/IbcAlpha/IBC/blob/master/resources/config.ini
+#  User guide:     https://github.com/IbcAlpha/IBC/blob/master/userguide.md
+# ============================================================================
+
+# ── Login (paper account) ───────────────────────────────────────────────────
+IbLoginId=YOUR_PAPER_USERNAME
+IbPassword=YOUR_PAPER_PASSWORD
+TradingMode=paper
+
+# ── THE key setting: daily auto-restart with NO re-authentication ───────────
+# At this time each day, TWS shuts down and restarts itself WITHOUT asking you
+# to log in again — so it runs the whole trading week on a single Monday login.
+# This is what fixes the daily logoff that kept breaking us. Pick a quiet time.
+AutoRestartTime=11:50 PM
+
+# ── API — must match the pipeline (.env IBKR_PORT) and allow orders ─────────
+OverrideTwsApiPort=7497
+ReadOnlyApi=no
+# Auto-accept the pipeline's incoming API connection (replaces the popup /
+# Trusted-IP dialog — required for unattended operation):
+AcceptIncomingConnectionAction=accept
+
+# ── Suppress dialogs that would otherwise block unattended startup ──────────
+AcceptNonBrokerageAccountWarning=yes
+DismissPasswordExpiryWarning=yes
+DismissNSEComplianceNotice=yes
+ExistingSessionDetectedAction=primary
+
+# ── 2FA (if your IBKR login uses the mobile authenticator) ──────────────────
+# On a failed 2FA, restart the login sequence so it retries instead of hanging.
+# (Once logged in Monday, AutoRestartTime keeps it alive all week with no 2FA.)
+TwoFactorAuthenticationTimeoutAction=restart

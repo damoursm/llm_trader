@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 from loguru import logger
 
 from src.models import Recommendation
+from src.utils import ET
 from src.performance.spread import _dynamic_half_spread, _pct_return, fmt_price
 from src.db import repo
 from config import settings
@@ -1889,7 +1890,8 @@ def _eval_stats(entries: list) -> dict:
     }
 
 
-def compute_solo_method_performance(split: Optional[str] = None, window_days: Optional[int] = None) -> dict:
+def compute_solo_method_performance(split: Optional[str] = None, window_days: Optional[int] = None,
+                                    session: Optional[str] = None) -> dict:
     """Simulate performance for each signal method used in isolation, split by direction.
 
     For each closed trade with stored method_scores, each method is asked:
@@ -1919,6 +1921,8 @@ def compute_solo_method_performance(split: Optional[str] = None, window_days: Op
     if window_days is not None:
         _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
         closed = [t for t in closed if (t.get("entry_date") or "") >= _cutoff]
+    if session:
+        closed = [t for t in closed if _trade_session(t) == session]
     if not closed:
         return {}
 
@@ -2079,18 +2083,45 @@ def compute_oos_comparison() -> dict:
     }
 
 
-def get_performance_for_email(window_days: Optional[int] = None) -> dict:
+def _trade_session(trade: dict) -> str:
+    """US-market session a trade was ENTERED in, from its ET entry timestamp.
+
+    RTH 09:30–16:00 · extended 04:00–09:30 + 16:00–20:00 · overnight 20:00–04:00.
+    Legacy/date-only entries (no time component) default to 'rth' — the only
+    session the scheduler currently trades.
+    """
+    raw = trade.get("entry_datetime")
+    if not raw or ("T" not in str(raw) and ":" not in str(raw)):
+        return "rth"
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        dt = dt.astimezone(ET) if dt.tzinfo is not None else dt.replace(tzinfo=ET)
+        mins = dt.hour * 60 + dt.minute
+    except Exception:
+        return "rth"
+    if 9 * 60 + 30 <= mins < 16 * 60:
+        return "rth"
+    if (4 * 60 <= mins < 9 * 60 + 30) or (16 * 60 <= mins < 20 * 60):
+        return "extended"
+    return "overnight"
+
+
+def get_performance_for_email(window_days: Optional[int] = None,
+                              session: Optional[str] = None) -> dict:
     """Return structured performance data for inclusion in the email report.
 
     When ``window_days`` is set, only trades ENTERED within the last N calendar
     days are included (1w = 7, 1m = 30); ``None`` = inception (every trade ever).
-    The dashboard's time-window toggle passes 7 / 30 / None so its metrics and
-    plots recompute against the windowed trade set.
+    ``session`` (rth | extended | overnight) additionally restricts to trades
+    entered in that US-market session; None = all sessions. The dashboard's
+    window + session toggles pass these so its metrics/plots recompute to match.
     """
     trades = _load_trades()
     if window_days is not None:
         _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
         trades = [t for t in trades if (t.get("entry_date") or "") >= _cutoff]
+    if session:
+        trades = [t for t in trades if _trade_session(t) == session]
     open_trades   = [t for t in trades if t["status"] == "OPEN"]
     closed_trades = [t for t in trades if t["status"] == "CLOSED"]
     # Open trades carry a current M2M return_pct (updated each run by update_open_trades()).
@@ -2152,7 +2183,7 @@ def get_performance_for_email(window_days: Optional[int] = None) -> dict:
     performance_table    = _compute_performance_table(all_trades) if all_trades else []
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
-    solo_method_perf     = compute_solo_method_performance(window_days=window_days)
+    solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session)
     method_eval_stats    = compute_method_eval_stats()
     oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)

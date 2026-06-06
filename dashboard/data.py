@@ -95,15 +95,16 @@ _perf_cache: dict = {}          # window key -> {"ts": float, "data": dict}
 _PERF_TTL = 60.0
 
 
-def performance(window_days: Optional[int] = None, force: bool = False) -> dict:
-    """Windowed performance bundle. ``window_days`` = 7 / 30 filters to trades
-    entered in that window; ``None`` = inception (every trade)."""
-    key = "all" if window_days is None else int(window_days)
+def performance(window_days: Optional[int] = None, session: Optional[str] = None,
+                force: bool = False) -> dict:
+    """Windowed + session-filtered performance bundle. ``window_days`` = 7 / 30
+    (None = inception); ``session`` = rth / extended / overnight (None = all)."""
+    key = ("all" if window_days is None else int(window_days), session or "all")
     now = time.time()
     entry = _perf_cache.get(key)
     if not force and entry is not None and (now - entry["ts"]) < _PERF_TTL:
         return entry["data"]
     from src.performance.tracker import get_performance_for_email
-    result = _retry(lambda: get_performance_for_email(window_days=window_days), "performance")
+    result = _retry(lambda: get_performance_for_email(window_days=window_days, session=session), "performance")
     _perf_cache[key] = {"ts": now, "data": result}
     return result

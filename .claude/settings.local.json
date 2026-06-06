@@ -25,7 +25,8 @@
       "Bash(grep -vE 'is not None|or 0|:\\\\.0f\\\\}%? *\\\\\"?\\\\\\)? *$')",
       "WebFetch(domain:api-docs.deepseek.com)",
       "WebSearch",
-      "WebFetch(domain:www.interactivebrokers.com)"
+      "WebFetch(domain:www.interactivebrokers.com)",
+      "Bash(\"C:/Users/mathi/miniconda3/python.exe\" -c \"import ib_async; print\\('has ib_async', ib_async.__version__\\)\")"
     ]
   }
 }

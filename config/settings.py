@@ -1,6 +1,14 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 from typing import List
+
+# Absolute path to <project root>/.env so settings load no matter the current
+# working directory (e.g. when launched via Windows Task Scheduler from System32,
+# or `python <abs path>/main.py` from your home dir). config/settings.py →
+# parent (config/) → parent (project root) → .env
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -744,7 +752,7 @@ class Settings(BaseSettings):
         return out
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
