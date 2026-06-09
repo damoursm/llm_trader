@@ -1,10 +1,19 @@
-"""Tests for src.performance.spread — half-spread tiers and _pct_return math."""
+"""Tests for src.performance.spread — half-spread tiers, commission model, and
+_pct_return math. The suite-wide conftest fixture pins commission_model='none';
+the commission tests below opt back in explicitly."""
 
 import math
 
 import pytest
 
-from src.performance.spread import _dynamic_half_spread, _pct_return, fmt_price
+from config.settings import settings
+from src.performance.spread import (
+    _commission_fraction,
+    _dynamic_half_spread,
+    _one_side_cost,
+    _pct_return,
+    fmt_price,
+)
 
 
 # ── _dynamic_half_spread tiers ────────────────────────────────────────────
@@ -85,6 +94,96 @@ def test_pct_return_uses_correct_tier_at_each_leg():
     # eff_exit  = 5.00 × 0.9975 = 4.9875
     # return    = (4.9875 − 0.50375) / 0.50375 × 100 ≈ +890 %
     assert r == pytest.approx(890.07, abs=1e-1)
+
+
+# ── commission model (opts back in; conftest pins 'none' suite-wide) ──────
+
+@pytest.fixture
+def tiered(monkeypatch):
+    """Tiered schedule with the buffer disabled — isolates the schedule math."""
+    monkeypatch.setattr(settings, "commission_model", "ibkr_tiered")
+    monkeypatch.setattr(settings, "commission_notional_usd", 730.0)
+    monkeypatch.setattr(settings, "commission_buffer", 1.0)
+
+
+def test_commission_none_is_zero():
+    assert _commission_fraction(100.0) == 0.0
+
+
+def test_commission_tiered_min_floor_dominates_expensive_names(tiered):
+    # $730 @ $100 → 7.3 shares → per-share $0.026 < $0.35 minimum → floor applies
+    assert _commission_fraction(100.0) == pytest.approx(0.35 / 730.0)
+
+
+def test_commission_tiered_per_share_dominates_cheap_names(tiered):
+    # $730 @ $1 → 730 shares → 730 × $0.0035 = $2.555 > $0.35 minimum
+    assert _commission_fraction(1.0) == pytest.approx(2.555 / 730.0)
+
+
+def test_commission_capped_at_1pct_of_trade_value(tiered):
+    # $730 @ $0.05 → 14 600 shares → $51.10 per-share fee → capped at 1% = $7.30
+    assert _commission_fraction(0.05) == pytest.approx(0.01)
+
+
+def test_commission_fixed_min_floor(monkeypatch):
+    monkeypatch.setattr(settings, "commission_model", "ibkr_fixed")
+    monkeypatch.setattr(settings, "commission_notional_usd", 730.0)
+    monkeypatch.setattr(settings, "commission_buffer", 1.0)
+    # 7.3 shares × $0.005 = $0.0365 → $1.00 minimum applies
+    assert _commission_fraction(100.0) == pytest.approx(1.0 / 730.0)
+
+
+def test_commission_buffer_raises_the_ceiling(monkeypatch):
+    monkeypatch.setattr(settings, "commission_model", "ibkr_fixed")
+    monkeypatch.setattr(settings, "commission_notional_usd", 730.0)
+    monkeypatch.setattr(settings, "commission_buffer", 1.5)
+    # $1.00 minimum × 1.5 buffer → $1.50/side ≈ 20.5 bp at the $730 base notional
+    assert _commission_fraction(100.0) == pytest.approx(1.5 / 730.0)
+
+
+def test_commission_buffer_applies_after_value_cap(monkeypatch):
+    # Penny name: the schedule fee hits the 1%-of-value cap first; the buffer
+    # then lifts the ceiling to 1.5% — deliberately conservative beyond the
+    # published cap (the buffer is a ceiling, not a schedule estimate).
+    monkeypatch.setattr(settings, "commission_model", "ibkr_fixed")
+    monkeypatch.setattr(settings, "commission_notional_usd", 730.0)
+    monkeypatch.setattr(settings, "commission_buffer", 1.5)
+    assert _commission_fraction(0.05) == pytest.approx(0.015)
+
+
+def test_commission_nonpositive_buffer_treated_as_off(monkeypatch):
+    monkeypatch.setattr(settings, "commission_model", "ibkr_fixed")
+    monkeypatch.setattr(settings, "commission_notional_usd", 730.0)
+    monkeypatch.setattr(settings, "commission_buffer", 0.0)   # would zero fees — ignored
+    assert _commission_fraction(100.0) == pytest.approx(1.0 / 730.0)
+
+
+def test_unrecognized_model_falls_back_to_the_pricier_plan(monkeypatch):
+    # Conservative fallthrough: a typo'd model name must not silently price
+    # trades on the cheaper tiered schedule.
+    monkeypatch.setattr(settings, "commission_model", "ibkr_typo")
+    monkeypatch.setattr(settings, "commission_notional_usd", 730.0)
+    monkeypatch.setattr(settings, "commission_buffer", 1.0)
+    assert _commission_fraction(100.0) == pytest.approx(1.0 / 730.0)   # fixed: $1 min
+
+
+def test_commission_non_positive_price_returns_zero(tiered):
+    assert _commission_fraction(0.0) == 0.0
+    assert _commission_fraction(-5.0) == 0.0
+
+
+def test_one_side_cost_is_spread_plus_commission(tiered):
+    # $100 mega-cap stock: 3 bp half-spread + $0.35/730 commission
+    assert _one_side_cost(100.0, "STOCK") == pytest.approx(0.0003 + 0.35 / 730.0)
+
+
+def test_pct_return_flat_round_trip_charges_spread_plus_commission(tiered):
+    """Open and close at the same price → loss ≈ 2 × (half-spread + commission)."""
+    r = _pct_return("BUY", 100.0, 100.0, "STOCK")
+    one_side = 0.0003 + 0.35 / 730.0
+    assert r == pytest.approx(-2 * one_side * 100, abs=2e-3)
+    # And the commission term makes the flat round trip strictly worse than spread-only.
+    assert r < -0.06
 
 
 # ── fmt_price formatting ──────────────────────────────────────────────────

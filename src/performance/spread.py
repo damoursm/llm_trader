@@ -1,4 +1,4 @@
-"""Bid-ask spread model and return-calculation primitives.
+"""Bid-ask spread + commission model and return-calculation primitives.
 
 Extracted from ``tracker.py`` so the daily-NAV engine (``daily_nav.py``) and
 the trade-tracker can both depend on it without round-trip imports.  Earlier
@@ -7,7 +7,7 @@ the engine pulled ``_dynamic_half_spread`` and ``_pct_return`` out of
 module breaks that cycle for good.
 
 Dependency tree after this extraction:
-    spread.py    (no internal deps)
+    spread.py    (depends only on config.settings — no src-internal deps)
         ↑
     daily_nav.py (depends on spread, cache)
         ↑
@@ -32,6 +32,8 @@ than editing the numbers — the engine and tracker both go through it.
 """
 
 from __future__ import annotations
+
+from config.settings import settings
 
 
 def _dynamic_half_spread(price: float, asset_type: str = "STOCK") -> float:
@@ -81,14 +83,73 @@ def _dynamic_half_spread(price: float, asset_type: str = "STOCK") -> float:
     return 0.0500
 
 
-def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK") -> float:
-    """Percent return, sign-aware, with the realistic round-trip half-spread.
+def _commission_fraction(price: float) -> float:
+    """One-side commission as a fraction of traded notional — a deliberate
+    CEILING, not a best estimate, so reported results err conservative.
 
-    BUY  : paid the ask at entry (+half), receive the bid at exit (−half).
-    SELL : shorted at the bid at entry (−half), covered at the ask (+half).
-    Both half-spreads are evaluated against their own price (entry and
-    current independently), so a position that crosses a price tier
-    naturally picks up the wider/narrower spread on each leg.
+    Converts IBKR's per-share commission schedule into percentage terms using
+    the assumed position notional ``settings.commission_notional_usd`` (a
+    deliberate constant — NOT live FX or live equity — so the return math
+    stays 100% deterministic; see the setting's docstring).
+
+        shares = notional / price
+        ibkr_fixed  : max($1.00, $0.005  × shares), capped at 1% of trade value
+        ibkr_tiered : max($0.35, $0.0035 × shares), capped at 1% of trade value
+        none        : 0 (spread-only, legacy behavior)
+        … then × settings.commission_buffer (default 1.5)
+
+    The buffer is applied AFTER the min/cap schedule math — including after
+    the 1%-of-value cap — as the intended fee ceiling: it covers the costs the
+    published schedule excludes (SEC transaction fee + FINRA TAF on sells,
+    exchange/clearing fees under tiered pricing, odd venue surcharges) and
+    schedule drift. Actual commissions captured from broker fills
+    (``broker_orders.commission`` in DuckDB) are the ground truth to calibrate
+    the buffer against once paper data accumulates.
+
+    The minimum-commission floor dominates at this system's order sizes, so
+    cheap (high-share-count) names converge to the per-share rate while
+    expensive names pay the flat minimum as a larger fraction of a smaller
+    share count's notional. Non-positive prices return 0 — the model is
+    undefined there, matching ``_dynamic_half_spread``.
+    """
+    model = (settings.commission_model or "none").lower()
+    if model == "none" or price is None or price <= 0:
+        return 0.0
+    notional = float(settings.commission_notional_usd)
+    if notional <= 0:
+        return 0.0
+    shares = notional / price
+    if model == "ibkr_tiered":
+        fee = max(0.35, 0.0035 * shares)
+    else:  # "ibkr_fixed" (default for any unrecognized value — the pricier plan)
+        fee = max(1.00, 0.005 * shares)
+    fee = min(fee, 0.01 * notional)   # IBKR caps commission at 1% of trade value
+    buffer = float(settings.commission_buffer)
+    if buffer > 0:                    # ≤0 would silently zero out fees — treat as off
+        fee *= buffer
+    return fee / notional
+
+
+def _one_side_cost(price: float, asset_type: str = "STOCK") -> float:
+    """Total one-way transaction cost as a fraction: half-spread + commission.
+
+    The single cost figure both return engines apply to entry/exit prices —
+    ``_pct_return`` here and the daily-NAV walk's anchor marks in
+    ``daily_nav.py`` — so the per-trade buy-and-hold return and the
+    path-faithful daily compound charge identical costs.
+    """
+    return _dynamic_half_spread(price, asset_type) + _commission_fraction(price)
+
+
+def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK") -> float:
+    """Percent return, sign-aware, with round-trip half-spread + commission.
+
+    BUY  : paid the ask at entry (+cost), receive the bid at exit (−cost).
+    SELL : shorted at the bid at entry (−cost), covered at the ask (+cost).
+    Each leg's cost (half-spread + commission, see ``_one_side_cost``) is
+    evaluated against its own price (entry and current independently), so a
+    position that crosses a price tier naturally picks up the wider/narrower
+    spread on each leg.
 
     Returns ``0.0`` for non-positive prices — the round-trip is undefined
     there.  Callers refuse to trade at such prices; this guard exists to
@@ -96,15 +157,15 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
     """
     if entry is None or current is None or entry <= 0 or current <= 0:
         return 0.0
-    entry_half = _dynamic_half_spread(entry, asset_type)
-    exit_half  = _dynamic_half_spread(current, asset_type)
+    entry_cost = _one_side_cost(entry, asset_type)
+    exit_cost  = _one_side_cost(current, asset_type)
     if action == "BUY":
-        effective_entry = entry   * (1 + entry_half)
-        effective_exit  = current * (1 - exit_half)
+        effective_entry = entry   * (1 + entry_cost)
+        effective_exit  = current * (1 - exit_cost)
         return (effective_exit - effective_entry) / effective_entry * 100
     # SELL = short
-    effective_entry = entry   * (1 - entry_half)
-    effective_exit  = current * (1 + exit_half)
+    effective_entry = entry   * (1 - entry_cost)
+    effective_exit  = current * (1 + exit_cost)
     return (effective_entry - effective_exit) / effective_entry * 100
 
 

@@ -142,9 +142,11 @@ def _safe(label: str, fn, *args, **kwargs):
 
 def _persist_run(run_id, start, finished, all_tickers, recommendations, actionable,
                  gate_diag, market_mode_context, macro_regime_context,
-                 confidence_threshold, allow_buys, signals_by_ticker) -> None:
-    """Write the run, its per-source 'APIs used' record, and every recommendation
-    (with method attribution + the LLM provider that synthesised it) to DuckDB."""
+                 confidence_threshold, allow_buys, signals_by_ticker,
+                 broker_report=None) -> None:
+    """Write the run, its per-source 'APIs used' record, every recommendation
+    (with method attribution + the LLM provider that synthesised it), and the
+    broker reconcile report (per-order slippage/commission rows) to DuckDB."""
     try:
         actionable_ids = {id(r) for r in actionable}
         provider = get_last_synthesis_meta().get("provider")
@@ -190,9 +192,13 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         sources = _collect_sources()
         repo.insert_run_sources(run_id, sources)
         repo.insert_recommendations(rec_rows)
+        n_orders = 0
+        if broker_report and broker_report.get("mode") not in (None, "off"):
+            repo.insert_broker_report(run_id, broker_report)
+            n_orders = len(broker_report.get("orders") or [])
         logger.info(
             f"[db] Persisted run {run_id}: {len(rec_rows)} recommendation(s), "
-            f"{len(sources)} source(s) → DuckDB"
+            f"{len(sources)} source(s), {n_orders} broker order event(s) → DuckDB"
         )
     except Exception as e:
         logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
@@ -258,15 +264,16 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
     if not report.get("ok") and report.get("errors"):
         problems.append("reconcile error")
     return {
-        "down":      bool(problems),
-        "mode":      report.get("mode"),
-        "connected": report.get("connected"),
-        "entries":   report.get("entries_submitted", 0),
-        "exits":     report.get("exits_submitted", 0),
-        "rejects":   report.get("rejects", 0),
-        "drift":     report.get("drift", []),
-        "slippage":  report.get("slippage", []),
-        "message":   "; ".join(problems),
+        "down":           bool(problems),
+        "mode":           report.get("mode"),
+        "connected":      report.get("connected"),
+        "entries":        report.get("entries_submitted", 0),
+        "exits":          report.get("exits_submitted", 0),
+        "fills_repaired": report.get("fills_repaired", 0),
+        "rejects":        report.get("rejects", 0),
+        "drift":          report.get("drift", []),
+        "slippage":       report.get("slippage", []),
+        "message":        "; ".join(problems),
     }
 
 
@@ -951,7 +958,7 @@ def run_pipeline(send_email: bool = False) -> None:
     if settings.broker_mode and settings.broker_mode != "off":
         from src.broker.reconcile import sync as _broker_sync
         try:
-            broker_report = _broker_sync()
+            broker_report = _broker_sync(run_id=run_id)
         except Exception as e:
             logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
 
@@ -994,11 +1001,13 @@ def run_pipeline(send_email: bool = False) -> None:
     # Plotly Dash dashboard (python main.py --dashboard), backed by DuckDB.
     logger.info("Monitor performance + rationale in the dashboard: python main.py --dashboard")
 
-    # Persist run + 'APIs used' + every recommendation (with attribution) to DuckDB.
+    # Persist run + 'APIs used' + every recommendation (with attribution) +
+    # the broker reconcile report (per-order slippage/commissions) to DuckDB.
     _persist_run(
         run_id, start, datetime.now(timezone.utc), all_tickers, recommendations, actionable,
         gate_diag, market_mode_context, macro_regime_context,
         _confidence_threshold, _allow_buys, signals_by_ticker,
+        broker_report=broker_report,
     )
 
     # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:

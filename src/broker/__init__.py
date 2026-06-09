@@ -14,13 +14,15 @@ from config.settings import settings
 from src.broker.base import (
     AccountSnapshot,
     Broker,
+    FillSummary,
     OrderRequest,
     OrderResult,
     Position,
 )
 
 __all__ = [
-    "Broker", "OrderRequest", "OrderResult", "Position", "AccountSnapshot", "get_broker",
+    "Broker", "OrderRequest", "OrderResult", "Position", "AccountSnapshot",
+    "FillSummary", "get_broker",
 ]
 
 _LIVE_PORTS = {4001, 7496}   # IB Gateway live / TWS live — guard against paper→live misconfig

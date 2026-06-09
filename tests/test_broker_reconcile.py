@@ -8,7 +8,7 @@ import pytest
 
 import src.broker.reconcile as rec
 from config.settings import settings
-from src.broker.base import AccountSnapshot, Broker, OrderResult, Position
+from src.broker.base import AccountSnapshot, Broker, FillSummary, OrderResult, Position
 
 
 class FakeBroker(Broker):
@@ -19,6 +19,7 @@ class FakeBroker(Broker):
         self._equity = equity
         self._account_id = account_id
         self.orders = []
+        self.fills = []          # FillSummary list served by get_fills()
 
     def connect(self):
         return True
@@ -31,6 +32,9 @@ class FakeBroker(Broker):
 
     def get_positions(self):
         return list(self._positions)
+
+    def get_fills(self):
+        return list(self.fills)
 
     def submit_order(self, req):
         self.orders.append(req)
@@ -135,3 +139,114 @@ def test_off_mode_is_noop(monkeypatch):
     assert r["entries_submitted"] == 0
     assert r["exits_submitted"] == 0
     assert r["connected"] is False
+
+
+# ── execution feedback: exit slippage, order rows, fill refresh, LMT ────────
+
+def test_exit_records_slippage_and_order_row(repo_store):
+    t = _open_trade("MSFT")
+    t.update(status="CLOSED", exit_price=101.0,
+             broker_order_id="o1", broker_status="Filled", broker_fill_qty=10,
+             broker_fill_price=100.0, broker_commission=0.35, broker_requested_qty=10)
+    repo_store["trades"] = [t]
+    b = FakeBroker(positions=[Position("MSFT", 10, 100.0)])   # fills at 100.05
+    r = rec.sync(broker=b)
+    assert r["exits_submitted"] == 1
+    exits = [s for s in r["slippage"] if s["intent"] == "EXIT"]
+    assert exits and exits[0]["ticker"] == "MSFT"
+    # SELL exit filled at 100.05 vs model 101 → received less → positive (adverse) bps
+    assert exits[0]["bps"] == pytest.approx((101.0 - 100.05) / 101.0 * 10000, abs=0.5)
+    rows = [o for o in r["orders"] if o["event"] == "SUBMIT" and o["intent"] == "EXIT"]
+    assert rows and rows[0]["model_price"] == pytest.approx(101.0)
+    assert rows[0]["fill_price"] == pytest.approx(100.05)
+
+
+def test_entry_slippage_is_cost_normalized_for_shorts(repo_store):
+    # Short entry (SELL) filled at 100.05 vs model 100 → sold HIGHER than model
+    # → favourable → negative cost bps.
+    repo_store["trades"] = [_open_trade("TSLA", action="SELL")]
+    r = rec.sync(broker=FakeBroker())
+    assert r["slippage"][0]["bps"] == pytest.approx(-5.0, abs=0.1)
+
+
+def test_run_id_lands_on_report(repo_store):
+    repo_store["trades"] = []
+    r = rec.sync(broker=FakeBroker(), run_id="run-42")
+    assert r["run_id"] == "run-42"
+
+
+def test_limit_order_buy_caps_above_model(repo_store, monkeypatch):
+    monkeypatch.setattr(settings, "broker_order_type", "LMT")
+    monkeypatch.setattr(settings, "broker_limit_cap_bps", 20.0)
+    repo_store["trades"] = [_open_trade("AAPL")]              # model 100.0
+    b = FakeBroker()
+    rec.sync(broker=b)
+    req = b.orders[0]
+    assert req.order_type == "LMT"
+    assert req.limit_price == pytest.approx(100.20)           # +20 bps, away-rounded to a cent
+
+
+def test_limit_order_sell_caps_below_model(repo_store, monkeypatch):
+    monkeypatch.setattr(settings, "broker_order_type", "LMT")
+    monkeypatch.setattr(settings, "broker_limit_cap_bps", 20.0)
+    repo_store["trades"] = [_open_trade("TSLA", action="SELL")]
+    b = FakeBroker()
+    rec.sync(broker=b)
+    assert b.orders[0].limit_price == pytest.approx(99.80)
+
+
+def test_fill_refresh_repairs_stale_entry(repo_store):
+    # Entry submitted on an earlier tick: order id recorded but no fill data yet
+    # (e.g. queued overnight). The refresh pass repairs it from today's executions.
+    t = _open_trade("AAPL")
+    t.update(broker_order_id="o9", broker_client_ref="rec-AAPL",
+             broker_status="Submitted", broker_fill_qty=0, broker_fill_price=None,
+             broker_requested_qty=7)
+    repo_store["trades"] = [t]
+    b = FakeBroker()
+    b.fills = [FillSummary(client_ref="rec-AAPL", ticker="AAPL", side="BUY",
+                           filled_qty=7, avg_fill_price=100.10, commission=0.35)]
+    r = rec.sync(broker=b)
+    assert r["fills_repaired"] == 1
+    tr = repo_store["trades"][0]
+    assert tr["broker_fill_qty"] == 7
+    assert tr["broker_fill_price"] == pytest.approx(100.10)
+    assert tr["broker_commission"] == pytest.approx(0.35)
+    assert tr["broker_status"] == "Filled"
+    assert b.orders == []          # repaired, not resubmitted
+    # The repaired fill contributes a slippage record and a FILL_REFRESH event row.
+    assert any(s["intent"] == "ENTRY" and s["ticker"] == "AAPL" for s in r["slippage"])
+    assert any(o["event"] == "FILL_REFRESH" for o in r["orders"])
+    # Second sync: leg is terminal and complete → nothing repaired twice.
+    r2 = rec.sync(broker=b)
+    assert r2["fills_repaired"] == 0
+
+
+def test_fill_refresh_repairs_partial_fill_then_completion(repo_store):
+    t = _open_trade("AAPL")
+    t.update(broker_order_id="o9", broker_client_ref="rec-AAPL",
+             broker_status="Submitted", broker_fill_qty=0, broker_requested_qty=10)
+    repo_store["trades"] = [t]
+    b = FakeBroker()
+    b.fills = [FillSummary(client_ref="rec-AAPL", ticker="AAPL", side="BUY",
+                           filled_qty=4, avg_fill_price=100.0, commission=0.35)]
+    rec.sync(broker=b)
+    assert repo_store["trades"][0]["broker_status"] == "PartiallyFilled"
+    # The rest fills later → still a candidate (non-terminal status) → repaired again.
+    b.fills = [FillSummary(client_ref="rec-AAPL", ticker="AAPL", side="BUY",
+                           filled_qty=10, avg_fill_price=100.05, commission=0.70)]
+    r = rec.sync(broker=b)
+    assert r["fills_repaired"] == 1
+    assert repo_store["trades"][0]["broker_fill_qty"] == 10
+    assert repo_store["trades"][0]["broker_status"] == "Filled"
+
+
+def test_submit_order_rows_recorded_for_entries(repo_store):
+    repo_store["trades"] = [_open_trade("AAPL")]
+    r = rec.sync(broker=FakeBroker())
+    rows = [o for o in r["orders"] if o["event"] == "SUBMIT" and o["intent"] == "ENTRY"]
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "AAPL"
+    assert rows[0]["model_price"] == pytest.approx(100.0)
+    assert rows[0]["slippage_bps"] == pytest.approx(5.0, abs=0.1)
+    assert rows[0]["client_ref"] == "rec-AAPL"

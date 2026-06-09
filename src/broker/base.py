@@ -24,7 +24,8 @@ class OrderRequest:
     ticker: str
     side: str                 # "BUY" | "SELL"
     quantity: int             # whole shares, > 0
-    order_type: str = "MKT"
+    order_type: str = "MKT"   # "MKT" | "LMT" (LMT requires limit_price)
+    limit_price: Optional[float] = None   # LMT only: marketable-limit cap price
     client_ref: str = ""      # idempotency key (the trade's recommendation_id → IBKR orderRef)
     intent: str = "ENTRY"     # "ENTRY" | "EXIT" — for logging/reconciliation only
 
@@ -62,6 +63,26 @@ class AccountSnapshot:
     currency: str = "USD"                # base currency of the equity figure
 
 
+@dataclass
+class FillSummary:
+    """Aggregated fills for one order, keyed by its client_ref (IBKR orderRef).
+
+    Produced by ``Broker.get_fills()`` from the broker's execution feed so the
+    reconciler can repair ``broker_fill_*`` fields on trades whose order didn't
+    reach a terminal state inside ``submit_order``'s short poll window (queued
+    overnight, partial fill, late commission report).
+    """
+    client_ref: str
+    ticker: str = ""
+    side: str = ""                       # "BUY" | "SELL"
+    filled_qty: int = 0
+    avg_fill_price: Optional[float] = None
+    commission: Optional[float] = None   # total, account currency
+    order_id: Optional[str] = None
+    perm_id: Optional[str] = None        # broker-stable id (survives session restarts)
+    last_fill_at: Optional[str] = None   # ISO timestamp of the latest execution
+
+
 class Broker(ABC):
     """Minimal synchronous broker surface the reconciler needs."""
 
@@ -82,6 +103,14 @@ class Broker(ABC):
 
     @abstractmethod
     def submit_order(self, req: OrderRequest) -> OrderResult: ...
+
+    def get_fills(self) -> List[FillSummary]:
+        """Recent (typically today's) executions aggregated per client_ref.
+
+        Default: none. Brokers that can report executions override this so the
+        reconciler's fill-refresh pass can repair stale fill/commission fields.
+        """
+        return []
 
     def disconnect(self) -> None:  # optional; default no-op
         return None

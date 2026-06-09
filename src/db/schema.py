@@ -11,6 +11,10 @@ run_sources         — one row per data source per run: the "APIs used" record.
 recommendations     — every top-N recommendation with its rationale + attribution.
 trades              — the real signal-driven ledger (replaces cache/trades.json).
 hypothetical_trades — the always-open paper book (replaces cache/hypothetical_trades.json).
+broker_reconciles   — one row per broker sync: connectivity, counts, drift, errors.
+broker_orders       — one event row per order submission / fill repair: model vs
+                      fill price, cost-normalized slippage bps, commission. The
+                      durable record the paper phase measures slippage/rejects from.
 """
 
 from __future__ import annotations
@@ -101,6 +105,48 @@ SCHEMA_STATEMENTS = [
         status          VARCHAR,
         return_pct      DOUBLE,
         data            VARCHAR
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS broker_reconciles (
+        run_id            VARCHAR,
+        created_at        VARCHAR,
+        mode              VARCHAR,
+        connected         BOOLEAN,
+        ok                BOOLEAN,
+        account_id        VARCHAR,
+        account_equity    DOUBLE,
+        account_currency  VARCHAR,
+        entries_submitted INTEGER,
+        exits_submitted   INTEGER,
+        fills_repaired    INTEGER,
+        rejects           INTEGER,
+        n_drift           INTEGER,
+        drift             VARCHAR,
+        errors            VARCHAR
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS broker_orders (
+        run_id        VARCHAR,
+        event         VARCHAR,
+        intent        VARCHAR,
+        ticker        VARCHAR,
+        side          VARCHAR,
+        order_type    VARCHAR,
+        requested_qty INTEGER,
+        filled_qty    INTEGER,
+        model_price   DOUBLE,
+        limit_price   DOUBLE,
+        fill_price    DOUBLE,
+        slippage_bps  DOUBLE,
+        commission    DOUBLE,
+        status        VARCHAR,
+        ok            BOOLEAN,
+        error         VARCHAR,
+        order_id      VARCHAR,
+        client_ref    VARCHAR,
+        submitted_at  VARCHAR
     );
     """,
 ]

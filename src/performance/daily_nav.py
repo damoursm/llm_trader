@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from src.performance.spread import _dynamic_half_spread
+from src.performance.spread import _one_side_cost
 
 
 # ---------------------------------------------------------------------------
@@ -124,19 +124,22 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
 # ---------------------------------------------------------------------------
 
 def _effective_entry(entry_price: float, action: str, asset_type: str) -> float:
-    """Cash basis paid (BUY) or received (SELL) per share, after the bid-ask half-spread."""
-    half = _dynamic_half_spread(entry_price, asset_type)
+    """Cash basis paid (BUY) or received (SELL) per share, after the one-way
+    transaction cost (bid-ask half-spread + commission — same figure
+    ``_pct_return`` charges, so both engines agree)."""
+    cost = _one_side_cost(entry_price, asset_type)
     if action == "BUY":
-        return entry_price * (1 + half)
-    return entry_price * (1 - half)
+        return entry_price * (1 + cost)
+    return entry_price * (1 - cost)
 
 
 def _effective_exit(exit_price: float, action: str, asset_type: str) -> float:
-    """Cash basis received (BUY exit) or paid (SELL cover) per share."""
-    half = _dynamic_half_spread(exit_price, asset_type)
+    """Cash basis received (BUY exit) or paid (SELL cover) per share, after the
+    one-way transaction cost (half-spread + commission)."""
+    cost = _one_side_cost(exit_price, asset_type)
     if action == "BUY":
-        return exit_price * (1 - half)
-    return exit_price * (1 + half)
+        return exit_price * (1 - cost)
+    return exit_price * (1 + cost)
 
 
 def _direction_sign(action: str) -> int:

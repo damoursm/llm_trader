@@ -165,7 +165,7 @@ HTML_TEMPLATE = """
 </div>
 {% elif broker_health %}
 <div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
-  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.slippage %} &middot; avg entry slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps{% endif %}.
+  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.fills_repaired %} &middot; {{ broker_health.fills_repaired }} fill(s) repaired{% endif %}{% if broker_health.slippage %} &middot; avg slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps (+ = adverse){% endif %}.
 </div>
 {% endif %}
 

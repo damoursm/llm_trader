@@ -705,8 +705,51 @@ class Settings(BaseSettings):
     broker_share_rounding: str = "nearest"        # "nearest" | "floor"
     broker_max_positions: int = 20                # hard cap on concurrent broker positions
     broker_max_gross_exposure_pct: float = 1.0    # cap on Σ|notional_usd| / equity_usd (1.0 = no leverage)
-    broker_order_type: str = "MKT"                # MKT (market) — RTH-only via the scheduler window
+    # Order type for broker submissions:
+    #   "MKT" — market order (fills immediately at whatever the book offers)
+    #   "LMT" — marketable limit: limit at model price ± broker_limit_cap_bps in the
+    #           adverse direction (BUY above / SELL below the model price). Caps the
+    #           worst acceptable fill on wide-spread names; an order whose cap is
+    #           exceeded rests unfilled and is repaired by the fill-refresh pass on
+    #           later ticks instead of filling arbitrarily far from the model.
+    broker_order_type: str = "MKT"                # "MKT" | "LMT"
+    broker_limit_cap_bps: float = 20.0            # LMT only: max adverse distance from model price
     broker_paper_equity: float = 100000.0         # USD equity used for the exposure cap in dry_run
+
+    # ── Simulated trading costs (commission term in the sim's return math) ──
+    # The bid-ask half-spread model (src/performance/spread.py) covers spread cost;
+    # this adds per-order commission so small positions don't overstate their edge
+    # (at ~$730 USD/position, IBKR Fixed's $1 minimum is ~27 bp round trip — larger
+    # than the modeled spread on a liquid large cap). Applied symmetrically in
+    # _pct_return AND the daily-NAV walk's entry/exit anchors, so both engines agree.
+    #
+    # CONSERVATIVE BY DEFAULT: the model deliberately errs toward OVERSTATING fees
+    # so reported performance understates the edge rather than flattering it —
+    # the pricier all-in plan (ibkr_fixed) is assumed, and commission_buffer adds
+    # headroom for everything the published schedule excludes. Actual commissions
+    # captured from fills (broker_orders.commission in DuckDB) are the ground
+    # truth for calibrating the model down later.
+    #   "ibkr_fixed"  — max($1.00, $0.005/share), capped at 1% of trade value
+    #                   (default — the more expensive plan, exchange fees included)
+    #   "ibkr_tiered" — max($0.35, $0.0035/share), capped at 1% of trade value
+    #                   (commission only — venue/clearing fees are NOT in the base
+    #                   rate; rely on commission_buffer to cover them)
+    #   "none"        — spread-only (legacy behavior)
+    commission_model: str = "ibkr_fixed"          # "ibkr_fixed" | "ibkr_tiered" | "none"
+    # Fee ceiling multiplier applied AFTER the min/cap schedule math. Covers the
+    # pass-throughs the schedule omits — SEC transaction fee + FINRA TAF on sells,
+    # exchange/clearing fees (tiered), odd venue surcharges — plus schedule drift.
+    # 1.5 ≈ $1.50 min/side → ~41 bp round trip at the $730 base notional (actual
+    # paper fills run ~27 bp — the gap is the intended safety margin). Set 1.0 to
+    # model the published schedule exactly.
+    commission_buffer: float = 1.5
+    # Assumed USD notional per 1.0× position, used to convert the per-order minimum
+    # into percentage terms. Keep roughly in sync with broker_base_notional × FX
+    # (1000 CAD × 0.73 ≈ 730 USD). A deliberate constant (not live FX) so the
+    # return math stays 100% deterministic — and conservative: larger (1.5–2.0×)
+    # positions experience a SMALLER min-commission floor in % terms, so pricing
+    # every trade at the 1.0× base notional is the worst case.
+    commission_notional_usd: float = 730.0
 
     @property
     def tracked_politicians_list(self) -> List[str]:

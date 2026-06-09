@@ -16,7 +16,29 @@ from typing import List, Optional
 from loguru import logger
 
 from config.settings import settings
-from src.broker.base import AccountSnapshot, Broker, OrderRequest, OrderResult, Position
+from src.broker.base import (
+    AccountSnapshot, Broker, FillSummary, OrderRequest, OrderResult, Position,
+)
+
+
+def to_ib_symbol(ticker: str) -> str:
+    """Map a yfinance-style ticker to IBKR symbology.
+
+    US class shares use a separator in yfinance ("BRK-B", sometimes "BF.B")
+    but a space in IBKR's ``symbol`` field ("BRK B"). Plain tickers pass
+    through unchanged. (Preferred-share suffixes have messier mappings and are
+    not handled — the universe doesn't trade them.)
+    """
+    return ticker.strip().upper().replace("-", " ").replace(".", " ")
+
+
+def from_ib_symbol(symbol: str) -> str:
+    """Inverse of ``to_ib_symbol``: IBKR "BRK B" → internal "BRK-B".
+
+    Applied to symbols coming back from the broker (positions, fills) so they
+    match the tickers stored on internal trades.
+    """
+    return symbol.strip().upper().replace(" ", "-")
 
 
 class IBKRBroker(Broker):
@@ -73,7 +95,7 @@ class IBKRBroker(Broker):
 
     def _qualify(self, ticker: str):
         from ib_async import Stock
-        contract = Stock(ticker, "SMART", "USD")
+        contract = Stock(to_ib_symbol(ticker), "SMART", "USD")
         self._ib.qualifyContracts(contract)
         return contract
 
@@ -113,7 +135,7 @@ class IBKRBroker(Broker):
         try:
             for p in self._ib.positions(self.account or ""):
                 out.append(Position(
-                    ticker=p.contract.symbol,
+                    ticker=from_ib_symbol(p.contract.symbol),
                     quantity=float(p.position),
                     avg_cost=float(p.avgCost) if p.avgCost else None,
                 ))
@@ -128,9 +150,12 @@ class IBKRBroker(Broker):
                                requested_qty=req.quantity, client_ref=req.client_ref,
                                status="DISCONNECTED", error="broker not connected")
         try:
-            from ib_async import MarketOrder
+            from ib_async import LimitOrder, MarketOrder
             contract = self._qualify(req.ticker)
-            order = MarketOrder(req.side, req.quantity)
+            if req.order_type == "LMT" and req.limit_price and req.limit_price > 0:
+                order = LimitOrder(req.side, req.quantity, req.limit_price)
+            else:
+                order = MarketOrder(req.side, req.quantity)
             if req.client_ref:
                 order.orderRef = req.client_ref      # idempotency / reconciliation tag
             if self.account:
@@ -138,6 +163,9 @@ class IBKRBroker(Broker):
 
             trade = self._ib.placeOrder(contract, order)
             # RTH market orders fill within ~ms; poll a few seconds for terminal status.
+            # A still-working order (e.g. a marketable limit whose cap was exceeded)
+            # exits this loop as Submitted — its fill/commission gets repaired by the
+            # reconciler's fill-refresh pass on a later tick via get_fills().
             for _ in range(12):
                 self._ib.sleep(1)
                 if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
@@ -146,15 +174,78 @@ class IBKRBroker(Broker):
             st = trade.orderStatus
             filled = int(float(st.filled or 0))
             ok = filled > 0 or st.status in ("Filled", "Submitted", "PreSubmitted")
+            # Commission reports trail the fills by a moment; sum whatever has
+            # arrived. 0.0 → None so the fill-refresh pass knows to repair it.
+            commission = 0.0
+            for f in (trade.fills or []):
+                cr = getattr(f, "commissionReport", None)
+                if cr is not None and cr.commission:
+                    commission += float(cr.commission)
             return OrderResult(
                 ok=ok, ticker=req.ticker, side=req.side, requested_qty=req.quantity,
                 filled_qty=filled,
                 avg_fill_price=float(st.avgFillPrice) if st.avgFillPrice else None,
                 order_id=str(trade.order.orderId), client_ref=req.client_ref,
-                status=st.status, error=None if ok else (st.status or "not filled"),
+                status=st.status, commission=round(commission, 4) if commission else None,
+                error=None if ok else (st.status or "not filled"),
             )
         except Exception as e:
             logger.warning(f"[broker:ibkr] submit_order {req.side} {req.quantity} {req.ticker} failed: {e}")
             return OrderResult(ok=False, ticker=req.ticker, side=req.side,
                                requested_qty=req.quantity, client_ref=req.client_ref,
                                status="ERROR", error=str(e))
+
+    # ── fills (today's executions, for the reconciler's repair pass) ───────
+    def get_fills(self) -> List[FillSummary]:
+        """Today's executions aggregated per orderRef (= our client_ref).
+
+        Uses ``reqExecutions``, which IBKR scopes to the current day — exactly
+        the window that matters for repairing orders that filled after
+        ``submit_order``'s poll (queued-overnight opens execute at today's
+        open and appear here). Orders that filled on an earlier day while the
+        app was down are not recoverable through this path; their positions
+        still reconcile via ``get_positions``.
+
+        Aggregation: IBKR maintains a running ``cumQty``/``avgPrice`` on each
+        execution, so the latest execution per ref carries the order-level
+        totals; commissions are summed across the individual fills.
+        """
+        if not self.is_connected():
+            return []
+        try:
+            from ib_async import ExecutionFilter
+            fills = self._ib.reqExecutions(ExecutionFilter())
+        except Exception as e:
+            logger.warning(f"[broker:ibkr] reqExecutions failed: {e}")
+            return []
+
+        agg: dict = {}
+        max_cum: dict = {}
+        for f in fills or []:
+            ex = getattr(f, "execution", None)
+            if ex is None:
+                continue
+            ref = (getattr(ex, "orderRef", "") or "").strip()
+            if not ref:
+                continue
+            s = agg.get(ref)
+            if s is None:
+                s = FillSummary(client_ref=ref,
+                                ticker=from_ib_symbol(f.contract.symbol),
+                                side="BUY" if ex.side == "BOT" else "SELL",
+                                order_id=str(ex.orderId), perm_id=str(ex.permId))
+                agg[ref] = s
+            cum = float(ex.cumQty or 0)
+            if cum >= max_cum.get(ref, 0.0):   # latest execution carries the running totals
+                max_cum[ref] = cum
+                s.filled_qty = int(cum)
+                s.avg_fill_price = float(ex.avgPrice) if ex.avgPrice else None
+            cr = getattr(f, "commissionReport", None)
+            if cr is not None and cr.commission:
+                s.commission = round((s.commission or 0.0) + float(cr.commission), 4)
+            t = getattr(f, "time", None)
+            if t is not None:
+                iso = t.isoformat() if hasattr(t, "isoformat") else str(t)
+                if s.last_fill_at is None or iso > s.last_fill_at:
+                    s.last_fill_at = iso
+        return list(agg.values())

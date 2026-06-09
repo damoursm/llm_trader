@@ -244,6 +244,92 @@ def insert_recommendations(recs: List[dict]) -> None:
         )
 
 
+# ── broker execution record (write path from reconcile, via the pipeline) ──
+
+_BROKER_RECONCILE_COLS = [
+    "run_id", "created_at", "mode", "connected", "ok", "account_id",
+    "account_equity", "account_currency", "entries_submitted", "exits_submitted",
+    "fills_repaired", "rejects", "n_drift", "drift", "errors",
+]
+
+_BROKER_ORDER_COLS = [
+    "run_id", "event", "intent", "ticker", "side", "order_type", "requested_qty",
+    "filled_qty", "model_price", "limit_price", "fill_price", "slippage_bps",
+    "commission", "status", "ok", "error", "order_id", "client_ref", "submitted_at",
+]
+
+
+def insert_broker_report(run_id: str, report: dict) -> None:
+    """Persist one reconcile report: a summary row (broker_reconciles) plus one
+    event row per order submission / fill repair (broker_orders).
+
+    This is the durable record the paper phase measures from — per-order model
+    vs fill price, cost-normalized slippage bps, commissions, rejects, drift.
+    Idempotent per run_id (re-running a run_id replaces its rows).
+    """
+    if not report:
+        return
+    from datetime import datetime, timezone
+
+    summary = (
+        run_id,
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        report.get("mode"),
+        bool(report.get("connected")),
+        bool(report.get("ok")),
+        report.get("account_id"),
+        _f(report.get("account_equity")),
+        report.get("account_currency"),
+        int(report.get("entries_submitted") or 0),
+        int(report.get("exits_submitted") or 0),
+        int(report.get("fills_repaired") or 0),
+        int(report.get("rejects") or 0),
+        len(report.get("drift") or []),
+        _json(report.get("drift")),
+        _json(report.get("errors")),
+    )
+    order_rows = [
+        (
+            run_id,
+            o.get("event"),
+            o.get("intent"),
+            o.get("ticker"),
+            o.get("side"),
+            o.get("order_type"),
+            o.get("requested_qty"),
+            o.get("filled_qty"),
+            _f(o.get("model_price")),
+            _f(o.get("limit_price")),
+            _f(o.get("fill_price")),
+            _f(o.get("slippage_bps")),
+            _f(o.get("commission")),
+            o.get("status"),
+            o.get("ok"),
+            o.get("error"),
+            o.get("order_id"),
+            o.get("client_ref"),
+            o.get("submitted_at"),
+        )
+        for o in (report.get("orders") or [])
+    ]
+    rec_ph = ", ".join(["?"] * len(_BROKER_RECONCILE_COLS))
+    ord_ph = ", ".join(["?"] * len(_BROKER_ORDER_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM broker_reconciles WHERE run_id = ?", [run_id])
+        conn.execute("DELETE FROM broker_orders WHERE run_id = ?", [run_id])
+        conn.execute(
+            f"INSERT INTO broker_reconciles ({', '.join(_BROKER_RECONCILE_COLS)}) VALUES ({rec_ph})",
+            summary,
+        )
+        if order_rows:
+            conn.executemany(
+                f"INSERT INTO broker_orders ({', '.join(_BROKER_ORDER_COLS)}) VALUES ({ord_ph})",
+                order_rows,
+            )
+        conn.execute("COMMIT")
+
+
 # ── generic read path (used by the dashboard) ──────────────────────────────
 
 def fetch_df(sql: str, params: Optional[list] = None, read_only: bool = True) -> pd.DataFrame:
