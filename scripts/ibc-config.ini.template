@@ -19,7 +19,7 @@ TradingMode=paper
 # At this time each day, TWS shuts down and restarts itself WITHOUT asking you
 # to log in again — so it runs the whole trading week on a single Monday login.
 # This is what fixes the daily logoff that kept breaking us. Pick a quiet time.
-AutoRestartTime=11:50 PM
+AutoRestartTime=10:00 PM
 
 # ── API — must match the pipeline (.env IBKR_PORT) and allow orders ─────────
 OverrideTwsApiPort=7497

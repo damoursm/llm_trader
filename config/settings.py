@@ -629,6 +629,30 @@ class Settings(BaseSettings):
     intraday_session_start: str = "09:30"
     intraday_session_end: str = "16:00"
 
+    # Scheduler resilience on laptops / Modern-Standby machines. This box exposes
+    # only S0 "Connected Standby" (no S1/S2/S3): when the display sleeps Windows
+    # *suspends* this process, so cron fires come due while frozen and APScheduler's
+    # default 1-second misfire grace silently drops them (the runner logged
+    # "Scheduler started" but never ticked). Two guards:
+    #   • keep_awake       — issue a Windows ES_SYSTEM_REQUIRED power request so the
+    #     OS will not idle into standby while the scheduler runs (no-op off-Windows).
+    #   • misfire_grace_sec — if the process IS suspended across a fire time, run the
+    #     tick on resume (coalesced) instead of dropping it. Kept under the 30-min
+    #     cadence so a late tick never duplicates the next scheduled one.
+    scheduler_keep_awake: bool = True
+    # How often the poll-loop runner re-reads the wall clock to decide whether a
+    # 30-min slot is due. Short so that after a Modern-Standby suspension it
+    # re-evaluates within this many seconds of resuming (instead of relying on a
+    # precomputed long sleep, which standby skews).
+    scheduler_poll_seconds: int = 30
+    # How late a 30-min slot may still run after its boundary. If the machine was
+    # suspended past this, the slot is skipped (logged) rather than run stale.
+    scheduler_misfire_grace_sec: int = 1500
+    # Normally only the 16:00 closing tick emails the daily report. Flip this on to
+    # email on EVERY in-window tick (every 30 min) — handy for confirming the
+    # scheduler actually fires. Turn back off once verified to avoid 13 emails/day.
+    scheduler_email_every_tick: bool = False
+
     # Intraday timing overlay (Hybrid: daily trend decides direction; a 30-min
     # momentum read only gates entry/exit *timing*).
     enable_intraday_timing: bool = True
