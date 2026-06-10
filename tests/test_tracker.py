@@ -92,35 +92,82 @@ def test_normalize_closed_returns_skips_open_trades():
     assert n == 0
 
 
-# ── _save_trades: skip write when content unchanged (Fix #20) ────────────
+# ── _save_trades / _load_trades: DuckDB round-trip ────────────────────────
+# (These replace two legacy tests that monkeypatched the obsolete TRADES_FILE
+# JSON path while _save_trades had moved to DuckDB — so they wrote their
+# fixture rows into the PRODUCTION trades table via full-replace, wiping the
+# real ledger. The conftest _isolated_db fixture now makes that impossible;
+# tracker.TRADES_FILE is also pointed away so _load_trades' legacy self-seed
+# can't read the real cache/trades.json.)
 
-def test_save_trades_skips_write_when_unchanged(tmp_path, monkeypatch):
-    """Writing the same content twice should only touch the file once."""
-    target = tmp_path / "trades.json"
-    monkeypatch.setattr(tracker, "TRADES_FILE", target)
-
-    trades = [{"ticker": "ABC", "status": "OPEN", "return_pct": 1.0}]
+def test_save_trades_roundtrips_through_duckdb(tmp_path, monkeypatch):
+    monkeypatch.setattr(tracker, "TRADES_FILE", tmp_path / "no-legacy.json")
+    trades = [{"ticker": "XYZ", "status": "OPEN", "return_pct": 1.0,
+               "entry_date": "2026-06-01", "entry_price": 10.0, "action": "BUY"}]
     _save_trades(trades)
-    assert target.exists()
-    first_mtime = target.stat().st_mtime_ns
-
-    # Save again with identical content — file must NOT be touched.
-    _save_trades(trades)
-    second_mtime = target.stat().st_mtime_ns
-    assert first_mtime == second_mtime, "no-op save must not update mtime"
+    assert tracker._load_trades() == trades   # byte-identical dict round-trip
 
 
-def test_save_trades_writes_when_content_differs(tmp_path, monkeypatch):
-    target = tmp_path / "trades.json"
-    monkeypatch.setattr(tracker, "TRADES_FILE", target)
+def test_save_trades_is_full_replace(tmp_path, monkeypatch):
+    monkeypatch.setattr(tracker, "TRADES_FILE", tmp_path / "no-legacy.json")
+    base = {"ticker": "XYZ", "status": "OPEN", "entry_date": "2026-06-01",
+            "entry_price": 10.0, "action": "BUY"}
+    _save_trades([dict(base, return_pct=1.0)])
+    _save_trades([dict(base, return_pct=2.0)])
+    loaded = tracker._load_trades()
+    assert len(loaded) == 1
+    assert loaded[0]["return_pct"] == 2.0
 
-    _save_trades([{"ticker": "ABC", "status": "OPEN", "return_pct": 1.0}])
-    original = target.read_text(encoding="utf-8")
 
-    _save_trades([{"ticker": "ABC", "status": "OPEN", "return_pct": 2.0}])
-    updated = target.read_text(encoding="utf-8")
-    assert original != updated
-    assert "2.0" in updated
+# ── Ledger-corruption regression (2026-06-10 production incident) ─────────
+
+def _poisoned_ledger():
+    """The literal malformed row that crashed production, plus realistic
+    open/closed trades (fake tickers so no OHLCV cache is consulted)."""
+    fake = {"ticker": "ABC", "status": "OPEN", "return_pct": 1.0,
+            "broker_status": "SKIPPED_ZERO_QTY"}
+    open_t = {"ticker": "ZZTA", "type": "STOCK", "action": "SELL", "direction": "BEARISH",
+              "status": "OPEN", "confidence": 0.8, "position_size_multiplier": 1.0,
+              "entry_date": "2026-06-10", "entry_price": 50.0,
+              "current_price": 49.0, "return_pct": 2.0, "days_held": 0,
+              "exit_date": None, "exit_price": None}
+    closed_t = {"ticker": "ZZTB", "type": "STOCK", "action": "BUY", "direction": "BULLISH",
+                "status": "CLOSED", "confidence": 0.8, "position_size_multiplier": 1.0,
+                "entry_date": "2026-06-10", "entry_price": 10.0,
+                "current_price": 11.0, "return_pct": 9.8, "days_held": 0,
+                "exit_date": "2026-06-10", "exit_price": 11.0}
+    return [fake, open_t, closed_t]
+
+
+def test_poisoned_ledger_does_not_crash_pipeline_paths(tmp_path, monkeypatch):
+    """Regression for 2026-06-10: a structurally-invalid row in the trades
+    table (a stray test fixture) crashed every pipeline tick with
+    KeyError('entry_date') — first in log_performance_summary, then in
+    get_performance_for_email. The loader's sanitize boundary must exclude it
+    from every consumer, and the next ledger write must purge it from the DB.
+    """
+    from config.settings import settings
+    from src.db import repo
+
+    monkeypatch.setattr(tracker, "TRADES_FILE", tmp_path / "no-legacy.json")
+    monkeypatch.setattr(settings, "enable_fetch_data", False)   # no network
+
+    repo.save_trades(_poisoned_ledger())   # corruption written raw, as the old test did
+
+    loaded = tracker._load_trades()
+    assert {t["ticker"] for t in loaded} == {"ZZTA", "ZZTB"}    # ABC excluded
+
+    tracker.log_performance_summary()                  # crash site #1 — must not raise
+
+    perf = tracker.get_performance_for_email()         # crash site #2 — must not raise
+    assert [t["ticker"] for t in perf["open_trades"]] == ["ZZTA"]
+    assert [t["ticker"] for t in perf["closed_trades"]] == ["ZZTB"]
+    assert perf["stats"]["total_all"] == 2
+
+    # The next ledger write (a normal pipeline step) self-purges the bad row.
+    tracker.update_open_trades()
+    raw = repo.load_trades()                           # raw read — no sanitize
+    assert {t["ticker"] for t in raw} == {"ZZTA", "ZZTB"}
 
 
 # ── _trading_days_held: uses real market calendar ────────────────────────

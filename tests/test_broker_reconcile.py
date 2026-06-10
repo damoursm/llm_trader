@@ -241,6 +241,29 @@ def test_fill_refresh_repairs_partial_fill_then_completion(repo_store):
     assert repo_store["trades"][0]["broker_status"] == "Filled"
 
 
+def test_adopted_drift_row_is_quiet_until_close(repo_store):
+    """A row adopted from drift (sentinel order id, RESTORED_ADOPTED status) must
+    submit nothing and never be a fill-refresh candidate while open — and on
+    close, the exit must size from the LIVE broker position (no stored fill qty)."""
+    t = _open_trade("VGT")
+    t.update(broker_order_id="ADOPTED_DRIFT_2026-06-10",
+             broker_status="RESTORED_ADOPTED")
+    repo_store["trades"] = [t]
+    b = FakeBroker(positions=[Position("VGT", 6, 117.0)])
+    b.fills = [FillSummary(client_ref="rec-VGT", ticker="VGT", side="BUY",
+                           filled_qty=6, avg_fill_price=117.0, commission=0.35)]
+    r = rec.sync(broker=b)
+    assert b.orders == []                       # no entry resubmitted
+    assert r["fills_repaired"] == 0             # not a refresh candidate
+    assert r["drift"] == []                     # position matches the OPEN row
+
+    t.update(status="CLOSED", exit_price=120.0)
+    r2 = rec.sync(broker=b)
+    assert r2["exits_submitted"] == 1
+    assert b.orders[-1].side == "SELL"
+    assert b.orders[-1].quantity == 6           # sized from the live position
+
+
 def test_submit_order_rows_recorded_for_entries(repo_store):
     repo_store["trades"] = [_open_trade("AAPL")]
     r = rec.sync(broker=FakeBroker())

@@ -63,17 +63,51 @@ SIZE_TIER_FULL  = 0.92   # 0.85–0.92 → 1.5×; above → 2.0×
 # Data helpers
 # ---------------------------------------------------------------------------
 
+# A ledger row must carry these to be a trade at all. Anything else is
+# corruption (e.g. the 2026-06-10 incident: a stale test wrote its fixture row
+# into the production table, and every consumer that sorted on entry_date or
+# formatted entry_price crashed the pipeline tick).
+_REQUIRED_TRADE_FIELDS = ("ticker", "entry_date", "entry_price", "status")
+
+
+def _sanitize_trades(trades: List[dict]) -> List[dict]:
+    """Drop rows that aren't structurally trades (missing a core field).
+
+    This is the single integrity boundary: every consumer downstream of
+    ``_load_trades`` may rely on the core fields existing, instead of
+    defending each sort/format site individually. Excluded rows are warned
+    about loudly; because every save is a full-replace of the table, the next
+    ledger write naturally purges them from the DB.
+    """
+    def _ok(t: dict) -> bool:
+        return all(t.get(f) is not None for f in _REQUIRED_TRADE_FIELDS)
+
+    valid = [t for t in trades if _ok(t)]
+    if len(valid) != len(trades):
+        bad = [t.get("ticker", "?") for t in trades if not _ok(t)]
+        logger.warning(
+            f"[tracker] {len(trades) - len(valid)} malformed ledger row(s) excluded "
+            f"(missing one of {_REQUIRED_TRADE_FIELDS}): {bad} — purged from the DB "
+            "on the next ledger write"
+        )
+    return valid
+
+
 def _load_trades() -> List[dict]:
     """Load the trade ledger from DuckDB (the single source of truth).
 
-    One-time safety net: if the DB is empty but the legacy ``cache/trades.json``
-    still exists, seed the DB from it so the JSON→DuckDB cutover never loses
-    history (even if the pipeline runs before ``python -m src.db.migrate``).
+    Rows are passed through ``_sanitize_trades`` so corrupted entries can
+    never reach (and crash) downstream consumers.
+
+    One-time safety net: if the DB holds no valid trades but the legacy
+    ``cache/trades.json`` still exists, seed the DB from it so the JSON→DuckDB
+    cutover never loses history (even if the pipeline runs before
+    ``python -m src.db.migrate``).
     """
     try:
-        trades = repo.load_trades()
+        trades = _sanitize_trades(repo.load_trades())
         if not trades and TRADES_FILE.exists():
-            legacy = json.loads(TRADES_FILE.read_text(encoding="utf-8"))
+            legacy = _sanitize_trades(json.loads(TRADES_FILE.read_text(encoding="utf-8")))
             if legacy:
                 repo.save_trades(legacy)
                 logger.info(f"[tracker] Seeded DuckDB from {TRADES_FILE} ({len(legacy)} trades)")
@@ -1309,7 +1343,7 @@ def update_open_trades() -> None:
 
 def log_performance_summary() -> None:
     """Log a full performance breakdown to the log file."""
-    trades = _load_trades()
+    trades = _load_trades()   # sanitized — malformed rows can't reach this point
     if not trades:
         logger.info("[tracker] No trades recorded yet.")
         return

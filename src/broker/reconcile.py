@@ -121,7 +121,18 @@ def _record_order(report: dict, *, event: str, intent: str, ticker: str, side: s
 
 # ── fill refresh: repair stale broker_fill_* fields from today's executions ──
 
-_TERMINAL_STATUSES = ("Filled", "Cancelled", "ApiCancelled", "Inactive", "DRYRUN")
+# Statuses for ledger rows recovered from a backup or adopted from drift:
+# their broker_order_id is a sentinel (blocks entry submission), and there is
+# no live order to poll, so the fill-refresh pass must never treat them as
+# candidates. On close, the exit path sizes from the live broker position, so
+# a paper position that does exist for the ticker is still flattened.
+#   RESTORED_NOT_SUBMITTED — position was never broker-entered
+#   RESTORED_ADOPTED       — a real broker position exists, but the original
+#                            order linkage was lost (e.g. the 2026-06-10 wipe)
+_RESTORED_STATUSES = ("RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED")
+
+_TERMINAL_STATUSES = ("Filled", "Cancelled", "ApiCancelled", "Inactive", "DRYRUN",
+                      "RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED")
 
 
 def _leg_needs_refresh(t: dict, prefix: str) -> bool:
@@ -129,7 +140,10 @@ def _leg_needs_refresh(t: dict, prefix: str) -> bool:
     fill data or hasn't reached a terminal status yet."""
     if not t.get(f"{prefix}order_id"):
         return False
-    if (t.get(f"{prefix}status") or "") not in _TERMINAL_STATUSES:
+    status = t.get(f"{prefix}status") or ""
+    if status in _RESTORED_STATUSES:
+        return False              # sentinel linkage — nothing at the broker to poll
+    if status not in _TERMINAL_STATUSES:
         return True
     return (not t.get(f"{prefix}fill_qty")
             or t.get(f"{prefix}fill_price") is None
