@@ -85,6 +85,25 @@ whole week on one Monday login. This replaces the daily logoff that kept breakin
 
 ---
 
+## 3 — Monitoring dashboard (optional, not trading-critical)
+
+The read-only dashboard (`main.py --dashboard`, http://127.0.0.1:8050) is kept always-on
+the same way as the scheduler — a Task Scheduler job pointed at a venv launcher:
+
+```
+powershell -ExecutionPolicy Bypass -File "C:\Users\mathi\PycharmProjects\llm_trader\scripts\register_dashboard_task.ps1"
+```
+
+(run once, as administrator). Creates task **`LlmTraderDashboard`** → runs
+**`scripts\run_dashboard.bat`** at log on, auto-restarts on failure (1 min × 3), kills any
+manually-started dashboard first so port 8050 is free. The dashboard opens the DuckDB
+**read-only** with retry/backoff, so it never blocks the scheduler's writes. If it's down,
+trading is unaffected — only monitoring is.
+
+Manage: `Start-ScheduledTask` / `Stop-ScheduledTask` / `Unregister-ScheduledTask -TaskName LlmTraderDashboard -Confirm:$false`.
+
+---
+
 ## Sanity checklist before flipping to `ibkr_live`
 - [ ] Scheduler runs as a service and **survives a reboot + a kill** (test both).
 - [ ] TWS/IBC survives its `AutoRestartTime` without manual login (watch it cross that time once).
