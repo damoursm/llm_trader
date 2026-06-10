@@ -143,10 +143,11 @@ def _safe(label: str, fn, *args, **kwargs):
 def _persist_run(run_id, start, finished, all_tickers, recommendations, actionable,
                  gate_diag, market_mode_context, macro_regime_context,
                  confidence_threshold, allow_buys, signals_by_ticker,
-                 broker_report=None) -> None:
+                 broker_report=None, snapshots=None) -> None:
     """Write the run, its per-source 'APIs used' record, every recommendation
-    (with method attribution + the LLM provider that synthesised it), and the
-    broker reconcile report (per-order slippage/commission rows) to DuckDB."""
+    (with method attribution + the LLM provider that synthesised it), the
+    broker reconcile report (per-order slippage/commission rows), and the FULL
+    per-ticker signal cross-section (the learning panel) to DuckDB."""
     try:
         actionable_ids = {id(r) for r in actionable}
         provider = get_last_synthesis_meta().get("provider")
@@ -196,9 +197,40 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         if broker_report and broker_report.get("mode") not in (None, "off"):
             repo.insert_broker_report(run_id, broker_report)
             n_orders = len(broker_report.get("orders") or [])
+
+        # Signals panel: persist EVERY ticker's full method-score vector — not
+        # just the top-10 recommendations — so the cross-section accumulates
+        # into a forward-testing dataset (news/options inputs can't be
+        # reconstructed historically; a run not persisted is data lost).
+        # Analyse with `python -m src.analysis.signal_panel`.
+        price_by_ticker = {s.ticker: s.price for s in (snapshots or []) if getattr(s, "price", None)}
+        sig_rows = []
+        for tk, s in (signals_by_ticker or {}).items():
+            scores = _method_scores_from_signal(tk, s.direction, signals_by_ticker)
+            sig_rows.append({
+                "ticker": tk,
+                "type": str(getattr(s, "type", "STOCK") or "STOCK"),
+                "direction": str(getattr(s.direction, "value", s.direction)),
+                "combined_score": float(getattr(s, "combined_score", 0.0)),
+                "confidence": float(s.confidence),
+                "n_methods_agreeing": len(_methods_agreeing(scores, s.direction)),
+                "dominant_method": _dominant_method(scores, s.direction),
+                "price": price_by_ticker.get(tk),
+                "scores": scores,
+            })
+        if sig_rows:
+            from src.utils import ET
+            repo.insert_signals(
+                run_id,
+                generated_at=start.isoformat(),
+                signal_date=start.astimezone(ET).date().isoformat(),
+                rows=sig_rows,
+            )
+
         logger.info(
             f"[db] Persisted run {run_id}: {len(rec_rows)} recommendation(s), "
-            f"{len(sources)} source(s), {n_orders} broker order event(s) → DuckDB"
+            f"{len(sources)} source(s), {n_orders} broker order event(s), "
+            f"{len(sig_rows)} signal row(s) → DuckDB"
         )
     except Exception as e:
         logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
@@ -1002,12 +1034,13 @@ def run_pipeline(send_email: bool = False) -> None:
     logger.info("Monitor performance + rationale in the dashboard: python main.py --dashboard")
 
     # Persist run + 'APIs used' + every recommendation (with attribution) +
-    # the broker reconcile report (per-order slippage/commissions) to DuckDB.
+    # the broker reconcile report (per-order slippage/commissions) + the full
+    # per-ticker signal cross-section (the learning panel) to DuckDB.
     _persist_run(
         run_id, start, datetime.now(timezone.utc), all_tickers, recommendations, actionable,
         gate_diag, market_mode_context, macro_regime_context,
         _confidence_threshold, _allow_buys, signals_by_ticker,
-        broker_report=broker_report,
+        broker_report=broker_report, snapshots=snapshots,
     )
 
     # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:

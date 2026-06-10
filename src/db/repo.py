@@ -15,6 +15,7 @@ from typing import List, Optional
 import pandas as pd
 
 from src.db.connection import connect
+from src.db.schema import SIGNAL_METHOD_COLUMNS
 
 
 # When True, read paths open read-only connections. The dashboard sets this so it
@@ -242,6 +243,55 @@ def insert_recommendations(recs: List[dict]) -> None:
             f"INSERT OR REPLACE INTO recommendations ({', '.join(_REC_COLS)}) VALUES ({placeholders})",
             rows,
         )
+
+
+# ── signals panel (full per-ticker cross-section, every run) ───────────────
+
+_SIGNAL_BASE_COLS = [
+    "run_id", "generated_at", "signal_date", "ticker", "type", "direction",
+    "combined_score", "confidence", "n_methods_agreeing", "dominant_method", "price",
+]
+_SIGNAL_COLS = _SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS) + ["scores"]
+
+
+def insert_signals(run_id: str, generated_at: str, signal_date: str,
+                   rows: List[dict]) -> None:
+    """Persist the full per-ticker signal cross-section for one run.
+
+    One row per ticker — ALL tickers the aggregator scored, not just the
+    top-10 recommendations. Each row dict carries scalar fields plus a
+    ``scores`` dict (method → score); known methods are projected into their
+    own DOUBLE columns for direct SQL (`corr(news, fwd_ret)`), and the full
+    dict is kept as JSON so a method added before its column exists is never
+    lost. Idempotent per run_id.
+    """
+    if not rows:
+        return
+    out = []
+    for r in rows:
+        scores = r.get("scores") or {}
+        out.append(tuple(
+            [run_id, generated_at, signal_date,
+             r.get("ticker"),
+             r.get("type"),
+             r.get("direction"),
+             _f(r.get("combined_score")),
+             _f(r.get("confidence")),
+             r.get("n_methods_agreeing"),
+             r.get("dominant_method"),
+             _f(r.get("price"))]
+            + [_f(scores.get(m)) for m in SIGNAL_METHOD_COLUMNS]
+            + [_json(scores)]
+        ))
+    placeholders = ", ".join(["?"] * len(_SIGNAL_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM signals WHERE run_id = ?", [run_id])
+        conn.executemany(
+            f"INSERT INTO signals ({', '.join(_SIGNAL_COLS)}) VALUES ({placeholders})",
+            out,
+        )
+        conn.execute("COMMIT")
 
 
 # ── broker execution record (write path from reconcile, via the pipeline) ──

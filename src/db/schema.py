@@ -15,9 +15,29 @@ broker_reconciles   — one row per broker sync: connectivity, counts, drift, er
 broker_orders       — one event row per order submission / fill repair: model vs
                       fill price, cost-normalized slippage bps, commission. The
                       durable record the paper phase measures slippage/rejects from.
+signals             — the full per-ticker signal cross-section of EVERY run (not
+                      just the top-10 recommendations): one row per (run, ticker)
+                      with all method scores, combined score, confidence. Joined
+                      against forward returns from cache/ohlcv this is the panel
+                      for information-coefficient analysis and threshold tuning —
+                      news/options inputs can't be reconstructed historically, so
+                      forward collection here is the only path to a
+                      backtest-quality dataset.
 """
 
 from __future__ import annotations
+
+# Per-method score columns on the `signals` table. MUST mirror
+# `src.performance.tracker._ALL_METHODS` — duplicated here (instead of imported)
+# because tracker depends on src.db, so importing it back would be circular.
+# tests/test_db_signals.py asserts the two stay in sync; when adding a method,
+# add the column here too (new columns only apply to newly created DB files —
+# an existing DB needs a one-time ALTER TABLE signals ADD COLUMN <m> DOUBLE).
+SIGNAL_METHOD_COLUMNS = (
+    "news", "sent_velocity", "tech", "insider", "put_call", "max_pain",
+    "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow",
+    "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
+)
 
 SCHEMA_STATEMENTS = [
     """
@@ -147,6 +167,23 @@ SCHEMA_STATEMENTS = [
         order_id      VARCHAR,
         client_ref    VARCHAR,
         submitted_at  VARCHAR
+    );
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS signals (
+        run_id              VARCHAR,
+        generated_at        VARCHAR,
+        signal_date         VARCHAR,
+        ticker              VARCHAR,
+        type                VARCHAR,
+        direction           VARCHAR,
+        combined_score      DOUBLE,
+        confidence          DOUBLE,
+        n_methods_agreeing  INTEGER,
+        dominant_method     VARCHAR,
+        price               DOUBLE,
+        {", ".join(f"{m} DOUBLE" for m in SIGNAL_METHOD_COLUMNS)},
+        scores              VARCHAR
     );
     """,
 ]
