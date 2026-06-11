@@ -6,12 +6,24 @@ single broker hook point: idempotent and self-healing.
   • Fill refresh: orders submitted on an earlier tick that hadn't reached a
     terminal state inside submit_order's short poll (queued overnight, partial
     fill, late commission report) are repaired from today's executions.
+  • Stale-unfilled cancel: an accepted order resting unfilled past
+    ``broker_unfilled_cancel_minutes`` (its price cap was never reached) is
+    cancelled and resubmitted re-anchored at the current mark.
   • Internal OPEN trade with no broker entry yet  → size + submit an entry, then
     record broker_* fields on the trade.
   • Internal CLOSED trade that still holds a broker position → submit the close,
     record the broker exit.
   • Broker position with no matching internal OPEN trade (drift) → report it
     (report-only; we never auto-flatten unexpected positions).
+
+Submission reliability: every submit is verified against the broker's answer
+(``_submit_with_retry``) — TRANSIENT failures (connection drop, timeout,
+pacing) retry a few times in-tick behind a duplicate guard (an attempt that
+errored after transmission may exist at the broker; resubmitting blind would
+double the position), while hard rejects return immediately. The retry window
+is deliberately short and every retry goes out as a marketable LMT capped at
+``broker_limit_cap_bps`` from the tick's model price, so a delayed fill can
+never drift past the cap.
 
 The internal NAV sim remains the source of truth for analytics; this adds the real
 execution leg plus a reconciliation report (slippage, drift, rejects) for the email
@@ -30,6 +42,8 @@ degrades to report-only; it never raises into the pipeline.
 from __future__ import annotations
 
 import math
+import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -37,6 +51,7 @@ from loguru import logger
 
 from config.settings import settings
 from src.broker import Broker, FillSummary, OrderRequest, get_broker
+from src.broker.base import OrderResult
 from src.broker.fx import usd_per_unit
 from src.broker.sizing import shares_for, shares_for_notional, within_caps
 from src.db import repo
@@ -82,6 +97,7 @@ def _new_report() -> dict:
     return {
         "run_id": None, "mode": settings.broker_mode, "connected": False, "ok": True,
         "entries_submitted": 0, "exits_submitted": 0, "fills_repaired": 0, "rejects": 0,
+        "retries": 0, "stale_cancels": 0, "entry_cancels_on_close": 0, "drift_flattened": 0,
         "drift": [], "slippage": [], "orders": [], "errors": [], "account_equity": None,
     }
 
@@ -226,6 +242,338 @@ def _refresh_fills(broker: Broker, trades: List[dict], report: dict) -> bool:
     return changed
 
 
+# ── submission reliability: verify, classify, retry (bounded) ───────────────
+
+# Failure text that indicates a TRANSIENT condition worth one more try —
+# everything else (insufficient funds, permissions, invalid contract, …) is a
+# hard reject a retry cannot fix.
+_TRANSIENT_MARKERS = (
+    "disconnect", "connection", "timeout", "timed out", "pacing",
+    "rate limit", "temporar", "busy", "not connected", "socket",
+)
+
+
+def _is_transient_failure(res: OrderResult) -> bool:
+    """True when a failed OrderResult looks recoverable by a quick retry."""
+    if res.ok:
+        return False
+    if (res.status or "").upper() == "DISCONNECTED":
+        return True
+    blob = f"{res.status or ''} {res.error or ''}".lower()
+    return any(m in blob for m in _TRANSIENT_MARKERS)
+
+
+def _known_order_result(broker: Broker, req: OrderRequest) -> Optional[OrderResult]:
+    """Synthesize an OrderResult from broker state when ``req.client_ref``
+    already exists there — the duplicate guard before any retry.
+
+    An attempt that errored AFTER transmission (socket dropped mid-flight) may
+    have reached the broker even though we recorded a failure; resubmitting
+    blind would double the position (orderRef is a tag, IBKR does not dedupe
+    on it). Filled → adopt the fill; still working → adopt the order and let
+    the fill-refresh pass complete it on a later tick.
+    """
+    try:
+        for f in broker.get_fills():
+            if f.client_ref == req.client_ref and (f.filled_qty or 0) > 0:
+                return OrderResult(
+                    ok=True, ticker=req.ticker, side=req.side,
+                    requested_qty=req.quantity, filled_qty=f.filled_qty,
+                    avg_fill_price=f.avg_fill_price, order_id=f.order_id,
+                    client_ref=req.client_ref, status="Filled",
+                    commission=f.commission,
+                )
+        for o in broker.get_open_orders():
+            if o.client_ref == req.client_ref:
+                return OrderResult(
+                    ok=True, ticker=req.ticker, side=req.side,
+                    requested_qty=req.quantity, filled_qty=0,
+                    order_id=o.order_id, client_ref=req.client_ref,
+                    status=o.status or "Submitted",
+                )
+    except Exception as e:
+        logger.debug(f"[broker] known-order check failed for {req.client_ref}: {e}")
+    return None
+
+
+def _submit_with_retry(broker: Broker, req: OrderRequest, model_price: float,
+                       report: dict, intent: str) -> OrderResult:
+    """Submit and verify; retry TRANSIENT failures a few times, briefly.
+
+    The window is deliberately small (``broker_submit_retries`` ×
+    ``broker_retry_wait_seconds``) so any eventual fill stays anchored near
+    this tick's model price — and every retry is converted to a marketable
+    LMT capped at ``broker_limit_cap_bps`` from that model price, so however
+    late the retry lands, the worst acceptable fill never drifts past the
+    cap. Hard rejects return immediately. Each failed attempt is persisted as
+    a SUBMIT_FAILED event row so the paper phase accumulates a reliability
+    record alongside slippage.
+    """
+    res = broker.submit_order(req)
+    retries = max(0, int(settings.broker_submit_retries))
+    wait = max(1, int(settings.broker_retry_wait_seconds))
+    attempt = 1
+    while (not res.ok) and attempt <= retries and _is_transient_failure(res):
+        _record_order(
+            report, event="SUBMIT_FAILED", intent=intent, ticker=req.ticker,
+            side=req.side, order_type=req.order_type, requested_qty=req.quantity,
+            filled_qty=0, model_price=model_price, limit_price=req.limit_price,
+            fill_price=None, commission=None, status=res.status, ok=False,
+            error=res.error, order_id=res.order_id, client_ref=req.client_ref,
+            submitted_at=res.submitted_at,
+        )
+        report["retries"] = report.get("retries", 0) + 1
+        logger.warning(
+            f"[broker] {intent} {req.ticker} attempt {attempt} failed transiently "
+            f"({res.status}: {res.error}) — retrying in {wait}s"
+        )
+        time.sleep(wait)
+        known = _known_order_result(broker, req)
+        if known is not None:
+            logger.info(
+                f"[broker] {intent} {req.ticker}: order {req.client_ref} already at "
+                f"the broker ({known.status}) — adopting it, NOT resubmitting"
+            )
+            return known
+        try:
+            broker.connect()   # idempotent; revives a dropped session
+        except Exception:
+            pass
+        cap = _limit_price_for(req.side, model_price)
+        if cap:
+            req = replace(req, order_type="LMT", limit_price=cap)
+        res = broker.submit_order(req)
+        attempt += 1
+    return res
+
+
+# ── stale-unfilled cancel: re-anchor resting orders at the current mark ─────
+
+def _age_minutes(iso_ts) -> Optional[float]:
+    try:
+        dt = datetime.fromisoformat(str(iso_ts))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _live_price(ticker: str) -> Optional[float]:
+    """Fresh live quote for re-anchoring a stale-cancelled EXIT (None-safe).
+
+    Lazy import: tracker has no dependency on src.broker, so this is acyclic.
+    """
+    try:
+        from src.performance.tracker import _fetch_price
+        px = _fetch_price(ticker)
+        return float(px) if px and px > 0 else None
+    except Exception as e:
+        logger.debug(f"[broker] live re-anchor fetch failed for {ticker}: {e}")
+        return None
+
+
+def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict) -> bool:
+    """Cancel accepted orders that rested unfilled past the configured age.
+
+    A capped marketable LMT only rests when the market moved away from its
+    model price — leaving it would either never fill (permanent sim↔broker
+    drift) or fill much later on a swing back. Cancelling and clearing the
+    leg lets the entry/exit pass below resubmit THIS tick, re-anchored at the
+    current mark under a fresh ``-rN`` client_ref, so the books converge in
+    bounded ≤cap steps. Partial fills are left working (cancelling the
+    remainder would strand a mismatched position). A cancel that loses the
+    race to a fill is left intact for the fill-refresh pass.
+    """
+    max_min = int(settings.broker_unfilled_cancel_minutes)
+    if max_min <= 0:
+        return False
+    changed = False
+    for t in trades:
+        for prefix, intent, want_status in (("broker_", "ENTRY", "OPEN"),
+                                            ("broker_exit_", "EXIT", "CLOSED")):
+            if t.get("status") != want_status:
+                continue
+            if not t.get(f"{prefix}order_id"):
+                continue
+            status = t.get(f"{prefix}status") or ""
+            if status in _TERMINAL_STATUSES or status in _RESTORED_STATUSES:
+                continue
+            if (t.get(f"{prefix}fill_qty") or 0) > 0:
+                continue
+            age = _age_minutes(t.get(f"{prefix}submitted_at"))
+            if age is None or age < max_min:
+                continue
+            ref = t.get(f"{prefix}client_ref")
+            try:
+                cancelled = bool(ref) and broker.cancel_order(ref)
+            except Exception as e:
+                logger.warning(f"[broker] cancel_order {ref} raised: {e}")
+                cancelled = False
+            if not cancelled:
+                continue
+            side = _entry_side(t["action"]) if intent == "ENTRY" else _exit_side(t["action"])
+            _record_order(
+                report, event="STALE_CANCEL", intent=intent, ticker=t["ticker"],
+                side=side, order_type="LMT",
+                requested_qty=t.get(f"{prefix}requested_qty"), filled_qty=0,
+                model_price=None, limit_price=None, fill_price=None,
+                commission=None, status="Cancelled", ok=True, error=None,
+                order_id=t.get(f"{prefix}order_id"), client_ref=ref,
+                submitted_at=None,
+            )
+            report["stale_cancels"] = report.get("stale_cancels", 0) + 1
+            hist = t.get(f"{prefix}cancelled_order_ids") or []
+            t[f"{prefix}cancelled_order_ids"] = hist + [t[f"{prefix}order_id"]]
+            t[f"{prefix}order_id"] = None
+            t[f"{prefix}status"] = "STALE_CANCELLED"
+            t[f"{prefix}resubmit_n"] = int(t.get(f"{prefix}resubmit_n") or 0) + 1
+            changed = True
+            logger.info(
+                f"[broker] stale unfilled {intent} {t['ticker']} cancelled after "
+                f"{age:.0f} min — resubmitting re-anchored at the current mark"
+            )
+    return changed
+
+
+# ── drift auto-reconciliation: flatten orphan positions ─────────────────────
+
+def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
+                    outside_rth: bool,
+                    report: dict, run_id: Optional[str]) -> Optional[OrderResult]:
+    """Submit a price-capped close for an orphan broker position.
+
+    The ledger is the source of truth — a position it cannot explain is
+    closed, never adopted (an adopted trade the strategy never signalled
+    would contaminate every performance metric). Always a marketable LMT
+    capped at ``broker_limit_cap_bps`` from a FRESH live quote: an unattended
+    cleanup must carry price protection, whatever ``broker_order_type`` says.
+    A flatten that rests unfilled is cancelled and re-anchored on the next
+    tick (each cycle gets a fresh quote + ref), so convergence happens in
+    bounded ≤cap steps. Returns None when skipped this tick (no quote,
+    fractional position, or a cancel race lost to a fill).
+    """
+    qty = int(abs(broker_qty))
+    if qty <= 0:
+        logger.warning(
+            f"[broker] drift {ticker}: fractional position ({broker_qty}) — "
+            "cannot be closed via the API; flatten it manually in TWS"
+        )
+        return None
+
+    # A flatten submitted on an earlier tick may still be working (its cap
+    # was never reached). Cancel it and re-anchor at a fresh quote; losing
+    # the cancel race to a fill means the position is gone — skip.
+    ref_prefix = f"drift-{ticker}-"
+    try:
+        for o in broker.get_open_orders():
+            if o.client_ref.startswith(ref_prefix):
+                if not broker.cancel_order(o.client_ref):
+                    logger.info(
+                        f"[broker] drift {ticker}: working flatten {o.client_ref} "
+                        "filled during cancel — nothing further this tick"
+                    )
+                    return None
+                logger.info(
+                    f"[broker] drift {ticker}: stale flatten {o.client_ref} "
+                    "cancelled — re-anchoring at a fresh quote"
+                )
+                break
+    except Exception as e:
+        logger.debug(f"[broker] drift open-order check failed for {ticker}: {e}")
+
+    live = _live_price(ticker)
+    if not live:
+        logger.warning(
+            f"[broker] drift {ticker}: no live quote for a price-capped flatten — "
+            "skipping this tick (reported only)"
+        )
+        return None
+
+    side = "SELL" if broker_qty > 0 else "BUY"
+    limit = _limit_price_for(side, live)
+    req = OrderRequest(
+        ticker=ticker, side=side, quantity=qty,
+        order_type="LMT", limit_price=limit,
+        client_ref=f"{ref_prefix}{run_id or _utcnow_iso()}",
+        intent="EXIT", outside_rth=outside_rth,
+    )
+    res = _submit_with_retry(broker, req, model_price=live, report=report,
+                             intent="DRIFT_FLATTEN")
+    _record_order(
+        report, event="DRIFT_FLATTEN", intent="EXIT", ticker=ticker, side=side,
+        order_type="LMT", requested_qty=qty, filled_qty=res.filled_qty,
+        model_price=live, limit_price=limit, fill_price=res.avg_fill_price,
+        commission=res.commission, status=res.status, ok=res.ok, error=res.error,
+        order_id=res.order_id, client_ref=res.client_ref,
+        submitted_at=res.submitted_at,
+    )
+    if res.ok:
+        logger.info(
+            f"[broker] drift {ticker}: auto-flatten submitted — {side} {qty} "
+            f"LMT @{limit} (live {live}); the broker converges to the ledger"
+        )
+    else:
+        report["errors"].append(f"drift flatten {ticker}: {res.error}")
+        logger.warning(f"[broker] drift {ticker}: flatten failed — {res.error}")
+    return res
+
+
+# ── drift prevention: never leave a working ENTRY behind a closed trade ─────
+
+def _cancel_entries_for_closed(broker: Broker, trades: List[dict], report: dict) -> bool:
+    """Cancel the still-working ENTRY order of any trade the ledger has CLOSED.
+
+    This is the orphan factory: the ledger closes a trade (signal flip, decay
+    exit) while its capped entry LMT is still resting at the broker. Nothing
+    else would ever cancel that order — the stale-cancel pass only manages
+    OPEN trades — so a later fill would create a position with no open trade
+    behind it (permanent drift). Cancelling here closes the gap; any part
+    that DID fill before the cancel is flattened by the exit pass right
+    after (which sizes from the actual held position).
+    """
+    changed = False
+    for t in trades:
+        if t.get("status") != "CLOSED":
+            continue
+        if not t.get("broker_order_id"):
+            continue
+        status = t.get("broker_status") or ""
+        if status in _TERMINAL_STATUSES or status in _RESTORED_STATUSES:
+            continue
+        req_qty = int(t.get("broker_requested_qty") or 0)
+        fill_qty = int(t.get("broker_fill_qty") or 0)
+        if req_qty and fill_qty >= req_qty:
+            continue   # fully filled, just not stamped terminal yet — fill refresh's job
+        ref = t.get("broker_client_ref")
+        try:
+            cancelled = bool(ref) and broker.cancel_order(ref)
+        except Exception as e:
+            logger.warning(f"[broker] cancel-on-close {ref} raised: {e}")
+            cancelled = False
+        if not cancelled:
+            # Unknown at the broker (already terminal there) or lost the race
+            # to a fill — the fill-refresh pass reconciles whichever it was.
+            continue
+        t["broker_status"] = "Cancelled"
+        t["broker_cancel_reason"] = "closed_before_fill"
+        changed = True
+        report["entry_cancels_on_close"] = report.get("entry_cancels_on_close", 0) + 1
+        _record_order(
+            report, event="CANCEL_ON_CLOSE", intent="ENTRY", ticker=t["ticker"],
+            side=_entry_side(t["action"]), order_type="LMT",
+            requested_qty=req_qty or None, filled_qty=fill_qty,
+            model_price=None, limit_price=None, fill_price=None, commission=None,
+            status="Cancelled", ok=True, error=None,
+            order_id=t.get("broker_order_id"), client_ref=ref, submitted_at=None,
+        )
+        logger.info(
+            f"[broker] trade {t['ticker']} closed with its entry still working "
+            f"({fill_qty}/{req_qty} filled) — entry order cancelled"
+        )
+    return changed
+
+
 def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
          run_id: Optional[str] = None) -> dict:
     """Reconcile the broker against the internal ledger. Returns a report dict.
@@ -291,13 +639,39 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         # ── FILL REFRESH: repair orders that completed after a previous tick ──
         changed = _refresh_fills(broker, trades, report) or changed
 
-        use_limit = settings.broker_order_type == "LMT"
+        # ── STALE-UNFILLED CANCEL: re-anchor orders resting past the age cap ──
+        changed = _cancel_stale_unfilled(broker, trades, report) or changed
+
+        # ── DRIFT PREVENTION: cancel working entries behind CLOSED trades ──
+        changed = _cancel_entries_for_closed(broker, trades, report) or changed
+
+        # Extended-session submissions: IBKR rejects MKT outside regular hours,
+        # so off-RTH ticks force a marketable LMT (model price ± cap) flagged
+        # outsideRth. An order submitted overnight rests until the 04:00
+        # pre-market open — consistent with the tracker snapping the fill
+        # timestamp to the next tradeable moment. RTH keeps the configured type.
+        from src.performance.market_calendar import current_session
+        outside_rth = current_session() != "rth"
+        use_limit = settings.broker_order_type == "LMT" or outside_rth
+        order_type = "LMT" if use_limit else "MKT"
+        if outside_rth:
+            logger.info(
+                "[broker] off-RTH tick — orders submitted as marketable LMT "
+                f"(cap {settings.broker_limit_cap_bps:g} bp) with outsideRth=True"
+            )
 
         # ── ENTRIES: OPEN trades not yet sent to the broker ──────────────
         for t in open_trades:
             if t.get("broker_order_id"):
                 continue  # idempotent — already submitted
             price = float(t.get("entry_price") or t.get("current_price") or 0.0)
+            resubmit_n = int(t.get("broker_resubmit_n") or 0)
+            if resubmit_n and t.get("current_price"):
+                # Stale-cancelled leg: re-anchor at the latest mark (refreshed
+                # by update_open_trades this tick) so the capped LMT follows
+                # the market in bounded steps instead of resting at the old
+                # entry price forever.
+                price = float(t["current_price"])
             mult = t.get("position_size_multiplier", 1.0)
             if settings.broker_sizing_mode == "equity_pct":
                 qty = shares_for(equity_usd, price, mult)
@@ -315,17 +689,20 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 continue
             side = _entry_side(t["action"])
             limit = _limit_price_for(side, price) if use_limit else None
-            res = broker.submit_order(OrderRequest(
+            ref = t.get("recommendation_id") or f"{t.get('run_id', '')}-{t['ticker']}"
+            if resubmit_n:
+                ref = f"{ref}-r{resubmit_n}"   # fresh ref per resubmission cycle
+            res = _submit_with_retry(broker, OrderRequest(
                 ticker=t["ticker"], side=side, quantity=qty,
-                order_type=settings.broker_order_type, limit_price=limit,
-                client_ref=t.get("recommendation_id") or f"{t.get('run_id', '')}-{t['ticker']}",
-                intent="ENTRY",
-            ))
+                order_type=order_type, limit_price=limit,
+                client_ref=ref,
+                intent="ENTRY", outside_rth=outside_rth,
+            ), model_price=price, report=report, intent="ENTRY")
             _apply_entry_result(t, res)
             changed = True
             _record_order(
                 report, event="SUBMIT", intent="ENTRY", ticker=t["ticker"], side=side,
-                order_type=settings.broker_order_type, requested_qty=qty,
+                order_type=order_type, requested_qty=qty,
                 filled_qty=res.filled_qty, model_price=price, limit_price=limit,
                 fill_price=res.avg_fill_price, commission=res.commission,
                 status=res.status, ok=res.ok, error=res.error,
@@ -343,29 +720,64 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 report["errors"].append(f"entry {t['ticker']}: {res.error}")
 
         # ── EXITS: CLOSED trades that still hold a broker position ────────
+        exited_this_tick: set = set()
         for t in closed_trades:
             if not t.get("broker_order_id") or t.get("broker_exit_order_id"):
                 continue  # never entered via broker, or already exited
+            # Size from what the broker ACTUALLY holds when the positions
+            # feed has a row: a recorded fill count that lagged (partial
+            # known at exit time, the rest discovered later by fill refresh)
+            # would otherwise leave a residual position with no open trade
+            # behind it. The goal after a ledger close is a FLAT broker book
+            # in that ticker. Sign-checked: a holding OPPOSITE to the trade's
+            # direction is never blind-traded (the drift pass handles it).
+            # No position row at all → fall back to the recorded fill qty so
+            # a confirmed entry is always covered even when the feed lags; a
+            # stale record at worst leaves a residue the drift pass flattens.
             held = positions.get(t["ticker"])
-            qty = int(t.get("broker_fill_qty") or (abs(held.quantity) if held else 0))
+            expected_sign = 1 if t["action"] == "BUY" else -1
+            if held is None:
+                qty = int(t.get("broker_fill_qty") or 0)
+            elif held.quantity == 0:
+                qty = 0
+            elif held.quantity * expected_sign < 0:
+                logger.warning(
+                    f"[broker] exit {t['ticker']}: held qty {held.quantity} has the "
+                    f"WRONG SIGN for a closed {t['action']} — not trading it blind "
+                    "(drift pass will handle the position)"
+                )
+                qty = 0
+            else:
+                qty = int(abs(held.quantity))
             if qty <= 0:
                 t["broker_exit_status"] = "NOTHING_TO_CLOSE"
                 changed = True
                 continue
             side = _exit_side(t["action"])
             model = float(t.get("exit_price") or t.get("current_price") or 0.0)
+            exit_resubmit_n = int(t.get("broker_exit_resubmit_n") or 0)
+            if exit_resubmit_n:
+                # Stale-cancelled exit: the sim's exit_price is frozen, so
+                # re-anchor at a fresh live quote (the position MUST flatten;
+                # each cycle's cap then tracks the current market).
+                live = _live_price(t["ticker"])
+                if live:
+                    model = live
             limit = _limit_price_for(side, model) if use_limit else None
-            res = broker.submit_order(OrderRequest(
+            ref = (t.get("recommendation_id") or t["ticker"]) + "-exit"
+            if exit_resubmit_n:
+                ref = f"{ref}-r{exit_resubmit_n}"
+            res = _submit_with_retry(broker, OrderRequest(
                 ticker=t["ticker"], side=side, quantity=qty,
-                order_type=settings.broker_order_type, limit_price=limit,
-                client_ref=(t.get("recommendation_id") or t["ticker"]) + "-exit",
-                intent="EXIT",
-            ))
+                order_type=order_type, limit_price=limit,
+                client_ref=ref,
+                intent="EXIT", outside_rth=outside_rth,
+            ), model_price=model, report=report, intent="EXIT")
             _apply_exit_result(t, res)
             changed = True
             _record_order(
                 report, event="SUBMIT", intent="EXIT", ticker=t["ticker"], side=side,
-                order_type=settings.broker_order_type, requested_qty=qty,
+                order_type=order_type, requested_qty=qty,
                 filled_qty=res.filled_qty, model_price=model, limit_price=limit,
                 fill_price=res.avg_fill_price, commission=res.commission,
                 status=res.status, ok=res.ok, error=res.error,
@@ -374,17 +786,48 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             )
             if res.ok:
                 report["exits_submitted"] += 1
+                exited_this_tick.add(t["ticker"])
                 _record_slippage(report, "EXIT", t["ticker"], side,
                                  model, res.avg_fill_price, res.commission)
             else:
                 report["rejects"] += 1
                 report["errors"].append(f"exit {t['ticker']}: {res.error}")
 
-        # ── DRIFT: broker positions with no matching internal OPEN trade ──
+        # ── DRIFT: broker positions the ledger cannot explain ─────────────
+        # Exemptions (not drift, just close latency): an OPEN trade owns the
+        # position; a CLOSED trade's exit order is still working; or the exit
+        # was submitted within THIS tick (the positions snapshot above
+        # predates it, so the position legitimately still appears there).
         open_tickers = {t["ticker"] for t in open_trades}
+        pending_exit_tickers = {
+            t["ticker"] for t in closed_trades
+            if t.get("broker_exit_order_id")
+            and (t.get("broker_exit_status") or "") not in _TERMINAL_STATUSES
+        }
+        drift_action = (settings.broker_drift_action or "report").lower()
+        if drift_action == "flatten" and settings.broker_mode == "ibkr_live":
+            logger.warning(
+                "[broker] broker_drift_action=flatten is refused in ibkr_live — "
+                "auto-selling unexpected REAL positions is a human decision; "
+                "downgrading to report-only"
+            )
+            drift_action = "report"
+
         for tk, p in positions.items():
-            if p.quantity != 0 and tk not in open_tickers:
-                report["drift"].append({"ticker": tk, "broker_qty": p.quantity})
+            if (p.quantity == 0 or tk in open_tickers
+                    or tk in pending_exit_tickers or tk in exited_this_tick):
+                continue
+            entry = {"ticker": tk, "broker_qty": p.quantity, "action": drift_action}
+            report["drift"].append(entry)
+            if drift_action != "flatten":
+                continue
+            res = _flatten_orphan(broker, tk, p.quantity, outside_rth,
+                                  report, run_id)
+            if res is not None and res.ok:
+                report["drift_flattened"] += 1
+                entry["action"] = "flatten_submitted"
+            else:
+                entry["action"] = "flatten_failed"
 
         if changed:
             repo.save_trades(trades)

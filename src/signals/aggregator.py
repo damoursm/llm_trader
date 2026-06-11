@@ -59,6 +59,7 @@ from src.signals.money_flow import compute_money_flow_score
 from src.signals.trend_strength import compute_trend_strength_score
 from src.signals.iv_rank import compute_iv_rank_score
 from src.signals.iv_expr import compute_iv_expr_score
+from src.signals.extended_session import compute_extended_gap_score
 
 
 # ── Smart-money signal direction + strength ──────────────────────────────────
@@ -94,7 +95,30 @@ _BASE_WEIGHTS = {
     "iv_rank":    0.13,   # IV Rank + directional: regime-aware contrarian / trend bias from RV percentile
     "iv_expr":    0.12,   # IV Expression: stock-vs-options bias from real chain IV + oi_skew
     "coint":      0.12,   # Cointegration pairs: per-ticker lean from stat-arb spread z-scores
+    "ext_gap":    0.15,   # Extended-session gap momentum: live off-hours print vs last close / ATR
 }
+
+# Extended-session weight overlay (runs outside RTH). Options chains close at
+# the end of the regular session, so every options-derived method reads
+# YESTERDAY'S positioning during a pre/after-market tick — informative context
+# but not live confirmation → scaled down. News flow (and its velocity) plus
+# the extended gap are the genuinely live information off-hours → scaled up.
+_EXTENDED_STALE_METHODS = ("put_call", "max_pain", "oi_skew", "iv_expr")
+_EXTENDED_FRESH_METHODS = ("news", "sent_velocity", "ext_gap")
+
+
+def _extended_session_weight_overlay(profile: dict) -> dict:
+    """Scale a weight profile for an extended/overnight run (see above)."""
+    stale_mult = float(settings.extended_stale_options_weight_mult)
+    fresh_mult = float(settings.extended_news_weight_mult)
+    out = dict(profile)
+    for m in _EXTENDED_STALE_METHODS:
+        if m in out:
+            out[m] = out[m] * stale_mult
+    for m in _EXTENDED_FRESH_METHODS:
+        if m in out:
+            out[m] = out[m] * fresh_mult
+    return out
 
 # Put/call contrarian score mapping
 _PC_SIGNAL_SCORE = {
@@ -756,8 +780,16 @@ def build_signals(
     opex_context=None,        # Optional[OpExContext]
     pead_context=None,        # Optional[PEADContext]
     coint_context=None,       # Optional[CointPairsContext]
+    snapshots=None,           # Optional[List[TickerSnapshot]] — live prices for ext_gap
+    session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
 ) -> List[TickerSignal]:
-    """Build a TickerSignal for each ticker using all enabled methods."""
+    """Build a TickerSignal for each ticker using all enabled methods.
+
+    ``session`` activates the extended-hours profile: the stale-options /
+    fresh-news weight overlay plus the ext_gap scorer (which needs the live
+    snapshot prices in ``snapshots``). ``None`` behaves exactly like "rth" so
+    every pre-extended-hours caller is bit-identical.
+    """
 
     use_news      = settings.enable_news_sentiment
     # Sentiment velocity reuses article timestamps; no live fetch / LLM call required.
@@ -795,6 +827,13 @@ def build_signals(
     use_iv_expr    = settings.enable_iv_expr and gex_context is not None
     # Cointegration reads per-ticker directional leans from a precomputed pairs context.
     use_coint      = settings.enable_cointegration and coint_context is not None
+    # Extended-session gap: only meaningful outside RTH with a live snapshot price.
+    is_extended    = session is not None and session != "rth"
+    use_ext_gap    = settings.enable_extended_gap and is_extended and snapshots is not None
+    snap_price_by_ticker = (
+        {s.ticker: float(s.price) for s in (snapshots or []) if getattr(s, "price", None)}
+        if use_ext_gap else {}
+    )
 
     if not use_news and not use_tech and not use_insider and not use_put_call:
         logger.warning("All analysis methods disabled — no signals will be generated.")
@@ -834,6 +873,18 @@ def build_signals(
             + (" [TRIPLE WITCHING]" if opex_context.is_triple_witching else "")
         )
 
+    # Extended-session overlay LAST so the staleness scaling applies to
+    # whatever each options weight ended up as (mode profile, adaptivity, and
+    # the OpEx boost all describe RTH dynamics — pinning happens in the
+    # regular session, not in a 4 AM pre-market book).
+    if is_extended:
+        weight_profile = _extended_session_weight_overlay(dict(weight_profile or _BASE_WEIGHTS))
+        logger.info(
+            f"[extended] {session} session weight overlay: options-derived ×"
+            f"{settings.extended_stale_options_weight_mult:g} (stale since RTH close), "
+            f"news/velocity/gap ×{settings.extended_news_weight_mult:g}"
+        )
+
     active_flags = {
         "news":       use_news,
         "sent_velocity": use_sent_velocity,
@@ -852,6 +903,7 @@ def build_signals(
         "iv_rank":    use_iv_rank,
         "iv_expr":    use_iv_expr,
         "coint":      use_coint,
+        "ext_gap":    use_ext_gap,
     }
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     active_count = sum(active_flags.values())
@@ -867,7 +919,7 @@ def build_signals(
         f"sector_mom={weights['sector_momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
         f"trend={weights['trend_strength']:.0%}  "
         f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
-        f"coint={weights['coint']:.0%}"
+        f"coint={weights['coint']:.0%}  ext_gap={weights['ext_gap']:.0%}"
     )
 
     signals        = []
@@ -1054,6 +1106,17 @@ def build_signals(
         if use_coint:
             coint_score_v = _coint_score_for(ticker, coint_context)
 
+        # ── Method 15: Extended-session gap momentum (off-hours only) ────
+        # Live extended print vs last completed close in ATR units: the
+        # pre-market gap forming in real time / the after-hours reaction to a
+        # just-released catalyst. Always 0.0 during RTH runs.
+        ext_gap_score_v = 0.0
+        ext_gap_pct_v   = 0.0
+        if use_ext_gap:
+            ext_gap_score_v, ext_gap_pct_v = compute_extended_gap_score(
+                ticker, snap_price_by_ticker.get(ticker), session=session,
+            )
+
         # ── Weighted combination ──────────────────────────────────────────
         combined = (
             weights["news"]       * sentiment_score +
@@ -1072,7 +1135,8 @@ def build_signals(
             weights["pead"]       * pead_score_v +
             weights["iv_rank"]    * iv_rank_score_v +
             weights["iv_expr"]    * iv_expr_score_v +
-            weights["coint"]      * coint_score_v
+            weights["coint"]      * coint_score_v +
+            weights["ext_gap"]    * ext_gap_score_v
         )
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -1112,6 +1176,7 @@ def build_signals(
             (use_iv_rank,    iv_rank_score_v),
             (use_iv_expr,    iv_expr_score_v),
             (use_coint,      coint_score_v),
+            (use_ext_gap,    ext_gap_score_v),
         ]
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
 
@@ -1205,6 +1270,8 @@ def build_signals(
             iv_expr_oi_skew=round(iv_expr_skew_v, 3),
             iv_expr_label=iv_expr_label_v,
             coint_score=round(coint_score_v, 3),
+            ext_gap_score=round(ext_gap_score_v, 3),
+            ext_gap_pct=round(ext_gap_pct_v, 2),
         ))
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
@@ -1227,13 +1294,14 @@ def build_signals(
         ivr_str  = f"  ivr={iv_rank_score_v:+.2f}(ir={iv_rank_v:.0f},{iv_rank_label_v})" if iv_rank_score_v != 0.0 else ""
         ivx_str  = f"  ivx={iv_expr_score_v:+.2f}(ir={iv_expr_rank_v:.0f},{iv_expr_label_v})" if iv_expr_score_v != 0.0 else ""
         coint_str = f"  coint={coint_score_v:+.2f}" if coint_score_v != 0.0 else ""
+        gap_str  = f"  gap={ext_gap_score_v:+.2f}({ext_gap_pct_v:+.1f}%)" if ext_gap_score_v != 0.0 else ""
         cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
         persist_str = f"  PERSIST({persist_count}×)" if persist_detected else ""
         sv_str      = f"  sv={sent_velocity_score:+.2f}" if sent_velocity_score != 0.0 else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

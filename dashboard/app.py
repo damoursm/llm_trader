@@ -161,6 +161,7 @@ _TRADE_COL_SPEC = [
     ("action", "Action", None, "BUY (long) or SELL (short) — how the position was opened."),
     ("direction", "Direction", None, "BULLISH (long) or BEARISH (short)."),
     ("entry_dt", "Entry (ET)", None, "When the position was opened, in US/Eastern time."),
+    ("session", "Session", None, "US-market session the position was ENTERED in: rth (09:30–16:00 ET), extended (pre-market 04:00–09:30 + after-hours 16:00–20:00), or overnight (20:00–04:00). Extended entries are sized down and bear the wider extended spread in their return."),
     ("entry_price", "Entry $", _NUM2, "Fill price at entry (the bid-ask spread is applied in the return, not here)."),
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
     ("exit_price", "Exit $", _NUM2, "Fill price at exit. Blank while the position is open."),
@@ -171,10 +172,10 @@ _TRADE_COL_SPEC = [
 
 # Method Performance table — header explanations (table is built inline below).
 _METHOD_HEADER_TIPS = {
-    "Method": "The signal method (e.g. news sentiment, technical, momentum).",
-    "Win rate %": "Solo simulation: for each closed trade, what if ONLY this method had decided the direction? This is the share it would have won.",
-    "Trades": "How many closed trades this method had a view on (|score| ≥ 0.10).",
-    "Avg return %": "Average % return of those solo-simulated trades.",
+    "Method": "The signal method (e.g. news sentiment, technical, momentum) — or an LLM engine row: 'Synthesis LLM' made the final BUY/SELL call, 'Sentiment LLM' scored the per-ticker news (run-dominant engine).",
+    "Win rate %": "Method rows — solo simulation: for each closed trade, what if ONLY this method had decided the direction? LLM rows — share of the engine's recommended trades (executed or not) currently positive.",
+    "Trades": "Method rows: closed trades this method had a view on (|score| ≥ 0.10). LLM rows: every BUY/SELL the engine recommended — actionable or not, executed or simulated — deduped to its last call per ticker per day.",
+    "Avg return %": "Average % return across those trades.",
 }
 
 
@@ -435,12 +436,13 @@ _SESSION_OPTIONS = [
 
 def _session_toggle(component_id: str) -> html.Div:
     """RTH / extended-hours / overnight selector. Filters the tab's metrics and
-    plots to trades ENTERED in that US-market session. The scheduler currently
-    trades RTH only, so Extended/Overnight are empty until you trade those."""
+    plots to trades ENTERED in that US-market session. Extended-hours trading
+    is live (Phase 1): the scheduler trades 04:00–20:00 ET, so RTH and
+    Extended populate side by side for comparison."""
     return html.Div(
         [
             html.Label("Session:  ",
-                       title="Filter to trades entered during Regular hours (09:30–16:00 ET), Extended hours (pre-market 04:00–09:30 + after-hours 16:00–20:00), or Overnight (20:00–04:00). The bot currently trades RTH only, so the other two are empty.",
+                       title="Filter to trades entered during Regular hours (09:30–16:00 ET), Extended hours (pre-market 04:00–09:30 + after-hours 16:00–20:00), or Overnight (20:00–04:00). The bot trades RTH and Extended; Overnight entries only occur from manual off-schedule runs (snapped to the next session).",
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
             dcc.RadioItems(
                 id=component_id, options=_SESSION_OPTIONS, value="all", inline=True,
@@ -507,17 +509,38 @@ def _methods_perf_section(window_days, session=None):
             "Avg return %": round(overall["avg_return"], 2) if overall.get("avg_return") is not None else None,
         })
 
+    # Per-LLM rows — EVERY trade each engine recommended (executed or not):
+    # one pseudo-trade per (engine, ticker, day), entered at the recorded
+    # recommendation-time price and marked at the latest cached close, so
+    # LLM APIs are compared on their full call stream rather than the few
+    # recommendations that survived the trading gates.
+    llm = perf.get("llm_perf") or {}
+    for role, label in (("synthesis", "Synthesis LLM"), ("sentiment", "Sentiment LLM")):
+        by_model = llm.get(role) or {}
+        for model, st in sorted(by_model.items(), key=lambda kv: -(kv[1].get("trades") or 0)):
+            rows.append({
+                "Method": f"{label} · {model}",
+                "Win rate %": st.get("win_rate"),
+                "Trades": st.get("trades"),
+                "Avg return %": st.get("avg_return"),
+            })
+
     table = dash_table.DataTable(
         data=rows,
         columns=[{"name": c, "id": c} for c in ["Method", "Win rate %", "Trades", "Avg return %"]],
         tooltip_header=_METHOD_HEADER_TIPS,
+        style_data_conditional=[
+            {"if": {"filter_query": '{Method} contains "LLM"'}, "backgroundColor": "#eef2ff"},
+        ],
         **_TABLE_KW,
     ) if rows else html.Div("No per-method stats in this window yet.", style={"color": "#6b7280"})
 
     return html.Div([
         dcc.Graph(figure=figures.method_winrate_fig(perf)),
-        _h3("Per-method stats (solo simulation)",
-            "How each signal method would have performed on its own. 'Solo simulation' = for each closed trade, ask what the result would be if only this method had decided the direction. Hover the column headers for details."),
+        _h3("Model evaluation — signal methods (solo simulation) & LLM engines",
+            "Method rows: how each signal method would have performed deciding alone (each closed trade re-simulated as if only that method set the direction). "
+            "Highlighted LLM rows: every BUY/SELL the engine recommended — executed or simulated — entered at the recommendation-time price, marked at the latest close, "
+            "deduped to the engine's last call per ticker per day. The 50/50 A/B routing flip gives each engine its own runs to be judged on. Hover the column headers for details."),
         table,
     ])
 
@@ -532,6 +555,10 @@ def _trades_table(trades: list):
     # date-only field for any legacy row missing the full datetime.
     df["entry_dt"] = [_fmt_et(t.get("entry_datetime")) or (t.get("entry_date") or "") for t in trades]
     df["exit_dt"] = [_fmt_et(t.get("exit_datetime")) or (t.get("exit_date") or "") for t in trades]
+    # Entry session (rth / extended / overnight). Stamped on new trades;
+    # derived from entry_datetime for legacy rows (date-only → rth).
+    from src.performance.tracker import _trade_session
+    df["session"] = [t.get("entry_session") or _trade_session(t) for t in trades]
     spec = [t for t in _TRADE_COL_SPEC if t[0] in df.columns]
     df = df[[s[0] for s in spec]]
     return dash_table.DataTable(

@@ -37,6 +37,7 @@ SIGNAL_METHOD_COLUMNS = (
     "news", "sent_velocity", "tech", "insider", "put_call", "max_pain",
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow",
     "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
+    "ext_gap",
 )
 
 SCHEMA_STATEMENTS = [

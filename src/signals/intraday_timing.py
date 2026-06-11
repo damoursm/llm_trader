@@ -24,6 +24,7 @@ import yfinance as yf
 from loguru import logger
 
 from config import settings
+from src.performance.market_calendar import current_session
 
 _INTERVAL = "30m"
 _PERIOD = "5d"     # ~65 thirty-min bars — enough for the slow EMA + recent context
@@ -37,11 +38,18 @@ def compute_intraday_timing(ticker: str) -> Optional[dict]:
 
     ``{"score": float[-1,1], "classification": RISING|FALLING|FLAT,
        "last_price": float, "ret_30m": pct}``.
+
+    Outside RTH the bars are fetched with ``prepost=True`` so the momentum
+    read reflects the live extended session instead of freezing at the last
+    regular-session bar (a 4 AM entry gate reading 16:00 yesterday's momentum
+    would be meaningless). During RTH the fetch is unchanged — regular bars
+    only — so RTH behavior is bit-identical to before.
     """
     if not settings.enable_fetch_data:
         return None
     try:
-        df = yf.Ticker(ticker).history(period=_PERIOD, interval=_INTERVAL)
+        prepost = current_session() != "rth"
+        df = yf.Ticker(ticker).history(period=_PERIOD, interval=_INTERVAL, prepost=prepost)
     except Exception as e:
         logger.debug(f"[intraday] fetch failed for {ticker}: {e}")
         return None

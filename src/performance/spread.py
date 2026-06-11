@@ -36,8 +36,27 @@ from __future__ import annotations
 from config.settings import settings
 
 
-def _dynamic_half_spread(price: float, asset_type: str = "STOCK") -> float:
+def _session_spread_multiplier(session) -> float:
+    """Half-spread multiplier for the trading session a price was struck in.
+
+    RTH (or unspecified — every pre-extended-hours record) → 1.0, so all
+    historical numbers are bit-identical. Extended/overnight multipliers are
+    deliberate over-estimates to be calibrated against IBKR paper fills later,
+    same plan as ``commission_buffer``. Commission is session-independent —
+    only the spread term widens off-hours.
+    """
+    if session == "extended":
+        return float(settings.spread_extended_multiplier)
+    if session == "overnight":
+        return float(settings.spread_overnight_multiplier)
+    return 1.0
+
+
+def _dynamic_half_spread(price: float, asset_type: str = "STOCK", session=None) -> float:
     """One-way bid-ask half-spread as a fraction (NOT percent).
+
+    ``session`` ("rth" | "extended" | "overnight" | None=rth) scales the tier
+    via ``_session_spread_multiplier`` — books are thinner outside RTH.
 
     Tiers (May 2026 calibration):
 
@@ -63,24 +82,27 @@ def _dynamic_half_spread(price: float, asset_type: str = "STOCK") -> float:
     """
     if price is None or price <= 0:
         return 0.0
+    mult = _session_spread_multiplier(session)
     if asset_type == "ETF":
-        return 0.00015 if price >= 100 else 0.00025
+        return (0.00015 if price >= 100 else 0.00025) * mult
     if asset_type == "COMMODITY":
-        return 0.00025 if price >= 100 else 0.0005
+        return (0.00025 if price >= 100 else 0.0005) * mult
     # STOCK — price-tiered (1 bp = 0.0001)
     if price >= 100:
-        return 0.0003
-    if price >= 50:
-        return 0.0004
-    if price >= 10:
-        return 0.0008
-    if price >= 1:
-        return 0.0025
-    if price >= 0.10:
-        return 0.0075
-    if price >= 0.01:
-        return 0.0250
-    return 0.0500
+        base = 0.0003
+    elif price >= 50:
+        base = 0.0004
+    elif price >= 10:
+        base = 0.0008
+    elif price >= 1:
+        base = 0.0025
+    elif price >= 0.10:
+        base = 0.0075
+    elif price >= 0.01:
+        base = 0.0250
+    else:
+        base = 0.0500
+    return base * mult
 
 
 def _commission_fraction(price: float) -> float:
@@ -130,18 +152,20 @@ def _commission_fraction(price: float) -> float:
     return fee / notional
 
 
-def _one_side_cost(price: float, asset_type: str = "STOCK") -> float:
+def _one_side_cost(price: float, asset_type: str = "STOCK", session=None) -> float:
     """Total one-way transaction cost as a fraction: half-spread + commission.
 
     The single cost figure both return engines apply to entry/exit prices —
     ``_pct_return`` here and the daily-NAV walk's anchor marks in
     ``daily_nav.py`` — so the per-trade buy-and-hold return and the
-    path-faithful daily compound charge identical costs.
+    path-faithful daily compound charge identical costs. ``session`` widens
+    the spread term outside RTH (commission is session-independent).
     """
-    return _dynamic_half_spread(price, asset_type) + _commission_fraction(price)
+    return _dynamic_half_spread(price, asset_type, session) + _commission_fraction(price)
 
 
-def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK") -> float:
+def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK",
+                entry_session=None, exit_session=None) -> float:
     """Percent return, sign-aware, with round-trip half-spread + commission.
 
     BUY  : paid the ask at entry (+cost), receive the bid at exit (−cost).
@@ -149,7 +173,8 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
     Each leg's cost (half-spread + commission, see ``_one_side_cost``) is
     evaluated against its own price (entry and current independently), so a
     position that crosses a price tier naturally picks up the wider/narrower
-    spread on each leg.
+    spread on each leg. Per-leg sessions widen the spread for a leg struck
+    outside RTH (None = rth — every pre-extended-hours record).
 
     Returns ``0.0`` for non-positive prices — the round-trip is undefined
     there.  Callers refuse to trade at such prices; this guard exists to
@@ -157,8 +182,8 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
     """
     if entry is None or current is None or entry <= 0 or current <= 0:
         return 0.0
-    entry_cost = _one_side_cost(entry, asset_type)
-    exit_cost  = _one_side_cost(current, asset_type)
+    entry_cost = _one_side_cost(entry, asset_type, entry_session)
+    exit_cost  = _one_side_cost(current, asset_type, exit_session)
     if action == "BUY":
         effective_entry = entry   * (1 + entry_cost)
         effective_exit  = current * (1 - exit_cost)

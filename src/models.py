@@ -1153,6 +1153,13 @@ class TickerSignal(BaseModel):
     # Net directional lean derived from the ticker's role (cheap/long vs expensive/short)
     # across all cointegrated pairs it belongs to, weighted by spread z-score extremity.
     coint_score: float = 0.0
+    # Extended-session gap momentum — populated when enable_extended_gap=true
+    # AND the run executes outside RTH (always 0.0 during the regular session,
+    # where the open gap is already captured by the technical stack).
+    # Live extended print vs last completed daily close, in the ticker's own
+    # ATR units: pre-market gap-and-go / after-hours catalyst reaction.
+    ext_gap_score: float = 0.0   # [-1, +1] tanh(gap_atr / scale), deadbanded
+    ext_gap_pct: float = 0.0     # raw extended-session move vs reference close (%)
 
 
 class Recommendation(BaseModel):

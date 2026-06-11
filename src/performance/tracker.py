@@ -170,15 +170,19 @@ def _now_iso() -> str:
 def _execution_iso() -> str:
     """Return the next realistic execution instant (ISO 8601 UTC).
 
-    Pipeline runs at 8 AM ET, but the equity market doesn't open until 9:30
-    AM ET — so the "8:00:23 AM at \\$77.03" audit line was misleading, no
-    fill could have happened then.  This helper snaps the timestamp forward
-    to the next NYSE session open (today's 9:30 AM ET if before, the next
-    trading day's open if after-close or on a weekend/holiday).  Used as
-    ``entry_datetime`` / ``exit_datetime`` so the recorded execution time
-    actually corresponds to a tradeable moment.
+    RTH: now (a fill can happen immediately). Extended sessions when
+    ``extended_hours_mode="trade"``: also now — extended fills are real fills
+    (the broker leg submits marketable LMT + outsideRth orders, and the cost
+    model charges the wider extended spread on that leg). Everything else
+    (overnight, weekends/holidays, or extended hours while NOT in trade mode)
+    snaps forward to the next NYSE regular-session open, so the recorded
+    execution time always corresponds to a moment the system could actually
+    have traded.
     """
-    from src.performance.market_calendar import effective_execution_iso
+    from src.performance.market_calendar import current_session, effective_execution_iso
+    if ((settings.extended_hours_mode or "").lower() == "trade"
+            and current_session() == "extended"):
+        return _now_iso()
     return effective_execution_iso()
 
 
@@ -275,13 +279,13 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
 METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Sentiment":   ["news", "sent_velocity"],
-    "Technical":   ["tech", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "iv_rank"],
+    "Technical":   ["tech", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap"],
     "Smart Money": ["insider"],
     "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr"],
     "Fundamental": ["pead"],
@@ -308,6 +312,7 @@ METHOD_LABELS: Dict[str, str] = {
     "iv_expr":    "IV Expression (Options Chain)",
     "coint":      "Cointegration Pairs",
     "cross_sectional": "Cross-Sectional Ranking",
+    "ext_gap":    "Extended-Session Gap",
 }
 
 
@@ -338,6 +343,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "iv_expr":    getattr(sig, "iv_expr_score", 0.0),
         "coint":      getattr(sig, "coint_score", 0.0),
         "cross_sectional": getattr(sig, "cross_sectional_score", 0.0),
+        "ext_gap":    getattr(sig, "ext_gap_score", 0.0),
     }
 
 
@@ -403,6 +409,227 @@ def _compute_segment_stats(trades: List[dict]) -> Optional[dict]:
     }
 
 
+# ── Per-LLM performance attribution ──────────────────────────────────────────
+# New trades are stamped with the exact engine ids at entry (record_new_trades);
+# legacy trades fall back to their run's recorded provider, resolved to a model
+# id through the mappings below (and frozen onto the trade once by
+# scripts/backfill_trade_llms.py, so a later ANALYST_MODEL change can't
+# relabel history).
+
+def _llm_run_map() -> Dict[str, dict]:
+    """run_id → recorded LLM providers, from the runs table ({} when unavailable)."""
+    try:
+        df = repo.fetch_df(
+            "SELECT run_id, llm_synthesis_provider, llm_sentiment_provider FROM runs"
+        )
+    except Exception as e:
+        logger.debug(f"[tracker] llm run map unavailable: {e}")
+        return {}
+    return {
+        str(r["run_id"]): {
+            "synthesis_provider": r["llm_synthesis_provider"],
+            "sentiment_summary":  r["llm_sentiment_provider"],
+        }
+        for _, r in df.iterrows()
+    }
+
+
+def _synthesis_model_for_provider(provider: Optional[str]) -> Optional[str]:
+    """Provider string (runs table) → exact model id, mirroring claude_analyst routing."""
+    p = (provider or "").lower()
+    if p == "anthropic":
+        return settings.analyst_model
+    if p == "deepseek":
+        return "deepseek-v4-flash"
+    if p == "rule-based":
+        return "rule-based (no LLM)"
+    return None
+
+
+def _sentiment_model_for_summary(summary: Optional[str]) -> Optional[str]:
+    """'deepseek×40, anthropic×2' → exact model id of the majority provider."""
+    if not summary:
+        return None
+    from src.analysis.sentiment import SENTIMENT_PROVIDER_MODELS
+    counts: Dict[str, int] = {}
+    for tok in str(summary).split(","):
+        name, sep, cnt = tok.strip().partition("×")
+        key = name.strip().lower()
+        try:
+            counts[key] = int(cnt) if sep else 0
+        except ValueError:
+            counts[key] = 0
+    counted = {k: v for k, v in counts.items() if k in SENTIMENT_PROVIDER_MODELS}
+    if not counted:
+        return None
+    top = max(counted.items(), key=lambda kv: kv[1])[0]
+    return SENTIMENT_PROVIDER_MODELS[top]
+
+
+def _llm_models_for_trade(trade: dict, run_map: Dict[str, dict]) -> tuple:
+    """(synthesis_model, sentiment_model) for a trade — stamped fields first,
+    then the run-record fallback for legacy trades."""
+    synth = trade.get("llm_synthesis_model")
+    sent  = trade.get("llm_sentiment_model")
+    if synth and sent:
+        return synth, sent
+    run = run_map.get(str(trade.get("run_id") or "")) or {}
+    if not synth:
+        synth = _synthesis_model_for_provider(run.get("synthesis_provider"))
+    if not sent:
+        sent = _sentiment_model_for_summary(run.get("sentiment_summary"))
+    return synth, sent
+
+
+def _synthesis_model_for_rec(value: Optional[str]) -> Optional[str]:
+    """``recommendations.llm_provider`` → exact model id.
+
+    Legacy rows stored the provider string ('anthropic' / 'deepseek' /
+    'rule-based'); newer rows persist the exact model id directly.
+    """
+    if not value:
+        return None
+    v = str(value).strip()
+    return _synthesis_model_for_provider(v) or v
+
+
+def _compute_llm_perf(window_days: Optional[int] = None,
+                      session: Optional[str] = None) -> dict:
+    """Per-LLM engine stats over EVERY recommended trade, executed or not.
+
+    The real ledger only holds recommendations that survived the actionable +
+    sizing gates — far too few (and selection-biased) to compare engines. Each
+    engine is therefore scored on its full recommendation stream: every
+    BUY/SELL it produced (actionable or not), deduped to the engine's LAST
+    call per (ticker, day) — mirroring the signal panel's last-run-per-day
+    rule so a signal persisting across intraday runs isn't multi-counted.
+    Each call becomes a pseudo-trade anchored at the snapshot price recorded
+    at recommendation time (signals table; legacy recs fall back to the
+    rec-day cached close) and marked at the latest cached close, through the
+    same entry/exit cost model as real trades — so a brand-new call starts
+    slightly negative by the round-trip cost, exactly like a real position.
+
+    Returns ``{"synthesis": {model: stats}, "sentiment": {model: stats}}`` —
+    synthesis = the final BUY/SELL caller, sentiment = the run-dominant
+    per-ticker news scorer (attributed via the run record).
+    """
+    try:
+        df = repo.fetch_df(
+            "SELECT r.run_id, r.generated_at, r.ticker, r.type, r.action, "
+            "       r.llm_provider, s.price AS snap_price "
+            "FROM recommendations r "
+            "LEFT JOIN signals s ON s.run_id = r.run_id AND s.ticker = r.ticker "
+            "WHERE r.action IN ('BUY', 'SELL') "
+            "ORDER BY r.generated_at"
+        )
+    except Exception as e:
+        logger.debug(f"[tracker] llm_perf recommendations query failed: {e}")
+        return {}
+    if df.empty:
+        return {}
+
+    run_map = _llm_run_map()
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat() if window_days is not None else None
+
+    # Dedup: the engine's last BUY/SELL call per (ticker, day) wins (rows are
+    # ordered by generated_at, so later calls overwrite earlier ones).
+    deduped: Dict[tuple, dict] = {}
+    for rec in df.itertuples(index=False):
+        gen = str(rec.generated_at or "")
+        entry_date = gen[:10]
+        if not entry_date or (cutoff and entry_date < cutoff):
+            continue
+        run = run_map.get(str(rec.run_id or "")) or {}
+        synth = (_synthesis_model_for_rec(rec.llm_provider)
+                 or _synthesis_model_for_provider(run.get("synthesis_provider")))
+        sent = _sentiment_model_for_summary(run.get("sentiment_summary"))
+        if not synth and not sent:
+            continue
+        deduped[(entry_date, rec.ticker, synth)] = {
+            "ticker": rec.ticker,
+            "type": rec.type or "STOCK",
+            "action": rec.action,
+            "entry_date": entry_date,
+            "entry_datetime": gen,
+            "snap_price": rec.snap_price,
+            "synth": synth,
+            "sent": sent,
+        }
+
+    from src.data.cache import load_ohlcv
+
+    bars_memo: Dict[str, object] = {}
+
+    def _bars(ticker: str):
+        if ticker not in bars_memo:
+            try:
+                b = load_ohlcv(ticker)
+                bars_memo[ticker] = None if (b is None or b.empty or "Close" not in b.columns) else b
+            except Exception:
+                bars_memo[ticker] = None
+        return bars_memo[ticker]
+
+    pseudo: List[dict] = []
+    for row in deduped.values():
+        row_session = _trade_session(row)
+        if session and row_session != session:
+            continue
+        bars = _bars(row["ticker"])
+        if bars is None:
+            continue
+        # Entry anchor: recommendation-time snapshot price, else that day's close.
+        try:
+            entry_price = float(row["snap_price"])
+        except (TypeError, ValueError):
+            entry_price = None
+        if entry_price is not None and not entry_price > 0:   # also catches NaN
+            entry_price = None
+        if entry_price is None:
+            day = [float(c) for d, c in zip(bars.index, bars["Close"])
+                   if d.date().isoformat() == row["entry_date"]]
+            entry_price = day[-1] if day and day[-1] > 0 else None
+        if entry_price is None:
+            continue
+        # End anchor: latest cached close (skip when no bar exists at/after entry yet).
+        last_close = float(bars["Close"].iloc[-1])
+        last_date = bars.index[-1].date().isoformat()
+        if last_close <= 0 or last_date < row["entry_date"]:
+            continue
+        pseudo.append({
+            "ticker": row["ticker"],
+            "type": row["type"],
+            "action": row["action"],
+            "direction": row["action"],     # BUY/SELL — same convention as the hypothetical book
+            "status": "OPEN",
+            "entry_date": row["entry_date"],
+            "entry_datetime": row["entry_datetime"],
+            "entry_price": entry_price,
+            # Entry leg bears that session's spread (extended recs pay the wider
+            # book); the exit anchor is an RTH cached close, so no exit session.
+            "entry_session": row_session,
+            "current_price": last_close,
+            "current_price_datetime": last_date,
+            "exit_date": None,
+            "exit_price": None,
+            "return_pct": round(_pct_return(row["action"], entry_price, last_close, row["type"],
+                                            entry_session=row_session), 3),
+            "position_size_multiplier": 1.0,
+            "llm_synthesis_model": row["synth"],
+            "llm_sentiment_model": row["sent"],
+        })
+
+    groups: Dict[str, Dict[str, List[dict]]] = {"synthesis": {}, "sentiment": {}}
+    for t in pseudo:
+        if t["llm_synthesis_model"]:
+            groups["synthesis"].setdefault(t["llm_synthesis_model"], []).append(t)
+        if t["llm_sentiment_model"]:
+            groups["sentiment"].setdefault(t["llm_sentiment_model"], []).append(t)
+    return {
+        role: {m: s for m, s in ((m, _compute_segment_stats(ts)) for m, ts in by_model.items()) if s}
+        for role, by_model in groups.items()
+    }
+
+
 _ASSET_TYPE_LABELS: Dict[str, str] = {
     "STOCK":     "Stocks only",
     "ETF":       "ETFs only",
@@ -410,11 +637,20 @@ _ASSET_TYPE_LABELS: Dict[str, str] = {
 }
 
 
+_SESSION_LABELS: Dict[str, str] = {
+    "rth":       "Regular hours (RTH) only",
+    "extended":  "Extended hours only",
+    "overnight": "Overnight only",
+}
+
+
 def _compute_performance_table(trades: List[dict]) -> List[dict]:
-    """Build unified breakdown rows: total → asset types → signal methods.
+    """Build unified breakdown rows: total → asset → direction → session → methods.
 
     Accepts both closed and open trades; open trades use their current M2M return_pct
     (maintained by update_open_trades() each run), equivalent to a hypothetical exit.
+    Session rows (entry-session split) appear only once at least one trade was
+    entered outside RTH — before that they would just duplicate "All Trades".
     """
     rows: List[dict] = []
 
@@ -437,6 +673,16 @@ def _compute_performance_table(trades: List[dict]) -> List[dict]:
         stats = _compute_segment_stats(subset)
         if stats:
             rows.append({"label": label, "group": "direction", **stats})
+
+    # Session rows (entry session: RTH / extended / overnight)
+    by_session: Dict[str, List[dict]] = {}
+    for t in trades:
+        by_session.setdefault(_trade_session(t), []).append(t)
+    if set(by_session) - {"rth"}:
+        for sess_key, label in _SESSION_LABELS.items():
+            stats = _compute_segment_stats(by_session.get(sess_key, []))
+            if stats:
+                rows.append({"label": label, "group": "session", **stats})
 
     # Signal-method rows (attribution-enabled trades only)
     attributed = [t for t in trades if t.get("methods_agreeing")]
@@ -706,6 +952,8 @@ def record_new_trades(
     recommendations: List[Recommendation],
     signals_by_ticker: Optional[dict] = None,
     run_id: Optional[str] = None,
+    llm_synthesis_model: Optional[str] = None,
+    llm_sentiment_model: Optional[str] = None,
 ) -> dict:
     """Open a new trade for each BUY/SELL recommendation not already open today.
 
@@ -748,6 +996,7 @@ def record_new_trades(
         "skipped_correlation_cap": 0,
         "skipped_no_price":     0,
         "haircut_applied":      0,   # informational — size reduced, not skipped
+        "extended_haircut_applied": 0,  # entries sized down for an off-RTH fill
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
@@ -787,12 +1036,25 @@ def record_new_trades(
             )
 
         # Capture the exact fetch instant (decision_datetime) AND the
-        # realistic next-session-open (entry_datetime).  The pipeline runs
-        # at 8 AM ET which is BEFORE the equity market opens, so the audit
-        # trail tracks both: when the call was made, and when it could
-        # actually have been filled.
+        # realistic fill instant (entry_datetime) — identical during RTH and
+        # extended-trade ticks, snapped to the next session open otherwise.
         decision_at = _now_iso()
         executed_at = _execution_iso()
+
+        # ── Step 3: extended-session sizing haircut ───────────────────────
+        # Entries filled outside RTH are sized down: the book is thin, the
+        # modeled spread is 4× wider, and the pre-prod goal is to accumulate
+        # evidence at reduced weight until paper fills prove the edge.
+        entry_session = _session_of_iso(executed_at)
+        ext_mult = float(settings.extended_size_multiplier)
+        if entry_session != "rth" and ext_mult < 0.999:
+            multiplier = round(multiplier * ext_mult, 3)
+            diag["extended_haircut_applied"] += 1
+            logger.info(
+                f"[tracker] {rec.ticker}: {entry_session}-session entry — "
+                f"size ×{ext_mult:g} → {multiplier:.2f}×"
+            )
+
         price = _fetch_price(rec.ticker)
         if price is None:
             diag["skipped_no_price"] += 1
@@ -879,6 +1141,8 @@ def record_new_trades(
             "sector_key": sector,
             "entry_date": today,
             "entry_datetime": executed_at,
+            "entry_session": entry_session,
+            "extended_size_multiplier": ext_mult if entry_session != "rth" else 1.0,
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,
@@ -901,6 +1165,10 @@ def record_new_trades(
             "method_scores":    mscores,
             "methods_agreeing": agreed,
             "dominant_method":  dominant,
+            # Exact LLM engines in use at entry (synthesis = final call,
+            # sentiment = run-dominant per-ticker scorer) — per-LLM attribution.
+            "llm_synthesis_model": llm_synthesis_model,
+            "llm_sentiment_model": llm_sentiment_model,
             # Open-position monitoring fields
             "signal_at_entry":  sig_at_entry,
             "max_favorable_excursion":  0.0,
@@ -972,17 +1240,20 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
         else:
             exit_decision_at = _now_iso()
             exit_price       = _fetch_price(trade["ticker"])
-        exit_executed_at = _execution_iso()  # realistic next-session fill time
+        exit_executed_at = _execution_iso()  # realistic fill time (now in RTH/extended-trade)
         if not exit_price or exit_price <= 0:
             logger.warning(f"[tracker] Cannot close {trade['ticker']} on reversal — no/non-positive price")
             continue
 
-        ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"))
+        exit_session = _session_of_iso(exit_executed_at)
+        ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"),
+                          entry_session=trade.get("entry_session"), exit_session=exit_session)
         mul = trade.get("position_size_multiplier", 1.0)
         exit_ref = _reference_close(trade["ticker"])
         trade["status"]                 = "CLOSED"
         trade["exit_date"]              = today
         trade["exit_datetime"]          = exit_executed_at
+        trade["exit_session"]           = exit_session
         trade["exit_decision_datetime"] = exit_decision_at
         trade["exit_price"]             = float(exit_price)
         trade["exit_ref_close"]         = exit_ref["close"] if exit_ref else None
@@ -1141,12 +1412,15 @@ def monitor_open_positions(
                 continue
 
         mul = trade.get("position_size_multiplier", 1.0)
-        ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"))
+        exit_session = _session_of_iso(executed_at)
+        ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"),
+                          entry_session=trade.get("entry_session"), exit_session=exit_session)
         exit_ref = _reference_close(trade["ticker"])
 
         trade["status"]                 = "CLOSED"
         trade["exit_date"]              = today
         trade["exit_datetime"]          = executed_at
+        trade["exit_session"]           = exit_session
         trade["exit_decision_datetime"] = trade.get("current_price_datetime") or decision_at
         trade["exit_price"]             = float(exit_price)
         trade["exit_ref_close"]         = exit_ref["close"] if exit_ref else None
@@ -1206,7 +1480,9 @@ def _normalize_closed_returns(trades: List[dict]) -> int:
         x = t.get("exit_price")
         if e is None or x is None:
             continue
-        ret = round(_pct_return(t.get("action", "BUY"), float(e), float(x), t.get("type", "STOCK")), 3)
+        ret = round(_pct_return(t.get("action", "BUY"), float(e), float(x), t.get("type", "STOCK"),
+                                entry_session=t.get("entry_session"),
+                                exit_session=t.get("exit_session")), 3)
         if abs(ret - t.get("return_pct", 0.0)) > 1e-3:
             t["return_pct"] = ret
             mul = t.get("position_size_multiplier", 1.0)
@@ -1262,6 +1538,11 @@ def update_open_trades() -> None:
     trades = _load_trades()
     today = date.today().isoformat()
     updated = 0
+    # The live M2M is "what if you closed right now" — so the hypothetical
+    # exit leg bears the CURRENT session's spread (an extended-hours mark
+    # charges the wider extended book it would actually cross).
+    from src.performance.market_calendar import current_session
+    mark_session = current_session()
 
     # Keep OHLCV current for every open-trade ticker so the daily-NAV walk
     # has a real close for each day the position was held (no synthetic
@@ -1290,7 +1571,8 @@ def update_open_trades() -> None:
             continue
 
         days = _trading_days_held(trade["entry_date"])
-        ret = _pct_return(trade["action"], trade["entry_price"], price, trade.get("type", "STOCK"))
+        ret = _pct_return(trade["action"], trade["entry_price"], price, trade.get("type", "STOCK"),
+                          entry_session=trade.get("entry_session"), exit_session=mark_session)
 
         mul = trade.get("position_size_multiplier", 1.0)
         trade["current_price"] = float(price)
@@ -1822,16 +2104,19 @@ def _flip_trade(trade: dict) -> dict:
 
     entry_px   = trade.get("entry_price")
     asset_type = trade.get("type", "STOCK")
+    e_sess     = trade.get("entry_session")
     if entry_px is not None:
         if flipped["status"] == "CLOSED" and trade.get("exit_price") is not None:
             flipped["return_pct"] = round(
-                _pct_return(flipped["action"], float(entry_px), float(trade["exit_price"]), asset_type),
+                _pct_return(flipped["action"], float(entry_px), float(trade["exit_price"]), asset_type,
+                            entry_session=e_sess, exit_session=trade.get("exit_session")),
                 3,
             )
         else:
             cp = trade.get("current_price") or entry_px
             flipped["return_pct"] = round(
-                _pct_return(flipped["action"], float(entry_px), float(cp), asset_type),
+                _pct_return(flipped["action"], float(entry_px), float(cp), asset_type,
+                            entry_session=e_sess),
                 3,
             )
     return flipped
@@ -2117,14 +2402,13 @@ def compute_oos_comparison() -> dict:
     }
 
 
-def _trade_session(trade: dict) -> str:
-    """US-market session a trade was ENTERED in, from its ET entry timestamp.
+def _session_of_iso(raw) -> str:
+    """US-market session of an ISO timestamp: ``rth | extended | overnight``.
 
     RTH 09:30–16:00 · extended 04:00–09:30 + 16:00–20:00 · overnight 20:00–04:00.
-    Legacy/date-only entries (no time component) default to 'rth' — the only
-    session the scheduler currently trades.
+    Date-only/missing values (no time component) default to 'rth' — matches
+    every legacy record, which could only have traded in the regular session.
     """
-    raw = trade.get("entry_datetime")
     if not raw or ("T" not in str(raw) and ":" not in str(raw)):
         return "rth"
     try:
@@ -2138,6 +2422,13 @@ def _trade_session(trade: dict) -> str:
     if (4 * 60 <= mins < 9 * 60 + 30) or (16 * 60 <= mins < 20 * 60):
         return "extended"
     return "overnight"
+
+
+def _trade_session(trade: dict) -> str:
+    """Session a trade was ENTERED in, from its ET entry timestamp (the
+    stored ``entry_session`` stamp and this derivation always agree — both
+    come from the same executed-at instant)."""
+    return _session_of_iso(trade.get("entry_datetime"))
 
 
 def get_performance_for_email(window_days: Optional[int] = None,
@@ -2218,6 +2509,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
     solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session)
+    llm_perf             = _compute_llm_perf(window_days=window_days, session=session)
     method_eval_stats    = compute_method_eval_stats()
     oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)
@@ -2245,6 +2537,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "trades_svg":               trades_svg,
         "timeline_svg":             timeline_svg,
         "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
+        "llm_perf":                 llm_perf,                  # actual trades grouped by LLM engine (synthesis / sentiment)
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
         "oos_comparison":           oos_comparison,            # train vs holdout accuracy (honest OOS)
         "method_labels":            METHOD_LABELS,

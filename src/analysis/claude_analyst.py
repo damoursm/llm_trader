@@ -2,6 +2,7 @@
 
 import anthropic
 import json
+import random
 from loguru import logger
 from typing import List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
@@ -55,6 +56,37 @@ def _get_deepseek_analyst_client():
             base_url=_DEEPSEEK_BASE_URL,
         )
     return _deepseek_analyst_client
+
+
+def _call_claude_analyst(prompt: str) -> str:
+    """Call the configured Claude analyst model (streaming). Returns raw response text.
+
+    Raises anthropic.APIStatusError / APIConnectionError on API failure — covers
+    400 (credit exhausted / bad request), 401 (auth), 402 (payment), 403
+    (permission), 429 (rate limit), 5xx, and connection failures.
+    """
+    client = _get_client()
+    logger.info(f"[claude] Using model: {settings.analyst_model}")
+    # Haiku 4.5 = 8 192 tokens max output; Sonnet 4.6 = 64 000; Opus = 32 000
+    if "haiku" in settings.analyst_model:
+        _max_tokens = 8096
+    elif "opus" in settings.analyst_model:
+        _max_tokens = 32000
+    else:
+        _max_tokens = 64000   # Sonnet 4.6
+    # Determinism: temperature=0 so identical prompts produce near-identical
+    # synthesis. Anthropic SDK does not expose a seed parameter; this is
+    # the strongest determinism Anthropic supports today.
+    raw_parts: list[str] = []
+    with client.messages.stream(
+        model=settings.analyst_model,
+        max_tokens=_max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    ) as stream:
+        for text in stream.text_stream:
+            raw_parts.append(text)
+    return "".join(raw_parts).strip()
 
 
 def _call_deepseek_analyst(prompt: str) -> str:
@@ -114,10 +146,14 @@ def generate_recommendations(
     business_cycle_context=None,    # Optional[BusinessCycleContext]
     intermarket_context=None,       # Optional[IntermarketContext]
     macro_news_context=None,        # Optional[MacroNewsContext]
+    session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
     Includes sections for whichever analysis methods are enabled.
+
+    ``session`` != "rth" prepends an extended-session context block to the
+    prompt: thin books, frozen options data, news/gap as the live signals.
     """
     if not signals:
         return []
@@ -155,6 +191,11 @@ def generate_recommendations(
         parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, sources_agreeing={s.sources_agreeing}"]
         if use_news:
             parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
+        if getattr(s, "ext_gap_score", 0.0):
+            parts.append(
+                f"  EXTENDED-SESSION GAP={s.ext_gap_score:+.2f} "
+                f"(live off-hours move {s.ext_gap_pct:+.1f}% vs last completed close, ATR-normalised)"
+            )
         if getattr(s, "sentiment_velocity_score", 0.0):
             parts.append(
                 f"  Sentiment VELOCITY={s.sentiment_velocity_score:+.2f} "
@@ -302,6 +343,8 @@ def generate_recommendations(
         active_methods.append("cointegration pairs (market-neutral stat-arb lean: long cheap leg / short rich leg)")
     if settings.enable_cross_sectional:
         active_methods.append("cross-sectional rank (per-method z-score vs universe — relative standout)")
+    if settings.enable_extended_gap and session and session != "rth":
+        active_methods.append("extended-session gap (live off-hours move vs last completed close, ATR-normalised)")
     methods_desc = ", ".join(active_methods) if active_methods else "combined signals"
 
     # Insider-specific instructions
@@ -2674,6 +2717,26 @@ Regime guide:
 
     commodity_tickers = ", ".join(settings.commodities_list) or "GLD, SLV, IAU, GDX, PPLT, PALL, CPER"
 
+    # ── Extended-session context (pre/after-market runs) ─────────────────────
+    # Tells the analyst which information is live vs frozen off-hours and
+    # raises its bar for BUY/SELL accordingly — mirrors the aggregator's
+    # extended weight overlay and the pipeline's threshold bump.
+    session_block = ""
+    if session and session != "rth":
+        _now_t = now_et().time()
+        sess_label = (
+            "OVERNIGHT (20:00–04:00 ET — exchanges closed)" if session == "overnight"
+            else ("PRE-MARKET (04:00–09:30 ET)" if (_now_t.hour, _now_t.minute) < (9, 30)
+                  else "AFTER-HOURS (16:00–20:00 ET)")
+        )
+        session_block = f"""
+⏰ SESSION CONTEXT — this run executes in the {sess_label} extended session, NOT regular trading hours:
+- Prices are extended-session prints on thin books: spreads run several times wider than RTH, quotes go stale, and modest orders move price. Demand MORE convergence than usual before any BUY/SELL.
+- ALL options-derived signals (Put/Call, Max Pain, OI Skew, IV Expression, GEX) are FROZEN at the last regular-session close — treat them as yesterday's positioning context, never as live confirmation.
+- The LIVE information off-hours is news flow (overnight catalysts, earnings releases, 8-K filings) and the per-ticker EXTENDED-SESSION GAP score where present (the live off-hours move vs the last completed close, in the ticker's own ATR units). A meaningful gap WITH confirming news = genuine repricing likely to carry into the next regular session; a gap with NO identifiable news is illiquidity noise — fade-prone, do not chase it.
+- After-hours earnings reactions overshoot on the first prints. Prefer WATCH with a precise thesis over an immediate BUY/SELL unless news, gap direction, and prior positioning all align.
+"""
+
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.
 
 Your defining edge: you are ruthlessly disciplined about false positives. You understand that a wrong BUY or SELL costs capital that cannot be recovered. You output HOLD or WATCH whenever the evidence is mixed, incomplete, or driven by a single source. When you do issue a BUY or SELL, it is because the convergence of evidence makes the directional call highly reliable — and you explain precisely why.
@@ -2681,7 +2744,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
+{session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -2730,51 +2793,38 @@ Output a JSON array where each element has:
 
 Return ALL tickers from the input. No markdown, JSON only."""
 
-    # ── Step 1: call primary analyst (Claude) ─────────────────────────────
+    # ── Step 1+2: A/B-routed analyst call ──────────────────────────────────
+    # A per-run coin flip (settings.llm_ab_anthropic_share, default 50/50)
+    # picks which engine synthesises first, so both providers accumulate
+    # comparable samples for the dashboard's per-LLM evaluation rows. The
+    # other engine remains the error fallback (credit exhausted, rate limit,
+    # connection failure, missing key, …), then rule-based as last resort.
+    primary = "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
+    order = ["anthropic", "deepseek"] if primary == "anthropic" else ["deepseek", "anthropic"]
+    logger.info(
+        f"[claude] A/B routing this run: primary={primary} "
+        f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
+    )
     raw: str | None = None
     analyst_source = settings.analyst_model
-    try:
-        client = _get_client()
-        logger.info(f"[claude] Using model: {settings.analyst_model}")
-        # Haiku 4.5 = 8 192 tokens max output; Sonnet 4.6 = 64 000; Opus = 32 000
-        if "haiku" in settings.analyst_model:
-            _max_tokens = 8096
-        elif "opus" in settings.analyst_model:
-            _max_tokens = 32000
-        else:
-            _max_tokens = 64000   # Sonnet 4.6
-        # Determinism: temperature=0 so identical prompts produce near-identical
-        # synthesis. Anthropic SDK does not expose a seed parameter; this is
-        # the strongest determinism Anthropic supports today.
-        raw_parts: list[str] = []
-        with client.messages.stream(
-            model=settings.analyst_model,
-            max_tokens=_max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        ) as stream:
-            for text in stream.text_stream:
-                raw_parts.append(text)
-        raw = "".join(raw_parts).strip()
-    except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
-        # Covers 400 (credit exhausted / bad request), 401 (auth), 402 (payment),
-        # 403 (permission), 429 (rate limit), 5xx (server errors), and connection failures.
-        logger.warning(
-            f"[claude] Claude API unavailable ({type(e).__name__}: {e}) — "
-            f"switching to DeepSeek {_DEEPSEEK_ANALYST_MODEL}"
-        )
-    except Exception as e:
-        logger.warning(f"[claude] Unexpected Claude error: {e} — switching to DeepSeek")
-
-    # ── Step 2: DeepSeek fallback if Claude didn't produce output ──────────
-    if raw is None:
+    for engine in order:
         try:
-            raw = _call_deepseek_analyst(prompt)
-            analyst_source = _DEEPSEEK_ANALYST_MODEL
-        except Exception as ds_err:
-            logger.error(f"[claude] DeepSeek fallback also failed: {ds_err}")
-            _set_synthesis_meta("rule-based")
-            return _fallback_recommendations(signals)
+            if engine == "anthropic":
+                raw = _call_claude_analyst(prompt)
+                analyst_source = settings.analyst_model
+            else:
+                raw = _call_deepseek_analyst(prompt)
+                analyst_source = _DEEPSEEK_ANALYST_MODEL
+            break
+        except Exception as e:
+            logger.warning(
+                f"[claude] {engine} analyst failed ({type(e).__name__}: {e}) — trying next engine"
+            )
+            raw = None
+    if raw is None:
+        logger.error("[claude] All LLM analysts failed — using rule-based fallback")
+        _set_synthesis_meta("rule-based")
+        return _fallback_recommendations(signals)
 
     # ── Step 3: parse and build recommendations ────────────────────────────
     # Strip markdown fences if the model wrapped the response

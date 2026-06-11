@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     # Options: "claude-haiku-4-5-20251001" (fast/cheap), "claude-opus-4-6" (highest quality)
     analyst_model: str = "claude-haiku-4-5-20251001"
 
+    # LLM A/B split — probability that a run picks the Anthropic engine as its
+    # PRIMARY (the other provider stays as fallback). Applied independently to
+    # synthesis (Claude analyst vs DeepSeek) and sentiment (Haiku vs DeepSeek),
+    # re-flipped once per run. 0.5 = even split for side-by-side evaluation in
+    # the dashboard's per-LLM rows; 1.0 = always Anthropic-first (legacy
+    # behavior); 0.0 = always DeepSeek-first.
+    llm_ab_anthropic_share: float = 0.5
+
     # Polygon.io market data (primary source for equity/ETF price + OHLCV)
     # Free API key: https://polygon.io — no credit card, works globally.
     # If absent, the pipeline falls back to yfinance for all market data.
@@ -629,6 +637,71 @@ class Settings(BaseSettings):
     intraday_session_start: str = "09:30"
     intraday_session_end: str = "16:00"
 
+    # Extended-hours operation:
+    #   "off"     — scheduler ticks RTH only (legacy behavior).
+    #   "observe" — Phase 0: extended ticks run the FULL pipeline (signals,
+    #               recommendations, DB persistence — the session-tagged
+    #               evidence base) but NO ledger or broker mutation and no
+    #               email.
+    #   "trade"   — Phase 1 (default): extended ticks are FULL trading ticks —
+    #               ledger entries/exits/marks and broker paper orders happen
+    #               off-hours too, with session-aware costs (×4 spread),
+    #               sizing (extended_size_multiplier), a stricter actionable
+    #               gate (extended_confidence_bump), and LMT+outsideRth broker
+    #               submissions. The daily email still fires only on the
+    #               16:00 RTH closing tick.
+    extended_hours_mode: str = "trade"        # "off" | "observe" | "trade"
+    # Extended observation windows (ET, comma-separated HH:MM-HH:MM, optional
+    # "@MM" per-window cadence override). Default covers the FULL extended day
+    # 04:00–20:00: the liquid shoulders (07:00–09:30 pre-market ramp,
+    # 16:00–17:30 earnings-reaction window) tick every extended_tick_minutes;
+    # the thin dead zones (04:00–07:00, 18:00–20:00) tick hourly — spreads
+    # there are widest and the evidence value per LLM dollar lowest, and the
+    # hourly cadence matches the news cache TTL so each tick sees fresh news.
+    extended_windows: str = "04:00-07:00@60,07:00-09:30,16:00-17:30,18:00-20:00@60"
+    extended_tick_minutes: int = 30
+    # Bid-ask half-spread multipliers outside RTH (commission is session-
+    # independent — only the spread term widens). Rough placeholders to be
+    # calibrated against IBKR paper fills later, same plan as commission_buffer.
+    spread_extended_multiplier: float = 4.0
+    spread_overnight_multiplier: float = 10.0
+
+    # ── Extended-session signal profile ─────────────────────────────────────
+    # Outside RTH the information landscape changes: options chains (put/call,
+    # max pain, OI skew, IV expression) are FROZEN at the last regular-session
+    # close, while news flow and the extended-session price action are the
+    # live, tradeable information. These knobs adapt the run accordingly.
+    #
+    # Confidence bump: added to the macro-regime actionable threshold for runs
+    # executing outside RTH (extended AND overnight) — thin books + wide
+    # spreads demand more conviction before a signal counts as actionable.
+    # In "observe" mode it only shapes the persisted `actionable` flag; in
+    # "trade" mode it directly gates which extended signals become positions.
+    extended_confidence_bump: float = 0.06
+    # Position-size multiplier applied ON TOP of the confidence tier and the
+    # correlation haircut for trades ENTERED outside RTH. Extended books are
+    # thin and the modeled spread 4× wider, so pre-prod sizes off-hours
+    # entries at half weight until paper fills prove the edge. 1.0 = off.
+    extended_size_multiplier: float = 0.5
+    # Aggregator weight overlay for extended/overnight runs: options-derived
+    # methods (put_call, max_pain, oi_skew, iv_expr) are scaled DOWN (stale
+    # since the RTH close — yesterday's positioning, not live confirmation);
+    # news + sentiment-velocity + the extended gap are scaled UP (the live
+    # extended-hours edge is overnight news repricing).
+    extended_stale_options_weight_mult: float = 0.5
+    extended_news_weight_mult: float = 1.25
+
+    # Extended-session gap momentum (ext_gap) — per-ticker scorer active ONLY
+    # outside RTH (returns 0.0 = "no view" during the regular session, where
+    # the open gap is already captured by technicals). Measures the live
+    # extended print vs the last COMPLETED daily close, normalised by the
+    # ticker's own ATR: pre-market gap-and-go / after-hours earnings reaction.
+    # Score = tanh(gap_atr / scale) with a deadband so micro-moves don't read
+    # as signal: |gap| < deadband × ATR → 0.0.
+    enable_extended_gap: bool = True
+    extended_gap_deadband_atr: float = 0.25   # min |gap| in ATR units to register a view
+    extended_gap_scale_atr: float = 1.5       # tanh saturation: 1.5 ATR gap → ~0.76 score
+
     # Scheduler resilience on laptops / Modern-Standby machines. This box exposes
     # only S0 "Connected Standby" (no S1/S2/S3): when the display sleeps Windows
     # *suspends* this process, so cron fires come due while frozen and APScheduler's
@@ -715,6 +788,44 @@ class Settings(BaseSettings):
     broker_order_type: str = "MKT"                # "MKT" | "LMT"
     broker_limit_cap_bps: float = 20.0            # LMT only: max adverse distance from model price
     broker_paper_equity: float = 100000.0         # USD equity used for the exposure cap in dry_run
+
+    # ── Order-submission reliability (acceptance check + bounded retry) ──
+    # Every submission's broker answer is verified; TRANSIENT failures
+    # (connection drop, timeout, pacing/rate limit) retry in-tick a few
+    # times. The window is deliberately SHORT — a delayed fill must stay
+    # anchored to THIS tick's model price — and every retry goes out as a
+    # marketable LMT capped at broker_limit_cap_bps from that model price,
+    # so the worst acceptable fill never drifts past the cap no matter when
+    # the retry lands. Hard rejects (insufficient funds, permissions,
+    # invalid contract) never retry — a retry can't fix them. Before each
+    # retry the broker is checked for an order already carrying this
+    # client_ref: an attempt that errored AFTER transmission may have
+    # reached the broker, and resubmitting blind would double the position.
+    broker_submit_retries: int = 2        # transient retries per order (0 = off)
+    broker_retry_wait_seconds: int = 5    # pause before each retry (reconnect window)
+    # An ACCEPTED order still resting unfilled after this many minutes (its
+    # price cap was never reached — the market moved away) is cancelled and
+    # resubmitted re-anchored at the current mark, so the broker book
+    # re-syncs with the sim in bounded ≤cap steps instead of resting at a
+    # stale price indefinitely. Partial fills are left working. 0 = never.
+    broker_unfilled_cancel_minutes: int = 90
+
+    # ── Drift auto-reconciliation ────────────────────────────────────────
+    # The ledger is the source of truth; a broker position the ledger cannot
+    # explain (no OPEN trade, no close in flight) is an ORPHAN. Drift is
+    # prevented at the source where possible (working entry orders are
+    # cancelled the moment their trade closes; exits flatten what the broker
+    # ACTUALLY holds), and whatever still slips through (ledger restores,
+    # manual TWS trades, fill races) is handled per this setting:
+    #   "flatten" (default) — submit a price-capped marketable LMT at a live
+    #                         quote to close the orphan; re-anchored each tick
+    #                         while it rests, so the broker converges to the
+    #                         ledger in bounded ≤cap steps.
+    #   "report"            — legacy behavior: surface it, touch nothing.
+    # SAFETY: in ibkr_live mode "flatten" is refused and downgraded to
+    # "report" — auto-selling unexpected REAL-money positions (e.g. something
+    # bought manually in TWS) is a deliberate human decision, not a default.
+    broker_drift_action: str = "flatten"   # "flatten" | "report"
 
     # ── Simulated trading costs (commission term in the sim's return math) ──
     # The bid-ask half-spread model (src/performance/spread.py) covers spread cost;

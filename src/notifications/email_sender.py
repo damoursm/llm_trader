@@ -165,7 +165,7 @@ HTML_TEMPLATE = """
 </div>
 {% elif broker_health %}
 <div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
-  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.fills_repaired %} &middot; {{ broker_health.fills_repaired }} fill(s) repaired{% endif %}{% if broker_health.slippage %} &middot; avg slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps (+ = adverse){% endif %}.
+  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.fills_repaired %} &middot; {{ broker_health.fills_repaired }} fill(s) repaired{% endif %}{% if broker_health.retries %} &middot; {{ broker_health.retries }} transient submit retr{{ 'y' if broker_health.retries == 1 else 'ies' }}{% endif %}{% if broker_health.stale_cancels %} &middot; {{ broker_health.stale_cancels }} stale order(s) re-anchored{% endif %}{% if broker_health.entry_cancels_on_close %} &middot; {{ broker_health.entry_cancels_on_close }} working entr{{ 'y' if broker_health.entry_cancels_on_close == 1 else 'ies' }} cancelled on close{% endif %}{% if broker_health.slippage %} &middot; avg slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps (+ = adverse){% endif %}.
 </div>
 {% endif %}
 
@@ -597,6 +597,12 @@ HTML_TEMPLATE = """
   <tr>
     <td colspan="8" style="background:#0f172a;padding:5px 10px;font-size:11px;color:#64748b;font-style:italic;border-top:1px solid #334155;">
       &#8212; By Trade Direction &#8212;
+    </td>
+  </tr>
+  {% elif row.group == 'session' and ns.last_group not in ('session',) %}
+  <tr>
+    <td colspan="8" style="background:#0f172a;padding:5px 10px;font-size:11px;color:#64748b;font-style:italic;border-top:1px solid #334155;">
+      &#8212; By Entry Session (RTH / extended / overnight) &#8212;
     </td>
   </tr>
   {% elif row.group == 'method' and ns.last_group not in ('method',) %}
@@ -1462,6 +1468,27 @@ HTML_TEMPLATE = """
         {% if cs > 0 %}Cheap (long) leg of one or more stretched cointegrated pairs — statistical-arbitrage mean-reversion bet favours this name.
         {% else %}Rich (short) leg of one or more stretched cointegrated pairs — spread expected to revert against this name.{% endif %}
         <span style="color:#64748b;font-size:10px;"> (Engle-Granger ADF + spread z-score; see Cointegration Pairs section)</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Extended-session gap momentum (off-hours runs only) -->
+    {% if enable_extended_gap and sig.ext_gap_score is defined and sig.ext_gap_score != 0 %}
+    {% set eg = sig.ext_gap_score %}
+    {% set egp = sig.ext_gap_pct if sig.ext_gap_pct is defined else 0 %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">Extended-Session Gap</span>
+        <span class="mscore {{ 'sp' if eg > 0 else 'sn' }}">{{ "%+.2f"|format(eg) }}</span>
+        <span style="font-size:10px;color:#94a3b8;margin-left:6px;">{{ "%+.1f"|format(egp) }}% vs last close</span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (eg|abs * 100)|int }}%;background:{{ '#16a34a' if eg >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {% if eg > 0 %}Live extended-hours print gapping UP vs the last completed close — overnight/after-hours repricing in progress; continuation likely when news-confirmed, fade-prone when not.
+        {% else %}Live extended-hours print gapping DOWN vs the last completed close — off-hours selling pressure; continuation likely when news-confirmed, fade-prone when not.{% endif %}
+        <span style="color:#64748b;font-size:10px;"> (gap / ATR, tanh-scaled; computed only on pre/after-market runs)</span>
       </div>
     </div>
     {% endif %}
@@ -5479,6 +5506,7 @@ def send_recommendations(
         enable_iv_rank=settings.enable_iv_rank,
         enable_iv_expr=settings.enable_iv_expr,
         enable_cointegration=settings.enable_cointegration,
+        enable_extended_gap=settings.enable_extended_gap,
         enable_cross_sectional=settings.enable_cross_sectional,
         enable_gex=settings.enable_gex,
         active_methods=active_methods,

@@ -1,7 +1,9 @@
 """LLM-based sentiment analysis of news articles.
 
-Primary:  DeepSeek V4-Flash (deepseek-v4-flash, non-thinking) — fast and cheap for per-ticker scoring
-Fallback: Claude Haiku — used if DeepSeek is unavailable or errors
+Engines: DeepSeek V4-Flash (deepseek-v4-flash, non-thinking) and Claude Haiku.
+Which one is PRIMARY is flipped once per run (settings.llm_ab_anthropic_share,
+default 50/50) so both accumulate comparable samples for the dashboard's
+per-LLM evaluation; the other engine is the error fallback.
 
 Precision controls:
   - Recency decay: articles are weighted by age before scoring (24h=1.0x → 7d=0.25x)
@@ -12,6 +14,7 @@ Precision controls:
 
 import json
 import math
+import random
 import threading
 import anthropic
 from datetime import datetime, timezone
@@ -39,10 +42,24 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 _PROVIDER_COUNTS: dict = {}
 _PROVIDER_LOCK = threading.Lock()
 
+# Which engine scores first this run — re-flipped per run in
+# reset_sentiment_providers() per settings.llm_ab_anthropic_share, so both
+# providers accumulate comparable trade samples for the dashboard's per-LLM
+# evaluation rows. The other engine remains the error fallback.
+_PRIMARY_SENTIMENT_ENGINE = "deepseek"
+
 
 def reset_sentiment_providers() -> None:
+    global _PRIMARY_SENTIMENT_ENGINE
     with _PROVIDER_LOCK:
         _PROVIDER_COUNTS.clear()
+    _PRIMARY_SENTIMENT_ENGINE = (
+        "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
+    )
+    logger.info(
+        f"[sentiment] A/B routing this run: primary={_PRIMARY_SENTIMENT_ENGINE} "
+        f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
+    )
 
 
 def _record_sentiment_provider(provider: str) -> None:
@@ -60,6 +77,28 @@ def get_sentiment_provider_summary() -> Optional[str]:
             return None
         items = sorted(_PROVIDER_COUNTS.items(), key=lambda kv: -kv[1])
         return ", ".join(f"{name}×{n}" for name, n in items)
+
+
+# provider name (as tallied above) → the exact model id that provider runs.
+SENTIMENT_PROVIDER_MODELS: dict = {
+    "deepseek": DEEPSEEK_MODEL,
+    "anthropic": HAIKU_MODEL,
+}
+
+
+def get_dominant_sentiment_model() -> Optional[str]:
+    """Exact model id of the provider that scored the most tickers this run.
+
+    Stamped onto each new trade for per-LLM performance attribution. A run with
+    a few fallback calls (e.g. 'deepseek×40, anthropic×2') attributes to the
+    majority engine; returns None when no sentiment LLM call was made.
+    """
+    with _PROVIDER_LOCK:
+        counted = {k: v for k, v in _PROVIDER_COUNTS.items() if k in SENTIMENT_PROVIDER_MODELS}
+        if not counted:
+            return None
+        top = max(counted.items(), key=lambda kv: kv[1])[0]
+        return SENTIMENT_PROVIDER_MODELS[top]
 
 # Fixed seed for OpenAI-compatible APIs (DeepSeek). Combined with temperature=0
 # this gives near-deterministic output across runs for the same prompt — the
@@ -215,46 +254,47 @@ Respond with JSON only, no markdown."""
     raw_score = None
     rationale = "Analysis unavailable."
 
-    # --- Primary: DeepSeek V4-Flash ---
-    # temperature=0 + a stable seed give near-deterministic output across runs
-    # for the same article digest, which is what we want so two pipeline runs
-    # within the same news-cache hour produce the same per-ticker sentiment.
-    deepseek = _get_deepseek()
-    if deepseek is not None:
+    # Primary engine per the run's A/B flip (reset_sentiment_providers); the
+    # other provider remains the error fallback. Determinism per engine:
+    # temperature=0 (+ a stable seed on DeepSeek; Anthropic exposes no seed)
+    # so two runs scoring the same digest on the same engine agree.
+    order = ["deepseek", "anthropic"] if _PRIMARY_SENTIMENT_ENGINE == "deepseek" else ["anthropic", "deepseek"]
+    last_err: Exception | None = None
+    for engine in order:
         try:
-            response = deepseek.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                seed=_LLM_SEED,
-                extra_body=_DEEPSEEK_THINKING_OFF,
-            )
-            raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
-            logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (deepseek-v3, {len(to_score)} articles)")
-            _record_sentiment_provider("deepseek")
+            if engine == "deepseek":
+                deepseek = _get_deepseek()
+                if deepseek is None:        # no API key — try the other engine
+                    continue
+                response = deepseek.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    seed=_LLM_SEED,
+                    extra_body=_DEEPSEEK_THINKING_OFF,
+                )
+                raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
+            else:
+                client = _get_haiku()
+                message = client.messages.create(
+                    model=HAIKU_MODEL,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                )
+                raw_score, rationale = _parse_response(message.content[0].text.strip())
+            logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} ({engine}, {len(to_score)} articles)")
+            _record_sentiment_provider(engine)
+            break
         except Exception as e:
-            logger.warning(f"{ticker} DeepSeek failed, falling back to Haiku: {e}")
+            last_err = e
+            logger.warning(f"{ticker} sentiment via {engine} failed: {e}")
 
-    # --- Fallback: Claude Haiku ---
-    # Anthropic SDK doesn't expose a seed parameter, but temperature=0 + the
-    # cached prompt gives the highest determinism Anthropic supports.
     if raw_score is None:
-        try:
-            client = _get_haiku()
-            message = client.messages.create(
-                model=HAIKU_MODEL,
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            raw_score, rationale = _parse_response(message.content[0].text.strip())
-            logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} (haiku-fallback, {len(to_score)} articles)")
-            _record_sentiment_provider("anthropic")
-        except Exception as e:
-            logger.error(f"Sentiment analysis failed for {ticker}: {e}")
-            _record_sentiment_provider("none")
-            return 0.0, f"Analysis error: {e}"
+        logger.error(f"Sentiment analysis failed for {ticker}: {last_err}")
+        _record_sentiment_provider("none")
+        return 0.0, f"Analysis error: {last_err}"
 
     # --- Precision adjustments ---
     count_scale     = _article_count_scale(len(to_score))

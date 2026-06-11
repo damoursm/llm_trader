@@ -40,6 +40,29 @@ NY_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN_LOCAL  = time(9, 30)
 MARKET_CLOSE_LOCAL = time(16, 0)
 
+# Extended-session boundaries (ET): pre-market 04:00–09:30, after-hours
+# 16:00–20:00, overnight 20:00–04:00. Same convention as tracker._trade_session.
+EXTENDED_OPEN_LOCAL  = time(4, 0)
+EXTENDED_CLOSE_LOCAL = time(20, 0)
+
+
+def current_session(now: Optional[datetime] = None) -> str:
+    """US-market session for a clock instant: ``rth | extended | overnight``.
+
+    Mirrors the boundaries of ``tracker._trade_session`` (which classifies a
+    stored trade dict) but takes a plain datetime, so callers like the
+    snapshot fetcher can branch on "what session is it right now". Naive
+    datetimes are assumed to already be Eastern.
+    """
+    dt = now or datetime.now(NY_TZ)
+    dt = dt.astimezone(NY_TZ) if dt.tzinfo is not None else dt
+    t = dt.time()
+    if MARKET_OPEN_LOCAL <= t < MARKET_CLOSE_LOCAL:
+        return "rth"
+    if EXTENDED_OPEN_LOCAL <= t < MARKET_OPEN_LOCAL or MARKET_CLOSE_LOCAL <= t < EXTENDED_CLOSE_LOCAL:
+        return "extended"
+    return "overnight"
+
 
 # NYSE full-day holidays, 2024–2030.  Includes observance shifts (e.g.
 # Independence Day 2026 falls on Saturday → observed Friday 2026-07-03).
@@ -89,6 +112,14 @@ def is_market_day(d: date) -> bool:
     if _TABLE_START <= d <= _TABLE_END:
         return d not in NYSE_HOLIDAYS
     return True   # outside table — assume weekday is a session (fail-open)
+
+
+def previous_market_day(d: date) -> date:
+    """Most recent NYSE session strictly before *d*."""
+    p = d - timedelta(days=1)
+    while not is_market_day(p):
+        p -= timedelta(days=1)
+    return p
 
 
 def market_days_between(start: date, end: date) -> int:

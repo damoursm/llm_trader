@@ -110,7 +110,10 @@ def get_snapshots_batch(tickers: List[str]) -> Dict[str, dict]:
         prev      = item.get("prevDay")   or {}
         last_trade = item.get("lastTrade") or {}
 
-        # Best available price: last trade → today's close → yesterday's close
+        # Best available price: last trade → today's close → yesterday's close.
+        # lastTrade includes pre/after-market prints, so extended-session
+        # snapshots (observation-mode ticks) get genuine extended prices here —
+        # only the yfinance fallback path needs special prepost handling.
         price      = last_trade.get("p") or day.get("c") or prev.get("c")
         prev_close = prev.get("c")
 

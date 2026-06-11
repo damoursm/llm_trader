@@ -61,6 +61,8 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │                             change leads 1–5 day moves over the level    │
 │  3M. Trend Strength       — ADX/DMI trend quality + Donchian 20-day      │
 │                             breakout — confirmed-trend direction         │
+│  3N. Extended-Session Gap — live pre/after-market print vs last completed │
+│                             close in ATR units (off-hours runs only)     │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
 │  5.  Recommendations      — Claude: BUY / SELL / HOLD / WATCH           │
 │  6.  Performance Tracking — paper trades, P&L, method attribution        │
@@ -1158,6 +1160,18 @@ Direction = `(+DI − -DI) / (+DI + -DI)` ∈ [−1, +1], scaled by `clip((ADX �
 **Composite score** ∈ [−1, +1]: `score = clip(0.60 × adx_dir + 0.40 × donchian, -1, +1)`. Positive = confirmed uptrend; negative = confirmed downtrend; near zero = chop (dampened by design rather than guessing). A `trend_strength_label` (`STRONG_UPTREND`, `BREAKOUT_UP`, `NO_TREND`, …) is stored for display.
 
 **Aggregator integration:** method `trend_strength`, base weight **0.15**, on `TickerSignal.trend_strength_score` (+ `adx_value`, `trend_strength_label`). Tracked in performance attribution under **Technical**. Claude receives a per-ticker `TrendStrength` line and instruction **16b** (treat it as a trend-following confirmation/gate: lean into strong aligned trends and 20-day breakouts; in ADX < 20 chop, prefer mean-reversion setups). Email: per-ticker row + a **Trend Strength Leaderboard** (strongest confirmed up/down trends). Tunable via `TREND_ADX_PERIOD` (14) and `TREND_DONCHIAN_PERIOD` (20). Disable with `ENABLE_TREND_STRENGTH=false`.
+
+---
+
+### Step 3N — Extended-Session Gap (`src/signals/extended_session.py`)
+
+When `ENABLE_EXTENDED_GAP=true` AND the run executes **outside regular trading hours** (the scheduler's 04:00–09:30 / 16:00–20:00 ET observation ticks), scores the one signal that only exists off-hours: how far the live extended-session print has moved from the last **completed** daily close, in units of the ticker's own ATR. Pre-market this is the overnight gap forming in real time (gap-and-go candidates); after-hours it is the immediate reaction to a just-released catalyst (earnings, 8-K, guidance) — the move the next regular open inherits.
+
+**Mechanics.** Reference close = previous market day's close (pre-market) or today's completed close (after the 16:00 close); the OHLCV cache only stores completed bars, and a missing reference row means a stale cache → the scorer **fails closed** (0.0) rather than measure a phantom gap. `gap_atr = gap% / ATR%(14, Wilder)`; |gap| below `EXTENDED_GAP_DEADBAND_ATR` (0.25) is "no view" (thin-book drift is noise); above it, `score = tanh(gap_atr / EXTENDED_GAP_SCALE_ATR)` (1.5 → a 1.5-ATR gap scores ~0.76). ATR units make the score mean "how unusual is this move *for this name*" — a 7% gap on a volatile microcap scores less than a 4% gap on a mega-cap. Always **0.0 during RTH runs** — the open gap is already captured by the daily technical stack, and a second reading would double-count it.
+
+**Gap-fade risk** is handled by architecture, not the scorer: a lone unconfirmed gap can never trigger a BUY/SELL (single-source convergence rule), while a news-confirmed gap composes with the up-weighted news methods of the extended-session profile. The Claude prompt's extended-session block makes the rule explicit: gap + news = genuine repricing; gap without news = illiquidity noise, fade-prone.
+
+**Aggregator integration:** method `ext_gap`, base weight **0.15** (×1.25 under the extended-session overlay), on `TickerSignal.ext_gap_score` (+ raw `ext_gap_pct`). Tracked in performance attribution under **Technical**; persisted as a `signals`-table column for IC analysis of the extended-hours evidence base. Email: per-ticker "Extended-Session Gap" row (renders only on off-hours runs). Live prices come from the session-aware snapshot path (Polygon `lastTrade` includes extended prints; the yfinance fallback reads 1-minute `prepost` bars). Disable with `ENABLE_EXTENDED_GAP=false`.
 
 ---
 

@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 from config import settings
 from src.models import TickerSnapshot
 from src.data import polygon_client
+from src.performance.market_calendar import current_session
 
 try:
     from zoneinfo import ZoneInfo as _ZoneInfo
@@ -143,6 +144,29 @@ def _fetch_ticker_yf(ticker: str) -> Tuple[Optional[yf.Ticker], Optional[pd.Data
 # Public API
 # ---------------------------------------------------------------------------
 
+def _extended_last_price(t) -> Optional[float]:
+    """Last extended-hours print via 1-minute prepost bars (None when unavailable).
+
+    ``fast_info.last_price`` reflects the REGULAR session only, so during
+    pre/after-market it silently returns the stale RTH close — the wrong
+    anchor for extended-session snapshots (``signals.price`` is the entry
+    anchor of the recommendation-stream pseudo-trades). The Polygon batch
+    path needs no equivalent: its snapshot already prefers ``lastTrade.p``,
+    which includes extended prints.
+    """
+    try:
+        bars = t.history(period="1d", interval="1m", prepost=True)
+        if bars is None or bars.empty or "Close" not in bars.columns:
+            return None
+        closes = bars["Close"].dropna()
+        if closes.empty:
+            return None
+        px = float(closes.iloc[-1])
+        return px if px > 0 else None
+    except Exception:
+        return None
+
+
 def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
     """
     Return latest price, 1-day and 5-day % change for each ticker.
@@ -193,7 +217,11 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
                     continue
 
                 info          = t.fast_info
-                current_price = float(info.last_price)
+                current_price = None
+                if current_session() != "rth":
+                    current_price = _extended_last_price(t)
+                if current_price is None:
+                    current_price = float(info.last_price)
                 prev_close    = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current_price
                 pct_change    = (current_price - prev_close) / prev_close * 100
                 week_open     = float(hist["Close"].iloc[0])

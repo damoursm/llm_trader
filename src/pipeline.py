@@ -61,8 +61,9 @@ from src.data.cluster_watchlist import (
 )
 from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
-from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary
+from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
 from src.notifications.email_sender import send_recommendations
+from src.performance.market_calendar import current_session
 from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
@@ -150,7 +151,12 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
     per-ticker signal cross-section (the learning panel) to DuckDB."""
     try:
         actionable_ids = {id(r) for r in actionable}
-        provider = get_last_synthesis_meta().get("provider")
+        meta = get_last_synthesis_meta()
+        provider = meta.get("provider")
+        # Per-rec attribution stores the EXACT engine id (legacy rows held only
+        # the provider string) so the per-LLM evaluation never has to guess
+        # which Claude model "anthropic" meant at the time.
+        rec_llm = meta.get("model") or ("rule-based (no LLM)" if provider == "rule-based" else provider)
 
         rec_rows = []
         for r in recommendations:
@@ -171,7 +177,7 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "dominant_method": _dominant_method(scores, r.direction),
                 "methods_agreeing": _methods_agreeing(scores, r.direction),
                 "contributing_scores": scores,
-                "llm_provider": provider,
+                "llm_provider": rec_llm,
             })
 
         repo.insert_run({
@@ -292,7 +298,14 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
         problems.append(f"{report['rejects']} order(s) rejected")
     if report.get("drift"):
         names = ", ".join(d["ticker"] for d in report["drift"][:6])
-        problems.append(f"{len(report['drift'])} position(s) drifted from the ledger ({names})")
+        flattened = report.get("drift_flattened", 0)
+        suffix = (f"; auto-flatten submitted for {flattened}" if flattened
+                  else "; report-only" if all(
+                      d.get("action") in (None, "report") for d in report["drift"])
+                  else "; auto-flatten FAILED — check broker order log")
+        problems.append(
+            f"{len(report['drift'])} position(s) drifted from the ledger ({names}){suffix}"
+        )
     if not report.get("ok") and report.get("errors"):
         problems.append("reconcile error")
     return {
@@ -303,6 +316,14 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
         "exits":          report.get("exits_submitted", 0),
         "fills_repaired": report.get("fills_repaired", 0),
         "rejects":        report.get("rejects", 0),
+        # Reliability observability: transient submit retries this tick and
+        # stale resting orders cancelled + re-anchored. Neither is a failure
+        # by itself (the mechanism worked) — they appear in the healthy line
+        # so a flaky Gateway is visible before it becomes rejects.
+        "retries":        report.get("retries", 0),
+        "stale_cancels":  report.get("stale_cancels", 0),
+        "entry_cancels_on_close": report.get("entry_cancels_on_close", 0),
+        "drift_flattened": report.get("drift_flattened", 0),
         "drift":          report.get("drift", []),
         "slippage":       report.get("slippage", []),
         "message":        "; ".join(problems),
@@ -393,14 +414,38 @@ def _run_edgar_tasks(all_tickers):
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(send_email: bool = False) -> None:
-    """Execute the full analysis pipeline."""
+def run_pipeline(send_email: bool = False, observe_only: bool = False,
+                 email_if_configured: bool = True) -> None:
+    """Execute the full analysis pipeline.
+
+    ``observe_only`` (extended-hours observation ticks): the full analysis runs
+    and is persisted to DuckDB (runs + recommendations + signals — the
+    session-tagged evidence base), but every ledger/broker mutation is skipped
+    — no trade opens/closes/marks, no position monitoring, no hypothetical
+    updates, no orders — and no email is assembled or sent.
+
+    ``email_if_configured``: legacy convenience for MANUAL runs — when True
+    (default), a configured SMTP sends the report even without
+    ``send_email``. The scheduler passes False so its per-slot ``send_email``
+    decision is authoritative: extended trading ticks run the full ledger
+    path but must never re-send the daily report.
+    """
     start = datetime.now(timezone.utc)
     run_id = start.strftime("%Y-%m-%d_%H%M%S")
     _reset_source_log()
     reset_sentiment_providers()
     reset_price_health()
-    logger.info(f"Pipeline started at {fmt_et(start)}")
+    # Session classification, fixed once per run so every consumer (weight
+    # overlay, ext_gap scorer, threshold bump, analyst prompt, gate diag)
+    # sees the same answer even when the run straddles a session boundary.
+    run_session = current_session()
+    logger.info(f"Pipeline started at {fmt_et(start)} (session: {run_session})")
+    if run_session != "rth":
+        logger.info(
+            f"[extended] {run_session}-session run — extended signal profile active: "
+            "stale-options down-weight, news up-weight, ext_gap scorer, "
+            f"+{settings.extended_confidence_bump:.0%} actionable threshold"
+        )
 
     tickers     = settings.stocks_list
     sectors     = settings.sectors_list
@@ -821,6 +866,8 @@ def run_pipeline(send_email: bool = False) -> None:
         opex_context=opex_context,
         pead_context=pead_context,
         coint_context=coint_context,
+        snapshots=snapshots,
+        session=run_session,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
 
@@ -866,6 +913,7 @@ def run_pipeline(send_email: bool = False) -> None:
         business_cycle_context=business_cycle_context,
         intermarket_context=intermarket_context,
         macro_news_context=macro_news_context,
+        session=run_session,
     )
 
     # Keep only the top 10 recommendations by conviction:
@@ -892,6 +940,17 @@ def run_pipeline(send_email: bool = False) -> None:
             f"(default 78%) | allow_buys={_allow_buys}"
         )
 
+    # Extended-session gate — thin books and wide spreads demand more
+    # conviction off-hours, so the regime threshold is bumped further for any
+    # run outside RTH. Phase 0 only shapes the persisted `actionable` flag
+    # (observation ticks never trade); a future trade mode inherits it as-is.
+    if run_session != "rth" and settings.extended_confidence_bump > 0:
+        _confidence_threshold = min(0.95, _confidence_threshold + settings.extended_confidence_bump)
+        logger.info(
+            f"[extended] {run_session}-session threshold bump: "
+            f"+{settings.extended_confidence_bump:.0%} → {_confidence_threshold:.0%}"
+        )
+
     # Catalyst timing — earnings blackout, OpEx amplifier already applied in build_signals,
     # now apply WATCH elevation (8-K + insider buy) and earnings blackout on actionable
     catalyst_timing_context = None
@@ -904,6 +963,7 @@ def run_pipeline(send_email: bool = False) -> None:
             signals_by_ticker=signals_by_ticker,
             sectors_list=settings.sectors_list,
             commodities_list=settings.commodities_list,
+            pead_context=pead_context,
         )
         # Apply WATCH elevation to the top-10 recommendations
         recommendations = apply_watch_elevation(
@@ -929,6 +989,7 @@ def run_pipeline(send_email: bool = False) -> None:
         "actionable_survivors":         0,
         "confidence_threshold":         round(_confidence_threshold, 2),
         "allow_buys":                   _allow_buys,
+        "session":                      run_session,
         "regime":                       (macro_regime_context.regime
                                           if macro_regime_context else "NEUTRAL"),
     }
@@ -968,31 +1029,54 @@ def run_pipeline(send_email: bool = False) -> None:
 
     _log_recommendations(recommendations)
 
-    # Performance tracking
-    update_open_trades()
-    # Open-position monitor: signal-decay / regime-flip exits BEFORE the
-    # counter-recommendation exit path. Catches the case where a held
-    # ticker's thesis has deteriorated but no counter-direction BUY/SELL
-    # appeared in today's top-10 (so close_trades_on_signal_reversal would
-    # silently keep holding it).
-    monitor_open_positions(
-        signals_by_ticker=signals_by_ticker,
-        macro_regime_context=macro_regime_context,
-    )
-    close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
-    trade_diag = record_new_trades(actionable, signals_by_ticker=signals_by_ticker, run_id=run_id) or {}
-
-    # Broker shadow execution (paper-first): once the internal ledger is final for
-    # this tick, reconcile a real broker (IBKR paper) against it — submit entries
-    # for new opens, close exits, report slippage/drift. No-op when broker_mode=off;
-    # the reconciler is exception-safe and never breaks the run.
+    # Performance tracking. On observation ticks (extended sessions) the whole
+    # mutation block is skipped: the evidence is what _persist_run writes
+    # (runs + recommendations + signals); the ledger, hypothetical book, and
+    # broker are never touched, and no email payload is assembled.
+    gate_diag["observe_only"] = observe_only
     broker_report = None
-    if settings.broker_mode and settings.broker_mode != "off":
-        from src.broker.reconcile import sync as _broker_sync
-        try:
-            broker_report = _broker_sync(run_id=run_id)
-        except Exception as e:
-            logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
+    if observe_only:
+        logger.info(
+            "[pipeline] OBSERVATION tick (extended session) — skipping ledger "
+            "updates, position monitoring, trade entries, broker sync, "
+            "hypothetical marks, and email assembly"
+        )
+        trade_diag = {}
+        perf, hypothetical_perf = {}, {}
+    else:
+        update_open_trades()
+        # Open-position monitor: signal-decay / regime-flip exits BEFORE the
+        # counter-recommendation exit path. Catches the case where a held
+        # ticker's thesis has deteriorated but no counter-direction BUY/SELL
+        # appeared in today's top-10 (so close_trades_on_signal_reversal would
+        # silently keep holding it).
+        monitor_open_positions(
+            signals_by_ticker=signals_by_ticker,
+            macro_regime_context=macro_regime_context,
+        )
+        close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
+        # Stamp each new trade with the exact LLM engines in use this run (final-call
+        # synthesis model + run-dominant sentiment scorer) for per-LLM attribution.
+        _synth_meta = get_last_synthesis_meta()
+        _synth_model = _synth_meta.get("model") or (
+            "rule-based (no LLM)" if _synth_meta.get("provider") == "rule-based" else None
+        )
+        trade_diag = record_new_trades(
+            actionable, signals_by_ticker=signals_by_ticker, run_id=run_id,
+            llm_synthesis_model=_synth_model,
+            llm_sentiment_model=get_dominant_sentiment_model(),
+        ) or {}
+
+        # Broker shadow execution (paper-first): once the internal ledger is final for
+        # this tick, reconcile a real broker (IBKR paper) against it — submit entries
+        # for new opens, close exits, report slippage/drift. No-op when broker_mode=off;
+        # the reconciler is exception-safe and never breaks the run.
+        if settings.broker_mode and settings.broker_mode != "off":
+            from src.broker.reconcile import sync as _broker_sync
+            try:
+                broker_report = _broker_sync(run_id=run_id)
+            except Exception as e:
+                logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
 
     # Merge per-gate counters from the actionable filter + the trade-entry path
     # into one diagnostic blob so the user can see at a glance which constraints
@@ -1021,13 +1105,14 @@ def run_pipeline(send_email: bool = False) -> None:
         f"no_price={gate_diag['trade_skipped_no_price']}, "
         f"corr_haircut_applied={gate_diag['trade_haircut_applied']})"
     )
-    log_performance_summary()
-    perf = get_performance_for_email()
+    if not observe_only:
+        log_performance_summary()
+        perf = get_performance_for_email()
 
-    # Hypothetical always-open book — fully isolated from the real-trade
-    # ledger above. Update marks then snapshot for the email section.
-    update_hypothetical_trades()
-    hypothetical_perf = get_hypothetical_performance_for_email()
+        # Hypothetical always-open book — fully isolated from the real-trade
+        # ledger above. Update marks then snapshot for the email section.
+        update_hypothetical_trades()
+        hypothetical_perf = get_hypothetical_performance_for_email()
 
     # The per-run static HTML report has been retired in favour of the live
     # Plotly Dash dashboard (python main.py --dashboard), backed by DuckDB.
@@ -1063,7 +1148,14 @@ def run_pipeline(send_email: bool = False) -> None:
     _print_summary(actionable, smart_money or [])
 
     email_configured = bool(settings.smtp_user and settings.email_recipients)
-    if send_email or email_configured:
+    if observe_only:
+        logger.info("[pipeline] Observation tick — email skipped by design.")
+    elif not send_email and not email_if_configured:
+        logger.info(
+            "[pipeline] Email suppressed for this tick (the scheduler emails "
+            "from RTH slots only)."
+        )
+    elif send_email or email_configured:
         send_recommendations(
             actionable,
             total_analysed=len(all_tickers),

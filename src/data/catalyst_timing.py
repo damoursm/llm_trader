@@ -8,6 +8,15 @@ Three mechanisms
    trades around earnings highly unreliable.  The blackout covers both sides: we
    don't enter new longs or shorts into a catalyst that erases the edge.
 
+   Post-release exemption: when the PEAD context already carries a REPORTED
+   surprise for the ticker (actual EPS published, days_since_report ≤ 1), the
+   binary event has resolved — the calendar entry that still flags it as
+   "upcoming" is a stale/mismatched date (AMC reports are often recorded
+   next-day across feeds).  Blocking there would suppress exactly the trade
+   the system wants post-earnings: the PEAD drift / extended-hours reaction.
+   Matters most for the after-hours observation ticks that watch the reaction
+   form in real time.
+
 2. OpEx Max-Pain Amplifier
    During OpEx week (especially Triple Witching: Mar/Jun/Sep/Dec), market-makers
    with net-short options books exert demonstrably stronger gravitational pull toward
@@ -63,6 +72,7 @@ def compute_catalyst_context(
     signals_by_ticker: Optional[dict] = None,
     sectors_list: Optional[List[str]] = None,
     commodities_list: Optional[List[str]] = None,
+    pead_context=None,
 ) -> CatalystTimingContext:
     """
     Compute all three catalyst timing signals from already-fetched contexts.
@@ -76,21 +86,43 @@ def compute_catalyst_context(
     signals_by_ticker  : Dict[str, TickerSignal] — aggregated signals (for vol check)
     sectors_list       : sector ETF tickers (for Recommendation.type assignment)
     commodities_list   : commodity tickers (for Recommendation.type assignment)
+    pead_context       : PEADContext — reported surprises; exempts already-released
+                         reports from the blackout (the event has resolved)
     """
 
     # ── 1. Earnings Blackout ──────────────────────────────────────────────────
+    # PEAD signals are built from REPORTED actuals, so a fresh one proves the
+    # report is already out — the uncertainty the blackout protects against is
+    # gone, and PEAD/gap-reaction entries take over.
+    already_reported: set = set()
+    if pead_context is not None:
+        already_reported = {
+            s.ticker.upper() for s in pead_context.signals
+            if s.days_since_report <= 1
+        }
+
     blackout_tickers: List[str] = []
     blackout_details: Dict[str, int] = {}
+    blackout_exempted: List[str] = []
     if earnings_context is not None:
         for event in earnings_context.upcoming:
             if 0 <= event.days_until <= 2:
-                blackout_tickers.append(event.ticker.upper())
-                blackout_details[event.ticker.upper()] = event.days_until
+                t = event.ticker.upper()
+                if t in already_reported:
+                    blackout_exempted.append(t)
+                    continue
+                blackout_tickers.append(t)
+                blackout_details[t] = event.days_until
 
     if blackout_tickers:
         logger.info(
             f"[catalyst] Earnings blackout: {len(blackout_tickers)} ticker(s) blocked "
             f"(within 2 days of earnings) — {blackout_tickers}"
+        )
+    if blackout_exempted:
+        logger.info(
+            f"[catalyst] Earnings blackout exemption: {blackout_exempted} — "
+            "report already out (fresh PEAD actual); post-release drift is tradeable"
         )
 
     # ── 2. OpEx Max-Pain Amplifier ────────────────────────────────────────────

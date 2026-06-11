@@ -34,9 +34,10 @@ class DryRunBroker(Broker):
 
     def submit_order(self, req: OrderRequest) -> OrderResult:
         lmt = f" @≤{req.limit_price}" if req.order_type == "LMT" and req.limit_price else ""
+        ext = ", outsideRth" if req.outside_rth else ""
         logger.info(
             f"[broker:dry_run] WOULD {req.intent} {req.side} {req.quantity} {req.ticker} "
-            f"({req.order_type}{lmt}, ref={req.client_ref})"
+            f"({req.order_type}{lmt}{ext}, ref={req.client_ref})"
         )
         return OrderResult(
             ok=True, ticker=req.ticker, side=req.side, requested_qty=req.quantity,

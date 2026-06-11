@@ -17,7 +17,7 @@ from loguru import logger
 
 from config.settings import settings
 from src.broker.base import (
-    AccountSnapshot, Broker, FillSummary, OrderRequest, OrderResult, Position,
+    AccountSnapshot, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
 )
 
 
@@ -156,6 +156,12 @@ class IBKRBroker(Broker):
                 order = LimitOrder(req.side, req.quantity, req.limit_price)
             else:
                 order = MarketOrder(req.side, req.quantity)
+            if req.outside_rth:
+                # Extended-session eligibility. IBKR accepts this only on
+                # limit orders; the reconciler forces LMT off-hours, so a MKT
+                # falling through here would be an upstream bug surfaced by
+                # IBKR's reject (captured in OrderResult.error).
+                order.outsideRth = True
             if req.client_ref:
                 order.orderRef = req.client_ref      # idempotency / reconciliation tag
             if self.account:
@@ -249,3 +255,57 @@ class IBKRBroker(Broker):
                 if s.last_fill_at is None or iso > s.last_fill_at:
                     s.last_fill_at = iso
         return list(agg.values())
+
+    # ── working orders (duplicate guard + stale-unfilled cancel pass) ──────
+    def get_open_orders(self) -> List[OpenOrderInfo]:
+        """Working orders for this API client, keyed by orderRef (= client_ref).
+
+        ``openTrades()`` returns the orders this client id placed that have not
+        reached a terminal state — exactly the set the reconciler needs to
+        check "did my errored submission actually reach the broker?" and
+        "which resting orders are stale?".
+        """
+        if not self.is_connected():
+            return []
+        out: List[OpenOrderInfo] = []
+        try:
+            for tr in self._ib.openTrades():
+                ref = (getattr(tr.order, "orderRef", "") or "").strip()
+                if not ref:
+                    continue
+                out.append(OpenOrderInfo(
+                    client_ref=ref,
+                    order_id=str(tr.order.orderId),
+                    status=tr.orderStatus.status or "",
+                    ticker=from_ib_symbol(tr.contract.symbol),
+                    side=tr.order.action,
+                ))
+        except Exception as e:
+            logger.warning(f"[broker:ibkr] get_open_orders failed: {e}")
+        return out
+
+    def cancel_order(self, client_ref: str) -> bool:
+        """Cancel the working order tagged *client_ref*; True only on a
+        confirmed cancel. An order that fills during the cancel race returns
+        False — the caller leaves the trade leg intact and the fill-refresh
+        pass records the execution instead."""
+        if not self.is_connected() or not client_ref:
+            return False
+        try:
+            for tr in self._ib.openTrades():
+                if (getattr(tr.order, "orderRef", "") or "").strip() != client_ref:
+                    continue
+                self._ib.cancelOrder(tr.order)
+                for _ in range(5):
+                    self._ib.sleep(1)
+                    if tr.orderStatus.status in ("Cancelled", "ApiCancelled", "Filled"):
+                        break
+                ok = tr.orderStatus.status in ("Cancelled", "ApiCancelled")
+                logger.info(
+                    f"[broker:ibkr] cancel {client_ref}: status={tr.orderStatus.status} "
+                    f"({'confirmed' if ok else 'not cancelled'})"
+                )
+                return ok
+        except Exception as e:
+            logger.warning(f"[broker:ibkr] cancel_order {client_ref} failed: {e}")
+        return False

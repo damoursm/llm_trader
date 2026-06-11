@@ -123,20 +123,22 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
 # Per-trade daily P&L walk
 # ---------------------------------------------------------------------------
 
-def _effective_entry(entry_price: float, action: str, asset_type: str) -> float:
+def _effective_entry(entry_price: float, action: str, asset_type: str, session=None) -> float:
     """Cash basis paid (BUY) or received (SELL) per share, after the one-way
     transaction cost (bid-ask half-spread + commission — same figure
-    ``_pct_return`` charges, so both engines agree)."""
-    cost = _one_side_cost(entry_price, asset_type)
+    ``_pct_return`` charges, so both engines agree). ``session`` widens the
+    spread for an anchor struck outside RTH (None = rth — every pre-extended
+    record)."""
+    cost = _one_side_cost(entry_price, asset_type, session)
     if action == "BUY":
         return entry_price * (1 + cost)
     return entry_price * (1 - cost)
 
 
-def _effective_exit(exit_price: float, action: str, asset_type: str) -> float:
+def _effective_exit(exit_price: float, action: str, asset_type: str, session=None) -> float:
     """Cash basis received (BUY exit) or paid (SELL cover) per share, after the
     one-way transaction cost (half-spread + commission)."""
-    cost = _one_side_cost(exit_price, asset_type)
+    cost = _one_side_cost(exit_price, asset_type, session)
     if action == "BUY":
         return exit_price * (1 - cost)
     return exit_price * (1 + cost)
@@ -227,6 +229,23 @@ def _et_date_of_iso(iso_str) -> Optional[date]:
         return None
 
 
+def _session_of_mark(iso_str) -> Optional[str]:
+    """US-market session a live mark was struck in (``None`` → rth).
+
+    Keeps the open-trade end anchor's hypothetical exit cost consistent with
+    ``update_open_trades`` — both charge the spread of the session the mark
+    actually crossed. Cached closes (the fallback anchor) are RTH by
+    definition and never pass through here.
+    """
+    if not iso_str or "T" not in str(iso_str):
+        return None
+    try:
+        from src.performance.market_calendar import current_session
+        return current_session(datetime.fromisoformat(str(iso_str)))
+    except Exception:
+        return None
+
+
 def _build_marks(
     trade: dict,
     today: date,
@@ -268,7 +287,8 @@ def _build_marks(
         trade.get("entry_ref_close_date"),
         close_series,
     )
-    eff_entry = _effective_entry(float(entry_px), action, asset_type) * entry_adj
+    eff_entry = _effective_entry(float(entry_px), action, asset_type,
+                                 trade.get("entry_session")) * entry_adj
 
     # Determine end anchor (date + effective price)
     if trade.get("status") == "CLOSED":
@@ -284,7 +304,8 @@ def _build_marks(
             trade.get("exit_ref_close_date"),
             close_series,
         )
-        end_mark = _effective_exit(float(exit_px), action, asset_type) * exit_adj
+        end_mark = _effective_exit(float(exit_px), action, asset_type,
+                                   trade.get("exit_session")) * exit_adj
     else:
         # OPEN: prefer the live current mark so the equity curve reflects the
         # latest intraday (30-min) price the pipeline marked the position at.
@@ -298,7 +319,11 @@ def _build_marks(
                 end_d = today
             if end_d < entry_d:
                 end_d = entry_d
-            end_mark = _effective_exit(float(cur_px), action, asset_type)
+            # The live mark's hypothetical exit crosses whatever book the mark
+            # was struck in — an extended-tick mark bears the extended spread,
+            # matching update_open_trades' M2M return_pct.
+            end_mark = _effective_exit(float(cur_px), action, asset_type,
+                                       _session_of_mark(trade.get("current_price_datetime")))
         else:
             anchor = _open_trade_end_anchor(entry_d, today, close_series)
             if anchor is None:

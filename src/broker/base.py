@@ -28,6 +28,9 @@ class OrderRequest:
     limit_price: Optional[float] = None   # LMT only: marketable-limit cap price
     client_ref: str = ""      # idempotency key (the trade's recommendation_id → IBKR orderRef)
     intent: str = "ENTRY"     # "ENTRY" | "EXIT" — for logging/reconciliation only
+    outside_rth: bool = False # allow the order to trade in extended sessions
+                              # (IBKR: order.outsideRth; requires LMT — IBKR
+                              # rejects MKT outside regular hours)
 
 
 @dataclass
@@ -61,6 +64,22 @@ class AccountSnapshot:
     buying_power: float
     account_id: str = ""
     currency: str = "USD"                # base currency of the equity figure
+
+
+@dataclass
+class OpenOrderInfo:
+    """One working (not yet terminal) order at the broker, keyed by client_ref.
+
+    Produced by ``Broker.get_open_orders()`` so the reconciler can (a) verify
+    whether a submission that errored mid-flight actually reached the broker
+    before retrying — resubmitting blind would double the position — and
+    (b) find resting stale orders to cancel.
+    """
+    client_ref: str
+    order_id: Optional[str] = None
+    status: str = ""
+    ticker: str = ""
+    side: str = ""
 
 
 @dataclass
@@ -111,6 +130,21 @@ class Broker(ABC):
         reconciler's fill-refresh pass can repair stale fill/commission fields.
         """
         return []
+
+    def get_open_orders(self) -> List["OpenOrderInfo"]:
+        """Working (non-terminal) orders at the broker, keyed by client_ref.
+
+        Default: none. Used by the reconciler's duplicate guard before a
+        retry and by the stale-unfilled cancel pass.
+        """
+        return []
+
+    def cancel_order(self, client_ref: str) -> bool:
+        """Cancel the working order carrying *client_ref*. Returns True only
+        when the broker confirms the cancel — False when the order is unknown,
+        already terminal, or filled during the cancel race (the fill-refresh
+        pass picks that up). Default: unsupported."""
+        return False
 
     def disconnect(self) -> None:  # optional; default no-op
         return None
