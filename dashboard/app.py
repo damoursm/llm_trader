@@ -8,7 +8,7 @@ Single source of truth is DuckDB (read-only here). Launch with:
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 from dash import Dash, Input, Output, dash_table, dcc, html
@@ -166,7 +166,7 @@ _TRADE_COL_SPEC = [
     ("filled_qty", "Shares", None, "Shares actually filled at IBKR (real-executions view only)."),
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
     ("exit_price", "Exit $", _NUM2, "Fill price at exit. Blank while the position is open."),
-    ("days_held", "Days", None, "NYSE trading days held — exclusive of the entry day, inclusive of today; weekends and holidays don't count. Refreshed each tick for open positions, frozen at close for realised trades."),
+    ("held", "Held", None, "Wall-clock holding time: days + hours (e.g. 2d 5h), hours (6h), or minutes (45m) for the freshest entries. Open positions measure entry → now; closed ones entry → exit. Legacy date-only rows fall back to the trading-days count (Nd)."),
     ("return_pct", "Return %", _NUM2, "Spread-adjusted % return. For OPEN positions this is the live mark-to-market — 'what if you closed right now'."),
     ("position_size_multiplier", "Size ×", _NUM2, "Capital weight from the confidence tier (1.0× / 1.5× / 2.0×), after the correlation haircut."),
     ("filled_notional_usd", "Notional $", _NUM2, "Actual dollars at risk: filled shares × average fill price (real-executions view only)."),
@@ -590,6 +590,33 @@ def _methods_perf_section(window_days, session=None):
 
 # ── Tab 3: Returns ─────────────────────────────────────────────────────────
 
+def _held_disp(t: dict) -> str:
+    """Wall-clock holding time as a compact ``2d 5h`` / ``6h`` / ``45m`` string.
+
+    Open positions measure entry → now; closed ones entry → exit. Falls back
+    to the trading-days count (``Nd``) for legacy date-only rows. An entry
+    timestamp in the future (overnight decisions snap execution to the next
+    session open) clamps to 0.
+    """
+    def _parse(iso):
+        dt = datetime.fromisoformat(str(iso))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    try:
+        start = _parse(t.get("entry_datetime"))
+        end = _parse(t.get("exit_datetime")) if t.get("status") == "CLOSED" \
+            else datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        d = t.get("days_held")
+        return f"{int(d)}d" if d is not None else ""
+    minutes = max(0, int((end - start).total_seconds() // 60))
+    days, rem = divmod(minutes, 1440)
+    hours, mins = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    return f"{hours}h" if hours else f"{mins}m"
+
+
 def _ibkr_leg_disp(t: dict, prefix: str) -> str:
     """Compact label for one broker order leg ('broker_' / 'broker_exit_'):
     did the order really go through? Raw statuses are mapped to a handful of
@@ -635,6 +662,7 @@ def _trades_table(trades: list):
     # derived from entry_datetime for legacy rows (date-only → rth).
     from src.performance.tracker import _trade_session
     df["session"] = [t.get("entry_session") or _trade_session(t) for t in trades]
+    df["held"] = [_held_disp(t) for t in trades]
     # IBKR order-status columns — simulated view only: the IBKR view contains
     # filled orders by construction, so the columns would be all-✓ noise there.
     if not trades[0].get("broker_view"):
