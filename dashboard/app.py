@@ -568,12 +568,29 @@ def _methods_perf_section(window_days, session=None):
                 "Avg return %": st.get("avg_return"),
             })
 
+    # Held-positions prompt A/B — exit outcomes grouped by the per-run coin
+    # flip (does telling the LLM what the system holds improve closes?).
+    # Each trade's closing run stamped exit_hold_prompt; pre-experiment
+    # closes carry no stamp and are excluded from both rows.
+    hp = perf.get("hold_prompt_eval") or {}
+    for key, label in (("on", "Exit eval · hold-prompt ON"),
+                       ("off", "Exit eval · hold-prompt OFF")):
+        st = hp.get(key)
+        if st and st.get("trades"):
+            rows.append({
+                "Method": label,
+                "Win rate %": st.get("win_rate"),
+                "Trades": st.get("trades"),
+                "Avg return %": st.get("avg_return"),
+            })
+
     table = dash_table.DataTable(
         data=rows,
         columns=[{"name": c, "id": c} for c in ["Method", "Win rate %", "Trades", "Avg return %"]],
         tooltip_header=_METHOD_HEADER_TIPS,
         style_data_conditional=[
             {"if": {"filter_query": '{Method} contains "LLM"'}, "backgroundColor": "#eef2ff"},
+            {"if": {"filter_query": '{Method} contains "hold-prompt"'}, "backgroundColor": "#fdf4ff"},
         ],
         **_TABLE_KW,
     ) if rows else html.Div("No per-method stats in this window yet.", style={"color": "#6b7280"})

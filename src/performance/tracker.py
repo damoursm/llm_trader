@@ -1205,12 +1205,66 @@ def record_new_trades(
     return diag
 
 
-def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> int:
+def get_open_position_summaries() -> List[dict]:
+    """Compact snapshot of every OPEN trade for the held-positions prompt
+    block: ticker, direction, entry anchor, and the latest mark from the
+    previous tick (``update_open_trades`` runs after synthesis, so the mark
+    is ≤1 tick old — fine for a review prompt, labelled 'last mark')."""
+    out = []
+    for t in _load_trades():
+        if t.get("status") != "OPEN":
+            continue
+        out.append({
+            "ticker": t["ticker"],
+            "action": t.get("action"),
+            "entry_date": t.get("entry_date"),
+            "entry_price": t.get("entry_price"),
+            "current_price": t.get("current_price") or t.get("entry_price"),
+            "return_pct": t.get("return_pct") or 0.0,
+            "days_held": t.get("days_held") or 0,
+        })
+    return out
+
+
+def compute_hold_prompt_eval(trades: Optional[List[dict]] = None) -> dict:
+    """A/B outcome comparison for the held-positions prompt experiment.
+
+    Every trade CLOSED on a run carries that run's coin flip
+    (``exit_hold_prompt`` True/False, stamped by the two close paths). The
+    prompt can only influence exits directly through the synthesis →
+    actionable → signal-reversal path, but ALL closes are stamped so the
+    comparison also captures second-order effects (a reversal close today
+    preempts a decay close tomorrow). Returns ``{"on": stats, "off": stats}``
+    with the same row shape as the dashboard's LLM-engine rows; segments
+    with no data are None. Pre-experiment closes (no stamp) are excluded.
+    """
+    trades = trades if trades is not None else _load_trades()
+
+    def _seg(flag: bool) -> Optional[dict]:
+        seg = [t for t in trades
+               if t.get("status") == "CLOSED" and t.get("exit_hold_prompt") is flag]
+        if not seg:
+            return None
+        rets = [float(t.get("return_pct") or 0.0) for t in seg]
+        wins = sum(1 for r in rets if r > 0)
+        return {
+            "trades": len(seg),
+            "win_rate": round(100.0 * wins / len(seg), 1),
+            "avg_return": round(sum(rets) / len(rets), 2),
+        }
+
+    return {"on": _seg(True), "off": _seg(False)}
+
+
+def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
+                                    hold_prompt_active: Optional[bool] = None) -> int:
     """Close open trades whose direction has reversed in today's actionable recommendations.
 
     An open BUY is closed when an actionable SELL exists for the same ticker (and vice versa).
     Uses current_price already refreshed by update_open_trades() — no second fetch needed.
     The closed trade is immediately saved; record_new_trades() will then open the new leg.
+    ``hold_prompt_active`` is this run's held-positions-prompt coin flip, stamped on each
+    close as ``exit_hold_prompt`` for the A/B evaluation.
     """
     trades = _load_trades()
     today = date.today().isoformat()
@@ -1265,6 +1319,7 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"]) -> 
         trade["weighted_return_pct"]    = round(ret * mul, 3)
         trade["days_held"]              = _trading_days_held(trade["entry_date"])
         trade["exit_reason"]            = "signal_reversal"
+        trade["exit_hold_prompt"]       = hold_prompt_active
         closed += 1
         logger.info(
             f"[tracker] Signal reversal → closed {trade['action']} {trade['ticker']} "
@@ -1358,6 +1413,7 @@ def _evaluate_decay(
 def monitor_open_positions(
     signals_by_ticker: Optional[dict] = None,
     macro_regime_context=None,
+    hold_prompt_active: Optional[bool] = None,
 ) -> int:
     """For every open trade, compare today's signal to entry and close on
     deterioration. Returns the number of trades closed.
@@ -1432,6 +1488,7 @@ def monitor_open_positions(
         trade["weighted_return_pct"]    = round(ret * mul, 3)
         trade["days_held"]              = _trading_days_held(trade["entry_date"])
         trade["exit_reason"]            = reason
+        trade["exit_hold_prompt"]       = hold_prompt_active
         closed_count += 1
 
         # Decay logging: show entry vs today combined + effective conf floor for context
@@ -2541,6 +2598,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "timeline_svg":             timeline_svg,
         "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
         "llm_perf":                 llm_perf,                  # actual trades grouped by LLM engine (synthesis / sentiment)
+        "hold_prompt_eval":         compute_hold_prompt_eval(trades),  # held-positions prompt A/B (exit outcomes ON vs OFF)
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
         "oos_comparison":           oos_comparison,            # train vs holdout accuracy (honest OOS)
         "method_labels":            METHOD_LABELS,

@@ -146,6 +146,8 @@ def generate_recommendations(
     business_cycle_context=None,    # Optional[BusinessCycleContext]
     intermarket_context=None,       # Optional[IntermarketContext]
     macro_news_context=None,        # Optional[MacroNewsContext]
+    catalyst_timing_context=None,   # Optional[CatalystTimingContext]
+    open_positions=None,            # Optional[List[dict]] — held-position review block (A/B'd per run)
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
 ) -> List[Recommendation]:
     """
@@ -2241,6 +2243,88 @@ Effect on max pain gravity:
     Never use OpEx alone to initiate a BUY or SELL. It amplifies or discounts the max_pain_score
     sub-component only."""
 
+    # Build catalyst-timing context block and instruction (computed in the
+    # pipeline BEFORE this synthesis so the LLM reasons WITH the event
+    # calendar; the earnings-blackout gate and WATCH elevation are still
+    # enforced mechanically on the output afterwards).
+    catalyst_block        = ""
+    catalyst_instructions = ""
+    if catalyst_timing_context:
+        cx = catalyst_timing_context
+        blackout_lines = "\n".join(
+            f"  - {tk}: earnings in {d} day(s)"
+            for tk, d in sorted(cx.earnings_blackout_details.items())
+        ) or "  (none)"
+        setup_lines = "\n".join(
+            f"  + {s.ticker}: 8-K={'yes' if s.has_8k else 'no'}, "
+            f"insider buy={'yes' if s.has_insider_buy else 'no'}, "
+            f"volume spike={'yes' if s.has_vol_spike else 'no'} — {s.catalyst_reason}"
+            for s in cx.catalyst_setups
+        ) or "  (none)"
+        _boost = ("ACTIVE — triple witching" if cx.opex_is_triple_witching
+                  else "ACTIVE — OpEx week") if cx.opex_boost_active else "inactive"
+
+        catalyst_block = f"""
+<catalyst_timing_context>
+Event-driven catalyst timing — known calendar facts for this run:
+{cx.summary}
+
+Earnings blackout (report within ±2 days; binary-event risk — IV crush / gap risk erase the directional edge; a post-release PEAD exemption is already applied upstream):
+{blackout_lines}
+
+8-K + insider-buy catalyst setups (a fresh material filing AND an insider purchase on the same name — the highest-conviction pre-signal pattern in this system):
+{setup_lines}
+
+OpEx max-pain aggregator weight this run: {cx.opex_max_pain_weight:.2f} (boost {_boost}).
+</catalyst_timing_context>
+"""
+
+        catalyst_instructions = f"""
+26. Catalyst timing overlay (events known in advance — a WHEN modifier, never a WHICH-WAY signal):
+    - Earnings blackout tickers ({', '.join(cx.earnings_blackout_tickers) or 'none'}): do NOT issue BUY or SELL
+      on these. A mechanical gate strips them from the actionable set after you answer, so an actionable call
+      on a blackout name is a wasted top-10 slot. Use HOLD/WATCH with the earnings date in the rationale, or
+      spend the conviction on a cleaner setup.
+    - Catalyst setups ({', '.join(s.ticker for s in cx.catalyst_setups) or 'none'}): 8-K + insider buy together
+      is a strong pre-signal. When the ticker's other signals lean the same direction, let it raise your
+      conviction or at minimum issue a WATCH naming the catalyst. Never BUY on the setup alone.
+    - These are timing modifiers layered onto the per-ticker signals — direction must still come from the
+      signal stack and your synthesis."""
+
+    # Build held-positions review block and instruction. A/B'd per run by the
+    # pipeline (open_positions_prompt_share): half the runs the LLM knows what
+    # the system holds, half it stays blind — the coin flip is stamped on
+    # every trade closed that run so exit outcomes are comparable over time.
+    open_positions_block        = ""
+    open_positions_instructions = ""
+    if open_positions:
+        pos_lines = "\n".join(
+            f"  - {p['ticker']}: {'LONG (opened BUY)' if p.get('action') == 'BUY' else 'SHORT (opened SELL)'} "
+            f"since {p.get('entry_date')} ({int(p.get('days_held') or 0)} trading day(s)), "
+            f"entry {float(p.get('entry_price') or 0):.2f}, "
+            f"last mark {float(p.get('current_price') or 0):.2f} "
+            f"({float(p.get('return_pct') or 0.0):+.2f}% spread-adjusted)"
+            for p in open_positions
+        )
+        held_tickers = ", ".join(p["ticker"] for p in open_positions)
+        open_positions_block = f"""
+<open_positions_context>
+The system currently HOLDS these positions. Your recommendation for each of these tickers doubles as the hold/close review — the trading layer closes a position when an actionable counter-direction call appears, and otherwise keeps holding:
+{pos_lines}
+</open_positions_context>
+"""
+        open_positions_instructions = f"""
+27. Held-position review (currently held: {held_tickers}):
+    - ZERO endowment bias: judge each held ticker exactly as you would a fresh candidate today. The
+      position's existence tells you what the system believed at entry — it is NOT evidence the thesis
+      still holds, and defending it earns nothing.
+    - If the entry thesis has broken, say so plainly: an actionable counter-direction BUY/SELL closes
+      the position (signal reversal). A HOLD/WATCH keeps it open. Do not manufacture reasons to keep a
+      position, and do not flip direction merely because the mark is negative — judge the signals, not
+      the P&L.
+    - In the rationale for each held ticker, explicitly CONFIRM or CONTRADICT the held direction in one
+      clause (e.g. "held long thesis intact: …" / "held long thesis broken: …")."""
+
     # Build seasonality context block and instruction
     seasonality_block        = ""
     seasonality_instructions = ""
@@ -2744,7 +2828,7 @@ Your defining edge: you are ruthlessly disciplined about false positives. You un
 Signal sources available today: {methods_desc}
 
 Today's date: {fmt_et(now_et())}
-{session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}
+{session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}{catalyst_block}{open_positions_block}
 INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
@@ -2775,7 +2859,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}
+{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}{catalyst_instructions}{open_positions_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

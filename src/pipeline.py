@@ -1,6 +1,7 @@
 """Main analysis pipeline: fetch → analyse → recommend → notify."""
 
 import hashlib
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -64,7 +65,7 @@ from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, monitor_open_positions, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, monitor_open_positions, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -881,6 +882,43 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # Sector pairs: find ETF vs constituent divergences (market-neutral pair trades)
     sector_pairs_context = find_sector_pairs(signals_by_ticker)
 
+    # ── Step 4.5: Catalyst timing (computed BEFORE synthesis) ────────────
+    # Earnings blackout, OpEx amplifier state, and 8-K+insider setups are
+    # known facts at this point — the LLM should reason WITH them (don't
+    # spend a BUY on a blackout ticker; weigh a catalyst setup) instead of
+    # being silently vetoed afterwards. The hard enforcement stays below:
+    # WATCH elevation on the ranked top-10 and the earnings-blackout gate on
+    # the actionable set are mechanical guarantees, not LLM suggestions.
+    catalyst_timing_context = None
+    if settings.enable_catalyst_timing:
+        catalyst_timing_context = compute_catalyst_context(
+            earnings_context=earnings_context,
+            opex_context=opex_context,
+            articles=articles,
+            insider_trades=insider_trades,
+            signals_by_ticker=signals_by_ticker,
+            sectors_list=settings.sectors_list,
+            commodities_list=settings.commodities_list,
+            pead_context=pead_context,
+        )
+
+    # ── Step 4.6: held-positions prompt A/B (coin flip per run) ──────────
+    # 50/50 experiment: half the runs tell the LLM which tickers the system
+    # currently holds (plus a zero-endowment-bias review instruction), half
+    # leave it blind (the pre-experiment behavior). The flip is stamped on
+    # every trade CLOSED this run (exit_hold_prompt) so the dashboard's
+    # method-evaluation table accumulates an exit-outcome comparison.
+    open_position_summaries = get_open_position_summaries()
+    hold_prompt_active = bool(open_position_summaries) and (
+        random.random() < float(settings.open_positions_prompt_share)
+    )
+    if open_position_summaries:
+        logger.info(
+            f"[hold_prompt] {'ON' if hold_prompt_active else 'OFF'} this run "
+            f"(share={settings.open_positions_prompt_share:g}, "
+            f"{len(open_position_summaries)} open position(s))"
+        )
+
     # ── Step 5: Generate recommendations ─────────────────────────────────
     logger.info("Step 5: Generating recommendations...")
     recommendations = generate_recommendations(
@@ -913,6 +951,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         business_cycle_context=business_cycle_context,
         intermarket_context=intermarket_context,
         macro_news_context=macro_news_context,
+        catalyst_timing_context=catalyst_timing_context,
+        open_positions=open_position_summaries if hold_prompt_active else None,
         session=run_session,
     )
 
@@ -951,21 +991,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             f"+{settings.extended_confidence_bump:.0%} → {_confidence_threshold:.0%}"
         )
 
-    # Catalyst timing — earnings blackout, OpEx amplifier already applied in build_signals,
-    # now apply WATCH elevation (8-K + insider buy) and earnings blackout on actionable
-    catalyst_timing_context = None
-    if settings.enable_catalyst_timing:
-        catalyst_timing_context = compute_catalyst_context(
-            earnings_context=earnings_context,
-            opex_context=opex_context,
-            articles=articles,
-            insider_trades=insider_trades,
-            signals_by_ticker=signals_by_ticker,
-            sectors_list=settings.sectors_list,
-            commodities_list=settings.commodities_list,
-            pead_context=pead_context,
-        )
-        # Apply WATCH elevation to the top-10 recommendations
+    # Catalyst timing enforcement — the context was computed BEFORE synthesis
+    # (Step 4.5) and the LLM already saw it; here the mechanical guarantees
+    # run regardless of what the LLM did with the information: WATCH
+    # elevation on the ranked top-10, earnings blackout on actionable below.
+    if catalyst_timing_context is not None:
         recommendations = apply_watch_elevation(
             recommendations,
             catalyst_timing_context,
@@ -992,6 +1022,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "session":                      run_session,
         "regime":                       (macro_regime_context.regime
                                           if macro_regime_context else "NEUTRAL"),
+        "hold_prompt_active":           hold_prompt_active,
+        "hold_prompt_n_positions":      len(open_position_summaries),
     }
 
     actionable: List = []
@@ -1053,8 +1085,10 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
+            hold_prompt_active=hold_prompt_active,
         )
-        close_trades_on_signal_reversal(actionable)   # exit early if signal reversed
+        close_trades_on_signal_reversal(               # exit early if signal reversed
+            actionable, hold_prompt_active=hold_prompt_active)
         # Stamp each new trade with the exact LLM engines in use this run (final-call
         # synthesis model + run-dominant sentiment scorer) for per-LLM attribution.
         _synth_meta = get_last_synthesis_meta()
@@ -1152,8 +1186,9 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         logger.info("[pipeline] Observation tick — email skipped by design.")
     elif not send_email and not email_if_configured:
         logger.info(
-            "[pipeline] Email suppressed for this tick (the scheduler emails "
-            "from RTH slots only)."
+            "[pipeline] Email suppressed for this tick (per-slot scheduler "
+            "decision: with scheduler_email_every_tick off, only the 16:00 "
+            "closing slot emails)."
         )
     elif send_email or email_configured:
         send_recommendations(

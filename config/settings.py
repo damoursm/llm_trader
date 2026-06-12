@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     # behavior); 0.0 = always DeepSeek-first.
     llm_ab_anthropic_share: float = 0.5
 
+    # Held-positions prompt A/B — probability that a run includes the
+    # <open_positions_context> block (the system's current holdings + a
+    # zero-endowment-bias review instruction) in the synthesis prompt.
+    # Re-flipped once per run; the flip is stamped on every trade CLOSED that
+    # run (exit_hold_prompt) so the dashboard's method-evaluation table can
+    # compare exit outcomes prompt-ON vs prompt-OFF over time. 0.5 = even
+    # split for the experiment; 1.0 = always include; 0.0 = never (the LLM
+    # stays blind to holdings, the pre-experiment behavior).
+    open_positions_prompt_share: float = 0.5
+
     # Polygon.io market data (primary source for equity/ETF price + OHLCV)
     # Free API key: https://polygon.io — no credit card, works globally.
     # If absent, the pipeline falls back to yfinance for all market data.
