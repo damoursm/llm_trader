@@ -166,10 +166,13 @@ _TRADE_COL_SPEC = [
     ("filled_qty", "Shares", None, "Shares actually filled at IBKR (real-executions view only)."),
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
     ("exit_price", "Exit $", _NUM2, "Fill price at exit. Blank while the position is open."),
+    ("days_held", "Days", None, "NYSE trading days held — exclusive of the entry day, inclusive of today; weekends and holidays don't count. Refreshed each tick for open positions, frozen at close for realised trades."),
     ("return_pct", "Return %", _NUM2, "Spread-adjusted % return. For OPEN positions this is the live mark-to-market — 'what if you closed right now'."),
     ("position_size_multiplier", "Size ×", _NUM2, "Capital weight from the confidence tier (1.0× / 1.5× / 2.0×), after the correlation haircut."),
     ("filled_notional_usd", "Notional $", _NUM2, "Actual dollars at risk: filled shares × average fill price (real-executions view only)."),
     ("status", "Status", None, "OPEN (held, live mark) or CLOSED (realised)."),
+    ("broker_entry", "IBKR entry", None, "Did the entry order really execute at the broker? ✓ filled (shares) · ⏳ working / partial · ↻ re-anchoring (tick-scoped cancel; resubmits at the current mark) · ✕ cancelled · ✗ rejected/failed · – never sent (broker off, duplicate twin, sizing skip, or pre-broker history). Simulated view only — the IBKR view contains only filled orders by construction."),
+    ("broker_exit", "IBKR exit", None, "Same for the closing order. ⏳ pending = the ledger closed the trade and the exit goes out on the next sync. Blank while the position is open."),
 ]
 
 # Method Performance table — header explanations (table is built inline below).
@@ -587,6 +590,39 @@ def _methods_perf_section(window_days, session=None):
 
 # ── Tab 3: Returns ─────────────────────────────────────────────────────────
 
+def _ibkr_leg_disp(t: dict, prefix: str) -> str:
+    """Compact label for one broker order leg ('broker_' / 'broker_exit_'):
+    did the order really go through? Raw statuses are mapped to a handful of
+    glyph-led states so the column scans at a glance."""
+    status = str(t.get(f"{prefix}status") or "").strip()
+    if not status:
+        if prefix == "broker_exit_" and t.get("broker_order_id") and t.get("status") == "CLOSED":
+            return "⏳ pending"     # ledger closed; the exit goes out next sync
+        return "" if (prefix == "broker_exit_" and t.get("status") == "OPEN") else "–"
+    qty = int(t.get(f"{prefix}fill_qty") or 0)
+    req = int(t.get(f"{prefix}requested_qty") or 0)
+    if status == "Filled":
+        return f"✓ filled {qty}" if qty else "✓ filled"
+    if status in ("Submitted", "PreSubmitted", "PendingSubmit"):
+        return f"⏳ partial {qty}/{req}" if qty else "⏳ working"
+    if status in ("STALE_CANCELLED", "EXPIRED"):
+        return "↻ re-anchoring"     # tick-scoped cancel; resubmits at the current mark
+    if status == "DUPLICATE_REF_NOT_SUBMITTED":
+        return "– duplicate, not sent"
+    if status == "NOTHING_TO_CLOSE":
+        return "– nothing held"
+    if status == "DRYRUN":
+        return "dry-run"
+    if status.upper().startswith("SKIPPED"):
+        return "– " + status.replace("_", " ").lower()
+    if status in ("Cancelled", "ApiCancelled", "Inactive"):
+        reason = t.get(f"{prefix}cancel_reason")
+        return f"✕ cancelled ({reason})" if reason else "✕ cancelled"
+    if status in ("RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED"):
+        return "restored"
+    return f"✗ {status}"            # rejects / connection failures / raw errors
+
+
 def _trades_table(trades: list):
     if not trades:
         return html.Div("None.", style={"color": "#6b7280", "marginBottom": 12})
@@ -599,6 +635,11 @@ def _trades_table(trades: list):
     # derived from entry_datetime for legacy rows (date-only → rth).
     from src.performance.tracker import _trade_session
     df["session"] = [t.get("entry_session") or _trade_session(t) for t in trades]
+    # IBKR order-status columns — simulated view only: the IBKR view contains
+    # filled orders by construction, so the columns would be all-✓ noise there.
+    if not trades[0].get("broker_view"):
+        df["broker_entry"] = [_ibkr_leg_disp(t, "broker_") for t in trades]
+        df["broker_exit"] = [_ibkr_leg_disp(t, "broker_exit_") for t in trades]
     spec = [t for t in _TRADE_COL_SPEC if t[0] in df.columns]
     df = df[[s[0] for s in spec]]
     return dash_table.DataTable(
