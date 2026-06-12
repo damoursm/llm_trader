@@ -655,10 +655,14 @@ class Settings(BaseSettings):
     # "@MM" per-window cadence override). Default covers the FULL extended day
     # 04:00–20:00: the liquid shoulders (07:00–09:30 pre-market ramp,
     # 16:00–17:30 earnings-reaction window) tick every extended_tick_minutes;
-    # the thin dead zones (04:00–07:00, 18:00–20:00) tick hourly — spreads
+    # the thin dead zones (04:00–07:00, 18:00–19:00) tick hourly — spreads
     # there are widest and the evidence value per LLM dollar lowest, and the
     # hourly cadence matches the news cache TTL so each tick sees fresh news.
-    extended_windows: str = "04:00-07:00@60,07:00-09:30,16:00-17:30,18:00-20:00@60"
+    # The LAST slot is 19:55, not 20:00: the pipeline needs ~4 min from tick
+    # to order submission, so a 20:00 slot's orders reached IBKR ~20:03 —
+    # AFTER the extended session closed — and could never fill same-day.
+    # 19:55 leaves the orders a live book to trade against before the close.
+    extended_windows: str = "04:00-07:00@60,07:00-09:30,16:00-17:30,18:00-19:00@60,19:55-19:55"
     extended_tick_minutes: int = 30
     # Bid-ask half-spread multipliers outside RTH (commission is session-
     # independent — only the spread term widens). Rough placeholders to be
@@ -786,7 +790,15 @@ class Settings(BaseSettings):
     #           exceeded rests unfilled and is repaired by the fill-refresh pass on
     #           later ticks instead of filling arbitrarily far from the model.
     broker_order_type: str = "MKT"                # "MKT" | "LMT"
-    broker_limit_cap_bps: float = 20.0            # LMT only: max adverse distance from model price
+    broker_limit_cap_bps: float = 20.0            # LMT only: max adverse distance from model price (RTH)
+    # Off-RTH the book is thin and the REAL spread is ~4× wider (the sim's own
+    # cost model charges 4× extended / 10× overnight half-spreads) — a 20 bp
+    # cap sits INSIDE the extended spread, so every off-RTH order rests
+    # unfilled, is cancelled next tick and chases the market on stale data.
+    # A wider extended cap keeps off-RTH orders genuinely marketable: fill in
+    # the decision tick at the current (wide) spread rather than later at a
+    # drifted price.
+    broker_limit_cap_bps_extended: float = 80.0   # LMT cap outside regular hours
     broker_paper_equity: float = 100000.0         # USD equity used for the exposure cap in dry_run
 
     # ── Order-submission reliability (acceptance check + bounded retry) ──
@@ -803,11 +815,18 @@ class Settings(BaseSettings):
     # reached the broker, and resubmitting blind would double the position.
     broker_submit_retries: int = 2        # transient retries per order (0 = off)
     broker_retry_wait_seconds: int = 5    # pause before each retry (reconnect window)
-    # An ACCEPTED order still resting unfilled after this many minutes (its
-    # price cap was never reached — the market moved away) is cancelled and
-    # resubmitted re-anchored at the current mark, so the broker book
-    # re-syncs with the sim in bounded ≤cap steps instead of resting at a
-    # stale price indefinitely. Partial fills are left working. 0 = never.
+    # ── Order lifetime: tick-scoped (default) or age-based ──────────────
+    # Tick-scoped (True): an order lives exactly one tick. Any order still
+    # unfilled at the next sync is cancelled and re-decided from THIS tick's
+    # data — entries resubmit only if the trade survived this tick's signal
+    # pass (monitor_open_positions runs first), re-anchored at the current
+    # mark; exits always resubmit re-anchored. No order ever works the book
+    # on a previous tick's price. False: legacy age rule below.
+    broker_tick_scoped_orders: bool = True
+    # Age fallback (used when tick-scoped is False; also an upper bound when
+    # True): an ACCEPTED order resting unfilled this many minutes is
+    # cancelled and resubmitted re-anchored at the current mark. Partial
+    # fills are left working. 0 = never (no age rule).
     broker_unfilled_cancel_minutes: int = 90
 
     # ── Drift auto-reconciliation ────────────────────────────────────────

@@ -163,10 +163,12 @@ _TRADE_COL_SPEC = [
     ("entry_dt", "Entry (ET)", None, "When the position was opened, in US/Eastern time."),
     ("session", "Session", None, "US-market session the position was ENTERED in: rth (09:30–16:00 ET), extended (pre-market 04:00–09:30 + after-hours 16:00–20:00), or overnight (20:00–04:00). Extended entries are sized down and bear the wider extended spread in their return."),
     ("entry_price", "Entry $", _NUM2, "Fill price at entry (the bid-ask spread is applied in the return, not here)."),
+    ("filled_qty", "Shares", None, "Shares actually filled at IBKR (real-executions view only)."),
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
     ("exit_price", "Exit $", _NUM2, "Fill price at exit. Blank while the position is open."),
     ("return_pct", "Return %", _NUM2, "Spread-adjusted % return. For OPEN positions this is the live mark-to-market — 'what if you closed right now'."),
     ("position_size_multiplier", "Size ×", _NUM2, "Capital weight from the confidence tier (1.0× / 1.5× / 2.0×), after the correlation haircut."),
+    ("filled_notional_usd", "Notional $", _NUM2, "Actual dollars at risk: filled shares × average fill price (real-executions view only)."),
     ("status", "Status", None, "OPEN (held, live mark) or CLOSED (realised)."),
 ]
 
@@ -460,6 +462,44 @@ def _session_value(value):
     return None if value in (None, "all") else value
 
 
+# ── Trade-source toggle (simulated ledger vs actual IBKR fills) ──────────────
+_SOURCE_OPTIONS = [
+    {"label": "Simulated (model)", "value": "sim"},
+    {"label": "IBKR (actual fills)", "value": "broker"},
+]
+
+
+def _source_toggle(component_id: str) -> html.Div:
+    """Two books, one toggle. Simulated = the strategy ledger (every decision at
+    its decision price through the modeled cost stack). IBKR = only orders that
+    actually filled, at real fill prices with real commissions."""
+    return html.Div(
+        [
+            html.Label("Trades:  ",
+                       title="Simulated (model): every decision the strategy made, priced at decision time with modeled spread + commission costs — strategy quality, independent of execution. "
+                             "IBKR (actual fills): only orders that really filled at the broker, at actual average fill prices with the commissions actually charged — execution reality, no modeled costs. "
+                             "The gap between the two views is the execution gap: slippage, unfilled or expired orders, and sizing rounding.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_SOURCE_OPTIONS, value="sim", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _usd(x, signed: bool = True) -> str:
+    if x is None:
+        return "–"
+    try:
+        return f"${x:+,.2f}" if signed else f"${x:,.2f}"
+    except (TypeError, ValueError):
+        return str(x)
+
+
 # ── Tab 2: Method Performance ──────────────────────────────────────────────
 
 def _methods_tab():
@@ -576,6 +616,7 @@ def _trades_table(trades: list):
 
 def _returns_tab():
     return html.Div([
+        _source_toggle("returns-source"),
         _window_toggle("returns-window"),
         _session_toggle("returns-session"),
         dcc.Loading(html.Div(id="returns-body")),
@@ -583,9 +624,73 @@ def _returns_tab():
 
 
 @app.callback(Output("returns-body", "children"),
-              Input("returns-window", "value"), Input("returns-session", "value"))
-def _returns_body(window_value, session_value):
+              Input("returns-window", "value"), Input("returns-session", "value"),
+              Input("returns-source", "value"))
+def _returns_body(window_value, session_value, source_value):
+    if (source_value or "sim") == "broker":
+        return _safe(lambda: _broker_returns_section(window_value, session_value))
     return _safe(lambda: _returns_section(window_value, session_value))
+
+
+def _broker_returns_section(window_value, session_value=None):
+    """The IBKR view: what actually executed, at actual prices and commissions.
+    Dollar P&L leads — real fills have real notionals, so percentages alone
+    hide sizing. No modeled costs anywhere in this view."""
+    from datetime import date, timedelta
+    from src.performance.broker_view import summarize_broker_trades
+
+    trades = data.broker_trades()
+    wd = _window_days(window_value)
+    if wd:
+        cutoff = (date.today() - timedelta(days=wd)).isoformat()
+        trades = [t for t in trades if str(t.get("entry_date") or "") >= cutoff]
+    sess = _session_value(session_value)
+    if sess:
+        trades = [t for t in trades if (t.get("entry_session") or "rth") == sess]
+    if not trades:
+        return html.Div(
+            "No IBKR fills recorded in this window yet — either broker_mode is "
+            "off/dry_run, or no submitted order has filled.",
+            style={"color": "#6b7280", "padding": 20})
+
+    s = summarize_broker_trades(trades)
+    # "Size ×" is a sim concept; in this view the dedicated Shares/Notional
+    # columns carry the real sizing, so drop the multiplier from the tables.
+    strip = lambda ts: [{k: v for k, v in t.items() if k != "position_size_multiplier"} for t in ts]
+    open_trades = strip(sorted((t for t in trades if t["status"] == "OPEN"),
+                               key=lambda t: str(t.get("entry_datetime") or ""), reverse=True))
+    closed_trades = strip(sorted((t for t in trades if t["status"] == "CLOSED"),
+                                 key=lambda t: str(t.get("exit_datetime") or ""), reverse=True))
+
+    cards = html.Div(
+        [
+            _kpi("Realized P&L", _usd(s.get("realized_pnl_usd")),
+                 figures.POS if (s.get("realized_pnl_usd") or 0) >= 0 else figures.NEG,
+                 tooltip="Sum over closed fills: signed price move × shares filled, minus the commissions IBKR actually charged. No modeled costs."),
+            _kpi("Open P&L", _usd(s.get("unrealized_pnl_usd")),
+                 figures.POS if (s.get("unrealized_pnl_usd") or 0) >= 0 else figures.NEG,
+                 tooltip="Mark-to-market of positions still held at the broker, vs their actual entry fills, minus entry commissions (exit cost unknown until it happens)."),
+            _kpi("Win rate", _pct(s.get("win_rate")),
+                 tooltip="Share of CLOSED broker round-trips with a positive net return on actual fills."),
+            _kpi("Avg return", _pct(s.get("avg_return"), signed=True),
+                 tooltip="Mean per-round-trip % return on actual fill prices net of actual commissions, equal-weighted."),
+            _kpi("Commissions", _usd(s.get("commissions_usd"), signed=False),
+                 tooltip="Total commissions IBKR actually charged on these fills (exit legs counted once filled)."),
+            _kpi("Closed / Open", f"{s.get('closed', 0)} / {s.get('open', 0)}",
+                 tooltip="Broker round-trips completed vs positions genuinely still held at the broker (a ledger-closed trade whose exit hasn't filled is still OPEN here)."),
+        ],
+        style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+    )
+
+    return html.Div([
+        cards,
+        _h3("Open broker positions",
+            "Shares genuinely held at IBKR right now (entry filled; exit not filled yet — even if the simulated ledger already closed the trade), marked at the latest price."),
+        _trades_table(open_trades),
+        _h3("Closed broker round-trips",
+            "Entry and exit both filled at IBKR. Returns are computed on the actual average fill prices, net of the commissions actually charged."),
+        _trades_table(closed_trades),
+    ])
 
 
 def _returns_section(window_value, session_value=None):

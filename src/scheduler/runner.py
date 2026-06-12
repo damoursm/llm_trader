@@ -91,7 +91,10 @@ def _parse_windows(spec: str) -> list[tuple[_time, _time, int | None]]:
 
     The optional ``@MM`` suffix overrides the tick cadence for that window
     (None = use ``extended_tick_minutes``) so thin dead zones can tick less
-    often than the liquid shoulders. Bad tokens are skipped with a warning.
+    often than the liquid shoulders. A window with equal endpoints
+    (``19:55-19:55``) is a SINGLE slot at exactly that time — used to place
+    the last after-hours tick early enough that its orders can still fill
+    before the 20:00 session close. Bad tokens are skipped with a warning.
     """
     out: list[tuple[_time, _time, int | None]] = []
     for tok in str(spec or "").split(","):
@@ -111,7 +114,7 @@ def _parse_windows(spec: str) -> list[tuple[_time, _time, int | None]]:
         if rng.count("-") == 1:
             a, b = rng.split("-")
             start, end = _parse_hhmm(a, None), _parse_hhmm(b, None)
-        if start is None or end is None or start >= end:
+        if start is None or end is None or start > end:
             logger.warning(f"[scheduler] ignoring bad extended window: {tok!r}")
             continue
         out.append((start, end, step))
@@ -158,16 +161,17 @@ def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
 
     observe    — True only for extended slots while NOT in "trade" mode
                  (Phase 0 observation; "trade" runs them as full ticks).
-    send_email — True only for RTH slots (the closing one, or every RTH tick
-                 when scheduler_email_every_tick). Extended slots never email
-                 in any mode: after-hours slots are past 16:00, so a plain
-                 time>=close check would re-send the daily report every
-                 extended trading tick.
+    send_email — with ``scheduler_email_every_tick`` on, EVERY slot emails —
+                 RTH and extended alike (extended ticks are full trading ticks,
+                 so their report is as real as an RTH one). With it off, only
+                 the closing RTH slot sends the daily report (the ``kind``
+                 gate matters there: after-hours slots are past 16:00, so a
+                 plain time>=close check would re-send it every extended tick).
     """
     mode = (settings.extended_hours_mode or "off").lower()
     observe = kind == "extended" and mode != "trade"
-    send_email = kind == "rth" and (
-        settings.scheduler_email_every_tick or (slot_t >= end_t)
+    send_email = settings.scheduler_email_every_tick or (
+        kind == "rth" and slot_t >= end_t
     )
     return observe, send_email
 
@@ -251,8 +255,9 @@ def start_scheduler() -> None:
                     )
                     try:
                         # email_if_configured=False: the per-slot send_email
-                        # decision is authoritative for scheduled ticks —
-                        # extended trading ticks never re-send the report.
+                        # decision is authoritative for scheduled ticks
+                        # (every slot when scheduler_email_every_tick, else
+                        # the 16:00 closing report only).
                         run_pipeline(send_email=send_email, observe_only=observe,
                                      email_if_configured=False)
                     except Exception as exc:  # never let one tick kill the loop

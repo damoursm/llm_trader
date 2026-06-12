@@ -55,6 +55,10 @@ def repo_store(monkeypatch):
     monkeypatch.setattr(settings, "broker_base_notional", 500.0)
     # Patch FX so tests never hit the network (1.0 = treat base notional as USD).
     monkeypatch.setattr(rec, "usd_per_unit", lambda ccy: 1.0)
+    # Deterministic session: caps and order typing are session-aware, so pin
+    # RTH regardless of the wall-clock the suite runs at.
+    from src.performance import market_calendar
+    monkeypatch.setattr(market_calendar, "current_session", lambda now=None: "rth")
     return store
 
 
@@ -193,6 +197,23 @@ def test_limit_order_sell_caps_below_model(repo_store, monkeypatch):
     b = FakeBroker()
     rec.sync(broker=b)
     assert b.orders[0].limit_price == pytest.approx(99.80)
+
+
+def test_limit_cap_widens_off_rth(repo_store, monkeypatch):
+    """Off-RTH the 20 bp RTH cap sits INSIDE the ~4× wider extended spread —
+    the order would rest unfilled every time. The session-aware cap keeps
+    off-RTH orders genuinely marketable in their decision tick."""
+    from src.performance import market_calendar
+    monkeypatch.setattr(market_calendar, "current_session", lambda now=None: "extended")
+    monkeypatch.setattr(settings, "broker_order_type", "LMT")
+    monkeypatch.setattr(settings, "broker_limit_cap_bps", 20.0)
+    monkeypatch.setattr(settings, "broker_limit_cap_bps_extended", 80.0)
+    repo_store["trades"] = [_open_trade("AAPL")]              # model 100.0
+    b = FakeBroker()
+    rec.sync(broker=b)
+    req = b.orders[0]
+    assert req.order_type == "LMT" and req.outside_rth
+    assert req.limit_price == pytest.approx(100.80)           # +80 bps extended cap
 
 
 def test_fill_refresh_repairs_stale_entry(repo_store):

@@ -2873,6 +2873,13 @@ Return ALL tickers from the input. No markdown, JSON only."""
         for r in data
     ]
 
+    # An LLM response can repeat a ticker (DeepSeek, 2026-06-11 16:30 tick:
+    # XLE/SPY/ITA/USO twice each). Downstream consumers assume one
+    # recommendation per ticker — duplicates flowed into two identical ledger
+    # trades, two broker entries under one orderRef, and two full-position
+    # exits that flipped the account short. Keep the first occurrence only.
+    recommendations = _dedupe_recommendations(recommendations, analyst_source)
+
     # Guarantee every signal ticker got a recommendation.
     # Tickers dropped by truncation (or simply omitted) fall back to rule-based logic
     # so open positions always receive a HOLD/SELL signal and nothing falls silent.
@@ -2892,6 +2899,27 @@ Return ALL tickers from the input. No markdown, JSON only."""
     )
     logger.info(f"Generated {len(recommendations)} recommendations via {analyst_source}")
     return recommendations
+
+
+def _dedupe_recommendations(recommendations: List[Recommendation],
+                            source: str) -> List[Recommendation]:
+    """Drop repeated tickers from a parsed LLM response, keeping the FIRST
+    occurrence of each. Conflicting later duplicates (even with a different
+    action) are discarded — one ticker, one recommendation."""
+    seen: set = set()
+    out: List[Recommendation] = []
+    for r in recommendations:
+        if r.ticker in seen:
+            continue
+        seen.add(r.ticker)
+        out.append(r)
+    if len(out) < len(recommendations):
+        logger.warning(
+            f"[claude] {source} response repeated {len(recommendations) - len(out)} "
+            "recommendation(s) for already-covered tickers — keeping the first "
+            "occurrence of each"
+        )
+    return out
 
 
 def _fallback_recommendations(signals: List[TickerSignal]) -> List[Recommendation]:

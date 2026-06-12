@@ -975,6 +975,8 @@ def record_new_trades(
     today = date.today().isoformat()
 
     # Prevent stacking: skip any ticker that already has an OPEN position.
+    # Tickers opened later in THIS loop are added too, so a recommendations
+    # list that repeats a ticker (duplicate LLM output) opens it exactly once.
     already_open = {t["ticker"] for t in trades if t["status"] == "OPEN"}
 
     # Running per-direction list of OPEN positions for correlation sizing.
@@ -1180,6 +1182,7 @@ def record_new_trades(
             "pattern_score_at_entry": pattern_score_at_entry,
         }
         trades.append(new_trade)
+        already_open.add(rec.ticker)
         # Register the just-opened trade as a same-direction peer so the next
         # candidate in this batch sees it for correlation purposes.
         opens_by_direction.setdefault(rec.action, []).append(new_trade)

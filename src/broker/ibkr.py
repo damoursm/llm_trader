@@ -133,6 +133,20 @@ class IBKRBroker(Broker):
             return []
         out: List[Position] = []
         try:
+            # ``ib.positions()`` reads a subscription cache that only advances
+            # while the event loop runs — on the long-lived singleton
+            # connection it can be a full tick stale by sync time (a flatten
+            # that filled after the previous tick's last pump still shows as
+            # held, and the drift pass would flatten it AGAIN, flipping the
+            # position). A blocking re-request drains the queued events and
+            # waits for positionEnd before we read.
+            try:
+                self._ib.reqPositions()
+            except Exception as e:
+                logger.warning(
+                    f"[broker:ibkr] reqPositions refresh failed — reading "
+                    f"cached positions: {e}"
+                )
             for p in self._ib.positions(self.account or ""):
                 out.append(Position(
                     ticker=from_ib_symbol(p.contract.symbol),

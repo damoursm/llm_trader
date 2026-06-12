@@ -36,13 +36,17 @@ def test_tick_plan(monkeypatch, mode, kind, slot, want_observe, want_email):
     assert (observe, send_email) == (want_observe, want_email)
 
 
-def test_tick_plan_email_every_tick_is_rth_only(monkeypatch):
-    """The debug email-every-tick flag must not leak into extended slots."""
+def test_tick_plan_email_every_tick_covers_all_slots(monkeypatch):
+    """With email_every_tick on, EVERY slot emails — extended included
+    (extended ticks are full trading ticks, their report is as real as an
+    RTH one). With it off (parametrized test above), only the 16:00 closing
+    RTH slot sends the daily report."""
     monkeypatch.setattr(settings, "extended_hours_mode", "trade")
     monkeypatch.setattr(settings, "scheduler_email_every_tick", True)
     from src.scheduler.runner import _tick_plan
     assert _tick_plan("rth", time(10, 0), time(16, 0)) == (False, True)
-    assert _tick_plan("extended", time(17, 0), time(16, 0)) == (False, False)
+    assert _tick_plan("extended", time(17, 0), time(16, 0)) == (False, True)
+    assert _tick_plan("extended", time(4, 0), time(16, 0)) == (False, True)
 
 
 # ── _execution_iso: extended fills are real fills in trade mode ───────────
@@ -199,6 +203,7 @@ def _broker_env(monkeypatch, session: str):
     monkeypatch.setattr(settings, "broker_mode", "ibkr_paper")
     monkeypatch.setattr(settings, "broker_order_type", "MKT")   # RTH default stays MKT
     monkeypatch.setattr(settings, "broker_limit_cap_bps", 20.0)
+    monkeypatch.setattr(settings, "broker_limit_cap_bps_extended", 80.0)
     monkeypatch.setattr(settings, "broker_base_notional_ccy", "USD")
     monkeypatch.setattr(settings, "broker_base_notional", 1000.0)
     monkeypatch.setattr(settings, "broker_sizing_mode", "notional")
@@ -220,8 +225,10 @@ def test_reconcile_extended_session_forces_lmt_outside_rth(monkeypatch):
     req = fake.requests[0]
     assert req.order_type == "LMT"
     assert req.outside_rth is True
-    # BUY cap: 100 x (1 + 20 bp) = 100.20, rounded away from the model.
-    assert req.limit_price == pytest.approx(100.20, abs=1e-6)
+    # BUY cap off-RTH uses the EXTENDED cap: 100 × (1 + 80 bp) = 100.80 —
+    # the 20 bp RTH cap sits inside the ~4× wider extended spread and would
+    # rest unfilled every time (the order must fill in its decision tick).
+    assert req.limit_price == pytest.approx(100.80, abs=1e-6)
 
 
 def test_reconcile_rth_keeps_configured_mkt(monkeypatch):

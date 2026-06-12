@@ -108,3 +108,19 @@ def performance(window_days: Optional[int] = None, session: Optional[str] = None
     result = _retry(lambda: get_performance_for_email(window_days=window_days, session=session), "performance")
     _perf_cache[key] = {"ts": now, "data": result}
     return result
+
+
+def broker_trades(force: bool = False) -> list:
+    """The IBKR-fills projection of the ledger (real executions, real
+    commissions — see ``src.performance.broker_view``), cached briefly.
+    Reads through ``repo.load_trades()`` so the read-only mode set above
+    applies; never touches the tracker's write paths."""
+    now = time.time()
+    entry = _perf_cache.get("broker_trades")
+    if not force and entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.performance.broker_view import build_broker_trades
+    trades = _retry(lambda: repo.load_trades(), "broker_trades")
+    result = build_broker_trades(trades)
+    _perf_cache["broker_trades"] = {"ts": now, "data": result}
+    return result

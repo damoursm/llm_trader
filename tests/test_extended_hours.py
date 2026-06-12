@@ -222,6 +222,20 @@ def test_session_slots_per_window_cadence(monkeypatch):
     ]
 
 
+def test_session_slots_single_point_window_for_pre_close_tick(monkeypatch):
+    """A window with equal endpoints (19:55-19:55) is ONE slot at exactly that
+    time. The default schedule uses it for the last after-hours tick: the
+    pipeline needs ~4 min from tick to order submission, so a 20:00 slot's
+    orders reached IBKR after the session close and could never fill same-day;
+    19:55 leaves them a live book."""
+    monkeypatch.setattr(settings, "extended_hours_mode", "trade")
+    monkeypatch.setattr(settings, "extended_windows", "18:00-19:00@60,19:55-19:55")
+    monkeypatch.setattr(settings, "extended_tick_minutes", 30)
+    from src.scheduler.runner import _session_slots
+    slots, _ = _session_slots()
+    assert _slot_times(slots, "extended") == ["18:00", "19:00", "19:55"]
+
+
 def test_parse_windows_bad_cadence_token_ignored(monkeypatch):
     monkeypatch.setattr(settings, "extended_hours_mode", "observe")
     monkeypatch.setattr(settings, "extended_windows", "04:00-06:00@xx,18:00-19:00@60")
