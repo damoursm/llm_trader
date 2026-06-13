@@ -96,6 +96,58 @@ def _dollar_pnl(b: dict) -> float:
     return sign * (end - entry) * fq - comm
 
 
+def _exec_cost_pct(leg_is_buy: bool, model: Optional[float], fill: Optional[float]) -> float:
+    """Cost-normalized execution cost of one leg vs its model/decision price,
+    in % — positive = adverse (paid above model when buying, received below
+    when selling). 0.0 when the model price is missing so the leg's cost
+    degrades cleanly to commission-only rather than dropping out."""
+    if not model or model <= 0 or not fill or fill <= 0:
+        return 0.0
+    return ((fill - model) if leg_is_buy else (model - fill)) / model * 100.0
+
+
+def one_way_cost_pcts_from_legs(legs: List[dict]) -> List[float]:
+    """Per-leg all-in one-way cost (%) over real **LMT** filled legs from
+    ``broker_orders`` (``repo.fetch_filled_lmt_legs``): real commission as % of
+    the leg's notional PLUS the cost-normalized execution cost vs the decision
+    price (the order's own side decides the adverse direction — a BUY order is
+    adverse filling higher, a SELL adverse filling lower, which covers both
+    entries and exits without needing to know which). MKT legs never reach
+    here — they're filtered out at the source, since LMT is what the system
+    uses going forward."""
+    out: List[float] = []
+    for r in legs:
+        fq = int(r.get("filled_qty") or 0)
+        fp = _f(r.get("fill_price"))
+        if fq <= 0 or not fp or fp <= 0:
+            continue
+        comm = _f(r.get("commission")) or 0.0
+        comm_pct = comm / (fq * fp) * 100.0
+        slip = _exec_cost_pct(str(r.get("side") or "").upper() == "BUY",
+                              _f(r.get("model_price")), fp)
+        out.append(comm_pct + slip)
+    return out
+
+
+def real_one_way_cost_fraction(legs: List[dict], min_legs: int) -> Optional[float]:
+    """Average all-in one-way cost as a FRACTION (e.g. 0.0056) over real LMT
+    fills, for calibrating the simulated cost model. None until at least
+    ``min_legs`` LMT legs exist — a flat average over a handful of fills is
+    noise. Clamped ≥ 0 by the caller (``set_real_cost_override``)."""
+    pcts = one_way_cost_pcts_from_legs(legs)
+    if len(pcts) < max(1, int(min_legs)):
+        return None
+    return (sum(pcts) / len(pcts)) / 100.0
+
+
+def avg_one_way_cost_pct_from_legs(legs: List[dict]) -> Optional[float]:
+    """Average all-in one-way cost (%) over real LMT fills, no min-leg floor —
+    the descriptive figure for the dashboard's IBKR cost tile. None when there
+    are no LMT fills yet."""
+    pcts = one_way_cost_pcts_from_legs(legs)
+    return round(sum(pcts) / len(pcts), 4) if pcts else None
+
+
 def summarize_broker_trades(btrades: List[dict]) -> dict:
     """Headline numbers for the dashboard's IBKR view. Dollar P&L is the
     primary lens here — real executions have real notionals, so percentages
@@ -111,6 +163,9 @@ def summarize_broker_trades(btrades: List[dict]) -> dict:
         + ((_f(b.get("broker_exit_commission")) or 0.0) if b["status"] == "CLOSED" else 0.0)
         for b in btrades
     )
+    # NOTE: the average one-way COST is no longer computed here — it is sourced
+    # from real LMT fills in broker_orders (avg_one_way_cost_pct_from_legs), so
+    # MKT fills are excluded and the figure matches the sim calibration.
     return {
         "trades": len(btrades),
         "closed": len(closed),

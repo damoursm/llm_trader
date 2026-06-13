@@ -19,7 +19,8 @@ from loguru import logger
 
 from src.models import Recommendation
 from src.utils import ET
-from src.performance.spread import _dynamic_half_spread, _pct_return, fmt_price
+from src.performance.spread import (_dynamic_half_spread, _one_side_cost, _pct_return,
+                                     fmt_price, set_real_cost_override)
 from src.db import repo
 from config import settings
 
@@ -2491,6 +2492,56 @@ def _trade_session(trade: dict) -> str:
     return _session_of_iso(trade.get("entry_datetime"))
 
 
+def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
+    """Install the real-fill cost calibration (see settings.sim_use_real_fill_costs).
+
+    Measures the average all-in one-way cost from actual **LMT** IBKR fills
+    (``repo.fetch_filled_lmt_legs`` — MKT fills are excluded, since LMT is what
+    the system uses going forward) and sets it as the flat per-leg cost the
+    whole sim then charges (``spread._one_side_cost``) — so the simulated
+    returns reflect what LMT execution really costs, not the modeled estimate.
+    Clears the override (→ model) when disabled or when fewer than
+    ``sim_real_fill_costs_min_legs`` LMT legs exist. Returns the applied
+    fraction (None = model). Idempotent; call before any cost-dependent step
+    (record/normalize/M2M/NAV) so every figure in a run uses one cost basis.
+    The ``trades`` arg is accepted for call-site symmetry but unused — the cost
+    basis comes from the broker fill log, not the ledger.
+    """
+    if not settings.sim_use_real_fill_costs:
+        set_real_cost_override(None)
+        return None
+    from src.performance.broker_view import real_one_way_cost_fraction
+    legs = repo.fetch_filled_lmt_legs()
+    frac = real_one_way_cost_fraction(legs, settings.sim_real_fill_costs_min_legs)
+    set_real_cost_override(frac)
+    if frac is not None:
+        logger.info(
+            f"[costs] sim calibrated to real LMT fills ({len(legs)} legs): "
+            f"{frac * 100:.3f}% one-way per leg"
+        )
+    return frac
+
+
+def _displayed_one_way_cost_pct(trades: List[dict], real_frac: Optional[float]) -> Optional[float]:
+    """The per-leg one-way cost % shown in the dashboard's simulated Returns
+    tile: the calibrated real cost when active, else the modeled half-spread +
+    commission averaged over these trades' legs (entry for all, exit for
+    closed)."""
+    if real_frac is not None:
+        return round(real_frac * 100.0, 4)
+    costs: List[float] = []
+    for t in trades:
+        atype = t.get("type", "STOCK")
+        ep = t.get("entry_price")
+        if ep and ep > 0:
+            costs.append(_one_side_cost(float(ep), atype, t.get("entry_session")) * 100.0)
+        if t.get("status") == "CLOSED":
+            xp = t.get("exit_price")
+            if xp and xp > 0:
+                costs.append(_one_side_cost(float(xp), atype, t.get("exit_session")) * 100.0)
+    return round(sum(costs) / len(costs), 4) if costs else None
+
+
 def get_performance_for_email(window_days: Optional[int] = None,
                               session: Optional[str] = None) -> dict:
     """Return structured performance data for inclusion in the email report.
@@ -2502,6 +2553,10 @@ def get_performance_for_email(window_days: Optional[int] = None,
     window + session toggles pass these so its metrics/plots recompute to match.
     """
     trades = _load_trades()
+    # Calibrate the sim cost to real IBKR fills (no-op when disabled / too few
+    # fills) BEFORE the NAV walk below, and from the FULL ledger (not the
+    # windowed/session slice) so the cost basis is stable across toggles.
+    real_cost_frac = calibrate_sim_costs(trades)
     if window_days is not None:
         _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
         trades = [t for t in trades if (t.get("entry_date") or "") >= _cutoff]
@@ -2598,6 +2653,8 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "timeline_svg":             timeline_svg,
         "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
         "llm_perf":                 llm_perf,                  # actual trades grouped by LLM engine (synthesis / sentiment)
+        "sim_one_way_cost_pct":     _displayed_one_way_cost_pct(all_trades, real_cost_frac),  # per-leg 1-way cost shown in Returns
+        "sim_cost_is_real":         real_cost_frac is not None,   # True = calibrated to real IBKR fills, False = modeled
         "hold_prompt_eval":         compute_hold_prompt_eval(trades),  # held-positions prompt A/B (exit outcomes ON vs OFF)
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
         "oos_comparison":           oos_comparison,            # train vs holdout accuracy (honest OOS)

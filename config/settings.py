@@ -793,13 +793,18 @@ class Settings(BaseSettings):
     broker_max_positions: int = 20                # hard cap on concurrent broker positions
     broker_max_gross_exposure_pct: float = 1.0    # cap on Σ|notional_usd| / equity_usd (1.0 = no leverage)
     # Order type for broker submissions:
-    #   "MKT" — market order (fills immediately at whatever the book offers)
-    #   "LMT" — marketable limit: limit at model price ± broker_limit_cap_bps in the
-    #           adverse direction (BUY above / SELL below the model price). Caps the
-    #           worst acceptable fill on wide-spread names; an order whose cap is
-    #           exceeded rests unfilled and is repaired by the fill-refresh pass on
-    #           later ticks instead of filling arbitrarily far from the model.
-    broker_order_type: str = "MKT"                # "MKT" | "LMT"
+    #   "LMT" (default) — marketable limit at model price ± the session cap in the
+    #           adverse direction (BUY above / SELL below). Bounds the worst
+    #           acceptable fill; on liquid names it executes as fast as MKT.
+    #           The settle pass removes LMT's historical downside: an order
+    #           whose cap is missed is re-anchored at a fresh quote within the
+    #           tick and KILLED if still unfilled — it never rests to fill
+    #           late at a stale price.
+    #   "MKT" — market order: fills immediately at whatever the book offers,
+    #           with NO price bound (observed 2026-06-12: −107 bp ZUMZ and
+    #           −91 bp ATGL fills on thin RTH books). Off-RTH ticks force LMT
+    #           regardless (IBKR rejects MKT outside regular hours).
+    broker_order_type: str = "LMT"                # "LMT" | "MKT"
     broker_limit_cap_bps: float = 20.0            # LMT only: max adverse distance from model price (RTH)
     # Off-RTH the book is thin and the REAL spread is ~4× wider (the sim's own
     # cost model charges 4× extended / 10× overnight half-spreads) — a 20 bp
@@ -825,6 +830,21 @@ class Settings(BaseSettings):
     # reached the broker, and resubmitting blind would double the position.
     broker_submit_retries: int = 2        # transient retries per order (0 = off)
     broker_retry_wait_seconds: int = 5    # pause before each retry (reconnect window)
+    # Connect retries at sync start: IB Gateway has a daily re-login window —
+    # without a retry, one badly-timed tick loses its whole order cycle
+    # (observed 2026-06-11 15:41 ET: "not connected", 4 positions waited a tick).
+    broker_connect_retries: int = 2           # extra connect attempts at sync start
+    broker_connect_retry_wait_seconds: int = 10
+    # ── Settle pass: fill fast or kill ───────────────────────────────────
+    # After this tick's orders are submitted, actively watch them for up to
+    # this many seconds: fills are recorded the moment they land; an order
+    # still at ZERO fill halfway through the window is cancelled and
+    # re-anchored once at a fresh capped quote; anything still unfilled at
+    # the deadline is CANCELLED — nothing ever rests across ticks, so an
+    # order either executes within ~a minute of its decision or it does not
+    # exist (the next tick re-decides from fresh data and prices). Partial
+    # fills are left working. 0 = legacy behavior (rest until next tick).
+    broker_settle_seconds: int = 60
     # ── Order lifetime: tick-scoped (default) or age-based ──────────────
     # Tick-scoped (True): an order lives exactly one tick. Any order still
     # unfilled at the next sync is cancelled and re-decided from THIS tick's
@@ -890,6 +910,20 @@ class Settings(BaseSettings):
     # positions experience a SMALLER min-commission floor in % terms, so pricing
     # every trade at the 1.0× base notional is the worst case.
     commission_notional_usd: float = 730.0
+    # ── Calibrate the sim cost to REAL IBKR fills ────────────────────────
+    # When on, the simulated per-leg cost (half-spread + commission in
+    # _one_side_cost) is REPLACED by the measured average all-in one-way cost
+    # from actual broker fills (real commission + execution cost vs the
+    # decision price, the same number the dashboard's IBKR "Avg 1-way cost"
+    # shows), applied flat to every entry/exit leg. The sim then charges what
+    # execution actually costs instead of the modeled estimate. Falls back to
+    # the model until at least sim_real_fill_costs_min_legs filled legs exist
+    # (a flat average over 2-3 fills would be noise) and is clamped ≥ 0 (a
+    # net-favorable fill streak never pays the sim to trade). Still fully
+    # deterministic: the calibration is a pure function of the broker fills in
+    # the same DuckDB. Set False to keep the modeled cost.
+    sim_use_real_fill_costs: bool = True
+    sim_real_fill_costs_min_legs: int = 10
 
     @property
     def tracked_politicians_list(self) -> List[str]:

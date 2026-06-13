@@ -59,6 +59,10 @@ def repo_store(monkeypatch):
     # RTH regardless of the wall-clock the suite runs at.
     from src.performance import market_calendar
     monkeypatch.setattr(market_calendar, "current_session", lambda now=None: "rth")
+    # Settle pass (fill-fast-or-kill) has its own suite — disabled here so
+    # these tests exercise the submit/refresh passes in isolation (and never
+    # real-sleep through the watch loop).
+    monkeypatch.setattr(settings, "broker_settle_seconds", 0)
     return store
 
 

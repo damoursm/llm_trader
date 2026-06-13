@@ -42,6 +42,9 @@ def _env(monkeypatch):
     monkeypatch.setattr(settings, "broker_submit_retries", 0)
     monkeypatch.setattr(settings, "broker_unfilled_cancel_minutes", 0)
     monkeypatch.setattr(settings, "broker_tick_scoped_orders", True)
+    # These tests target the tick-scope/dedupe/drift passes — the settle pass
+    # (fill-fast-or-kill) has its own suite (test_broker_settle.py).
+    monkeypatch.setattr(settings, "broker_settle_seconds", 0)
     monkeypatch.setattr(settings, "broker_drift_action", "flatten")
     monkeypatch.setattr(market_calendar, "current_session", lambda now=None: "rth")
 

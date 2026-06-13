@@ -667,6 +667,16 @@ def _ibkr_leg_disp(t: dict, prefix: str) -> str:
     return f"✗ {status}"            # rejects / connection failures / raw errors
 
 
+def _pct4(x) -> str:
+    """Percent with up to 3 decimals (one-way fees are small — 0.4% not 0%)."""
+    if x is None:
+        return "–"
+    try:
+        return f"{x:.3f}%"
+    except (TypeError, ValueError):
+        return str(x)
+
+
 def _trades_table(trades: list):
     if not trades:
         return html.Div("None.", style={"color": "#6b7280", "marginBottom": 12})
@@ -740,6 +750,8 @@ def _broker_returns_section(window_value, session_value=None):
             style={"color": "#6b7280", "padding": 20})
 
     s = summarize_broker_trades(trades)
+    from src.performance.broker_view import avg_one_way_cost_pct_from_legs
+    lmt_cost = avg_one_way_cost_pct_from_legs(data.filled_lmt_legs())
     # "Size ×" is a sim concept; in this view the dedicated Shares/Notional
     # columns carry the real sizing, so drop the multiplier from the tables.
     strip = lambda ts: [{k: v for k, v in t.items() if k != "position_size_multiplier"} for t in ts]
@@ -762,6 +774,8 @@ def _broker_returns_section(window_value, session_value=None):
                  tooltip="Mean per-round-trip % return on actual fill prices net of actual commissions, equal-weighted."),
             _kpi("Commissions", _usd(s.get("commissions_usd"), signed=False),
                  tooltip="Total commissions IBKR actually charged on these fills (exit legs counted once filled)."),
+            _kpi("Avg 1-way cost (LMT)", _pct4(lmt_cost),
+                 tooltip="Average ALL-IN cost per ONE-WAY fill across all real LMT fills, as a % of that leg's notional: real IBKR commission PLUS the execution cost (how far the fill landed from the decision price — captures the bid-ask crossing and any latency drift, positive = adverse). LMT ONLY — market (MKT) fills are excluded, since LMT is what the system uses going forward; drift-flatten cleanups are excluded too. Signed, so a favorable fill can lower it. This is the figure the simulated cost is calibrated to once enough LMT fills accumulate."),
             _kpi("Closed / Open", f"{s.get('closed', 0)} / {s.get('open', 0)}",
                  tooltip="Broker round-trips completed vs positions genuinely still held at the broker (a ledger-closed trade whose exit hasn't filled is still OPEN here)."),
         ],
@@ -801,6 +815,17 @@ def _returns_section(window_value, session_value=None):
                  tooltip="Best single-trade % return in the window."),
             _kpi("Worst", _pct(stats.get("worst"), signed=True), figures.NEG,
                  tooltip="Worst single-trade % return in the window."),
+            _kpi("Avg 1-way cost" + (" (real)" if perf.get("sim_cost_is_real") else ""),
+                 _pct4(perf.get("sim_one_way_cost_pct")),
+                 tooltip=("All-in one-way cost charged on each simulated leg, as a % of trade value. "
+                          + ("CALIBRATED TO REAL IBKR FILLS: the measured average actual cost "
+                             "(commission + execution vs decision price) is applied flat to every "
+                             "entry and exit, so the simulated returns reflect what execution really costs."
+                             if perf.get("sim_cost_is_real")
+                             else "MODELED (half-spread + commission) — not enough real IBKR fills yet to "
+                                  "calibrate (set by sim_real_fill_costs_min_legs); switches to real fills "
+                                  "automatically once they accumulate.")
+                          + " Compare with the IBKR view's 'Avg 1-way cost' (measured directly from fills).")),
             _kpi("Closed / Open", f"{stats.get('total_closed', 0)} / {stats.get('total_open', 0)}",
                  tooltip="Number of closed (realised) trades vs. positions currently open, within the selected window."),
         ],
@@ -841,10 +866,63 @@ def _serve_once(host: str, port: int) -> None:
     serve(app.server, host=host, port=port, threads=8, channel_timeout=120)
 
 
+def _lan_ipv4() -> str | None:
+    """Best-guess primary LAN IPv4 of this machine (the address a phone on the
+    same Wi-Fi would use). No traffic is sent — a UDP socket 'connected' to a
+    public IP just makes the OS pick the outbound interface. None on failure."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        return ip if not ip.startswith("127.") else None
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def _tailscale_ipv4() -> str | None:
+    """This machine's Tailscale IP (100.64.0.0/10) if Tailscale is up — the
+    address a phone reaches from ANYWHERE (cellular included) over the private
+    tailnet. Tries the CLI on PATH, then the default Windows install path.
+    None when Tailscale isn't installed/running."""
+    import subprocess
+    for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
+        try:
+            out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+        for line in (out.stdout or "").splitlines():
+            ip = line.strip()
+            if ip.startswith("100."):
+                return ip
+        return None
+    return None
+
+
 def run() -> None:
     """Run the dashboard, auto-restarting on an unexpected crash so it stays alive."""
     host, port = settings.dashboard_host, settings.dashboard_port
     logger.info(f"Dashboard starting at http://{host}:{port}  (Ctrl+C to stop)")
+    if host in ("0.0.0.0", "::"):
+        # Bound to all interfaces → reachable from other devices: the LAN when
+        # home, and the Tailscale tailnet from anywhere (incl. cellular).
+        lan = _lan_ipv4()
+        if lan:
+            logger.info(f"  📱 Same Wi-Fi: http://{lan}:{port}")
+        ts = _tailscale_ipv4()
+        if ts:
+            logger.info(f"  🌍 Away from home (Tailscale): http://{ts}:{port}")
+        else:
+            logger.info(
+                "  🌍 For away-from-home access, install Tailscale (see CLAUDE.md → "
+                "'Monitoring dashboard') — do NOT port-forward this to the internet."
+            )
+        logger.info(
+            "  Bound to ALL interfaces — the (read-only) dashboard is reachable by "
+            f"any device that can route to it. Windows Firewall must allow inbound TCP {port}."
+        )
 
     backoff = 2
     while True:

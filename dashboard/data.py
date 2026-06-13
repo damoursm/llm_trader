@@ -110,6 +110,13 @@ def performance(window_days: Optional[int] = None, session: Optional[str] = None
     return result
 
 
+def filled_lmt_legs() -> list:
+    """Real LMT fills (ENTRY/EXIT, no drift flattens) from broker_orders —
+    the basis for the IBKR one-way cost tile and the sim-cost calibration.
+    Read-only + retry, like every dashboard accessor."""
+    return _retry(lambda: repo.fetch_filled_lmt_legs(), "lmt_legs")
+
+
 def broker_trades(force: bool = False) -> list:
     """The IBKR-fills projection of the ledger (real executions, real
     commissions — see ``src.performance.broker_view``), cached briefly.

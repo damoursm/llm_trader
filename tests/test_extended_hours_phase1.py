@@ -207,6 +207,7 @@ def _broker_env(monkeypatch, session: str):
     monkeypatch.setattr(settings, "broker_base_notional_ccy", "USD")
     monkeypatch.setattr(settings, "broker_base_notional", 1000.0)
     monkeypatch.setattr(settings, "broker_sizing_mode", "notional")
+    monkeypatch.setattr(settings, "broker_settle_seconds", 0)   # settle has its own suite
     monkeypatch.setattr(market_calendar, "current_session", lambda now=None: session)
     fake = _RecordingBroker()
     monkeypatch.setattr(reconcile, "get_broker", lambda: fake)

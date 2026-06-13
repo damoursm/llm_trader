@@ -65,7 +65,7 @@ from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, monitor_open_positions, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -1076,6 +1076,10 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         trade_diag = {}
         perf, hypothetical_perf = {}, {}
     else:
+        # Calibrate the sim cost to real IBKR fills BEFORE any cost-dependent
+        # step this tick (normalize / M2M / new entries / NAV), so every figure
+        # the run produces and persists shares one real cost basis.
+        calibrate_sim_costs()
         update_open_trades()
         # Open-position monitor: signal-decay / regime-flip exits BEFORE the
         # counter-recommendation exit path. Catches the case where a held

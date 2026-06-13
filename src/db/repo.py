@@ -386,3 +386,30 @@ def fetch_df(sql: str, params: Optional[list] = None, read_only: bool = True) ->
     """Run a query and return a pandas DataFrame. Read-only by default."""
     with connect(read_only=read_only) as conn:
         return conn.execute(sql, params or []).df()
+
+
+def fetch_filled_lmt_legs() -> list:
+    """Filled **LMT** strategy legs from ``broker_orders`` — the real fills that
+    represent how the system trades going forward (MKT is no longer the
+    default; off-RTH always forces LMT). ENTRY/EXIT only; DRIFT_FLATTEN orphan
+    cleanups are excluded (aggressive one-offs, not representative trade legs).
+    Deduped to the most-complete fill per ``client_ref`` (a SUBMIT row and a
+    later SETTLE_FILL/FILL_REFRESH for the same order, or duplicate twins, must
+    not double-count). Each row: side, filled_qty, model_price, fill_price,
+    commission. Used to calibrate the sim cost (``tracker.calibrate_sim_costs``)
+    and to show the IBKR one-way cost. ``[]`` when the table/file isn't there
+    yet (fresh DB, tests). MKT fills never appear by construction."""
+    sql = ("SELECT client_ref, side, filled_qty, model_price, fill_price, commission "
+           "FROM broker_orders "
+           "WHERE upper(order_type) = 'LMT' AND filled_qty > 0 AND fill_price IS NOT NULL "
+           "AND event <> 'DRIFT_FLATTEN' AND intent IN ('ENTRY', 'EXIT')")
+    try:
+        rows = fetch_df(sql).to_dict("records")
+    except Exception:
+        return []
+    best: dict = {}
+    for r in rows:
+        ref = r.get("client_ref")
+        if ref not in best or (r.get("filled_qty") or 0) > (best[ref].get("filled_qty") or 0):
+            best[ref] = r
+    return list(best.values())

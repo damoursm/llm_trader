@@ -107,6 +107,7 @@ def _new_report() -> dict:
         "run_id": None, "mode": settings.broker_mode, "connected": False, "ok": True,
         "entries_submitted": 0, "exits_submitted": 0, "fills_repaired": 0, "rejects": 0,
         "retries": 0, "stale_cancels": 0, "entry_cancels_on_close": 0, "drift_flattened": 0,
+        "settled_fills": 0, "settle_reanchors": 0, "unfilled_killed": 0,
         "drift": [], "slippage": [], "orders": [], "errors": [], "account_equity": None,
     }
 
@@ -677,6 +678,210 @@ def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
     return res
 
 
+# ── settle pass: fill fast or kill ───────────────────────────────────────────
+
+_SETTLE_POLL_SECONDS = 5
+
+
+def _leg_ref_base(t: dict, prefix: str) -> str:
+    """The un-suffixed client_ref base for a leg — mirrors the entry/exit
+    passes so a settle re-anchor produces the same ``-rN`` ref the next tick
+    would have."""
+    base = t.get("recommendation_id") or f"{t.get('run_id', '')}-{t['ticker']}"
+    return base if prefix == "broker_" else (t.get("recommendation_id") or t["ticker"]) + "-exit"
+
+
+def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
+                               outside_rth: bool, sync_started: datetime) -> bool:
+    """Actively manage THIS tick's submissions until they fill — or kill them.
+
+    The order lifecycle goal: an order either executes within ~a minute of
+    its decision, or it does not exist. Without this pass, an order that
+    missed ``submit_order``'s short poll rested at the broker until the next
+    tick — able to fill 30+ minutes later at a price anchored to data that
+    old (the definition of a bad fill), and the raw material for every
+    stale-snapshot drift race.
+
+    Mechanics, within a ``broker_settle_seconds`` budget (0 = pass disabled):
+      • every ~5 s, today's executions are polled; a leg whose order filled
+        is repaired on the spot (fill price/commission recorded, slippage
+        logged) — the happy path costs one poll;
+      • halfway through the budget, any order still at ZERO fill is cancelled
+        and re-anchored ONCE at a fresh live quote under the next ``-rN``
+        ref — same capped marketable LMT discipline as everywhere else;
+      • at the deadline, survivors are CANCELLED and their leg cleared
+        (``UNFILLED_KILLED``, ``resubmit_n``+1): nothing rests across ticks;
+        the next tick re-decides with fresh signals and a fresh price (an
+        entry only comes back if the trade survives that tick's monitor
+        pass; an exit always comes back until flat).
+
+    Partial fills are left working through both the re-anchor and the kill —
+    cancelling a remainder mid-fill strands less than letting it finish, and
+    the exit pass sizes from the actual held position regardless. A cancel
+    that loses the race to a fill is left for the fill-refresh pass. Drift
+    flattens are NOT tracked here (no ledger leg behind an orphan); they keep
+    their per-tick re-anchor cycle.
+    """
+    budget = int(settings.broker_settle_seconds)
+    if budget <= 0:
+        return False
+
+    def _pending() -> list:
+        out = []
+        for t in trades:
+            for prefix, intent, want_status in (("broker_", "ENTRY", "OPEN"),
+                                                ("broker_exit_", "EXIT", "CLOSED")):
+                if t.get("status") != want_status:
+                    continue
+                if not t.get(f"{prefix}order_id"):
+                    continue
+                status = t.get(f"{prefix}status") or ""
+                if status in _TERMINAL_STATUSES or status in _RESTORED_STATUSES:
+                    continue
+                sub_at = t.get(f"{prefix}submitted_at")
+                if _predates(sub_at, sync_started):
+                    continue   # an earlier tick's order — the stale pass owns it
+                out.append((t, prefix, intent))
+        return out
+
+    legs = _pending()
+    if not legs:
+        return False
+    changed = False
+    n_polls = max(1, budget // _SETTLE_POLL_SECONDS)
+    reanchor_poll = max(0, n_polls // 2)
+    logger.info(
+        f"[broker] settle: {len(legs)} order(s) unfilled after submission — "
+        f"watching ≤{budget}s (fill fast or kill)"
+    )
+
+    for poll_i in range(n_polls):
+        time.sleep(_SETTLE_POLL_SECONDS)
+        try:
+            fills = {f.client_ref: f for f in broker.get_fills()}
+        except Exception as e:
+            logger.debug(f"[broker] settle fills poll failed: {e}")
+            fills = {}
+        still = []
+        for (t, prefix, intent) in legs:
+            ref = t.get(f"{prefix}client_ref")
+            fs = fills.get(ref)
+            req = int(t.get(f"{prefix}requested_qty") or 0)
+            if fs is not None and fs.filled_qty and (not req or fs.filled_qty >= req):
+                _apply_fill(t, prefix, fs)
+                side = _entry_side(t["action"]) if intent == "ENTRY" else _exit_side(t["action"])
+                report["settled_fills"] += 1
+                changed = True
+                _record_order(
+                    report, event="SETTLE_FILL", intent=intent, ticker=t["ticker"],
+                    side=side, order_type="LMT", requested_qty=req,
+                    filled_qty=fs.filled_qty, model_price=None, limit_price=None,
+                    fill_price=fs.avg_fill_price, commission=fs.commission,
+                    status="Filled", ok=True, error=None,
+                    order_id=fs.order_id, client_ref=ref, submitted_at=None,
+                )
+                logger.info(
+                    f"[broker] settle: {intent} {t['ticker']} filled in-tick "
+                    f"@{fs.avg_fill_price} ({(poll_i + 1) * _SETTLE_POLL_SECONDS}s after submit)"
+                )
+            else:
+                still.append((t, prefix, intent))
+        legs = still
+        if not legs:
+            return changed
+
+        if poll_i == reanchor_poll:
+            # Halfway: re-anchor zero-fill orders at a FRESH quote (the cap
+            # may simply be on the wrong side of a moving book).
+            for (t, prefix, intent) in list(legs):
+                if (t.get(f"{prefix}fill_qty") or 0) > 0:
+                    continue   # partial — leave it working
+                ref = t.get(f"{prefix}client_ref")
+                try:
+                    cancelled = bool(ref) and broker.cancel_order(ref)
+                except Exception as e:
+                    logger.warning(f"[broker] settle cancel {ref} raised: {e}")
+                    cancelled = False
+                if not cancelled:
+                    continue   # racing a fill — the next poll will see it
+                hist = t.get(f"{prefix}cancelled_order_ids") or []
+                t[f"{prefix}cancelled_order_ids"] = hist + [t[f"{prefix}order_id"]]
+                n = int(t.get(f"{prefix}resubmit_n") or 0) + 1
+                t[f"{prefix}resubmit_n"] = n
+                live = _live_price(t["ticker"])
+                if not live:
+                    t[f"{prefix}order_id"] = None
+                    t[f"{prefix}status"] = "UNFILLED_KILLED"
+                    changed = True
+                    continue   # no quote to re-anchor on — next tick re-decides
+                side = _entry_side(t["action"]) if intent == "ENTRY" else _exit_side(t["action"])
+                qty = int(t.get(f"{prefix}requested_qty") or 0)
+                if qty <= 0:
+                    continue
+                new_ref = f"{_leg_ref_base(t, prefix)}-r{n}"
+                limit = _limit_price_for(side, live, outside_rth)
+                res = _submit_with_retry(broker, OrderRequest(
+                    ticker=t["ticker"], side=side, quantity=qty,
+                    order_type="LMT", limit_price=limit,
+                    client_ref=new_ref, intent=intent, outside_rth=outside_rth,
+                ), model_price=live, report=report, intent=intent)
+                if intent == "ENTRY":
+                    _apply_entry_result(t, res)
+                else:
+                    _apply_exit_result(t, res)
+                changed = True
+                report["settle_reanchors"] += 1
+                _record_order(
+                    report, event="SETTLE_REANCHOR", intent=intent, ticker=t["ticker"],
+                    side=side, order_type="LMT", requested_qty=qty,
+                    filled_qty=res.filled_qty, model_price=live, limit_price=limit,
+                    fill_price=res.avg_fill_price, commission=res.commission,
+                    status=res.status, ok=res.ok, error=res.error,
+                    order_id=res.order_id, client_ref=res.client_ref,
+                    submitted_at=res.submitted_at,
+                )
+                logger.info(
+                    f"[broker] settle: {intent} {t['ticker']} re-anchored at fresh "
+                    f"quote {live} (cap {limit}) under {new_ref}"
+                )
+
+    # Deadline: kill every zero-fill survivor — nothing rests across ticks.
+    for (t, prefix, intent) in legs:
+        if (t.get(f"{prefix}fill_qty") or 0) > 0:
+            continue   # partial — leave the remainder working
+        status = t.get(f"{prefix}status") or ""
+        if status in _TERMINAL_STATUSES:
+            continue   # a re-anchor attempt already concluded (e.g. rejected)
+        ref = t.get(f"{prefix}client_ref")
+        try:
+            cancelled = bool(ref) and broker.cancel_order(ref)
+        except Exception as e:
+            logger.warning(f"[broker] settle kill {ref} raised: {e}")
+            cancelled = False
+        if not cancelled:
+            continue   # likely filled during the race — fill refresh repairs it
+        hist = t.get(f"{prefix}cancelled_order_ids") or []
+        t[f"{prefix}cancelled_order_ids"] = hist + [t[f"{prefix}order_id"]]
+        t[f"{prefix}order_id"] = None
+        t[f"{prefix}status"] = "UNFILLED_KILLED"
+        t[f"{prefix}resubmit_n"] = int(t.get(f"{prefix}resubmit_n") or 0) + 1
+        changed = True
+        report["unfilled_killed"] += 1
+        _record_order(
+            report, event="SETTLE_KILL", intent=intent, ticker=t["ticker"],
+            side=_entry_side(t["action"]) if intent == "ENTRY" else _exit_side(t["action"]),
+            order_type="LMT", requested_qty=t.get(f"{prefix}requested_qty"),
+            filled_qty=0, model_price=None, limit_price=None, fill_price=None,
+            commission=None, status="Cancelled", ok=True, error=None,
+            order_id=hist[-1] if hist else None, client_ref=ref, submitted_at=None,
+        )
+        logger.info(
+            f"[broker] settle: {intent} {t['ticker']} did not fill within {budget}s — "
+            "cancelled; nothing rests, the next tick re-decides at fresh data"
+        )
+    return changed
+
+
 # ── drift prevention: never leave a working ENTRY behind a closed trade ─────
 
 def _cancel_entries_for_closed(broker: Broker, trades: List[dict], report: dict) -> bool:
@@ -747,13 +952,29 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
     if broker is None:
         return report  # broker_mode=off → no broker calls at all
 
-    try:
-        report["connected"] = bool(broker.connect())
-    except Exception as e:  # never let a broker hiccup break the pipeline
-        report["ok"] = False
-        report["errors"].append(f"connect: {e}")
-        logger.warning(f"[broker] connect raised: {e}")
-        return report
+    # Connect, with a short retry: IB Gateway's daily re-login window can
+    # last seconds — without a retry, one badly-timed tick loses its entire
+    # order cycle (every trade waits a full tick; observed 2026-06-11 15:41).
+    attempts = 1 + max(0, int(settings.broker_connect_retries))
+    wait = max(1, int(settings.broker_connect_retry_wait_seconds))
+    for attempt in range(attempts):
+        try:
+            report["connected"] = bool(broker.connect())
+        except Exception as e:  # never let a broker hiccup break the pipeline
+            report["connected"] = False
+            if attempt == attempts - 1:
+                report["ok"] = False
+                report["errors"].append(f"connect: {e}")
+                logger.warning(f"[broker] connect raised: {e}")
+                return report
+        if report["connected"]:
+            break
+        if attempt < attempts - 1:
+            logger.warning(
+                f"[broker] not connected (attempt {attempt + 1}/{attempts}) — "
+                f"retrying in {wait}s (gateway re-login window?)"
+            )
+            time.sleep(wait)
     if not report["connected"]:
         report["ok"] = False
         report["errors"].append("not connected")
@@ -1032,6 +1253,13 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 entry["action"] = "flatten_submitted"
             else:
                 entry["action"] = "flatten_failed"
+
+        # ── SETTLE: fill fast or kill (this tick's submissions) ──────────
+        # Watch unfilled orders ≤broker_settle_seconds, re-anchor once at a
+        # fresh quote, then cancel survivors — an order either executes
+        # within ~a minute of its decision or it does not exist.
+        changed = _settle_unfilled_this_tick(broker, trades, report,
+                                             outside_rth, sync_started) or changed
 
         if changed:
             repo.save_trades(trades)

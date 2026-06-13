@@ -46,3 +46,16 @@ def _spread_only_costs(monkeypatch):
     from config.settings import settings
 
     monkeypatch.setattr(settings, "commission_model", "none")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cost_override():
+    """Reset the process-global real-fill cost override before AND after every
+    test. It's a module-global in spread.py installed by calibrate_sim_costs;
+    without this reset one test's calibration could leak into another's
+    hand-computed spread/NAV assertions."""
+    from src.performance import spread
+
+    spread.set_real_cost_override(None)
+    yield
+    spread.set_real_cost_override(None)

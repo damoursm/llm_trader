@@ -33,7 +33,32 @@ than editing the numbers — the engine and tracker both go through it.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from config.settings import settings
+
+
+# Real-fill cost calibration (see settings.sim_use_real_fill_costs). When the
+# pipeline / performance layer measures the average all-in one-way cost from
+# actual IBKR fills, it sets this module-global; _one_side_cost then returns it
+# flat for EVERY leg instead of the modeled half-spread + commission, so the
+# simulation charges what execution really costs. None = use the model (the
+# default until enough real fills accumulate, and always in tests — reset
+# per-test by conftest). It is a single process-global, recomputed
+# deterministically from the DB's broker fills each run/perf call.
+_REAL_COST_OVERRIDE: Optional[float] = None
+
+
+def set_real_cost_override(fraction: Optional[float]) -> None:
+    """Install (or clear with None) the real-fill one-way cost fraction that
+    _one_side_cost returns for every leg. Clamped ≥ 0 — a net-favorable fill
+    streak must never make the sim pay you to trade."""
+    global _REAL_COST_OVERRIDE
+    _REAL_COST_OVERRIDE = None if fraction is None else max(0.0, float(fraction))
+
+
+def get_real_cost_override() -> Optional[float]:
+    return _REAL_COST_OVERRIDE
 
 
 def _session_spread_multiplier(session) -> float:
@@ -160,7 +185,15 @@ def _one_side_cost(price: float, asset_type: str = "STOCK", session=None) -> flo
     ``daily_nav.py`` — so the per-trade buy-and-hold return and the
     path-faithful daily compound charge identical costs. ``session`` widens
     the spread term outside RTH (commission is session-independent).
+
+    When a real-fill calibration is installed (``set_real_cost_override`` —
+    the measured average all-in one-way cost from actual IBKR fills), it is
+    returned flat for every leg INSTEAD of the model, so the simulation
+    charges what execution actually costs. The override already blends the
+    real session/price mix, so it intentionally ignores ``price``/``session``.
     """
+    if _REAL_COST_OVERRIDE is not None:
+        return _REAL_COST_OVERRIDE
     return _dynamic_half_spread(price, asset_type, session) + _commission_fraction(price)
 
 
