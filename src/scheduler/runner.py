@@ -92,9 +92,11 @@ def _parse_windows(spec: str) -> list[tuple[_time, _time, int | None]]:
     The optional ``@MM`` suffix overrides the tick cadence for that window
     (None = use ``extended_tick_minutes``) so thin dead zones can tick less
     often than the liquid shoulders. A window with equal endpoints
-    (``19:55-19:55``) is a SINGLE slot at exactly that time — used to place
+    (``19:50-19:50``) is a SINGLE slot at exactly that time — used to place
     the last after-hours tick early enough that its orders can still fill
-    before the 20:00 session close. Bad tokens are skipped with a warning.
+    before the 20:00 session close (it leaves a ~10-min buffer so the
+    every-tick hold-review's extra latency still clears the close). Bad tokens
+    are skipped with a warning.
     """
     out: list[tuple[_time, _time, int | None]] = []
     for tok in str(spec or "").split(","):

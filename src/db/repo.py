@@ -309,6 +309,36 @@ _BROKER_ORDER_COLS = [
 ]
 
 
+# ── per-tick opener-pinned hold-review trajectory (fix #2) ─────────────────
+
+_TRADE_REVIEW_COLS = [
+    "run_id", "reviewed_at", "ticker", "position_id", "entry_datetime",
+    "confidence", "action", "direction", "conf_floor", "entry_confidence",
+    "entry_action", "price", "return_pct", "synthesis_model", "sentiment_model",
+]
+
+
+def insert_trade_reviews(rows: List[dict]) -> None:
+    """Append one row per held position re-judged this tick (the opener-pinned
+    hold-review). Builds the confidence-over-time trajectory the dashboard plots
+    per ticker. Append-only — each tick is a fresh observation."""
+    if not rows:
+        return
+    out = [(
+        r.get("run_id"), r.get("reviewed_at"), r.get("ticker"), r.get("position_id"),
+        r.get("entry_datetime"), _f(r.get("confidence")), r.get("action"), r.get("direction"),
+        _f(r.get("conf_floor")), _f(r.get("entry_confidence")), r.get("entry_action"),
+        _f(r.get("price")), _f(r.get("return_pct")),
+        r.get("synthesis_model"), r.get("sentiment_model"),
+    ) for r in rows]
+    placeholders = ", ".join(["?"] * len(_TRADE_REVIEW_COLS))
+    with connect() as conn:
+        conn.executemany(
+            f"INSERT INTO trade_reviews ({', '.join(_TRADE_REVIEW_COLS)}) VALUES ({placeholders})",
+            out,
+        )
+
+
 def insert_broker_report(run_id: str, report: dict) -> None:
     """Persist one reconcile report: a summary row (broker_reconciles) plus one
     event row per order submission / fill repair (broker_orders).

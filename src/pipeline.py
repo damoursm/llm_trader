@@ -65,7 +65,7 @@ from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -358,6 +358,126 @@ def _fetch_snapshots(all_tickers):
     if not snapshots:
         logger.warning("[snapshots] No market data retrieved — continuing with news-only signals")
     return snapshots
+
+
+def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
+                        build_kwargs, synth_kwargs, session):
+    """Fix #2 — opener-pinned, fresh-data hold-review (one entry per held position).
+
+    For every OPEN position opened by LLM engines, produce TODAY's recommendation
+    using the SAME synthesis + sentiment engines that opened it, on FRESHLY
+    refetched news + prices — so ``monitor_open_positions`` compares entry-vs-now
+    confidence apples-to-apples (identical engines, temperature=0 ⇒ low volatility).
+    Returns ``{ticker: Recommendation}``. Runs EVERY trading tick.
+
+    Default (``enable_pinned_hold_review``): refetch news + prices for the held set
+    (no hourly cache) and, per (sentiment, synthesis) engine combo, re-aggregate
+    with the pinned sentiment engine + re-synthesize with the pinned synthesis
+    engine — combos run concurrently. A combo whose forced synthesis engine fails
+    yields no reviews for its tickers (they hold this tick).
+
+    Off: the cheap fallback — reuse THIS run's recs, but only for positions whose
+    opening engines BOTH match this run's engines (no extra LLM calls, no refetch).
+    """
+    from collections import defaultdict
+
+    groups: dict = defaultdict(list)
+    for t in open_trades:
+        se = _provider_of_synth_model(t.get("llm_sentiment_model"))
+        sy = _provider_of_synth_model(t.get("llm_synthesis_model"))
+        if se in ("anthropic", "deepseek") and sy in ("anthropic", "deepseek"):
+            groups[(se, sy)].append(t["ticker"])
+    if not groups:
+        return {}
+
+    # Cheap fallback: reuse this run's recs for positions whose engines BOTH match.
+    if not settings.enable_pinned_hold_review:
+        by_ticker = {r.ticker: r for r in full_recs}
+        return {
+            tk: by_ticker[tk]
+            for (se, sy), tks in groups.items() if se == run_sent and sy == run_synth
+            for tk in tks if tk in by_ticker
+        }
+
+    held = sorted({tk for tks in groups.values() for tk in tks})
+    # FRESH market data (bypassing the hourly caches), every tick, for the held set.
+    try:
+        fresh_articles = fetch_all_news(held, sectors)
+    except Exception as e:
+        logger.warning(f"[hold_review] fresh news fetch failed ({e}) — reviews skipped this tick")
+        return {}
+    try:
+        fresh_snaps = get_snapshots(held)
+    except Exception as e:
+        logger.warning(f"[hold_review] fresh snapshot fetch failed ({e}) — proceeding without it")
+        fresh_snaps = []
+
+    def _review(item):
+        (se, sy), tickers = item
+        try:
+            sub = build_signals(tickers, fresh_articles, snapshots=fresh_snaps,
+                                session=session, force_sentiment_engine=se, **build_kwargs)
+            recs = generate_recommendations(sub, session=session, force_engine=sy, **synth_kwargs)
+        except Exception as e:
+            logger.warning(f"[hold_review] combo (sent={se}, synth={sy}) failed: {e}")
+            return {}
+        # force_engine returns [] on failure, so any non-empty result is from `sy`.
+        want = set(tickers)
+        return {r.ticker: r for r in (recs or []) if r.ticker in want}
+
+    reviews: dict = {}
+    items = list(groups.items())
+    if len(items) == 1:
+        reviews.update(_review(items[0]))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(items)) as ex:
+            for part in ex.map(_review, items):
+                reviews.update(part)
+    logger.info(
+        f"[hold_review] pinned: {len(reviews)}/{len(held)} held position(s) re-judged "
+        f"by their opening engines across {len(items)} engine combo(s)"
+    )
+    return reviews
+
+
+def _persist_trade_reviews(run_id, hold_reviews, open_trades):
+    """Append this tick's opener-pinned reviews to the ``trade_reviews`` table —
+    the confidence-over-time trajectory the dashboard plots per ticker. Each row
+    pairs the review's fresh confidence/action with the position's entry
+    confidence + current price/return so deterioration can be read against the
+    entry baseline, the close threshold, and the eventual direction change.
+    Exception-safe: a DB hiccup never breaks the run."""
+    if not hold_reviews:
+        return
+    by_ticker = {t["ticker"]: t for t in open_trades}
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for ticker, rec in hold_reviews.items():
+        t = by_ticker.get(ticker) or {}
+        entry_conf = t.get("confidence")
+        rows.append({
+            "run_id": run_id,
+            "reviewed_at": now,
+            "ticker": ticker,
+            "position_id": t.get("recommendation_id"),
+            "entry_datetime": t.get("entry_datetime"),
+            "confidence": getattr(rec, "confidence", None),
+            "action": getattr(rec, "action", None),
+            "direction": getattr(rec, "direction", None),
+            "conf_floor": _confidence_floor(entry_conf),
+            "entry_confidence": entry_conf,
+            "entry_action": t.get("action"),
+            "price": t.get("current_price"),
+            "return_pct": t.get("return_pct"),
+            "synthesis_model": t.get("llm_synthesis_model"),
+            "sentiment_model": t.get("llm_sentiment_model"),
+        })
+    try:
+        repo.insert_trade_reviews(rows)
+        logger.info(f"[hold_review] persisted {len(rows)} review observation(s) to trade_reviews")
+    except Exception as e:
+        logger.warning(f"[hold_review] persisting trade_reviews failed: {e}")
 
 
 def _run_yf_options_tasks(all_tickers):
@@ -857,9 +977,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
-    signals = build_signals(
-        all_tickers,
-        articles,
+    # Context kwargs shared by the main signal build AND the every-tick
+    # opener-pinned hold-review (fix #2) — the review reuses them verbatim so it
+    # runs the identical algorithm, only with fresh news/prices + a pinned
+    # sentiment engine. (tickers / articles / snapshots are supplied fresh there.)
+    build_kwargs = dict(
         insider_trades=insider_trades,
         put_call_context=put_call_context,
         gex_context=gex_context,
@@ -867,8 +989,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         opex_context=opex_context,
         pead_context=pead_context,
         coint_context=coint_context,
+    )
+    signals = build_signals(
+        all_tickers,
+        articles,
         snapshots=snapshots,
         session=run_session,
+        **build_kwargs,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
 
@@ -921,8 +1048,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     # ── Step 5: Generate recommendations ─────────────────────────────────
     logger.info("Step 5: Generating recommendations...")
-    recommendations = generate_recommendations(
-        signals,
+    # Context kwargs shared by the main synthesis AND the every-tick opener-pinned
+    # hold-review (fix #2) — the review reuses them with force_engine + its own
+    # (fresh-data) signals, and WITHOUT open_positions (fresh-candidate framing,
+    # apples-to-apples with how the position was judged at entry).
+    synth_kwargs = dict(
         insider_trades=insider_trades,
         macro_context=macro_context,
         cot_context=cot_context,
@@ -952,9 +1082,25 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         intermarket_context=intermarket_context,
         macro_news_context=macro_news_context,
         catalyst_timing_context=catalyst_timing_context,
+    )
+    recommendations = generate_recommendations(
+        signals,
         open_positions=open_position_summaries if hold_prompt_active else None,
         session=run_session,
+        **synth_kwargs,
     )
+
+    # ── Fix #2: capture this run's engines for the opener-pinned hold-review ──
+    # The actual review (fresh news/price refetch + per-opener-engine
+    # re-judgment of every held position) runs in the trading block below, so
+    # observation ticks pay nothing. Captured here BEFORE the top-10 truncation:
+    # this run's synthesis + sentiment engines (for the cheap fallback path) and
+    # the full pre-truncation recs (every held ticker is pinned into the universe
+    # at Step 0, so each has a rec).
+    _synth_meta = get_last_synthesis_meta()
+    run_synthesis_provider = _synth_meta.get("provider")
+    run_sentiment_provider = _provider_of_synth_model(get_dominant_sentiment_model())
+    _full_recs = list(recommendations)
 
     # Keep only the top 10 recommendations by conviction:
     # BUY/SELL first (sorted by confidence desc), then HOLD/WATCH to fill up to 10.
@@ -1080,22 +1226,34 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # step this tick (normalize / M2M / new entries / NAV), so every figure
         # the run produces and persists shares one real cost basis.
         calibrate_sim_costs()
-        update_open_trades()
-        # Open-position monitor: signal-decay / regime-flip exits BEFORE the
-        # counter-recommendation exit path. Catches the case where a held
-        # ticker's thesis has deteriorated but no counter-direction BUY/SELL
-        # appeared in today's top-10 (so close_trades_on_signal_reversal would
-        # silently keep holding it).
+        update_open_trades()   # also force-refreshes OHLCV for open tickers (fresh prices)
+        # Fix #2 — opener-pinned hold-review: re-judge every held LLM-opened
+        # position with the SAME engines that opened it, on fresh news + prices,
+        # EVERY tick. Built here (after update_open_trades' OHLCV refresh, before
+        # the monitor consumes it).
+        _open_trades_now = get_open_trades()
+        hold_reviews = _build_hold_reviews(
+            _open_trades_now, run_sentiment_provider, run_synthesis_provider,
+            _full_recs, sectors, build_kwargs, synth_kwargs, run_session,
+        )
+        # Persist the trajectory (confidence/action vs entry + price) BEFORE the
+        # monitor may close on it, so the review that triggered a close is recorded.
+        _persist_trade_reviews(run_id, hold_reviews, _open_trades_now)
+        # Open-position monitor: opener-pinned LLM exits (+ macro-regime, + the
+        # aggregator backstop for legacy trades) BEFORE the counter-recommendation
+        # exit path.
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
             hold_prompt_active=hold_prompt_active,
+            hold_reviews=hold_reviews,
+            run_synthesis_provider=run_synthesis_provider,
         )
-        close_trades_on_signal_reversal(               # exit early if signal reversed
+        close_trades_on_signal_reversal(               # legacy/rule-based only (LLM-opened owned by monitor)
             actionable, hold_prompt_active=hold_prompt_active)
         # Stamp each new trade with the exact LLM engines in use this run (final-call
         # synthesis model + run-dominant sentiment scorer) for per-LLM attribution.
-        _synth_meta = get_last_synthesis_meta()
+        # (_synth_meta was captured right after synthesis, above.)
         _synth_model = _synth_meta.get("model") or (
             "rule-based (no LLM)" if _synth_meta.get("provider") == "rule-based" else None
         )

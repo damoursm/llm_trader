@@ -58,6 +58,175 @@ def method_winrate_fig(perf: dict) -> go.Figure:
     return fig
 
 
+def confidence_return_fig(perf: dict) -> go.Figure:
+    """Scatter of each trade's return against the confidence that opened it.
+
+    This is the position-sizing calibration check: confidence drives the
+    1.0×/1.5×/2.0× size tier, so higher-confidence trades *should* earn more on
+    average — an upward-sloping trend confirms it, a flat/negative one says the
+    confidence number isn't carrying directional information worth sizing on.
+    Closed trades use their realised return; open trades their live mark-to-market
+    (the same convention as the rest of the dashboard). Marker colour is win
+    (green) / loss (red); shape is closed (filled circle) / open (hollow diamond).
+    A least-squares line summarises the relationship.
+    """
+    def _pts(trades):
+        xs, ys, txt = [], [], []
+        for t in trades or []:
+            c, r = t.get("confidence"), t.get("return_pct")
+            if c is None or r is None:
+                continue
+            try:
+                xs.append(float(c) * 100.0)
+                ys.append(float(r))
+            except (TypeError, ValueError):
+                continue
+            txt.append(t.get("ticker", ""))
+        return xs, ys, txt
+
+    cx, cy, ctxt = _pts(perf.get("closed_trades"))
+    ox, oy, otxt = _pts(perf.get("open_trades"))
+    if not cx and not ox:
+        return _empty("Return-vs-confidence needs trades with a stored confidence.")
+
+    fig = go.Figure()
+    if cx:
+        fig.add_trace(go.Scatter(
+            x=cx, y=cy, mode="markers", name="Closed",
+            marker=dict(size=10, symbol="circle",
+                        color=[POS if v >= 0 else NEG for v in cy], line=dict(width=0)),
+            text=ctxt,
+            hovertemplate="%{text}: %{y:+.2f}% @ %{x:.0f}% conf<extra>closed</extra>",
+        ))
+    if ox:
+        fig.add_trace(go.Scatter(
+            x=ox, y=oy, mode="markers", name="Open (live M2M)",
+            marker=dict(size=11, symbol="diamond-open",
+                        color=[POS if v >= 0 else NEG for v in oy], line=dict(width=2)),
+            text=otxt,
+            hovertemplate="%{text}: %{y:+.2f}% @ %{x:.0f}% conf<extra>open</extra>",
+        ))
+
+    # Least-squares trend over all points (needs ≥2 distinct confidences).
+    ax, ay = cx + ox, cy + oy
+    if len(ax) >= 2 and len(set(ax)) >= 2:
+        import numpy as np
+        slope, intercept = np.polyfit(ax, ay, 1)
+        x0, x1 = min(ax), max(ax)
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[slope * x0 + intercept, slope * x1 + intercept],
+            mode="lines", name=f"Trend ({slope:+.2f}%/pt)",
+            line=dict(color=MUTED, dash="dash", width=2),
+            hoverinfo="skip",
+        ))
+
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    fig.update_layout(
+        xaxis_title="Entry confidence (%)", yaxis_title="Return (%)",
+        margin=dict(l=10, r=10, t=30, b=10), height=380,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def confidence_timeline_fig(reviews, trades) -> go.Figure:
+    """Per-ticker hold-review trajectory (fix #2): the opener-pinned review
+    confidence over time (left axis) + price (right axis) + entry/exit decisions,
+    so you can see whether conviction deterioration precedes a direction change.
+
+    Confidence markers are coloured by the review's action (BUY green / SELL red /
+    HOLD·WATCH grey); a dashed line marks the entry confidence and a dotted line
+    the close floor (the level below which same-direction conviction triggers
+    ``llm_confidence_loss``). Entry/exit markers come from the ledger.
+    """
+    import pandas as pd
+    from plotly.subplots import make_subplots
+
+    if reviews is None or getattr(reviews, "empty", True):
+        return _empty("No review history yet for this ticker (LLM-opened positions accrue it each tick).")
+
+    df = reviews.copy()
+    df["t"] = pd.to_datetime(df["reviewed_at"], errors="coerce", utc=True)
+    df = df.dropna(subset=["t"]).sort_values("t")
+    if df.empty:
+        return _empty("No review history yet for this ticker.")
+
+    act_color = {"BUY": POS, "SELL": NEG, "HOLD": MUTED, "WATCH": MUTED}
+    mcolors = [act_color.get(str(a).upper(), MUTED) for a in df["action"]]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Confidence trajectory (left), markers coloured by the review's action.
+    fig.add_trace(go.Scatter(
+        x=df["t"], y=df["confidence"], mode="lines+markers", name="Review confidence",
+        line=dict(color="#2563eb", width=2),
+        marker=dict(size=9, color=mcolors, line=dict(width=1, color="#1e3a8a")),
+        customdata=df[["action", "direction", "return_pct"]].values,
+        hovertemplate=("%{x|%Y-%m-%d %H:%M} ET<br>conf %{y:.2f} · %{customdata[0]} "
+                       "(%{customdata[1]})<br>ret %{customdata[2]:+.2f}%<extra></extra>"),
+    ), secondary_y=False)
+
+    # Entry-confidence baseline + close floor (constant per position; latest value),
+    # drawn as full-width lines (robust across plotly versions vs add_hline).
+    x0, x1 = df["t"].iloc[0], df["t"].iloc[-1]
+    ec = df["entry_confidence"].dropna()
+    if not ec.empty:
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[float(ec.iloc[-1])] * 2, mode="lines", name="entry conf",
+            line=dict(color=POS, dash="dash", width=1.5), hoverinfo="skip"), secondary_y=False)
+    fl = df["conf_floor"].dropna()
+    if not fl.empty:
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[float(fl.iloc[-1])] * 2, mode="lines", name="close floor",
+            line=dict(color=NEG, dash="dot", width=1.5), hoverinfo="skip"), secondary_y=False)
+
+    # Price (right axis).
+    if df["price"].notna().any():
+        fig.add_trace(go.Scatter(
+            x=df["t"], y=df["price"], mode="lines", name="Price",
+            line=dict(color="#9ca3af", width=1.5),
+            hovertemplate="%{x|%Y-%m-%d %H:%M} ET<br>price %{y:.2f}<extra></extra>",
+        ), secondary_y=True)
+
+    # Entry / exit decision markers from the ledger (on the price axis).
+    def _parse(iso):
+        try:
+            ts = pd.to_datetime(iso, utc=True)
+            return None if pd.isna(ts) else ts
+        except Exception:
+            return None
+
+    for tr in (trades or []):
+        e_t, e_p = _parse(tr.get("entry_datetime")), tr.get("entry_price")
+        if e_t is not None and e_p:
+            is_buy = tr.get("action") == "BUY"
+            fig.add_trace(go.Scatter(
+                x=[e_t], y=[e_p], mode="markers", showlegend=False,
+                marker=dict(symbol="triangle-up" if is_buy else "triangle-down",
+                            size=14, color=POS if is_buy else NEG,
+                            line=dict(width=1, color="#111827")),
+                hovertemplate=f"ENTRY {tr.get('action')} @ %{{y:.2f}}<extra></extra>",
+            ), secondary_y=True)
+        if tr.get("status") == "CLOSED":
+            x_t, x_p = _parse(tr.get("exit_datetime")), tr.get("exit_price")
+            if x_t is not None and x_p:
+                fig.add_trace(go.Scatter(
+                    x=[x_t], y=[x_p], mode="markers", showlegend=False,
+                    marker=dict(symbol="x", size=12, color="#111827"),
+                    hovertemplate=f"EXIT @ %{{y:.2f}}<br>{tr.get('exit_reason') or 'close'}<extra></extra>",
+                ), secondary_y=True)
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10), height=420,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_yaxes(title_text="Confidence", range=[0, 1], secondary_y=False)
+    fig.update_yaxes(title_text="Price ($)", secondary_y=True, showgrid=False)
+    return fig
+
+
 def equity_curve_fig(perf: dict) -> go.Figure:
     """Reuse the existing equity-curve builder; fall back to a placeholder."""
     try:

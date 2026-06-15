@@ -183,6 +183,14 @@ _METHOD_HEADER_TIPS = {
     "Avg return %": "Average % return across those trades.",
 }
 
+# Macro Performance table — header explanations (aggregated decision layers).
+_MACRO_HEADER_TIPS = {
+    "Layer": "The aggregated decision layer being judged: 'LLM Synthesis' = the final BUY/SELL caller (all engines combined; the per-engine split is in the Model Evaluation table below), 'Aggregator' = the mechanical combined signal (the weighted blend of all method scores), or 'Bundle · X' = one method family (e.g. Technical, Options) voting by the sign of its summed scores. Each layer is scored on its OWN full stream of directional calls.",
+    "Win rate %": "Share of that layer's directional calls currently positive — counting EVERY call it made (actionable or not, executed or not), not just the trades that survived the gates.",
+    "Trades": "Number of directional calls the layer made, deduped to its last call per ticker per day (same rule as the LLM rows below).",
+    "Avg return %": "Average forward % return across those calls: snapshot price at the call → latest cached close, net of the modeled one-way cost (so a brand-new call starts slightly negative, like a real position).",
+}
+
 
 # ── LLM model usage (Method Performance tab → "LLM models used" section) ──────
 # Exact model ids per provider. Sources of truth in the code:
@@ -360,6 +368,9 @@ def _rationale_body(run_id):
     if not recs_disp.empty:
         recs_disp["confidence"] = (recs_disp["confidence"].astype(float) * 100).round(0).astype("Int64")
         recs_disp["generated_at"] = recs_disp["generated_at"].map(_fmt_et)
+        # Row id = ticker so an active-cell click resolves to the ticker robustly
+        # (survives native sort / filter / pagination) for the review-timeline plot.
+        recs_disp["id"] = recs_disp["ticker"]
 
     run_meta = data.run_row(run_id)
     syn = (run_meta["llm_synthesis_provider"] if run_meta is not None else None) or "–"
@@ -372,8 +383,9 @@ def _rationale_body(run_id):
             "Each external data source the pipeline called this run — green ✓ succeeded, red ✗ failed. Hover a chip for the error or status."),
         html.Div(chips or "No source records.", style={"marginBottom": 18}),
         _h3(f"Recommendations  ·  {len(recs_disp)} shown",
-            "Every BUY/SELL/HOLD/WATCH the model produced this run. Green-tinted rows are actionable (paper-traded). Hover a column header for its definition."),
+            "Every BUY/SELL/HOLD/WATCH the model produced this run. Green-tinted rows are actionable (paper-traded). Hover a column header for its definition. Click any row to chart that ticker's hold-review confidence over time below."),
         dash_table.DataTable(
+            id="rec-table",
             data=recs_disp.to_dict("records"),
             columns=_columns(_REC_COL_SPEC),
             tooltip_header=_header_tooltips(_REC_COL_SPEC),
@@ -389,6 +401,45 @@ def _rationale_body(run_id):
             ],
             **_TABLE_KW,
         ),
+        dcc.Loading(html.Div(id="rec-review-plot", style={"marginTop": 16})),
+    ])
+
+
+@app.callback(Output("rec-review-plot", "children"), Input("rec-table", "active_cell"))
+def _rec_review_plot(active_cell):
+    """Click a recommendation row → chart that ticker's opener-pinned hold-review
+    confidence over time, with price + entry/exit decisions, so deterioration →
+    direction-change is visible. ``row_id`` is the ticker (set in _rationale_body)."""
+    if not active_cell:
+        return html.Div(
+            "↑ Click any recommendation row to chart its hold-review confidence over time "
+            "(the per-tick re-judgment by the engines that opened it) against price and the "
+            "entry/exit decisions.",
+            style={"color": "#6b7280", "fontStyle": "italic", "padding": "8px 2px"})
+    ticker = active_cell.get("row_id")
+    if not ticker:
+        return html.Div()
+    return _safe(lambda: _review_timeline_section(ticker))
+
+
+def _review_timeline_section(ticker: str):
+    reviews = data.trade_reviews_df(ticker)
+    trades = data.trades_for_ticker(ticker)
+    if reviews is None or reviews.empty:
+        return html.Div(
+            f"No hold-review history recorded for {ticker} yet. Only LLM-opened positions accrue "
+            "it, and only from this feature's first run onward — it fills in tick by tick while a "
+            "position is held.",
+            style={"color": "#6b7280", "padding": "8px 2px"})
+    return html.Div([
+        _h3(f"{ticker} — hold-review confidence over time",
+            "Each point is one tick's re-judgment of this position by the SAME synthesis + sentiment "
+            "engines that opened it, on fresh news + prices (so it's an apples-to-apples vs the entry "
+            "confidence). Marker colour = the review's action (green BUY / red SELL / grey HOLD). "
+            "Dashed line = entry confidence; dotted line = the close floor (same-direction conviction "
+            "below it triggers an llm_confidence_loss exit). Grey line = price; triangles = entry, "
+            "✕ = exit. Watch whether the confidence sliding toward the floor precedes a colour flip."),
+        dcc.Graph(figure=figures.confidence_timeline_fig(reviews, trades)),
     ])
 
 
@@ -595,8 +646,47 @@ def _methods_perf_section(window_days, session=None):
         **_TABLE_KW,
     ) if rows else html.Div("No per-method stats in this window yet.", style={"color": "#6b7280"})
 
+    # ── Macro evaluation — aggregated decision layers (synthesis vs aggregator
+    # vs method bundles), each scored on its full directional-call stream so the
+    # LLM's confidence and the aggregator's confidence are directly comparable.
+    macro_rows = [
+        {
+            "Layer": r["label"],
+            "Win rate %": round(r["win_rate"], 1) if r.get("win_rate") is not None else None,
+            "Trades": r.get("trades"),
+            "Avg return %": round(r["avg_return"], 2) if r.get("avg_return") is not None else None,
+        }
+        for r in (perf.get("macro_eval") or [])
+    ]
+    macro_table = dash_table.DataTable(
+        data=macro_rows,
+        columns=[{"name": c, "id": c} for c in ["Layer", "Win rate %", "Trades", "Avg return %"]],
+        tooltip_header=_MACRO_HEADER_TIPS,
+        style_data_conditional=[
+            {"if": {"filter_query": '{Layer} contains "Synthesis"'}, "backgroundColor": "#eef2ff"},
+            {"if": {"filter_query": '{Layer} contains "Aggregator"'}, "backgroundColor": "#ecfdf5"},
+        ],
+        **_TABLE_KW,
+    ) if macro_rows else html.Div("No macro-layer stats in this window yet.", style={"color": "#6b7280"})
+
     return html.Div([
         dcc.Graph(figure=figures.method_winrate_fig(perf)),
+        _h3("Return vs entry confidence",
+            "Each dot is one trade: its entry confidence (x) against its return (y) — closed trades at their realised return, "
+            "open trades (hollow diamonds) at their live mark-to-market; green = win, red = loss. Confidence sets the position-size "
+            "tier (1.0×/1.5×/2.0×), so an upward-sloping dashed trend line confirms higher-confidence calls actually earn more and "
+            "the sizing is justified; a flat or downward line means confidence isn't carrying directional information. Respects the "
+            "window + session toggles above."),
+        dcc.Graph(figure=figures.confidence_return_fig(perf)),
+        _h3("Macro evaluation — decision layers (LLM synthesis vs aggregator vs bundles)",
+            "Head-to-head performance of the aggregated decision layers, all scored on the SAME unbiased basis: "
+            "every directional call each layer made — not just the few that became trades — entered at the call-time "
+            "snapshot price and marked at the latest close through the real cost model. 'LLM Synthesis' is the final "
+            "BUY/SELL call (all engines; the per-engine split is in the Model Evaluation table below); 'Aggregator' is "
+            "the mechanical combined signal; each 'Bundle' is a method family voting by its summed score. This is the "
+            "direct test of whether the LLM's confidence or the aggregator's confidence is the more reliable predictor. "
+            "Respects the window + session toggles above."),
+        macro_table,
         _h3("Model evaluation — signal methods (solo simulation) & LLM engines",
             "Method rows: how each signal method would have performed deciding alone (each closed trade re-simulated as if only that method set the direction). "
             "Highlighted LLM rows: every BUY/SELL the engine recommended — executed or simulated — entered at the recommendation-time price, marked at the latest close, "

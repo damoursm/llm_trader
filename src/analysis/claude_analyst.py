@@ -149,6 +149,7 @@ def generate_recommendations(
     catalyst_timing_context=None,   # Optional[CatalystTimingContext]
     open_positions=None,            # Optional[List[dict]] — held-position review block (A/B'd per run)
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
+    force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' — pin synthesis (hold-review)
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -156,6 +157,12 @@ def generate_recommendations(
 
     ``session`` != "rth" prepends an extended-session context block to the
     prompt: thin books, frozen options data, news/gap as the live signals.
+
+    ``force_engine`` ('anthropic' | 'deepseek') pins synthesis to exactly that
+    engine, skipping the per-run A/B flip, with NO cross-engine OR rule-based
+    fallback — used by the opener-pinned hold-review so a position is always
+    re-judged by the engine that opened it. On a forced-engine failure this
+    returns ``[]`` (the caller treats it as "no review this tick").
     """
     if not signals:
         return []
@@ -345,7 +352,11 @@ def generate_recommendations(
         active_methods.append("cointegration pairs (market-neutral stat-arb lean: long cheap leg / short rich leg)")
     if settings.enable_cross_sectional:
         active_methods.append("cross-sectional rank (per-method z-score vs universe — relative standout)")
-    if settings.enable_extended_gap and session and session != "rth":
+    # ext_gap is in the active method set off-hours always, and in RTH too when the
+    # session profile is OFF (default) — so the prompt's method list is identical
+    # across sessions (comparable scores). It reads 0 in RTH by design.
+    if settings.enable_extended_gap and (not settings.enable_extended_signal_profile
+                                         or (session and session != "rth")):
         active_methods.append("extended-session gap (live off-hours move vs last completed close, ATR-normalised)")
     methods_desc = ", ".join(active_methods) if active_methods else "combined signals"
 
@@ -2805,8 +2816,10 @@ Regime guide:
     # Tells the analyst which information is live vs frozen off-hours and
     # raises its bar for BUY/SELL accordingly — mirrors the aggregator's
     # extended weight overlay and the pipeline's threshold bump.
+    # Gated by enable_extended_signal_profile (default OFF) so the synthesis prompt
+    # is session-invariant — the LLM confidence stays comparable across the day.
     session_block = ""
-    if session and session != "rth":
+    if session and session != "rth" and settings.enable_extended_signal_profile:
         _now_t = now_et().time()
         sess_label = (
             "OVERNIGHT (20:00–04:00 ET — exchanges closed)" if session == "overnight"
@@ -2883,12 +2896,18 @@ Return ALL tickers from the input. No markdown, JSON only."""
     # comparable samples for the dashboard's per-LLM evaluation rows. The
     # other engine remains the error fallback (credit exhausted, rate limit,
     # connection failure, missing key, …), then rule-based as last resort.
-    primary = "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
-    order = ["anthropic", "deepseek"] if primary == "anthropic" else ["deepseek", "anthropic"]
-    logger.info(
-        f"[claude] A/B routing this run: primary={primary} "
-        f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
-    )
+    if force_engine in ("anthropic", "deepseek"):
+        # Opener-pinned hold-review: this engine ONLY — no A/B flip, no
+        # cross-engine fallback, no rule-based fallback (see below).
+        order = [force_engine]
+        logger.info(f"[claude] FORCED synthesis engine={force_engine} (pinned hold-review)")
+    else:
+        primary = "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
+        order = ["anthropic", "deepseek"] if primary == "anthropic" else ["deepseek", "anthropic"]
+        logger.info(
+            f"[claude] A/B routing this run: primary={primary} "
+            f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
+        )
     raw: str | None = None
     analyst_source = settings.analyst_model
     for engine in order:
@@ -2906,6 +2925,11 @@ Return ALL tickers from the input. No markdown, JSON only."""
             )
             raw = None
     if raw is None:
+        if force_engine:
+            # Pinned hold-review: never fabricate a rule-based verdict — the caller
+            # treats an empty result as "no review this tick" (position holds).
+            logger.warning(f"[claude] forced synthesis engine={force_engine} failed — no review produced")
+            return []
         logger.error("[claude] All LLM analysts failed — using rule-based fallback")
         _set_synthesis_meta("rule-based")
         return _fallback_recommendations(signals)
@@ -2967,9 +2991,12 @@ Return ALL tickers from the input. No markdown, JSON only."""
     # Guarantee every signal ticker got a recommendation.
     # Tickers dropped by truncation (or simply omitted) fall back to rule-based logic
     # so open positions always receive a HOLD/SELL signal and nothing falls silent.
+    # (Skip for a pinned hold-review: a rule-based fill would break the
+    # apples-to-apples comparison — an omitted ticker simply gets no review and
+    # the position holds this tick.)
     covered = {r.ticker for r in recommendations}
     missing = [s for s in signals if s.ticker not in covered]
-    if missing:
+    if missing and not force_engine:
         fallback = _fallback_recommendations(missing)
         recommendations += fallback
         logger.warning(

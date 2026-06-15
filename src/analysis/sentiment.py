@@ -186,9 +186,17 @@ def _source_diversity_scale(articles: List[NewsArticle]) -> float:
     return 0.70
 
 
-def analyse_sentiment(ticker: str, articles: List[NewsArticle]) -> tuple[float, str]:
+def analyse_sentiment(ticker: str, articles: List[NewsArticle],
+                      force_engine: Optional[str] = None) -> tuple[float, str]:
     """
     Score news sentiment for a ticker with precision controls applied.
+
+    ``force_engine`` ('deepseek' | 'anthropic') pins scoring to exactly that
+    engine with NO cross-engine fallback — used by the opener-pinned hold-review
+    so a position is always re-scored by the same sentiment engine that opened it
+    (apples-to-apples). On a forced-engine failure the score is the usual
+    (0.0, "error") rather than silently switching engines. ``None`` keeps the
+    per-run A/B order (`_PRIMARY_SENTIMENT_ENGINE` first, the other as fallback).
 
     Returns:
         (score, rationale)
@@ -258,7 +266,10 @@ Respond with JSON only, no markdown."""
     # other provider remains the error fallback. Determinism per engine:
     # temperature=0 (+ a stable seed on DeepSeek; Anthropic exposes no seed)
     # so two runs scoring the same digest on the same engine agree.
-    order = ["deepseek", "anthropic"] if _PRIMARY_SENTIMENT_ENGINE == "deepseek" else ["anthropic", "deepseek"]
+    if force_engine in ("deepseek", "anthropic"):
+        order = [force_engine]   # pinned hold-review: this engine ONLY, no fallback
+    else:
+        order = ["deepseek", "anthropic"] if _PRIMARY_SENTIMENT_ENGINE == "deepseek" else ["anthropic", "deepseek"]
     last_err: Exception | None = None
     for engine in order:
         try:

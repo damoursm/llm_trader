@@ -494,6 +494,94 @@ def _synthesis_model_for_rec(value: Optional[str]) -> Optional[str]:
     return _synthesis_model_for_provider(v) or v
 
 
+def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
+                         bars_memo: Optional[dict] = None) -> List[dict]:
+    """Mark a list of directional *calls* to forward returns as pseudo-trades.
+
+    Shared scoring core for the unbiased recommendation/signal streams (used by
+    both ``_compute_llm_perf`` and ``compute_macro_eval``). The real ledger only
+    holds gate-surviving trades, so to judge a decision layer on its FULL output
+    we treat every directional call as a pseudo-trade: anchored at the snapshot
+    price recorded when the call was made, marked at the latest cached close, and
+    charged the same entry-leg cost model as a real trade (so a brand-new call
+    starts slightly negative by the round-trip cost, exactly like a real position).
+
+    Each call dict needs: ``ticker``, ``type``, ``action`` ('BUY'|'SELL'),
+    ``entry_date``, ``entry_datetime``, ``snap_price`` (None → that day's close).
+    ``llm_synthesis_model`` / ``llm_sentiment_model`` ride through when present.
+    Calls are dropped when the ticker has no cached bars, no usable entry price,
+    or no forward bar at/after the entry date yet. Calls must already be deduped
+    by the caller (the dedup key differs per stream). Pass a shared ``bars_memo``
+    to reuse OHLCV loads across several streams (e.g. the macro layers).
+    """
+    from src.data.cache import load_ohlcv
+
+    if bars_memo is None:
+        bars_memo = {}
+
+    def _bars(ticker: str):
+        if ticker not in bars_memo:
+            try:
+                b = load_ohlcv(ticker)
+                bars_memo[ticker] = None if (b is None or b.empty or "Close" not in b.columns) else b
+            except Exception:
+                bars_memo[ticker] = None
+        return bars_memo[ticker]
+
+    out: List[dict] = []
+    for c in calls:
+        row_session = _trade_session(c)
+        if session and row_session != session:
+            continue
+        bars = _bars(c["ticker"])
+        if bars is None:
+            continue
+        # Entry anchor: snapshot price recorded with the call, else that day's close.
+        try:
+            entry_price = float(c.get("snap_price"))
+        except (TypeError, ValueError):
+            entry_price = None
+        if entry_price is not None and not entry_price > 0:   # also catches NaN
+            entry_price = None
+        if entry_price is None:
+            day = [float(cl) for d, cl in zip(bars.index, bars["Close"])
+                   if d.date().isoformat() == c["entry_date"]]
+            entry_price = day[-1] if day and day[-1] > 0 else None
+        if entry_price is None:
+            continue
+        # End anchor: latest cached close (skip when no bar exists at/after entry yet).
+        last_close = float(bars["Close"].iloc[-1])
+        last_date = bars.index[-1].date().isoformat()
+        if last_close <= 0 or last_date < c["entry_date"]:
+            continue
+        ctype = c.get("type") or "STOCK"
+        t = {
+            "ticker": c["ticker"],
+            "type": ctype,
+            "action": c["action"],
+            "direction": c["action"],       # BUY/SELL — same convention as the hypothetical book
+            "status": "OPEN",
+            "entry_date": c["entry_date"],
+            "entry_datetime": c["entry_datetime"],
+            "entry_price": entry_price,
+            # Entry leg bears that session's spread (extended calls pay the wider
+            # book); the exit anchor is an RTH cached close, so no exit session.
+            "entry_session": row_session,
+            "current_price": last_close,
+            "current_price_datetime": last_date,
+            "exit_date": None,
+            "exit_price": None,
+            "return_pct": round(_pct_return(c["action"], entry_price, last_close, ctype,
+                                            entry_session=row_session), 3),
+            "position_size_multiplier": 1.0,
+        }
+        for k in ("llm_synthesis_model", "llm_sentiment_model"):
+            if c.get(k):
+                t[k] = c[k]
+        out.append(t)
+    return out
+
+
 def _compute_llm_perf(window_days: Optional[int] = None,
                       session: Optional[str] = None) -> dict:
     """Per-LLM engine stats over EVERY recommended trade, executed or not.
@@ -553,82 +641,131 @@ def _compute_llm_perf(window_days: Optional[int] = None,
             "entry_date": entry_date,
             "entry_datetime": gen,
             "snap_price": rec.snap_price,
-            "synth": synth,
-            "sent": sent,
+            "llm_synthesis_model": synth,
+            "llm_sentiment_model": sent,
         }
 
-    from src.data.cache import load_ohlcv
-
-    bars_memo: Dict[str, object] = {}
-
-    def _bars(ticker: str):
-        if ticker not in bars_memo:
-            try:
-                b = load_ohlcv(ticker)
-                bars_memo[ticker] = None if (b is None or b.empty or "Close" not in b.columns) else b
-            except Exception:
-                bars_memo[ticker] = None
-        return bars_memo[ticker]
-
-    pseudo: List[dict] = []
-    for row in deduped.values():
-        row_session = _trade_session(row)
-        if session and row_session != session:
-            continue
-        bars = _bars(row["ticker"])
-        if bars is None:
-            continue
-        # Entry anchor: recommendation-time snapshot price, else that day's close.
-        try:
-            entry_price = float(row["snap_price"])
-        except (TypeError, ValueError):
-            entry_price = None
-        if entry_price is not None and not entry_price > 0:   # also catches NaN
-            entry_price = None
-        if entry_price is None:
-            day = [float(c) for d, c in zip(bars.index, bars["Close"])
-                   if d.date().isoformat() == row["entry_date"]]
-            entry_price = day[-1] if day and day[-1] > 0 else None
-        if entry_price is None:
-            continue
-        # End anchor: latest cached close (skip when no bar exists at/after entry yet).
-        last_close = float(bars["Close"].iloc[-1])
-        last_date = bars.index[-1].date().isoformat()
-        if last_close <= 0 or last_date < row["entry_date"]:
-            continue
-        pseudo.append({
-            "ticker": row["ticker"],
-            "type": row["type"],
-            "action": row["action"],
-            "direction": row["action"],     # BUY/SELL — same convention as the hypothetical book
-            "status": "OPEN",
-            "entry_date": row["entry_date"],
-            "entry_datetime": row["entry_datetime"],
-            "entry_price": entry_price,
-            # Entry leg bears that session's spread (extended recs pay the wider
-            # book); the exit anchor is an RTH cached close, so no exit session.
-            "entry_session": row_session,
-            "current_price": last_close,
-            "current_price_datetime": last_date,
-            "exit_date": None,
-            "exit_price": None,
-            "return_pct": round(_pct_return(row["action"], entry_price, last_close, row["type"],
-                                            entry_session=row_session), 3),
-            "position_size_multiplier": 1.0,
-            "llm_synthesis_model": row["synth"],
-            "llm_sentiment_model": row["sent"],
-        })
+    pseudo = _build_pseudo_trades(list(deduped.values()), session)
 
     groups: Dict[str, Dict[str, List[dict]]] = {"synthesis": {}, "sentiment": {}}
     for t in pseudo:
-        if t["llm_synthesis_model"]:
+        if t.get("llm_synthesis_model"):
             groups["synthesis"].setdefault(t["llm_synthesis_model"], []).append(t)
-        if t["llm_sentiment_model"]:
+        if t.get("llm_sentiment_model"):
             groups["sentiment"].setdefault(t["llm_sentiment_model"], []).append(t)
     return {
         role: {m: s for m, s in ((m, _compute_segment_stats(ts)) for m, ts in by_model.items()) if s}
         for role, by_model in groups.items()
     }
+
+
+# ── Macro / aggregated-layer evaluation ──────────────────────────────────────
+# Compares the high-level DECISION LAYERS — the LLM synthesis final call, the
+# mechanical aggregator's combined signal, and each method bundle (category) — on
+# ONE unbiased, apples-to-apples basis: every directional call each layer made
+# (not just the few that survived the trading gates), scored as a pseudo-trade
+# over forward returns through the same cost model as real trades. This is the
+# "whose confidence is more reliable" panel: synthesis vs aggregator vs bundles.
+#
+# A bundle's direction per (ticker, run) is the sign of the SUM of its member
+# method scores; it "has a view" only when |sum| clears this floor (filters the
+# all-but-zero noise so a near-flat family isn't counted as a directional call).
+_BUNDLE_VIEW_FLOOR = 0.10
+
+_MACRO_HEADLINE_ORDER = ("synthesis", "aggregator")
+
+
+def compute_macro_eval(window_days: Optional[int] = None,
+                       session: Optional[str] = None) -> List[dict]:
+    """Performance rows for the dashboard's Macro Evaluation table — the
+    aggregated decision layers, each scored on its OWN full stream of directional
+    calls via the same pseudo-trade model as ``_compute_llm_perf``.
+
+    Returns a list of ``{label, group, trades, win_rate, avg_return,
+    compound_return, wtd_avg_return, best, worst}`` rows (empty streams omitted),
+    ordered LLM synthesis → aggregator → bundles (by win rate). Streams, all
+    deduped to the LAST call per (ticker, day):
+      • LLM Synthesis — every BUY/SELL recommendation (any engine, actionable or
+        not), anchored at the recommendation-time snapshot (``signals.price``).
+      • Aggregator — every ``signals`` row whose stored direction is BULLISH/BEARISH.
+      • Bundle · <category> — direction = sign(Σ member method scores) from the
+        ``signals`` per-method columns, when |Σ| ≥ ``_BUNDLE_VIEW_FLOOR``.
+    """
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat() if window_days is not None else None
+    bars_memo: Dict[str, object] = {}     # shared across every stream's NAV anchors
+    rows: List[dict] = []
+
+    def _emit(label: str, group: str, calls: List[dict]) -> None:
+        st = _compute_segment_stats(_build_pseudo_trades(calls, session, bars_memo))
+        if st:
+            rows.append({"label": label, "group": group, **st})
+
+    # ── 1. LLM Synthesis (final call) — all engines combined ──────────────────
+    try:
+        rdf = repo.fetch_df(
+            "SELECT r.run_id, r.generated_at, r.ticker, r.type, r.action, "
+            "       s.price AS snap_price "
+            "FROM recommendations r "
+            "LEFT JOIN signals s ON s.run_id = r.run_id AND s.ticker = r.ticker "
+            "WHERE r.action IN ('BUY', 'SELL') ORDER BY r.generated_at"
+        )
+    except Exception as e:
+        logger.debug(f"[tracker] macro_eval recommendations query failed: {e}")
+        rdf = None
+    if rdf is not None and not rdf.empty:
+        syn_ded: Dict[tuple, dict] = {}
+        for rec in rdf.itertuples(index=False):
+            gen = str(rec.generated_at or "")
+            d = gen[:10]
+            if not d or (cutoff and d < cutoff):
+                continue
+            syn_ded[(d, rec.ticker)] = {
+                "ticker": rec.ticker, "type": rec.type or "STOCK", "action": rec.action,
+                "entry_date": d, "entry_datetime": gen, "snap_price": rec.snap_price,
+            }
+        _emit("LLM Synthesis (final call)", "synthesis", list(syn_ded.values()))
+
+    # ── 2 + 3. Aggregator + method bundles — from the signals cross-section ────
+    try:
+        method_cols = ", ".join(_ALL_METHODS)
+        sdf = repo.fetch_df(
+            "SELECT generated_at, ticker, type, direction, price, "
+            f"{method_cols} FROM signals ORDER BY generated_at"
+        )
+    except Exception as e:
+        logger.debug(f"[tracker] macro_eval signals query failed: {e}")
+        sdf = None
+    if sdf is not None and not sdf.empty:
+        agg_ded: Dict[tuple, dict] = {}
+        bundle_ded: Dict[str, Dict[tuple, dict]] = {c: {} for c in METHOD_CATEGORIES}
+        for r in sdf.itertuples(index=False):
+            gen = str(r.generated_at or "")
+            d = gen[:10]
+            if not d or (cutoff and d < cutoff):
+                continue
+            base = {"ticker": r.ticker, "type": (r.type or "STOCK"),
+                    "entry_date": d, "entry_datetime": gen, "snap_price": r.price}
+            direction = str(r.direction or "").upper()
+            if direction in ("BULLISH", "BEARISH"):
+                agg_ded[(d, r.ticker)] = {**base, "action": "BUY" if direction == "BULLISH" else "SELL"}
+            for cat, members in METHOD_CATEGORIES.items():
+                total = 0.0
+                for m in members:
+                    v = getattr(r, m, 0.0)
+                    if v is not None and v == v:     # skip None / NaN
+                        total += float(v)
+                if abs(total) >= _BUNDLE_VIEW_FLOOR:
+                    bundle_ded[cat][(d, r.ticker)] = {**base, "action": "BUY" if total > 0 else "SELL"}
+        _emit("Aggregator (combined signal)", "aggregator", list(agg_ded.values()))
+        for cat in METHOD_CATEGORIES:
+            _emit(f"Bundle · {cat}", "bundle", list(bundle_ded[cat].values()))
+
+    # Headline layers first (synthesis, then aggregator), bundles after by win rate.
+    head = sorted((r for r in rows if r["group"] in _MACRO_HEADLINE_ORDER),
+                  key=lambda x: _MACRO_HEADLINE_ORDER.index(x["group"]))
+    bundles = sorted((r for r in rows if r["group"] == "bundle"),
+                     key=lambda x: -(x.get("win_rate") or 0))
+    return head + bundles
 
 
 _ASSET_TYPE_LABELS: Dict[str, str] = {
@@ -1206,6 +1343,13 @@ def record_new_trades(
     return diag
 
 
+def get_open_trades() -> List[dict]:
+    """Every OPEN trade dict (full records, incl. ``llm_synthesis_model`` /
+    ``llm_sentiment_model``). Used by the pipeline's opener-pinned hold-review to
+    group positions by their opening engines."""
+    return [t for t in _load_trades() if t.get("status") == "OPEN"]
+
+
 def get_open_position_summaries() -> List[dict]:
     """Compact snapshot of every OPEN trade for the held-positions prompt
     block: ticker, direction, entry anchor, and the latest mark from the
@@ -1266,6 +1410,11 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
     The closed trade is immediately saved; record_new_trades() will then open the new leg.
     ``hold_prompt_active`` is this run's held-positions-prompt coin flip, stamped on each
     close as ``exit_hold_prompt`` for the A/B evaluation.
+
+    Fix #2 — when ``enable_llm_hold_review`` is on this path SKIPS LLM-opened
+    positions entirely: they are owned by the opener-pinned hold-review in
+    ``monitor_open_positions`` (which runs first and detects flips via the opening
+    engine every tick). This path serves only legacy / rule-based-opened trades.
     """
     trades = _load_trades()
     today = date.today().isoformat()
@@ -1288,6 +1437,14 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
             (trade["action"] == "BUY"  and new_action == "SELL") or
             (trade["action"] == "SELL" and new_action == "BUY")
         ):
+            continue
+        # Fix #2 — LLM-opened positions are owned by the opener-pinned
+        # hold-review in monitor_open_positions (which runs first and detects
+        # flips via the opening engine every tick). This path, driven by THIS
+        # run's non-pinned actionable set, must not close them — it serves only
+        # legacy / rule-based-opened trades (no LLM engine).
+        open_provider = _provider_of_synth_model(trade.get("llm_synthesis_model"))
+        if settings.enable_llm_hold_review and open_provider in ("anthropic", "deepseek"):
             continue
 
         # Reuse the most recent intraday mark when available; otherwise
@@ -1337,22 +1494,60 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
 # Open-position monitoring — signal decay + regime exits
 # ---------------------------------------------------------------------------
 
+def _provider_of_synth_model(model: Optional[str]) -> Optional[str]:
+    """Inverse of ``_synthesis_model_for_provider``: a stored synthesis model id
+    → its engine ('anthropic' | 'deepseek' | 'rule-based'). ``None`` for a
+    blank/unknown value (treated as "no LLM engine" → aggregator backstop)."""
+    m = (model or "").strip().lower()
+    if not m:
+        return None
+    if "deepseek" in m:
+        return "deepseek"
+    if "claude" in m or "anthropic" in m:
+        return "anthropic"
+    if "rule" in m:
+        return "rule-based"
+    return None
+
+
+def _confidence_floor(entry_conf) -> float:
+    """The opener-review confidence a held position must clear to stay open:
+    ``max(absolute backstop, relative × LLM ENTRY confidence)``. Shared by the
+    exit gate (``_evaluate_decay``) and the persisted review trajectory so the
+    plotted close-threshold line always matches what actually fires."""
+    absf = float(settings.signal_decay_confidence_floor)
+    if entry_conf is None:
+        return absf
+    return max(absf, float(settings.signal_decay_confidence_floor_relative) * float(entry_conf))
+
+
 def _evaluate_decay(
     trade: dict,
     today_signal,
     macro_regime_context,
+    hold_review=None,
 ) -> Optional[str]:
-    """Return an ``exit_reason`` string when an open trade should be closed,
-    or ``None`` to keep it open.
+    """Return an ``exit_reason`` when an open trade should close, else ``None``.
 
-    Checks four triggers in priority order:
-      1. ``macro_regime_exit`` — long position while macro is PANIC/RISK_OFF.
-      2. ``signal_flipped``    — oriented combined score crossed against trade.
-      3. ``signal_decay``      — oriented (entry - today) > drop threshold.
-      4. ``confidence_loss``   — today's confidence < floor.
+    Fix #2 — the gate that HOLDS/CLOSES a position uses the SAME rationale that
+    OPENED it. A position opened by an LLM engine (Claude / DeepSeek) is governed
+    by ``hold_review`` — its OWN opening engine's fresh re-judgment of the ticker.
+    The caller (pipeline ``_build_hold_reviews``) guarantees every entry in
+    ``hold_reviews`` is produced by that position's opening synthesis + sentiment
+    engines (apples-to-apples), so this function just trusts a present review.
+    The aggregator's combined_score / confidence (a different decision-maker,
+    often near zero on LLM-conviction names — it was killing those trades one
+    tick after entry) is no longer consulted for LLM-opened trades. It survives
+    only as the backstop for legacy / rule-based-opened trades (no LLM engine).
 
-    Trades that lack ``signal_at_entry`` (legacy data) can still trigger 1, 2,
-    and 4 — the decay check (3) needs the entry baseline so is silently skipped.
+    LLM-opened trade, in priority order:
+      1. ``macro_regime_exit``   — long while macro is PANIC/RISK_OFF (top-down
+         risk overlay, engine-independent — always applies).
+      2. ``llm_signal_flipped``  — the engine now calls the opposite direction.
+      3. ``llm_confidence_loss`` — same-direction conviction fell below the
+         entry-relative floor (max(absolute, relative × LLM ENTRY confidence));
+         HOLD/WATCH counts as zero directional conviction (but does NOT close).
+    No review this tick (engine failed to produce one) → hold.
     """
     action = trade.get("action")
     if action not in ("BUY", "SELL"):
@@ -1365,7 +1560,33 @@ def _evaluate_decay(
             and getattr(macro_regime_context, "regime", "") in ("PANIC", "RISK_OFF")):
         return "macro_regime_exit"
 
-    # Need today's signal for the remaining checks
+    # 2. LLM-driven hold/close — the OPENING engine's pinned review governs.
+    open_provider = _provider_of_synth_model(trade.get("llm_synthesis_model"))
+    if settings.enable_llm_hold_review and open_provider in ("anthropic", "deepseek"):
+        # No opener-pinned review available this tick → hold.
+        if hold_review is None:
+            return None
+        rev_action = getattr(hold_review, "action", None)
+        # Flip — the engine now actively calls the OTHER way.
+        if (action == "BUY" and rev_action == "SELL") or (action == "SELL" and rev_action == "BUY"):
+            return "llm_signal_flipped"
+        # Same-direction re-affirmation whose conviction collapsed below the
+        # entry-relative floor. A neutral HOLD/WATCH is NOT a close: the engine
+        # isn't calling the other way, and on hold-prompt-OFF runs it judges a
+        # held ticker as a fresh candidate (commonly HOLD for want of a NEW
+        # catalyst) — treating that as an exit would just reintroduce premature
+        # closes through another door. Only an explicit reversal or a genuine
+        # same-direction conviction collapse closes.
+        if rev_action == action:
+            conv = float(getattr(hold_review, "confidence", 0.0) or 0.0)
+            if conv < _confidence_floor(trade.get("confidence")):  # entry conf = the LLM number that gated the open
+                return "llm_confidence_loss"
+        return None
+
+    # 3. Aggregator backstop — legacy / rule-based-opened trades only (no LLM
+    #    engine to stay consistent with). Original four-trigger behaviour.
+    if not settings.enable_signal_decay_exits:
+        return None
     if today_signal is None:
         return None
 
@@ -1374,30 +1595,19 @@ def _evaluate_decay(
     direction_sign = 1 if action == "BUY" else -1
     today_oriented = today_combined * direction_sign
 
-    # 2. Signal flipped — today's combined crossed against the trade
+    # 3a. Signal flipped — today's combined crossed against the trade
     if today_oriented < settings.signal_decay_flip_threshold:
         return "signal_flipped"
 
-    # 3. Signal decay — needs entry baseline
+    # 3b. Signal decay — needs entry baseline
     entry = trade.get("signal_at_entry") or {}
     entry_combined = entry.get("combined_score")
     if entry_combined is not None:
         entry_oriented = float(entry_combined) * direction_sign
-        decay = entry_oriented - today_oriented
-        if decay > settings.signal_decay_drop_threshold:
+        if entry_oriented - today_oriented > settings.signal_decay_drop_threshold:
             return "signal_decay"
 
-    # 4. Confidence loss — entry-relative floor with absolute backstop.
-    #
-    # effective_floor = max(absolute_floor, relative_factor × entry_confidence)
-    #
-    # Entry confidence comes from signal_at_entry.confidence (the AGGREGATOR
-    # confidence captured at trade open), which is the right apples-to-apples
-    # comparator with today's aggregator confidence. Trade dict's "confidence"
-    # field is Claude's post-tilt number and is NOT used here.
-    #
-    # Legacy trades without signal_at_entry fall back to the absolute floor
-    # only (old behaviour).
+    # 3c. Confidence loss — entry-relative floor with absolute backstop.
     entry_conf_raw = (entry or {}).get("confidence")
     relative_factor = float(settings.signal_decay_confidence_floor_relative)
     absolute_floor  = float(settings.signal_decay_confidence_floor)
@@ -1415,23 +1625,31 @@ def monitor_open_positions(
     signals_by_ticker: Optional[dict] = None,
     macro_regime_context=None,
     hold_prompt_active: Optional[bool] = None,
+    hold_reviews: Optional[dict] = None,
+    run_synthesis_provider: Optional[str] = None,
 ) -> int:
-    """For every open trade, compare today's signal to entry and close on
-    deterioration. Returns the number of trades closed.
+    """For every open trade, re-judge it and close on deterioration. Returns the
+    number of trades closed.
+
+    Fix #2 — an LLM-opened position is reviewed by its OWN opening engine via
+    ``hold_reviews`` (ticker → today's opener-pinned synthesis ``Recommendation``,
+    built fresh every tick by the pipeline). ``signals_by_ticker`` (the aggregator
+    cross-section) is now only the backstop for legacy / rule-based-opened trades —
+    see ``_evaluate_decay``. ``run_synthesis_provider`` is retained for logging.
 
     Exit reasons it can set:
-      - macro_regime_exit  (PANIC/RISK_OFF while long)
-      - signal_flipped     (oriented combined crossed against the trade)
-      - signal_decay       (entry strength minus today's strength exceeds threshold)
-      - confidence_loss    (today's confidence below floor)
+      - macro_regime_exit    (PANIC/RISK_OFF while long — always applies)
+      - llm_signal_flipped   (opening engine now calls the opposite direction)
+      - llm_confidence_loss  (opening engine's conviction fell below entry floor)
+      - signal_flipped / signal_decay / confidence_loss  (aggregator backstop,
+        legacy / rule-based-opened trades only)
+      - intraday_reversal    (opt-in 30-min hard reversal)
 
     Designed to run AFTER ``update_open_trades`` (so ``current_price`` is fresh)
-    and BEFORE ``close_trades_on_signal_reversal`` (which still catches the
-    case where a counter-direction recommendation explicitly appeared in the
-    actionable list — that path remains the canonical "we have a new BUY on
-    a ticker we're short" exit).
+    and BEFORE ``close_trades_on_signal_reversal``.
     """
-    if not settings.enable_signal_decay_exits:
+    if not (settings.enable_llm_hold_review or settings.enable_signal_decay_exits
+            or settings.enable_intraday_exit or settings.signal_decay_regime_exit):
         return 0
 
     trades = _load_trades()
@@ -1445,7 +1663,8 @@ def monitor_open_positions(
             continue
 
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
-        reason = _evaluate_decay(trade, today_signal, macro_regime_context)
+        hold_review = (hold_reviews or {}).get(trade["ticker"])
+        reason = _evaluate_decay(trade, today_signal, macro_regime_context, hold_review)
         # Opt-in intraday exit: close when the 30-min trend has reversed hard
         # against the position (Hybrid model — intraday only times the exit).
         if reason is None and settings.enable_intraday_exit:
@@ -1492,30 +1711,45 @@ def monitor_open_positions(
         trade["exit_hold_prompt"]       = hold_prompt_active
         closed_count += 1
 
-        # Decay logging: show entry vs today combined + effective conf floor for context
-        entry = trade.get("signal_at_entry") or {}
-        ec = entry.get("combined_score")
-        ef_conf = entry.get("confidence")
-        tc = float(getattr(today_signal, "combined_score", 0.0)) if today_signal else None
-        cf = float(getattr(today_signal, "confidence", 0.0)) if today_signal else None
+        # Logging — branch by which decision-maker fired so the line is legible.
         regime = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
-        # Recompute the effective confidence floor for this trade so the log line
-        # explains why confidence_loss fired (or what it was tested against).
-        if ef_conf is None:
-            eff_floor = float(settings.signal_decay_confidence_floor)
-            floor_kind = "abs"
+        if reason in ("llm_signal_flipped", "llm_confidence_loss"):
+            # LLM exit: entry conf is the LLM number on the trade; today is the
+            # opening engine's fresh re-judgment of the ticker (hold_review).
+            entry_conf = trade.get("confidence")
+            rev_action = getattr(hold_review, "action", None)
+            rev_conf = getattr(hold_review, "confidence", None)
+            floor = _confidence_floor(entry_conf)
+            open_prov = _provider_of_synth_model(trade.get("llm_synthesis_model"))
+            logger.info(
+                f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
+                f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  "
+                f"opener_engine={open_prov} (run={run_synthesis_provider})  "
+                f"entry_conf={entry_conf}  today_review={rev_action}@{rev_conf}  "
+                f"conf_floor={floor:.2f}  regime={regime}"
+            )
         else:
-            rel_floor = float(settings.signal_decay_confidence_floor_relative) * float(ef_conf)
-            abs_floor = float(settings.signal_decay_confidence_floor)
-            eff_floor = max(abs_floor, rel_floor)
-            floor_kind = "rel" if rel_floor >= abs_floor else "abs"
-        logger.info(
-            f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
-            f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  "
-            f"entry_combined={ec}  today_combined={tc}  "
-            f"entry_conf={ef_conf}  today_conf={cf}  "
-            f"conf_floor={eff_floor:.2f}({floor_kind})  regime={regime}"
-        )
+            # Aggregator backstop / regime: entry vs today combined + conf floor.
+            entry = trade.get("signal_at_entry") or {}
+            ec = entry.get("combined_score")
+            ef_conf = entry.get("confidence")
+            tc = float(getattr(today_signal, "combined_score", 0.0)) if today_signal else None
+            cf = float(getattr(today_signal, "confidence", 0.0)) if today_signal else None
+            if ef_conf is None:
+                eff_floor = float(settings.signal_decay_confidence_floor)
+                floor_kind = "abs"
+            else:
+                rel_floor = float(settings.signal_decay_confidence_floor_relative) * float(ef_conf)
+                abs_floor = float(settings.signal_decay_confidence_floor)
+                eff_floor = max(abs_floor, rel_floor)
+                floor_kind = "rel" if rel_floor >= abs_floor else "abs"
+            logger.info(
+                f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
+                f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  "
+                f"entry_combined={ec}  today_combined={tc}  "
+                f"entry_conf={ef_conf}  today_conf={cf}  "
+                f"conf_floor={eff_floor:.2f}({floor_kind})  regime={regime}"
+            )
 
     if closed_count:
         _save_trades(trades)
@@ -2625,6 +2859,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
     solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session)
     llm_perf             = _compute_llm_perf(window_days=window_days, session=session)
+    macro_eval           = compute_macro_eval(window_days=window_days, session=session)
     method_eval_stats    = compute_method_eval_stats()
     oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)
@@ -2653,6 +2888,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "timeline_svg":             timeline_svg,
         "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
         "llm_perf":                 llm_perf,                  # actual trades grouped by LLM engine (synthesis / sentiment)
+        "macro_eval":               macro_eval,                # aggregated decision layers (synthesis vs aggregator vs bundles)
         "sim_one_way_cost_pct":     _displayed_one_way_cost_pct(all_trades, real_cost_frac),  # per-leg 1-way cost shown in Returns
         "sim_cost_is_real":         real_cost_frac is not None,   # True = calibrated to real IBKR fills, False = modeled
         "hold_prompt_eval":         compute_hold_prompt_eval(trades),  # held-positions prompt A/B (exit outcomes ON vs OFF)

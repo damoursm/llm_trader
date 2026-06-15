@@ -117,6 +117,30 @@ def filled_lmt_legs() -> list:
     return _retry(lambda: repo.fetch_filled_lmt_legs(), "lmt_legs")
 
 
+def trade_reviews_df(ticker: str) -> pd.DataFrame:
+    """The opener-pinned hold-review trajectory for one ticker (fix #2), ordered
+    by time. Empty DataFrame when there's no history yet or the table predates
+    this feature (a read-only dashboard can't create it — the next pipeline run
+    will)."""
+    def _q():
+        return repo.fetch_df(
+            "SELECT * FROM trade_reviews WHERE ticker = ? ORDER BY reviewed_at", [ticker])
+    try:
+        return _retry(_q, "trade_reviews")
+    except Exception:
+        return pd.DataFrame()
+
+
+def trades_for_ticker(ticker: str) -> list:
+    """All ledger trade dicts for one ticker (entry/exit markers for the review
+    timeline). Read-only via repo.load_trades()."""
+    try:
+        trades = _retry(lambda: repo.load_trades(), "trades_for_ticker")
+    except Exception:
+        return []
+    return [t for t in trades if t.get("ticker") == ticker]
+
+
 def broker_trades(force: bool = False) -> list:
     """The IBKR-fills projection of the ledger (real executions, real
     commissions — see ``src.performance.broker_view``), cached briefly.

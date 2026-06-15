@@ -782,6 +782,7 @@ def build_signals(
     coint_context=None,       # Optional[CointPairsContext]
     snapshots=None,           # Optional[List[TickerSnapshot]] — live prices for ext_gap
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
+    force_sentiment_engine: Optional[str] = None,  # pin news scoring to one engine (hold-review)
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods.
 
@@ -827,9 +828,14 @@ def build_signals(
     use_iv_expr    = settings.enable_iv_expr and gex_context is not None
     # Cointegration reads per-ticker directional leans from a precomputed pairs context.
     use_coint      = settings.enable_cointegration and coint_context is not None
-    # Extended-session gap: only meaningful outside RTH with a live snapshot price.
+    # Extended-session gap. With the session profile OFF (default), ext_gap is in
+    # the active method set in EVERY session so the method set + weight
+    # normalisation are identical across the trading day (comparable scores) — it
+    # still reads 0.0 in RTH by design (the daily technical stack already captures
+    # the gap; the scorer fails closed). With the profile ON, it's off-hours-only.
     is_extended    = session is not None and session != "rth"
-    use_ext_gap    = settings.enable_extended_gap and is_extended and snapshots is not None
+    use_ext_gap    = (settings.enable_extended_gap and snapshots is not None
+                      and (is_extended or not settings.enable_extended_signal_profile))
     snap_price_by_ticker = (
         {s.ticker: float(s.price) for s in (snapshots or []) if getattr(s, "price", None)}
         if use_ext_gap else {}
@@ -876,8 +882,10 @@ def build_signals(
     # Extended-session overlay LAST so the staleness scaling applies to
     # whatever each options weight ended up as (mode profile, adaptivity, and
     # the OpEx boost all describe RTH dynamics — pinning happens in the
-    # regular session, not in a 4 AM pre-market book).
-    if is_extended:
+    # regular session, not in a 4 AM pre-market book). Gated by
+    # enable_extended_signal_profile (default OFF → one fixed profile all day, so
+    # scores are comparable across the trading day).
+    if is_extended and settings.enable_extended_signal_profile:
         weight_profile = _extended_session_weight_overlay(dict(weight_profile or _BASE_WEIGHTS))
         logger.info(
             f"[extended] {session} session weight overlay: options-derived ×"
@@ -934,7 +942,8 @@ def build_signals(
         if use_news or use_sent_velocity:
             relevant_articles = filter_relevant_articles(ticker, articles)
         if use_news:
-            sentiment_score, news_rationale = analyse_sentiment(ticker, relevant_articles)
+            sentiment_score, news_rationale = analyse_sentiment(
+                ticker, relevant_articles, force_engine=force_sentiment_engine)
 
         # ── Method 1b: Sentiment velocity (Δsentiment, not level) ─────────
         # Rate of change of news tone (recent window − prior window). The change

@@ -187,6 +187,25 @@ SCHEMA_STATEMENTS = [
         scores              VARCHAR
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS trade_reviews (
+        run_id            VARCHAR,
+        reviewed_at       VARCHAR,
+        ticker            VARCHAR,
+        position_id       VARCHAR,
+        entry_datetime    VARCHAR,
+        confidence        DOUBLE,
+        action            VARCHAR,
+        direction         VARCHAR,
+        conf_floor        DOUBLE,
+        entry_confidence  DOUBLE,
+        entry_action      VARCHAR,
+        price             DOUBLE,
+        return_pct        DOUBLE,
+        synthesis_model   VARCHAR,
+        sentiment_model   VARCHAR
+    );
+    """,
 ]
 
 

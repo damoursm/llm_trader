@@ -500,6 +500,26 @@ class Settings(BaseSettings):
     #
     # MFE (max favorable excursion) and MAE (max adverse excursion) are tracked
     # passively on every tick — pure observability, doesn't trigger anything.
+    # Fix #2 — symmetric entry/exit rationale. When True (default), an LLM-opened
+    # position is HELD/CLOSED by its OWN opening engine's fresh re-judgment each
+    # run (the same synthesis call that gates entry), and ONLY on a tick that
+    # engine is running — a Claude position is never closed by a DeepSeek run, and
+    # vice versa. The aggregator's combined_score/confidence (a different
+    # decision-maker, near zero on LLM-conviction names) is NO LONGER consulted
+    # for LLM-opened trades; it survives only as the backstop for legacy /
+    # rule-based-opened trades (gated by enable_signal_decay_exits below). Set
+    # False to revert entirely to the aggregator-driven monitor.
+    enable_llm_hold_review: bool = True
+    # Every-tick, opener-pinned hold-review. When True (default), each open
+    # LLM-opened position is re-evaluated on EVERY trading tick by the SAME
+    # synthesis AND sentiment engines that opened it — fresh news + prices are
+    # refetched, the ticker's signal is re-aggregated with the pinned sentiment
+    # engine, and the pinned synthesis engine re-judges it — so entry-vs-now is a
+    # same-engine, apples-to-apples comparison (temp=0 ⇒ low volatility). When
+    # False, falls back to reviewing a position only on ticks whose A/B engine
+    # happens to match the opener (the cheaper, partial behaviour). Costs extra
+    # LLM calls per tick (one synthesis + pinned sentiment per engine combo held).
+    enable_pinned_hold_review: bool = True
     enable_signal_decay_exits: bool = True
     signal_decay_flip_threshold: float = -0.10   # oriented combined < this -> flipped
     signal_decay_drop_threshold: float = 0.40    # oriented (entry - today) > this -> decayed
@@ -668,11 +688,13 @@ class Settings(BaseSettings):
     # the thin dead zones (04:00–07:00, 18:00–19:00) tick hourly — spreads
     # there are widest and the evidence value per LLM dollar lowest, and the
     # hourly cadence matches the news cache TTL so each tick sees fresh news.
-    # The LAST slot is 19:55, not 20:00: the pipeline needs ~4 min from tick
-    # to order submission, so a 20:00 slot's orders reached IBKR ~20:03 —
-    # AFTER the extended session closed — and could never fill same-day.
-    # 19:55 leaves the orders a live book to trade against before the close.
-    extended_windows: str = "04:00-07:00@60,07:00-09:30,16:00-17:30,18:00-19:00@60,19:55-19:55"
+    # The LAST slot is 19:50, not 20:00: the pipeline needs ~4 min from tick to
+    # order submission AND the every-tick engine-pinned hold-review adds more on
+    # the critical path (fresh news/price refetch + per-engine re-synthesis), so
+    # the final slot leaves a ~10-min pre-close buffer — a 20:00 (or even 19:55)
+    # slot's orders would reach IBKR after the extended session closed and could
+    # never fill same-day. 19:50 leaves the orders a live book before the close.
+    extended_windows: str = "04:00-07:00@60,07:00-09:30,16:00-17:30,18:00-19:00@60,19:50-19:50"
     extended_tick_minutes: int = 30
     # Bid-ask half-spread multipliers outside RTH (commission is session-
     # independent — only the spread term widens). Rough placeholders to be
@@ -697,11 +719,25 @@ class Settings(BaseSettings):
     # thin and the modeled spread 4× wider, so pre-prod sizes off-hours
     # entries at half weight until paper fills prove the edge. 1.0 = off.
     extended_size_multiplier: float = 0.5
-    # Aggregator weight overlay for extended/overnight runs: options-derived
-    # methods (put_call, max_pain, oi_skew, iv_expr) are scaled DOWN (stale
-    # since the RTH close — yesterday's positioning, not live confirmation);
-    # news + sentiment-velocity + the extended gap are scaled UP (the live
-    # extended-hours edge is overnight news repricing).
+    # Master switch for the session-dependent SIGNAL profile (default OFF so
+    # scores are comparable across the trading day — the requirement behind the
+    # fix #2 confidence trajectory). When OFF: one fixed weight profile is used
+    # in every session (no stale-options/fresh-news overlay), `ext_gap` is part
+    # of the active method set in ALL sessions (so the method set + weight
+    # normalisation are identical — it still reads 0 in RTH by design, since the
+    # daily technical stack already captures the gap), and the synthesis prompt
+    # carries NO extended-session context block. When ON: restores the original
+    # session-adaptive behaviour (overlay below + ext_gap off-hours-only +
+    # the prompt's SESSION CONTEXT block). NOTE: the actionable-threshold bump
+    # `extended_confidence_bump` is a GATE, not a score, so it is independent —
+    # set it to 0.0 if you also want session-invariant actionability.
+    enable_extended_signal_profile: bool = False
+    # Aggregator weight overlay for extended/overnight runs (only applied when
+    # enable_extended_signal_profile=True): options-derived methods (put_call,
+    # max_pain, oi_skew, iv_expr) are scaled DOWN (stale since the RTH close —
+    # yesterday's positioning, not live confirmation); news + sentiment-velocity
+    # + the extended gap are scaled UP (the live extended-hours edge is overnight
+    # news repricing).
     extended_stale_options_weight_mult: float = 0.5
     extended_news_weight_mult: float = 1.25
 
