@@ -154,6 +154,10 @@ HTML_TEMPLATE = """
   These recommendations are rule-based, not AI-generated. Check Anthropic &amp; DeepSeek API credits and keys.
   </div>
 </div>
+{% elif llm_health and llm_health.synthesis_provider %}
+<div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
+  &#9989; LLM &mdash; synthesis: <b>{{ llm_health.synthesis_provider }}</b>{% if llm_health.sentiment_summary %} &middot; sentiment: {{ llm_health.sentiment_summary }}{% endif %}.
+</div>
 {% endif %}
 
 {% if broker_health and broker_health.down %}

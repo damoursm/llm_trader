@@ -148,6 +148,48 @@ def test_no_ref_close_falls_back_to_no_adjustment(fake_closes):
     assert result < -30.0   # ≈ -40 %
 
 
+def test_split_adjustment_ignores_subsplit_noise():
+    """The split-adjustment must fire ONLY for a genuine corporate action
+    (≥~20% discrete move). A near-1.0 ratio means the reference close wasn't a
+    finalized daily close — an intraday/forming-bar snapshot or a mixed-source
+    cache disagreement — not a split, and applying it injects a phantom return.
+
+    Regression for the 2026-06-16 daily-NAV reconciliation bug: INTC's same-day
+    intraday exit ref (112.46) vs the finalized 06-11 close (116.96) was read as
+    a 1.04× 'split', inflating its compound to +5.1% vs a true +1.5%; RDW's
+    mixed-source ref (16.06 vs 15.75) as a 0.98×.
+    """
+    # ~4% intraday-vs-finalized gap (INTC) → NOT a split → ignored.
+    assert dn._split_adjustment_factor(112.46, "2026-06-11", {date(2026, 6, 11): 116.96}) == 1.0
+    # ~2% mixed-source gap (RDW) → ignored.
+    assert dn._split_adjustment_factor(16.06, "2026-06-09", {date(2026, 6, 9): 15.75}) == 1.0
+    # Genuine 2:1 split → applied.
+    assert dn._split_adjustment_factor(100.0, "2026-05-01", {date(2026, 5, 1): 50.0}) == pytest.approx(0.5)
+    # Genuine 5:4 split (0.8 — the smallest common forward split) → applied.
+    assert dn._split_adjustment_factor(100.0, "2026-05-01", {date(2026, 5, 1): 80.0}) == pytest.approx(0.8)
+
+
+def test_intraday_exit_ref_no_phantom_compound(fake_closes):
+    """A same-day intraday trade whose exit_ref_close was captured mid-session
+    must reconcile to the real entry→exit move — the intraday-snapshot reference
+    must not inject a phantom split adjustment. End-to-end regression for the
+    INTC bug above (+5.1% phantom vs ~+1.5% real)."""
+    fake_closes("STK", [date(2026, 6, 10), date(2026, 6, 11)], [107.04, 116.96])
+    base = {
+        "ticker": "STK", "type": "STOCK", "action": "BUY",
+        "entry_date": "2026-06-11", "exit_date": "2026-06-11",
+        "entry_price": 112.33, "exit_price": 114.07,
+        "entry_ref_close": 107.04, "entry_ref_close_date": "2026-06-10",  # finalized prior close → 1.0×
+        "position_size_multiplier": 1.0, "status": "CLOSED",
+    }
+    polluted = dict(base, exit_ref_close=112.46, exit_ref_close_date="2026-06-11")  # intraday snap → would-be 1.04×
+    clean    = dict(base, exit_ref_close=116.96, exit_ref_close_date="2026-06-11")  # finalized close → 1.0×
+    r_pol = compute_trade_compound(polluted)
+    r_cln = compute_trade_compound(clean)
+    assert r_pol == r_cln           # guard neutralises the intraday-snapshot ref
+    assert r_pol is not None and 0.0 < r_pol < 2.0   # ~+1.5% real move, NOT the +5% phantom
+
+
 # ── Zero-mark guard (Fix #15) ────────────────────────────────────────────
 
 def test_zero_mark_skipped_walk_continues(monkeypatch):

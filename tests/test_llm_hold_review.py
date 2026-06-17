@@ -136,13 +136,34 @@ def test_legacy_trade_uses_aggregator_backstop(monkeypatch):
         hold_review=None) == "signal_flipped"
 
 
-def test_rule_based_opened_uses_aggregator_backstop(monkeypatch):
+def test_rule_based_without_review_uses_aggregator_backstop(monkeypatch):
+    # Rule-based / legacy-opened trade with NO LLM review this tick → the
+    # aggregator backstop is the true last resort (#4). It no longer fires when a
+    # review IS available — see test_rule_based_with_review_uses_llm_path.
     monkeypatch.setattr(settings, "enable_signal_decay_exits", True)
     trade = _claude_trade(synth_model="rule-based (no LLM)", sent_model="none")
     trade["signal_at_entry"] = {"combined_score": 0.5, "confidence": 0.85}
     assert tracker._evaluate_decay(
         trade, today_signal=_hostile_aggregator(), macro_regime_context=None,
-        hold_review=_rec(action="BUY", confidence=0.9)) == "signal_flipped"
+        hold_review=None) == "signal_flipped"
+
+
+def test_rule_based_with_review_uses_llm_path(monkeypatch):
+    # #4 hardening: a rule-based / legacy-opened trade now gets an LLM review
+    # (built with THIS run's engine — pipeline._build_hold_reviews), and that
+    # review GOVERNS the exit. The poor aggregator-decay backstop (30%-win
+    # historically) no longer fires when a review exists.
+    monkeypatch.setattr(settings, "enable_signal_decay_exits", True)
+    trade = _claude_trade(synth_model="rule-based (no LLM)", sent_model="none")
+    trade["signal_at_entry"] = {"combined_score": 0.5, "confidence": 0.85}
+    # Review flips direction → LLM flip close (NOT the aggregator's signal_flipped).
+    assert tracker._evaluate_decay(
+        trade, today_signal=_hostile_aggregator(), macro_regime_context=None,
+        hold_review=_rec(action="SELL", confidence=0.8)) == "llm_signal_flipped"
+    # Same-direction confident review → HOLD, despite the hostile aggregator.
+    assert tracker._evaluate_decay(
+        trade, today_signal=_hostile_aggregator(), macro_regime_context=None,
+        hold_review=_rec(action="BUY", confidence=0.85)) is None
 
 
 def test_disabled_review_falls_back_to_aggregator(monkeypatch):
@@ -263,6 +284,52 @@ def test_build_hold_reviews_off_mode_reuses_matching_engine_only(monkeypatch):
         open_trades, run_sent="anthropic", run_synth="anthropic", full_recs=full,
         sectors=[], build_kwargs={}, synth_kwargs={}, session="rth")
     assert set(reviews) == {"XLE"}                     # only the engine-matched position
+
+
+def test_build_hold_reviews_covers_rule_based_with_run_engine(monkeypatch):
+    # #4: a rule-based / legacy-opened position (no LLM opener to pin) is reviewed
+    # with THIS run's engine, so it still gets an LLM hold-review instead of being
+    # left to the aggregator-decay backstop. An LLM-opened position stays pinned.
+    import src.pipeline as pl
+    monkeypatch.setattr(settings, "enable_pinned_hold_review", True)
+    open_trades = [
+        _claude_trade(),                                  # XLE — Claude-opened → pinned anthropic
+        {"ticker": "USO", "status": "OPEN",               # rule-based-opened
+         "llm_synthesis_model": "rule-based (no LLM)", "llm_sentiment_model": "none"},
+    ]
+    seen = {"synth": []}
+    monkeypatch.setattr(pl, "fetch_all_news", lambda tks, sectors: [])
+    monkeypatch.setattr(pl, "get_snapshots", lambda tks: [])
+    monkeypatch.setattr(pl, "build_signals",
+                        lambda tickers, *a, **k: _fake_signals(tickers))
+
+    def fake_synth(signals, session=None, force_engine=None, **kw):
+        seen["synth"].append((tuple(s.ticker for s in signals), force_engine))
+        return [_rec(s.ticker, "BUY", 0.8) for s in signals]
+    monkeypatch.setattr(pl, "generate_recommendations", fake_synth)
+
+    reviews = pl._build_hold_reviews(
+        open_trades, run_sent="deepseek", run_synth="deepseek", full_recs=[],
+        sectors=[], build_kwargs={}, synth_kwargs={}, session="rth")
+
+    assert set(reviews) == {"XLE", "USO"}                 # BOTH reviewed
+    # XLE pinned to its opener (anthropic); USO (rule-based) uses the run engine (deepseek).
+    assert dict(seen["synth"]) == {("XLE",): "anthropic", ("USO",): "deepseek"}
+
+
+def test_build_hold_reviews_skips_rule_based_when_run_not_llm(monkeypatch):
+    # If THIS run has no LLM engine either, there is nothing to review a
+    # rule-based trade with → left to the aggregator backstop (no fetch happens).
+    import src.pipeline as pl
+    monkeypatch.setattr(settings, "enable_pinned_hold_review", True)
+    open_trades = [{"ticker": "USO", "status": "OPEN",
+                    "llm_synthesis_model": "rule-based (no LLM)", "llm_sentiment_model": "none"}]
+    monkeypatch.setattr(pl, "fetch_all_news",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")))
+    reviews = pl._build_hold_reviews(
+        open_trades, run_sent="rule-based", run_synth="rule-based", full_recs=[],
+        sectors=[], build_kwargs={}, synth_kwargs={}, session="rth")
+    assert reviews == {}
 
 
 # ── force_engine plumbing (synthesis + sentiment) ────────────────────────────

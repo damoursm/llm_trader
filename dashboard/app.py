@@ -767,7 +767,14 @@ def _pct4(x) -> str:
         return str(x)
 
 
-def _trades_table(trades: list):
+def _trades_table(trades: list, table_id: str | None = None):
+    """Render a trade ledger as a DataTable.
+
+    When ``table_id`` is given the table gets that ``id`` and each row gets an
+    ``id`` equal to its ticker, so an ``active_cell`` click resolves to the
+    ticker robustly (survives native sort / filter / pagination) — used by the
+    Returns tab to chart the clicked ticker's confidence-over-time plot below.
+    """
     if not trades:
         return html.Div("None.", style={"color": "#6b7280", "marginBottom": 12})
     df = pd.DataFrame(trades)
@@ -787,8 +794,14 @@ def _trades_table(trades: list):
         df["broker_exit"] = [_ibkr_leg_disp(t, "broker_exit_") for t in trades]
     spec = [t for t in _TRADE_COL_SPEC if t[0] in df.columns]
     df = df[[s[0] for s in spec]]
+    records = df.to_dict("records")
+    extra = {}
+    if table_id:
+        for rec in records:
+            rec["id"] = rec.get("ticker")   # active_cell.row_id → ticker
+        extra["id"] = table_id
     return dash_table.DataTable(
-        data=df.to_dict("records"),
+        data=records,
         columns=_columns(spec),
         tooltip_header=_header_tooltips(spec),
         filter_action="native",
@@ -796,6 +809,7 @@ def _trades_table(trades: list):
             {"if": {"filter_query": "{return_pct} > 0", "column_id": "return_pct"}, "color": figures.POS},
             {"if": {"filter_query": "{return_pct} < 0", "column_id": "return_pct"}, "color": figures.NEG},
         ],
+        **extra,
         **_TABLE_KW,
     )
 
@@ -816,6 +830,30 @@ def _returns_body(window_value, session_value, source_value):
     if (source_value or "sim") == "broker":
         return _safe(lambda: _broker_returns_section(window_value, session_value))
     return _safe(lambda: _returns_section(window_value, session_value))
+
+
+@app.callback(Output("returns-review-plot", "children"),
+              Input("returns-open-table", "active_cell"),
+              Input("returns-closed-table", "active_cell"))
+def _returns_review_plot(open_cell, closed_cell):
+    """Click any open/closed trade row in the Returns tab → chart that ticker's
+    confidence score over the days the position was held (the opener-pinned
+    hold-review, left axis) against the stock price (right axis) — the same
+    per-ticker plot as the Recommendations tab. ``ctx.triggered_id`` picks
+    whichever of the two tables was clicked last; ``row_id`` is the ticker
+    (set in ``_trades_table``). Shared by the Simulated and IBKR views (only one
+    renders at a time, so the table ids never collide)."""
+    from dash import ctx
+    cell = closed_cell if ctx.triggered_id == "returns-closed-table" else open_cell
+    if not cell:
+        return html.Div(
+            "↑ Click any open or closed trade row to chart that ticker's confidence "
+            "score over the days it was held against the stock price.",
+            style={"color": "#6b7280", "fontStyle": "italic", "padding": "8px 2px"})
+    ticker = cell.get("row_id")
+    if not ticker:
+        return html.Div()
+    return _safe(lambda: _review_timeline_section(ticker))
 
 
 def _broker_returns_section(window_value, session_value=None):
@@ -875,11 +913,12 @@ def _broker_returns_section(window_value, session_value=None):
     return html.Div([
         cards,
         _h3("Open broker positions",
-            "Shares genuinely held at IBKR right now (entry filled; exit not filled yet — even if the simulated ledger already closed the trade), marked at the latest price."),
-        _trades_table(open_trades),
+            "Shares genuinely held at IBKR right now (entry filled; exit not filled yet — even if the simulated ledger already closed the trade), marked at the latest price. Click a row to chart that ticker's confidence-over-time below."),
+        _trades_table(open_trades, table_id="returns-open-table"),
         _h3("Closed broker round-trips",
-            "Entry and exit both filled at IBKR. Returns are computed on the actual average fill prices, net of the commissions actually charged."),
-        _trades_table(closed_trades),
+            "Entry and exit both filled at IBKR. Returns are computed on the actual average fill prices, net of the commissions actually charged. Click a row to chart that ticker's confidence-over-time below."),
+        _trades_table(closed_trades, table_id="returns-closed-table"),
+        dcc.Loading(html.Div(id="returns-review-plot", style={"marginTop": 16})),
     ])
 
 
@@ -925,10 +964,11 @@ def _returns_section(window_value, session_value=None):
     return html.Div([
         cards,
         dcc.Graph(figure=figures.equity_curve_fig(perf)),
-        _h3("Open positions", "Positions currently held, marked to the latest price — the return shown is live mark-to-market ('what if you closed now'). Filtered to the selected entry window."),
-        _trades_table(perf.get("open_trades") or []),
-        _h3("Closed trades", "Realised round-trips, with their final spread-adjusted return. Filtered to the selected entry window."),
-        _trades_table(perf.get("closed_trades") or []),
+        _h3("Open positions", "Positions currently held, marked to the latest price — the return shown is live mark-to-market ('what if you closed now'). Filtered to the selected entry window. Click a row to chart that ticker's confidence-over-time below."),
+        _trades_table(perf.get("open_trades") or [], table_id="returns-open-table"),
+        _h3("Closed trades", "Realised round-trips, with their final spread-adjusted return. Filtered to the selected entry window. Click a row to chart that ticker's confidence-over-time below."),
+        _trades_table(perf.get("closed_trades") or [], table_id="returns-closed-table"),
+        dcc.Loading(html.Div(id="returns-review-plot", style={"marginTop": 16})),
     ])
 
 

@@ -180,7 +180,25 @@ def _split_adjustment_factor(
     current = close_series.get(ref_d)
     if current is None or current <= 0 or ref_close <= 0:
         return 1.0
-    return current / float(ref_close)
+    factor = current / float(ref_close)
+
+    # Guard: this factor must represent a discrete corporate action (split or
+    # large special dividend), which rescales the adjusted close by a large,
+    # discrete amount — the smallest common forward split (5:4) is already a
+    # 20% move, and reverse splits are ≥2×. A factor NEAR 1.0 is therefore
+    # never a real corporate action; it means the recorded reference close
+    # didn't match the finalized cache close for an UNRELATED reason:
+    #   • an intraday / still-forming-bar reference (the pre-2026-06-16
+    #     _reference_close bug — INTC booked a 1.04× "split", inflating its
+    #     compound to +5.1% vs a true +1.5%), or
+    #   • a mixed-source cache (yfinance ↔ Polygon) disagreeing on the adjusted
+    #     close by a couple of percent (RDW: 16.06 vs 15.75 → 0.98×).
+    # Applying such a factor injects a phantom return that makes the daily-NAV
+    # compound diverge from the buy-and-hold return_pct. Anything within ±15%
+    # is treated as no adjustment; only a genuine split/large-action survives.
+    if abs(factor - 1.0) < 0.15:
+        return 1.0
+    return factor
 
 
 def _open_trade_end_anchor(

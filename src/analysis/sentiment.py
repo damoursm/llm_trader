@@ -350,9 +350,13 @@ def filter_relevant_articles(ticker: str, articles: List[NewsArticle]) -> List[N
     }
     keywords.update(ticker_aliases.get(ticker, []))
 
+    tkr = ticker.upper()
     relevant = [
         a for a in articles
-        if any(kw in (a.title + a.summary).lower() for kw in keywords)
+        # Per-ticker feeds (yfinance) tag the symbol explicitly → exact match,
+        # no fuzzy keyword needed; general-market feeds fall back to keyword.
+        if tkr in (getattr(a, "tickers", None) or [])
+        or any(kw in (a.title + a.summary).lower() for kw in keywords)
     ]
     # Precision: return empty list when too few relevant articles found.
     # Do NOT fall back to all articles — that injects irrelevant noise.

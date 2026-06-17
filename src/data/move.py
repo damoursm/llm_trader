@@ -21,9 +21,14 @@ Cross-asset divergence:
   MOVE / VIX ratio normally 4–7×.  Ratio > 8 = bond fear outpacing equity
   complacency → divergence warning; equities have not yet caught up.
 
-Ticker priority:
-  1. ^MOVE  — ICE BofA MOVE Index (Yahoo Finance)
-  2. VXTLT  — CBOE/ErisX 30-day Treasury ETF Volatility Index (fallback)
+Data source:
+  ^MOVE — ICE BofA MOVE Index (Yahoo Finance): yf.download() for 5d/20d history,
+  with a fast_info fallback for the spot level. ^MOVE is intermittently
+  unavailable on yfinance (it was failing ~11% of runs); when BOTH live paths
+  fail the most recent cached MOVE (within a few days) is carried FORWARD rather
+  than dropping the bond-vol read entirely — it feeds the Macro Regime Filter,
+  and MOVE is a slow daily index so a recent prior level is a fine stand-in. The
+  carried-forward read is flagged stale in its summary/source.
 
 Cached daily (yfinance, no API key required).
 """
@@ -77,6 +82,28 @@ def _save_cache(ctx: MOVEContext) -> None:
         )
     except Exception as e:
         logger.warning(f"[move] Cache save failed: {e}")
+
+
+def _load_most_recent_cache(today: date, max_age_days: int = 7):
+    """Most recent cached MOVE strictly BEFORE *today*, within ``max_age_days``.
+
+    The stale-but-usable fallback for when today's live ^MOVE fetch fails. On a
+    day ^MOVE is unavailable on yfinance, the live fetch fails on EVERY run (the
+    cache is only written on success), so without this the Macro Regime Filter
+    loses its bond-vol read all day. MOVE is a slow daily index, so the last good
+    level (a day or two old) is a fine stand-in. Returns ``(ctx, date)`` or
+    ``(None, None)``.
+    """
+    for d in range(1, max_age_days + 1):
+        prior = today - timedelta(days=d)
+        p = _cache_path(prior)
+        if not p.exists():
+            continue
+        try:
+            return MOVEContext.model_validate(json.loads(p.read_text(encoding="utf-8"))), prior
+        except Exception:
+            continue
+    return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,7 +218,20 @@ def fetch_move_context(today: Optional[date] = None) -> Optional[MOVEContext]:
     else:
         move = _fetch_current_price()
         if move is None:
-            logger.warning("[move] ^MOVE unavailable — skipping MOVE context")
+            # Both live paths failed (^MOVE is intermittently unavailable on
+            # yfinance). Carry forward the most recent cached level rather than
+            # dropping the bond-vol read for the whole day — it gates the Macro
+            # Regime Filter. (This was the ~11%-of-runs silent gap.)
+            stale, stale_date = _load_most_recent_cache(today)
+            if stale is not None:
+                age = (today - stale_date).days
+                logger.warning(
+                    f"[move] ^MOVE live fetch failed — carrying forward cached "
+                    f"{stale_date} level (MOVE={stale.move}, {age}d old)")
+                stale.summary = f"[stale: {age}d-old level, live ^MOVE fetch failed] {stale.summary}"
+                stale.source = f"{stale.source} (carried forward from {stale_date})"
+                return stale
+            logger.warning("[move] ^MOVE unavailable and no recent cache — skipping MOVE context")
             return None
         logger.debug(f"[move] Using fast_info fallback: MOVE={move}")
 

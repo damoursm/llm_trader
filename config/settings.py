@@ -74,6 +74,12 @@ class Settings(BaseSettings):
 
     # Analysis method flags (at least one should be true)
     enable_news_sentiment: bool = True    # method 1: LLM sentiment from news/RSS
+    # Per-ticker news via yfinance Ticker.news — gives EVERY symbol real,
+    # ticker-tagged articles (not just the ~30 mega-caps the keyword aliases
+    # cover), which is what actually feeds the news + sentiment-velocity scores.
+    # Fetched once per hour (cached with the news pool). Kill switch if Yahoo
+    # rate-limits.
+    enable_ticker_news: bool = True
 
     # Sentiment velocity (Δsentiment, not level) — the rate of change of news tone leads
     # short-horizon (1–5 day) moves better than the absolute level. Deterministic lexical

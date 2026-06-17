@@ -382,11 +382,19 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
     from collections import defaultdict
 
     groups: dict = defaultdict(list)
+    run_is_llm = run_sent in ("anthropic", "deepseek") and run_synth in ("anthropic", "deepseek")
     for t in open_trades:
         se = _provider_of_synth_model(t.get("llm_sentiment_model"))
         sy = _provider_of_synth_model(t.get("llm_synthesis_model"))
         if se in ("anthropic", "deepseek") and sy in ("anthropic", "deepseek"):
-            groups[(se, sy)].append(t["ticker"])
+            groups[(se, sy)].append(t["ticker"])          # opener-pinned (Fix #2)
+        elif run_is_llm:
+            # Rule-based / legacy-opened (no LLM opener to pin): review with THIS
+            # run's engines so the exit is still LLM-judged rather than handed to
+            # the poor aggregator-decay backstop (30%-win historically). Not
+            # engine-pinned (there is nothing to pin), but far better — this
+            # completes Fix #2 for the trades the LLM did NOT open.
+            groups[(run_sent, run_synth)].append(t["ticker"])
     if not groups:
         return {}
 
@@ -697,6 +705,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # futures are resolved before we collect results below.
     #
     logger.info("Steps 1–3: Launching parallel data fetch...")
+
+    # Per-ticker signal fetchers must cover the DISCOVERED universe, not the
+    # static watchlist. `stocks_list` is empty in this deployment (the universe
+    # is built entirely by Step-0 discovery), so the news / PEAD / put-call / EPS
+    # / analyst / short / revision / whisper / trends / reddit fetchers — all
+    # wired to `tickers` below — were fetching for an EMPTY list and scoring 0
+    # across the board (the root cause behind the dead news/PEAD/put-call
+    # signals). The trending seed and the liquidity-gate protected set above
+    # already ran on the original static list, so reassigning here only affects
+    # those fetchers. Full all_tickers coverage is the deliberate cost tradeoff.
+    tickers = all_tickers
 
     with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:
 

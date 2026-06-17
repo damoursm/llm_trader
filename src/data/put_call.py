@@ -342,9 +342,15 @@ def fetch_put_call_context(tickers: List[str]) -> Optional[PutCallContext]:
         summary=" ".join(summary_parts),
     )
     _save_cache(ctx)
+    # NB: the conditional must live OUTSIDE the format spec — ``{x:.2f if ...}``
+    # puts the ternary INTO the format spec and raises (TypeError when market_pc
+    # is None — which it is whenever the CBOE market-wide feed fails — or
+    # ValueError otherwise), which previously crashed the whole fetcher AFTER
+    # the per-ticker signals were built, so _safe discarded them and put_call
+    # scored 0 for every ticker, every run.
+    market_pc_str = f"{market_pc:.2f}" if market_pc else "N/A"
     logger.info(
-        f"[put_call] Context built — market P/C: "
-        f"{market_pc:.2f if market_pc else 'N/A'}, "
+        f"[put_call] Context built — market P/C: {market_pc_str}, "
         f"{len(ticker_signals)} ticker extreme(s)"
     )
     return ctx

@@ -11,6 +11,11 @@ class NewsArticle(BaseModel):
     url: str
     source: str
     published_at: datetime
+    # Tickers this article is explicitly ABOUT — populated by per-ticker feeds
+    # (e.g. yfinance ``Ticker.news``) so the article maps to the symbol directly
+    # without fuzzy title/summary keyword matching. Empty for general-market
+    # feeds (RSS / NewsAPI), which still fall back to keyword relevance.
+    tickers: List[str] = Field(default_factory=list)
 
 
 class TickerSnapshot(BaseModel):

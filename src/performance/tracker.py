@@ -125,36 +125,74 @@ def _save_trades(trades: List[dict]) -> None:
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
-    """Fetch the latest live price for *ticker* — yfinance first, Polygon fallback.
+    """Fetch the latest live last-trade price for *ticker*, **session-aware**.
 
-    The pipeline runs intraday (every 30 min, 09:30–16:00 ET), so this returns a
-    genuine live last-trade price. yfinance ``fast_info.last_price`` is tried
-    first (no API key, per-ticker); on any failure we fall back to Polygon's
-    snapshot. The success source and any total failure are recorded in
-    ``_PRICE_HEALTH`` so a broken feed surfaces in the dashboard and email.
+    yfinance ``fast_info.last_price`` reports the REGULAR session only — during
+    pre/after-market it silently returns the stale RTH close (at the 04:00
+    pre-market tick that is the *prior trading day's* close, stale by a whole
+    weekend). It must therefore NOT be the primary source off-hours, or an
+    extended-session entry/mark is booked at a stale price (observed 2026-06-15:
+    CRDO entered at Friday's 250.81 close while the live pre-market print — and
+    the analysis snapshot — was ~262). The source order mirrors the snapshot
+    path in ``market_data.get_snapshots``:
+
+    * **RTH** — yfinance ``fast_info.last_price`` first (fast, no API key), then
+      Polygon ``lastTrade`` as the fallback (unchanged behaviour).
+    * **Extended / overnight** — yfinance 1-min ``prepost`` bars first (the
+      genuine extended print, available on the free data plan), then Polygon's
+      single-ticker ``lastTrade`` (a secondary — it 403s without the snapshot
+      entitlement that this plan lacks), and only then stale ``fast_info`` as a
+      last resort so we still return *something* rather than ``None``.
+
+    The success source and any total failure are recorded in ``_PRICE_HEALTH``
+    so a broken feed surfaces in the dashboard and email.
     """
     if not settings.enable_fetch_data:
         return None
-    # 1) yfinance live last price
-    try:
-        px = float(yf.Ticker(ticker).fast_info.last_price)
-        if px > 0:
-            _PRICE_HEALTH["yfinance"] += 1
-            return px
-    except Exception as e:
-        logger.debug(f"[tracker] yfinance price failed for {ticker}: {e}")
-    # 2) Polygon fallback
-    try:
-        from src.data import polygon_client
-        px = polygon_client.get_last_price(ticker)
-        if px and float(px) > 0:
-            _PRICE_HEALTH["polygon"] += 1
-            logger.info(f"[tracker] {ticker}: live price via Polygon fallback (yfinance unavailable)")
-            return float(px)
-    except Exception as e:
-        logger.debug(f"[tracker] Polygon price failed for {ticker}: {e}")
+
+    def _yf_fast() -> Optional[float]:
+        try:
+            px = float(yf.Ticker(ticker).fast_info.last_price)
+            if px > 0:
+                _PRICE_HEALTH["yfinance"] += 1
+                return px
+        except Exception as e:
+            logger.debug(f"[tracker] yfinance price failed for {ticker}: {e}")
+        return None
+
+    def _polygon() -> Optional[float]:
+        try:
+            from src.data import polygon_client
+            px = polygon_client.get_last_price(ticker)
+            if px and float(px) > 0:
+                _PRICE_HEALTH["polygon"] += 1
+                return float(px)
+        except Exception as e:
+            logger.debug(f"[tracker] Polygon price failed for {ticker}: {e}")
+        return None
+
+    def _yf_prepost() -> Optional[float]:
+        # 1-minute prepost bars — the genuine extended print fast_info hides.
+        try:
+            from src.data.market_data import _extended_last_price
+            px = _extended_last_price(yf.Ticker(ticker))
+            if px and px > 0:
+                _PRICE_HEALTH["yfinance"] += 1
+                return float(px)
+        except Exception as e:
+            logger.debug(f"[tracker] yfinance prepost price failed for {ticker}: {e}")
+        return None
+
+    from src.performance.market_calendar import current_session
+    if current_session() != "rth":
+        px = _yf_prepost() or _polygon() or _yf_fast()   # extended-aware first
+    else:
+        px = _yf_fast() or _polygon()                    # RTH: live yfinance first
+
+    if px is not None and px > 0:
+        return px
     _PRICE_HEALTH["failed"].append(ticker)
-    logger.warning(f"[tracker] Could not fetch price for {ticker} — yfinance + Polygon both failed")
+    logger.warning(f"[tracker] Could not fetch price for {ticker} — all sources failed")
     return None
 
 
@@ -188,7 +226,7 @@ def _execution_iso() -> str:
 
 
 def _reference_close(ticker: str) -> Optional[dict]:
-    """Snapshot the most recent cached OHLCV close for *ticker*.
+    """Snapshot the most recent **finalized** daily OHLCV close for *ticker*.
 
     Returned as ``{"date": YYYY-MM-DD, "close": float}`` (or ``None`` when
     the ticker has no cached history).  Stored on every new trade entry and
@@ -198,17 +236,35 @@ def _reference_close(ticker: str) -> Optional[dict]:
     yields the multiplier that brings the recorded entry/exit price back
     onto the current cache scale, eliminating the phantom-jump bug that
     naked adjusted-close walks suffer through a split.
+
+    Critically this must skip the **still-forming current-session bar**: an
+    intraday entry/exit would otherwise record today's *in-progress* close
+    (the latest print, not the finalized daily close), which later finalizes
+    to a different value. The split-adjustment then divides the finalized
+    close by that intraday snapshot and reads the gap as a phantom corporate
+    action (observed 2026-06-15: INTC's same-day intraday exit booked a 1.04×
+    "split", inflating its daily-NAV compound to +5.1% vs a true +1.5%). We
+    therefore return the last close strictly BEFORE today's session — always a
+    finalized bar — mirroring the completed-bars-only principle the indicators
+    use (``market_data._drop_forming_bar``).
     """
     try:
         from src.data.cache import load_ohlcv
+        from src.performance.daily_nav import _session_date
         df = load_ohlcv(ticker)
         if df is None or df.empty or "Close" not in df.columns:
             return None
-        last_close = float(df["Close"].iloc[-1])
-        if last_close <= 0:
-            return None
-        last_date = df.index[-1].date().isoformat()
-        return {"date": last_date, "close": last_close}
+        today = date.today()
+        # Walk newest→oldest to the last finalized session (strictly before
+        # today), skipping the forming current-day bar and any bad close.
+        for ts, close in zip(reversed(df.index.tolist()), reversed(df["Close"].tolist())):
+            d = _session_date(ts)
+            if d is None or d >= today:
+                continue
+            c = float(close)
+            if c > 0:
+                return {"date": d.isoformat(), "close": c}
+        return None
     except Exception as e:
         logger.debug(f"[tracker] _reference_close({ticker}) failed: {e}")
         return None
@@ -1537,10 +1593,15 @@ def _evaluate_decay(
     engines (apples-to-apples), so this function just trusts a present review.
     The aggregator's combined_score / confidence (a different decision-maker,
     often near zero on LLM-conviction names — it was killing those trades one
-    tick after entry) is no longer consulted for LLM-opened trades. It survives
-    only as the backstop for legacy / rule-based-opened trades (no LLM engine).
+    tick after entry) is no longer consulted whenever a review is present. As of
+    the #4 hardening, the pipeline builds a review for rule-based / legacy-opened
+    trades too (with THIS run's engine, since there is no opener to pin), so the
+    aggregator backstop now fires ONLY as a true last resort — a rule-based /
+    legacy trade with no LLM review available this tick (e.g. the LLM is wholly
+    unavailable).
 
-    LLM-opened trade, in priority order:
+    When a review is present (LLM-opened → opener-pinned; rule-based → this
+    run's engine), in priority order:
       1. ``macro_regime_exit``   — long while macro is PANIC/RISK_OFF (top-down
          risk overlay, engine-independent — always applies).
       2. ``llm_signal_flipped``  — the engine now calls the opposite direction.
@@ -1560,12 +1621,15 @@ def _evaluate_decay(
             and getattr(macro_regime_context, "regime", "") in ("PANIC", "RISK_OFF")):
         return "macro_regime_exit"
 
-    # 2. LLM-driven hold/close — the OPENING engine's pinned review governs.
+    # 2. LLM-driven hold/close — a fresh LLM re-judgment governs the exit.
+    #    For LLM-opened trades that review is the OPENER-PINNED one (Fix #2 — the
+    #    same engine that opened it). For rule-based / legacy-opened trades the
+    #    pipeline now builds a review with THIS run's engine, so their exit is
+    #    LLM-judged too instead of being handed to the aggregator-decay backstop
+    #    (30%-win historically). A present review governs for ALL trades.
     open_provider = _provider_of_synth_model(trade.get("llm_synthesis_model"))
-    if settings.enable_llm_hold_review and open_provider in ("anthropic", "deepseek"):
-        # No opener-pinned review available this tick → hold.
-        if hold_review is None:
-            return None
+    opener_is_llm = open_provider in ("anthropic", "deepseek")
+    if settings.enable_llm_hold_review and hold_review is not None:
         rev_action = getattr(hold_review, "action", None)
         # Flip — the engine now actively calls the OTHER way.
         if (action == "BUY" and rev_action == "SELL") or (action == "SELL" and rev_action == "BUY"):
@@ -1582,9 +1646,15 @@ def _evaluate_decay(
             if conv < _confidence_floor(trade.get("confidence")):  # entry conf = the LLM number that gated the open
                 return "llm_confidence_loss"
         return None
+    if settings.enable_llm_hold_review and opener_is_llm:
+        # LLM-opened but NO review produced this tick (opener engine failed) →
+        # HOLD. Never fall through to the aggregator backstop, which was killing
+        # LLM-conviction names one tick after entry (the Fix #2 invariant).
+        return None
 
-    # 3. Aggregator backstop — legacy / rule-based-opened trades only (no LLM
-    #    engine to stay consistent with). Original four-trigger behaviour.
+    # 3. Aggregator backstop — rule-based / legacy-opened trades with NO LLM
+    #    review available this tick (true last resort, e.g. the LLM is entirely
+    #    unavailable). Original four-trigger behaviour.
     if not settings.enable_signal_decay_exits:
         return None
     if today_signal is None:
