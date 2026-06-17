@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     # behavior); 0.0 = always DeepSeek-first.
     llm_ab_anthropic_share: float = 0.5
 
+    # SYNTHESIS-only N-way model bake-off. When set to a comma-separated list of
+    # model ids, the per-run synthesis engine is picked UNIFORMLY from this pool
+    # (equal split) instead of the binary llm_ab_anthropic_share flip — so 3+
+    # models (e.g. Haiku, Opus 4.8, DeepSeek) accumulate comparable samples and
+    # each shows as its own row in the dashboard's per-LLM evaluation. The chosen
+    # model's provider is inferred (deepseek* → DeepSeek, else Anthropic); the
+    # OTHER provider is the error fallback. Empty = legacy binary behavior above.
+    # Sentiment is unaffected (stays Haiku ⇄ DeepSeek via llm_ab_anthropic_share —
+    # Opus per-ticker sentiment would be wasteful). Example:
+    #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash
+    llm_ab_synthesis_models: str = ""
+
     # Held-positions prompt A/B — probability that a run includes the
     # <open_positions_context> block (the system's current holdings + a
     # zero-endowment-bias review instruction) in the synthesis prompt.

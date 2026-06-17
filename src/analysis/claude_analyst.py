@@ -82,20 +82,68 @@ def _anthropic_sampling_kwargs(model: str) -> dict:
     return {"temperature": 0}
 
 
-def _call_claude_analyst(prompt: str) -> str:
-    """Call the configured Claude analyst model (streaming). Returns raw response text.
+def _anthropic_thinking_kwargs(model: str) -> dict:
+    """``{"thinking": {"type": "adaptive"}}`` for models that support adaptive
+    thinking — Opus 4.6+, Sonnet 4.6+, and the Fable/Mythos 5 families — so the
+    synthesis reasons before committing to BUY/SELL/HOLD; ``{}`` for models that
+    don't (Haiku 4.5, Sonnet 4.5, older), which would 400 on the parameter.
+
+    Effort is left at its default (``high``). ``display`` stays ``"omitted"`` (the
+    default) — we accumulate only the answer via ``text_stream``, never surface
+    the reasoning, so a summary would just be wasted tokens. Per the Anthropic
+    model reference (2026-06). Note: thinking is non-deterministic, so on a
+    thinking model the hold-review re-judgments are inherently noisier than the
+    old temperature=0 path (a tradeoff for the better synthesis)."""
+    m = (model or "").lower()
+    if "fable" in m or "mythos" in m:
+        return {"thinking": {"type": "adaptive"}}
+    mt = re.search(r"(opus|sonnet)-(\d+)-(\d+)", m)
+    if mt and (int(mt.group(2)), int(mt.group(3))) >= (4, 6):
+        return {"thinking": {"type": "adaptive"}}
+    return {}
+
+
+def _engine_of(model: str) -> str:
+    """Which provider a synthesis model id belongs to: 'deepseek' for DeepSeek
+    ids, 'anthropic' for Claude ids."""
+    return "deepseek" if "deepseek" in (model or "").lower() else "anthropic"
+
+
+def _synthesis_attempts_for(chosen_model: str, anthropic_fallback: str,
+                            deepseek_fallback: str) -> list:
+    """Ordered ``(engine, model)`` synthesis attempts for a chosen model: the
+    chosen model first, then the OTHER provider's default model as the error
+    fallback, so a provider outage still yields a recommendation. Pure /
+    deterministic — the random pool pick happens in the caller, so this is
+    unit-testable."""
+    eng = _engine_of(chosen_model)
+    if eng == "anthropic":
+        return [("anthropic", chosen_model), ("deepseek", deepseek_fallback)]
+    return [("deepseek", chosen_model), ("anthropic", anthropic_fallback)]
+
+
+def _call_claude_analyst(prompt: str, model: Optional[str] = None) -> str:
+    """Call a Claude analyst model (streaming). Returns raw response text.
+
+    ``model`` defaults to ``settings.analyst_model``; the A/B router passes an
+    explicit model when rotating the synthesis bake-off pool (e.g. Haiku vs Opus),
+    so the per-model max_tokens / sampling / thinking choices below adapt to it.
 
     Raises anthropic.APIStatusError / APIConnectionError on API failure — covers
     400 (credit exhausted / bad request), 401 (auth), 402 (payment), 403
     (permission), 429 (rate limit), 5xx, and connection failures.
     """
+    model = model or settings.analyst_model
     client = _get_client()
-    logger.info(f"[claude] Using model: {settings.analyst_model}")
-    # Haiku 4.5 = 8 192 tokens max output; Sonnet 4.6 = 64 000; Opus = 32 000
-    if "haiku" in settings.analyst_model:
-        _max_tokens = 8096
-    elif "opus" in settings.analyst_model:
-        _max_tokens = 32000
+    logger.info(f"[claude] Using model: {model}")
+    # Output ceiling. Adaptive-thinking tokens count against max_tokens, so Opus
+    # gets 64 000 (was 32 000) to leave room for the reasoning AND the JSON answer
+    # — too tight a cap truncates the answer (stop_reason=max_tokens) and breaks
+    # the parse. Streaming, so no SDK timeout risk (Opus 4.6+ supports up to 128K).
+    if "haiku" in model:
+        _max_tokens = 8096    # Haiku 4.5 (no adaptive thinking)
+    elif "opus" in model:
+        _max_tokens = 64000
     else:
         _max_tokens = 64000   # Sonnet 4.6
     # Determinism: temperature=0 so identical prompts produce near-identical
@@ -104,10 +152,11 @@ def _call_claude_analyst(prompt: str) -> str:
     # _anthropic_sampling_kwargs omits it there (determinism via thinking/effort).
     raw_parts: list[str] = []
     with client.messages.stream(
-        model=settings.analyst_model,
+        model=model,
         max_tokens=_max_tokens,
         messages=[{"role": "user", "content": prompt}],
-        **_anthropic_sampling_kwargs(settings.analyst_model),
+        **_anthropic_sampling_kwargs(model),
+        **_anthropic_thinking_kwargs(model),
     ) as stream:
         for text in stream.text_stream:
             raw_parts.append(text)
@@ -2921,32 +2970,50 @@ Return ALL tickers from the input. No markdown, JSON only."""
     # comparable samples for the dashboard's per-LLM evaluation rows. The
     # other engine remains the error fallback (credit exhausted, rate limit,
     # connection failure, missing key, …), then rule-based as last resort.
+    # Two A/B modes, both recording the EXACT model so the dashboard's per-LLM
+    # evaluation shows one row per engine:
+    #   • llm_ab_synthesis_models set → N-way model bake-off: pick one model
+    #     UNIFORMLY from the pool each run (e.g. Haiku / Opus 4.8 / DeepSeek →
+    #     ~1/3 each), so all N accumulate comparable samples.
+    #   • otherwise → legacy 2-way provider flip via llm_ab_anthropic_share
+    #     (anthropic=analyst_model ⇄ deepseek).
+    # Each attempt is an (engine, model) pair; the non-chosen provider is the
+    # error fallback, rule-based the last resort.
+    pool = [m.strip() for m in (settings.llm_ab_synthesis_models or "").split(",") if m.strip()]
     if force_engine in ("anthropic", "deepseek"):
-        # Opener-pinned hold-review: this engine ONLY — no A/B flip, no
-        # cross-engine fallback, no rule-based fallback (see below).
-        order = [force_engine]
+        # Opener-pinned hold-review: this engine ONLY (its default model) — no
+        # A/B, no cross-engine fallback, no rule-based fallback (see below).
+        forced_model = settings.analyst_model if force_engine == "anthropic" else _DEEPSEEK_ANALYST_MODEL
+        attempts = [(force_engine, forced_model)]
         logger.info(f"[claude] FORCED synthesis engine={force_engine} (pinned hold-review)")
+    elif pool:
+        chosen = random.choice(pool)               # uniform → equal split over the pool
+        attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL)
+        logger.info(f"[claude] A/B synthesis bake-off this run: model={chosen} "
+                    f"(pool of {len(pool)}, equal split)")
     else:
         primary = "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
-        order = ["anthropic", "deepseek"] if primary == "anthropic" else ["deepseek", "anthropic"]
+        engines = ["anthropic", "deepseek"] if primary == "anthropic" else ["deepseek", "anthropic"]
+        attempts = [(e, settings.analyst_model if e == "anthropic" else _DEEPSEEK_ANALYST_MODEL)
+                    for e in engines]
         logger.info(
             f"[claude] A/B routing this run: primary={primary} "
             f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
         )
     raw: str | None = None
     analyst_source = settings.analyst_model
-    for engine in order:
+    for engine, model in attempts:
         try:
             if engine == "anthropic":
-                raw = _call_claude_analyst(prompt)
-                analyst_source = settings.analyst_model
+                raw = _call_claude_analyst(prompt, model=model)
+                analyst_source = model
             else:
                 raw = _call_deepseek_analyst(prompt)
                 analyst_source = _DEEPSEEK_ANALYST_MODEL
             break
         except Exception as e:
             logger.warning(
-                f"[claude] {engine} analyst failed ({type(e).__name__}: {e}) — trying next engine"
+                f"[claude] {engine} ({model}) analyst failed ({type(e).__name__}: {e}) — trying next engine"
             )
             raw = None
     if raw is None:

@@ -347,7 +347,7 @@ def test_generate_recommendations_force_engine_no_fallback(monkeypatch):
     import src.analysis.claude_analyst as ca
     called = []
 
-    def boom(_p):
+    def boom(_p, model=None):   # _call_claude_analyst now takes an optional model
         called.append("anthropic")
         raise RuntimeError("forced engine down")
 
