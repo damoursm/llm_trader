@@ -189,6 +189,13 @@ def print_report(panel: pd.DataFrame, ic: pd.DataFrame,
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
+    import sys
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")   # Windows console: render → glyphs
+    except Exception:
+        pass
+    from src.db import repo
+    repo.set_read_only(True)   # never contend with a running scheduler's write lock
     p = argparse.ArgumentParser(description="Per-method IC report over the persisted signals panel.")
     p.add_argument("--horizons", default="1,5,10",
                    help="comma-separated forward horizons in sessions (default 1,5,10)")

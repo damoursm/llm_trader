@@ -35,13 +35,27 @@ RSS_FEEDS = {
     "wsj_markets": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
 }
 
+# Press-release wires — where primary catalysts (earnings, guidance, M&A, FDA,
+# contracts) break in real time, minutes before the secondary RSS pickup. Free
+# public RSS, no key. URLs verified live (2026-06-17); Business Wire's token feed
+# and Accesswire's endpoint returned 0/bozo and are intentionally omitted. Fetched
+# on the same fast path as RSS_FEEDS (fresh every tick — never behind the news
+# cache), so a wire crossing between hourly refreshes is seen at the next tick.
+PR_WIRE_FEEDS = {
+    "globenewswire_pubco": "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20Public%20Companies",
+    "prnewswire_financial": "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss",
+    "prnewswire_ma": "https://www.prnewswire.com/rss/financial-services-latest-news/acquisitions-mergers-and-takeovers-list.rss",
+}
+
 
 def fetch_rss_news(max_age_hours: int = 24) -> List[NewsArticle]:
-    """Fetch news from all RSS feeds, filtered to recent articles."""
+    """Fetch news from all RSS + press-release-wire feeds, filtered to recent
+    articles. Real-time by nature — the pipeline fetches this FRESH every tick
+    (never cached) so breaking catalysts aren't hidden behind the hourly cache."""
     articles: List[NewsArticle] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
 
-    for source, url in RSS_FEEDS.items():
+    for source, url in {**RSS_FEEDS, **PR_WIRE_FEEDS}.items():
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries:
@@ -152,34 +166,52 @@ def fetch_ticker_news(tickers: List[str], max_age_hours: int = 168) -> List[News
     return out
 
 
-def fetch_all_news(tickers: List[str], sectors: List[str]) -> List[NewsArticle]:
-    """Aggregate news from all sources for watchlist tickers and sectors."""
-    all_articles: List[NewsArticle] = []
+def _dedupe_by_url(articles: List[NewsArticle]) -> List[NewsArticle]:
+    """Drop duplicate URLs, first occurrence wins (preserves source ordering)."""
+    seen = set()
+    unique: List[NewsArticle] = []
+    for art in articles:
+        if art.url not in seen:
+            seen.add(art.url)
+            unique.append(art)
+    return unique
+
+
+def fetch_cached_news(tickers: List[str], sectors: List[str]) -> List[NewsArticle]:
+    """The CACHE-WORTHY news bundle: per-ticker yfinance + NewsAPI.
+
+    These are the rate-limited (yfinance 429s) / quota-bound (NewsAPI free tier)
+    sources, so the pipeline caches them hourly. RSS + press-release wires are
+    deliberately NOT included here — they're fetched fresh every tick via
+    ``fetch_rss_news`` so a breaking headline is never hidden behind this cache
+    (the reactivity fast-lane). ``fetch_all_news`` recombines the two.
+    """
+    out: List[NewsArticle] = []
 
     # Per-ticker news (the primary per-symbol feed — ticker-tagged, covers all).
-    all_articles.extend(fetch_ticker_news(tickers))
-
-    # RSS feeds (general-market context, always available)
-    all_articles.extend(fetch_rss_news())
+    out.extend(fetch_ticker_news(tickers))
 
     # NewsAPI targeted queries. Window must exceed the free tier's ~24h embargo
     # (a from<24h query returns 0 results on the free plan), so look back 7 days;
     # the sentiment scorer weights by recency and drops anything >7d as stale.
     ticker_query = " OR ".join(tickers[:10])  # API limit
-    all_articles.extend(fetch_newsapi(ticker_query, max_age_hours=168))
+    out.extend(fetch_newsapi(ticker_query, max_age_hours=168))
 
     sector_names = [SECTOR_ETF_NAMES.get(s, s) for s in sectors[:5]]
     sector_query = " OR ".join(sector_names)
-    all_articles.extend(fetch_newsapi(sector_query, max_age_hours=168))
+    out.extend(fetch_newsapi(sector_query, max_age_hours=168))
 
-    # Deduplicate by URL
-    seen = set()
-    unique = []
-    for art in all_articles:
-        if art.url not in seen:
-            seen.add(art.url)
-            unique.append(art)
+    return _dedupe_by_url(out)
 
+
+def fetch_all_news(tickers: List[str], sectors: List[str]) -> List[NewsArticle]:
+    """Full FRESH bundle (cache-worthy sources + live RSS/wires), deduped.
+
+    Direct callers (e.g. the hold-review refetch) get everything fresh in one
+    call. The SCHEDULED pipeline instead splits these — ``fetch_cached_news``
+    hourly-cached + ``fetch_rss_news`` every tick — so RSS stays real-time
+    without re-hammering the rate-limited per-ticker feed."""
+    unique = _dedupe_by_url(fetch_cached_news(tickers, sectors) + fetch_rss_news())
     logger.info(f"Total unique articles: {len(unique)}")
     return unique
 

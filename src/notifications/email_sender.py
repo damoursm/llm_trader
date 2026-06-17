@@ -173,6 +173,20 @@ HTML_TEMPLATE = """
 </div>
 {% endif %}
 
+{% if price_health and price_health.down %}
+<div style="background:#7c2d12;border:1px solid #c2410c;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fed7aa;font-size:13px;">
+  &#128276; <b>Price provenance alert</b> &mdash; {{ price_health.message }}.
+  <div style="margin-top:6px;color:#fdba74;line-height:1.7;">
+  {% for f in price_health.flagged %}&bull; {{ f.ticker }}: entered {{ '%.4f'|format(f.entry_price) }} vs snapshot {{ '%.4f'|format(f.snapshot_price) }} &mdash; {{ '%.0f'|format(f.bps) }} bp ({{ f.session }}, band {{ '%.0f'|format(f.band) }} bp)<br>{% endfor %}
+  A new trade was booked far from the analysis snapshot price &mdash; check the live price feed (stale off-hours quote?) before trusting these fills.
+  </div>
+</div>
+{% elif price_health and price_health.n_checked %}
+<div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
+  &#9989; Prices verified &mdash; {{ price_health.n_checked }} new trade(s) entered within the snapshot band.
+</div>
+{% endif %}
+
 <!-- ══════════════════════════════════════
      SIGNAL OVERVIEW CHART
      ══════════════════════════════════════ -->
@@ -5335,6 +5349,7 @@ def send_recommendations(
     source_health: Optional[list] = None,  # failed data sources this run (label/error dicts)
     llm_health: Optional[dict] = None,     # LLM-layer health verdict this run (down/message)
     broker_health: Optional[dict] = None,  # broker/execution reconcile verdict this run
+    price_health: Optional[dict] = None,   # price-provenance verdict (entry vs snapshot divergence)
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -5485,6 +5500,7 @@ def send_recommendations(
         source_health=source_health or [],
         llm_health=llm_health,
         broker_health=broker_health,
+        price_health=price_health,
         total=total_analysed or len(all_recs),
         colors=ACTION_COLOR,
         # recommendation lists
@@ -5726,6 +5742,9 @@ def send_recommendations(
 
     if broker_health and broker_health.get("down"):
         subject = "🔔 BROKER | " + subject
+
+    if price_health and price_health.get("down"):
+        subject = "🔔 PRICE | " + subject
 
     try:
         # Outer wrapper: multipart/related so inline CID images are recognised

@@ -155,3 +155,83 @@ def broker_trades(force: bool = False) -> list:
     result = build_broker_trades(trades)
     _perf_cache["broker_trades"] = {"ts": now, "data": result}
     return result
+
+
+# ── Diagnostics accessors (IC · calibration · exit quality · execution) ──────
+
+def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) -> dict:
+    """Per-method information-coefficient table over the persisted signals panel
+    joined with forward returns. Cached (the OHLCV join is heavy). Returns
+    ``{panel_rows, tickers, ic}`` where ``ic`` is a DataFrame (empty until the
+    panel has enough forward-return history)."""
+    key = ("signal_ic", days, tuple(horizons), int(min_n))
+    now = time.time()
+    entry = _perf_cache.get(key)
+    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.analysis.signal_panel import build_panel, compute_ic
+
+    def _q():
+        panel = build_panel(horizons=horizons, days=days)
+        ic = (compute_ic(panel, horizons=horizons, min_n=min_n)
+              if panel is not None and not panel.empty else pd.DataFrame())
+        return {
+            "panel_rows": 0 if panel is None or panel.empty else int(len(panel)),
+            "tickers":    0 if panel is None or panel.empty else int(panel["ticker"].nunique()),
+            "ic":         ic,
+        }
+    result = _retry(_q, "signal_ic")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
+
+
+def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None) -> dict:
+    """Confidence-calibration report (buckets + slope) over the windowed/session
+    perf bundle's closed + open trades — so it tracks the tab's toggles and
+    reuses the cached perf computation."""
+    perf = performance(window_days=window_days, session=session)
+    from src.analysis.confidence_calibration import compute_calibration
+    trades = (perf.get("closed_trades") or []) + (perf.get("open_trades") or [])
+    return compute_calibration(trades)
+
+
+def exit_quality(window_days: Optional[int] = None, session: Optional[str] = None) -> dict:
+    """MFE/MAE exit-quality report over the windowed/session closed trades (the
+    sim ledger carries the excursion fields)."""
+    perf = performance(window_days=window_days, session=session)
+    from src.analysis.exit_quality import compute_exit_quality
+    return compute_exit_quality(perf.get("closed_trades") or [])
+
+
+def broker_forensics() -> dict:
+    """Slippage / fill-rate / drift / reject forensics over the broker tables
+    (all runs — not windowed)."""
+    from src.analysis.broker_forensics import (
+        compute_forensics, load_broker_orders, load_broker_reconciles)
+    return _retry(lambda: compute_forensics(load_broker_orders(), load_broker_reconciles()),
+                  "broker_forensics")
+
+
+def tracking_error() -> dict:
+    """Sim-vs-broker tracking-error report over every trade with a matching
+    broker fill."""
+    from src.analysis.tracking_error import compute_tracking_error
+    trades = _retry(lambda: repo.load_trades(), "tracking_error")
+    return compute_tracking_error(trades)
+
+
+def latest_gate_diag() -> dict:
+    """gate_diag JSON of the most recent run (carries the price-provenance
+    verdict for the banner + Execution tab). ``{}`` when unavailable."""
+    rid = latest_run_id()
+    if not rid:
+        return {}
+    df = _retry(lambda: repo.fetch_df("SELECT gate_diag FROM runs WHERE run_id = ?", [rid]),
+                "gate_diag")
+    if df.empty or not df.iloc[0]["gate_diag"]:
+        return {}
+    import json
+    try:
+        return json.loads(df.iloc[0]["gate_diag"])
+    except Exception:
+        return {}

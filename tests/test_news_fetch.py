@@ -96,3 +96,70 @@ def test_fetch_ticker_news_legacy_schema(monkeypatch):
 def test_fetch_ticker_news_disabled(monkeypatch):
     monkeypatch.setattr(news_fetcher.settings, "enable_ticker_news", False)
     assert fetch_ticker_news(["CRDO"]) == []
+
+
+# ── RSS fast-lane + press-release wires (reactivity changes) ─────────────────
+
+def test_dedupe_by_url_first_wins():
+    a, b, dup = _art("x"), _art("y"), _art("x")   # _art url = "u"+title → dup of "x"
+    out = news_fetcher._dedupe_by_url([a, b, dup])
+    assert [t.title for t in out] == ["x", "y"]
+
+
+def test_fetch_cached_news_excludes_rss(monkeypatch):
+    """The cache-worthy bundle must NOT pull RSS — RSS is the fresh fast-lane."""
+    monkeypatch.setattr(news_fetcher, "fetch_ticker_news", lambda t: [_art("tk", tickers=["AAA"])])
+    monkeypatch.setattr(news_fetcher, "fetch_newsapi", lambda q, max_age_hours=168: [])
+
+    def boom():
+        raise AssertionError("fetch_cached_news must not fetch RSS")
+    monkeypatch.setattr(news_fetcher, "fetch_rss_news", boom)
+
+    out = news_fetcher.fetch_cached_news(["AAA"], ["XLK"])
+    assert [a.title for a in out] == ["tk"]
+
+
+def test_fetch_all_news_merges_cached_and_rss_deduped(monkeypatch):
+    monkeypatch.setattr(news_fetcher, "fetch_cached_news", lambda t, s: [_art("c")])
+    monkeypatch.setattr(news_fetcher, "fetch_rss_news", lambda: [_art("r"), _art("c")])  # "c" dups
+    titles = [a.title for a in news_fetcher.fetch_all_news(["AAA"], [])]
+    assert titles.count("c") == 1 and "r" in titles
+
+
+def test_fetch_rss_includes_pr_wires(monkeypatch):
+    """Every RSS feed AND every press-release wire URL is fetched."""
+    seen = []
+
+    class _Feed:
+        entries = []
+        bozo = 0
+
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", lambda url: (seen.append(url) or _Feed()))
+    news_fetcher.fetch_rss_news()
+    assert news_fetcher.PR_WIRE_FEEDS                      # wires configured
+    for u in {**news_fetcher.RSS_FEEDS, **news_fetcher.PR_WIRE_FEEDS}.values():
+        assert u in seen
+
+
+def test_pipeline_fetch_news_fast_lanes_rss(monkeypatch):
+    """The core reactivity guarantee: even on a news-cache HIT, RSS/wires are
+    refetched FRESH every tick and merged — so a breaking catalyst is never
+    hidden behind the hourly cache."""
+    import src.pipeline as pipeline
+
+    cached = [_art("cached-bundle", tickers=["AAA"])]
+    fresh = [_art("breaking wire")]
+    rss_calls = []
+
+    monkeypatch.setattr(pipeline, "load_news", lambda: cached)          # cache HIT
+    monkeypatch.setattr(pipeline, "fetch_rss_news", lambda: (rss_calls.append(1) or fresh))
+    monkeypatch.setattr(pipeline, "save_news", lambda a: None)
+
+    def _no_cached_fetch(t, s):
+        raise AssertionError("must not refetch the cached bundle on a cache hit")
+    monkeypatch.setattr(pipeline, "fetch_cached_news", _no_cached_fetch)
+
+    out = pipeline._fetch_news(["AAA"], [])
+    assert rss_calls == [1]                                # RSS fetched fresh despite cache hit
+    titles = {a.title for a in out}
+    assert {"cached-bundle", "breaking wire"} <= titles    # merged

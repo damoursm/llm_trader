@@ -6,7 +6,7 @@ default 50/50) so both accumulate comparable samples for the dashboard's
 per-LLM evaluation; the other engine is the error fallback.
 
 Precision controls:
-  - Recency decay: articles are weighted by age before scoring (24h=1.0x → 7d=0.25x)
+  - Recency decay: articles weighted by age before scoring (fresh=1.0x, 18h=0.5x, ~2d=0.16x, >7d dropped)
   - Article-count scaling: a score from 1 article is dampened vs 10+ articles
   - Source diversity: if all articles come from a single source, apply a confidence penalty
   - Relevance fallback fix: if <2 relevant articles found, return [] (not all articles)
@@ -106,8 +106,11 @@ def get_dominant_sentiment_model() -> Optional[str]:
 # produce only marginally different recommendations.
 _LLM_SEED = 1729
 
-# Recency decay: articles older than this many hours get progressively down-weighted
-_DECAY_HALF_LIFE_HOURS = 36   # score halves every 36 hours
+# Recency decay: articles older than this many hours get progressively down-weighted.
+# Tightened 36h → 18h (2026-06-17) to react faster to news catalysts — a same-day
+# catalyst dominates the score while yesterday's news fades quickly
+# (18h=0.5x, ~24h=0.40x, ~2d=0.16x, >7d dropped entirely).
+_DECAY_HALF_LIFE_HOURS = 18   # score halves every 18 hours
 
 
 def _get_deepseek() -> OpenAI | None:

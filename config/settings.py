@@ -708,6 +708,20 @@ class Settings(BaseSettings):
     spread_extended_multiplier: float = 4.0
     spread_overnight_multiplier: float = 10.0
 
+    # ── Price-provenance health check ───────────────────────────────────────
+    # Per-run guard against the stale-price class (the 2026-06-15 CRDO bug: an
+    # entry booked at Friday's stale close while the live pre-market print — and
+    # the analysis snapshot — was ~4.5% higher). After trades open, every leg's
+    # recorded entry_price is compared to the run's snapshot price for that
+    # ticker; a divergence beyond the session-appropriate band is flagged
+    # (CRITICAL log + email/dashboard banner). RTH is tight (the snapshot and the
+    # entry fetch are near-simultaneous); off-hours allows more drift between the
+    # snapshot and the entry fetch on a thin, fast-moving tape.
+    enable_price_provenance_check: bool = True
+    price_provenance_band_rth_bps: float = 100.0
+    price_provenance_band_extended_bps: float = 350.0
+    price_provenance_band_overnight_bps: float = 600.0
+
     # ── Extended-session signal profile ─────────────────────────────────────
     # Outside RTH the information landscape changes: options chains (put/call,
     # max pain, OI skew, IV expression) are FROZEN at the last regular-session

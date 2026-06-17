@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from src.utils import now_et, fmt_et
-from src.data.news_fetcher import fetch_all_news
+from src.data.news_fetcher import fetch_all_news, fetch_cached_news, fetch_rss_news, _dedupe_by_url
 from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
 from src.data.trending import get_trending_tickers
@@ -331,13 +331,88 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
     }
 
 
+def _assess_price_provenance(run_id, snapshots) -> Optional[dict]:
+    """Flag trades opened THIS run whose recorded entry_price diverges from the
+    run's snapshot price beyond a session-appropriate band.
+
+    The standing, automatic version of the one-off fill-vs-snapshot audit run on
+    the 2026-06-15 stale-price bug (CRDO entered at Friday's stale close while the
+    snapshot — and the live pre-market print — was ~4.5% higher). ``entry_price``
+    comes from ``tracker._fetch_price`` (a SEPARATE live fetch from the analysis
+    snapshot), so a feed/staleness bug shows up as a large divergence here even
+    though both *should* agree. RTH uses a tight band; off-hours allows more drift
+    between the snapshot and the entry fetch on a thin tape.
+
+    Returns ``{down, n_checked, flagged:[...], message}`` or None when the check is
+    disabled / there is nothing to compare.
+    """
+    if not settings.enable_price_provenance_check or not run_id:
+        return None
+    price_by_ticker = {s.ticker: float(s.price) for s in (snapshots or [])
+                       if getattr(s, "price", None)}
+    if not price_by_ticker:
+        return None
+    bands = {
+        "rth":       settings.price_provenance_band_rth_bps,
+        "extended":  settings.price_provenance_band_extended_bps,
+        "overnight": settings.price_provenance_band_overnight_bps,
+    }
+    try:
+        trades = repo.load_trades()
+    except Exception as e:
+        logger.debug(f"[price] provenance check could not read trades: {e}")
+        return None
+
+    flagged, n_checked = [], 0
+    for t in trades:
+        if t.get("run_id") != run_id:
+            continue
+        entry = t.get("entry_price")
+        snap = price_by_ticker.get(t.get("ticker"))
+        if not entry or not snap or float(snap) <= 0:
+            continue
+        n_checked += 1
+        session = t.get("entry_session") or "rth"
+        band = bands.get(session, bands["rth"])
+        bps = abs(float(entry) - float(snap)) / float(snap) * 1e4
+        if bps > band:
+            flagged.append({
+                "ticker":         t.get("ticker"),
+                "entry_price":    round(float(entry), 4),
+                "snapshot_price": round(float(snap), 4),
+                "bps":            round(bps, 1),
+                "session":        session,
+                "band":           band,
+            })
+    if not n_checked:
+        return None
+    message = ""
+    if flagged:
+        names = ", ".join(f"{f['ticker']} {f['bps']:.0f}bp" for f in flagged[:6])
+        message = (f"{len(flagged)} of {n_checked} new trade(s) entered at a price "
+                   f"far from the run snapshot ({names}) — possible stale-price/feed bug")
+    return {"down": bool(flagged), "n_checked": n_checked, "flagged": flagged, "message": message}
+
+
 def _fetch_news(tickers, sectors):
-    articles = load_news()
-    if articles is None:
-        articles = fetch_all_news(tickers, sectors)
-        save_news(articles)
+    # Cache-worthy bundle (per-ticker yfinance + NewsAPI): hourly cache so the
+    # rate-limited / quota-bound feeds aren't re-hammered every 30-min tick.
+    cached = load_news()
+    if cached is None:
+        cached = fetch_cached_news(tickers, sectors)
+        save_news(cached)
+        logger.info(f"[news] Fetched cache-worthy bundle ({len(cached)} articles, hourly cache)")
     else:
-        logger.info("[news] Using cached articles")
+        logger.info(f"[news] Using cached per-ticker + NewsAPI bundle ({len(cached)} articles)")
+    # Fast-lane: RSS + press-release wires fetched FRESH every tick (never cached),
+    # mirroring the 8-K fast path — so a catalyst breaking between the hourly
+    # refreshes is seen at the NEXT 30-min tick instead of up to ~an hour later.
+    fresh_rss = fetch_rss_news()
+    articles = _dedupe_by_url(cached + fresh_rss)
+    logger.info(
+        f"[news] {len(articles)} articles ({len(cached)} cached + "
+        f"{len(fresh_rss)} live RSS/wires, deduped)"
+    )
     return articles
 
 
@@ -1333,6 +1408,16 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # Plotly Dash dashboard (python main.py --dashboard), backed by DuckDB.
     logger.info("Monitor performance + rationale in the dashboard: python main.py --dashboard")
 
+    # Price-provenance guard: compare every new trade's recorded entry price to
+    # the run's snapshot (the standing version of the one-off stale-price audit).
+    # Stash in gate_diag so it persists for the dashboard, and reuse the verdict
+    # for the email banner + subject tag below.
+    price_health = _assess_price_provenance(run_id, snapshots)
+    if price_health:
+        gate_diag["price_provenance"] = price_health
+        if price_health["down"]:
+            logger.critical(f"[price] PRICE PROVENANCE — {price_health['message']}.")
+
     # Persist run + 'APIs used' + every recommendation (with attribution) +
     # the broker reconcile report (per-order slippage/commissions) + the full
     # per-ticker signal cross-section (the learning panel) to DuckDB.
@@ -1421,6 +1506,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             source_health=[s for s in _collect_sources() if not s.get("ok")],
             llm_health=llm_health,
             broker_health=broker_health,
+            price_health=price_health,
         )
     else:
         logger.info("Email not configured — skipping.")

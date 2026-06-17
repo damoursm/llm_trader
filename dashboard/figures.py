@@ -237,3 +237,111 @@ def equity_curve_fig(perf: dict) -> go.Figure:
     except Exception:
         pass
     return _empty("Equity curve needs ≥2 closed trades.")
+
+
+def calibration_bar_fig(rep: dict) -> go.Figure:
+    """Bar of average return per confidence bucket (the bucketed companion to the
+    return-vs-confidence scatter). Rising green bars left→right + a positive slope
+    confirm higher-confidence (bigger-sized) trades actually earn more."""
+    buckets = rep.get("buckets") or []
+    if not buckets:
+        return _empty("Confidence calibration needs trades with a stored confidence.")
+    names = [b["label"] for b in buckets]
+    avgs = [b["avg_return"] or 0.0 for b in buckets]
+    ns = [b["trades"] for b in buckets]
+    colors = [POS if a >= 0 else NEG for a in avgs]
+    fig = go.Figure(go.Bar(
+        x=names, y=avgs, marker_color=colors,
+        text=[f"{a:+.2f}% (n={n})" for a, n in zip(avgs, ns)], textposition="auto",
+        hovertemplate="%{x}<br>avg %{y:+.2f}%<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    slope = rep.get("slope")
+    title = "Avg return by confidence bucket"
+    if slope is not None:
+        title += f"   ·   slope {slope:+.3f}%/pt"
+    fig.update_layout(
+        title=title, yaxis_title="Avg return (%)",
+        margin=dict(l=10, r=10, t=40, b=10), height=340,
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
+def mfe_capture_fig(rep: dict) -> go.Figure:
+    """Per closed trade: peak favorable excursion (MFE, x) vs realized return (y).
+
+    The dashed y=x line is "kept the entire peak". Points far below it gave back
+    most of the move (no profit-taking); points near or below zero on the y-axis
+    were round-trips that rode a gain back to a loss. Colour = win/loss."""
+    rows = rep.get("per_trade") or []
+    if not rows:
+        return _empty("Exit quality needs closed trades with an MFE/MAE band.")
+    xs = [r["mfe"] for r in rows]
+    ys = [r["return_pct"] for r in rows]
+    txt = [r.get("ticker") or "" for r in rows]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="markers", name="trades", text=txt,
+        marker=dict(size=10, color=[POS if v >= 0 else NEG for v in ys], line=dict(width=0)),
+        hovertemplate="%{text}: kept %{y:+.2f}% of a %{x:+.2f}% peak<extra></extra>",
+    ))
+    lim = max([abs(v) for v in xs + ys] + [1.0])
+    fig.add_trace(go.Scatter(
+        x=[0, lim], y=[0, lim], mode="lines", name="full capture",
+        line=dict(color=MUTED, dash="dash", width=1.5), hoverinfo="skip",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    fig.update_layout(
+        title="Exit capture — peak (MFE) vs kept (return)",
+        xaxis_title="MFE — peak favorable (%)", yaxis_title="Realized return (%)",
+        margin=dict(l=10, r=10, t=40, b=10), height=380,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def slippage_by_session_fig(slip_df) -> go.Figure:
+    """Grouped bars of mean + p90 fill-vs-decision slippage (bp, + = adverse) by
+    session — the test of whether the LMT cap (20 bp RTH / 80 bp extended) is
+    actually being achieved."""
+    if slip_df is None or getattr(slip_df, "empty", True):
+        return _empty("No filled legs with recorded slippage yet.")
+    sessions = slip_df["session"].tolist()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=sessions, y=slip_df["mean_bps"], name="mean",
+                         marker_color="#2563eb",
+                         text=[f"n={int(n)}" for n in slip_df["n"]], textposition="auto"))
+    fig.add_trace(go.Bar(x=sessions, y=slip_df["p90_bps"], name="p90", marker_color="#93c5fd"))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    fig.update_layout(
+        barmode="group", title="Fill slippage by session (bp, + = adverse)",
+        yaxis_title="Slippage (bp)", margin=dict(l=10, r=10, t=40, b=10), height=340,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def tracking_error_fig(rep: dict) -> go.Figure:
+    """Time series of the sim − broker return gap by entry date. A line hugging
+    zero = the model tracks reality; a persistent one-sided drift = a cost/price
+    bug (the auto-catch for the stale-price class)."""
+    by_date = rep.get("by_date") or []
+    if not by_date:
+        return _empty("Tracking error needs trades with matching broker fills.")
+    xs = [r["entry_date"] for r in by_date]
+    ys = [r["mean_d_return"] for r in by_date]
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="lines+markers", line=dict(color="#2563eb", width=2),
+        hovertemplate="%{x}<br>sim − broker %{y:+.2f}%<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    fig.update_layout(
+        title="Sim − broker return gap by entry date",
+        yaxis_title="Δreturn (sim − broker, %)",
+        margin=dict(l=10, r=10, t=40, b=10), height=340,
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig

@@ -65,29 +65,49 @@ def _h3(text: str, tooltip: str = "") -> html.H3:
 
 
 def _health_banner():
-    """Prominent red banner when the latest run had any failed data source
-    (API errors, dead live-price feed, …). Returns an empty Div when all good."""
+    """Prominent banners for the latest run: failed data sources (red) and a
+    price-provenance alert (amber) when a new trade entered far from the run
+    snapshot. Returns an empty Div when all good."""
+    blocks = []
+
     try:
         failures = data.latest_run_failures()
     except Exception as e:
         logger.debug(f"[dashboard] health banner skipped: {e}")
         failures = []
-    if not failures:
-        return html.Div()
-    items = []
-    for f in failures:
-        lbl = f.get("source_label") or "?"
-        err = f.get("error")
-        items.append(f"{lbl} — {err}" if err else lbl)
-    return html.Div(
-        [
-            html.B(f"⚠ {len(failures)} data source(s) failed in the latest run"),
-            html.Div(" · ".join(items),
-                     style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
-        ],
-        style={"background": "#fef2f2", "border": "1px solid #fecaca", "color": "#b91c1c",
-               "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
-    )
+    if failures:
+        items = []
+        for f in failures:
+            lbl = f.get("source_label") or "?"
+            err = f.get("error")
+            items.append(f"{lbl} — {err}" if err else lbl)
+        blocks.append(html.Div(
+            [
+                html.B(f"⚠ {len(failures)} data source(s) failed in the latest run"),
+                html.Div(" · ".join(items),
+                         style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
+            ],
+            style={"background": "#fef2f2", "border": "1px solid #fecaca", "color": "#b91c1c",
+                   "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
+        ))
+
+    try:
+        pp = (data.latest_gate_diag() or {}).get("price_provenance")
+    except Exception as e:
+        logger.debug(f"[dashboard] provenance banner skipped: {e}")
+        pp = None
+    if pp and pp.get("down"):
+        blocks.append(html.Div(
+            [
+                html.B("🔔 Price provenance alert"),
+                html.Div((pp.get("message") or "") + " — see the Execution tab.",
+                         style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
+            ],
+            style={"background": "#fffbeb", "border": "1px solid #fcd34d", "color": "#92400e",
+                   "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
+        ))
+
+    return html.Div(blocks) if blocks else html.Div()
 
 
 def _pct(x, signed: bool = False) -> str:
@@ -312,6 +332,8 @@ def serve_layout() -> html.Div:
                             children=dcc.Loading(html.Div(_safe(_methods_tab), style=body))),
                     dcc.Tab(label="Returns", value="returns",
                             children=dcc.Loading(html.Div(_safe(_returns_tab), style=body))),
+                    dcc.Tab(label="Execution", value="execution",
+                            children=dcc.Loading(html.Div(_safe(_execution_tab), style=body))),
                 ],
             ),
         ],
@@ -556,6 +578,66 @@ def _usd(x, signed: bool = True) -> str:
 
 # ── Tab 2: Method Performance ──────────────────────────────────────────────
 
+_IC_TOOLTIP = (
+    "Spearman rank correlation between each method's score and the forward "
+    "close-to-close return at 1/5/10 trading-day horizons, plus the directional "
+    "hit rate (% of non-zero scores whose sign matched the move). Computed over the "
+    "persisted signals panel — EVERY scored ticker each run, not just the few that "
+    "became trades — so it is unbiased by the trading gates. A method with a "
+    "persistent NEGATIVE IC is sign-inverted (a logic bug); a high-weight method "
+    "with IC ≈ 0 at large n is dead weight in the aggregator. 'Views' = scored, "
+    "non-zero observations. Run/forward-return based, so it is NOT affected by the "
+    "window toggle; n grows every run — judge nothing on a thin panel.")
+
+
+def _ic_section():
+    """Per-method information coefficient over the signals panel (item #1)."""
+    from src.performance.tracker import METHOD_LABELS
+    res = data.signal_ic()
+    icdf = res.get("ic")
+    heading = _h3("Signal information coefficient (IC)", _IC_TOOLTIP)
+    if icdf is None or getattr(icdf, "empty", True):
+        return html.Div([
+            heading,
+            html.Div(
+                f"Signals panel has {res.get('panel_rows', 0)} row(s) across "
+                f"{res.get('tickers', 0)} ticker(s) — not enough forward-return history "
+                "for IC yet. It accrues automatically every run.",
+                style={"color": "#6b7280"}),
+        ])
+    horizons = (1, 5, 10)
+    labels = dict(METHOD_LABELS)
+    labels["combined_score"] = "All methods (combined)"
+    rows = []
+    for _, r in icdf.iterrows():
+        row = {"method": labels.get(r["method"], r["method"]), "views": int(r["views"])}
+        for h in horizons:
+            n, ic, hit = r.get(f"n_{h}d"), r.get(f"ic_{h}d"), r.get(f"hit_{h}d")
+            row[f"n_{h}d"] = int(n) if pd.notna(n) else None
+            row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
+            row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
+        rows.append(row)
+    cols = [{"name": "Method", "id": "method"},
+            {"name": "Views", "id": "views", "type": "numeric", "format": _INT}]
+    for h in horizons:
+        cols += [
+            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
+            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"hit@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
+        ]
+    longest = max(horizons)
+    cond = [
+        {"if": {"filter_query": f"{{ic_{longest}d}} > 0", "column_id": f"ic_{longest}d"},
+         "color": figures.POS, "fontWeight": "bold"},
+        {"if": {"filter_query": f"{{ic_{longest}d}} < 0", "column_id": f"ic_{longest}d"},
+         "color": figures.NEG, "fontWeight": "bold"},
+    ]
+    return html.Div([
+        heading,
+        dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW),
+    ])
+
+
 def _methods_tab():
     # The LLM-models-used table is run-based (not trade-windowed), so it lives
     # outside the windowed body. The per-method performance section (bar + table)
@@ -573,6 +655,7 @@ def _methods_tab():
         _window_toggle("methods-window"),
         _session_toggle("methods-session"),
         dcc.Loading(html.Div(id="methods-body")),
+        _safe(_ic_section),
         _h3("LLM models used (synthesis & sentiment)",
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
         models_table,
@@ -583,6 +666,40 @@ def _methods_tab():
               Input("methods-window", "value"), Input("methods-session", "value"))
 def _methods_body(window_value, session_value):
     return _safe(lambda: _methods_perf_section(_window_days(window_value), _session_value(session_value)))
+
+
+def _calibration_block(window_days, session):
+    """Confidence-calibration buckets + slope (item #2) — the formal summary of
+    the return-vs-confidence scatter above it."""
+    cal = data.confidence_calibration(window_days, session)
+    rows = [{"bucket": b["label"], "trades": b["trades"], "win": b["win_rate"],
+             "avg": b["avg_return"], "median": b["median_return"], "wtd": b["wtd_avg_return"],
+             "best": b["best"], "worst": b["worst"]} for b in (cal.get("buckets") or [])]
+    cols = [
+        {"name": "Confidence bucket", "id": "bucket"},
+        {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT},
+        {"name": "Win rate %", "id": "win", "type": "numeric", "format": _NUM2},
+        {"name": "Avg return %", "id": "avg", "type": "numeric", "format": _NUM2},
+        {"name": "Median %", "id": "median", "type": "numeric", "format": _NUM2},
+        {"name": "Wtd avg %", "id": "wtd", "type": "numeric", "format": _NUM2},
+        {"name": "Best %", "id": "best", "type": "numeric", "format": _NUM2},
+        {"name": "Worst %", "id": "worst", "type": "numeric", "format": _NUM2},
+    ]
+    table = (dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW) if rows
+             else html.Div("No trades with a stored confidence in this window yet.",
+                           style={"color": "#6b7280"}))
+    return html.Div([
+        _h3("Confidence calibration — buckets + slope",
+            "Trades bucketed by entry confidence (each bucket is also a position-size "
+            "tier). If higher-confidence buckets earn more — and the slope is positive "
+            "— confidence is carrying return-predictive information worth sizing on; a "
+            "flat/negative slope means the size tiers are sizing on noise. Closed trades "
+            "at realised return, open at live mark. Respects the window + session toggles."),
+        html.Div(cal.get("verdict", ""),
+                 style={"color": "#374151", "marginBottom": 8, "fontSize": 13}),
+        dcc.Graph(figure=figures.calibration_bar_fig(cal)),
+        table,
+    ])
 
 
 def _methods_perf_section(window_days, session=None):
@@ -678,6 +795,7 @@ def _methods_perf_section(window_days, session=None):
             "the sizing is justified; a flat or downward line means confidence isn't carrying directional information. Respects the "
             "window + session toggles above."),
         dcc.Graph(figure=figures.confidence_return_fig(perf)),
+        _calibration_block(window_days, session),
         _h3("Macro evaluation — decision layers (LLM synthesis vs aggregator vs bundles)",
             "Head-to-head performance of the aggregated decision layers, all scored on the SAME unbiased basis: "
             "every directional call each layer made — not just the few that became trades — entered at the call-time "
@@ -922,6 +1040,57 @@ def _broker_returns_section(window_value, session_value=None):
     ])
 
 
+def _exit_quality_block(window_value, session_value):
+    """MFE/MAE exit-quality (item #5). Sim-ledger only — the excursion fields are
+    maintained on the simulated trade, not the broker view."""
+    rep = data.exit_quality(_window_days(window_value), _session_value(session_value))
+    heading = _h3("Exit quality — MFE / MAE",
+                  "Where the exit landed inside each trade's own MFE→MAE range. Exit "
+                  "placement 1.0 = sold at the peak; 0.0 = cut at the worst point. Capture "
+                  "= fraction of the favorable peak kept. Low placement ⇒ exits skew late "
+                  "(cutting near the bottom); low capture with healthy MFE ⇒ winners ridden "
+                  "back to flat (no profit-taking). Closed trades only; trades with a "
+                  "degenerate (entered≈closed) excursion band are excluded.")
+    if not rep.get("n"):
+        return html.Div([heading, html.Div(rep.get("verdict", ""), style={"color": "#6b7280"})])
+    cap = rep.get("avg_capture")
+    cards = html.Div(
+        [
+            _kpi("Avg exit placement", _pct((rep["avg_placement"] or 0) * 100),
+                 tooltip="Mean position in the MFE→MAE range (100% = exited at the peak, 0% = at the worst point)."),
+            _kpi("Avg capture", _pct(cap * 100) if cap is not None else "–",
+                 tooltip="Mean fraction of the favorable peak (MFE) kept at exit."),
+            _kpi("Exited near MAE", _pct(rep["pct_exited_near_mae"]),
+                 tooltip="Share of trades exited in the bottom 20% of their range — cutting near the worst point."),
+            _kpi("Gave back >½ peak", _pct(rep.get("pct_gave_back_most_mfe")),
+                 tooltip="Share of trades that kept less than half their favorable peak."),
+            _kpi("Trades", str(rep["n"]),
+                 tooltip="Analysable closed trades (non-degenerate MFE/MAE band)."),
+        ],
+        style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+    )
+    rows = [{"ticker": r["ticker"], "ret": r["return_pct"], "mfe": r["mfe"], "mae": r["mae"],
+             "place": r["exit_placement"], "capture": r["capture"], "giveback": r["give_back"],
+             "reason": r["exit_reason"]} for r in rep["per_trade"]]
+    cols = [
+        {"name": "Ticker", "id": "ticker"},
+        {"name": "Return %", "id": "ret", "type": "numeric", "format": _NUM2},
+        {"name": "MFE %", "id": "mfe", "type": "numeric", "format": _NUM2},
+        {"name": "MAE %", "id": "mae", "type": "numeric", "format": _NUM2},
+        {"name": "Placement", "id": "place", "type": "numeric", "format": _NUM2},
+        {"name": "Capture", "id": "capture", "type": "numeric", "format": _NUM2},
+        {"name": "Give-back %", "id": "giveback", "type": "numeric", "format": _NUM2},
+        {"name": "Exit reason", "id": "reason"},
+    ]
+    return html.Div([
+        heading,
+        html.Div(rep.get("verdict", ""), style={"color": "#374151", "marginBottom": 8, "fontSize": 13}),
+        cards,
+        dcc.Graph(figure=figures.mfe_capture_fig(rep)),
+        dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW),
+    ])
+
+
 def _returns_section(window_value, session_value=None):
     perf = data.performance(window_days=_window_days(window_value), session=_session_value(session_value))
     stats = perf.get("stats") or {}
@@ -968,7 +1137,148 @@ def _returns_section(window_value, session_value=None):
         _trades_table(perf.get("open_trades") or [], table_id="returns-open-table"),
         _h3("Closed trades", "Realised round-trips, with their final spread-adjusted return. Filtered to the selected entry window. Click a row to chart that ticker's confidence-over-time below."),
         _trades_table(perf.get("closed_trades") or [], table_id="returns-closed-table"),
+        _exit_quality_block(window_value, session_value),
         dcc.Loading(html.Div(id="returns-review-plot", style={"marginTop": 16})),
+    ])
+
+
+# ── Tab 4: Execution (price provenance · broker forensics · tracking error) ──
+
+def _execution_tab():
+    return html.Div([
+        _safe(_provenance_section),
+        _safe(_broker_forensics_section),
+        _safe(_tracking_error_section),
+    ])
+
+
+def _provenance_section():
+    """Price-provenance detail (item #8): trades in the latest run whose entry
+    price diverged from the run snapshot beyond the session band."""
+    pp = (data.latest_gate_diag() or {}).get("price_provenance")
+    heading = _h3("Price provenance — entry vs snapshot",
+                  "Standing guard against the stale-price class: each new trade's recorded "
+                  "entry price is compared to the run's analysis snapshot for that ticker. A "
+                  "divergence beyond the session band (RTH tight, off-hours wider) is flagged — "
+                  "the automatic version of the one-off CRDO fill-vs-snapshot audit. Latest run.")
+    if not pp:
+        return html.Div([heading, html.Div(
+            "No price-provenance record in the latest run (no trades opened, no snapshot, "
+            "or the check is disabled).", style={"color": "#6b7280"})])
+    flagged = pp.get("flagged") or []
+    if not flagged:
+        body = html.Div(
+            f"✓ All {pp.get('n_checked', 0)} new trade(s) in the latest run entered within "
+            "the snapshot band.", style={"color": figures.POS, "fontWeight": "bold"})
+    else:
+        rows = [{"ticker": f["ticker"], "entry": f["entry_price"], "snap": f["snapshot_price"],
+                 "bps": f["bps"], "session": f["session"], "band": f["band"]} for f in flagged]
+        cols = [
+            {"name": "Ticker", "id": "ticker"},
+            {"name": "Entry $", "id": "entry", "type": "numeric", "format": _NUM2},
+            {"name": "Snapshot $", "id": "snap", "type": "numeric", "format": _NUM2},
+            {"name": "Divergence bp", "id": "bps", "type": "numeric", "format": _NUM2},
+            {"name": "Session", "id": "session"},
+            {"name": "Band bp", "id": "band", "type": "numeric", "format": _NUM2},
+        ]
+        body = html.Div([
+            html.Div("🔔 " + (pp.get("message") or ""),
+                     style={"color": "#92400e", "marginBottom": 8}),
+            dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW),
+        ])
+    return html.Div([heading, body])
+
+
+def _broker_forensics_section():
+    """Slippage / fill-rate / drift / reject forensics (item #3)."""
+    rep = data.broker_forensics()
+    heading = _h3("Broker execution forensics",
+                  "Over all persisted broker orders: fill rate vs kill rate (the settle-or-kill "
+                  "design), fill slippage by session (is the LMT cap achievable?), how often broker "
+                  "positions drift from the ledger, and what the broker rejects. broker_mode must be "
+                  "on for rows to accrue.")
+    if not rep.get("n_orders"):
+        return html.Div([heading, html.Div(
+            "No broker orders recorded yet (broker_mode off / dry-run, or nothing submitted).",
+            style={"color": "#6b7280"})])
+    fo, d = rep["fill_outcomes"], rep["drift"]
+    cards = html.Div(
+        [
+            _kpi("Fill rate", _pct(fo.get("fill_rate")),
+                 tooltip="Filled orders ÷ terminal orders (still-working and no-op rows excluded)."),
+            _kpi("Order events", str(rep["n_orders"]),
+                 tooltip="Total persisted broker order / fill-repair events."),
+            _kpi("Drift runs", f"{d.get('runs_with_drift', 0)}/{d.get('n_runs', 0)}",
+                 tooltip="Reconcile runs where a broker position diverged from the ledger."),
+        ],
+        style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+    )
+    outcome_rows = [{"outcome": k, "count": v}
+                    for k, v in sorted(fo.get("counts", {}).items(), key=lambda kv: -kv[1])]
+    outcomes_table = dash_table.DataTable(
+        data=outcome_rows,
+        columns=[{"name": "Fill outcome", "id": "outcome"},
+                 {"name": "Count", "id": "count", "type": "numeric", "format": _INT}],
+        **_TABLE_KW) if outcome_rows else html.Div()
+    reject_df = rep["reject_reasons"]
+    reject_rows = reject_df.to_dict("records") if reject_df is not None and not reject_df.empty else []
+    reject_table = (dash_table.DataTable(
+        data=reject_rows,
+        columns=[{"name": "Reject reason", "id": "reason"},
+                 {"name": "Count", "id": "n", "type": "numeric", "format": _INT}],
+        **_TABLE_KW) if reject_rows
+        else html.Div("No rejected / failed orders.", style={"color": "#6b7280", "marginTop": 8}))
+    return html.Div([
+        heading, cards,
+        dcc.Graph(figure=figures.slippage_by_session_fig(rep["slippage_by_session"])),
+        _h3("Fill outcomes", "Count of order events by terminal outcome (filled / killed / failed / working / skipped)."),
+        outcomes_table,
+        _h3("Reject reasons", "Failed / rejected orders grouped by the broker error message."),
+        reject_table,
+    ])
+
+
+def _tracking_error_section():
+    """Sim-vs-broker tracking error (item #4)."""
+    rep = data.tracking_error()
+    heading = _h3("Sim-vs-broker tracking error",
+                  "The gap between the modeled ledger and actual IBKR fills, per matched trade. A "
+                  "line hugging zero = the model tracks reality; a persistent one-sided drift = a "
+                  "cost-model / pricing bug (the auto-catch for the stale-price class). Needs filled "
+                  "broker orders.")
+    if not rep.get("n_matched"):
+        return html.Div([heading, html.Div(rep.get("verdict", ""), style={"color": "#6b7280"})])
+    o = rep["overall"]
+    cards = html.Div(
+        [
+            _kpi("Matched trades", str(rep["n_matched"]),
+                 tooltip="Sim trades whose broker entry actually filled."),
+            _kpi("Mean Δreturn", _pct(o["mean_d_return"], signed=True),
+                 tooltip="Mean (sim − broker) return; + = the sim is optimistic vs real fills."),
+            _kpi("Mean entry gap",
+                 f"{o['mean_entry_bps']:+.0f} bp" if o.get("mean_entry_bps") is not None else "–",
+                 tooltip="Mean signed entry-price gap (broker − sim) in basis points."),
+        ],
+        style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+    )
+    rows = [{"ticker": r["ticker"], "date": r["entry_date"], "session": r["session"],
+             "sim": r["sim_return"], "broker": r["broker_return"], "dret": r["d_return"],
+             "bps": r["entry_bps"]} for r in rep["per_trade"]]
+    cols = [
+        {"name": "Ticker", "id": "ticker"},
+        {"name": "Entry date", "id": "date"},
+        {"name": "Session", "id": "session"},
+        {"name": "Sim %", "id": "sim", "type": "numeric", "format": _NUM2},
+        {"name": "Broker %", "id": "broker", "type": "numeric", "format": _NUM2},
+        {"name": "Δreturn %", "id": "dret", "type": "numeric", "format": _NUM2},
+        {"name": "Entry gap bp", "id": "bps", "type": "numeric", "format": _NUM2},
+    ]
+    return html.Div([
+        heading,
+        html.Div(rep.get("verdict", ""), style={"color": "#374151", "marginBottom": 8, "fontSize": 13}),
+        cards,
+        dcc.Graph(figure=figures.tracking_error_fig(rep)),
+        dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW),
     ])
 
 
