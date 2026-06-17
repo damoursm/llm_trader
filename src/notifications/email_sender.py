@@ -5459,18 +5459,20 @@ def send_recommendations(
     )
 
     # ── Charts ─────────────────────────────────────────────────────────────
-    # The overview chart is always generated — it's a single cheap chart that
-    # shows method-breakdown stacked bars for every recommendation.
-    # Per-ticker stock charts and the equity curve are only built when ENABLE_CHARTS=true.
+    # All PNG charts (overview + per-ticker + equity curve) require kaleido's
+    # headless-Chromium export and are gated on ENABLE_CHARTS. The overview used
+    # to be exempt ("always generated"), but kaleido 0.2.1 hangs on Windows — each
+    # export burned a 60s timeout and may have been crashing the process — so with
+    # ENABLE_CHARTS=false we now skip kaleido entirely. The email still carries the
+    # inline-SVG equity curve (perf.trades_svg), which needs no kaleido.
     charts: dict = {}
     equity_png: Optional[str] = None
+    overview_png = None
     try:
         from src.charts.builder import PLOTLY_AVAILABLE
-        if PLOTLY_AVAILABLE:
+        if settings.enable_charts and PLOTLY_AVAILABLE:
             overview_fig = build_signals_overview(all_recs, signals_by_ticker)
             overview_png = fig_to_png_b64(overview_fig, width=1100, height=None)
-        else:
-            overview_png = None
     except Exception as e:
         logger.debug(f"[email] Overview chart skipped: {e}")
         overview_png = None

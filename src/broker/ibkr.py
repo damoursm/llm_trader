@@ -170,6 +170,15 @@ class IBKRBroker(Broker):
                 order = LimitOrder(req.side, req.quantity, req.limit_price)
             else:
                 order = MarketOrder(req.side, req.quantity)
+            # Set the TIF explicitly. ib_async leaves Order.tif = '' (empty), which
+            # makes IBKR's account order-preset fill it in as DAY and emit the noisy,
+            # drift-prone warning 10349 ("Order TIF was set to DAY based on order
+            # preset") — during which the order momentarily reports Cancelled in the
+            # event feed before it actually fills (observed on MGNI 2026-06-17, filled
+            # fine but logged a scary cancel). Sending DAY ourselves leaves nothing for
+            # the preset to coerce. DAY is correct here — the settle pass cancels any
+            # still-unfilled order each tick, so orders never need to live past the day.
+            order.tif = "DAY"
             if req.outside_rth:
                 # Extended-session eligibility. IBKR accepts this only on
                 # limit orders; the reconciler forces LMT off-hours, so a MKT

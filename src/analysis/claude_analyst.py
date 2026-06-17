@@ -3,6 +3,7 @@
 import anthropic
 import json
 import random
+import re
 from loguru import logger
 from typing import List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
@@ -58,6 +59,29 @@ def _get_deepseek_analyst_client():
     return _deepseek_analyst_client
 
 
+def _anthropic_sampling_kwargs(model: str) -> dict:
+    """``{"temperature": 0}`` for Anthropic models that still accept sampling
+    params, ``{}`` for those that removed them.
+
+    Opus 4.7+ and the Fable/Mythos 5 families REMOVED ``temperature``/``top_p``/
+    ``top_k`` — sending ``temperature`` now returns HTTP 400 ("temperature is
+    deprecated for this model"), which silently kicked synthesis over to the
+    DeepSeek fallback (observed 2026-06-17 after ANALYST_MODEL was pointed at a
+    newer Opus). Haiku 4.5, Sonnet 4.6, Opus 4.6 and older still accept it, where
+    we keep temperature=0 for near-deterministic synthesis. On the no-sampling
+    models determinism is governed by adaptive thinking / effort instead, so there
+    is simply nothing to set here. Per the Anthropic model reference (2026-06).
+    Any future sampling-removed model not matched here still degrades safely —
+    the 400 is caught by the engine fallback."""
+    m = (model or "").lower()
+    if "fable" in m or "mythos" in m:
+        return {}
+    mt = re.search(r"opus-(\d+)-(\d+)", m)
+    if mt and (int(mt.group(1)), int(mt.group(2))) >= (4, 7):
+        return {}
+    return {"temperature": 0}
+
+
 def _call_claude_analyst(prompt: str) -> str:
     """Call the configured Claude analyst model (streaming). Returns raw response text.
 
@@ -75,14 +99,15 @@ def _call_claude_analyst(prompt: str) -> str:
     else:
         _max_tokens = 64000   # Sonnet 4.6
     # Determinism: temperature=0 so identical prompts produce near-identical
-    # synthesis. Anthropic SDK does not expose a seed parameter; this is
-    # the strongest determinism Anthropic supports today.
+    # synthesis (Anthropic exposes no seed). Sent ONLY for models that still
+    # accept sampling params — Opus 4.7+/Fable/Mythos 5 reject it (400), so
+    # _anthropic_sampling_kwargs omits it there (determinism via thinking/effort).
     raw_parts: list[str] = []
     with client.messages.stream(
         model=settings.analyst_model,
         max_tokens=_max_tokens,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0,
+        **_anthropic_sampling_kwargs(settings.analyst_model),
     ) as stream:
         for text in stream.text_stream:
             raw_parts.append(text)

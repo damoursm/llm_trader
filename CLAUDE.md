@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python main.py                # Run once, console output only
 python main.py --email        # Run once and send email report
 python main.py --schedule     # Start the poll-loop runner (RTH every 30 min 9:30–16:00 ET + extended trading ticks 4:00–19:50; NYSE market days; emails per scheduler_email_every_tick — every slot when on, else only the 16:00 close)
-python main.py --dashboard    # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
+python main.py --supervise    # PRODUCTION: run --schedule under an external auto-restart supervisor (src/scheduler/supervisor.py) that relaunches the scheduler if the process dies (it died silently — no traceback — under the kaleido email crash). To STOP a supervised scheduler, kill the `--supervise` parent FIRST (so it can't respawn), then the `--schedule` child.
+python main.py --dashboard    # Launch the read-only monitoring dashboard (Plotly Dash via waitress; in-process auto-restart)
 ```
 
 Logs go to `logs/llm_trader_YYYY-MM-DD.log` (7-day rotation). The HTML report (when `ENABLE_CHARTS=true`) is saved to `logs/report_YYYY-MM-DD_HHMM.html`.
