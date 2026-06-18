@@ -60,6 +60,22 @@ class Settings(BaseSettings):
     # News sources
     newsapi_key: str = ""
     alpha_vantage_key: str = ""
+    # Finnhub — real-time company news (free tier). Empty key → the source is
+    # skipped. Free company-news has no per-article sentiment, so it adds news
+    # COVERAGE; the provider-sentiment LLM-skip is driven by Polygon insights.
+    finnhub_api_key: str = ""
+    enable_finnhub_news: bool = False
+    # Polygon news + per-article sentiment "insights" (verified on the free key:
+    # each article carries {ticker, sentiment, reasoning}). Feeds the provider-
+    # sentiment hybrid below so the LLM scorer can be skipped for these articles.
+    enable_polygon_news: bool = False
+    # Provider-sentiment hybrid: when an article carries a provider sentiment
+    # (Polygon insights), derive the per-ticker news score from those instead of
+    # calling the DeepSeek/Haiku scorer — a latency + cost win. Falls back to the
+    # LLM when too few provider-scored articles exist. OFF by default for A/B.
+    enable_provider_sentiment: bool = False
+    provider_sentiment_min_articles: int = 2   # min provider-scored relevant articles to skip the LLM
+    provider_sentiment_magnitude: float = 0.6  # |score| a positive/negative label maps to ([-1,1] scale)
     # Financial Modeling Prep — market-wide analyst upgrades/downgrades feed (Section E catalyst
     # discovery). Free key: https://site.financialmodelingprep.com/developer/docs . Empty → the
     # market-wide analyst discovery source is skipped (yfinance analyst data is per-ticker only).
@@ -840,6 +856,12 @@ class Settings(BaseSettings):
     ibkr_client_id: int = 11           # any stable int unique to this API connection
     ibkr_account: str = ""             # optional: pin a specific IBKR account id (else the sole/first)
     ibkr_connect_timeout: int = 15     # seconds to wait for the Gateway socket
+    # Prefer IBKR's real-time last/mark price (free Cboe One + IEX feed via the
+    # broker connection) over yfinance in tracker._fetch_price — the same data
+    # that fills the orders, so the mark matches the execution venue. Requires an
+    # IBKR broker_mode (ibkr_paper/ibkr_live); falls back to yfinance/Polygon when
+    # off, disconnected, or the quote is missing. OFF by default for A/B.
+    enable_ibkr_price_feed: bool = False
     # Position sizing. Two modes (broker_sizing_mode), each × the 1.0/1.5/2.0×
     # confidence tier already on every trade:
     #   "notional"   — fixed base order size: broker_base_notional in broker_base_notional_ccy.

@@ -189,6 +189,53 @@ def _source_diversity_scale(articles: List[NewsArticle]) -> float:
     return 0.70
 
 
+# Provider sentiment LABEL → unit score (scaled by provider_sentiment_magnitude).
+_PROVIDER_LABEL_UNIT = {
+    "positive": 1.0, "bullish": 1.0, "buy": 1.0,
+    "negative": -1.0, "bearish": -1.0, "sell": -1.0,
+    "neutral": 0.0, "hold": 0.0,
+}
+
+
+def _provider_sentiment_score(ticker: str,
+                              fresh_articles: List[NewsArticle]) -> Optional[tuple[float, str]]:
+    """Per-ticker news score derived from PRE-COMPUTED provider sentiment
+    (e.g. Polygon insights), skipping the LLM. Returns ``(score, rationale)`` or
+    ``None`` to defer to the LLM (flag off, or too few provider-scored articles).
+
+    Mirrors the LLM path's precision adjustments (recency-weighted blend, then
+    article-count × source-diversity scaling) so the two are comparable."""
+    if not settings.enable_provider_sentiment:
+        return None
+    tkr = ticker.upper()
+    mag = float(settings.provider_sentiment_magnitude)
+    scored = []
+    for a in fresh_articles:
+        label = (a.provider_insights or {}).get(tkr) or (a.provider_insights or {}).get(ticker)
+        if not label:
+            continue
+        unit = _PROVIDER_LABEL_UNIT.get(str(label).strip().lower())
+        if unit is None:
+            continue
+        scored.append((a, unit * mag))
+    if len(scored) < int(settings.provider_sentiment_min_articles):
+        return None
+
+    wsum = sum(_recency_weight(a) for a, _ in scored)
+    if wsum <= 0:
+        return None
+    raw = sum(_recency_weight(a) * s for a, s in scored) / wsum
+    arts = [a for a, _ in scored]
+    precision = _article_count_scale(len(arts)) * _source_diversity_scale(arts)
+    score = round(raw * precision, 3)
+    src = next((a.provider_sentiment_source for a in arts if a.provider_sentiment_source), "provider")
+    pos = sum(1 for _, s in scored if s > 0)
+    neg = sum(1 for _, s in scored if s < 0)
+    rationale = (f"Provider sentiment ({src}): {len(arts)} pre-scored article(s) "
+                 f"({pos} positive / {neg} negative) → {score:+.2f}; LLM scorer skipped.")
+    return score, rationale
+
+
 def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                       force_engine: Optional[str] = None) -> tuple[float, str]:
     """
@@ -213,6 +260,17 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
     fresh_articles = [a for a in articles if _recency_weight(a) > 0.0]
     if not fresh_articles:
         return 0.0, "All available articles are older than 7 days — no actionable signal."
+
+    # Provider-sentiment hybrid (latency win): when enough fresh articles already
+    # carry a provider sentiment (e.g. Polygon insights), score from those and
+    # skip the LLM call entirely. Bypassed for force_engine (the opener-pinned
+    # hold-review must re-judge with its OWN LLM engine for apples-to-apples).
+    if force_engine is None:
+        provider = _provider_sentiment_score(ticker, fresh_articles)
+        if provider is not None:
+            _record_sentiment_provider("provider")
+            logger.info(f"{ticker} provider_sentiment={provider[0]:+.2f} (LLM scorer skipped)")
+            return provider
 
     # Sort by recency weight descending; send top 20 to LLM
     weighted = sorted(fresh_articles, key=_recency_weight, reverse=True)

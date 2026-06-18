@@ -29,11 +29,12 @@ TRADES_FILE = Path("cache/trades.json")
 # Live-price-fetch health for the current run — surfaced to the dashboard + email
 # as a "Live price feed" data source so a broken feed is visible. yfinance is
 # tried first, Polygon second; a ticker that fails both lands in ``failed``.
-_PRICE_HEALTH: dict = {"yfinance": 0, "polygon": 0, "failed": []}
+_PRICE_HEALTH: dict = {"ibkr": 0, "yfinance": 0, "polygon": 0, "failed": []}
 
 
 def reset_price_health() -> None:
     """Clear the live-price health counters (call once at the start of a run)."""
+    _PRICE_HEALTH["ibkr"] = 0
     _PRICE_HEALTH["yfinance"] = 0
     _PRICE_HEALTH["polygon"] = 0
     _PRICE_HEALTH["failed"] = []
@@ -42,6 +43,7 @@ def reset_price_health() -> None:
 def get_price_health() -> dict:
     """Snapshot of this run's live-price fetch outcomes."""
     return {
+        "ibkr": _PRICE_HEALTH["ibkr"],
         "yfinance": _PRICE_HEALTH["yfinance"],
         "polygon": _PRICE_HEALTH["polygon"],
         "failed": list(_PRICE_HEALTH["failed"]),
@@ -150,6 +152,28 @@ def _fetch_price(ticker: str) -> Optional[float]:
     if not settings.enable_fetch_data:
         return None
 
+    def _ibkr() -> Optional[float]:
+        # Preferred when enabled: IBKR's real-time feed — the SAME data that
+        # fills the orders — over the existing broker connection (reused; no
+        # reconnect per call). Requires an IBKR broker_mode; silently yields to
+        # the other sources when off, disconnected, or no quote is returned.
+        if not settings.enable_ibkr_price_feed:
+            return None
+        try:
+            from src.broker import get_broker
+            broker = get_broker()
+            if broker is None:
+                return None
+            if not broker.is_connected():
+                broker.connect()
+            px = broker.get_market_price(ticker)
+            if px and float(px) > 0:
+                _PRICE_HEALTH["ibkr"] = _PRICE_HEALTH.get("ibkr", 0) + 1
+                return float(px)
+        except Exception as e:
+            logger.debug(f"[tracker] IBKR price failed for {ticker}: {e}")
+        return None
+
     def _yf_fast() -> Optional[float]:
         try:
             px = float(yf.Ticker(ticker).fast_info.last_price)
@@ -184,10 +208,12 @@ def _fetch_price(ticker: str) -> Optional[float]:
         return None
 
     from src.performance.market_calendar import current_session
+    # IBKR real-time first (when enabled) in BOTH sessions — its feed includes
+    # extended prints and matches the fill venue; then the existing chain.
     if current_session() != "rth":
-        px = _yf_prepost() or _polygon() or _yf_fast()   # extended-aware first
+        px = _ibkr() or _yf_prepost() or _polygon() or _yf_fast()
     else:
-        px = _yf_fast() or _polygon()                    # RTH: live yfinance first
+        px = _ibkr() or _yf_fast() or _polygon()
 
     if px is not None and px > 0:
         return px

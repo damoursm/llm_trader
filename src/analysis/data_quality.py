@@ -55,7 +55,7 @@ KNOWN_DEAD_SOURCES = frozenset({"tick", "insider"})
 EXPECTED_SPARSE_SOURCES = frozenset({
     "8k", "sec", "analyst", "eps", "pead", "short",
     "trends", "reddit", "whisper", "revision", "options", "gex",
-    "earnings_cal", "macro_news",
+    "earnings_cal", "macro_news", "polygon_news", "finnhub_news",
 })
 
 

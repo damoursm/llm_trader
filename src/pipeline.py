@@ -52,6 +52,7 @@ from src.data.sector_rotation import fetch_sector_rotation_context
 from src.data.rotation_drivers import fetch_rotation_drivers_context
 from src.data.intermarket import fetch_intermarket_context
 from src.data.macro_news import fetch_macro_news_context
+from src.data.provider_news import fetch_polygon_news, fetch_finnhub_news
 from src.data.macro_regime import compute_macro_regime
 from src.data.market_mode import compute_market_mode
 from src.data.business_cycle_rotation import compute_business_cycle_context
@@ -102,13 +103,13 @@ def _collect_sources() -> list:
     sources = _snapshot_source_log()
     try:
         ph = get_price_health()
-        attempts = ph.get("yfinance", 0) + ph.get("polygon", 0)
+        attempts = ph.get("ibkr", 0) + ph.get("yfinance", 0) + ph.get("polygon", 0)
         failed = ph.get("failed") or []
         if attempts or failed:
             n = len(failed)
             shown = ", ".join(failed[:8]) + ("…" if n > 8 else "")
             sources.append({
-                "label": "Live price feed (yfinance→Polygon)",
+                "label": "Live price feed (IBKR→yfinance→Polygon)",
                 "enabled": True,
                 "ok": n == 0,
                 "error": f"{n} ticker(s) had no price: {shown}" if n else None,
@@ -840,6 +841,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f_news         = pool.submit(_safe, "news", _fetch_news, tickers, sectors)
         f_snapshots    = pool.submit(_safe, "snapshots", _fetch_snapshots, all_tickers)
 
+        # Provider news feeds (flag-gated). Polygon carries per-article sentiment
+        # insights (feeds the provider-sentiment hybrid → LLM-skip); Finnhub adds
+        # real-time news coverage (no sentiment on the free tier).
+        f_polygon_news = (pool.submit(_safe, "polygon_news", fetch_polygon_news, all_tickers)
+                          if settings.enable_polygon_news else None)
+        f_finnhub_news = (pool.submit(_safe, "finnhub_news", fetch_finnhub_news, tickers)
+                          if (settings.enable_finnhub_news and settings.finnhub_api_key) else None)
+
         f_trends       = (pool.submit(_safe, "trends", fetch_google_trends, tickers)
                           if settings.enable_google_trends else None)
 
@@ -946,12 +955,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # Merge all article sources into a single list
     articles = get(f_news) or []
     _article_chunks = {
-        "8k":      edgar.get("8k"),
-        "trends":  get(f_trends),
-        "reddit":  get(f_reddit),
-        "analyst": get(f_analyst),
-        "eps":     get(f_eps),
-        "short":   get(f_short),
+        "8k":           edgar.get("8k"),
+        "trends":       get(f_trends),
+        "reddit":       get(f_reddit),
+        "analyst":      get(f_analyst),
+        "eps":          get(f_eps),
+        "short":        get(f_short),
+        "polygon_news": get(f_polygon_news),
+        "finnhub_news": get(f_finnhub_news),
     }
     for label, chunk in _article_chunks.items():
         if chunk:

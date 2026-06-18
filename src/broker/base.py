@@ -146,5 +146,14 @@ class Broker(ABC):
         pass picks that up). Default: unsupported."""
         return False
 
+    def get_market_price(self, ticker: str) -> Optional[float]:
+        """Latest real-time last/mark price for *ticker*, or None if unavailable.
+
+        Default: unsupported (None). IBKRBroker overrides this so the tracker's
+        live-price path can prefer the broker's real-time feed — the same source
+        that fills the orders — over yfinance. Read-only; never places an order.
+        """
+        return None
+
     def disconnect(self) -> None:  # optional; default no-op
         return None

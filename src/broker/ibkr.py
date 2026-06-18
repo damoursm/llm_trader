@@ -307,6 +307,33 @@ class IBKRBroker(Broker):
             logger.warning(f"[broker:ibkr] get_open_orders failed: {e}")
         return out
 
+    # ── real-time price (read-only; preferred live source for the tracker) ──
+    def get_market_price(self, ticker: str) -> Optional[float]:
+        """Real-time last/mark price via a blocking ``reqTickers`` snapshot.
+
+        Uses IBKR's free Cboe One + IEX real-time feed (the same data that fills
+        the orders), so the tracker's mark/decision price matches the execution
+        venue. Returns None if not connected or no usable quote arrives — the
+        caller then falls back to yfinance/Polygon. Prefers last trade, then the
+        bid/ask midpoint (``marketPrice``), then the prior close; all NaN-filtered.
+        """
+        if not self.is_connected():
+            return None
+        try:
+            contract = self._qualify(ticker)
+            tickers = self._ib.reqTickers(contract)
+            if not tickers:
+                return None
+            t = tickers[0]
+            candidates = [getattr(t, "last", None), t.marketPrice(), getattr(t, "close", None)]
+            for px in candidates:
+                # px == px filters NaN (NaN != NaN); guard None and non-positive.
+                if px is not None and px == px and float(px) > 0:
+                    return float(px)
+        except Exception as e:
+            logger.debug(f"[broker:ibkr] get_market_price {ticker} failed: {e}")
+        return None
+
     def cancel_order(self, client_ref: str) -> bool:
         """Cancel the working order tagged *client_ref*; True only on a
         confirmed cancel. An order that fills during the cancel race returns

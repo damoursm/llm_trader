@@ -182,6 +182,23 @@ def get_last_price(ticker):
         return None
 
 
+def get_news(limit: int = 1000) -> List[dict]:
+    """Latest market-wide news with per-article sentiment ``insights``.
+
+    One call to ``/v2/reference/news`` (Benzinga-sourced + Polygon's LLM
+    sentiment layer) returns the most recent articles across all tickers, each
+    carrying ``insights: [{ticker, sentiment, sentiment_reasoning}]`` — verified
+    present on the free key. Returns the raw results list (empty on failure);
+    the caller filters to the universe and maps to NewsArticle.
+    """
+    if not is_available():
+        return []
+    j = _get("/v2/reference/news", {"order": "desc", "limit": int(limit)})
+    if not j or not j.get("results"):
+        return []
+    return j["results"]
+
+
 def get_bars(ticker: str, period: str = "3mo") -> pd.DataFrame:
     """
     Fetch daily OHLCV bars for *ticker* covering *period*.

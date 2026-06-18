@@ -16,6 +16,13 @@ class NewsArticle(BaseModel):
     # without fuzzy title/summary keyword matching. Empty for general-market
     # feeds (RSS / NewsAPI), which still fall back to keyword relevance.
     tickers: List[str] = Field(default_factory=list)
+    # Per-ticker sentiment LABEL pre-computed by a data provider — e.g. Polygon
+    # news "insights": {"AAPL": "positive", "MSFT": "neutral"}. When present for
+    # a ticker, the provider-sentiment hybrid (enable_provider_sentiment) derives
+    # the news score from these and SKIPS the LLM scorer for that ticker. Empty
+    # for feeds without provider sentiment (RSS, NewsAPI, Finnhub free).
+    provider_insights: Dict[str, str] = Field(default_factory=dict)
+    provider_sentiment_source: Optional[str] = None   # e.g. "polygon"
 
 
 class TickerSnapshot(BaseModel):
