@@ -39,6 +39,17 @@ class Settings(BaseSettings):
     #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash
     llm_ab_synthesis_models: str = ""
 
+    # Anthropic prompt caching (cache_control) on the SYNTHESIS prompt. The large
+    # persona + macro-context prefix is identical across the main call and the
+    # opener-pinned hold-review calls within a tick, so caching it (5-min ephemeral)
+    # makes the 2nd+ same-model call within a tick read the prefix at ~10% cost
+    # instead of full price. Output is unchanged (same prompt, just billed cheaper).
+    # A cache WRITE costs 1.25× the prefix tokens, a READ 0.1×, so this is a net win
+    # only when prefixes are reused — measure via the "[claude] prompt cache:" log
+    # and flip off if your model mix yields few reads. Sentiment is NOT cached (its
+    # prefix is below Haiku's 2048-token cache minimum). Default on.
+    enable_prompt_caching: bool = True
+
     # Held-positions prompt A/B — probability that a run includes the
     # <open_positions_context> block (the system's current holdings + a
     # zero-endowment-bias review instruction) in the synthesis prompt.

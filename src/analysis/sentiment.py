@@ -236,6 +236,56 @@ def _provider_sentiment_score(ticker: str,
     return score, rationale
 
 
+# FIXED, ticker-FREE instruction prefix — identical for every ticker, so it forms
+# a shared prefix that DeepSeek auto-caches across the ~40 per-ticker calls in a
+# run (and Anthropic would cache via cache_control IF it met the per-model minimum
+# — it does NOT: this prefix is ~600 tok, far below Haiku 4.5's 4096-tok minimum,
+# so cache_control is a silent no-op on Haiku; the real saving here is DeepSeek's
+# automatic prefix caching). The per-ticker name + news digest go in the suffix.
+_SENTIMENT_PREFIX = """You are an elite buy-side analyst with 25 years of experience at top-tier hedge funds. You have an exceptional ability to identify the exact news catalysts that move stock prices — your track record places you in the top 0.1% of market professionals worldwide.
+
+Your task: analyse the recent news for THE TARGET TICKER (specified at the end) and score the SHORT-TERM directional impact (1–5 trading days) with surgical precision.
+
+PRECISION MANDATE — false positives are more costly than false negatives:
+- Score 0.0 unless you identify a SPECIFIC, IDENTIFIABLE catalyst with a clear price mechanism. Vague positive/negative sentiment does NOT count.
+- Reserve scores above ±0.7 for high-impact, unambiguous catalysts: earnings beats/misses with guidance change, FDA approvals/rejections, M&A announcements, major regulatory actions, CEO departure, bankruptcy risk.
+- Scores ±0.3–0.6: clear but moderate catalyst — analyst upgrade/downgrade with PT, supply chain disruption, contract win/loss.
+- Scores ±0.1–0.2: minor directional catalyst — relevant but unlikely to move price significantly.
+- Score 0.0 if: news is noise, recycled information, or there is no clear directional catalyst.
+- Score ONLY news materially about the target ticker itself — ignore passing mentions, sector round-ups, or macro pieces that merely list it; those are not ticker-specific catalysts.
+- If catalysts conflict, NET them by magnitude and recency — do not mechanically average to 0; the dominant, most recent, highest-impact catalyst drives the sign.
+- Recency matters: articles marked "1h ago" or "6h ago" carry much more weight than "3d ago" or "5d ago".
+- When in doubt, output 0.0. A missed opportunity is better than a wrong call.
+
+SOURCE WEIGHTING — the digest mixes hard catalysts with soft sentiment; weight them differently. Each article is tagged "[source | age]":
+- HARD sources move price directly and can justify scores up to ±1.0: SEC 8-K filings, earnings/EPS surprises, analyst rating & price-target changes, and primary financial news (M&A, FDA, guidance, legal/regulatory).
+- SOFT sources are attention/positioning, NOT catalysts, and cap at ±0.2 on their own: Reddit/WSB social sentiment, Google Trends search spikes, short-interest shifts. They are corroborating color, never a standalone thesis. A soft source ALIGNED with a hard catalyst modestly amplifies conviction; if it CONTRADICTS the hard catalyst, discount it.
+
+Respond with a JSON object with exactly these fields:
+- "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral
+- "rationale": one to three sentences explaining (1) the specific catalyst and (2) the exact price mechanism. If score is 0.0, state why no actionable catalyst was identified.
+
+Examples:
+{"score": 0.6, "rationale": "Q3 earnings beat with raised FY guidance (hard catalyst) reprices forward estimates over the next few sessions."}
+{"score": 0.0, "rationale": "Only a Reddit mention spike and a generic sector round-up; no ticker-specific hard catalyst identified."}"""
+
+
+def _anthropic_user_content(prefix: str, suffix: str, model: str):
+    """Anthropic ``content`` for a sentiment call: a cache_control prefix block +
+    variable suffix when caching is on AND the prefix meets the model's minimum
+    (Haiku 4.5 = 4096 tok). The sentiment prefix is ~600 tok, so this currently
+    returns a single concatenated string (cache_control would silently no-op);
+    kept so it caches automatically if the prompt ever grows past the minimum."""
+    if settings.enable_prompt_caching:
+        min_tokens = 4096 if "haiku" in (model or "") else 1024
+        if len(prefix) >= min_tokens * 4:   # ~4 chars/token
+            return [
+                {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": suffix},
+            ]
+    return prefix + suffix
+
+
 def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                       force_engine: Optional[str] = None) -> tuple[float, str]:
     """
@@ -287,38 +337,12 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
         )
     digest = "\n\n".join(digest_lines)
 
-    prompt = f"""You are an elite buy-side analyst with 25 years of experience at top-tier hedge funds. You have an exceptional ability to identify the exact news catalysts that move stock prices — your track record places you in the top 0.1% of market professionals worldwide.
-
-Your task: analyse the following recent news for **{ticker}** and score the SHORT-TERM directional impact (1–5 trading days) with surgical precision.
-
-PRECISION MANDATE — false positives are more costly than false negatives:
-- Score 0.0 unless you identify a SPECIFIC, IDENTIFIABLE catalyst with a clear price mechanism. Vague positive/negative sentiment does NOT count.
-- Reserve scores above ±0.7 for high-impact, unambiguous catalysts: earnings beats/misses with guidance change, FDA approvals/rejections, M&A announcements, major regulatory actions, CEO departure, bankruptcy risk.
-- Scores ±0.3–0.6: clear but moderate catalyst — analyst upgrade/downgrade with PT, supply chain disruption, contract win/loss.
-- Scores ±0.1–0.2: minor directional catalyst — relevant but unlikely to move price significantly.
-- Score 0.0 if: news is noise, recycled information, or there is no clear directional catalyst.
-- Score ONLY news materially about {ticker} itself — ignore passing mentions, sector round-ups, or macro pieces that merely list the ticker; those are not {ticker}-specific catalysts.
-- If catalysts conflict, NET them by magnitude and recency — do not mechanically average to 0; the dominant, most recent, highest-impact catalyst drives the sign.
-- Recency matters: articles marked "1h ago" or "6h ago" carry much more weight than "3d ago" or "5d ago".
-- When in doubt, output 0.0. A missed opportunity is better than a wrong call.
-
-SOURCE WEIGHTING — the digest below mixes hard catalysts with soft sentiment; weight them differently. Each article is tagged "[source | age]":
-- HARD sources move price directly and can justify scores up to ±1.0: SEC 8-K filings, earnings/EPS surprises, analyst rating & price-target changes, and primary financial news (M&A, FDA, guidance, legal/regulatory).
-- SOFT sources are attention/positioning, NOT catalysts, and cap at ±0.2 on their own: Reddit/WSB social sentiment, Google Trends search spikes, short-interest shifts. They are corroborating color, never a standalone thesis. A soft source ALIGNED with a hard catalyst modestly amplifies conviction; if it CONTRADICTS the hard catalyst, discount it.
-
-<news>
-{digest}
-</news>
-
-Respond with a JSON object with exactly these fields:
-- "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral
-- "rationale": one to three sentences explaining (1) the specific catalyst and (2) the exact price mechanism. If score is 0.0, state why no actionable catalyst was identified.
-
-Examples:
-{{"score": 0.6, "rationale": "Q3 earnings beat with raised FY guidance (hard catalyst) reprices forward estimates over the next few sessions."}}
-{{"score": 0.0, "rationale": "Only a Reddit mention spike and a generic sector round-up; no {ticker}-specific hard catalyst identified."}}
-
-Respond with JSON only, no markdown."""
+    # Ticker-free fixed prefix (shared → DeepSeek auto-caches it across tickers) +
+    # per-ticker variable suffix. The prefix carries ALL instructions/examples; the
+    # suffix carries only the target ticker and the news digest.
+    suffix = (f"\n\nTARGET TICKER: {ticker}\n\n<news>\n{digest}\n</news>\n\n"
+              "Respond with JSON only, no markdown.")
+    prompt = _SENTIMENT_PREFIX + suffix
 
     raw_score = None
     rationale = "Analysis unavailable."
@@ -352,7 +376,8 @@ Respond with JSON only, no markdown."""
                 message = client.messages.create(
                     model=HAIKU_MODEL,
                     max_tokens=256,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[{"role": "user",
+                               "content": _anthropic_user_content(_SENTIMENT_PREFIX, suffix, HAIKU_MODEL)}],
                     temperature=0,
                 )
                 raw_score, rationale = _parse_response(message.content[0].text.strip())

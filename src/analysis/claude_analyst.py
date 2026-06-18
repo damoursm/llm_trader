@@ -122,6 +122,41 @@ def _synthesis_attempts_for(chosen_model: str, anthropic_fallback: str,
     return [("deepseek", chosen_model), ("anthropic", anthropic_fallback)]
 
 
+# Marks the boundary between the CACHEABLE prefix (persona + signal-method
+# descriptions + macro-context blocks — identical across the main synthesis and
+# every opener-pinned hold-review call within a tick) and the VARIABLE suffix
+# (the minute timestamp, open-positions block, per-ticker <signals>, and the task
+# instructions). Inserted in the synthesis prompt; split on (and discarded) here,
+# never sent to the model. The timestamp + open-positions MUST sit after it or the
+# prefix would differ per call and never cache.
+_CACHE_SENTINEL = " @@CACHE_BREAKPOINT@@ "
+
+
+def _cache_min_tokens(model: str) -> int:
+    """Anthropic minimum cacheable prefix: Haiku 4.5 = 4096 tokens, Opus/Sonnet =
+    1024. Below it, cache_control is a silent no-op (billed at full input price)."""
+    return 4096 if "haiku" in (model or "") else 1024
+
+
+def _analyst_content(prompt: str, model: str):
+    """Build the Anthropic ``content`` for the synthesis call. With caching on and
+    a prefix big enough to meet the model's minimum (1024 tok Opus/Sonnet, 4096
+    Haiku 4.5), returns two text blocks with ``cache_control`` on the prefix so the
+    2nd+ same-model call within the 5-min TTL reads it at ~10% cost. Otherwise a
+    single plain string (sentinel stripped) — byte-identical content either way."""
+    if _CACHE_SENTINEL in prompt and settings.enable_prompt_caching:
+        prefix, suffix = prompt.split(_CACHE_SENTINEL, 1)
+        # Below the minimum, cache_control is a SILENT no-op (billed full price),
+        # so gate on it: Haiku 4.5 = 4096 tok, Opus/Sonnet = 1024.
+        min_tokens = _cache_min_tokens(model)
+        if len(prefix) >= min_tokens * 4:   # ~4 chars/token — skip if too small to cache
+            return [
+                {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": suffix},
+            ]
+    return prompt.replace(_CACHE_SENTINEL, "")
+
+
 def _call_claude_analyst(prompt: str, model: Optional[str] = None) -> str:
     """Call a Claude analyst model (streaming). Returns raw response text.
 
@@ -154,12 +189,23 @@ def _call_claude_analyst(prompt: str, model: Optional[str] = None) -> str:
     with client.messages.stream(
         model=model,
         max_tokens=_max_tokens,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": _analyst_content(prompt, model)}],
         **_anthropic_sampling_kwargs(model),
         **_anthropic_thinking_kwargs(model),
     ) as stream:
         for text in stream.text_stream:
             raw_parts.append(text)
+        # Surface actual prompt-cache usage so savings are MEASURABLE (and a
+        # net-negative mix — many writes, few reads — is visible to flip the flag).
+        try:
+            u = stream.get_final_message().usage
+            cr = getattr(u, "cache_read_input_tokens", 0) or 0
+            cw = getattr(u, "cache_creation_input_tokens", 0) or 0
+            if cr or cw:
+                logger.info(f"[claude] prompt cache: read={cr} write={cw} "
+                            f"uncached_input={getattr(u, 'input_tokens', 0)} tok")
+        except Exception:
+            pass
     return "".join(raw_parts).strip()
 
 
@@ -170,6 +216,9 @@ def _call_deepseek_analyst(prompt: str) -> str:
         raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
     logger.info(f"[claude] Falling back to DeepSeek analyst: {_DEEPSEEK_ANALYST_MODEL}")
     raw_parts: list[str] = []
+    # DeepSeek ignores Anthropic cache_control and does its own automatic prefix
+    # caching, so just strip the sentinel (it must never reach the model).
+    prompt = prompt.replace(_CACHE_SENTINEL, "")
     # Determinism: temperature=0 + fixed seed so two runs on the same prompt
     # produce near-identical synthesis (slight provider-side variance only).
     with client.chat.completions.create(
@@ -2913,10 +2962,8 @@ Regime guide:
 Your defining edge: you are ruthlessly disciplined about false positives. You understand that a wrong BUY or SELL costs capital that cannot be recovered. You output HOLD or WATCH whenever the evidence is mixed, incomplete, or driven by a single source. When you do issue a BUY or SELL, it is because the convergence of evidence makes the directional call highly reliable — and you explain precisely why.
 
 Signal sources available today: {methods_desc}
-
-Today's date: {fmt_et(now_et())}
-{session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}{catalyst_block}{open_positions_block}
-INPUT — multi-method ticker signals:
+{session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}{catalyst_block}{_CACHE_SENTINEL}Today's date: {fmt_et(now_et())}
+{open_positions_block}INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
 </signals>
