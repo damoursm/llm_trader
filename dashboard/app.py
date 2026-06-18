@@ -334,6 +334,8 @@ def serve_layout() -> html.Div:
                             children=dcc.Loading(html.Div(_safe(_returns_tab), style=body))),
                     dcc.Tab(label="Execution", value="execution",
                             children=dcc.Loading(html.Div(_safe(_execution_tab), style=body))),
+                    dcc.Tab(label="Data Quality", value="data_quality",
+                            children=dcc.Loading(html.Div(_safe(_data_quality_tab), style=body))),
                 ],
             ),
         ],
@@ -1279,6 +1281,154 @@ def _tracking_error_section():
         cards,
         dcc.Graph(figure=figures.tracking_error_fig(rep)),
         dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW),
+    ])
+
+
+# ── Tab 5: Data Quality (source reliability · per-method coverage) ───────────
+
+_DQ_LOOKBACK_DAYS = 14
+
+
+def _data_quality_tab():
+    return html.Div([
+        html.Div(
+            f"Source reliability + per-method coverage over the last {_DQ_LOOKBACK_DAYS} days — "
+            "catches flaky/slow data sources and feeds that went dark BEFORE they quietly degrade "
+            "signals (the failure mode behind every data warning so far). Built from the per-run "
+            "run_sources + signals tables.",
+            style={"color": "#6b7280", "marginBottom": 12}),
+        _safe(_source_reliability_section),
+        _safe(_method_coverage_section),
+    ])
+
+
+def _source_reliability_section():
+    rows = data.source_reliability(_DQ_LOOKBACK_DAYS)
+    heading = _h3("Source reliability",
+                  "Per data source over the window, with FOUR outcomes — ok (returned data), empty "
+                  "(ran fine but returned nothing), dead (upstream gone, no free replacement), error "
+                  "(raised). 'Empty' is first-class: a source that runs but returns nothing is no longer "
+                  "silently counted as ok. An always-on feed that goes empty is flagged ⚠ for "
+                  "investigation; event-driven feeds (8-K, earnings…) are expected to be empty sometimes; "
+                  "dead feeds (greyed) are acknowledged, not actionable. Sorted worst-first. From run_sources.")
+    if not rows:
+        return html.Div([heading, html.Div("No run-source records in the window yet.",
+                                            style={"color": "#6b7280"})])
+    below = [r for r in rows if (r.get("success_rate") or 100.0) < 100.0]
+    unexpected = [r for r in rows if r.get("unexpected_empty")]
+    dead = [r for r in rows if r.get("known_dead")]
+    slowest = max(rows, key=lambda r: r.get("median_s") or 0.0)
+    cards = html.Div(
+        [
+            _kpi("Sources tracked", str(len(rows)),
+                 tooltip="Distinct enabled data sources that ran at least once in the window."),
+            _kpi("Errored", str(len(below)), figures.NEG if below else figures.POS,
+                 tooltip="Sources that raised on at least one run — silent data loss candidates."),
+            _kpi("Empty (always-on)", str(len(unexpected)), figures.NEG if unexpected else figures.POS,
+                 tooltip="Always-on feeds whose LATEST run returned nothing though they should always "
+                         "have data — investigate. Excludes event-driven and dead sources."),
+            _kpi("Dead feeds", str(len(dead)), "#9ca3af",
+                 tooltip="Sources whose upstream is gone with no free replacement (^TICK delisted; "
+                         "congressional Stock Watcher 403). Acknowledged, not actionable — shown so the "
+                         "deadness stays VISIBLE rather than masked as ok."),
+            _kpi("Slowest (median)", f"{slowest['source']} · {slowest.get('median_s') or 0:.0f}s",
+                 tooltip="The source with the highest median fetch time — the biggest tick-budget cost."),
+        ],
+        style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+    )
+
+    def _status_disp(r):
+        return "empty ⚠" if r.get("unexpected_empty") else r.get("last_status", "")
+
+    def _note(r):
+        if r.get("unexpected_empty"):
+            return "⚠ always-on feed returned nothing — investigate"
+        if r.get("known_dead"):
+            return "known-dead — upstream gone, no free replacement"
+        if r.get("last_error"):
+            return r["last_error"]
+        if r.get("expected_sparse"):
+            return "event-driven (empty sometimes normal)"
+        return ""
+
+    table_rows = [{"source": r["source"], "runs": r["runs"], "success": r["success_rate"],
+                   "empty_pct": r.get("empty_rate"), "status": _status_disp(r),
+                   "median_s": r["median_s"], "p90_s": r["p90_s"], "note": _note(r)}
+                  for r in rows]
+    cols = [
+        {"name": "Source", "id": "source"},
+        {"name": "Runs", "id": "runs", "type": "numeric", "format": _INT},
+        {"name": "Success %", "id": "success", "type": "numeric", "format": _NUM2},
+        {"name": "Empty %", "id": "empty_pct", "type": "numeric", "format": _NUM2},
+        {"name": "Last status", "id": "status"},
+        {"name": "Median s", "id": "median_s", "type": "numeric", "format": _NUM2},
+        {"name": "p90 s", "id": "p90_s", "type": "numeric", "format": _NUM2},
+        {"name": "Note", "id": "note"},
+    ]
+    cond = [
+        {"if": {"filter_query": "{success} < 100", "column_id": "success"},
+         "color": figures.NEG, "fontWeight": "bold"},
+        # An always-on feed that returned nothing this run — the actionable flag.
+        {"if": {"filter_query": '{status} contains "⚠"'},
+         "backgroundColor": "#3f1d1d", "color": "#fca5a5", "fontWeight": "bold"},
+        # Dead feeds: greyed/italic — acknowledged, not an alarm.
+        {"if": {"filter_query": '{status} = "dead"'},
+         "color": "#9ca3af", "fontStyle": "italic"},
+    ]
+    return html.Div([
+        heading, cards,
+        dcc.Graph(figure=figures.source_latency_fig(rows)),
+        dash_table.DataTable(data=table_rows, columns=cols, style_data_conditional=cond, **_TABLE_KW),
+    ])
+
+
+def _method_coverage_section():
+    from src.performance.tracker import METHOD_LABELS
+    cov = data.method_coverage(_DQ_LOOKBACK_DAYS)
+    per = cov.get("per_method") or []
+    heading = _h3("Per-method data coverage",
+                  "For each signal method, the share of scored tickers with a REAL (non-zero) score — a "
+                  "method reads 0.0 ('no view') when its data source failed for a ticker, so a feed going "
+                  "dark shows as collapsing coverage before it shows as bad performance. Δ = recent minus "
+                  "prior coverage; a large negative Δ is the alarm. From the signals panel.")
+    if not per:
+        return html.Div([heading, html.Div("No signal rows in the window yet.",
+                                            style={"color": "#6b7280"})])
+    drops = [r for r in per if r.get("delta") is not None and r["delta"] <= -20]
+    cards = html.Div(
+        [
+            _kpi("Methods", str(len(per)),
+                 tooltip="Signal methods tracked in the signals panel."),
+            _kpi("Signal rows", f"{cov.get('n_rows', 0):,}",
+                 tooltip="Total run×ticker rows in the window (the coverage denominator)."),
+            _kpi("Coverage drops", str(len(drops)), figures.NEG if drops else figures.POS,
+                 tooltip="Methods whose coverage fell ≥20pp recent-vs-prior — a feed that likely went dark."),
+        ],
+        style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+    )
+    rows = [{"method": METHOD_LABELS.get(r["method"], r["method"]), "coverage": r["coverage_pct"],
+             "scored": r["n_scored"], "total": r["n_total"], "recent": r["recent_pct"],
+             "prior": r["prior_pct"], "delta": r["delta"]} for r in per]
+    cols = [
+        {"name": "Method", "id": "method"},
+        {"name": "Coverage %", "id": "coverage", "type": "numeric", "format": _NUM2},
+        {"name": "Scored", "id": "scored", "type": "numeric", "format": _INT},
+        {"name": "Of", "id": "total", "type": "numeric", "format": _INT},
+        {"name": "Recent %", "id": "recent", "type": "numeric", "format": _NUM2},
+        {"name": "Prior %", "id": "prior", "type": "numeric", "format": _NUM2},
+        {"name": "Δ (pp)", "id": "delta", "type": "numeric", "format": _NUM2},
+    ]
+    cond = [{"if": {"filter_query": "{delta} <= -20", "column_id": "delta"},
+             "color": figures.NEG, "fontWeight": "bold"}]
+    return html.Div([
+        heading,
+        html.Div("Low coverage is NORMAL for sparse methods (PEAD, extended-gap, options-derived put_call / "
+                 "max_pain / OI-skew / IV — they only fire for a subset of tickers). The actionable signal "
+                 "is a negative Δ: a method whose coverage dropped means its feed went dark.",
+                 style={"color": "#374151", "marginBottom": 8, "fontSize": 13}),
+        cards,
+        dcc.Graph(figure=figures.method_coverage_fig(cov)),
+        dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW),
     ])
 
 

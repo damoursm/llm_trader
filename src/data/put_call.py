@@ -67,9 +67,11 @@ def _load_cache() -> Optional[PutCallContext]:
         return None
     try:
         ctx = PutCallContext.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        # NB: a conditional inside the format spec ({x:.2f if x else 'N/A'}) is
+        # invalid and throws on EVERY load — precompute the display string instead.
+        pc = f"{ctx.market_pc_ratio:.2f}" if ctx.market_pc_ratio is not None else "N/A"
         logger.info(
-            f"[put_call] Loaded from cache — market P/C: "
-            f"{ctx.market_pc_ratio:.2f if ctx.market_pc_ratio else 'N/A'}, "
+            f"[put_call] Loaded from cache — market P/C: {pc}, "
             f"{len(ctx.ticker_signals)} ticker extreme(s)"
         )
         return ctx

@@ -7,7 +7,10 @@ venv/
 env/
 logs/*.log
 cache/
-data/
+# Anchored to the repo root: the DuckDB lives in /data/, but an unanchored
+# "data/" ALSO matched src/data/ — which silently hid the entire data-fetcher
+# layer from ripgrep/code-search (and any tooling that honors .gitignore).
+/data/
 .pytest_cache/
 *.egg-info/
 dist/

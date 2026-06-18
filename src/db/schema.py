@@ -66,7 +66,9 @@ SCHEMA_STATEMENTS = [
         enabled       BOOLEAN,
         ok            BOOLEAN,
         error         VARCHAR,
-        duration_s    DOUBLE
+        duration_s    DOUBLE,
+        n_items       INTEGER,
+        empty         BOOLEAN
     );
     """,
     """
@@ -209,7 +211,18 @@ SCHEMA_STATEMENTS = [
 ]
 
 
+# One-time idempotent column additions for tables created before a field
+# existed. DuckDB's ADD COLUMN IF NOT EXISTS is a no-op once the column is
+# present, so this runs safely on every write connection.
+_ADD_COLUMNS = (
+    ("run_sources", "n_items", "INTEGER"),
+    ("run_sources", "empty", "BOOLEAN"),
+)
+
+
 def ensure_schema(conn) -> None:
     """Create all tables if they do not yet exist (idempotent)."""
     for stmt in SCHEMA_STATEMENTS:
         conn.execute(stmt)
+    for table, col, coltype in _ADD_COLUMNS:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {coltype}")

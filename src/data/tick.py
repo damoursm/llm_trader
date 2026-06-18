@@ -142,7 +142,10 @@ def fetch_tick_context() -> Optional[TICKContext]:
         return None
 
     if raw is None or raw.empty:
-        logger.warning("[tick] ^TICK returned no data")
+        # Yahoo delisted the ^TICK index, so yfinance returns nothing for it and
+        # no alternative provider is wired up. Fail soft at debug level rather than
+        # a per-run WARNING (unactionable until a new NYSE-TICK source is added).
+        logger.debug("[tick] ^TICK unavailable via yfinance (Yahoo delisted it) — skipping")
         return None
 
     # Drop rows where High/Low are NaN

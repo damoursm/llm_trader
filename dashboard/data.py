@@ -220,6 +220,35 @@ def tracking_error() -> dict:
     return compute_tracking_error(trades)
 
 
+def source_reliability(days: int = 14) -> list:
+    """Per-source success rate + latency over the last N days (from run_sources)
+    — surfaces chronically-flaky or slow data sources. Cached + retry."""
+    key = ("source_reliability", int(days))
+    now = time.time()
+    entry = _perf_cache.get(key)
+    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.analysis.data_quality import compute_source_reliability, load_source_rows
+    result = _retry(lambda: compute_source_reliability(load_source_rows(days)), "source_reliability")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
+
+
+def method_coverage(days: int = 14) -> dict:
+    """Per-method data coverage (% of tickers with a real, non-zero score) + a
+    recent-vs-prior delta to flag feeds that went dark. From the signals panel.
+    Cached + retry."""
+    key = ("method_coverage", int(days))
+    now = time.time()
+    entry = _perf_cache.get(key)
+    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.analysis.data_quality import compute_method_coverage, load_signal_rows
+    result = _retry(lambda: compute_method_coverage(load_signal_rows(days)), "method_coverage")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
+
+
 def latest_gate_diag() -> dict:
     """gate_diag JSON of the most recent run (carries the price-provenance
     verdict for the banner + Execution tab). ``{}`` when unavailable."""

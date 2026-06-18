@@ -324,6 +324,63 @@ def slippage_by_session_fig(slip_df) -> go.Figure:
     return fig
 
 
+def source_latency_fig(rows: list) -> go.Figure:
+    """Slowest data sources by median fetch time (the tick-budget view); a bar is
+    red if that source had ANY failure in the window, blue otherwise."""
+    if not rows:
+        return _empty("No source-reliability data yet (needs recorded runs).")
+    top = sorted(rows, key=lambda r: -(r.get("median_s") or 0.0))[:15]
+    top = [r for r in top if (r.get("median_s") or 0.0) > 0] or top[:1]
+    names = [r["source"] for r in top][::-1]
+    meds = [r.get("median_s") or 0.0 for r in top][::-1]
+    colors = [(NEG if (r.get("success_rate") or 100.0) < 100.0 else "#2563eb") for r in top][::-1]
+    fig = go.Figure(go.Bar(
+        x=meds, y=names, orientation="h", marker_color=colors,
+        text=[f"{m:.1f}s" for m in meds], textposition="auto",
+        hovertemplate="%{y}: %{x:.2f}s median<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Slowest data sources (median fetch s; red = had a failure)",
+        xaxis_title="Median fetch time (s)",
+        margin=dict(l=10, r=10, t=40, b=10), height=max(320, 22 * len(top)),
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
+def method_coverage_fig(cov: dict) -> go.Figure:
+    """Per-method data coverage (% of tickers with a real, non-zero score),
+    sorted low→high. A bar is red when coverage DROPPED recently (delta ≤ −20pp —
+    a feed likely went dark); amber for low/sparse; green for healthy/dense."""
+    per = (cov or {}).get("per_method") or []
+    if not per:
+        return _empty("No method-coverage data yet (needs persisted signal rows).")
+    rows = sorted(per, key=lambda r: r.get("coverage_pct", 0.0), reverse=True)
+    names = [r["method"] for r in rows][::-1]
+    covs = [r.get("coverage_pct", 0.0) for r in rows][::-1]
+
+    def _color(r):
+        d = r.get("delta")
+        if d is not None and d <= -20:
+            return NEG                           # dropped — likely went dark
+        return POS if (r.get("coverage_pct") or 0) >= 50 else "#f59e0b"
+    colors = [_color(r) for r in rows][::-1]
+    texts = [(f"{c:.0f}%  (Δ{r['delta']:+.0f})" if r.get("delta") is not None else f"{c:.0f}%")
+             for c, r in zip(covs, rows[::-1])]
+    fig = go.Figure(go.Bar(
+        x=covs, y=names, orientation="h", marker_color=colors,
+        text=texts, textposition="auto",
+        hovertemplate="%{y}: %{x:.1f}% of tickers scored<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Per-method coverage (% tickers scored; red = coverage dropped)",
+        xaxis_title="Coverage (%)", xaxis=dict(range=[0, 100]),
+        margin=dict(l=10, r=10, t=40, b=10), height=max(360, 22 * len(rows)),
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
 def tracking_error_fig(rep: dict) -> go.Figure:
     """Time series of the sim − broker return gap by entry date. A line hugging
     zero = the model tracks reality; a persistent one-sided drift = a cost/price

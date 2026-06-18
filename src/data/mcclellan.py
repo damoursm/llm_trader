@@ -32,26 +32,45 @@ Zero-line crossings of the oscillator are the best swing-trade timing signals:
   Crossing above 0 → bullish momentum shift (EMA19 now above EMA39)
   Crossing below 0 → bearish momentum shift (EMA19 now below EMA39)
 
-Data source: ^NYAD (NYSE Advance-Decline issues) via yfinance. Cached daily.
+Data source: Polygon grouped-daily (every US stock's OHLC in one call) →
+Ratio-Adjusted Net Advances (RANA). Yahoo delisted ^NYAD and every A/D variant
+(0 bars), so the legacy yfinance path was a silent zombie. RANA normalises the
+advance/decline count to a fixed scale so the classic oscillator thresholds still
+apply regardless of how many issues trade:
+
+    RANA = 1000 × (advancing − declining) / (advancing + declining)
+
+where advancing/declining is each stock's close vs its PRIOR close. The daily
+RANA series is accumulated in cache/mcclellan_ad_history.json (one Polygon call
+per new trading day; daily-cached so only the first tick of each day fetches).
+One-time backfill:  python -m src.data.mcclellan
 """
 
 import json
-from datetime import date
+import time
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import httpx
 import pandas as pd
-import yfinance as yf
 from loguru import logger
 
 from config import settings
 from src.models import McClellanContext
 
 CACHE_DIR  = Path("cache")
-_LOOKBACK  = "9mo"    # ~190 trading days; needs ≥ 44 days for EMA39 to converge
-_AD_SYMBOL = "^NYAD"  # NYSE Advance-Decline issues (daily or cumulative A/D)
 _EMA_SHORT = 19       # "10% trend" — fast EMA
 _EMA_LONG  = 39       # "5% trend"  — slow EMA
+
+# Polygon grouped-daily breadth source (replaces the delisted ^NYAD)
+_POLY_GROUPED    = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+_AD_HISTORY_PATH = CACHE_DIR / "mcclellan_ad_history.json"
+_HEADERS         = {"User-Agent": "llm-trader research"}
+_BACKFILL_DAYS   = 55       # trading days to seed (≥ _EMA_LONG+10 = 49 required)
+_MAX_FETCH_RUN   = 6        # cap Polygon calls per normal run (daily-cached → ~1 fetch/day)
+_POLY_DELAY      = 13.0     # seconds between grouped calls (free tier ≈ 5/min)
+_MIN_PRICE       = 1.0      # exclude sub-$1 names from the A/D count (penny noise)
 
 # Oscillator thresholds
 _OB_HIGH = 100.0   # overbought
@@ -59,9 +78,13 @@ _OB_MID  =  50.0   # bullish momentum
 _OS_MID  = -50.0   # bearish momentum
 _OS_HIGH = -100.0  # oversold
 
-# Summation thresholds (relative to our data window; not tied to the absolute scale)
-_SI_BULL_EXT =  500.0
-_SI_BEAR_EXT = -500.0
+# Summation thresholds. The RANA-based oscillator cumsums to a larger range than
+# the legacy raw-net-advance scale, so these match the classic McClellan SI
+# "extended" convention (~±2000) rather than the old ±500 (which pinned the
+# reading at EXTENDED). The Summation Index grows toward a stable continuous
+# series as the A/D history accumulates day by day.
+_SI_BULL_EXT =  2000.0
+_SI_BEAR_EXT = -2000.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,66 +172,150 @@ def _compute_direction(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Breadth A/D source — Polygon grouped-daily → Ratio-Adjusted Net Advances
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_ad_history() -> Dict[str, float]:
+    if not _AD_HISTORY_PATH.exists():
+        return {}
+    try:
+        return json.loads(_AD_HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"[mcclellan] A/D history load failed: {e}")
+        return {}
+
+
+def _save_ad_history(history: Dict[str, float]) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    try:
+        _AD_HISTORY_PATH.write_text(json.dumps(history, indent=0, sort_keys=True), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"[mcclellan] A/D history save failed: {e}")
+
+
+def _recent_weekdays(n: int) -> List[date]:
+    """The last ``n`` weekdays up to yesterday (oldest first). Holidays are
+    fetched too but Polygon returns no results for them, so they're skipped."""
+    out: List[date] = []
+    d = date.today() - timedelta(days=1)
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return sorted(out)
+
+
+def _prev_weekday(d: date) -> date:
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _grouped_closes(iso_day: str) -> Dict[str, float]:
+    """{ticker: close} for every US stock on ``iso_day`` (empty for a non-trading
+    day). Retries once on a 429 (free-tier rate limit)."""
+    for attempt in range(2):
+        r = httpx.get(_POLY_GROUPED.format(date=iso_day),
+                      params={"adjusted": "true", "apiKey": settings.polygon_api_key},
+                      headers=_HEADERS, timeout=30)
+        if r.status_code == 429:
+            time.sleep(_POLY_DELAY)
+            continue
+        r.raise_for_status()
+        res = r.json().get("results") or []
+        return {x["T"]: x["c"] for x in res
+                if x.get("T") and isinstance(x.get("c"), (int, float)) and x["c"] > 0}
+    return {}
+
+
+def _rana(today: Dict[str, float], prev: Dict[str, float]) -> float:
+    """Ratio-Adjusted Net Advances: 1000 × (adv − dec) / (adv + dec), each
+    stock's close vs its prior close, sub-$1 names excluded."""
+    adv = dec = 0
+    for t, c in today.items():
+        pc = prev.get(t)
+        if pc is None or c < _MIN_PRICE or pc < _MIN_PRICE:
+            continue
+        if c > pc:
+            adv += 1
+        elif c < pc:
+            dec += 1
+    tot = adv + dec
+    return round(1000.0 * (adv - dec) / tot, 3) if tot else 0.0
+
+
+def _build_rana_series(max_fetch: int = _MAX_FETCH_RUN, backfill: bool = False) -> Optional[pd.Series]:
+    """Daily RANA series, accumulated in cache. Normal runs fetch only the few
+    newest missing trading days (daily-cached → ~1/day); ``backfill=True`` seeds
+    the full window. Returns None until ``_EMA_LONG+10`` days exist."""
+    if not settings.polygon_api_key:
+        logger.warning("[mcclellan] POLYGON_API_KEY not set — cannot build breadth A/D")
+        return None
+
+    history = _load_ad_history()
+    if not history and not backfill:
+        logger.warning("[mcclellan] no breadth A/D history yet — run the one-time "
+                       "backfill: python -m src.data.mcclellan")
+        return None
+
+    target = _BACKFILL_DAYS + 12 if backfill else 7
+    weekdays = _recent_weekdays(target)
+    missing = [d for d in weekdays if d.isoformat() not in history]
+    if missing:
+        # Fetch closes from the weekday before the earliest gap (baseline) onward;
+        # cap per normal run, but take the NEWEST days so incremental stays recent.
+        cap = (10 ** 6) if backfill else max_fetch
+        fetch_days = [d for d in weekdays if d >= _prev_weekday(min(missing))][-cap:]
+        closes: Dict[str, Dict[str, float]] = {}
+        for i, d in enumerate(fetch_days):
+            try:
+                c = _grouped_closes(d.isoformat())
+            except Exception as e:
+                logger.debug(f"[mcclellan] grouped {d} failed: {e}")
+                c = {}
+            if c:
+                closes[d.isoformat()] = c
+            if i < len(fetch_days) - 1:
+                time.sleep(_POLY_DELAY)
+        ordered = sorted(closes)
+        added = 0
+        for i in range(1, len(ordered)):
+            ds, prev = ordered[i], ordered[i - 1]
+            if ds not in history:
+                history[ds] = _rana(closes[ds], closes[prev])
+                added += 1
+        if added:
+            _save_ad_history(history)
+            logger.info(f"[mcclellan] breadth A/D: +{added} day(s) via Polygon, {len(history)} cached")
+
+    if len(history) < _EMA_LONG + 10:
+        logger.warning(f"[mcclellan] only {len(history)} A/D day(s) — need {_EMA_LONG + 10}; "
+                       "run `python -m src.data.mcclellan` to backfill")
+        return None
+    return pd.Series({pd.Timestamp(k): v for k, v in history.items()}).sort_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_mcclellan_context() -> Optional[McClellanContext]:
     """
-    Compute the McClellan Oscillator and Summation Index from NYSE A/D data.
-    Returns McClellanContext or None if data is unavailable. Cached daily.
+    Compute the McClellan Oscillator and Summation Index from market-wide
+    advance/decline breadth (Polygon RANA). Returns McClellanContext or None if
+    data is unavailable. Cached daily.
     """
     cached = _load_cache()
     if cached is not None:
         return cached
 
     if not settings.enable_fetch_data:
-        logger.debug("[mcclellan] ENABLE_FETCH_DATA=false — skipping yfinance fetch")
+        logger.debug("[mcclellan] ENABLE_FETCH_DATA=false — skipping breadth fetch")
         return None
 
-    try:
-        data = yf.download(
-            _AD_SYMBOL,
-            period=_LOOKBACK,
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-        )
-    except Exception as e:
-        logger.warning(f"[mcclellan] yfinance download failed: {e}")
-        return None
-
-    if data is None or data.empty:
-        logger.warning(f"[mcclellan] No data returned for {_AD_SYMBOL}")
-        return None
-
-    try:
-        # Single-ticker download may be flat or MultiIndex depending on yfinance version
-        if isinstance(data.columns, pd.MultiIndex):
-            close = data["Close"][_AD_SYMBOL].dropna()
-        else:
-            close = data["Close"].dropna()
-    except Exception as e:
-        logger.warning(f"[mcclellan] Could not extract Close series: {e}")
-        return None
-
-    if len(close) < _EMA_LONG + 10:
-        logger.warning(
-            f"[mcclellan] Insufficient history: {len(close)} bars (need {_EMA_LONG + 10})"
-        )
-        return None
-
-    # Determine if ^NYAD gives the cumulative A/D line or raw daily net-advances.
-    # If values span > 10_000, it's likely the cumulative line → take daily differences.
-    val_range = float(close.max() - close.min())
-    if val_range > 10_000:
-        logger.debug(f"[mcclellan] ^NYAD appears cumulative (range={val_range:.0f}); differencing")
-        net_adv = close.diff().dropna()
-    else:
-        logger.debug(f"[mcclellan] ^NYAD appears to be daily net advances (range={val_range:.0f})")
-        net_adv = close
-
-    if len(net_adv) < _EMA_LONG + 5:
-        logger.warning(f"[mcclellan] Insufficient net-advance data: {len(net_adv)} bars")
+    net_adv = _build_rana_series()
+    if net_adv is None or len(net_adv) < _EMA_LONG + 10:
         return None
 
     # McClellan Oscillator = EMA(19) − EMA(39) of net advances
@@ -291,3 +398,25 @@ def fetch_mcclellan_context() -> Optional[McClellanContext]:
         f"| {direction}{cross_tag}"
     )
     return ctx
+
+
+def backfill() -> None:
+    """One-time seed of the breadth A/D history from Polygon grouped-daily.
+    Throttled to the free-tier rate limit (~5/min), so ~55 days takes ~12 min.
+    Safe to re-run — it only fetches days not already cached."""
+    import sys
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    logger.info(f"[mcclellan] backfilling ~{_BACKFILL_DAYS} trading days of breadth A/D "
+                "from Polygon (throttled for free tier — this takes a while)...")
+    s = _build_rana_series(backfill=True)
+    if s is None:
+        logger.warning("[mcclellan] backfill produced insufficient history")
+    else:
+        logger.info(f"[mcclellan] backfill complete — {len(s)} A/D days cached")
+
+
+if __name__ == "__main__":
+    backfill()

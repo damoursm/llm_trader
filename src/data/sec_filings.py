@@ -30,7 +30,11 @@ from src.data.insider_trades import _parse_date, _notional_to_amount_range
 
 _EDGAR_SEARCH        = "https://efts.sec.gov/LATEST/search-index"
 _EDGAR_SUBM          = "https://data.sec.gov/submissions/CIK{cik10}.json"
-_EDGAR_ARCHIVE       = "https://www.sec.gov/Archives/edgar/data/{cik}/{accn_nodash}/{accn_nodash}-index.json"
+# The filing directory listing JSON. The old "{accn_nodash}-index.json" form
+# 404s (that path is the HTML index, not the JSON the parser reads); the bare
+# "index.json" returns the {"directory":{"item":[...]}} listing — confirmed live.
+_EDGAR_ARCHIVE       = "https://www.sec.gov/Archives/edgar/data/{cik}/{accn_nodash}/index.json"
+_EDGAR_BROWSE        = "https://www.sec.gov/cgi-bin/browse-edgar"
 _COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _HEADERS             = {"User-Agent": "llm-trader research@example.com"}
 _REQUEST_DELAY       = 0.15   # seconds between EDGAR requests (rate limit)
@@ -98,6 +102,39 @@ def _ticker_from_name(name: str, index: Dict[str, str]) -> Optional[str]:
     return None
 
 
+# EFTS display_names embed the ticker, e.g. "Nerdy Inc.  (NRDY)  (CIK 0001819404)".
+# The CIK parenthetical ("CIK 000…") contains a space + digits so it never matches
+# this all-caps ticker pattern.
+_DISPLAY_TICKER_RE = re.compile(r"\(([A-Z][A-Z.\-]{0,5})\)")
+
+
+def _ticker_from_display_name(display: str) -> Optional[str]:
+    """Extract the ticker embedded in a single EFTS display_name string."""
+    if not display:
+        return None
+    for m in _DISPLAY_TICKER_RE.findall(display):
+        if m and not m.startswith("CIK"):
+            return m.upper()
+    return None
+
+
+def _subject_ticker(display_names, index: Dict[str, str]) -> Optional[str]:
+    """Resolve the subject-company ticker from an EFTS display_names value
+    (str or list). Prefers the embedded "(TICKER)" — far more reliable than
+    fuzzy name matching — then falls back to name lookup on the cleaned name."""
+    if isinstance(display_names, str):
+        display_names = [display_names]
+    for dn in display_names or []:
+        t = _ticker_from_display_name(dn)
+        if t:
+            return t
+    for dn in display_names or []:
+        t = _ticker_from_name(str(dn).split("(")[0].strip(), index)
+        if t:
+            return t
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Strategy 1: SC 13D / SC 13G  (activist and large passive stakes)
 # ---------------------------------------------------------------------------
@@ -118,7 +155,11 @@ def fetch_activist_stakes() -> List[InsiderTrade]:
         resp = httpx.get(
             _EDGAR_SEARCH,
             params={
-                "forms":     "SC 13D,SC 13G,SC 13D/A,SC 13G/A",
+                # The SEC renamed these forms "SC 13D"→"SCHEDULE 13D" (2024); the
+                # old names now return ZERO hits. The explicit-variant list (incl.
+                # /A) is what EFTS actually matches here — confirmed live: 685
+                # filings in 30d vs 0 for "SC 13D" or the root "SCHEDULE 13D".
+                "forms":     "SCHEDULE 13D,SCHEDULE 13D/A,SCHEDULE 13G,SCHEDULE 13G/A",
                 "dateRange": "custom",
                 "startdt":   cutoff.isoformat(),
                 "enddt":     date.today().isoformat(),
@@ -131,32 +172,29 @@ def fetch_activist_stakes() -> List[InsiderTrade]:
 
         for hit in hits:
             src       = hit.get("_source", {})
-            form_type = src.get("form_type", "")
+            # EFTS names the field `form` (not `form_type`) and provides filer/
+            # subject as `display_names` (not `entity_name`). The old code read
+            # the non-existent names, so every 13D/13G hit was silently dropped.
+            form_type = (src.get("form") or src.get("form_type") or "").strip()
             filed     = _parse_date(src.get("file_date", ""))
             if not filed:
                 continue
 
-            entity = src.get("entity_name", "").strip()
-
-            # entity_name = subject company (the stock being accumulated)
-            ticker = _ticker_from_name(entity, ticker_index)
-
-            # display_names may hold the filer (activist fund) name or an alternate company name
             display_names = src.get("display_names") or []
             if isinstance(display_names, str):
                 display_names = [display_names]
 
-            if not ticker:
-                for dn in display_names:
-                    ticker = _ticker_from_name(dn, ticker_index)
-                    if ticker:
-                        break
-
+            # display_names = [subject company "(TICKER)", filer fund]; the
+            # subject carries the embedded ticker.
+            ticker = _subject_ticker(display_names, ticker_index)
             if not ticker:
                 continue
 
-            # Best guess at the activist/institution name
-            filer = display_names[0] if display_names else entity
+            subject = (display_names[0].split("(")[0].strip()
+                       if display_names else ticker)
+            # The filer (activist/fund) is the entry WITHOUT a ticker, if present.
+            filer = next((dn.split("(")[0].strip() for dn in display_names
+                          if not _ticker_from_display_name(dn)), subject)
             is_activist = "13D" in form_type
 
             trades.append(InsiderTrade(
@@ -168,7 +206,7 @@ def fetch_activist_stakes() -> List[InsiderTrade]:
                 amount_range=">5% ownership",
                 transaction_date=filed,
                 disclosure_date=filed,
-                notes=f"SEC {form_type} — {entity}",
+                notes=f"SEC {form_type} — {subject}",
             ))
     except Exception as e:
         logger.warning(f"[sec] 13D/13G fetch failed: {e}")
@@ -255,34 +293,62 @@ def fetch_form144_sales() -> List[InsiderTrade]:
 # Strategy 3: Form 13F-HR  (superinvestor quarterly holdings)
 # ---------------------------------------------------------------------------
 
+# Verified 13F-filer CIKs for tracked institutions, checked BEFORE the EDGAR
+# full-text search — that search is unreliable for some filers (it returns no
+# hit for "Berkshire Hathaway", so the institution was silently skipped every
+# run). Keys are lowercase, matched as a substring of the configured name;
+# verified against data.sec.gov/submissions. Add an entry whenever an institution
+# logs "Could not resolve CIK".
+_KNOWN_INSTITUTION_CIKS = {
+    "berkshire hathaway":                 "1067983",   # BERKSHIRE HATHAWAY INC
+    "pershing square capital management": "1336528",   # Pershing Square Capital Management, L.P.
+    "appaloosa management":               "1006438",   # APPALOOSA MANAGEMENT LP
+    "baupost group":                      "1061768",   # BAUPOST GROUP LLC/MA
+    "scion asset management":             "1649339",   # Scion Asset Management, LLC
+    "greenlight capital":                 "1079114",   # GREENLIGHT CAPITAL INC
+    "third point":                        "1040273",   # Third Point LLC
+    "icahn capital":                      "921669",    # ICAHN CARL C (the live 13F filer; "Icahn Capital LP" CIK 1412093 went dormant in 2011)
+    "tiger global management":            "1167483",   # TIGER GLOBAL MANAGEMENT LLC
+    "duquesne family office":             "1536411",   # Duquesne Family Office LLC
+}
+
+
 def _lookup_institution_cik(name: str) -> Optional[str]:
     """
-    Resolve the CIK for a tracked institution by finding their own 13F filings.
-    The accession number prefix IS the filer's CIK:
-      "0001067983-24-000042"  →  CIK = "0001067983"
+    Resolve the 13F-filer CIK for a tracked institution. Curated, verified CIKs
+    (_KNOWN_INSTITUTION_CIKS) are the authoritative fast path; for an institution
+    not in the map we fall back to EDGAR's company-search (browse-edgar atom),
+    which resolves a FILER name → CIK.
+
+    The previous EFTS full-text fallback was fundamentally broken: q='"<name>"'
+    matches every 13F that *holds* the named company, not the institution's own
+    filing (a search for "Berkshire Hathaway" returns Check Capital et al.), so
+    it resolved the wrong CIK or none. Add new filers to the map above when they
+    log "Could not resolve CIK".
     """
+    low = name.lower()
+    for key, cik in _KNOWN_INSTITUTION_CIKS.items():
+        if key in low:
+            return cik
     try:
         resp = httpx.get(
-            _EDGAR_SEARCH,
+            _EDGAR_BROWSE,
             params={
-                "q":         f'"{name}"',
-                "forms":     "13F-HR",
-                "dateRange": "custom",
-                "startdt":   "2020-01-01",
+                "action":  "getcompany",
+                "company": name,
+                "type":    "13F-HR",
+                "owner":   "include",
+                "count":   "10",
+                "output":  "atom",
             },
             headers=_HEADERS,
             timeout=15,
         )
         resp.raise_for_status()
-        hits = resp.json().get("hits", {}).get("hits", [])
-
-        for hit in hits:
-            entity    = hit.get("_source", {}).get("entity_name", "")
-            accession = hit.get("_id", "")
-            if name.lower() in entity.lower() and accession:
-                parts = accession.split("-")
-                if parts and parts[0].isdigit():
-                    return parts[0]   # 10-digit zero-padded CIK
+        # The atom feed lists matching filers as <cik>NNNNNNNNNN</cik>.
+        ciks = re.findall(r"<cik>(\d+)</cik>", resp.text)
+        if ciks:
+            return ciks[0].lstrip("0") or ciks[0]
     except Exception as e:
         logger.debug(f"[13f] CIK lookup failed for '{name}': {e}")
     return None
@@ -346,13 +412,19 @@ def _parse_infotable(xml_text: str) -> Dict[str, Dict]:
     """
     Parse a 13F infotable XML.
     Returns {cusip: {name, value_usd, shares}}.
-    value_usd is in dollars (XML stores thousands; we multiply by 1000).
+    value_usd is in whole dollars (post-2023 13F amendment; no ×1000 scaling).
     Handles both namespaced and non-namespaced variants.
     """
     holdings: Dict[str, Dict] = {}
     try:
-        clean = re.sub(r"<(/?)[\w-]+:", r"<\1", xml_text)
-        clean = re.sub(r'\sxmlns[^"]*"[^"]*"', "", clean)
+        # Strip ALL namespaces so ElementTree never hits an unbound prefix.
+        # Some filers (e.g. Greenlight) carry `xsi:schemaLocation` with NO
+        # matching xmlns:xsi declaration — genuinely unbound — which crashed the
+        # parse for ~half the tracked institutions. We must drop xmlns
+        # declarations AND prefixes on both tags and attributes.
+        clean = re.sub(r'\sxmlns(:[\w.\-]+)?\s*=\s*"[^"]*"', "", xml_text)  # xmlns decls
+        clean = re.sub(r"(<\s*/?\s*)[\w.\-]+:", r"\1", clean)               # tag prefixes
+        clean = re.sub(r'(\s)[\w.\-]+:([\w.\-]+\s*=)', r"\1\2", clean)      # attr prefixes
         root  = ET.fromstring(clean)
 
         for table in root.iter("infoTable"):
@@ -362,7 +434,11 @@ def _parse_infotable(xml_text: str) -> Dict[str, Dict]:
                 continue
 
             try:
-                value_usd = int((table.findtext("value") or "0").replace(",", "")) * 1000
+                # The SEC's amended Form 13F (effective Jan 2023) reports `value`
+                # in WHOLE DOLLARS. The legacy ×1000 (values were in thousands)
+                # inflated every recent holding 1000× — e.g. Berkshire's Alphabet
+                # stake showed as $11.8 TRILLION. All filings we fetch are recent.
+                value_usd = int((table.findtext("value") or "0").replace(",", ""))
             except ValueError:
                 value_usd = 0
 
@@ -373,6 +449,18 @@ def _parse_infotable(xml_text: str) -> Dict[str, Dict]:
                 shares = 0
 
             holdings[cusip] = {"name": name, "value_usd": value_usd, "shares": shares}
+
+        # `value` scale is NOT self-describing: post-2023 filings report whole
+        # dollars, but some filers still report THOUSANDS. Detect per-filing from
+        # the implied price (value/shares) — a median under $1/sh means the
+        # values are in thousands (real share prices are dollars), so scale up.
+        # Confirmed live: dollar filers sit at $60–180/sh, thousands filers at
+        # $0.03–0.13/sh — a wide, unambiguous gap.
+        prices = sorted(h["value_usd"] / h["shares"]
+                        for h in holdings.values() if h["shares"] > 0)
+        if prices and prices[len(prices) // 2] < 1.0:
+            for h in holdings.values():
+                h["value_usd"] *= 1000
     except Exception as e:
         logger.debug(f"[13f] XML parse error: {e}")
     return holdings

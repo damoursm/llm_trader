@@ -63,6 +63,7 @@ from src.data.cluster_watchlist import (
 from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
+from src.analysis.data_quality import EXPECTED_SPARSE_SOURCES, KNOWN_DEAD_SOURCES, is_context_populated
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
 from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor
@@ -118,11 +119,30 @@ def _collect_sources() -> list:
     return sources
 
 
+def _result_size(result) -> Optional[int]:
+    """Item count of a fetcher result, for emptiness detection.
+
+    0 for ``None`` or an empty container (the 'returned nothing' case); the
+    length for a populated list/dict/str/etc.; ``None`` for a non-sized object
+    (a present Pydantic context model has no length but is NOT empty — it ran and
+    produced a structured result)."""
+    if result is None:
+        return 0
+    if isinstance(result, (list, tuple, set, frozenset, dict, str, bytes)):
+        return len(result)
+    return None
+
+
 def _safe(label: str, fn, *args, **kwargs):
     """Run fn; log warning and return None on any exception.
 
-    Records the per-source outcome (ok / error / duration) into the per-run
-    source log so the run's 'APIs used' record can be persisted to DuckDB.
+    Records the per-source outcome — ok / error / duration AND emptiness
+    (``n_items`` + ``empty``) — into the per-run source log so the run's 'APIs
+    used' record persists it to DuckDB. "Ran OK but returned nothing" is a
+    distinct, first-class state (not silently ``ok``): it is logged — WARNING for
+    a source expected to always return data, INFO for an event-driven sparse
+    feed (see ``EXPECTED_SPARSE_SOURCES``) — and surfaced in the Data Quality
+    dashboard tab so a silently-dark source gets investigated.
     """
     t0 = time.time()
     ok, err, result = True, None, None
@@ -132,13 +152,35 @@ def _safe(label: str, fn, *args, **kwargs):
         ok, err = False, str(e)
         logger.warning(f"[{label}] fetch failed: {e}")
     finally:
+        size = _result_size(result) if ok else None
+        empty = bool(ok and size == 0)
+        # A present-but-hollow / partially-filled context object (key fields
+        # missing) counts as "returned nothing useful" even though it's not None.
+        hollow = False
+        if ok and not empty and is_context_populated(label, result) is False:
+            empty, hollow = True, True
         with _SOURCE_LOCK:
             _SOURCE_LOG.append({
                 "label": label,
                 "ok": ok,
                 "error": err,
                 "duration_s": round(time.time() - t0, 3),
+                "n_items": size,
+                "empty": empty,
             })
+        if empty:
+            if label in KNOWN_DEAD_SOURCES:
+                logger.debug(f"[{label}] returned no data (known-dead source, "
+                             "no free replacement)")
+            elif label in EXPECTED_SPARSE_SOURCES:
+                logger.info(f"[{label}] returned no data this run "
+                            "(event-driven source — may be normal)")
+            elif hollow:
+                logger.warning(f"[{label}] returned a HOLLOW/partial context — "
+                               "present but key fields missing; investigate.")
+            else:
+                logger.warning(f"[{label}] returned NOTHING — ran OK but empty. "
+                               "An always-on feed is dark; investigate.")
     return result
 
 

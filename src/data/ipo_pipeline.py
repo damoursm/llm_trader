@@ -151,7 +151,13 @@ def _fetch_filings(cutoff: date, today: date) -> List[dict]:
         resp = httpx.get(
             _EDGAR_SEARCH,
             params={
-                "forms":     "S-1,S-1/A,S-11,S-11/A",
+                # Root forms only. EFTS matches "/A" amendments UNDER the root
+                # form, so "S-1,S-11" returns the full S-1/S-11 family (base +
+                # amendments). Listing the explicit "/A" forms here instead
+                # collapses the result set to ONLY amendments (confirmed live:
+                # "S-1,S-11" → 238 hits incl. base registrations; adding the
+                # "/A" forms → 140, all amendments, zero new registrations).
+                "forms":     "S-1,S-11",
                 "dateRange": "custom",
                 "startdt":   cutoff.isoformat(),
                 "enddt":     today.isoformat(),
@@ -168,7 +174,16 @@ def _fetch_filings(cutoff: date, today: date) -> List[dict]:
 
 
 def _parse_sic(src: dict) -> Optional[int]:
-    """Extract SIC code from a filing source dict if present."""
+    """Extract SIC code from a filing source dict if present.
+
+    EDGAR EFTS returns `sics` as a list of strings (e.g. ["1000"]); the legacy
+    scalar keys are kept as fallbacks for cached/alternate shapes."""
+    sics = src.get("sics")
+    if isinstance(sics, list) and sics:
+        try:
+            return int(str(sics[0]))
+        except (ValueError, TypeError):
+            pass
     for key in ("sic", "sic_code", "sicCode"):
         val = src.get(key)
         if val is not None:
@@ -281,7 +296,10 @@ def fetch_ipo_context(lookback_days: int = 30) -> Optional[IPOContext]:
     seen: set = set()   # deduplicate by (company, date, form)
 
     for src in raw_sources:
-        form_type = src.get("form_type", "").strip()
+        # EDGAR EFTS names this field `form` (e.g. "S-1/A"); the old code read a
+        # non-existent `form_type`, so every hit was dropped and the IPO pipeline
+        # cached an empty result every single day (confirmed against live EFTS).
+        form_type = (src.get("form") or src.get("form_type") or "").strip()
         if not form_type:
             continue
 
@@ -289,11 +307,15 @@ def fetch_ipo_context(lookback_days: int = 30) -> Optional[IPOContext]:
         if filed is None:
             continue
 
-        company = src.get("entity_name", "").strip()
+        # EFTS provides the filer as `display_names`
+        # (e.g. "Idaho Copper Corp  (COPR)  (CIK 0001263364)") — there is no
+        # `entity_name`. Strip the trailing "(TICKER) (CIK …)" parenthetical.
+        company = (src.get("entity_name") or "").strip()
         if not company:
             display = src.get("display_names") or []
-            company = (display[0] if isinstance(display, list) and display
-                       else str(display) if display else "Unknown")
+            raw = (display[0] if isinstance(display, list) and display
+                   else str(display) if display else "")
+            company = raw.split("(")[0].strip() or "Unknown"
 
         key = (company.lower(), filed, form_type)
         if key in seen:

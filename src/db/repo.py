@@ -192,15 +192,16 @@ def insert_run_sources(run_id: str, sources: List[dict]) -> None:
     """Persist the per-source 'APIs used' record for a run (idempotent per run)."""
     rows = [
         (run_id, s.get("label"), s.get("enabled", True), s.get("ok"),
-         s.get("error"), _f(s.get("duration_s")))
+         s.get("error"), _f(s.get("duration_s")), s.get("n_items"), s.get("empty"))
         for s in (sources or [])
     ]
     with connect() as conn:
         conn.execute("DELETE FROM run_sources WHERE run_id = ?", [run_id])
         if rows:
             conn.executemany(
-                "INSERT INTO run_sources (run_id, source_label, enabled, ok, error, duration_s) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO run_sources "
+                "(run_id, source_label, enabled, ok, error, duration_s, n_items, empty) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
 

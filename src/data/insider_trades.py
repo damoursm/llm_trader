@@ -82,7 +82,11 @@ def _fetch_house_trades(cutoff: date, tracked: List[str]) -> List[InsiderTrade]:
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.warning(f"[insider] House watcher fetch failed: {e}")
+        # The public House Stock Watcher S3 dataset returns 403 (anonymous access
+        # revoked, 2026) with no free drop-in replacement, so this fails soft.
+        # Debug, not a per-run WARNING — it's unactionable noise; self-heals if the
+        # dataset is restored.
+        logger.debug(f"[insider] House Stock Watcher unavailable — skipping ({e})")
         return trades
 
     for item in data:
@@ -136,7 +140,9 @@ def _fetch_senate_trades(cutoff: date, tracked: List[str]) -> List[InsiderTrade]
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.warning(f"[insider] Senate watcher fetch failed: {e}")
+        # Same as the House dataset above — the public Senate Stock Watcher S3
+        # bucket returns 403 with no free replacement. Debug, not WARNING.
+        logger.debug(f"[insider] Senate Stock Watcher unavailable — skipping ({e})")
         return trades
 
     for item in data:
