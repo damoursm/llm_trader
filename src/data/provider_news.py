@@ -100,10 +100,49 @@ def fetch_polygon_news(tickers: List[str]) -> List[NewsArticle]:
 
 _FINNHUB_NEWS = "https://finnhub.io/api/v1/company-news"
 
+# Finnhub's per-ticker feed is flooded with generic market-summary "roundups"
+# (not ticker catalysts) that dilute the sentiment digest. Drop them by:
+#   - SOURCE: pure aggregators that only publish auto-generated roundups, and
+#   - TITLE: unambiguous movers/session/roundup phrasing.
+# Confirmed live: ChartMill "Which S&P500 stocks are moving", "Thursday's
+# session:", "most active stock…". Hard catalysts ("Apple beats Q3…", "FDA
+# approves…", "Nvidia announces…") match none of these, so they're never dropped.
+_FINNHUB_NOISE_SOURCES = {"chartmill"}
+_FINNHUB_NOISE_TITLE_PATTERNS = (
+    # market-breadth / movers roundups
+    "stocks are moving", "stocks moving", "most active", "top movers",
+    "biggest movers", "movers within", "making the most noise", "stocks to watch",
+    "what to watch", "trending stocks", "premarket movers", "after-hours movers",
+    "after hours movers", "market wrap", "closing bell", "opening bell",
+    "session:", "stocks that are making", "movers and shakers",
+    "stock market today", "wall street today", "market today:", "s&p 500 ",
+    "dow jones", "nasdaq today",
+    # retail listicle / SEO hooks (Motley Fool / Yahoo syndication) — these
+    # phrasings never appear in an institutional catalyst headline.
+    "hand over fist", "got $", "1 stock", "2 stocks", "3 stocks", "4 stocks",
+    "5 stocks", "stock to buy", "stocks to buy", "stock to sell", "stocks to sell",
+    "best stock", "best stocks", "top stock", "top stocks", "stocks for",
+    "should you buy", "better buy", "is it too late", "no-brainer",
+    "screaming buy", "millionaire", "billionaire", "if you'd invested",
+    "if you invested", "could make you", "would have", "magnificent seven",
+    "where will", "prediction", "reasons to buy", "stock split",
+    "to buy and hold", "dividend stock", "for retirees", "retirement",
+    "smartest", "no brainer", "here are", "vs.",
+)
+
+
+def _is_finnhub_noise(title: str, source: str) -> bool:
+    """True for aggregator roundups / market summaries (not a ticker catalyst)."""
+    if (source or "").strip().lower() in _FINNHUB_NOISE_SOURCES:
+        return True
+    t = (title or "").lower()
+    return any(p in t for p in _FINNHUB_NOISE_TITLE_PATTERNS)
+
 
 def fetch_finnhub_news(tickers: List[str], lookback_days: int = 3,
-                       max_tickers: int = 60) -> List[NewsArticle]:
-    """Real-time Finnhub company-news for each ticker (last ``lookback_days``).
+                       max_tickers: int = 60, max_per_ticker: int = 15) -> List[NewsArticle]:
+    """Real-time Finnhub company-news for each ticker (last ``lookback_days``),
+    noise-filtered and capped to the ``max_per_ticker`` most-recent real articles.
     No per-article sentiment on the free tier, so ``provider_insights`` stays
     empty (these articles still go through the LLM scorer). [] when disabled or
     no key."""
@@ -112,6 +151,7 @@ def fetch_finnhub_news(tickers: List[str], lookback_days: int = 3,
     frm = (date.today() - timedelta(days=lookback_days)).isoformat()
     to = date.today().isoformat()
     out: List[NewsArticle] = []
+    dropped = 0
     for tk in (tickers or [])[:max_tickers]:
         try:
             r = httpx.get(_FINNHUB_NEWS, params={
@@ -125,12 +165,22 @@ def fetch_finnhub_news(tickers: List[str], lookback_days: int = 3,
         except Exception as e:
             logger.debug(f"[finnhub_news] {tk} failed: {e}")
             continue
+        # Newest first, then keep only the top max_per_ticker non-noise articles —
+        # bounds the volume of low-signal back-catalogue Finnhub returns per name.
+        items = sorted(items, key=lambda x: x.get("datetime") or 0, reverse=True)
+        kept_tk = 0
         for item in items:
+            if kept_tk >= max_per_ticker:
+                break
             ts = item.get("datetime")
             headline = (item.get("headline") or "").strip()
             url = (item.get("url") or "").strip()
             if not ts or not headline or not url:
                 continue
+            source = item.get("source") or "Finnhub"
+            if _is_finnhub_noise(headline, source):
+                dropped += 1
+                continue   # generic roundup / listicle — not a ticker catalyst
             try:
                 published = datetime.fromtimestamp(int(ts), tz=timezone.utc)
             except (ValueError, OSError, TypeError):
@@ -139,12 +189,22 @@ def fetch_finnhub_news(tickers: List[str], lookback_days: int = 3,
                 title=headline,
                 summary=(item.get("summary") or "")[:1000],
                 url=url,
-                source=(item.get("source") or "Finnhub"),
+                source=source,
                 published_at=published,
                 tickers=[tk.upper()],
                 provider_sentiment_source="finnhub",
             ))
+            kept_tk += 1
         time.sleep(0.1)   # gentle pacing for the free 60/min tier
     out = _dedupe(out)
-    logger.info(f"[finnhub_news] {len(out)} article(s) across {min(len(tickers or []), max_tickers)} ticker(s)")
+    n_tk = min(len(tickers or []), max_tickers)
+    if out:
+        newest = max(a.published_at for a in out)
+        age_min = (datetime.now(timezone.utc) - newest).total_seconds() / 60.0
+        # Empirical freshness check: how old is the most recent article Finnhub
+        # returned? Lets you SEE whether the feed is <15 min fresh in production.
+        logger.info(f"[finnhub_news] {len(out)} article(s) across {n_tk} ticker(s) "
+                    f"({dropped} noise dropped); newest is {age_min:.0f} min old")
+    else:
+        logger.info(f"[finnhub_news] 0 article(s) across {n_tk} ticker(s) ({dropped} noise dropped)")
     return out

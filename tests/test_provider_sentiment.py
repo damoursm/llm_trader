@@ -109,6 +109,47 @@ def test_fetch_polygon_news_maps_insights(monkeypatch):
     assert a.source == "Benzinga"
 
 
+def test_finnhub_noise_filter_helper():
+    from src.data.provider_news import _is_finnhub_noise
+    # aggregator source → dropped regardless of title
+    assert _is_finnhub_noise("Apple beats Q3 earnings", "ChartMill") is True
+    # generic roundup / movers titles → dropped
+    assert _is_finnhub_noise("Which S&P500 stocks are moving on Thursday?", "Yahoo") is True
+    assert _is_finnhub_noise("Thursday's session: most active stock", "X") is True
+    assert _is_finnhub_noise("These stocks are making the most noise today", "X") is True
+    # real ticker catalysts → kept
+    assert _is_finnhub_noise("Apple beats Q3 earnings, raises guidance", "Reuters") is False
+    assert _is_finnhub_noise("FDA approves Pfizer drug", "Benzinga") is False
+    assert _is_finnhub_noise("Nvidia announces new GPU architecture", "CNBC") is False
+
+
+def test_fetch_finnhub_news_drops_noise(monkeypatch):
+    import time as _t
+    monkeypatch.setattr(pn.settings, "enable_finnhub_news", True)
+    monkeypatch.setattr(pn.settings, "finnhub_api_key", "x")
+    monkeypatch.setattr(pn.time, "sleep", lambda *a, **k: None)
+    ts = int(_t.time())
+    payload = [
+        {"datetime": ts, "headline": "Apple beats Q3 earnings, raises guidance",
+         "url": "http://a", "source": "Reuters", "summary": "s"},
+        {"datetime": ts, "headline": "Which S&P500 stocks are moving on Thursday?",
+         "url": "http://b", "source": "ChartMill", "summary": "s"},
+        {"datetime": ts, "headline": "Thursday's session: most active stock",
+         "url": "http://c", "source": "Marketbeat", "summary": "s"},
+    ]
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return payload
+
+    monkeypatch.setattr(pn.httpx, "get", lambda *a, **k: _Resp())
+    arts = pn.fetch_finnhub_news(["AAPL"])
+    assert len(arts) == 1                      # 2 noise dropped, 1 catalyst kept
+    assert arts[0].title.startswith("Apple beats")
+    assert arts[0].provider_sentiment_source == "finnhub"
+
+
 def test_provider_news_disabled_returns_empty(monkeypatch):
     monkeypatch.setattr(pn.settings, "enable_polygon_news", False)
     assert pn.fetch_polygon_news(["AAPL"]) == []
