@@ -237,7 +237,7 @@ class Settings(BaseSettings):
     # EPS beat/miss: yfinance earnings_dates (free)
     enable_earnings: bool = True
     earnings_lookback_days: int = 90   # how far back to look for recent EPS surprises
-    earnings_upcoming_days: int = 14   # how many days ahead to include in calendar
+    earnings_upcoming_days: int = 30   # how many days ahead to include in calendar
 
     # Short interest — FINRA Reg SHO daily short volume + yfinance (no API key required)
     # Squeeze setups (high SI + low days-to-cover), bearish positioning, short covering signals

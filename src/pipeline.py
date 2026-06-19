@@ -1006,10 +1006,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     )
     insider_trades = smart_money if (smart_money or any_smart_money_enabled) else None
 
-    # Surface tickers discovered via smart money signals
+    # Surface tickers discovered via smart money signals — GATED like every other
+    # discovery source (macro/peer below). 13D/G, 13F, Form 144 and options flow
+    # can surface untradeable OTC microcaps with no OHLCV (e.g. FGRS / "Figure Tech
+    # Blockchain"); without the gate they leaked straight into technical analysis
+    # ("empty data" / "not enough history" warnings) and the bid-ask cost model.
+    # Fail-closed: a name with no verifiable liquidity is dropped (re-appears once
+    # its OHLCV cache is warm).
     if smart_money:
         smart_tickers = get_tickers_from_smart_money(smart_money)
         new_from_smart = [t for t in smart_tickers if t not in all_tickers]
+        new_from_smart = apply_liquidity_gate(new_from_smart, source="smart_money", budget=gate_budget)
         if new_from_smart:
             logger.info(f"Adding {new_from_smart} to universe from smart money signals")
             all_tickers = all_tickers + new_from_smart

@@ -61,15 +61,20 @@ def is_liquid(
     df = _load(ticker, budget)
     if df is None or df.empty:
         return False
-    if "Close" not in df.columns or "Volume" not in df.columns or len(df) < _EVAL_MIN_BARS:
+    if "Close" not in df.columns or "Volume" not in df.columns:
         return False
     try:
-        close = df["Close"].astype(float)
-        vol   = df["Volume"].astype(float)
-        last_close = float(close.iloc[-1])
+        # Drop NaN rows before evaluating: the last bar is often the still-forming
+        # intraday bar (or a trailing yfinance NaN), so reading iloc[-1] raw made
+        # `NaN * NaN >= floor` → False and wrongly gated out liquid large-caps
+        # during RTH. Judge on the last VALID completed bars instead.
+        sub = df[["Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(sub) < _EVAL_MIN_BARS:
+            return False
+        last_close = float(sub["Close"].iloc[-1])
         if last_close < min_price:
             return False
-        avg20_vol = float(vol.iloc[-20:].mean())
+        avg20_vol = float(sub["Volume"].iloc[-20:].mean())
         return avg20_vol * last_close >= min_dollar_volume
     except Exception:
         return False

@@ -113,6 +113,7 @@ def fetch_google_trends(tickers: List[str]) -> List[NewsArticle]:
         logger.warning(f"[google_trends] Failed to initialize pytrends: {e}")
         return []
 
+    n_data_batches = 0   # batches that returned real data (vs empty/rate-limited)
     for batch in batches:
         try:
             # 90 days gives us 7-day recent + 21-day baseline + buffer
@@ -120,9 +121,12 @@ def fetch_google_trends(tickers: List[str]) -> List[NewsArticle]:
             df = pt.interest_over_time()
 
             if df is None or df.empty:
+                # pytrends returns an EMPTY frame (no exception) when Google
+                # rate-limits — count it as a miss, not a successful "no data".
                 logger.debug(f"[google_trends] No data for batch {batch}")
                 time.sleep(_REQUEST_DELAY)
                 continue
+            n_data_batches += 1
 
             # Drop the isPartial column if present
             if "isPartial" in df.columns:
@@ -165,6 +169,15 @@ def fetch_google_trends(tickers: List[str]) -> List[NewsArticle]:
             logger.warning(f"[google_trends] Batch {batch} failed: {e}")
             time.sleep(_REQUEST_DELAY * 2)
 
+    # If EVERY batch came back empty/failed, this is a rate-limit/block — NOT a
+    # genuine "no trending spikes" result. Do NOT cache [] (that poisons the daily
+    # cache so every later tick serves 0 and never retries) and RAISE so the source
+    # is recorded as failed (Data Quality shows an error, not silent-empty).
+    if batches and n_data_batches == 0:
+        raise RuntimeError(
+            f"Google Trends returned no data for any of {len(batches)} batch(es) "
+            "— rate-limited/blocked; not caching"
+        )
     logger.info(f"[google_trends] Generated {len(articles)} trend articles from {len(tickers)} tickers")
     _save_cache(articles)
     return articles
