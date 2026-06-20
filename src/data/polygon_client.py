@@ -14,6 +14,7 @@ Does NOT cover (stay on yfinance for these):
 
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
@@ -25,6 +26,16 @@ from config import settings
 
 _BASE    = "https://api.polygon.io"
 _TIMEOUT = 30.0
+
+# Endpoint families already reported as 403 (entitlement limit) this process —
+# warn once, then debug, so a free-tier-forbidden endpoint doesn't spam the log
+# (the snapshot endpoint logged 54× in one day; yfinance fallback handles it).
+_WARNED_FORBIDDEN: set = set()
+
+
+def _endpoint_family(path: str) -> str:
+    """Collapse a trailing ``/{SYMBOL}`` so per-ticker 403s share one key."""
+    return re.sub(r"/[A-Z0-9.\-=^]+$", "", path)
 
 _PERIOD_DAYS: Dict[str, int] = {
     "5d": 10, "1mo": 35, "3mo": 95, "6mo": 185,
@@ -50,6 +61,20 @@ def _get(path: str, params: Optional[dict] = None) -> Optional[dict]:
         status = exc.response.status_code
         if status == 429:
             logger.warning(f"[polygon] Rate limited on {path} — returning empty (yfinance fallback will apply)")
+        elif status == 403:
+            # Entitlement limit: this endpoint isn't on the current Polygon plan
+            # (e.g. the free tier's real-time snapshot). Not transient, not a rate
+            # limit — the yfinance fallback covers it. Warn once per endpoint, then
+            # debug, so it doesn't repeat every tick.
+            fam = _endpoint_family(path)
+            if fam not in _WARNED_FORBIDDEN:
+                _WARNED_FORBIDDEN.add(fam)
+                logger.warning(
+                    f"[polygon] HTTP 403 on {fam} — endpoint not available on this API "
+                    "plan; using fallback (further 403s on it silenced this run)."
+                )
+            else:
+                logger.debug(f"[polygon] HTTP 403 on {path} (endpoint not on plan)")
         elif status != 404:
             logger.warning(f"[polygon] HTTP {status} on {path}")
         return None

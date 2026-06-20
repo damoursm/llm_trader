@@ -226,27 +226,52 @@ def test_zero_mark_skipped_walk_continues(monkeypatch):
     assert date(2026, 5, 15) in dates_in_walk
 
 
-# ── Open-trade end anchor determinism (Fix #9) ───────────────────────────
+# ── Open-trade end anchor: live mark primary, cached-close fallback ───────────
+# Design note: an OPEN trade is marked to the LIVE current_price each tick so the
+# equity curve reflects the latest intraday price (CLAUDE.md: "Open-position NAV is
+# marked to the live price each tick"). The deterministic cached-close anchor
+# (_open_trade_end_anchor, the original Fix #9) remains the FALLBACK for legacy
+# trades with no live mark — and that fallback is still invariant to wall-clock.
 
-def test_open_trade_compound_invariant_to_current_price(fake_closes):
-    """Two pipeline runs on the same day with different current_price values
-    must produce the same open-trade compound — the engine anchors to the
-    cached close, not the live mark."""
+_OPEN_BASE = {
+    "ticker": "STK", "type": "STOCK", "action": "BUY",
+    "entry_date": "2026-05-12", "entry_price": 100.0,
+    "entry_ref_close": 100.0, "entry_ref_close_date": "2026-05-12",
+    "position_size_multiplier": 1.0, "status": "OPEN",
+}
+
+
+def test_open_trade_tracks_live_mark_when_present(fake_closes):
+    """The open-trade compound moves WITH the live current_price mark — a higher
+    intraday mark yields a higher compound (the live-mark design)."""
     fake_closes("STK",
                 [date(2026, 5, 12), date(2026, 5, 13), date(2026, 5, 14)],
                 [100.0, 105.0, 110.0])
-    base = {
-        "ticker": "STK", "type": "STOCK", "action": "BUY",
-        "entry_date": "2026-05-12", "entry_price": 100.0,
-        "entry_ref_close": 100.0, "entry_ref_close_date": "2026-05-12",
-        "position_size_multiplier": 1.0, "status": "OPEN",
-    }
-    morning   = dict(base, current_price=108.0)   # pre-market thin quote
-    afternoon = dict(base, current_price=115.0)   # intraday
     today = date(2026, 5, 15)
-    a = compute_trade_compound(morning,   today=today)
-    b = compute_trade_compound(afternoon, today=today)
-    assert a == b, f"open-trade compound must be invariant to current_price (got {a} vs {b})"
+    a = compute_trade_compound(dict(_OPEN_BASE, current_price=108.0), today=today)
+    b = compute_trade_compound(dict(_OPEN_BASE, current_price=115.0), today=today)
+    assert a is not None and b is not None
+    assert b > a, f"a higher live mark must raise the compound (got {a} vs {b})"
+
+
+def test_open_trade_fallback_anchor_is_deterministic(fake_closes):
+    """With NO live mark (legacy trade), the engine anchors to the most recent
+    cached close — invariant to the wall-clock time the run happened (Fix #9),
+    and sitting strictly between the live-mark results above/below that close
+    (confirming it anchors at the 110 close, not the live price)."""
+    fake_closes("STK",
+                [date(2026, 5, 12), date(2026, 5, 13), date(2026, 5, 14)],
+                [100.0, 105.0, 110.0])
+    legacy = dict(_OPEN_BASE)                       # no current_price
+    r_early = compute_trade_compound(legacy, today=date(2026, 5, 15))
+    r_late  = compute_trade_compound(legacy, today=date(2026, 5, 16))  # same cache, later run
+    assert r_early is not None
+    assert r_early == r_late, "fallback compound must not depend on wall-clock given the cache"
+
+    # Anchored at the 110 cached close → between the 108 and 115 live-mark walks.
+    lo = compute_trade_compound(dict(_OPEN_BASE, current_price=108.0), today=date(2026, 5, 15))
+    hi = compute_trade_compound(dict(_OPEN_BASE, current_price=115.0), today=date(2026, 5, 15))
+    assert lo < r_early < hi
 
 
 # ── Portfolio aggregation ────────────────────────────────────────────────

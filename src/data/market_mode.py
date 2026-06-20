@@ -88,6 +88,22 @@ _MODE_WEIGHTS = {
     "mcclellan": 1.0,
 }
 
+# Last run's input coverage (available / total market-structure signals), surfaced
+# by the pipeline through ``_collect_sources``. Unlike the regime, low mode coverage
+# needs no behaviour guard — NEUTRAL is already the safe default (no weight tilt).
+_LAST_COVERAGE: dict = {"available": 0, "total": len(_MODE_WEIGHTS)}
+
+
+def reset_mode_coverage() -> None:
+    """Clear the cached market-mode input-coverage (call at run start). total=0 marks
+    'not computed this run' so it never false-alarms in source-health."""
+    _LAST_COVERAGE.update(available=0, total=0)
+
+
+def get_mode_coverage() -> dict:
+    """Snapshot of the most recent market-mode computation's input coverage."""
+    return dict(_LAST_COVERAGE)
+
 # ── Weight profiles for each mode ────────────────────────────────────────────
 # Raw (unnormalised) weights — the aggregator's _normalised_weights() will
 # divide by total so the final fractions depend only on relative ratios.
@@ -136,13 +152,15 @@ def compute_market_mode(
     """
     weighted_score = 0.0
     total_weight   = 0.0
+    inputs_available = 0
     evidence: list[str] = []
 
     def _add(name, signal_val, score_map, weight):
-        nonlocal weighted_score, total_weight
+        nonlocal weighted_score, total_weight, inputs_available
         score = score_map.get(signal_val, 0.0)
         weighted_score += score * weight
         total_weight   += weight
+        inputs_available += 1
         evidence.append(f"{name}={signal_val}({score:+.2f})")
 
     if vix_context is not None:
@@ -163,6 +181,8 @@ def compute_market_mode(
     else:
         mode = "NEUTRAL"
 
+    inputs_total = len(_MODE_WEIGHTS)
+    _LAST_COVERAGE.update(available=inputs_available, total=inputs_total)
     weight_profile = WEIGHT_PROFILES[mode]
     evidence_str   = "  |  ".join(evidence) if evidence else "no market-structure inputs available"
 
@@ -194,4 +214,6 @@ def compute_market_mode(
         evidence=evidence_str,
         weight_summary=weight_summary,
         summary=summary,
+        inputs_available=inputs_available,
+        inputs_total=inputs_total,
     )

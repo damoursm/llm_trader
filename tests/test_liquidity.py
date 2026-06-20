@@ -45,3 +45,10 @@ def test_gate_dedupes_and_uppercases(monkeypatch):
     monkeypatch.setattr(liquidity.settings, "enable_discovery_liquidity_gate", False)
     # no-op mode still cleans the input (dedupe + uppercase)
     assert liquidity.apply_liquidity_gate(["aapl", "AAPL", "nvda"]) == ["AAPL", "NVDA"]
+
+
+def test_gate_drops_junk_tickers(monkeypatch):
+    # "N/A" and friends leaking from a discovery source must never survive the
+    # gate's cleaning pass — they otherwise reach yfinance and spam the log.
+    monkeypatch.setattr(liquidity.settings, "enable_discovery_liquidity_gate", False)
+    assert liquidity.apply_liquidity_gate(["AAPL", "N/A", "--", "", "nvda"]) == ["AAPL", "NVDA"]

@@ -56,6 +56,12 @@ EXPECTED_SPARSE_SOURCES = frozenset({
     "8k", "sec", "analyst", "eps", "pead", "short",
     "trends", "reddit", "whisper", "revision", "options", "gex",
     "earnings_cal", "macro_news", "polygon_news", "finnhub_news",
+    # Alpha Vantage pre-scored news + StockTwits crowd sentiment — optional,
+    # off by default, and event/coverage-sparse (no qualifying article/chatter).
+    "av_news", "stocktwits",
+    # Quiver alt-data — all event-driven (a ticker may have no congress trade /
+    # contract / lobbying / dark-pool shift in the window).
+    "quiver_congress", "quiver_contracts", "quiver_lobbying", "quiver_offexchange",
 })
 
 

@@ -122,8 +122,83 @@ def test_fetch_cached_news_excludes_rss(monkeypatch):
 def test_fetch_all_news_merges_cached_and_rss_deduped(monkeypatch):
     monkeypatch.setattr(news_fetcher, "fetch_cached_news", lambda t, s: [_art("c")])
     monkeypatch.setattr(news_fetcher, "fetch_rss_news", lambda: [_art("r"), _art("c")])  # "c" dups
+    monkeypatch.setattr(news_fetcher, "fetch_google_news", lambda t: [_art("g"), _art("c")])  # "c" dups
     titles = [a.title for a in news_fetcher.fetch_all_news(["AAA"], [])]
-    assert titles.count("c") == 1 and "r" in titles
+    assert titles.count("c") == 1 and "r" in titles and "g" in titles
+
+
+# ── Google News RSS (per-ticker + Business Wire) ─────────────────────────────
+
+def _gfeed(entries):
+    class _F:
+        pass
+    f = _F()
+    f.entries = entries
+    return f
+
+
+def _genable(monkeypatch):
+    monkeypatch.setattr(news_fetcher.settings, "enable_google_news", True)
+    monkeypatch.setattr(news_fetcher.settings, "google_news_max_tickers", 50)
+    monkeypatch.setattr(news_fetcher.settings, "google_news_business_wire", True)
+
+
+def test_fetch_google_news_maps_tickers_and_queries_business_wire(monkeypatch):
+    import time as _t
+    _genable(monkeypatch)
+    recent = _t.gmtime()
+    seen = []
+
+    def fake_parse(url):
+        seen.append(url)
+        return _gfeed([{"title": "AAPL soars", "summary": "x", "link": f"http://g/{len(seen)}",
+                        "published_parsed": recent, "source": {"title": "Reuters"}}])
+
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", fake_parse)
+    arts = news_fetcher.fetch_google_news(["AAPL"])
+
+    assert len(seen) == 2                                  # general + Business Wire query
+    assert any("businesswire.com" in u for u in seen)
+    assert arts and all(a.tickers == ["AAPL"] for a in arts)
+    assert any(a.source == "google_news/Reuters" for a in arts)
+
+
+def test_fetch_google_news_dedupes_identical_urls(monkeypatch):
+    import time as _t
+    _genable(monkeypatch)
+    recent = _t.gmtime()
+    # Both the general and BW query return the SAME article URL → one survives.
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", lambda url: _gfeed(
+        [{"title": "dup", "summary": "", "link": "http://same", "published_parsed": recent}]))
+    arts = news_fetcher.fetch_google_news(["AAPL"])
+    assert len(arts) == 1
+
+
+def test_fetch_google_news_drops_stale(monkeypatch):
+    import time as _t
+    _genable(monkeypatch)
+    stale = _t.gmtime(_t.time() - 30 * 86400)             # 30 days old
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", lambda url: _gfeed(
+        [{"title": "old", "summary": "", "link": "http://o", "published_parsed": stale}]))
+    assert news_fetcher.fetch_google_news(["AAPL"], max_age_hours=24) == []
+
+
+def test_fetch_google_news_skips_non_equity_and_caps(monkeypatch):
+    _genable(monkeypatch)
+    monkeypatch.setattr(news_fetcher.settings, "google_news_max_tickers", 2)
+    queried = []
+    monkeypatch.setattr(news_fetcher.feedparser, "parse",
+                        lambda url: (queried.append(url) or _gfeed([])))
+    # ^VIX (index) and GC=F (future) skipped; cap=2 keeps the first two equities.
+    news_fetcher.fetch_google_news(["^VIX", "GC=F", "AAPL", "MSFT", "NVDA"])
+    assert all("VIX" not in u and "GC" not in u for u in queried)
+    tickers_hit = {t for t in ("AAPL", "MSFT", "NVDA") if any(t in u for u in queried)}
+    assert tickers_hit == {"AAPL", "MSFT"}                # NVDA dropped by the cap
+
+
+def test_fetch_google_news_disabled(monkeypatch):
+    monkeypatch.setattr(news_fetcher.settings, "enable_google_news", False)
+    assert news_fetcher.fetch_google_news(["AAPL"]) == []
 
 
 def test_fetch_rss_includes_pr_wires(monkeypatch):
@@ -139,6 +214,30 @@ def test_fetch_rss_includes_pr_wires(monkeypatch):
     assert news_fetcher.PR_WIRE_FEEDS                      # wires configured
     for u in {**news_fetcher.RSS_FEEDS, **news_fetcher.PR_WIRE_FEEDS}.values():
         assert u in seen
+
+
+class _EmptyFeed:
+    entries = []
+    bozo = 0
+
+
+def test_fetch_rss_includes_fda_when_enabled(monkeypatch):
+    """FDA / MedWatch regulatory feeds ride the fresh fast-lane when enabled."""
+    seen = []
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", lambda url: (seen.append(url) or _EmptyFeed()))
+    monkeypatch.setattr(news_fetcher.settings, "enable_fda_news", True)
+    news_fetcher.fetch_rss_news()
+    for u in news_fetcher.FDA_FEEDS.values():
+        assert u in seen
+
+
+def test_fetch_rss_excludes_fda_when_disabled(monkeypatch):
+    seen = []
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", lambda url: (seen.append(url) or _EmptyFeed()))
+    monkeypatch.setattr(news_fetcher.settings, "enable_fda_news", False)
+    news_fetcher.fetch_rss_news()
+    for u in news_fetcher.FDA_FEEDS.values():
+        assert u not in seen
 
 
 def test_pipeline_fetch_news_fast_lanes_rss(monkeypatch):

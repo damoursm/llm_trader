@@ -29,6 +29,23 @@ from loguru import logger
 from config import settings
 from src.data.cache import load_ohlcv
 
+# Per-run correlation-sizing health. The haircut silently drops pairs it can't
+# compute (missing OHLCV cache, too little overlap) — a *failure* is then
+# indistinguishable from a genuine ρ≈0, weakening the concentration haircut
+# unseen. These counters let ``_collect_sources`` surface a high failure rate
+# (run_sources → Data Quality tab + health banner).
+_CORR_HEALTH: dict = {"attempted": 0, "failed": 0}
+
+
+def reset_correlation_health() -> None:
+    """Clear the per-run correlation-sizing health counters (call at run start)."""
+    _CORR_HEALTH.update(attempted=0, failed=0)
+
+
+def get_correlation_health() -> dict:
+    """Snapshot of this run's correlation-pair compute outcomes."""
+    return dict(_CORR_HEALTH)
+
 
 def _load_log_returns(ticker: str, days: int) -> Optional[pd.Series]:
     """Return a date-indexed log-return Series for *ticker* over the last
@@ -121,8 +138,10 @@ def mean_pairwise_correlation(
         other_up = other.upper()
         if other_up == cand:
             continue
+        _CORR_HEALTH["attempted"] += 1
         r = pairwise_correlation(cand, other_up, days=days)
         if r is None:
+            _CORR_HEALTH["failed"] += 1   # couldn't compute — NOT a true ρ≈0
             continue
         rhos[other_up] = r
     if not rhos:

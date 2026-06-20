@@ -61,9 +61,23 @@ def run_supervised() -> None:
     try:
         while True:
             started = time.time()
-            logger.info(f"[supervisor] launching: {' '.join(cmd)}")
-            child = subprocess.Popen(cmd, cwd=str(_ROOT))
-            code = child.wait()                         # blocks until the scheduler exits
+            try:
+                logger.info(f"[supervisor] launching: {' '.join(cmd)}")
+                child = subprocess.Popen(cmd, cwd=str(_ROOT))
+                code = child.wait()                     # blocks until the scheduler exits
+            except KeyboardInterrupt:
+                raise                                   # clean shutdown via the outer handler
+            except Exception as exc:
+                # A spawn/wait failure (OSError, transient OS error, etc.) must NOT
+                # propagate — that would kill the supervisor itself, the silent death
+                # it exists to prevent (observed: the scheduler was dead with no
+                # supervisor alive to relaunch it). Log, back off, and retry.
+                logger.exception(
+                    f"[supervisor] launch/wait failed ({exc}) — backing off {backoff}s and retrying."
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _BACKOFF_MAX_S)
+                continue
             uptime = time.time() - started
             restarts += 1
             logger.critical(

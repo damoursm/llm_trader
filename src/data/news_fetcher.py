@@ -2,7 +2,9 @@
 
 import feedparser
 import httpx
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
 from loguru import logger
 from typing import List
 from src.models import NewsArticle
@@ -47,6 +49,16 @@ PR_WIRE_FEEDS = {
     "prnewswire_ma": "https://www.prnewswire.com/rss/financial-services-latest-news/acquisitions-mergers-and-takeovers-list.rss",
 }
 
+# Regulatory catalyst feeds — FDA approvals/CRLs and MedWatch recalls are binary,
+# market-moving events for drug/device names that the general wires sometimes lag.
+# Market-wide (mapped to tickers downstream via the keyword aliases, like the other
+# RSS feeds); gated by enable_fda_news. URLs verified live 2026-06-19. On the same
+# fresh-every-tick fast lane as RSS_FEEDS.
+FDA_FEEDS = {
+    "fda_press": "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
+    "fda_medwatch": "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/medwatch/rss.xml",
+}
+
 
 def fetch_rss_news(max_age_hours: int = 24) -> List[NewsArticle]:
     """Fetch news from all RSS + press-release-wire feeds, filtered to recent
@@ -55,7 +67,10 @@ def fetch_rss_news(max_age_hours: int = 24) -> List[NewsArticle]:
     articles: List[NewsArticle] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
 
-    for source, url in {**RSS_FEEDS, **PR_WIRE_FEEDS}.items():
+    feeds = {**RSS_FEEDS, **PR_WIRE_FEEDS}
+    if settings.enable_fda_news:
+        feeds.update(FDA_FEEDS)          # regulatory catalysts on the fresh fast lane
+    for source, url in feeds.items():
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries:
@@ -166,6 +181,92 @@ def fetch_ticker_news(tickers: List[str], max_age_hours: int = 168) -> List[News
     return out
 
 
+# Google News RSS search — free, no key, near-real-time, and far broader than the
+# 5 fixed market feeds: a per-ticker query surfaces Reuters / Bloomberg / Barron's /
+# FT / Investing.com AND Business Wire (the one wire our direct feeds miss). Each
+# article is tied to its ticker by the query, so it maps directly — no fuzzy
+# title matching (the same reason fetch_ticker_news beats the keyword pools).
+_GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+_GOOGLE_NEWS_WORKERS = 6   # modest fan-out so a 40-name universe doesn't burst-trip Google
+
+
+def _google_entry_source(entry) -> str:
+    """Real publisher name from a Google News entry → 'google_news/<Publisher>'
+    (keeps source-diversity scoring meaningful), falling back to 'google_news'."""
+    try:
+        src = entry.get("source")
+        title = src.get("title") if isinstance(src, dict) else getattr(src, "title", None)
+        if title:
+            return f"google_news/{title}"
+    except Exception:
+        pass
+    return "google_news"
+
+
+def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool) -> List[NewsArticle]:
+    """Per-ticker Google News: a general query + (optionally) a Business Wire
+    site-query. Fails soft so one bad symbol never aborts the batch."""
+    queries = [f'"{ticker}" stock']
+    if with_bw:
+        queries.append(f'"{ticker}" site:businesswire.com')
+    out: List[NewsArticle] = []
+    for q in queries:
+        try:
+            feed = feedparser.parse(_GOOGLE_NEWS_RSS.format(q=quote_plus(q)))
+        except Exception as e:
+            logger.debug(f"[google_news] {ticker} query failed: {e}")
+            continue
+        for entry in feed.entries:
+            pub = _parse_feed_date(entry)
+            if pub and pub < cutoff:
+                continue
+            title = (entry.get("title") or "").strip()
+            if not title:
+                continue
+            out.append(NewsArticle(
+                title=title,
+                summary=entry.get("summary", ""),
+                url=entry.get("link", ""),
+                source=_google_entry_source(entry),
+                published_at=pub or datetime.now(timezone.utc),
+                tickers=[ticker.upper()],
+            ))
+    return out
+
+
+def fetch_google_news(tickers: List[str], max_age_hours: int = 24) -> List[NewsArticle]:
+    """Per-ticker Google News RSS (general + Business Wire), ticker-tagged.
+
+    Free and near-real-time, so the pipeline fetches it FRESH every tick (the
+    reactivity fast-lane). Bounded by ``google_news_max_tickers`` and fanned out
+    over a small thread pool to keep the per-tick request burst reasonable;
+    fail-soft per ticker. Skips non-equity symbols (futures ``=``, indices ``^``)
+    that produce junk queries. Deduped by URL within this source.
+    """
+    if not settings.enable_google_news:
+        return []
+    eligible = [t for t in tickers if t and "=" not in t and not t.startswith("^")]
+    cap = int(settings.google_news_max_tickers)
+    if cap > 0:
+        eligible = eligible[:cap]
+    if not eligible:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    with_bw = bool(settings.google_news_business_wire)
+    out: List[NewsArticle] = []
+    workers = max(1, min(_GOOGLE_NEWS_WORKERS, len(eligible)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gnews") as ex:
+        futs = [ex.submit(_fetch_google_news_for_ticker, t, cutoff, with_bw) for t in eligible]
+        for f in as_completed(futs):
+            try:
+                out.extend(f.result() or [])
+            except Exception as e:
+                logger.debug(f"[google_news] worker failed: {e}")
+    out = _dedupe_by_url(out)
+    logger.info(f"Google News: {len(out)} articles across {len(eligible)} tickers (BW={with_bw})")
+    return out
+
+
 def _dedupe_by_url(articles: List[NewsArticle]) -> List[NewsArticle]:
     """Drop duplicate URLs, first occurrence wins (preserves source ordering)."""
     seen = set()
@@ -208,10 +309,14 @@ def fetch_all_news(tickers: List[str], sectors: List[str]) -> List[NewsArticle]:
     """Full FRESH bundle (cache-worthy sources + live RSS/wires), deduped.
 
     Direct callers (e.g. the hold-review refetch) get everything fresh in one
-    call. The SCHEDULED pipeline instead splits these — ``fetch_cached_news``
-    hourly-cached + ``fetch_rss_news`` every tick — so RSS stays real-time
-    without re-hammering the rate-limited per-ticker feed."""
-    unique = _dedupe_by_url(fetch_cached_news(tickers, sectors) + fetch_rss_news())
+    call — including per-ticker Google News, so held positions are re-judged on
+    the broadest coverage. The SCHEDULED pipeline instead splits these —
+    ``fetch_cached_news`` hourly-cached + ``fetch_rss_news`` + ``fetch_google_news``
+    every tick — so RSS stays real-time without re-hammering the rate-limited
+    per-ticker feed."""
+    unique = _dedupe_by_url(
+        fetch_cached_news(tickers, sectors) + fetch_rss_news() + fetch_google_news(tickers)
+    )
     logger.info(f"Total unique articles: {len(unique)}")
     return unique
 

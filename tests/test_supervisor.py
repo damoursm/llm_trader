@@ -35,6 +35,24 @@ def test_supervisor_respawns_on_exit_then_stops_clean(monkeypatch):
     assert launches["n"] == 3              # launched 3× (2 respawns + the interrupted one)
 
 
+def test_supervisor_survives_spawn_failure(monkeypatch):
+    """A subprocess spawn/wait error must NOT kill the supervisor (the silent-death
+    bug) — it logs, backs off, and retries. A KeyboardInterrupt then stops it clean."""
+    attempts = {"n": 0}
+
+    def _popen(cmd, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] >= 3:
+            raise KeyboardInterrupt        # stop the test after 2 failed spawns
+        raise OSError("transient spawn failure")
+
+    monkeypatch.setattr(sup.subprocess, "Popen", _popen)
+    monkeypatch.setattr(sup.time, "sleep", lambda *_: None)
+
+    sup.run_supervised()                   # must return cleanly, NOT propagate OSError
+    assert attempts["n"] == 3              # retried after each OSError until interrupted
+
+
 def test_supervisor_launches_the_schedule_child(monkeypatch):
     """The supervised child is exactly `python main.py --schedule`, run from root."""
     seen = {}

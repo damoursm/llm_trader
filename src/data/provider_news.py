@@ -17,8 +17,10 @@ existing RSS/NewsAPI/LLM path is unaffected):
 """
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional
 
 import httpx
@@ -137,6 +139,136 @@ def _is_finnhub_noise(title: str, source: str) -> bool:
         return True
     t = (title or "").lower()
     return any(p in t for p in _FINNHUB_NOISE_TITLE_PATTERNS)
+
+
+# ── Alpha Vantage NEWS_SENTIMENT (pre-scored — feeds the LLM-skip hybrid) ─────
+#
+# AV returns per-article, per-ticker sentiment labels, so (like Polygon insights)
+# it can score tickers WITHOUT an LLM call. The catch is the FREE tier's ~25
+# requests/DAY, shared with discovery (trending.py) + the earnings calendar — so
+# this is ONE batched multi-ticker call, hourly-cached, and OFF by default
+# (enable_alpha_vantage_news). Turn it on only on a paid AV tier, or if you don't
+# rely on AV elsewhere. URL/schema are AV's stable documented NEWS_SENTIMENT shape.
+_AV_NEWS_URL = "https://www.alphavantage.co/query"
+_AV_CACHE_DIR = Path("cache")
+
+
+def _av_label(lbl: Optional[str]) -> Optional[str]:
+    """Map an AV ticker_sentiment_label (Bullish / Somewhat-Bullish / Neutral /
+    Somewhat-Bearish / Bearish) to the hybrid's bullish|bearish|neutral."""
+    l = (lbl or "").strip().lower()
+    if "bull" in l:
+        return "bullish"
+    if "bear" in l:
+        return "bearish"
+    if "neutral" in l:
+        return "neutral"
+    return None
+
+
+def _parse_av_time(s: Optional[str]) -> Optional[datetime]:
+    """AV time_published is 'YYYYMMDDTHHMMSS' (UTC)."""
+    try:
+        return datetime.strptime(str(s), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _av_cache_path() -> Path:
+    key = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H")
+    return _AV_CACHE_DIR / f"av_news_{key}.json"
+
+
+def _load_av_cache() -> Optional[List[NewsArticle]]:
+    path = _av_cache_path()
+    if not path.exists():
+        return None
+    try:
+        return [NewsArticle.model_validate(a) for a in json.loads(path.read_text(encoding="utf-8"))]
+    except Exception as e:
+        logger.warning(f"[av_news] cache load failed: {e}")
+        return None
+
+
+def _save_av_cache(articles: List[NewsArticle]) -> None:
+    try:
+        _AV_CACHE_DIR.mkdir(exist_ok=True)
+        _av_cache_path().write_text(
+            json.dumps([a.model_dump(mode="json") for a in articles], default=str),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning(f"[av_news] cache save failed: {e}")
+
+
+def fetch_alpha_vantage_news(tickers: List[str]) -> List[NewsArticle]:
+    """ONE batched AV NEWS_SENTIMENT call for the universe, with per-ticker
+    sentiment attached (provider_insights → LLM-skip). Hourly-cached to stay
+    inside the free 25/day budget. [] when disabled / no key / quota hit."""
+    if not settings.enable_alpha_vantage_news or not settings.alpha_vantage_key:
+        return []
+    cached = _load_av_cache()
+    if cached is not None:
+        logger.info(f"[av_news] {len(cached)} cached article(s) (hourly)")
+        return cached
+
+    universe = [t.upper() for t in (tickers or []) if t]
+    cap = int(settings.alpha_vantage_news_max_tickers)
+    subset = universe[:cap] if cap > 0 else universe
+    if not subset:
+        return []
+    try:
+        r = httpx.get(_AV_NEWS_URL, params={
+            "function": "NEWS_SENTIMENT", "tickers": ",".join(subset),
+            "apikey": settings.alpha_vantage_key, "limit": 200, "sort": "LATEST",
+        }, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"[av_news] fetch failed: {e}")
+        return []
+
+    feed = data.get("feed")
+    if not isinstance(feed, list):
+        # AV signals quota/rate problems via an Information/Note string (HTTP 200).
+        note = data.get("Information") or data.get("Note") or data.get("Error Message")
+        if note:
+            logger.warning(f"[av_news] {str(note)[:140]}")
+        return []
+
+    uni = set(subset)
+    out: List[NewsArticle] = []
+    for item in feed:
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        if not title or not url:
+            continue
+        insights, tks = {}, []
+        for ts in (item.get("ticker_sentiment") or []):
+            tk = (ts.get("ticker") or "").upper()
+            if tk not in uni:
+                continue
+            tks.append(tk)
+            lbl = _av_label(ts.get("ticker_sentiment_label"))
+            if lbl:
+                insights[tk] = lbl
+        if not tks:
+            continue   # article didn't actually touch our universe
+        out.append(NewsArticle(
+            title=title,
+            summary=(item.get("summary") or "")[:1000],
+            url=url,
+            source=(item.get("source") or "AlphaVantage"),
+            published_at=_parse_av_time(item.get("time_published")) or datetime.now(timezone.utc),
+            tickers=tks,
+            provider_insights=insights,
+            provider_sentiment_source="alphavantage" if insights else None,
+        ))
+    out = _dedupe(out)
+    _save_av_cache(out)
+    scored = sum(1 for a in out if a.provider_insights)
+    logger.info(f"[av_news] {len(out)} article(s) for universe ({scored} pre-scored); 1 AV request this hour")
+    return out
 
 
 def fetch_finnhub_news(tickers: List[str], lookback_days: int = 3,

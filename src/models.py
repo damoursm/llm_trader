@@ -738,6 +738,8 @@ class MarketModeContext(BaseModel):
     evidence: str = ""           # pipe-separated per-source contributions
     weight_summary: str = ""     # human-readable weight delta vs. NEUTRAL baseline
     summary: str = ""
+    inputs_available: int = 0    # market-structure signals that contributed
+    inputs_total: int = 0        # total possible signals (coverage = available/total)
 
 
 class MacroRegimeContext(BaseModel):
@@ -749,6 +751,8 @@ class MacroRegimeContext(BaseModel):
     has_panic_signal: bool = False  # at least one source (VIX or MOVE) fired PANIC
     evidence: str = ""              # pipe-separated per-source contributions
     summary: str = ""              # human-readable full summary
+    inputs_available: int = 0       # macro signals that contributed
+    inputs_total: int = 0           # total possible macro signals (coverage = available/total)
 
 
 class SectorPair(BaseModel):

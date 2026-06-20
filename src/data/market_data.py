@@ -16,12 +16,13 @@ Rate-limit handling (yfinance fallback only)
   …up to BACKOFF_MAX                      (600 s)
 """
 
+import re
 import time
 import yfinance as yf
 import pandas as pd
 from datetime import datetime as _datetime, time as _dtime
 from loguru import logger
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 from config import settings
 from src.models import TickerSnapshot
 from src.data import polygon_client
@@ -33,6 +34,43 @@ except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo as _ZoneInfo  # type: ignore
 _NY_TZ = _ZoneInfo("America/New_York")
 _MARKET_CLOSE = _dtime(16, 0)
+
+
+# ── Ticker validation ─────────────────────────────────────────────────────────
+# A junk ticker (most often the literal "N/A" leaking from a discovery source
+# whose ticker field was missing) reaches yfinance, which then raises an opaque
+# "'Response' object is not subscriptable" deep inside its parser — observed 268×
+# in one day's log, plus 30× "Not enough history for N/A" downstream. The legit
+# universe uses only: plain symbols (AAPL), class shares (BRK-B), futures (CL=F,
+# GC=F), the DXY (DX-Y.NYB), and ^-prefixed indices (^VIX, ^NYAD). None contain a
+# "/" or whitespace, so a single positive-charset check rejects the junk without
+# touching any real ticker.
+_VALID_TICKER_RE = re.compile(r"^\^?[A-Z][A-Z0-9.\-=]{0,11}$")
+_TICKER_JUNK = frozenset({"N/A", "NA", "NAN", "NONE", "NULL", "--", "-", ""})
+
+
+def is_valid_ticker(ticker: Optional[str]) -> bool:
+    """True iff ``ticker`` is a well-formed symbol (rejects ``N/A``/junk/blank)."""
+    if not isinstance(ticker, str):
+        return False
+    s = ticker.strip().upper()
+    if s in _TICKER_JUNK:
+        return False
+    return bool(_VALID_TICKER_RE.match(s))
+
+
+def sanitize_tickers(tickers: Iterable[str]) -> List[str]:
+    """Upper-case, de-dupe (order-preserving), and drop invalid/junk tickers."""
+    seen: set = set()
+    out: List[str] = []
+    for t in tickers or []:
+        if not is_valid_ticker(t):
+            continue
+        s = t.strip().upper()
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def _bar_session_date(ts):
@@ -341,6 +379,14 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
     """
     from src.data.cache import load_ohlcv, save_ohlcv
     from datetime import date as _date
+
+    # Fail fast on a junk ticker ("N/A" etc.) so it never reaches yfinance — which
+    # raises an opaque "'Response' object is not subscriptable" on a bad symbol and
+    # spams the log (268× in one day). Defense-in-depth: the pipeline also sanitizes
+    # the universe, but the tracker / liquidity warm-up / other callers route here too.
+    if not is_valid_ticker(ticker):
+        logger.debug(f"[market_data] get_history: skipping invalid ticker {ticker!r}")
+        return pd.DataFrame()
 
     cached = load_ohlcv(ticker)
     if cached is not None and not cached.empty and not force_refresh:

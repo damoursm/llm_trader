@@ -20,6 +20,10 @@ from src.broker.base import (
     AccountSnapshot, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
 )
 
+# Non-USD base currencies already flagged this process — the account config is
+# static, so warn once instead of every get_account() call (29×/day in one log).
+_WARNED_NON_USD_CCY: set = set()
+
 
 def to_ib_symbol(ticker: str) -> str:
     """Map a yfinance-style ticker to IBKR symbology.
@@ -115,10 +119,12 @@ class IBKRBroker(Broker):
                     return 0.0
 
             currency = vals.get("NetLiquidation", ("", "USD"))[1] or "USD"
-            if currency != "USD":
+            if currency != "USD" and currency not in _WARNED_NON_USD_CCY:
+                _WARNED_NON_USD_CCY.add(currency)
                 logger.warning(
                     f"[broker:ibkr] account base currency is {currency}, not USD — sizing "
-                    "assumes USD. Set your IBKR paper account base currency to USD to avoid FX skew."
+                    "assumes USD. Set your IBKR paper account base currency to USD to avoid FX skew. "
+                    "(warned once per run)"
                 )
             return AccountSnapshot(
                 equity=num("NetLiquidation"), cash=num("TotalCashValue"),

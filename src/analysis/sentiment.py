@@ -15,6 +15,7 @@ Precision controls:
 import json
 import math
 import random
+import re
 import threading
 import anthropic
 from datetime import datetime, timezone
@@ -35,6 +36,14 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"   # DeepSeek V4-Flash — cheapest/latest (
 # OpenAI SDK's extra_body since `thinking` is a DeepSeek-specific parameter.
 _DEEPSEEK_THINKING_OFF = {"thinking": {"type": "disabled"}}
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+# Output ceiling for the sentiment call. The old 256 truncated a verbose DeepSeek
+# rationale mid-JSON (XBI) → invalid JSON → lost score. max_tokens is only a CEILING
+# — the model stops at the JSON close and is billed per ACTUAL token, so a score +
+# short rationale still emits ~100 tokens regardless. A generous cap therefore costs
+# nothing and makes truncation impossible. Shared by both engines (≤ Haiku 4.5's
+# 8192 hard limit; DeepSeek accepts far more — synthesis uses 32000).
+_SENTIMENT_MAX_TOKENS = 4096
 
 # Thread-safe tally of which provider answered each per-ticker sentiment call this
 # run (sentiment runs concurrently across tickers). Surfaced to the pipeline as the
@@ -138,10 +147,24 @@ def _parse_response(raw: str) -> tuple[float, str]:
         if raw.startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
-    data = json.loads(raw)
-    score = max(-1.0, min(1.0, float(data["score"])))
-    rationale = str(data["rationale"])
-    return score, rationale
+    try:
+        data = json.loads(raw)
+        score = max(-1.0, min(1.0, float(data["score"])))
+        rationale = str(data["rationale"])
+        return score, rationale
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        # Salvage a truncated/malformed response (e.g. DeepSeek hitting the
+        # 256-token cap mid-rationale → invalid JSON, observed for XBI). The score
+        # is the only field that feeds the aggregator, so recover it by regex
+        # rather than lose the signal to a 0.0 fallback — especially valuable when
+        # the other engine is rate-limited and can't be tried.
+        m = re.search(r'"score"\s*:\s*(-?\d+(?:\.\d+)?)', raw)
+        if not m:
+            raise
+        score = max(-1.0, min(1.0, float(m.group(1))))
+        rm = re.search(r'"rationale"\s*:\s*"(.*?)(?:"\s*[},]|$)', raw, re.DOTALL)
+        rationale = rm.group(1).strip() if rm else "Rationale unavailable (truncated response)."
+        return score, rationale
 
 
 def _recency_weight(article: NewsArticle) -> float:
@@ -364,7 +387,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                     continue
                 response = deepseek.chat.completions.create(
                     model=DEEPSEEK_MODEL,
-                    max_tokens=256,
+                    max_tokens=_SENTIMENT_MAX_TOKENS,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                     seed=_LLM_SEED,
@@ -375,7 +398,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                 client = _get_haiku()
                 message = client.messages.create(
                     model=HAIKU_MODEL,
-                    max_tokens=256,
+                    max_tokens=_SENTIMENT_MAX_TOKENS,
                     messages=[{"role": "user",
                                "content": _anthropic_user_content(_SENTIMENT_PREFIX, suffix, HAIKU_MODEL)}],
                     temperature=0,

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from src.utils import now_et, fmt_et
-from src.data.news_fetcher import fetch_all_news, fetch_cached_news, fetch_rss_news, _dedupe_by_url
+from src.data.news_fetcher import fetch_all_news, fetch_cached_news, fetch_rss_news, fetch_google_news, _dedupe_by_url
 from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
 from src.data.trending import get_trending_tickers
@@ -52,7 +52,11 @@ from src.data.sector_rotation import fetch_sector_rotation_context
 from src.data.rotation_drivers import fetch_rotation_drivers_context
 from src.data.intermarket import fetch_intermarket_context
 from src.data.macro_news import fetch_macro_news_context
-from src.data.provider_news import fetch_polygon_news, fetch_finnhub_news
+from src.data.provider_news import fetch_polygon_news, fetch_finnhub_news, fetch_alpha_vantage_news
+from src.data.stocktwits import fetch_stocktwits_sentiment
+from src.data.quiver import (
+    fetch_congress_trades, fetch_gov_contracts, fetch_lobbying, fetch_offexchange,
+)
 from src.data.macro_regime import compute_macro_regime
 from src.data.market_mode import compute_market_mode
 from src.data.business_cycle_rotation import compute_business_cycle_context
@@ -113,6 +117,80 @@ def _collect_sources() -> list:
                 "enabled": True,
                 "ok": n == 0,
                 "error": f"{n} ticker(s) had no price: {shown}" if n else None,
+                "duration_s": None,
+            })
+    except Exception:
+        pass
+
+    # FX sizing rate — a silent fallback to the static CAD→USD constant (or an
+    # assumed 1.0) mis-sizes every converted order. Only reported when the broker
+    # actually performed a non-USD conversion this run.
+    try:
+        from src.broker.fx import get_fx_health
+        fxh = get_fx_health()
+        fx_attempts = fxh["live"] + fxh["fallback"] + fxh["assumed_one"]
+        if fx_attempts:
+            bad = fxh["fallback"] + fxh["assumed_one"]
+            sources.append({
+                "label": "FX rate (sizing CAD→USD)",
+                "enabled": True,
+                "ok": bad == 0,
+                "error": (f"live quote unavailable — {fxh['fallback']} fallback-rate / "
+                          f"{fxh['assumed_one']} assumed-1.0 conversion(s)") if bad else None,
+                "duration_s": None,
+            })
+    except Exception:
+        pass
+
+    # Correlation sizing — pairs that fail to compute are silently dropped, so a
+    # high failure rate quietly weakens the concentration haircut.
+    try:
+        from src.performance.correlation import get_correlation_health
+        ch = get_correlation_health()
+        if ch["attempted"]:
+            fail_pct = ch["failed"] / ch["attempted"]
+            over = fail_pct > float(settings.correlation_health_max_fail_pct)
+            sources.append({
+                "label": "Correlation sizing",
+                "enabled": True,
+                "ok": not over,
+                "error": (f"{ch['failed']}/{ch['attempted']} pair(s) ({fail_pct:.0%}) "
+                          "failed to compute — haircut weakened") if over else None,
+                "duration_s": None,
+            })
+    except Exception:
+        pass
+
+    # Macro-regime input coverage — too few surviving macro feeds means the
+    # composite is untrustworthy (and now forced to fail-safe CAUTION).
+    try:
+        from src.data.macro_regime import get_regime_coverage
+        rc = get_regime_coverage()
+        if rc["total"]:
+            ok = rc["available"] >= int(settings.macro_regime_min_inputs)
+            sources.append({
+                "label": "Macro regime inputs",
+                "enabled": True,
+                "ok": ok,
+                "error": (f"only {rc['available']}/{rc['total']} macro inputs available "
+                          "— regime forced to CAUTION (fail-safe)") if not ok else None,
+                "duration_s": None,
+            })
+    except Exception:
+        pass
+
+    # Market-mode input coverage — low-stakes (NEUTRAL default applies no tilt),
+    # so flagged unhealthy only when ALL structural inputs are dark.
+    try:
+        from src.data.market_mode import get_mode_coverage
+        mc = get_mode_coverage()
+        if mc["total"]:
+            sources.append({
+                "label": "Market mode inputs",
+                "enabled": True,
+                "ok": mc["available"] >= 1,
+                "error": (f"0/{mc['total']} market-structure inputs available "
+                          "— mode defaulted to NEUTRAL blindly") if mc["available"] < 1 else None,
                 "duration_s": None,
             })
     except Exception:
@@ -682,6 +760,18 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     _reset_source_log()
     reset_sentiment_providers()
     reset_price_health()
+    # Per-run health counters for the silent-default sites surfaced via
+    # _collect_sources (FX sizing rate, correlation-pair compute, regime/mode
+    # input coverage) — reset so each run's source-health reflects only this tick.
+    try:
+        from src.broker.fx import reset_fx_health
+        from src.performance.correlation import reset_correlation_health
+        from src.data.macro_regime import reset_regime_coverage
+        from src.data.market_mode import reset_mode_coverage
+        reset_fx_health(); reset_correlation_health()
+        reset_regime_coverage(); reset_mode_coverage()
+    except Exception:
+        pass
     # Session classification, fixed once per run so every consumer (weight
     # overlay, ext_gap scorer, threshold bump, analyst prompt, gate diag)
     # sees the same answer even when the run straddles a session boundary.
@@ -809,6 +899,16 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     if len(all_tickers) != _before:
         logger.info(f"[liquidity] Step 0 universe gated: {_before} → {len(all_tickers)} tickers")
 
+    # Drop junk tickers ("N/A" etc.) that bypassed the gate via a protected path
+    # (e.g. a malformed open-trade / hypothetical row) — they otherwise reach
+    # yfinance and spam "'Response' object is not subscriptable". The gate itself
+    # now also validates, so this covers only the never-gated pinned set.
+    from src.data.market_data import sanitize_tickers
+    _pre_sane = len(all_tickers)
+    all_tickers = sanitize_tickers(all_tickers)
+    if len(all_tickers) != _pre_sane:
+        logger.warning(f"[universe] Dropped {_pre_sane - len(all_tickers)} invalid ticker(s) from the universe")
+
     # ── Steps 1–3: Parallel data fetch ────────────────────────────────────
     #
     # Three concurrent groups:
@@ -848,6 +948,32 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                           if settings.enable_polygon_news else None)
         f_finnhub_news = (pool.submit(_safe, "finnhub_news", fetch_finnhub_news, tickers)
                           if (settings.enable_finnhub_news and settings.finnhub_api_key) else None)
+
+        # Per-ticker Google News RSS (free, no key) — fresh every tick. Widens
+        # coverage to Reuters/Bloomberg/Barron's/FT and closes the Business Wire gap.
+        f_google_news = (pool.submit(_safe, "google_news", fetch_google_news, tickers)
+                         if settings.enable_google_news else None)
+
+        # Alpha Vantage pre-scored news (LLM-skip hybrid; one batched call, hourly
+        # cached) and StockTwits crowd sentiment (LLM-scored, like Reddit). Both
+        # key/token-gated and OFF by default — see settings.
+        f_av_news = (pool.submit(_safe, "av_news", fetch_alpha_vantage_news, all_tickers)
+                     if (settings.enable_alpha_vantage_news and settings.alpha_vantage_key) else None)
+        f_stocktwits = (pool.submit(_safe, "stocktwits", fetch_stocktwits_sentiment, tickers)
+                        if (settings.enable_stocktwits and settings.stocktwits_access_token) else None)
+
+        # Quiver Quantitative alt-data (key-gated). Congress → smart_money (revives
+        # the congressional feed); gov-contracts / lobbying / dark-pool → synthetic
+        # NewsArticles scored by the sentiment pipeline.
+        _quiver_on = bool(settings.quiver_api_key)
+        f_quiver_congress = (pool.submit(_safe, "quiver_congress", fetch_congress_trades)
+                             if (_quiver_on and settings.enable_quiver_congress) else None)
+        f_quiver_contracts = (pool.submit(_safe, "quiver_contracts", fetch_gov_contracts, all_tickers)
+                              if (_quiver_on and settings.enable_quiver_gov_contracts) else None)
+        f_quiver_lobbying = (pool.submit(_safe, "quiver_lobbying", fetch_lobbying, all_tickers)
+                             if (_quiver_on and settings.enable_quiver_lobbying) else None)
+        f_quiver_offexchange = (pool.submit(_safe, "quiver_offexchange", fetch_offexchange, all_tickers)
+                                if (_quiver_on and settings.enable_quiver_offexchange) else None)
 
         f_trends       = (pool.submit(_safe, "trends", fetch_google_trends, tickers)
                           if settings.enable_google_trends else None)
@@ -963,12 +1089,21 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "short":        get(f_short),
         "polygon_news": get(f_polygon_news),
         "finnhub_news": get(f_finnhub_news),
+        "google_news":  get(f_google_news),
+        "av_news":      get(f_av_news),
+        "stocktwits":   get(f_stocktwits),
+        "quiver_contracts": get(f_quiver_contracts),
+        "quiver_lobbying":  get(f_quiver_lobbying),
+        "quiver_darkpool":  get(f_quiver_offexchange),
     }
     for label, chunk in _article_chunks.items():
         if chunk:
             articles = articles + chunk
             logger.info(f"  [{label}] +{len(chunk)} article(s)")
 
+    # Dedup across ALL merged sources (Google News especially overlaps the direct
+    # feeds) — first occurrence wins, preserving source ordering.
+    articles = _dedupe_by_url(articles)
     logger.info(f"Steps 1–3: {len(articles)} total articles assembled")
 
     # Macro-news scan — derives a geopolitical / oil / tariff / policy regime
@@ -998,11 +1133,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     options_trades = yf_options.get("options")
     if options_trades:
         smart_money.extend(options_trades)
+    # Quiver congressional trades — revives the politician smart-money signal that
+    # died when the Stock Watcher S3 went 403 (same InsiderTrade shape).
+    quiver_congress = get(f_quiver_congress)
+    if quiver_congress:
+        smart_money.extend(quiver_congress)
 
     any_smart_money_enabled = (
         settings.enable_insider_trades or
         settings.enable_options_flow or
-        settings.enable_sec_filings
+        settings.enable_sec_filings or
+        bool(settings.quiver_api_key and settings.enable_quiver_congress)
     )
     insider_trades = smart_money if (smart_money or any_smart_money_enabled) else None
 
@@ -1322,6 +1463,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "session":                      run_session,
         "regime":                       (macro_regime_context.regime
                                           if macro_regime_context else "NEUTRAL"),
+        # Regime/mode INPUT COVERAGE — persisted per run so the dashboard can show
+        # whether a verdict came from full or degraded feeds (a 1/10-input regime
+        # reads identically to an 8/10 one without this). Mirrors price_provenance.
+        "regime_coverage":              {"available": getattr(macro_regime_context, "inputs_available", 0),
+                                          "total":     getattr(macro_regime_context, "inputs_total", 0)},
+        "mode_coverage":                {"available": getattr(market_mode_context, "inputs_available", 0),
+                                          "total":     getattr(market_mode_context, "inputs_total", 0)},
         "hold_prompt_active":           hold_prompt_active,
         "hold_prompt_n_positions":      len(open_position_summaries),
     }

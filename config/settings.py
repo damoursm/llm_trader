@@ -87,6 +87,20 @@ class Settings(BaseSettings):
     enable_provider_sentiment: bool = False
     provider_sentiment_min_articles: int = 2   # min provider-scored relevant articles to skip the LLM
     provider_sentiment_magnitude: float = 0.6  # |score| a positive/negative label maps to ([-1,1] scale)
+
+    # Quiver Quantitative — alternative data (Hobbyist tier). Empty key → every
+    # Quiver source is skipped. Congress trades revive the smart-money congressional
+    # feed (dead since the Stock Watcher S3 went 403); gov-contracts / lobbying /
+    # off-exchange (dark-pool) are rendered as synthetic NewsArticles and scored by
+    # the sentiment pipeline (same pattern as Trends/Reddit/short-interest).
+    quiver_api_key: str = ""
+    enable_quiver_congress: bool = True        # → smart_money (List[InsiderTrade])
+    enable_quiver_gov_contracts: bool = True   # → NewsArticle (federal contract awards = revenue catalyst)
+    enable_quiver_lobbying: bool = True        # → NewsArticle (lobbying spend = regulatory-attention context)
+    enable_quiver_offexchange: bool = True     # → NewsArticle (per-ticker dark-pool accumulation/distribution)
+    quiver_lookback_days: int = 30             # window for congress / contracts / lobbying events
+    quiver_offexchange_max_tickers: int = 60   # cap the per-ticker dark-pool loop (Hobbyist rate limits)
+
     # Financial Modeling Prep — market-wide analyst upgrades/downgrades feed (Section E catalyst
     # discovery). Free key: https://site.financialmodelingprep.com/developer/docs . Empty → the
     # market-wide analyst discovery source is skipped (yfinance analyst data is per-ticker only).
@@ -119,6 +133,34 @@ class Settings(BaseSettings):
     # Fetched once per hour (cached with the news pool). Kill switch if Yahoo
     # rate-limits.
     enable_ticker_news: bool = True
+
+    # Per-ticker Google News RSS — free, no key, near-real-time, and far broader
+    # than the 5 fixed market feeds (surfaces Reuters/Bloomberg/Barron's/FT AND
+    # Business Wire, the one wire our direct feeds miss). Fetched fresh every tick
+    # (reactivity fast-lane). google_news_max_tickers caps the per-tick request
+    # burst; google_news_business_wire adds the per-ticker site:businesswire.com query.
+    enable_google_news: bool = True
+    google_news_max_tickers: int = 50
+    google_news_business_wire: bool = True
+
+    # FDA / MedWatch regulatory catalyst RSS (free, no key) — drug approvals/CRLs +
+    # device recalls, on the fresh-every-tick fast lane. High signal for drug/device
+    # names; market-wide (mapped via keyword aliases like the other RSS feeds).
+    enable_fda_news: bool = True
+
+    # Alpha Vantage NEWS_SENTIMENT — pre-scored per-ticker news that feeds the
+    # LLM-skip hybrid (like Polygon insights). ONE batched call, hourly-cached.
+    # OFF by default: the free tier is ~25 req/DAY, shared with AV discovery +
+    # earnings — only enable on a paid tier (or if you don't use AV elsewhere).
+    enable_alpha_vantage_news: bool = False
+    alpha_vantage_news_max_tickers: int = 50
+
+    # StockTwits crowd sentiment — one synthetic chatter-summary article per ticker
+    # (LLM-scored, like Reddit). The public endpoint now 403s without auth, so this
+    # needs a (free) StockTwits API token and is OFF by default.
+    enable_stocktwits: bool = False
+    stocktwits_access_token: str = ""
+    stocktwits_max_tickers: int = 30
 
     # Sentiment velocity (Δsentiment, not level) — the rate of change of news tone leads
     # short-horizon (1–5 day) moves better than the absolute level. Deterministic lexical
@@ -410,6 +452,11 @@ class Settings(BaseSettings):
     #   NEUTRAL   → threshold 0.78 (baseline, unchanged)
     #   RISK_ON   → threshold 0.72
     enable_macro_regime_filter: bool = True
+    # Minimum number of macro inputs (of ~10: VIX, MOVE, bond, global, FRED, breadth,
+    # credit, DIX, intermarket, macro_news) that must be available for the composite
+    # regime to be trusted. Below this, the regime is forced to at least CAUTION rather
+    # than allowed to fail-OPEN to a permissive NEUTRAL when the feeds go dark.
+    macro_regime_min_inputs: int = 3
 
     # Sector Rotation / "Ebb and Flow" — cross-sector money flow via relative momentum + volume
     # Ranks all 11 SPDR sector ETFs by excess return vs SPY (1w/1m/3m) adjusted for volume.
@@ -673,6 +720,7 @@ class Settings(BaseSettings):
     correlation_min_multiplier: float = 0.25  # deepest soft haircut applied to the candidate
     correlation_portfolio_cap: float = 2.5    # Σ(size·ρ) hard skip threshold per direction
     correlation_min_overlap_days: int = 20    # minimum overlapping bars to trust a pair ρ
+    correlation_health_max_fail_pct: float = 0.5  # >this share of intended pairs failing to compute → flag the sizing-correlation feed unhealthy (Data Quality)
 
     # ── Out-of-sample validation (deterministic hash split) ──────────────────
     # Every closed trade is permanently assigned to "train" or "holdout" via a

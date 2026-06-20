@@ -25,7 +25,7 @@ from loguru import logger
 
 from config import settings
 from src.data.cache import load_ohlcv
-from src.data.market_data import get_history
+from src.data.market_data import get_history, is_valid_ticker
 
 _CACHE_MIN_BARS = 20    # accept the cache outright at/above this many bars
 _EVAL_MIN_BARS  = 10    # below this, too little data to judge liquidity → fail-closed
@@ -98,7 +98,7 @@ def apply_liquidity_gate(
     cands: List[str] = []
     for c in candidates:
         s = (c or "").strip().upper()
-        if s and s not in seen:
+        if s and s not in seen and is_valid_ticker(s):   # drop junk ("N/A" etc.) up front
             seen.add(s)
             cands.append(s)
     if not cands or not settings.enable_discovery_liquidity_gate:

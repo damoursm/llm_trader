@@ -15,6 +15,7 @@ Regime effects in the pipeline
 
 from loguru import logger
 
+from config import settings
 from src.models import MacroRegimeContext
 
 # Per-source score mappings ∈ [-3, +1]
@@ -154,6 +155,22 @@ _REGIME_ALLOW_BUYS = {
     "RISK_ON":  True,
 }
 
+# Last run's input coverage (available / total macro signals), so the pipeline can
+# surface it through ``_collect_sources`` → run_sources (Data Quality) + the health
+# banner without threading the context object into that helper.
+_LAST_COVERAGE: dict = {"available": 0, "total": len(_WEIGHTS)}
+
+
+def reset_regime_coverage() -> None:
+    """Clear the cached regime input-coverage (call at run start). total=0 marks
+    'not computed this run' so a disabled regime never false-alarms in source-health."""
+    _LAST_COVERAGE.update(available=0, total=0)
+
+
+def get_regime_coverage() -> dict:
+    """Snapshot of the most recent regime computation's input coverage."""
+    return dict(_LAST_COVERAGE)
+
 
 def compute_macro_regime(
     vix_context=None,
@@ -176,13 +193,15 @@ def compute_macro_regime(
     weighted_score = 0.0
     total_weight   = 0.0
     has_panic      = False
+    inputs_available = 0
     evidence: list[str] = []
 
     def _add(name, signal_val, score_map, weight):
-        nonlocal weighted_score, total_weight, has_panic
+        nonlocal weighted_score, total_weight, has_panic, inputs_available
         score = score_map.get(signal_val, 0.0)
         weighted_score += score * weight
         total_weight   += weight
+        inputs_available += 1
         evidence.append(f"{name}={signal_val}({score:+.1f})")
         if score_map is _VIX_SCORES or score_map is _MOVE_SCORES:
             if signal_val == "PANIC":
@@ -228,20 +247,42 @@ def compute_macro_regime(
     else:
         regime = "RISK_ON"
 
+    # Fail-CAUTIOUS, not fail-open: when too few macro inputs survived, the
+    # composite is untrustworthy — and its absence-of-signal default is a
+    # PERMISSIVE NEUTRAL (BUYs allowed at the 0.78 baseline). If all the macro
+    # feeds go dark we must not silently relax the gate; degrade a permissive
+    # verdict to at least CAUTION (higher threshold, BUYs still allowed). A
+    # genuinely protective verdict (CAUTION/RISK_OFF/PANIC — e.g. a lone VIX
+    # PANIC) is never loosened by this.
+    inputs_total = len(_WEIGHTS)
+    low_coverage = inputs_available < int(settings.macro_regime_min_inputs)
+    coverage_note = ""
+    if low_coverage and regime in ("NEUTRAL", "RISK_ON"):
+        coverage_note = (
+            f"LOW MACRO COVERAGE ({inputs_available}/{inputs_total} inputs) — "
+            f"regime forced {regime}→CAUTION (fail-safe). "
+        )
+        regime = "CAUTION"
+    _LAST_COVERAGE.update(available=inputs_available, total=inputs_total)
+
     threshold  = _REGIME_THRESHOLD[regime]
     allow_buys = _REGIME_ALLOW_BUYS[regime]
 
     evidence_str = "  |  ".join(evidence) if evidence else "no macro inputs available"
     summary = (
         f"Composite regime: {regime} (score={norm:+.2f}) — "
+        + coverage_note
         + ("BUY entries BLOCKED. " if not allow_buys else "")
         + f"Actionable threshold → {threshold:.0%}. "
         + evidence_str
     )
 
     logger.info(
-        f"[macro_regime] {regime}  score={norm:+.2f}  threshold={threshold:.0%}  allow_buys={allow_buys}"
+        f"[macro_regime] {regime}  score={norm:+.2f}  threshold={threshold:.0%}  "
+        f"allow_buys={allow_buys}  inputs={inputs_available}/{inputs_total}"
     )
+    if coverage_note:
+        logger.warning(f"[macro_regime] {coverage_note.strip()}")
     logger.debug(f"[macro_regime] evidence: {evidence_str}")
 
     return MacroRegimeContext(
@@ -252,4 +293,6 @@ def compute_macro_regime(
         has_panic_signal=has_panic,
         evidence=evidence_str,
         summary=summary,
+        inputs_available=inputs_available,
+        inputs_total=inputs_total,
     )
