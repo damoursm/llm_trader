@@ -14,12 +14,31 @@ from src.data.insider_trades import build_insider_summary
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _DEEPSEEK_ANALYST_MODEL = "deepseek-v4-flash"   # DeepSeek V4-Flash — cheapest/latest (replaces deprecated deepseek-chat)
-# v4-flash defaults to thinking ENABLED; force it OFF — non-thinking is cheaper, faster,
-# and more deterministic (no chain-of-thought tokens) for structured-JSON synthesis.
+# DeepSeek v4 defaults to thinking ENABLED. OFF = cheaper/faster/deterministic (no
+# chain-of-thought tokens) — used for the cheap fallback. ON = better multi-step
+# reasoning for the BUY/SELL synthesis (the bake-off's *-thinking arms), at the cost
+# of reasoning output tokens; the stream loop only consumes `delta.content` (the
+# answer), so reasoning_content is generated-but-billed and discarded.
 _DEEPSEEK_THINKING_OFF = {"thinking": {"type": "disabled"}}
+_DEEPSEEK_THINKING_ON  = {"thinking": {"type": "enabled"}}
 # Fixed seed for the DeepSeek analyst fallback; combined with temperature=0
 # this gets us near-deterministic synthesis across identical-prompt runs.
 _DEEPSEEK_ANALYST_SEED = 4242
+_DEEPSEEK_THINKING_SUFFIX = "-thinking"
+
+
+def _deepseek_spec(model_id: Optional[str]) -> tuple[str, bool]:
+    """Decode a logical DeepSeek synthesis id → (API model, thinking flag).
+
+    Thinking is a request parameter, not part of the API model id, so the bake-off
+    pool encodes it with a ``-thinking`` suffix on a logical id that is recorded
+    verbatim for provenance (so the dashboard shows flash-thinking and pro-thinking
+    as distinct rows). E.g. ``deepseek-v4-pro-thinking`` → (``deepseek-v4-pro``,
+    True); ``deepseek-v4-flash`` → (``deepseek-v4-flash``, False)."""
+    mid = (model_id or _DEEPSEEK_ANALYST_MODEL).strip()
+    thinking = mid.endswith(_DEEPSEEK_THINKING_SUFFIX)
+    api_model = mid[: -len(_DEEPSEEK_THINKING_SUFFIX)] if thinking else mid
+    return api_model, thinking
 
 _client = None
 _deepseek_analyst_client = None
@@ -209,12 +228,19 @@ def _call_claude_analyst(prompt: str, model: Optional[str] = None) -> str:
     return "".join(raw_parts).strip()
 
 
-def _call_deepseek_analyst(prompt: str) -> str:
-    """Call DeepSeek V4-Flash (non-thinking) as fallback analyst. Returns raw response text."""
+def _call_deepseek_analyst(prompt: str, model: Optional[str] = None,
+                           thinking: bool = False) -> str:
+    """Call a DeepSeek analyst model (streaming). Returns raw response text.
+
+    ``model`` is the API model id (defaults to v4-flash); ``thinking`` toggles
+    DeepSeek's reasoning mode. The A/B bake-off passes the decoded
+    (api_model, thinking) for its flash-thinking / pro-thinking arms; the plain
+    cross-engine fallback uses the cheap flash non-thinking default."""
     client = _get_deepseek_analyst_client()
     if client is None:
         raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
-    logger.info(f"[claude] Falling back to DeepSeek analyst: {_DEEPSEEK_ANALYST_MODEL}")
+    api_model = model or _DEEPSEEK_ANALYST_MODEL
+    logger.info(f"[claude] DeepSeek analyst: {api_model} ({'thinking' if thinking else 'non-thinking'})")
     raw_parts: list[str] = []
     # DeepSeek ignores Anthropic cache_control and does its own automatic prefix
     # caching, so just strip the sentinel (it must never reach the model).
@@ -222,13 +248,13 @@ def _call_deepseek_analyst(prompt: str) -> str:
     # Determinism: temperature=0 + fixed seed so two runs on the same prompt
     # produce near-identical synthesis (slight provider-side variance only).
     with client.chat.completions.create(
-        model=_DEEPSEEK_ANALYST_MODEL,
+        model=api_model,
         max_tokens=32000,
         messages=[{"role": "user", "content": prompt}],
         stream=True,
         temperature=0,
         seed=_DEEPSEEK_ANALYST_SEED,
-        extra_body=_DEEPSEEK_THINKING_OFF,
+        extra_body=_DEEPSEEK_THINKING_ON if thinking else _DEEPSEEK_THINKING_OFF,
     ) as stream:
         for chunk in stream:
             if not chunk.choices:
@@ -3055,8 +3081,9 @@ Return ALL tickers from the input. No markdown, JSON only."""
                 raw = _call_claude_analyst(prompt, model=model)
                 analyst_source = model
             else:
-                raw = _call_deepseek_analyst(prompt)
-                analyst_source = _DEEPSEEK_ANALYST_MODEL
+                api_model, thinking = _deepseek_spec(model)
+                raw = _call_deepseek_analyst(prompt, model=api_model, thinking=thinking)
+                analyst_source = model       # the LOGICAL id (e.g. deepseek-v4-pro-thinking) for provenance
             break
         except Exception as e:
             logger.warning(
@@ -3143,10 +3170,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
             f"— filled with rule-based fallback: {', '.join(s.ticker for s in missing)}"
         )
 
-    _set_synthesis_meta(
-        "deepseek" if analyst_source == _DEEPSEEK_ANALYST_MODEL else "anthropic",
-        analyst_source,
-    )
+    _set_synthesis_meta(_engine_of(analyst_source), analyst_source)
     logger.info(f"Generated {len(recommendations)} recommendations via {analyst_source}")
     return recommendations
 

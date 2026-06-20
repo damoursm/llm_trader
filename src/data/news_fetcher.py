@@ -25,16 +25,19 @@ SECTOR_ETF_NAMES = {
     "XLC": "Communication Services",
 }
 
-# Public RSS feeds (no API key needed). NOTE: Reuters retired its public RSS
-# feeds, so that endpoint is intentionally omitted (it returned 0 entries /
-# bozo errors). These feeds are general-market — per-ticker relevance comes
-# from fetch_ticker_news below, not from these.
+# Public RSS feeds (no API key needed). These feeds are general-market —
+# per-ticker relevance comes from fetch_ticker_news below, not from these.
+# DEAD endpoints intentionally omitted (verified 2026-06-19): Reuters retired
+# its public RSS; the Dow Jones feeds **marketwatch** (feeds.content.dowjones.io)
+# and **wsj_markets** (feeds.a.dj.com) are FROZEN — they served Jun-2025 /
+# Jan-2025 content (the 24h cutoff dropped 100% of it, so they added nothing but
+# two wasted fetches/tick). WSJ/MarketWatch coverage is now captured indirectly
+# via per-ticker Google News + Polygon (Benzinga). Re-add only if a live URL is
+# confirmed fresh (newest article within hours).
 RSS_FEEDS = {
     "cnbc_markets": "https://www.cnbc.com/id/20910258/device/rss/rss.html",
-    "marketwatch": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
     "seeking_alpha": "https://seekingalpha.com/market_currents.xml",
     "yahoo_finance": "https://finance.yahoo.com/news/rssindex",
-    "wsj_markets": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
 }
 
 # Press-release wires — where primary catalysts (earnings, guidance, M&A, FDA,

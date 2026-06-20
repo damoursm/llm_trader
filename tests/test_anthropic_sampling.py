@@ -6,9 +6,10 @@ sending temperature 400s and silently kicks synthesis to the DeepSeek fallback.
 
 import pytest
 
+import src.analysis.claude_analyst as ca
 from src.analysis.claude_analyst import (
     _anthropic_sampling_kwargs, _anthropic_thinking_kwargs,
-    _engine_of, _synthesis_attempts_for,
+    _engine_of, _synthesis_attempts_for, _deepseek_spec,
 )
 
 
@@ -80,3 +81,62 @@ def test_attempts_anthropic_chosen_then_deepseek_fallback(chosen):
 def test_attempts_deepseek_chosen_then_anthropic_fallback():
     assert _synthesis_attempts_for("deepseek-v4-flash", "claude-opus-4-8", "deepseek-v4-flash") == [
         ("deepseek", "deepseek-v4-flash"), ("anthropic", "claude-opus-4-8")]
+
+
+# ── 4-way bake-off: DeepSeek flash-thinking / pro-thinking arms ───────────────
+
+@pytest.mark.parametrize("logical,api,thinking", [
+    ("deepseek-v4-flash-thinking", "deepseek-v4-flash", True),
+    ("deepseek-v4-pro-thinking",   "deepseek-v4-pro",   True),
+    ("deepseek-v4-flash",          "deepseek-v4-flash", False),
+    ("deepseek-v4-pro",            "deepseek-v4-pro",   False),
+    (None,                         "deepseek-v4-flash", False),   # fallback default
+])
+def test_deepseek_spec_decodes_thinking_suffix(logical, api, thinking):
+    assert _deepseek_spec(logical) == (api, thinking)
+
+
+def test_thinking_ids_route_to_deepseek():
+    # Provenance + hold-review pinning depend on these mapping to DeepSeek.
+    assert _engine_of("deepseek-v4-flash-thinking") == "deepseek"
+    assert _engine_of("deepseek-v4-pro-thinking") == "deepseek"
+
+
+def test_attempts_pro_thinking_chosen_then_anthropic_fallback():
+    # The logical id is preserved as the chosen attempt (so provenance records the
+    # exact arm); the cross-engine fallback stays cheap flash non-thinking.
+    assert _synthesis_attempts_for("deepseek-v4-pro-thinking", "claude-opus-4-8", "deepseek-v4-flash") == [
+        ("deepseek", "deepseek-v4-pro-thinking"), ("anthropic", "claude-opus-4-8")]
+
+
+def _capture_deepseek_create(monkeypatch):
+    cap = {}
+
+    class _Stream:
+        def __enter__(self): return []          # no chunks → empty raw
+        def __exit__(self, *a): return False
+
+    class _Completions:
+        def create(self, **kw):
+            cap.update(kw)
+            return _Stream()
+
+    class _Client:
+        chat = type("C", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(ca, "_get_deepseek_analyst_client", lambda: _Client())
+    return cap
+
+
+def test_call_deepseek_threads_pro_and_thinking(monkeypatch):
+    cap = _capture_deepseek_create(monkeypatch)
+    ca._call_deepseek_analyst("hi", model="deepseek-v4-pro", thinking=True)
+    assert cap["model"] == "deepseek-v4-pro"
+    assert cap["extra_body"] == ca._DEEPSEEK_THINKING_ON
+
+
+def test_call_deepseek_defaults_to_flash_nonthinking(monkeypatch):
+    cap = _capture_deepseek_create(monkeypatch)
+    ca._call_deepseek_analyst("hi")
+    assert cap["model"] == ca._DEEPSEEK_ANALYST_MODEL
+    assert cap["extra_body"] == ca._DEEPSEEK_THINKING_OFF

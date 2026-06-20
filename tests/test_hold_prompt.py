@@ -35,7 +35,7 @@ def test_open_positions_reach_the_synthesis_prompt(monkeypatch):
 
     captured = {}
 
-    def fake(prompt):
+    def fake(prompt, **kwargs):   # tolerate model= / thinking= kwargs from the bake-off
         captured["prompt"] = prompt
         return "[]"
 
@@ -57,7 +57,7 @@ def test_prompt_off_run_has_no_block(monkeypatch):
 
     captured = {}
 
-    def fake(prompt):
+    def fake(prompt, **kwargs):   # tolerate model= / thinking= kwargs from the bake-off
         captured["prompt"] = prompt
         return "[]"
 

@@ -470,7 +470,7 @@ def test_session_profile_off_removes_synthesis_block(monkeypatch):
     monkeypatch.setattr(settings, "enable_extended_signal_profile", False)
     cap = {}
 
-    def fake(p):
+    def fake(p, **kwargs):   # tolerate model= / thinking= kwargs from the bake-off
         cap["p"] = p
         return "[]"
 
@@ -485,7 +485,7 @@ def test_session_profile_on_adds_synthesis_block(monkeypatch):
     monkeypatch.setattr(settings, "enable_extended_signal_profile", True)
     cap = {}
 
-    def fake(p):
+    def fake(p, **kwargs):   # tolerate model= / thinking= kwargs from the bake-off
         cap["p"] = p
         return "[]"
 

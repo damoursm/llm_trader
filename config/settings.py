@@ -34,9 +34,10 @@ class Settings(BaseSettings):
     # each shows as its own row in the dashboard's per-LLM evaluation. The chosen
     # model's provider is inferred (deepseek* → DeepSeek, else Anthropic); the
     # OTHER provider is the error fallback. Empty = legacy binary behavior above.
-    # Sentiment is unaffected (stays Haiku ⇄ DeepSeek via llm_ab_anthropic_share —
-    # Opus per-ticker sentiment would be wasteful). Example:
-    #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash
+    # DeepSeek arms may carry a "-thinking" suffix (logical id → API model + reasoning
+    # mode, decoded by claude_analyst._deepseek_spec). Sentiment is unaffected (stays
+    # Haiku ⇄ DeepSeek flash non-thinking via llm_ab_anthropic_share). Example:
+    #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking,deepseek-v4-pro-thinking
     llm_ab_synthesis_models: str = ""
 
     # Anthropic prompt caching (cache_control) on the SYNTHESIS prompt. The large

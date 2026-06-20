@@ -40,7 +40,7 @@ def test_catalyst_context_reaches_the_synthesis_prompt(monkeypatch):
 
     captured = {}
 
-    def fake(prompt):
+    def fake(prompt, **kwargs):   # tolerate model= / thinking= kwargs from the bake-off
         captured["prompt"] = prompt
         return json.dumps([{"ticker": "XLE", "type": "ETF",
                             "direction": "BULLISH", "action": "WATCH",
@@ -64,7 +64,7 @@ def test_no_catalyst_context_means_no_block(monkeypatch):
 
     captured = {}
 
-    def fake(prompt):
+    def fake(prompt, **kwargs):   # tolerate model= / thinking= kwargs from the bake-off
         captured["prompt"] = prompt
         return "[]"
 
