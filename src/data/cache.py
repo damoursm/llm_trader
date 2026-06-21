@@ -126,35 +126,45 @@ def load_latest_snapshots() -> Optional[List[TickerSnapshot]]:
 OHLCV_DIR = CACHE_DIR / "ohlcv"
 
 
-def _ohlcv_path(ticker: str) -> Path:
-    return OHLCV_DIR / f"{ticker.upper()}.json"
+def _ohlcv_dir(interval: str = "1d") -> Path:
+    """OHLCV cache directory for an interval. Daily keeps the legacy path
+    (``cache/ohlcv/``) so every existing caller is byte-for-byte unchanged;
+    non-daily timeframes get a sibling namespace (``cache/ohlcv_30m/`` …)."""
+    return OHLCV_DIR if interval == "1d" else CACHE_DIR / f"ohlcv_{interval}"
 
 
-def load_ohlcv(ticker: str) -> Optional["pd.DataFrame"]:
-    """Return cached OHLCV DataFrame for a ticker, or None if not cached."""
+def _ohlcv_path(ticker: str, interval: str = "1d") -> Path:
+    return _ohlcv_dir(interval) / f"{ticker.upper()}.json"
+
+
+def load_ohlcv(ticker: str, interval: str = "1d") -> Optional["pd.DataFrame"]:
+    """Return cached OHLCV DataFrame for a ticker, or None if not cached.
+
+    ``interval`` selects the timeframe namespace ("1d" = legacy daily cache,
+    "30m" = the intraday cache, etc.)."""
     import pandas as pd
-    path = _ohlcv_path(ticker)
+    path = _ohlcv_path(ticker, interval)
     if not path.exists():
         return None
     try:
         df = pd.read_json(path, orient="split")
         df.index = pd.to_datetime(df.index)
-        logger.debug(f"[cache] Loaded OHLCV for {ticker} from {path.name} ({len(df)} rows)")
+        logger.debug(f"[cache] Loaded OHLCV[{interval}] for {ticker} from {path.name} ({len(df)} rows)")
         return df
     except Exception as e:
-        logger.warning(f"[cache] Failed to load OHLCV cache for {ticker}: {e}")
+        logger.warning(f"[cache] Failed to load OHLCV[{interval}] cache for {ticker}: {e}")
         return None
 
 
-def save_ohlcv(ticker: str, df: "pd.DataFrame") -> None:
+def save_ohlcv(ticker: str, df: "pd.DataFrame", interval: str = "1d") -> None:
     """Persist OHLCV DataFrame to disk, overwriting any previous version."""
-    OHLCV_DIR.mkdir(parents=True, exist_ok=True)
-    path = _ohlcv_path(ticker)
+    _ohlcv_dir(interval).mkdir(parents=True, exist_ok=True)
+    path = _ohlcv_path(ticker, interval)
     try:
         path.write_text(df.to_json(orient="split", date_format="iso"), encoding="utf-8")
-        logger.debug(f"[cache] Saved OHLCV for {ticker} → {path.name}")
+        logger.debug(f"[cache] Saved OHLCV[{interval}] for {ticker} → {path.name}")
     except Exception as e:
-        logger.warning(f"[cache] Failed to save OHLCV for {ticker}: {e}")
+        logger.warning(f"[cache] Failed to save OHLCV[{interval}] for {ticker}: {e}")
 
 
 # ---------------------------------------------------------------------------

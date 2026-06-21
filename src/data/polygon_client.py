@@ -98,6 +98,28 @@ def _n_bdays_ago(n: int) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+
+def get_grouped_daily_closes(max_lookback: int = 5) -> Dict[str, float]:
+    """``{ticker: close}`` for the most recent COMPLETED session via ONE
+    grouped-daily aggregates call.
+
+    This endpoint works on the free tier (unlike the per-ticker snapshot endpoint,
+    which 403s), and returns every US ticker's daily bar in a single request — so
+    it's the deterministic, near-100%-coverage bulk price source the snapshot
+    fallback needs. Tries the last few weekdays so a weekend / holiday / pre-EOD
+    'today' falls through to the last session that actually has data. ``{}`` if
+    unavailable (no key / all lookbacks empty)."""
+    if not is_available():
+        return {}
+    for n in range(max_lookback + 1):
+        j = _get(f"/v2/aggs/grouped/locale/us/market/stocks/{_n_bdays_ago(n)}",
+                 {"adjusted": "true"})
+        results = (j or {}).get("results") or []
+        if results:
+            return {b["T"]: float(b["c"]) for b in results
+                    if b.get("T") and b.get("c")}
+    return {}
+
 def is_available() -> bool:
     """True when POLYGON_API_KEY is configured."""
     return bool(settings.polygon_api_key)

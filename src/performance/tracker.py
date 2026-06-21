@@ -398,6 +398,16 @@ METHOD_LABELS: Dict[str, str] = {
     "ext_gap":    "Extended-Session Gap",
 }
 
+# Multi-timeframe technical labels (panel-only) — derived from the base daily
+# labels so the 30-min / weekly variants stay in sync (e.g. "VWAP Distance ·
+# 30m"). Mirrors schema.SIGNAL_TIMEFRAME_COLUMNS / multi_timeframe.TECHNICAL_METHODS.
+METHOD_LABELS.update({
+    f"{m}_{suffix}": f"{METHOD_LABELS[m]} · {label}"
+    for m in ("tech", "vwap", "momentum", "money_flow",
+              "trend_strength", "iv_rank", "pattern", "sector_momentum")
+    for suffix, label in (("30m", "30m"), ("1w", "Weekly"))
+})
+
 
 def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: Optional[dict]) -> dict:
     """Extract per-method scores from the TickerSignal for a given ticker."""

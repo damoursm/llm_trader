@@ -71,3 +71,26 @@ def test_404_is_silent(monkeypatch):
     monkeypatch.setattr(pc.httpx, "get", lambda *a, **k: _raiser(404))
     out = _captured_warnings(lambda: pc._get("/v2/aggs/ticker/ZZZZ/range"))
     assert out == ""                                        # missing ticker → no noise
+
+
+# ── grouped-daily close fallback (the deterministic bulk price source) ────────
+
+def test_grouped_daily_closes_parses_first_nonempty(monkeypatch):
+    monkeypatch.setattr(pc.settings, "polygon_api_key", "x")
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(path)
+        if len(calls) == 1:
+            return {"results": []}                          # today/holiday empty → try prior day
+        return {"results": [{"T": "AAPL", "c": 150.0}, {"T": "BRK.B", "c": 50.0},
+                            {"T": "NOCLOSE"}]}              # missing 'c' → dropped
+    monkeypatch.setattr(pc, "_get", fake_get)
+    out = pc.get_grouped_daily_closes()
+    assert out == {"AAPL": 150.0, "BRK.B": 50.0}
+    assert len(calls) == 2                                  # fell through to the first non-empty
+
+
+def test_grouped_daily_closes_no_key(monkeypatch):
+    monkeypatch.setattr(pc.settings, "polygon_api_key", "")
+    assert pc.get_grouped_daily_closes() == {}

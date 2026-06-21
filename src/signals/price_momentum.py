@@ -29,7 +29,7 @@ Cache strategy:
   Minimum 70 bars required; returns 0.0 when data is insufficient.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,15 +56,19 @@ def _get_ohlcv(ticker: str) -> pd.DataFrame:
     return get_history(ticker, period="18mo")
 
 
-def compute_price_momentum_score(ticker: str) -> Tuple[float, float, float]:
+def compute_price_momentum_score(ticker: str, df: Optional[pd.DataFrame] = None) -> Tuple[float, float, float]:
     """Return (score, mom_1m_pct, mom_3m_pct).
 
     score ∈ [-1.0, +1.0].
     Positive = price trending above its own historical baseline (upward momentum).
     Negative = price trending below historical baseline (downward momentum).
     Returns (0.0, 0.0, 0.0) when data is insufficient.
+
+    ``df``: optional pre-fetched OHLCV frame (any timeframe). When ``None`` the
+    daily cache-first fetch is used — identical to the legacy behaviour.
     """
-    df = _get_ohlcv(ticker)
+    if df is None:
+        df = _get_ohlcv(ticker)
 
     if df.empty or len(df) < _MIN_ROWS or "Close" not in df.columns:
         logger.debug(f"[momentum] {ticker}: insufficient data ({len(df)} rows)")

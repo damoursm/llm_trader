@@ -37,7 +37,7 @@ Minimum 50 bars required (ADX needs ~2× the period to stabilise); returns
 (0.0, 0.0, "NO_DATA") when data is insufficient.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -140,16 +140,20 @@ def _classify(adx: float, direction: float, breakout: int) -> str:
     return "NEUTRAL"
 
 
-def compute_trend_strength_score(ticker: str) -> Tuple[float, float, str]:
+def compute_trend_strength_score(ticker: str, df: Optional[pd.DataFrame] = None) -> Tuple[float, float, str]:
     """Return (score, adx_value, label).
 
     score ∈ [−1.0, +1.0] — positive = confirmed uptrend, negative = confirmed downtrend,
     near zero = no trend / chop. Returns (0.0, 0.0, "NO_DATA") when data is insufficient.
+
+    ``df``: optional pre-fetched OHLCV frame (any timeframe). When ``None`` the
+    daily cache-first fetch is used — identical to the legacy behaviour.
     """
     adx_period      = max(2, settings.trend_adx_period)
     donchian_period = max(2, settings.trend_donchian_period)
 
-    df = _get_ohlcv(ticker)
+    if df is None:
+        df = _get_ohlcv(ticker)
     required = {"High", "Low", "Close"}
     if df.empty or len(df) < _MIN_ROWS or not required.issubset(df.columns):
         logger.debug(f"[trend] {ticker}: insufficient data ({len(df)} rows)")

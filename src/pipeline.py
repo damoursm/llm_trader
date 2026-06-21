@@ -334,17 +334,22 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         price_by_ticker = {s.ticker: s.price for s in (snapshots or []) if getattr(s, "price", None)}
         sig_rows = []
         for tk, s in (signals_by_ticker or {}).items():
-            scores = _method_scores_from_signal(tk, s.direction, signals_by_ticker)
+            # Base 19-method scores drive agreement / dominance (the trade-
+            # attribution set); the multi-timeframe components are persisted
+            # alongside for the panel's IC table but excluded from those counts.
+            base_scores = _method_scores_from_signal(tk, s.direction, signals_by_ticker)
+            tf_scores = getattr(s, "timeframe_scores", None) or {}
+            all_scores = {**base_scores, **tf_scores} if tf_scores else base_scores
             sig_rows.append({
                 "ticker": tk,
                 "type": str(getattr(s, "type", "STOCK") or "STOCK"),
                 "direction": str(getattr(s.direction, "value", s.direction)),
                 "combined_score": float(getattr(s, "combined_score", 0.0)),
                 "confidence": float(s.confidence),
-                "n_methods_agreeing": len(_methods_agreeing(scores, s.direction)),
-                "dominant_method": _dominant_method(scores, s.direction),
+                "n_methods_agreeing": len(_methods_agreeing(base_scores, s.direction)),
+                "dominant_method": _dominant_method(base_scores, s.direction),
                 "price": price_by_ticker.get(tk),
-                "scores": scores,
+                "scores": all_scores,
             })
         if sig_rows:
             from src.utils import ET
@@ -469,8 +474,12 @@ def _assess_price_provenance(run_id, snapshots) -> Optional[dict]:
     """
     if not settings.enable_price_provenance_check or not run_id:
         return None
+    # Only compare against LIVE snapshot prices — a "prev_close" fallback anchor
+    # (grouped-daily fill when no live quote existed) vs a live fill would diverge
+    # legitimately and falsely trip the band.
     price_by_ticker = {s.ticker: float(s.price) for s in (snapshots or [])
-                       if getattr(s, "price", None)}
+                       if getattr(s, "price", None)
+                       and getattr(s, "price_source", "live") == "live"}
     if not price_by_ticker:
         return None
     bands = {

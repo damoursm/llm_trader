@@ -52,3 +52,18 @@ def test_gate_drops_junk_tickers(monkeypatch):
     # gate's cleaning pass — they otherwise reach yfinance and spam the log.
     monkeypatch.setattr(liquidity.settings, "enable_discovery_liquidity_gate", False)
     assert liquidity.apply_liquidity_gate(["AAPL", "N/A", "--", "", "nvda"]) == ["AAPL", "NVDA"]
+
+
+def test_gate_drops_exotic_security_types(monkeypatch):
+    # Preferred / OTC-foreign / unit / warrant get filtered in the cleaning pass
+    # (independent of the dollar-volume gate); plain commons + ADRs + class shares pass.
+    monkeypatch.setattr(liquidity.settings, "enable_discovery_liquidity_gate", False)
+    monkeypatch.setattr(liquidity.settings, "enable_security_type_filter", True)
+    out = liquidity.apply_liquidity_gate(["AAPL", "COF-PN", "ASMLF", "BACCU", "ARQQW", "TCEHY", "BRK-B"])
+    assert out == ["AAPL", "TCEHY", "BRK-B"]
+
+
+def test_security_type_filter_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(liquidity.settings, "enable_discovery_liquidity_gate", False)
+    monkeypatch.setattr(liquidity.settings, "enable_security_type_filter", False)
+    assert liquidity.apply_liquidity_gate(["AAPL", "COF-PN"]) == ["AAPL", "COF-PN"]

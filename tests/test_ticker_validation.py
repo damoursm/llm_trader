@@ -7,8 +7,9 @@ raised an opaque "'Response' object is not subscriptable" deep in its parser —
 """
 
 import pandas as pd
+import pytest
 
-from src.data.market_data import is_valid_ticker, sanitize_tickers, get_history
+from src.data.market_data import is_valid_ticker, sanitize_tickers, get_history, is_exotic_security
 
 
 def test_real_tickers_are_valid():
@@ -27,6 +28,28 @@ def test_sanitize_dedupes_uppercases_and_drops_junk():
     assert sanitize_tickers(
         ["aapl", "N/A", "MSFT", "msft", "BRK-B", None, "--", "GC=F"]
     ) == ["AAPL", "MSFT", "BRK-B", "GC=F"]
+
+
+@pytest.mark.parametrize("ticker", [
+    "ALL-PJ", "AXS-PE", "COF-PN", "ET-PI",        # preferred series
+    "ASMLF", "BEIGF", "DGEAF",                     # OTC foreign ordinaries (5-char F)
+    "BACCU", "SPAC-U", "FOO-UN",                   # units
+    "ARQQW", "FOO-WT", "BAR.WS",                   # warrants
+    "BAZ-RT", "TYG-RI",                            # rights
+])
+def test_exotic_securities_flagged(ticker):
+    assert is_exotic_security(ticker)
+
+
+@pytest.mark.parametrize("ticker", [
+    "AAPL", "MSFT", "GOOGL", "GOOG", "META", "TQQQ", "FNGU",   # plain commons / ETFs
+    "BRK-B", "BF-B",                              # class shares (NOT preferred)
+    "TCEHY", "NSRGY",                            # ADRs (exchange-listed — kept)
+    "INTU", "LABU", "MU", "F", "V",              # ≤4-char ending F/W/U/V — kept
+    "GC=F", "^VIX", "DX-Y.NYB",                  # futures / indices
+])
+def test_real_securities_not_flagged(ticker):
+    assert not is_exotic_security(ticker)
 
 
 def test_get_history_fails_fast_on_junk(monkeypatch):

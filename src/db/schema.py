@@ -27,18 +27,35 @@ signals             — the full per-ticker signal cross-section of EVERY run (n
 
 from __future__ import annotations
 
-# Per-method score columns on the `signals` table. MUST mirror
+# Base per-method score columns on the `signals` table. MUST mirror
 # `src.performance.tracker._ALL_METHODS` — duplicated here (instead of imported)
 # because tracker depends on src.db, so importing it back would be circular.
 # tests/test_db_signals.py asserts the two stay in sync; when adding a method,
 # add the column here too (new columns only apply to newly created DB files —
 # an existing DB needs a one-time ALTER TABLE signals ADD COLUMN <m> DOUBLE).
-SIGNAL_METHOD_COLUMNS = (
+SIGNAL_BASE_METHOD_COLUMNS = (
     "news", "sent_velocity", "tech", "insider", "put_call", "max_pain",
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow",
     "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
     "ext_gap",
 )
+
+# Multi-timeframe technical columns — the 30-min + weekly variants of the 8
+# OHLCV methods. Mirrors `src.signals.multi_timeframe.TECHNICAL_METHODS` ×
+# the non-daily timeframes (the DAILY variant is the bare method column above).
+# These are PANEL-ONLY (the IC dashboard); they are NOT in tracker._ALL_METHODS
+# (the trade-attribution set). tests/test_db_signals.py guards the convention.
+_MTF_METHODS = (
+    "tech", "vwap", "momentum", "money_flow",
+    "trend_strength", "iv_rank", "pattern", "sector_momentum",
+)
+_MTF_TIMEFRAMES = ("30m", "1w")
+SIGNAL_TIMEFRAME_COLUMNS = tuple(
+    f"{m}_{tf}" for tf in _MTF_TIMEFRAMES for m in _MTF_METHODS
+)
+
+# Full set of method-score columns persisted to the `signals` panel.
+SIGNAL_METHOD_COLUMNS = SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
 
 SCHEMA_STATEMENTS = [
     """
@@ -217,6 +234,8 @@ SCHEMA_STATEMENTS = [
 _ADD_COLUMNS = (
     ("run_sources", "n_items", "INTEGER"),
     ("run_sources", "empty", "BOOLEAN"),
+    # Multi-timeframe technical columns on an existing signals table.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_TIMEFRAME_COLUMNS),
 )
 
 

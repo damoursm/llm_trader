@@ -38,7 +38,7 @@ Cache strategy:
   Minimum 30 bars required; returns (0.0, 50.0, 0.0) when data is insufficient.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -128,15 +128,19 @@ def _compute_obv_z(df: pd.DataFrame) -> float:
     return float((slopes_arr[-1] - slopes_arr.mean()) / std)
 
 
-def compute_money_flow_score(ticker: str) -> Tuple[float, float, float]:
+def compute_money_flow_score(ticker: str, df: Optional[pd.DataFrame] = None) -> Tuple[float, float, float]:
     """Return (score, mfi_value, cmf_value).
 
     score ∈ [−1.0, +1.0].
     Positive = institutional accumulation / buying pressure.
     Negative = distribution / selling pressure.
     Returns (0.0, 50.0, 0.0) when data is insufficient.
+
+    ``df``: optional pre-fetched OHLCV frame (any timeframe). When ``None`` the
+    daily cache-first fetch is used — identical to the legacy behaviour.
     """
-    df = _get_ohlcv(ticker)
+    if df is None:
+        df = _get_ohlcv(ticker)
 
     required_cols = {"High", "Low", "Close", "Volume"}
     if df.empty or len(df) < _MIN_ROWS or not required_cols.issubset(df.columns):

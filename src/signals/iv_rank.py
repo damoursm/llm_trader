@@ -44,7 +44,7 @@ Cache strategy:
   Minimum 65 bars required; returns (0.0, 50.0, 0.0, "NEUTRAL") otherwise.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -89,7 +89,7 @@ def _atr_pct(df: pd.DataFrame) -> float:
     return float(atr) / last
 
 
-def compute_iv_rank_score(ticker: str) -> Tuple[float, float, float, str]:
+def compute_iv_rank_score(ticker: str, df: Optional[pd.DataFrame] = None) -> Tuple[float, float, float, str]:
     """Return ``(score, iv_rank, ret_5d_pct, direction_label)``.
 
     ``score`` ∈ [-1, +1]: regime-aware directional bias.
@@ -97,8 +97,12 @@ def compute_iv_rank_score(ticker: str) -> Tuple[float, float, float, str]:
       within the trailing 252-day RV distribution.
     ``ret_5d_pct``: raw 5-day percent return.
     ``direction_label``: short token describing the regime + direction.
+
+    ``df``: optional pre-fetched OHLCV frame (any timeframe). When ``None`` the
+    daily cache-first fetch is used — identical to the legacy behaviour.
     """
-    df = _get_ohlcv(ticker)
+    if df is None:
+        df = _get_ohlcv(ticker)
 
     if df.empty or len(df) < _MIN_ROWS or "Close" not in df.columns:
         logger.debug(f"[iv_rank] {ticker}: insufficient data ({len(df)} rows)")

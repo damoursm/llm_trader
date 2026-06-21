@@ -32,6 +32,11 @@ class TickerSnapshot(BaseModel):
     pct_change_5d: float
     volume: int
     market_cap: Optional[float] = None
+    # Provenance of `price`: "live" (Polygon snapshot / yfinance last trade) or
+    # "prev_close" (deterministic grouped-daily fallback when no live quote was
+    # available). Lets the price-provenance check skip non-live anchors so it
+    # never flags a live fill against a prior-session close.
+    price_source: str = "live"
 
 
 _BULLISH_TX_TYPES: frozenset = frozenset({
@@ -1176,6 +1181,15 @@ class TickerSignal(BaseModel):
     # ATR units: pre-market gap-and-go / after-hours catalyst reaction.
     ext_gap_score: float = 0.0   # [-1, +1] tanh(gap_atr / scale), deadbanded
     ext_gap_pct: float = 0.0     # raw extended-session move vs reference close (%)
+
+    # Multi-timeframe technical components — populated when
+    # enable_multi_timeframe_signals=true. The non-daily per-(method, timeframe)
+    # scores ({"tech_30m": .., "tech_1w": .., "vwap_30m": .., …}) computed by
+    # src/signals/multi_timeframe.py; the DAILY component stays in each method's
+    # own *_score field above. Persisted to the signals panel for the dashboard's
+    # 4-category Information-Coefficient table; the live combined_score uses the
+    # renormalised blend of these with the daily component.
+    timeframe_scores: Dict[str, float] = Field(default_factory=dict)
 
 
 class Recommendation(BaseModel):

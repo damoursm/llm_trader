@@ -40,7 +40,7 @@ import pandas as pd
 from loguru import logger
 
 from src.data.cache import load_ohlcv
-from src.data.market_data import get_history
+from src.data.market_data import get_history, get_weekly_history
 from src.signals.sector_benchmark import get_sector_benchmark
 
 
@@ -53,16 +53,26 @@ _MED_WEIGHT    = 0.4
 _TANH_SCALE    = 1.5
 
 
-def _get_close(ticker: str) -> Optional[pd.Series]:
-    """Return the Close series for *ticker* from cache, with a one-shot fetch
-    fallback when missing. Returns ``None`` on any failure."""
-    df = load_ohlcv(ticker)
-    if df is None or df.empty or "Close" not in df.columns:
-        try:
-            df = get_history(ticker, period="18mo")
-        except Exception as e:
-            logger.debug(f"[sector_mom] history fetch failed for {ticker}: {e}")
+def _get_close(ticker: str, interval: str = "1d") -> Optional[pd.Series]:
+    """Return the Close series for *ticker* at ``interval`` from cache, with a
+    one-shot fetch fallback when missing. Returns ``None`` on any failure.
+
+    ``1d`` = daily cache (legacy); ``30m`` = intraday fetch; ``1w`` = weekly
+    resampled from the daily cache."""
+    try:
+        if interval == "1d":
+            df = load_ohlcv(ticker)
+            if df is None or df.empty or "Close" not in df.columns:
+                df = get_history(ticker, period="18mo")
+        elif interval == "30m":
+            df = get_history(ticker, interval="30m")
+        elif interval == "1w":
+            df = get_weekly_history(ticker)
+        else:
             return None
+    except Exception as e:
+        logger.debug(f"[sector_mom] history fetch failed for {ticker}[{interval}]: {e}")
+        return None
     if df is None or df.empty or "Close" not in df.columns:
         return None
     s = df["Close"].astype(float)
@@ -103,12 +113,14 @@ def _compute_relative_momentum(
     ticker: str,
     benchmark: str,
     tag: str = "rel_mom",
+    interval: str = "1d",
 ) -> Tuple[float, float, float, str]:
     """Generic ticker-minus-benchmark residual momentum scorer.
 
     Shared implementation backing both the sector and market variants. The
     ``tag`` argument is only used in debug logging so the two callers
-    show up distinctly in logs.
+    show up distinctly in logs. ``interval`` pulls BOTH legs at the same
+    timeframe so the residual is apples-to-apples.
 
     Returns ``(score, rel_1m_pct, rel_3m_pct, benchmark)``. Returns zeros
     (and the benchmark string, so callers can still report it) whenever
@@ -117,8 +129,8 @@ def _compute_relative_momentum(
     if not benchmark or benchmark.upper() == ticker.upper():
         return 0.0, 0.0, 0.0, ""
 
-    tk_close = _get_close(ticker)
-    bm_close = _get_close(benchmark)
+    tk_close = _get_close(ticker, interval)
+    bm_close = _get_close(benchmark, interval)
     if tk_close is None or bm_close is None:
         logger.debug(
             f"[{tag}] {ticker} vs {benchmark}: missing OHLCV "
@@ -174,6 +186,7 @@ def _compute_relative_momentum(
 def compute_sector_relative_momentum_score(
     ticker: str,
     asset_type: Optional[str] = None,
+    interval: str = "1d",
 ) -> Tuple[float, float, float, str]:
     """Return ``(score, rel_1m_pct, rel_3m_pct, benchmark)`` — sector benchmark.
 
@@ -183,11 +196,14 @@ def compute_sector_relative_momentum_score(
     * ``rel_1m_pct``/``rel_3m_pct`` = raw ticker-minus-benchmark return %
       over 21 / 42 trading days. Useful diagnostic for the email.
     * ``benchmark`` = ETF symbol actually used (``""`` if none).
+
+    ``interval`` pulls both the ticker and its sector ETF at the same timeframe
+    ("1d" daily/legacy, "30m" intraday, "1w" weekly).
     """
     benchmark = get_sector_benchmark(ticker, asset_type=asset_type)
     if not benchmark:
         return 0.0, 0.0, 0.0, ""
-    return _compute_relative_momentum(ticker, benchmark, tag="sector_mom")
+    return _compute_relative_momentum(ticker, benchmark, tag="sector_mom", interval=interval)
 
 
 def compute_market_relative_momentum_score(

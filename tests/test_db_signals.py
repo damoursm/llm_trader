@@ -7,18 +7,34 @@ import pandas as pd
 import pytest
 
 from config.settings import settings
-from src.db.schema import SIGNAL_METHOD_COLUMNS
+from src.db.schema import (
+    SIGNAL_BASE_METHOD_COLUMNS,
+    SIGNAL_METHOD_COLUMNS,
+    SIGNAL_TIMEFRAME_COLUMNS,
+)
 
 
-# ── drift guard: schema columns must mirror tracker._ALL_METHODS ──────────
+# ── drift guard: BASE schema columns must mirror tracker._ALL_METHODS ──────
 
-def test_signal_method_columns_match_tracker():
+def test_signal_base_columns_match_tracker():
     from src.performance.tracker import _ALL_METHODS
-    assert tuple(SIGNAL_METHOD_COLUMNS) == tuple(_ALL_METHODS), (
-        "schema.SIGNAL_METHOD_COLUMNS must mirror tracker._ALL_METHODS — when "
-        "adding a method, add its column to the signals DDL in schema.py "
-        "(and ALTER TABLE signals ADD COLUMN <m> DOUBLE on existing DB files)."
+    assert tuple(SIGNAL_BASE_METHOD_COLUMNS) == tuple(_ALL_METHODS), (
+        "schema.SIGNAL_BASE_METHOD_COLUMNS must mirror tracker._ALL_METHODS — "
+        "the trade-attribution set. When adding a base method, add its column "
+        "here (and ALTER TABLE signals ADD COLUMN <m> DOUBLE on existing DBs)."
     )
+
+
+def test_signal_timeframe_columns_convention():
+    """The panel-only multi-timeframe columns follow ``{method}_{tf}`` for a
+    known technical method × non-daily timeframe, and compose with the base
+    set without overlap."""
+    from src.signals.multi_timeframe import TECHNICAL_METHODS, NON_DAILY_TIMEFRAMES
+    valid = {f"{m}_{tf}" for m in TECHNICAL_METHODS for tf in NON_DAILY_TIMEFRAMES}
+    assert set(SIGNAL_TIMEFRAME_COLUMNS) == valid
+    assert tuple(SIGNAL_METHOD_COLUMNS) == tuple(SIGNAL_BASE_METHOD_COLUMNS) + tuple(SIGNAL_TIMEFRAME_COLUMNS)
+    assert len(set(SIGNAL_METHOD_COLUMNS)) == len(SIGNAL_METHOD_COLUMNS)   # no dupes
+    assert not (set(SIGNAL_BASE_METHOD_COLUMNS) & set(SIGNAL_TIMEFRAME_COLUMNS))
 
 
 # ── insert_signals round-trip (temporary DuckDB file) ─────────────────────
@@ -48,6 +64,17 @@ def test_insert_signals_roundtrip(tmp_db):
     assert df.iloc[0]["signal_date"] == "2026-06-09"
     assert df.iloc[0]["dominant_method"] == "news"
     assert '"news": 0.5' in df.iloc[0]["scores"]           # full dict kept as JSON
+
+
+def test_insert_signals_timeframe_columns(tmp_db):
+    from src.db import repo
+    row = _row("AAPL")
+    row["scores"]["tech_30m"] = 0.42
+    row["scores"]["sector_momentum_1w"] = -0.31
+    repo.insert_signals("run-1", "2026-06-09T14:00:00+00:00", "2026-06-09", [row])
+    df = repo.fetch_df("SELECT * FROM signals", read_only=False)
+    assert df.iloc[0]["tech_30m"] == pytest.approx(0.42)         # projected tf column
+    assert df.iloc[0]["sector_momentum_1w"] == pytest.approx(-0.31)
 
 
 def test_insert_signals_idempotent_per_run(tmp_db):

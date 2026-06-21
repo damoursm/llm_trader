@@ -18,6 +18,7 @@ Score improvements vs a naive approach:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 import pandas as pd
 import ta
@@ -75,14 +76,20 @@ def _volume_conviction(df: pd.DataFrame) -> tuple[float, float]:
     return multiplier, vol_ratio
 
 
-def compute_technical_score(ticker: str) -> TechnicalResult:
+def compute_technical_score(ticker: str, df: Optional[pd.DataFrame] = None) -> TechnicalResult:
     """
     Compute technical indicators and return a TechnicalResult.
 
     score ∈ [-1.0, +1.0] — positive = bullish, negative = bearish.
     Also returns vol_ratio, atr_pct, bb_width_pct for use in the aggregator.
+
+    ``df``: optional pre-fetched OHLCV frame (any timeframe). When ``None`` the
+    daily 3-month history is fetched — identical to the legacy behaviour. On a
+    faster/slower candle the same window NUMBERS (RSI-14, SMA-50/200…) apply to
+    that timeframe's bars.
     """
-    df = get_history(ticker, period="3mo")
+    if df is None:
+        df = get_history(ticker, period="3mo")
     if df.empty or len(df) < 20:
         logger.warning(f"Not enough history for technical analysis of {ticker}")
         return EMPTY_RESULT

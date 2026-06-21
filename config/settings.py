@@ -388,6 +388,11 @@ class Settings(BaseSettings):
     discovery_min_price: float = 5.0                 # minimum last close ($)
     discovery_min_dollar_volume: float = 20_000_000  # minimum 20-day average dollar volume ($)
     discovery_gate_max_fetch: int = 25               # cap cold OHLCV fetches per run for the gate
+    # Drop exotic security TYPES from discovery (preferred series, warrants, units,
+    # rights, OTC foreign ordinaries) — redundant with a primary listing and/or not
+    # on the US consolidated tape (can't be priced deterministically). The pinned
+    # watchlist bypasses the gate, so an explicitly-chosen preferred is still honored.
+    enable_security_type_filter: bool = True
 
     # Reddit social sentiment — r/wallstreetbets, r/stocks, r/investing
     # Free Reddit API credentials: https://www.reddit.com/prefs/apps (create "script" app)
@@ -561,6 +566,29 @@ class Settings(BaseSettings):
     enable_cross_sectional: bool = True
     cross_sectional_weight: float = 0.20   # how strongly cs_score adjusts combined_score
     cross_sectional_zcap: float = 2.5      # cap individual z-scores to this magnitude
+
+    # ── Multi-timeframe technical signals (30-min / daily / weekly) ───────────────
+    # Every OHLCV-based method (tech, vwap, momentum, money_flow, trend_strength,
+    # iv_rank, pattern, sector_momentum) is also computed on a faster 30-min candle
+    # and a slower weekly candle. The three timeframe scores are BLENDED (weights
+    # below, renormalised over whichever timeframes are available) into the live
+    # combined_score, and every per-(method, timeframe) score is persisted to the
+    # signals panel for the dashboard's 4-category Information-Coefficient table.
+    # Master OFF ⇒ exactly the legacy daily-only behaviour.
+    enable_multi_timeframe_signals: bool = True
+    enable_intraday_30m: bool = True       # fetch + score the 30-min candle (yfinance)
+    enable_weekly_signals: bool = True     # resample the daily cache → weekly candle (free, no fetch)
+    # Strategy blend weights across timeframes (renormalised at runtime over the
+    # timeframes that actually produced a score for a given ticker). Daily-dominant
+    # by default; set tf_blend_1d=1.0 to revert to daily-only without flipping the flag.
+    tf_blend_30m: float = 0.20
+    tf_blend_1d: float = 0.60
+    tf_blend_1w: float = 0.20
+    # 30-min fetch is yfinance (≤60d history, per-IP rate-limited). 0 = attempt every
+    # ticker; set a positive cap to throttle if 429s bite on a wide universe.
+    intraday_30m_max_tickers: int = 0
+    # Re-fetch the 30-min OHLCV cache when its newest bar is older than this (minutes).
+    intraday_30m_ttl_minutes: int = 25
 
     # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
     # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the

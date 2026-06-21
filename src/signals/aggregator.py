@@ -932,6 +932,10 @@ def build_signals(
 
     signals        = []
     combined_scores: dict = {}
+    # Bounds how many tickers attempt the rate-limited 30-min fetch this run
+    # (intraday_30m_max_tickers; 0 = unbounded). Weekly is free (resampled) and
+    # always runs.
+    n30_used = 0
 
     for ticker in tickers:
 
@@ -1126,23 +1130,60 @@ def build_signals(
                 ticker, snap_price_by_ticker.get(ticker), session=session,
             )
 
+        # ── Multi-timeframe blend (30m / daily / weekly) ──────────────────
+        # Recompute the 8 OHLCV methods on the faster + slower candles and
+        # renormalise-blend them with the daily score. The blended value is what
+        # the combine + coherence consume, so the live strategy reflects all
+        # three timeframes. The daily component stays on the signal unchanged
+        # (the panel's "Daily" IC category + email). Flag off ⇒ daily passthrough.
+        tf_scores: dict = {}
+        tech_eff, vwap_eff, momentum_eff, money_flow_eff = (
+            technical_score, vwap_score, momentum_score, money_flow_score)
+        trend_strength_eff, iv_rank_eff, pattern_eff, sector_momentum_eff = (
+            trend_strength_score, iv_rank_score_v, pattern_score, sector_momentum_score)
+        if settings.enable_multi_timeframe_signals:
+            from src.signals.multi_timeframe import compute_timeframe_scores, blend_timeframes
+            allow_30m = (settings.intraday_30m_max_tickers <= 0
+                         or n30_used < settings.intraday_30m_max_tickers)
+            tf_scores = compute_timeframe_scores(ticker, allow_30m=allow_30m)
+            if allow_30m and settings.enable_intraday_30m:
+                n30_used += 1
+
+            def _eff(method: str, daily_v: float) -> float:
+                return blend_timeframes({
+                    "30m": tf_scores.get(f"{method}_30m"),
+                    "1d":  daily_v,
+                    "1w":  tf_scores.get(f"{method}_1w"),
+                })
+
+            tech_eff            = _eff("tech", technical_score)
+            vwap_eff            = _eff("vwap", vwap_score)
+            momentum_eff        = _eff("momentum", momentum_score)
+            money_flow_eff      = _eff("money_flow", money_flow_score)
+            trend_strength_eff  = _eff("trend_strength", trend_strength_score)
+            iv_rank_eff         = _eff("iv_rank", iv_rank_score_v)
+            pattern_eff         = _eff("pattern", pattern_score)
+            sector_momentum_eff = _eff("sector_momentum", sector_momentum_score)
+
         # ── Weighted combination ──────────────────────────────────────────
+        # Technical methods use their multi-timeframe BLEND (*_eff); non-OHLCV
+        # methods use their single live score.
         combined = (
             weights["news"]       * sentiment_score +
             weights["sent_velocity"] * sent_velocity_score +
-            weights["tech"]       * technical_score +
+            weights["tech"]       * tech_eff +
             weights["insider"]    * insider_sc +
             weights["put_call"]   * pc_score +
             weights["max_pain"]   * mp_score +
             weights["oi_skew"]    * oi_skew_score +
-            weights["vwap"]       * vwap_score +
-            weights["pattern"]    * pattern_score +
-            weights["momentum"]   * momentum_score +
-            weights["sector_momentum"] * sector_momentum_score +
-            weights["money_flow"] * money_flow_score +
-            weights["trend_strength"] * trend_strength_score +
+            weights["vwap"]       * vwap_eff +
+            weights["pattern"]    * pattern_eff +
+            weights["momentum"]   * momentum_eff +
+            weights["sector_momentum"] * sector_momentum_eff +
+            weights["money_flow"] * money_flow_eff +
+            weights["trend_strength"] * trend_strength_eff +
             weights["pead"]       * pead_score_v +
-            weights["iv_rank"]    * iv_rank_score_v +
+            weights["iv_rank"]    * iv_rank_eff +
             weights["iv_expr"]    * iv_expr_score_v +
             weights["coint"]      * coint_score_v +
             weights["ext_gap"]    * ext_gap_score_v
@@ -1167,22 +1208,24 @@ def build_signals(
             direction = "NEUTRAL"
 
         # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
+        # Technical methods use the blended (*_eff) values so coherence reflects
+        # exactly what the combine consumed.
         method_scores = [
             (use_news,       sentiment_score),
             (use_sent_velocity, sent_velocity_score),
-            (use_tech,       technical_score),
+            (use_tech,       tech_eff),
             (use_insider,    insider_sc),
             (use_put_call,   pc_score),
             (use_max_pain,   mp_score),
             (use_oi_skew,    oi_skew_score),
-            (use_vwap,       vwap_score),
-            (use_pattern,    pattern_score),
-            (use_momentum,   momentum_score),
-            (use_sector_momentum, sector_momentum_score),
-            (use_money_flow, money_flow_score),
-            (use_trend_strength, trend_strength_score),
+            (use_vwap,       vwap_eff),
+            (use_pattern,    pattern_eff),
+            (use_momentum,   momentum_eff),
+            (use_sector_momentum, sector_momentum_eff),
+            (use_money_flow, money_flow_eff),
+            (use_trend_strength, trend_strength_eff),
             (use_pead,       pead_score_v),
-            (use_iv_rank,    iv_rank_score_v),
+            (use_iv_rank,    iv_rank_eff),
             (use_iv_expr,    iv_expr_score_v),
             (use_coint,      coint_score_v),
             (use_ext_gap,    ext_gap_score_v),
@@ -1281,6 +1324,7 @@ def build_signals(
             coint_score=round(coint_score_v, 3),
             ext_gap_score=round(ext_gap_score_v, 3),
             ext_gap_pct=round(ext_gap_pct_v, 2),
+            timeframe_scores=tf_scores,
         ))
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""

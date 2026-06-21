@@ -67,6 +67,14 @@ def test_disabled_returns_none(monkeypatch):
     assert pipeline._assess_price_provenance("R1", [_snap("AAA", 100.0)]) is None
 
 
+def test_prev_close_anchor_is_skipped(monkeypatch):
+    # A grouped-daily 'prev_close' fallback anchor must NOT be compared against a
+    # live fill — that gap is legitimate and would falsely trip the band.
+    _patch_trades(monkeypatch, [_trade("CRDO", 250.81)])
+    snap = types.SimpleNamespace(ticker="CRDO", price=262.0, price_source="prev_close")
+    assert pipeline._assess_price_provenance("R1", [snap]) is None   # no live anchors → nothing to check
+
+
 def test_no_snapshots_returns_none(monkeypatch):
     _patch_trades(monkeypatch, [_trade("AAA", 100.0)])
     assert pipeline._assess_price_provenance("R1", []) is None

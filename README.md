@@ -9,14 +9,18 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  0.  Ticker Discovery     — trending tickers beyond the static watchlist │
-│  1.  News Fetch           — RSS feeds + NewsAPI (last 24 h)              │
+│      + gate: validate (drop "N/A"), drop exotic types (pref/warrant/    │
+│      unit/OTC-foreign), then liquidity (price + 20d $-vol)               │
+│  1.  News Fetch           — RSS + PR wires + FDA + per-ticker Google     │
+│      News (fresh/tick) + NewsAPI + Polygon/Finnhub/AV/StockTwits         │
 │  1b. SEC 8-K Filings      — material events: earnings, M&A, restatements │
 │  1c. Google Trends        — search interest spikes (retail attention)    │
 │  1d. Reddit Sentiment     — WSB / r/stocks / r/investing mention counts  │
 │  1e. Analyst Ratings      — upgrades, downgrades, price-target changes   │
 │  1f. EPS Surprises        — recent beat/miss history from yfinance       │
 │  1g. Short Interest       — FINRA Reg SHO short volume + squeeze signals │
-│  2.  Market Data          — price snapshots via yfinance                 │
+│  2.  Market Data          — Polygon batch → yfinance → grouped-daily     │
+│      close fallback (deterministic; exec prices via _fetch_price/IBKR)   │
 │  3a. Insider Trades       — politician disclosures + EDGAR Form 4        │
 │  3b. Options Flow         — unusual call/put sweep detection             │
 │  3c. SEC Filings          — 13D/13G activist, Form 144, 13F positions    │
@@ -146,7 +150,7 @@ Both catalyst sources inject at Step 0, so the existing per-ticker enrichment �
 
 Steps 0–0d widen the discovery funnel; this applies one **uniform quality floor** to every *discovered* candidate before it enters the analysis universe, so breadth doesn't translate into untradeable microcaps — the names the tracker's price-tiered bid-ask model (`_dynamic_half_spread`) charges up to **250 bp a side**, which silently erodes realised P&L.
 
-`liquidity.apply_liquidity_gate()` keeps a candidate only when its **last close ≥ `DISCOVERY_MIN_PRICE`** ($5) **and** its **20-day average dollar volume ≥ `DISCOVERY_MIN_DOLLAR_VOLUME`** ($20M). Data is loaded **cache-first** with a bounded warm-up fetch (`DISCOVERY_GATE_MAX_FETCH`, a single shared budget per run); a name whose liquidity cannot be verified is **dropped (fail-closed)** — the base watchlist is never affected, and a genuinely liquid name re-appears next run once its OHLCV cache is warm.
+`liquidity.apply_liquidity_gate()` applies three filters in its cleaning pass: **(1) ticker validation** — `is_valid_ticker` drops junk like `N/A` before it reaches yfinance (which otherwise raises an opaque error and spams the log); **(2) security-type filter** — `is_exotic_security` drops preferred series (`-P[A-Z]`), warrants/units/rights, and OTC foreign ordinaries (5-char `…F/W/U`), which are redundant with a primary listing and/or not on the US consolidated tape (ADRs `…Y` and class shares `BRK-B` are KEPT); disable with `ENABLE_SECURITY_TYPE_FILTER=false`; **(3) liquidity** — keeps a candidate only when its **last close ≥ `DISCOVERY_MIN_PRICE`** ($5) **and** its **20-day average dollar volume ≥ `DISCOVERY_MIN_DOLLAR_VOLUME`** ($20M). Data is loaded **cache-first** with a bounded warm-up fetch (`DISCOVERY_GATE_MAX_FETCH`, a single shared budget per run); a name whose liquidity cannot be verified is **dropped (fail-closed)** — the base watchlist is never affected, and a genuinely liquid name re-appears next run once its OHLCV cache is warm.
 
 **Never gated** (pinned/intentional): the static watchlist, sector ETFs, commodities, factor/thematic ETFs, and open-trade tickers. The gate runs as one pass at the end of Step 0 (covering trending, market-wide earnings/analyst catalysts, and cluster-watch injections) and again at the macro→discovery (Step 3.85) and cointegration-peer (Step 3.9) injection points. The opportunity screener (Step 0b) applies the same price/dollar-volume floor internally. Disable with `ENABLE_DISCOVERY_LIQUIDITY_GATE=false`.
 
@@ -154,22 +158,31 @@ Steps 0–0d widen the discovery funnel; this applies one **uniform quality floo
 
 ### Step 1 — News Fetch (`src/data/news_fetcher.py`)
 
-Pulls articles from two layers and deduplicates by URL, filtered to the last 24 hours. Cached hourly.
+Pulls articles from several layers and deduplicates by URL, filtered to the last 24 hours. The **fresh-every-tick fast lane** (RSS + PR wires + FDA + Google News) is never cached so breaking catalysts aren't hidden; the rate-limited per-ticker yfinance + NewsAPI bundle is cached hourly.
 
-**Layer A — RSS feeds (no key required)**
+**Layer A — RSS + press-release wires + regulatory (no key required, fetched fresh every tick)**
 
 | Feed | Coverage |
 |---|---|
-| Reuters Business | General markets and macro |
 | CNBC Markets | US equity and sector news |
-| MarketWatch | Real-time headlines |
 | Seeking Alpha | Individual stock analysis |
 | Yahoo Finance | Broad market news |
-| WSJ Markets | Premium financial coverage |
+| GlobeNewswire / PR Newswire (financial + M&A) | Primary press-release wires — catalysts break here first |
+| FDA / MedWatch | Drug approvals/CRLs + device recalls (regulatory catalysts) |
 
-**Layer B — NewsAPI targeted queries (requires `NEWSAPI_KEY`)**
+> Reuters, MarketWatch, and WSJ public RSS endpoints were **removed** — they retired / froze (serving 12–17-month-old content the 24h cutoff dropped entirely). That coverage now comes via Google News + Polygon (Benzinga).
+
+**Layer B — per-ticker Google News (no key required, fetched fresh every tick)**
+
+`fetch_google_news` runs a per-ticker Google News RSS query (`"<TICKER>" stock`) plus a `site:businesswire.com` query, so each article is ticker-tagged and coverage widens to Reuters/Bloomberg/Barron's/FT/Investing.com **and** Business Wire. Bounded by `GOOGLE_NEWS_MAX_TICKERS`.
+
+**Layer C — NewsAPI targeted queries (requires `NEWSAPI_KEY`)**
 
 Two targeted queries: the first 10 watchlist tickers joined with `OR`, and sector names for ETF context.
+
+**Layer D — provider news + alt-data**
+
+Polygon `/v2/reference/news` (Benzinga-sourced, carries per-article sentiment `insights` → can skip the LLM scorer) and Finnhub `company-news` (coverage only). Optional, off by default: Alpha Vantage `NEWS_SENTIMENT` (pre-scored, hourly-cached, budget-gated) and StockTwits crowd sentiment (token-gated). All normalised to `NewsArticle`.
 
 ---
 
@@ -253,7 +266,9 @@ When `ENABLE_SHORT_INTEREST=true`, combines two free sources to detect squeeze s
 
 ### Step 2 — Market Data (`src/data/market_data.py`)
 
-Price snapshots for every ticker via yfinance, with four-level cache fallback. When a 429 rate-limit is detected: exponential backoff (60s → 120s → 240s), stops after 3 consecutive failures.
+Bulk price snapshots for every ticker via a three-tier path: **(1) Polygon batch** (the per-ticker `/v2/snapshot` endpoint **403s on the free tier**, so this returns empty there), **(2) yfinance per-ticker** (live, with 429 exponential backoff 60→120→240s, stops after 3 failures), **(3) a deterministic grouped-daily close fallback** — one Polygon `/v2/aggs/grouped` call (which DOES work on the free tier) fills any still-uncovered ticker with the last completed close, marked `price_source="prev_close"`. This lifted bulk coverage on a wide discovered universe from ~37% to ~90%+.
+
+**Two separate price paths.** This bulk snapshot feeds the analysis panel / scoring context / price-provenance check — **not** trade fills. Execution prices come from `tracker._fetch_price` (IBKR real-time → yfinance → Polygon single-ticker), fetched live only for the handful of actionable/held tickers. A live intraday price is inherently non-deterministic; the deterministic anchor used for analysis/NAV/IC is the completed daily **close**.
 
 **Intraday operation (no unclosed-bar look-ahead):** the pipeline runs every 30 min during market hours on **live** prices, and the daily OHLCV history used by the indicators is **completed-bars-only** — the still-forming current-session bar is dropped until the 16:00 ET close (`market_data._drop_forming_bar`). So no indicator or return calculation ever reads an unclosed daily bar; the live price is used for fills and mark-to-market, the completed daily bars for the multi-day signals (Hybrid model).
 
@@ -1718,7 +1733,9 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 
 To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env`.
 
-**DeepSeek V4-Flash analyst fallback:** When the configured Claude model raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through `deepseek-v4-flash` (DeepSeek V4-Flash, non-thinking) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If DeepSeek also fails, the pipeline falls back to a simple rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
+**Synthesis A/B bake-off (`LLM_AB_SYNTHESIS_MODELS`):** instead of always using `ANALYST_MODEL`, set a comma-separated pool and each run picks one model UNIFORMLY (equal split), so every model accumulates comparable samples and shows as its own row in the dashboard's per-LLM evaluation (keyed by exact model id). Current pool: `claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking,deepseek-v4-pro-thinking` (≈¼ each). **DeepSeek arms encode reasoning mode via a `-thinking` suffix** — a logical id decoded by `_deepseek_spec` into (API model, thinking flag); thinking is the synthesis quality lever and is free on flash, while pro is ~3× flash on cache-miss tokens. The logical id is recorded for provenance so flash-thinking and pro-thinking are distinct rows. Empty pool → legacy binary `ANALYST_MODEL` ⇄ DeepSeek behavior. **Sentiment is unaffected** (stays flash non-thinking, the high-volume cost driver).
+
+**DeepSeek analyst fallback:** When the chosen analyst engine raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through the OTHER provider's default model (the cross-engine fallback stays cheap flash non-thinking) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If both fail, the pipeline falls back to a rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
 
 ---
 

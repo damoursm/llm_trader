@@ -28,7 +28,7 @@ Important caveats:
   - Requires at least 25 rows of history to compute; returns 0.0 otherwise.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,7 +56,7 @@ def _get_ohlcv(ticker: str) -> pd.DataFrame:
     return get_history(ticker, period="6mo")
 
 
-def compute_vwap_score(ticker: str) -> Tuple[float, float]:
+def compute_vwap_score(ticker: str, df: Optional[pd.DataFrame] = None) -> Tuple[float, float]:
     """
     Return (score, vwap_distance_pct) for the ticker.
 
@@ -64,8 +64,12 @@ def compute_vwap_score(ticker: str) -> Tuple[float, float]:
                             negative = price above VWAP (bearish reversion).
     vwap_distance_pct     — raw (price − VWAP) / VWAP × 100 (positive = above VWAP).
     Returns (0.0, 0.0) if there is insufficient data.
+
+    ``df``: optional pre-fetched OHLCV frame (any timeframe). When ``None`` the
+    daily cache-first fetch is used — identical to the legacy behaviour.
     """
-    df = _get_ohlcv(ticker)
+    if df is None:
+        df = _get_ohlcv(ticker)
 
     required = {"High", "Low", "Close", "Volume"}
     if df.empty or len(df) < _MIN_ROWS or not required.issubset(df.columns):

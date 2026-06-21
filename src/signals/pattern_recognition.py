@@ -198,8 +198,15 @@ def _detect_pattern(prices: np.ndarray) -> Optional[str]:
 
 # ── Pattern library cache ─────────────────────────────────────────────────────
 
-def _load_library(ticker: str) -> Optional[dict]:
-    path = _CACHE_DIR / f"{ticker.upper()}.json"
+def _cache_dir(interval: str = "1d") -> Path:
+    """Pattern-library directory for a timeframe. Daily keeps the legacy
+    ``cache/patterns`` path; each non-daily timeframe trains its own library
+    in a sibling namespace (``cache/patterns_30m`` …)."""
+    return _CACHE_DIR if interval == "1d" else Path(f"cache/patterns_{interval}")
+
+
+def _load_library(ticker: str, interval: str = "1d") -> Optional[dict]:
+    path = _cache_dir(interval) / f"{ticker.upper()}.json"
     if not path.exists():
         return None
     try:
@@ -212,18 +219,22 @@ def _load_library(ticker: str) -> Optional[dict]:
         return None
 
 
-def _save_library(ticker: str, library: dict) -> None:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def _save_library(ticker: str, library: dict, interval: str = "1d") -> None:
+    d = _cache_dir(interval)
+    d.mkdir(parents=True, exist_ok=True)
     try:
-        (_CACHE_DIR / f"{ticker.upper()}.json").write_text(json.dumps(library))
+        (d / f"{ticker.upper()}.json").write_text(json.dumps(library))
     except Exception as e:
         logger.warning(f"[pattern] Failed to save library for {ticker}: {e}")
 
 
-def _build_library(ticker: str, df: pd.DataFrame) -> dict:
+def _build_library(ticker: str, df: pd.DataFrame, interval: str = "1d") -> dict:
     """
     Scan the full price history with a sliding window to compute per-pattern
     win rates and average returns for this specific ticker.
+
+    ``interval`` is the timeframe of ``df`` — stored for provenance; the scan
+    works in *bars*, so the same detector runs on any candle size.
     """
     closes = df["Close"].values.astype(float)
     n = len(closes)
@@ -271,6 +282,7 @@ def _build_library(ticker: str, df: pd.DataFrame) -> dict:
 
     return {
         "ticker":       ticker.upper(),
+        "interval":     interval,
         "last_updated": date.today().isoformat(),
         "history_bars": n,
         "patterns":     patterns_out,
@@ -279,7 +291,8 @@ def _build_library(ticker: str, df: pd.DataFrame) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def compute_pattern_score(ticker: str) -> Tuple[float, str]:
+def compute_pattern_score(ticker: str, df: Optional[pd.DataFrame] = None,
+                          interval: str = "1d") -> Tuple[float, str]:
     """
     Detect the current chart pattern and return (score, pattern_name).
 
@@ -287,25 +300,35 @@ def compute_pattern_score(ticker: str) -> Tuple[float, str]:
     Returns (0.0, "") when no pattern is detected or data is insufficient.
 
     Cold path (first call / expired cache):
-      Fetches 2 years of OHLCV data, builds pattern library, saves to cache.
+      Builds the pattern library from history and saves it to the interval's cache.
     Warm path (cache hit):
-      Loads library instantly, detects pattern from OHLCV chart cache.
+      Loads library instantly, detects the pattern from the most recent bars.
+
+    ``df``: optional pre-fetched OHLCV frame (its own ``interval``). When ``None``
+    the legacy daily flow runs (fetch 2y for the build / daily chart cache for
+    detection). For a non-daily timeframe ``df`` must be supplied (the library +
+    detection are built from it), and the daily-trade live-registry overlay is
+    skipped — that overlay is keyed on the daily trade ledger.
     """
-    library = _load_library(ticker)
+    library = _load_library(ticker, interval)
 
     if library is None:
-        df = get_history(ticker, period=_HISTORY_PERIOD)
-        if df.empty or len(df) < _MIN_HISTORY:
-            logger.debug(f"[pattern] {ticker}: insufficient history ({len(df)} bars) — skipping")
+        src = df if df is not None else get_history(ticker, period=_HISTORY_PERIOD)
+        if src is None or src.empty or len(src) < _MIN_HISTORY:
+            logger.debug(f"[pattern] {ticker}[{interval}]: insufficient history "
+                         f"({0 if src is None else len(src)} bars) — skipping")
             return 0.0, ""
-        logger.info(f"[pattern] Building pattern library for {ticker} ({len(df)} bars)…")
-        library = _build_library(ticker, df)
-        _save_library(ticker, library)
-        recent_prices = df["Close"].values[-_DETECT_WINDOW:].astype(float)
+        logger.info(f"[pattern] Building {interval} pattern library for {ticker} ({len(src)} bars)…")
+        library = _build_library(ticker, src, interval)
+        _save_library(ticker, library, interval)
+        recent_prices = src["Close"].values[-_DETECT_WINDOW:].astype(float)
     else:
-        recent_df = load_ohlcv(ticker)
-        if recent_df is None or len(recent_df) < 20:
-            recent_df = get_history(ticker, period="3mo")
+        if df is not None:
+            recent_df = df
+        else:
+            recent_df = load_ohlcv(ticker)
+            if recent_df is None or len(recent_df) < 20:
+                recent_df = get_history(ticker, period="3mo")
         if recent_df is None or recent_df.empty or len(recent_df) < 20:
             return 0.0, ""
         recent_prices = recent_df["Close"].values[-_DETECT_WINDOW:].astype(float)
@@ -328,12 +351,17 @@ def compute_pattern_score(ticker: str) -> Tuple[float, str]:
         syn_source   = "synthetic"
 
     # ── Live registry overlay (Bayesian shrinkage) ─────────────────────────
-    blended_wr, blend_info = _blend_with_live_registry(
-        pattern_name=current,
-        ticker=ticker,
-        syn_win_rate=syn_win_rate,
-        syn_n=syn_n,
-    )
+    # The live registry is the DAILY trade ledger — only meaningful for the
+    # daily timeframe; non-daily timeframes use the synthetic prior directly.
+    if interval == "1d":
+        blended_wr, blend_info = _blend_with_live_registry(
+            pattern_name=current,
+            ticker=ticker,
+            syn_win_rate=syn_win_rate,
+            syn_n=syn_n,
+        )
+    else:
+        blended_wr, blend_info = syn_win_rate, "no-live(tf)"
 
     edge  = (blended_wr - 0.5) * 2.0
     score = round(max(-1.0, min(1.0, edge * inherent)), 3)

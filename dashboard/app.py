@@ -582,19 +582,61 @@ def _usd(x, signed: bool = True) -> str:
 
 _IC_TOOLTIP = (
     "Spearman rank correlation between each method's score and the forward "
-    "close-to-close return at 1/5/10 trading-day horizons, plus the directional "
-    "hit rate (% of non-zero scores whose sign matched the move). Computed over the "
+    "close-to-close return at 1/5/10 trading-day horizons. Computed over the "
     "persisted signals panel — EVERY scored ticker each run, not just the few that "
-    "became trades — so it is unbiased by the trading gates. A method with a "
-    "persistent NEGATIVE IC is sign-inverted (a logic bug); a high-weight method "
-    "with IC ≈ 0 at large n is dead weight in the aggregator. 'Views' = scored, "
-    "non-zero observations. Run/forward-return based, so it is NOT affected by the "
-    "window toggle; n grows every run — judge nothing on a thin panel.")
+    "became trades — so it is unbiased by the trading gates. Split into four "
+    "categories: the 8 OHLCV methods computed on 30-min, daily, and weekly candles "
+    "(the SAME indicators on different bar sizes), and Other (news, sentiment, smart "
+    "money, options, catalysts — most-recent data). 'Sim win %' = simulated solo win "
+    "rate (share of non-zero scores whose sign matched the move); 'Sim ret %' = "
+    "simulated solo return (mean sign(score)×forward-return — the gross P&L if that "
+    "method alone decided the trade). A persistent NEGATIVE IC is sign-inverted (a "
+    "logic bug); IC ≈ 0 at large n is dead weight. 'Views' = scored, non-zero "
+    "observations. Run/forward-return based (NOT affected by the window toggle); "
+    "n grows every run — judge nothing on a thin panel.")
+
+_IC_HORIZONS = (1, 5, 10)
+
+
+def _ic_category_table(subset, labels):
+    """Build one category's IC DataTable from its rows of the ic DataFrame."""
+    rows = []
+    for _, r in subset.iterrows():
+        row = {"method": labels.get(r["method"], r["method"]), "views": int(r["views"])}
+        for h in _IC_HORIZONS:
+            n, ic, hit, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
+                               r.get(f"hit_{h}d"), r.get(f"simret_{h}d"))
+            row[f"n_{h}d"] = int(n) if pd.notna(n) else None
+            row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
+            row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
+            row[f"simret_{h}d"] = round(float(sim), 2) if pd.notna(sim) else None
+        rows.append(row)
+    cols = [{"name": "Method", "id": "method"},
+            {"name": "Views", "id": "views", "type": "numeric", "format": _INT}]
+    for h in _IC_HORIZONS:
+        cols += [
+            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
+            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"Sim win@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"Sim ret@{h}d %", "id": f"simret_{h}d", "type": "numeric", "format": _NUM2},
+        ]
+    longest = max(_IC_HORIZONS)
+    cond = []
+    for c in (f"ic_{longest}d", f"simret_{longest}d"):
+        cond += [
+            {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c},
+             "color": figures.POS, "fontWeight": "bold"},
+            {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c},
+             "color": figures.NEG, "fontWeight": "bold"},
+        ]
+    return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
 
 
 def _ic_section():
-    """Per-method information coefficient over the signals panel (item #1)."""
+    """Per-method information coefficient over the signals panel, split into the
+    30-min / daily / weekly technical categories plus Other."""
     from src.performance.tracker import METHOD_LABELS
+    from src.analysis.signal_panel import IC_CATEGORY_ORDER
     res = data.signal_ic()
     icdf = res.get("ic")
     heading = _h3("Signal information coefficient (IC)", _IC_TOOLTIP)
@@ -607,37 +649,20 @@ def _ic_section():
                 "for IC yet. It accrues automatically every run.",
                 style={"color": "#6b7280"}),
         ])
-    horizons = (1, 5, 10)
     labels = dict(METHOD_LABELS)
     labels["combined_score"] = "All methods (combined)"
-    rows = []
-    for _, r in icdf.iterrows():
-        row = {"method": labels.get(r["method"], r["method"]), "views": int(r["views"])}
-        for h in horizons:
-            n, ic, hit = r.get(f"n_{h}d"), r.get(f"ic_{h}d"), r.get(f"hit_{h}d")
-            row[f"n_{h}d"] = int(n) if pd.notna(n) else None
-            row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
-            row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
-        rows.append(row)
-    cols = [{"name": "Method", "id": "method"},
-            {"name": "Views", "id": "views", "type": "numeric", "format": _INT}]
-    for h in horizons:
-        cols += [
-            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
-            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"hit@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
-        ]
-    longest = max(horizons)
-    cond = [
-        {"if": {"filter_query": f"{{ic_{longest}d}} > 0", "column_id": f"ic_{longest}d"},
-         "color": figures.POS, "fontWeight": "bold"},
-        {"if": {"filter_query": f"{{ic_{longest}d}} < 0", "column_id": f"ic_{longest}d"},
-         "color": figures.NEG, "fontWeight": "bold"},
-    ]
-    return html.Div([
-        heading,
-        dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW),
-    ])
+    children = [heading]
+    has_cat = "category" in icdf.columns
+    for category in IC_CATEGORY_ORDER:
+        subset = icdf[icdf["category"] == category] if has_cat else icdf
+        if subset is None or subset.empty:
+            continue
+        children.append(html.Div(category, style={
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}))
+        children.append(_ic_category_table(subset, labels))
+        if not has_cat:
+            break
+    return html.Div(children)
 
 
 def _methods_tab():

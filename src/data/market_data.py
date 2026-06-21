@@ -20,7 +20,7 @@ import re
 import time
 import yfinance as yf
 import pandas as pd
-from datetime import datetime as _datetime, time as _dtime
+from datetime import datetime as _datetime, time as _dtime, timedelta as _timedelta, timezone as _timezone
 from loguru import logger
 from typing import Iterable, List, Optional, Tuple
 from config import settings
@@ -73,6 +73,33 @@ def sanitize_tickers(tickers: Iterable[str]) -> List[str]:
     return out
 
 
+# ── Exotic security-type filter ───────────────────────────────────────────────
+# Preferred series, warrants, units, rights, and OTC foreign-ordinary symbols are
+# redundant with a primary listing and/or not on the US consolidated tape, so they
+# can't be priced deterministically (grouped-daily misses them) and aren't what the
+# strategy trades. Drop them from DISCOVERY (the gate); the pinned/watchlist universe
+# bypasses this, so an explicitly-chosen preferred is still honored. ADRs ('…Y',
+# exchange-listed + tradeable) are deliberately KEPT.
+_PREFERRED_RE   = re.compile(r"-P[A-Z]$")                # ALL-PJ, COF-PN  (NOT BRK-B, BF-B)
+_WUR_FORM_RE    = re.compile(r"[-.](WT|WS|WI|UN|U|RT|RI|R)$")  # explicit warrant/unit/right/when-issued
+_NASDAQ_5CH_RE  = re.compile(r"^[A-Z]{4}[FWU]$")         # 5-char OTC foreign(F)/warrant(W)/unit(U)
+
+
+def is_exotic_security(ticker: Optional[str]) -> bool:
+    """True for preferred / warrant / unit / right / OTC-foreign-ordinary symbols.
+
+    Conservative + high-precision so it never drops a real common: class shares
+    (BRK-B), plain commons, 4-char tickers ending F/W/U (INTU, LABU), ADRs (TCEHY),
+    futures (GC=F) and indices (^VIX) all pass; only the 5-char Nasdaq special-type
+    suffixes and the unambiguous dash/dot forms are flagged."""
+    if not isinstance(ticker, str):
+        return False
+    s = ticker.strip().upper()
+    if not s:
+        return False
+    return bool(_PREFERRED_RE.search(s) or _WUR_FORM_RE.search(s) or _NASDAQ_5CH_RE.match(s))
+
+
 def _bar_session_date(ts):
     """Map an OHLCV index timestamp to its NYSE session date (ET)."""
     tz = getattr(ts, "tzinfo", None) or getattr(ts, "tz", None)
@@ -90,28 +117,76 @@ def _bar_session_date(ts):
         return None
 
 
-def _drop_forming_bar(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    """Remove the current session's still-forming daily bar.
+def _ts_to_utc(ts) -> Optional["pd.Timestamp"]:
+    """Coerce an OHLCV index timestamp to a tz-aware UTC ``Timestamp``.
 
-    The pipeline runs intraday (every 30 min, 09:30–16:00 ET), so a freshly
-    fetched daily bar dated *today* is incomplete until the 16:00 ET close —
-    feeding it to a daily indicator (or the NAV walk) would read a price that
-    is still moving (look-ahead within the day). Before the close we drop
-    today's bar so all daily history is completed-bars-only; after the close it
-    is final and kept. Live prices for fills / marks come from the live quote
-    (``_fetch_price`` → ``fast_info.last_price``), never from this
-    intentionally-lagged daily history.
+    The cache stores tz-naive timestamps in UTC (``_normalize_index_tz``), while
+    a fresh yfinance frame is tz-aware ET — so a tz-naive value is interpreted as
+    UTC and a tz-aware one is converted. Used by the intraday/weekly forming-bar
+    drops, which need instant-level (not just date-level) comparison."""
+    try:
+        t = pd.Timestamp(ts)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    except (TypeError, ValueError):
+        return None
+
+
+def _drop_forming_bar(df: Optional[pd.DataFrame], interval: str = "1d") -> Optional[pd.DataFrame]:
+    """Remove the current period's still-forming bar (look-ahead guard).
+
+    The pipeline runs intraday, so the newest bar of any timeframe may still be
+    forming — feeding it to an indicator (or the NAV walk) reads a price that is
+    still moving (look-ahead within the period). This drops it until the period
+    closes; once final it is kept. Live prices for fills / marks come from the
+    live quote (``_fetch_price``), never from this intentionally-lagged history.
+
+      * ``1d``  — drop today's daily bar until the 16:00 ET close (legacy logic).
+      * ``30m`` — drop trailing 30-minute bars whose window (bar_start → +30 min)
+                  has not yet elapsed.
+      * ``1w``  — drop the current ISO-week bar until that week's Friday close.
     """
     if df is None or getattr(df, "empty", True):
         return df
-    now_et = _datetime.now(_NY_TZ)
-    if now_et.time() >= _MARKET_CLOSE:
-        return df  # regular session closed — today's daily bar is complete
-    today = now_et.date()
-    mask = [_bar_session_date(ts) != today for ts in df.index]
-    if all(mask):
-        return df
-    return df[mask]
+
+    if interval == "1d":
+        now_et = _datetime.now(_NY_TZ)
+        if now_et.time() >= _MARKET_CLOSE:
+            return df  # regular session closed — today's daily bar is complete
+        today = now_et.date()
+        mask = [_bar_session_date(ts) != today for ts in df.index]
+        return df if all(mask) else df[mask]
+
+    if interval == "30m":
+        now_utc = _datetime.now(_timezone.utc)
+        mask = []
+        for ts in df.index:
+            u = _ts_to_utc(ts)
+            # Keep a bar only once its 30-min window has fully elapsed.
+            mask.append(u is not None and (u + _timedelta(minutes=30)) <= now_utc)
+        return df if all(mask) else df[mask]
+
+    if interval == "1w":
+        now_et = _datetime.now(_NY_TZ)
+
+        def _week_complete(ts) -> bool:
+            # Resample labels each weekly bar with that week's Friday (W-FRI).
+            try:
+                friday = pd.Timestamp(ts).date()
+            except (TypeError, ValueError):
+                return False
+            if now_et.date() > friday:
+                return True
+            if now_et.date() == friday:
+                return now_et.time() >= _MARKET_CLOSE
+            return False
+
+        mask = [_week_complete(ts) for ts in df.index]
+        return df if all(mask) else df[mask]
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +366,42 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
             except Exception as e:
                 logger.warning(f"[market_data] Unexpected error for {ticker}: {e}")
 
+    # ── 3. Deterministic grouped-daily close fallback ─────────────────────
+    # Polygon's per-ticker snapshot endpoint 403s on the free tier and the
+    # yfinance fallback rate-limits/aborts on a wide universe, leaving many
+    # tickers with NO price (~63% on a 568-name discovered universe). The
+    # grouped-daily aggregates endpoint DOES work on the free tier and returns
+    # every US ticker's completed close in ONE call — deterministic and
+    # near-100% coverage. Fill anything still uncovered with the last completed
+    # close, marked price_source="prev_close" so it's NOT a live quote (the
+    # price-provenance check skips these; live execution uses tracker._fetch_price,
+    # never this bulk snapshot). A recent close beats a null for the learning
+    # panel + scoring context.
+    covered_now = {s.ticker for s in snapshots}
+    still = [t for t in tickers if t not in covered_now]
+    if still:
+        try:
+            grouped = polygon_client.get_grouped_daily_closes()
+        except Exception as e:
+            logger.warning(f"[market_data] grouped-daily close fallback failed: {e}")
+            grouped = {}
+        filled = 0
+        for ticker in still:
+            # Class shares: our universe uses 'BRK-B', Polygon grouped uses 'BRK.B'.
+            close = grouped.get(ticker) or grouped.get(ticker.replace("-", "."))
+            if close and close > 0:
+                snapshots.append(TickerSnapshot(
+                    ticker=ticker, price=float(close),
+                    pct_change_1d=0.0, pct_change_5d=0.0, volume=0,
+                    market_cap=None, price_source="prev_close",
+                ))
+                filled += 1
+        if filled:
+            logger.info(
+                f"[market_data] grouped-daily close fallback filled {filled}/{len(still)} "
+                "uncovered ticker(s) with the last completed close (deterministic)"
+            )
+
     source = (
         "yfinance" if not polygon_client.is_available()
         else ("polygon" if not remaining else "polygon+yfinance")
@@ -360,7 +471,8 @@ def _merge_ohlcv(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.Data
     return combined
 
 
-def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -> pd.DataFrame:
+def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False,
+                interval: str = "1d") -> pd.DataFrame:
     """
     Return OHLCV history for chart generation / technical analysis.
 
@@ -376,7 +488,14 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
     ``force_refresh``: bypass the TTL check and re-fetch even when the
     cached last bar is within the 3-day window. Used by the performance
     tracker to keep open-trade OHLCV fully up to date.
+
+    ``interval``: "1d" (default, the daily path below) or "30m" (yfinance-only
+    intraday path — see ``_get_intraday_history``). Weekly bars come from
+    ``get_weekly_history`` (resampled from the daily cache), not this function.
     """
+    if interval != "1d":
+        return _get_intraday_history(ticker, interval=interval, force_refresh=force_refresh)
+
     from src.data.cache import load_ohlcv, save_ohlcv
     from datetime import date as _date
 
@@ -437,3 +556,121 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False) -
             else:
                 logger.warning(f"[market_data] get_history failed for {ticker}: {e}")
                 return cached if (cached is not None and not cached.empty) else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe history — 30-minute (intraday) and weekly
+# ---------------------------------------------------------------------------
+
+def _fetch_intraday_yf(ticker: str, interval: str = "30m") -> pd.DataFrame:
+    """Fetch intraday OHLCV via yfinance (RTH only). Fail-soft per ticker.
+
+    yfinance caps 30-minute history at ~60 days. On a rate limit we give up on
+    THIS ticker immediately rather than running the daily path's 60–240 s
+    backoff — blocking a 30-min tick on hundreds of sleeps would be worse than
+    a patchy 30m panel (the ticker simply scores on daily/weekly this tick).
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="60d", interval=interval)
+    except Exception as e:
+        if _is_rate_limit(e):
+            logger.debug(f"[market_data] {interval} rate-limited for {ticker} — skipping")
+        else:
+            logger.debug(f"[market_data] {interval} fetch failed for {ticker}: {e}")
+        return pd.DataFrame()
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in hist.columns]
+    return hist[cols] if cols else pd.DataFrame()
+
+
+def _merge_intraday(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.DataFrame:
+    """Combine cached intraday bars with a fresh fetch, deduping by exact
+    timestamp (preferring fresh on overlap).
+
+    Unlike ``_merge_ohlcv`` (which dedupes by *date*, right for one-bar-per-day
+    daily history) this keeps intraday granularity, so the 30-min cache grows
+    beyond yfinance's 60-day window over successive runs."""
+    if fresh is None or fresh.empty:
+        return cached if cached is not None else pd.DataFrame()
+    fresh = _normalize_index_tz(fresh)
+    if cached is None or cached.empty:
+        return fresh
+    cached = _normalize_index_tz(cached)
+    combined = pd.concat([cached, fresh]).sort_index()
+    return combined[~combined.index.duplicated(keep="last")]
+
+
+def _get_intraday_history(ticker: str, interval: str = "30m",
+                          force_refresh: bool = False) -> pd.DataFrame:
+    """Intraday OHLCV with a short-TTL cache (``interval`` namespace).
+
+    The forming bar changes every tick, so the cache uses a minute-level TTL
+    (``intraday_30m_ttl_minutes``) instead of the daily 3-day TTL. RTH 30-min
+    bars don't change off-hours (we fetch RTH-only), so when the market is
+    closed a non-empty cache is reused without a refetch."""
+    from src.data.cache import load_ohlcv, save_ohlcv
+
+    if interval != "30m" or not is_valid_ticker(ticker):
+        return pd.DataFrame()
+
+    cached = load_ohlcv(ticker, interval)
+    have_cache = cached is not None and not cached.empty
+    if have_cache and not force_refresh:
+        if current_session() != "rth":
+            return _drop_forming_bar(cached, interval)   # RTH 30m bars are static off-hours
+        last = _ts_to_utc(cached.index[-1])
+        if last is not None:
+            age_min = (_datetime.now(_timezone.utc) - last).total_seconds() / 60.0
+            if age_min <= settings.intraday_30m_ttl_minutes:
+                return _drop_forming_bar(cached, interval)
+
+    if not settings.enable_fetch_data:
+        return _drop_forming_bar(cached, interval) if have_cache else pd.DataFrame()
+
+    fresh = _fetch_intraday_yf(ticker, interval)
+    if fresh is not None and not fresh.empty:
+        merged = _drop_forming_bar(_merge_intraday(cached, fresh), interval)
+        save_ohlcv(ticker, merged, interval)
+        logger.debug(
+            f"[market_data] {interval}: fetched {len(fresh)} bars for {ticker} "
+            f"(cache now {len(merged) if merged is not None else 0} bars)"
+        )
+        return merged
+    return _drop_forming_bar(cached, interval) if have_cache else pd.DataFrame()
+
+
+def _resample_weekly(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Resample a daily OHLCV frame to weekly bars (week ending Friday)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = _normalize_index_tz(df)
+    agg = {}
+    for col, how in (("Open", "first"), ("High", "max"), ("Low", "min"),
+                     ("Close", "last"), ("Volume", "sum")):
+        if col in d.columns:
+            agg[col] = how
+    if "Close" not in agg:
+        return pd.DataFrame()
+    weekly = d.resample("W-FRI").agg(agg).dropna(subset=["Close"])
+    return weekly
+
+
+def get_weekly_history(ticker: str) -> pd.DataFrame:
+    """Weekly OHLCV resampled from the daily cache (no extra fetch).
+
+    Uses whatever daily history is already cached (warmed by the daily scorers
+    each tick); only fetches if the daily cache is empty. The current,
+    still-forming week is dropped so weekly indicators read completed bars only.
+    A thin daily cache yields few weekly bars — the weekly scorers fail-soft to
+    'no view' below their minimum-row thresholds."""
+    from src.data.cache import load_ohlcv
+
+    if not is_valid_ticker(ticker):
+        return pd.DataFrame()
+    daily = load_ohlcv(ticker)
+    if daily is None or daily.empty:
+        daily = get_history(ticker, period="18mo")
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    return _drop_forming_bar(_resample_weekly(daily), interval="1w")
