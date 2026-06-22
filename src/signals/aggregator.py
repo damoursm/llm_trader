@@ -937,6 +937,16 @@ def build_signals(
     # always runs.
     n30_used = 0
 
+    # One batched Alpaca call warms the 30-min cache for the whole universe so the
+    # per-ticker compute_timeframe_scores() reads below avoid N round trips. No-op
+    # when Alpaca isn't configured — the per-ticker yfinance path still applies.
+    if settings.enable_multi_timeframe_signals and settings.enable_intraday_30m:
+        try:
+            from src.data.market_data import warm_intraday_cache
+            warm_intraday_cache(tickers)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"[aggregator] 30m batch warm failed: {e}")
+
     for ticker in tickers:
 
         # ── Method 1: News sentiment (the LEVEL) ──────────────────────────

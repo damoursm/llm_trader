@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     # If absent, the pipeline falls back to yfinance for all market data.
     polygon_api_key: str = ""
 
+    # Alpaca Market Data (Algo Trader Plus) — real-time SIP intraday bars.
+    # Primary source for 30-minute candles when configured: full US-market (SIP)
+    # coverage, real-time, no ~60-day cap, no per-IP 429s. Falls back to yfinance
+    # when absent. Keys: https://alpaca.markets (account → API keys; paper or live
+    # account keys both work for market data).
+    alpaca_api_key: str = ""
+    alpaca_api_secret: str = ""
+    alpaca_data_feed: str = "sip"   # "sip" = Algo Trader Plus (full market); "iex" = free (~2.5% vol)
+
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
 
@@ -576,16 +585,22 @@ class Settings(BaseSettings):
     # signals panel for the dashboard's 4-category Information-Coefficient table.
     # Master OFF ⇒ exactly the legacy daily-only behaviour.
     enable_multi_timeframe_signals: bool = True
-    enable_intraday_30m: bool = True       # fetch + score the 30-min candle (yfinance)
+    enable_intraday_30m: bool = True       # fetch + score the 30-min candle (Alpaca SIP → yfinance)
     enable_weekly_signals: bool = True     # resample the daily cache → weekly candle (free, no fetch)
+    # Prefer Alpaca SIP for 30-min bars over yfinance (key-gated — inert without
+    # ALPACA_API_KEY/SECRET). Real-time, full-market, uncapped. Set false to force
+    # the legacy yfinance-only intraday path even when Alpaca keys are present.
+    enable_alpaca_intraday: bool = True
+    alpaca_intraday_lookback_days: int = 120  # 30-min history depth per Alpaca fetch (no 60d cap)
     # Strategy blend weights across timeframes (renormalised at runtime over the
     # timeframes that actually produced a score for a given ticker). Daily-dominant
     # by default; set tf_blend_1d=1.0 to revert to daily-only without flipping the flag.
     tf_blend_30m: float = 0.20
     tf_blend_1d: float = 0.60
     tf_blend_1w: float = 0.20
-    # 30-min fetch is yfinance (≤60d history, per-IP rate-limited). 0 = attempt every
-    # ticker; set a positive cap to throttle if 429s bite on a wide universe.
+    # 0 = attempt every ticker (full coverage). A positive cap throttles the fetch;
+    # only needed on the yfinance fallback path (≤60d history, per-IP 429s) — Alpaca
+    # SIP has no per-IP rate limit, so leave at 0 when Alpaca is configured.
     intraday_30m_max_tickers: int = 0
     # Re-fetch the 30-min OHLCV cache when its newest bar is older than this (minutes).
     intraday_30m_ttl_minutes: int = 25
