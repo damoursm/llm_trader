@@ -25,7 +25,7 @@ from loguru import logger
 from typing import Iterable, List, Optional, Tuple
 from config import settings
 from src.models import TickerSnapshot
-from src.data import polygon_client, alpaca_client
+from src.data import polygon_client
 from src.performance.market_calendar import current_session
 
 try:
@@ -284,8 +284,8 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
     """
     Return latest price, 1-day and 5-day % change for each ticker.
 
-    Tries Alpaca first (single batch call for all tickers).  Any ticker not
-    returned by Alpaca is retried via yfinance.  Stops early on yfinance rate-
+    Tries Massive/Polygon first (batched calls for all tickers).  Any ticker not
+    returned by Polygon is retried via yfinance.  Stops early on yfinance rate-
     limit exhaustion but always returns whatever was collected.
     """
     if not settings.enable_fetch_data:
@@ -561,96 +561,36 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False,
 # ---------------------------------------------------------------------------
 # Multi-timeframe history — 30-minute (intraday) and weekly
 #
-# 30-min source: Alpaca SIP (real-time, full US market, uncapped) when configured,
-# else yfinance (RTH only, ≤60d, 429-prone). Both feed the same interval-namespaced
-# cache; the forming bar is dropped either way (no look-ahead). Weekly is resampled
-# from the daily cache (free, no fetch).
+# 30-min source: Massive/Polygon (real-time on the Stocks Advanced plan, full US
+# market) when a key is configured, else yfinance (RTH only, ≤60d, 429-prone).
+# Both feed the same interval-namespaced cache; the forming bar is dropped either
+# way (no look-ahead). Weekly is resampled from the daily cache (free, no fetch).
 # ---------------------------------------------------------------------------
 
-# Per-cycle 30-min prefetch staged by warm_intraday_cache() — one batched Alpaca
-# call for the whole universe. _get_intraday_history consults this before any
-# per-ticker fetch, so the batch replaces N round trips. Replaced on every warm.
-_INTRADAY_PREFETCH: dict = {}
+def _fetch_intraday_polygon(ticker: str, interval: str = "30m") -> pd.DataFrame:
+    """Fetch 30-min OHLCV via Massive/Polygon (real-time on Stocks Advanced).
 
-
-def clear_intraday_prefetch() -> None:
-    """Drop the staged per-cycle 30-min prefetch (test isolation / manual reset)."""
-    global _INTRADAY_PREFETCH
-    _INTRADAY_PREFETCH = {}
-
-
-def _fetch_intraday_alpaca_batch(tickers, interval: str = "30m") -> dict:
-    """Batch 30-min fetch via Alpaca's multi-symbol bars. ``{ticker: df}``; ``{}`` on error."""
+    Fail-soft: returns empty on any error / non-30m interval so the caller falls
+    back to yfinance."""
+    if interval != "30m":
+        return pd.DataFrame()
     try:
-        return alpaca_client.get_bars_batch(
-            tickers, interval=interval,
-            lookback_days=settings.alpaca_intraday_lookback_days,
+        return polygon_client.get_intraday_bars(
+            ticker, lookback_days=settings.intraday_30m_lookback_days,
         )
     except Exception as e:  # pragma: no cover - defensive
-        logger.debug(f"[market_data] alpaca batch {interval} fetch failed: {e}")
-        return {}
-
-
-def warm_intraday_cache(tickers, interval: str = "30m") -> int:
-    """Prefetch 30-min OHLCV for many tickers in ONE batched Alpaca call and stage it
-    for this cycle, so the subsequent per-ticker ``get_history(interval="30m")`` reads
-    avoid N round trips. Each frame is also merged into the file cache (the same merge
-    + forming-bar path as a per-ticker fetch), so cross-run history still grows.
-
-    No-op (returns 0) when Alpaca is unavailable, the interval isn't 30m, or fetching
-    is disabled — the per-ticker yfinance path then still applies. Returns the number
-    of tickers warmed."""
-    global _INTRADAY_PREFETCH
-    _INTRADAY_PREFETCH = {}
-    if (interval != "30m" or not settings.enable_fetch_data
-            or not alpaca_client.is_available()):
-        return 0
-    from src.data.cache import load_ohlcv, save_ohlcv
-
-    valid = [t for t in dict.fromkeys(tickers) if is_valid_ticker(t)]
-    if not valid:
-        return 0
-
-    fresh_map = _fetch_intraday_alpaca_batch(valid, interval)
-    warmed = 0
-    for ticker, fresh in fresh_map.items():
-        if fresh is None or fresh.empty:
-            continue
-        merged = _merge_intraday(load_ohlcv(ticker, interval), fresh)
-        if merged is not None and not merged.empty:
-            save_ohlcv(ticker, merged, interval)
-            _INTRADAY_PREFETCH[ticker] = merged
-            warmed += 1
-    if warmed:
-        n_calls = (len(valid) - 1) // alpaca_client._MAX_SYMBOLS_PER_REQ + 1
-        logger.info(
-            f"[market_data] warmed 30m cache for {warmed}/{len(valid)} tickers "
-            f"via Alpaca batch ({n_calls} call(s))"
-        )
-    return warmed
-
-
-def _fetch_intraday_alpaca(ticker: str, interval: str = "30m") -> pd.DataFrame:
-    """Fetch intraday OHLCV via Alpaca SIP (real-time, full market, uncapped).
-
-    Fail-soft: returns empty on any error so the caller falls back to yfinance."""
-    try:
-        return alpaca_client.get_bars(
-            ticker, interval=interval,
-            lookback_days=settings.alpaca_intraday_lookback_days,
-        )
-    except Exception as e:  # pragma: no cover - defensive
-        logger.debug(f"[market_data] alpaca {interval} fetch failed for {ticker}: {e}")
+        logger.debug(f"[market_data] polygon {interval} fetch failed for {ticker}: {e}")
         return pd.DataFrame()
 
 
 def _fetch_intraday(ticker: str, interval: str = "30m") -> pd.DataFrame:
-    """Intraday OHLCV: Alpaca SIP preferred, yfinance as fallback.
+    """Intraday OHLCV: Massive/Polygon preferred, yfinance as fallback.
 
-    Alpaca (when configured) is real-time, full US-market coverage, and uncapped;
-    yfinance covers the gap when Alpaca is absent, lacks the ticker, or errors."""
-    if alpaca_client.is_available():
-        df = _fetch_intraday_alpaca(ticker, interval)
+    Polygon (when a key is configured) is real-time on the Advanced plan with full
+    US-market coverage; yfinance covers the gap when Polygon is absent, lacks the
+    ticker, or errors."""
+    if polygon_client.is_available():
+        df = _fetch_intraday_polygon(ticker, interval)
         if df is not None and not df.empty:
             return df
     return _fetch_intraday_yf(ticker, interval)
@@ -707,13 +647,6 @@ def _get_intraday_history(ticker: str, interval: str = "30m",
 
     if interval != "30m" or not is_valid_ticker(ticker):
         return pd.DataFrame()
-
-    # A batched warm this cycle (warm_intraday_cache) staged this ticker — use it
-    # directly so there's no per-ticker round trip. Forming bar is dropped at read
-    # time against the current clock, same as the per-ticker path below.
-    staged = _INTRADAY_PREFETCH.get(ticker)
-    if staged is not None and not staged.empty:
-        return _drop_forming_bar(staged, interval)
 
     cached = load_ohlcv(ticker, interval)
     have_cache = cached is not None and not cached.empty

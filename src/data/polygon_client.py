@@ -24,8 +24,14 @@ from loguru import logger
 
 from config import settings
 
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+except ImportError:  # pragma: no cover
+    from backports.zoneinfo import ZoneInfo as _ZoneInfo  # type: ignore
+
 _BASE    = "https://api.polygon.io"
 _TIMEOUT = 30.0
+_NY_TZ   = _ZoneInfo("America/New_York")
 
 # Endpoint families already reported as 403 (entitlement limit) this process —
 # warn once, then debug, so a free-tier-forbidden endpoint doesn't spam the log
@@ -287,3 +293,58 @@ def get_bars(ticker: str, period: str = "3mo") -> pd.DataFrame:
     df = pd.DataFrame(rows).set_index("ts")
     df.index.name = None
     return df
+
+
+def _rth_only_30m(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only regular-session 30-min bars (09:30–16:00 ET).
+
+    The aggregates endpoint returns extended-hours bars too, but the 30-min panel
+    has always been RTH-only (the yfinance contract), and the intraday cache's
+    'static off-hours' reuse assumes no bar forms after the close. Bars are labelled
+    by start time, so the last kept bar starts 15:30 (covers 15:30–16:00)."""
+    if df.empty:
+        return df
+    et = df.index.tz_convert(_NY_TZ)
+    mask = [(t.hour, t.minute) >= (9, 30) and (t.hour, t.minute) < (16, 0) for t in et]
+    return df[mask]
+
+
+def get_intraday_bars(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
+    """
+    Fetch 30-minute OHLCV bars for *ticker* (REAL-TIME on the Stocks Advanced plan).
+
+    Returns a DataFrame (Open, High, Low, Close, Volume) with a tz-aware UTC
+    DatetimeIndex — the format market_data's intraday merge expects — RTH-filtered
+    to the regular session. Empty DataFrame on failure / when Polygon is unavailable
+    (the caller then falls back to yfinance).
+    """
+    if not is_available():
+        return pd.DataFrame()
+
+    from_date = (date.today() - timedelta(days=lookback_days)).isoformat()
+    to_date   = date.today().isoformat()
+
+    data = _get(
+        f"/v2/aggs/ticker/{ticker}/range/30/minute/{from_date}/{to_date}",
+        {"adjusted": "true", "sort": "asc", "limit": 50000},
+    )
+    if not data or not data.get("results"):
+        logger.debug(f"[polygon] get_intraday_bars: no data for {ticker}")
+        return pd.DataFrame()
+
+    rows = []
+    for bar in data["results"]:
+        rows.append({
+            "ts":     pd.Timestamp(bar["t"], unit="ms", tz="UTC"),  # bar START, UTC
+            "Open":   float(bar["o"]),
+            "High":   float(bar["h"]),
+            "Low":    float(bar["l"]),
+            "Close":  float(bar["c"]),
+            "Volume": int(bar["v"]),
+        })
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).set_index("ts").sort_index()
+    df.index.name = None
+    return _rth_only_30m(df)

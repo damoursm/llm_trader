@@ -9,9 +9,11 @@ and other statuses are unaffected.
 import io
 
 import httpx
+import pandas as pd
 import pytest
 from loguru import logger
 
+import src.data.market_data as md
 import src.data.polygon_client as pc
 
 
@@ -94,3 +96,64 @@ def test_grouped_daily_closes_parses_first_nonempty(monkeypatch):
 def test_grouped_daily_closes_no_key(monkeypatch):
     monkeypatch.setattr(pc.settings, "polygon_api_key", "")
     assert pc.get_grouped_daily_closes() == {}
+
+
+# ── 30-minute intraday aggregates (real-time on Stocks Advanced) ──────────────
+
+def test_get_intraday_bars_parses_and_rth_filters(monkeypatch):
+    monkeypatch.setattr(pc.settings, "polygon_api_key", "x")
+
+    def fake_get(path, params=None):
+        assert "/range/30/minute/" in path          # 30-min aggregates endpoint
+        # 2024-01-02 is EST (UTC-5). `t` is the bar START in ms epoch (UTC).
+        return {"results": [
+            {"t": 1704204000000, "o": 1, "h": 1, "l": 1, "c": 9,  "v": 10},  # 14:00Z 09:00 ET → drop
+            {"t": 1704205800000, "o": 1, "h": 1, "l": 1, "c": 11, "v": 10},  # 14:30Z 09:30 ET → keep
+            {"t": 1704227400000, "o": 1, "h": 1, "l": 1, "c": 12, "v": 10},  # 20:30Z 15:30 ET → keep
+            {"t": 1704229200000, "o": 1, "h": 1, "l": 1, "c": 13, "v": 10},  # 21:00Z 16:00 ET → drop
+        ]}
+    monkeypatch.setattr(pc, "_get", fake_get)
+
+    df = pc.get_intraday_bars("AAPL")
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert df["Close"].tolist() == [11.0, 12.0]      # pre-market + close-boundary stripped
+    assert str(df.index.tz) == "UTC"
+
+
+def test_get_intraday_bars_no_key(monkeypatch):
+    monkeypatch.setattr(pc.settings, "polygon_api_key", "")
+    assert pc.get_intraday_bars("AAPL").empty
+
+
+def test_get_intraday_bars_empty_results(monkeypatch):
+    monkeypatch.setattr(pc.settings, "polygon_api_key", "x")
+    monkeypatch.setattr(pc, "_get", lambda path, params=None: {"results": []})
+    assert pc.get_intraday_bars("AAPL").empty
+
+
+# ── market_data dispatcher: Polygon preferred, yfinance fallback ──────────────
+
+def test_fetch_intraday_prefers_polygon(monkeypatch):
+    df = pd.DataFrame({"Close": [1.0]}, index=pd.to_datetime(["2024-01-02T14:30:00Z"]))
+    monkeypatch.setattr(md.polygon_client, "is_available", lambda: True)
+    monkeypatch.setattr(md, "_fetch_intraday_polygon", lambda t, interval="30m": df)
+    monkeypatch.setattr(md, "_fetch_intraday_yf",
+                        lambda t, interval="30m": pytest.fail("yfinance should not be called"))
+    assert md._fetch_intraday("AAPL", "30m") is df
+
+
+def test_fetch_intraday_falls_back_to_yf_when_polygon_empty(monkeypatch):
+    sentinel = pd.DataFrame({"Close": [9.0]}, index=pd.to_datetime(["2024-01-02T14:30:00Z"]))
+    monkeypatch.setattr(md.polygon_client, "is_available", lambda: True)
+    monkeypatch.setattr(md, "_fetch_intraday_polygon", lambda t, interval="30m": pd.DataFrame())
+    monkeypatch.setattr(md, "_fetch_intraday_yf", lambda t, interval="30m": sentinel)
+    assert md._fetch_intraday("AAPL", "30m") is sentinel
+
+
+def test_fetch_intraday_uses_yf_when_polygon_unavailable(monkeypatch):
+    sentinel = pd.DataFrame({"Close": [7.0]}, index=pd.to_datetime(["2024-01-02T14:30:00Z"]))
+    monkeypatch.setattr(md.polygon_client, "is_available", lambda: False)
+    monkeypatch.setattr(md, "_fetch_intraday_polygon",
+                        lambda t, interval="30m": pytest.fail("polygon should not be called"))
+    monkeypatch.setattr(md, "_fetch_intraday_yf", lambda t, interval="30m": sentinel)
+    assert md._fetch_intraday("AAPL", "30m") is sentinel

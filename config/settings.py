@@ -61,19 +61,11 @@ class Settings(BaseSettings):
     # stays blind to holdings, the pre-experiment behavior).
     open_positions_prompt_share: float = 0.5
 
-    # Polygon.io market data (primary source for equity/ETF price + OHLCV)
-    # Free API key: https://polygon.io — no credit card, works globally.
-    # If absent, the pipeline falls back to yfinance for all market data.
+    # Massive / Polygon.io market data — primary source for equity/ETF price + all
+    # OHLCV timeframes (daily bulk via grouped-daily; 30-min intraday via aggregates,
+    # REAL-TIME on the Stocks Advanced plan). Key: https://polygon.io (works globally,
+    # no credit card for the free tier). If absent, the pipeline falls back to yfinance.
     polygon_api_key: str = ""
-
-    # Alpaca Market Data (Algo Trader Plus) — real-time SIP intraday bars.
-    # Primary source for 30-minute candles when configured: full US-market (SIP)
-    # coverage, real-time, no ~60-day cap, no per-IP 429s. Falls back to yfinance
-    # when absent. Keys: https://alpaca.markets (account → API keys; paper or live
-    # account keys both work for market data).
-    alpaca_api_key: str = ""
-    alpaca_api_secret: str = ""
-    alpaca_data_feed: str = "sip"   # "sip" = Algo Trader Plus (full market); "iex" = free (~2.5% vol)
 
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
@@ -585,13 +577,9 @@ class Settings(BaseSettings):
     # signals panel for the dashboard's 4-category Information-Coefficient table.
     # Master OFF ⇒ exactly the legacy daily-only behaviour.
     enable_multi_timeframe_signals: bool = True
-    enable_intraday_30m: bool = True       # fetch + score the 30-min candle (Alpaca SIP → yfinance)
+    enable_intraday_30m: bool = True       # fetch + score the 30-min candle (Massive/Polygon → yfinance)
     enable_weekly_signals: bool = True     # resample the daily cache → weekly candle (free, no fetch)
-    # Prefer Alpaca SIP for 30-min bars over yfinance (key-gated — inert without
-    # ALPACA_API_KEY/SECRET). Real-time, full-market, uncapped. Set false to force
-    # the legacy yfinance-only intraday path even when Alpaca keys are present.
-    enable_alpaca_intraday: bool = True
-    alpaca_intraday_lookback_days: int = 120  # 30-min history depth per Alpaca fetch (no 60d cap)
+    intraday_30m_lookback_days: int = 120  # 30-min history depth per Massive/Polygon fetch
     # Strategy blend weights across timeframes (renormalised at runtime over the
     # timeframes that actually produced a score for a given ticker). Daily-dominant
     # by default; set tf_blend_1d=1.0 to revert to daily-only without flipping the flag.
@@ -599,8 +587,8 @@ class Settings(BaseSettings):
     tf_blend_1d: float = 0.60
     tf_blend_1w: float = 0.20
     # 0 = attempt every ticker (full coverage). A positive cap throttles the fetch;
-    # only needed on the yfinance fallback path (≤60d history, per-IP 429s) — Alpaca
-    # SIP has no per-IP rate limit, so leave at 0 when Alpaca is configured.
+    # only needed on the yfinance fallback path (≤60d history, per-IP 429s) — the
+    # Massive/Polygon Advanced plan is unlimited-rate, so leave at 0 when configured.
     intraday_30m_max_tickers: int = 0
     # Re-fetch the 30-min OHLCV cache when its newest bar is older than this (minutes).
     intraday_30m_ttl_minutes: int = 25

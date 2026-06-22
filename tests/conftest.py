@@ -59,15 +59,3 @@ def _no_real_cost_override():
     spread.set_real_cost_override(None)
     yield
     spread.set_real_cost_override(None)
-
-
-@pytest.fixture(autouse=True)
-def _no_intraday_prefetch():
-    """Reset the per-cycle 30-min batch prefetch global before AND after every test
-    so a warm_intraday_cache() in one test can't leak staged frames into another's
-    get_history() reads."""
-    from src.data import market_data
-
-    market_data.clear_intraday_prefetch()
-    yield
-    market_data.clear_intraday_prefetch()
