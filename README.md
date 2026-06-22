@@ -1952,7 +1952,13 @@ python main.py             # Run once, console output only
 python main.py --email     # Run once and send email report
 python main.py --schedule  # Start APScheduler (every 30 min, 9:30-16:00 ET, Mon-Fri; emails at close)
 python main.py --dashboard # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
+python main.py --backfill  # Pre-warm the OHLCV caches for the whole universe via Massive/Polygon (deep daily history), then exit
 ```
+
+**Universe OHLCV backfill** — `python main.py --backfill` (or `python -m src.data.backfill --days 730 [--with-30m] [--skip-daily]`) pre-fetches deep daily history for the **whole universe** (watchlist + sector/commodity/factor ETFs + held/hypothetical + every ticker scored in the `signals` panel over the last 90 days) via Massive/Polygon and warms `cache/ohlcv/`. Purely additive (merges, never deletes). Run it once so the live pipeline starts with deep, warm caches — faster first ticks, deeper multi-timeframe indicators, and forward returns ready for the Signal-IC panel.
+
+- **30-min:** add `--with-30m` (or `--skip-daily --with-30m` for a 30-min-only top-up) to warm `cache/ohlcv_30m/`. Depth is Polygon-capped at ~120 days (`intraday_30m_lookback_days`).
+- **Weekly:** needs no pass — it is resampled from the daily cache on demand, so the daily backfill gives deep weekly bars automatically (~2y → ~106 weekly bars).
 
 ---
 

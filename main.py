@@ -52,9 +52,16 @@ def main() -> None:
     parser.add_argument("--supervise", action="store_true",
                         help="Run the scheduler under an auto-restart supervisor (relaunches it if the process dies)")
     parser.add_argument("--dashboard", action="store_true", help="Launch the monitoring dashboard (Plotly Dash)")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Backfill OHLCV caches for the whole universe via Massive/Polygon, then exit")
+    parser.add_argument("--backfill-30m", action="store_true",
+                        help="With --backfill, also warm the 30-min cache (heavier)")
     args = parser.parse_args()
 
-    if args.dashboard:
+    if args.backfill:
+        from src.data.backfill import backfill
+        backfill(with_30m=args.backfill_30m)
+    elif args.dashboard:
         from dashboard.app import run as run_dashboard
         run_dashboard()
     elif args.supervise:
