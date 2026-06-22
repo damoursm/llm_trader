@@ -271,6 +271,14 @@ When `ENABLE_RELATED_DISCOVERY=true` (default), widens the universe with peers o
 
 ---
 
+### Massive technical indicators (`src/signals/massive_tech.py`)
+
+When `ENABLE_MASSIVE_TECH=true` (default), computes a `massive` method score from **Massive/Polygon's server-side RSI + MACD** indicators (2 API calls/ticker, capped at `MASSIVE_TECH_MAX_TICKERS`, default 40) — each mapped to [-1, +1] and averaged. It runs **alongside** our own locally-computed `tech` method so the dashboard's **Method Performance** can compare them head-to-head (labelled *Massive Tech (RSI+MACD)*) and reveal whether the server-side path is worth keeping.
+
+For now it is **tracked and compared only** — persisted to the signals panel + trade attribution, but **not** folded into the weighted `combined_score` (weighting a capped method would dampen every ticker through the aggregator's weight normalisation). Promote it to a live weight once the comparison validates it.
+
+---
+
 ### Step 1g — Short Interest (`src/data/short_interest.py`)
 
 When `ENABLE_SHORT_INTEREST=true`, combines two free sources to detect squeeze setups, bearish positioning builds, and short-covering signals. Cached daily.

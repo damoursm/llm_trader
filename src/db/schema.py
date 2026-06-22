@@ -34,7 +34,7 @@ from __future__ import annotations
 # add the column here too (new columns only apply to newly created DB files —
 # an existing DB needs a one-time ALTER TABLE signals ADD COLUMN <m> DOUBLE).
 SIGNAL_BASE_METHOD_COLUMNS = (
-    "news", "sent_velocity", "tech", "insider", "put_call", "max_pain",
+    "news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain",
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow",
     "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
     "ext_gap",
@@ -234,6 +234,8 @@ SCHEMA_STATEMENTS = [
 _ADD_COLUMNS = (
     ("run_sources", "n_items", "INTEGER"),
     ("run_sources", "empty", "BOOLEAN"),
+    # Massive server-side technical-indicator method column on an existing DB.
+    ("signals", "massive", "DOUBLE"),
     # Multi-timeframe technical columns on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_TIMEFRAME_COLUMNS),
 )

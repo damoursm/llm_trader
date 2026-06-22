@@ -437,3 +437,36 @@ def get_related_companies(ticker: str) -> List[str]:
         return []
     j = _get(f"/v1/related-companies/{ticker}", {})
     return [r["ticker"] for r in (j or {}).get("results", []) or [] if r.get("ticker")]
+
+
+def _indicator_values(ticker: str, indicator: str, params: dict) -> list:
+    """Latest daily values for a Massive technical indicator (one call). The
+    response nests them under ``results.values`` newest-first."""
+    if not is_available() or not ticker:
+        return []
+    p = {"timespan": "day", "order": "desc", "limit": 1, **params}
+    j = _get(f"/v1/indicators/{indicator}/{ticker}", p)
+    return ((j or {}).get("results") or {}).get("values") or []
+
+
+def get_rsi(ticker: str, window: int = 14) -> Optional[float]:
+    """Latest daily RSI (0–100) for *ticker* via Massive; None when unavailable."""
+    vals = _indicator_values(ticker, "rsi", {"window": window})
+    try:
+        return float(vals[0]["value"]) if vals else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def get_macd(ticker: str) -> Optional[dict]:
+    """Latest daily MACD for *ticker* via Massive → ``{value, signal, histogram}``;
+    None when unavailable."""
+    vals = _indicator_values(ticker, "macd", {})
+    if not vals:
+        return None
+    v = vals[0]
+    try:
+        return {"value": float(v["value"]), "signal": float(v["signal"]),
+                "histogram": float(v["histogram"])}
+    except (KeyError, TypeError, ValueError):
+        return None

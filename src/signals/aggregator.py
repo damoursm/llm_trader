@@ -796,6 +796,12 @@ def build_signals(
     # Sentiment velocity reuses article timestamps; no live fetch / LLM call required.
     use_sent_velocity = settings.enable_sentiment_velocity
     use_tech      = settings.enable_technical_analysis and settings.enable_fetch_data
+    # Massive server-side technicals (RSI+MACD), scored alongside `tech` for a
+    # head-to-head dashboard comparison. Tracked/persisted only — NOT folded into
+    # the weighted combined_score yet (weights are normalised over active methods, so
+    # weighting a capped method would dampen every ticker). Promote it later by
+    # adding "massive" to _BASE_WEIGHTS + active_flags + the combine.
+    use_massive   = settings.enable_massive_tech
     use_insider   = (
         (settings.enable_insider_trades or
          settings.enable_options_flow or
@@ -936,6 +942,7 @@ def build_signals(
     # (intraday_30m_max_tickers; 0 = unbounded). Weekly is free (resampled) and
     # always runs.
     n30_used = 0
+    n_massive_used = 0   # bounds Massive RSI+MACD fetches (massive_tech_max_tickers)
 
     for ticker in tickers:
 
@@ -1165,6 +1172,15 @@ def build_signals(
             pattern_eff         = _eff("pattern", pattern_score)
             sector_momentum_eff = _eff("sector_momentum", sector_momentum_score)
 
+        # ── Massive server-side technicals (RSI+MACD), capped per tick ─────
+        # Scored for comparison vs `tech`; persisted but NOT in the combine below.
+        massive_score = 0.0
+        if use_massive and (settings.massive_tech_max_tickers <= 0
+                            or n_massive_used < settings.massive_tech_max_tickers):
+            from src.signals.massive_tech import compute_massive_tech_score
+            massive_score = compute_massive_tech_score(ticker)
+            n_massive_used += 1
+
         # ── Weighted combination ──────────────────────────────────────────
         # Technical methods use their multi-timeframe BLEND (*_eff); non-OHLCV
         # methods use their single live score.
@@ -1274,6 +1290,7 @@ def build_signals(
             sentiment_recent=round(sent_recent, 3),
             sentiment_prior=round(sent_prior, 3),
             technical_score=round(technical_score, 3),
+            massive_score=round(massive_score, 3),
             insider_score=round(insider_sc, 3),
             put_call_score=round(pc_score, 3),
             max_pain_score=round(mp_score, 3),

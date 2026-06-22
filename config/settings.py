@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     enable_related_discovery: bool = True
     related_discovery_max: int = 25
 
+    # Massive/Polygon server-side technical indicators (RSI + MACD) scored as the
+    # `massive` method, run ALONGSIDE our own `tech` for head-to-head dashboard
+    # comparison. 2 API calls/ticker, so capped per tick. Set the weight via
+    # aggregator `_BASE_WEIGHTS["massive"]`; off → the method scores 0 (no effect).
+    enable_massive_tech: bool = True
+    massive_tech_max_tickers: int = 40   # 0 = every ticker (heavier: 2 calls each)
+
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
 

@@ -362,7 +362,7 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
@@ -380,6 +380,7 @@ METHOD_LABELS: Dict[str, str] = {
     "news":     "News Sentiment",
     "sent_velocity": "Sentiment Velocity (Δ)",
     "tech":     "Technical Analysis",
+    "massive":  "Massive Tech (RSI+MACD)",
     "insider":  "Smart Money / Insider",
     "put_call": "Put/Call Ratio",
     "max_pain": "Max Pain (GEX)",
@@ -421,6 +422,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "news":      sig.sentiment_score,
         "sent_velocity": getattr(sig, "sentiment_velocity_score", 0.0),
         "tech":      sig.technical_score,
+        "massive":   getattr(sig, "massive_score", 0.0),
         "insider":   sig.insider_score,
         "put_call":  sig.put_call_score,
         "max_pain":  sig.max_pain_score,

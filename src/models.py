@@ -1162,6 +1162,7 @@ class TickerSignal(BaseModel):
     sentiment_recent: float = 0.0          # mean lexical tone of the recent window
     sentiment_prior: float = 0.0           # mean lexical tone of the prior window
     technical_score: float      # -1.0 to +1.0
+    massive_score: float = 0.0  # -1.0 to +1.0  (Massive/Polygon server-side RSI+MACD composite — compared vs `tech`)
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)
     put_call_score: float = 0.0 # -1.0 to +1.0  (per-ticker options put/call sentiment)
     vwap_score: float = 0.0     # -1.0 to +1.0  (mean-reversion: above VWAP→bearish, below→bullish)
