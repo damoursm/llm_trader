@@ -293,6 +293,76 @@ class PEADContext(BaseModel):
     summary: str
 
 
+class FundamentalsSignal(BaseModel):
+    """Per-ticker valuation / profitability / leverage snapshot (TTM, daily).
+
+    Sourced from Massive/Polygon's financials & ratios endpoint. Ratios are
+    Optional because some are undefined for a given company (e.g. P/E for a
+    loss-maker, dividend yield for a non-payer)."""
+    ticker: str
+    pe: Optional[float] = None             # price / earnings (TTM)
+    pb: Optional[float] = None             # price / book
+    ps: Optional[float] = None             # price / sales
+    ev_ebitda: Optional[float] = None      # enterprise value / EBITDA
+    roe: Optional[float] = None            # return on equity (fraction)
+    roa: Optional[float] = None            # return on assets (fraction)
+    debt_to_equity: Optional[float] = None
+    dividend_yield: Optional[float] = None # fraction (0.012 = 1.2%)
+    current_ratio: Optional[float] = None
+    fcf: Optional[float] = None            # free cash flow (TTM, USD)
+    market_cap: Optional[float] = None     # USD
+    enterprise_value: Optional[float] = None
+    as_of: Optional[date] = None
+    summary: str = ""
+
+
+class FundamentalsContext(BaseModel):
+    """Valuation & quality fundamentals across the scored universe.
+
+    Sourced from Massive/Polygon's financials & ratios endpoint — trailing-twelve-
+    month ratios recomputed daily from SEC-filed statements + the latest close.
+    Fed into the LLM synthesis prompt as a quality/valuation OVERLAY so it can weigh
+    how cheap/expensive, profitable, and leveraged a name is alongside the
+    price/news/options signals. Not a timing signal and not an aggregator scorer."""
+    signals: List[FundamentalsSignal]
+    report_date: date
+    summary: str = ""
+
+
+class DividendEvent(BaseModel):
+    """An upcoming/declared cash dividend (Massive/Polygon)."""
+    ticker: str
+    ex_dividend_date: date
+    cash_amount: float
+    frequency: int = 0           # payments/year (4 = quarterly, 12 = monthly, 0 = unknown)
+    pay_date: Optional[date] = None
+    days_until_ex: int = 0       # ex-date − today (≥0 = upcoming)
+
+
+class SplitEvent(BaseModel):
+    """A stock split (Massive/Polygon)."""
+    ticker: str
+    execution_date: date
+    split_from: float
+    split_to: float
+    ratio: str = ""              # human-readable, e.g. "3:2" or (reverse) "1:10"
+    days_until: int = 0          # execution_date − today (negative = already executed)
+
+
+class CorporateActionsContext(BaseModel):
+    """Upcoming ex-dividends + recent/upcoming stock splits across the universe.
+
+    A WHEN/mechanics overlay for the LLM (instruction §29), not a directional signal:
+    on an ex-dividend date the price drops by ~the dividend (not real weakness; mild
+    income support); a split rescales price / share count, so OHLCV-derived signals
+    around the execution date can be distorted. Sourced from Massive/Polygon's
+    dividends & splits calendars, filtered to the scored universe."""
+    dividends: List[DividendEvent] = []
+    splits: List[SplitEvent] = []
+    report_date: date
+    summary: str = ""
+
+
 class GEXSignal(BaseModel):
     """Gamma Exposure (GEX) signal for a single ticker."""
     ticker: str

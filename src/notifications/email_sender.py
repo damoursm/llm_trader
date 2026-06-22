@@ -4856,6 +4856,99 @@ HTML_TEMPLATE = """
 {% endif %}
 
 <!-- ══════════════════════════════════════
+     5pf — FUNDAMENTALS (valuation & quality, TTM)
+     ══════════════════════════════════════ -->
+{% if fundamentals_context and fundamentals_context.signals %}
+{% set fund_rows = fundamentals_context.signals | selectattr('market_cap') | sort(attribute='market_cap', reverse=true) | list %}
+{% if fund_rows %}
+<h2>34d. Fundamentals — Valuation &amp; Quality
+  <span style="font-size:13px;font-weight:400;color:#94a3b8;">(TTM ratios · Massive/Polygon · top {{ [fund_rows|length, 15]|min }} by mkt cap)</span>
+</h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 12px 0;">{{ fundamentals_context.summary }}</p>
+  <table style="width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;">
+    <thead>
+      <tr style="color:#94a3b8;text-align:right;border-bottom:1px solid #334155;">
+        <th style="text-align:left;padding:5px 6px;">Ticker</th>
+        <th style="padding:5px 6px;">P/E</th>
+        <th style="padding:5px 6px;">P/B</th>
+        <th style="padding:5px 6px;">EV/EBITDA</th>
+        <th style="padding:5px 6px;">ROE</th>
+        <th style="padding:5px 6px;">D/E</th>
+        <th style="padding:5px 6px;">Div&nbsp;Yld</th>
+        <th style="padding:5px 6px;">Mkt&nbsp;Cap</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for s in fund_rows[:15] %}
+      <tr style="text-align:right;border-bottom:1px solid #1e293b;">
+        <td style="text-align:left;padding:5px 6px;font-weight:700;color:#e2e8f0;">{{ s.ticker }}</td>
+        <td style="padding:5px 6px;">{{ '%.1f'|format(s.pe) if s.pe is not none else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%.1f'|format(s.pb) if s.pb is not none else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%.1f'|format(s.ev_ebitda) if s.ev_ebitda is not none else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%.0f%%'|format(s.roe * 100) if s.roe is not none else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%.2f'|format(s.debt_to_equity) if s.debt_to_equity is not none else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%.1f%%'|format(s.dividend_yield * 100) if s.dividend_yield else '—' }}</td>
+        <td style="padding:5px 6px;">${{ '%.0f'|format(s.market_cap / 1e9) }}B</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Trailing-twelve-month valuation, profitability &amp; leverage from SEC-filed statements + the latest close (Massive/Polygon). Fed into the LLM synthesis as a quality overlay — a conviction/horizon modifier, never a standalone trade trigger.
+  </p>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- ══════════════════════════════════════
+     5pg — CORPORATE ACTIONS (ex-dividends + splits)
+     ══════════════════════════════════════ -->
+{% if corporate_actions_context and (corporate_actions_context.dividends or corporate_actions_context.splits) %}
+<h2>34e. Corporate Actions
+  <span style="font-size:13px;font-weight:400;color:#94a3b8;">(Massive/Polygon · ex-dividends &amp; splits)</span>
+</h2>
+<div class="card" style="padding:14px 18px;">
+  <p style="color:#cbd5e1;font-size:13px;margin:0 0 12px 0;">{{ corporate_actions_context.summary }}</p>
+  <div style="display:flex;gap:28px;flex-wrap:wrap;">
+    {% if corporate_actions_context.dividends %}
+    <div style="flex:1;min-width:260px;">
+      <div style="color:#4ade80;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Upcoming ex-dividends</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;">
+        {% for d in corporate_actions_context.dividends[:12] %}
+        <tr style="border-bottom:1px solid #1e293b;">
+          <td style="padding:4px 6px;font-weight:700;">{{ d.ticker }}</td>
+          <td style="padding:4px 6px;color:#94a3b8;">{{ d.ex_dividend_date }}</td>
+          <td style="padding:4px 6px;text-align:right;">${{ '%.2f'|format(d.cash_amount) }}</td>
+          <td style="padding:4px 6px;text-align:right;color:#64748b;">in {{ d.days_until_ex }}d</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    {% endif %}
+    {% if corporate_actions_context.splits %}
+    <div style="flex:1;min-width:220px;">
+      <div style="color:#fbbf24;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Splits</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;">
+        {% for s in corporate_actions_context.splits[:12] %}
+        <tr style="border-bottom:1px solid #1e293b;">
+          <td style="padding:4px 6px;font-weight:700;">{{ s.ticker }}</td>
+          <td style="padding:4px 6px;">{{ s.ratio }}</td>
+          <td style="padding:4px 6px;color:#94a3b8;">{{ s.execution_date }}</td>
+          <td style="padding:4px 6px;text-align:right;color:#64748b;">{{ 'in %dd'|format(s.days_until) if s.days_until >= 0 else '%dd ago'|format(-s.days_until) }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    {% endif %}
+  </div>
+  <p style="color:#475569;font-size:11px;margin:12px 0 0 0;">
+    Mechanics overlay fed to the LLM (§29): price drops ~the dividend on an ex-date (not real weakness), and price/share count rescale around a split — OHLCV signals near these dates can mislead. Never a directional trigger.
+  </p>
+</div>
+{% endif %}
+
+<!-- ══════════════════════════════════════
      5y — TREND STRENGTH LEADERBOARD
      ══════════════════════════════════════ -->
 {% set ts_signals = signals | selectattr('trend_strength_score', 'defined') | selectattr('trend_strength_score', 'ne', 0) | list if signals else [] %}
@@ -5325,6 +5418,8 @@ def send_recommendations(
     whisper_context=None,            # Optional[WhisperContext]              — avoid circular import
     earnings_context=None,           # Optional[EarningsContext]             — avoid circular import
     pead_context=None,               # Optional[PEADContext]                 — avoid circular import
+    fundamentals_context=None,       # Optional[FundamentalsContext]         — avoid circular import
+    corporate_actions_context=None,  # Optional[CorporateActionsContext]     — avoid circular import
     gex_context=None,            # Optional[GEXContext]             — avoid circular import
     opex_context=None,           # Optional[OpExContext]            — avoid circular import
     seasonality_context=None,    # Optional[SeasonalityContext]     — avoid circular import
@@ -5579,6 +5674,10 @@ def send_recommendations(
         earnings_context=earnings_context,
         # Post-Earnings Announcement Drift (per-ticker SUE x time-decay)
         pead_context=pead_context,
+        # Fundamentals — TTM valuation/quality ratios (Massive/Polygon)
+        fundamentals_context=fundamentals_context,
+        # Corporate actions — ex-dividends + splits (Massive/Polygon)
+        corporate_actions_context=corporate_actions_context,
         # Gamma Exposure (GEX)
         gex_context=gex_context,
         # OpEx calendar (pure date math)

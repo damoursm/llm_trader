@@ -247,6 +247,30 @@ Beat/miss records are surfaced as `NewsArticle` objects. A beat of >10% is a str
 
 ---
 
+### Step 3F — Company Fundamentals (`src/data/fundamentals.py`)
+
+When `ENABLE_FUNDAMENTALS=true` (default), fetches trailing-twelve-month valuation, profitability, and leverage ratios — P/E, P/B, P/S, EV/EBITDA, ROE, ROA, debt/equity, dividend yield, current ratio, free cash flow, market cap, enterprise value — from the **Massive/Polygon financials & ratios** endpoint (`/stocks/financials/v1/ratios`, multi-ticker batched via `ticker.any_of`, cached daily). Requires the **Stocks Advanced** plan (or the ratios add-on); the free tier 403s and the feature degrades to a no-op.
+
+Unlike the per-ticker scorers, fundamentals are **not** combined into the aggregator score. They are passed into the Claude synthesis prompt as a `<fundamentals_context>` block (instruction §28) — a slow-moving **quality/valuation overlay** that shapes conviction and holding horizon (a cheap, profitable name supports a POSITION-length hold; a richly-valued, leveraged one argues for caution), never a standalone BUY/SELL trigger. Surfaced in the email's **Fundamentals** section.
+
+---
+
+### Step 3G — Corporate Actions (`src/data/corporate_actions.py`)
+
+When `ENABLE_CORPORATE_ACTIONS=true` (default), pulls upcoming **ex-dividend dates** (next `CORP_ACTIONS_DIV_LOOKAHEAD_DAYS`, default 14) and recent/upcoming **stock splits** (± `CORP_ACTIONS_SPLIT_WINDOW_DAYS`, default 30) from the **Massive/Polygon** dividends & splits calendars — two market-wide date-filtered calls, filtered to the scored universe, cached daily.
+
+Passed into the Claude synthesis prompt as a `<corporate_actions_context>` block (instruction §29) — a **mechanics/timing overlay**, never a directional trigger: on an ex-dividend date the price drops by ~the dividend (not real weakness), and price / share count rescale around a split (so OHLCV-derived signals near the date can mislead). Surfaced in the email's **Corporate Actions** section.
+
+---
+
+### Step 0 add-on — Related-company peer discovery (`src/data/related_companies.py`)
+
+When `ENABLE_RELATED_DISCOVERY=true` (default), widens the universe with peers of the watchlist + held names from **Massive's related-companies graph** (~10 per seed). Results are deduped, validated, capped at `RELATED_DISCOVERY_MAX` (25), cached daily, and — crucially — routed through the **liquidity gate** with the rest of the discovered set, so untradeable microcap peers are dropped (never injected raw).
+
+> **Massive/Polygon Advanced now also powers:** real-time 30-min bars + real-time full-market snapshots (`price_source="live"`), and Massive (Benzinga) news with per-article sentiment `insights` (`ENABLE_POLYGON_NEWS` / `ENABLE_PROVIDER_SENTIMENT`, now on by default — the provider sentiment skips the LLM scorer for those articles).
+
+---
+
 ### Step 1g — Short Interest (`src/data/short_interest.py`)
 
 When `ENABLE_SHORT_INTEREST=true`, combines two free sources to detect squeeze setups, bearish positioning builds, and short-covering signals. Cached daily.

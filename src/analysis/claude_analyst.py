@@ -296,6 +296,8 @@ def generate_recommendations(
     intermarket_context=None,       # Optional[IntermarketContext]
     macro_news_context=None,        # Optional[MacroNewsContext]
     catalyst_timing_context=None,   # Optional[CatalystTimingContext]
+    fundamentals_context=None,      # Optional[FundamentalsContext]
+    corporate_actions_context=None, # Optional[CorporateActionsContext]
     open_positions=None,            # Optional[List[dict]] — held-position review block (A/B'd per run)
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
     force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' — pin synthesis (hold-review)
@@ -2983,13 +2985,69 @@ Regime guide:
 - After-hours earnings reactions overshoot on the first prints. Prefer WATCH with a precise thesis over an immediate BUY/SELL unless news, gap direction, and prior positioning all align.
 """
 
+    # Fundamentals overlay (TTM valuation/quality ratios from Massive/Polygon,
+    # daily). A slow-moving conviction/horizon modifier — rendered in the
+    # non-cached suffix because the scored universe changes per run.
+    fundamentals_block        = ""
+    fundamentals_instructions = ""
+    if fundamentals_context and getattr(fundamentals_context, "signals", None):
+        _sig_tickers = {s.ticker for s in signals}
+        _fund_lines = "\n".join(
+            f"  {fs.summary}"
+            for fs in fundamentals_context.signals
+            if fs.ticker in _sig_tickers and fs.summary
+        )
+        if _fund_lines:
+            fundamentals_block = (
+                "INPUT — company fundamentals (TTM valuation / profitability / "
+                "leverage, Massive/Polygon, updated daily; a quality overlay, not a "
+                "timing signal):\n<fundamentals_context>\n"
+                f"{_fund_lines}\n</fundamentals_context>\n\n"
+            )
+            fundamentals_instructions = """
+28. Fundamentals overlay (valuation / quality — a CONVICTION & HORIZON modifier, never a standalone trigger):
+    - Reward convergence: a BUY whose technical/news/flow setup is confirmed by reasonable valuation and solid profitability (positive ROE, manageable D/E) deserves higher conviction; size more cautiously when the same setup sits on a richly-valued, highly-leveraged name.
+    - For SELLs, weak quality (negative ROE, heavy leverage) corroborates a bearish thesis. An expensive multiple ALONE is never a short trigger — rich names stay rich in momentum regimes.
+    - Fundamentals move slowly: let them shape conviction and holding horizon (a cheap, profitable name supports a POSITION-length hold; a stretched one argues for a tighter SWING), never let them create or flip a directional call on their own. No ratios shown for a ticker = no fundamentals view; rely on the other layers.
+"""
+
+    # Corporate actions overlay (upcoming ex-dividends + nearby splits). Mechanics/
+    # timing caveats on names already being evaluated — never a directional call.
+    corporate_actions_block        = ""
+    corporate_actions_instructions = ""
+    if corporate_actions_context and getattr(corporate_actions_context, "report_date", None):
+        _ca_tickers = {s.ticker for s in signals}
+        _div_lines = "\n".join(
+            f"  {d.ticker}: ex-div in {d.days_until_ex}d (${d.cash_amount:.2f}, {d.frequency or '?'}x/yr)"
+            for d in corporate_actions_context.dividends if d.ticker in _ca_tickers
+        )
+        _split_lines = "\n".join(
+            f"  {s.ticker}: {s.ratio or str(int(s.split_to)) + ':' + str(int(s.split_from))} split "
+            + (f"in {s.days_until}d" if s.days_until >= 0 else f"{abs(s.days_until)}d ago")
+            for s in corporate_actions_context.splits if s.ticker in _ca_tickers
+        )
+        if _div_lines or _split_lines:
+            corporate_actions_block = (
+                "INPUT — corporate actions (Massive/Polygon; a WHEN/mechanics overlay, not a directional signal):\n"
+                "<corporate_actions_context>\n"
+                + (f"Upcoming ex-dividends:\n{_div_lines}\n" if _div_lines else "")
+                + (f"Splits (price/share rescale):\n{_split_lines}\n" if _split_lines else "")
+                + "</corporate_actions_context>\n\n"
+            )
+            corporate_actions_instructions = """
+29. Corporate-actions overlay (mechanics & timing — never a directional trigger):
+    - On a ticker's EX-DIVIDEND date the price drops by roughly the dividend: do NOT read that mechanical gap as fresh weakness or trade purely because of it. A near-term dividend is mild income support, not a thesis.
+    - Around a SPLIT execution date, price and share count rescale (a 3:2 lifts share count; a reverse 1:10 cuts it): treat OHLCV-derived signals (momentum, gaps, pattern) on that name with caution near the date — the level shift can masquerade as a move.
+    - These refine entries/exits and conviction on names you are ALREADY evaluating on other evidence; they never create a call.
+"""
+
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.
 
 Your defining edge: you are ruthlessly disciplined about false positives. You understand that a wrong BUY or SELL costs capital that cannot be recovered. You output HOLD or WATCH whenever the evidence is mixed, incomplete, or driven by a single source. When you do issue a BUY or SELL, it is because the convergence of evidence makes the directional call highly reliable — and you explain precisely why.
 
 Signal sources available today: {methods_desc}
 {session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}{catalyst_block}{_CACHE_SENTINEL}Today's date: {fmt_et(now_et())}
-{open_positions_block}INPUT — multi-method ticker signals:
+{fundamentals_block}{corporate_actions_block}{open_positions_block}INPUT — multi-method ticker signals:
 <signals>
 {signals_text}
 </signals>
@@ -3019,7 +3077,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}{catalyst_instructions}{open_positions_instructions}
+{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}{catalyst_instructions}{open_positions_instructions}{fundamentals_instructions}{corporate_actions_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.

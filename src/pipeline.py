@@ -24,6 +24,8 @@ from src.data.reddit_sentiment import fetch_reddit_sentiment
 from src.data.analyst_ratings import fetch_analyst_ratings
 from src.data.earnings import fetch_earnings_surprises, fetch_earnings_context
 from src.data.pead import fetch_pead_context
+from src.data.fundamentals import fetch_fundamentals_context
+from src.data.corporate_actions import fetch_corporate_actions_context
 from src.data.short_interest import fetch_short_interest
 from src.data.options_flow import fetch_options_flow
 from src.data.sec_filings import fetch_sec_filings
@@ -889,6 +891,20 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         all_tickers = all_tickers + new_from_hyp
         logger.info(f"[hypothetical] Pinning always-open tickers into universe: {new_from_hyp}")
 
+    # Related-company peer discovery (Massive) — widen with peers of the watchlist +
+    # held names; added to the discovered set so it is liquidity-gated below (never raw).
+    if settings.enable_related_discovery:
+        try:
+            from src.data.related_companies import discover_related_tickers
+            _related = discover_related_tickers(list(tickers) + list(open_trade_tickers),
+                                                max_results=settings.related_discovery_max)
+            _new_rel = [t for t in _related if t not in all_tickers]
+            if _new_rel:
+                all_tickers = all_tickers + _new_rel
+                logger.info(f"[related] Peer-discovery added {len(_new_rel)} name(s): {_new_rel[:12]}")
+        except Exception as e:
+            logger.warning(f"[related] peer discovery failed: {e}")
+
     # ── Section F: discovery liquidity gate ───────────────────────────────────
     # Drop untradeable microcaps (below the price or 20-day avg dollar-volume floor) from every
     # DISCOVERED name before the universe is processed, so the widened funnel (Sections A–E) doesn't
@@ -1008,6 +1024,12 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
         f_pead         = (pool.submit(_safe, "pead", fetch_pead_context, tickers)
                           if settings.enable_pead else None)
+
+        f_fundamentals = (pool.submit(_safe, "fundamentals", fetch_fundamentals_context, tickers)
+                          if settings.enable_fundamentals else None)
+
+        f_corp_actions = (pool.submit(_safe, "corp_actions", fetch_corporate_actions_context, tickers)
+                          if settings.enable_corporate_actions else None)
 
         f_short        = (pool.submit(_safe, "short", fetch_short_interest, tickers)
                           if settings.enable_short_interest else None)
@@ -1195,6 +1217,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     gex_context               = yf_options.get("gex")
     earnings_context = get(f_earnings_cal)
     pead_context     = get(f_pead)
+    fundamentals_context = get(f_fundamentals)
+    corporate_actions_context = get(f_corp_actions)
 
     # OpEx context — pure date math, computed synchronously (no I/O)
     opex_context = compute_opex_context() if settings.enable_opex else None
@@ -1386,6 +1410,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         intermarket_context=intermarket_context,
         macro_news_context=macro_news_context,
         catalyst_timing_context=catalyst_timing_context,
+        fundamentals_context=fundamentals_context,
+        corporate_actions_context=corporate_actions_context,
     )
     recommendations = generate_recommendations(
         signals,
@@ -1699,6 +1725,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             whisper_context=whisper_context,
             earnings_context=earnings_context,
             pead_context=pead_context,
+            fundamentals_context=fundamentals_context,
+            corporate_actions_context=corporate_actions_context,
             gex_context=gex_context,
             opex_context=opex_context,
             seasonality_context=seasonality_context,

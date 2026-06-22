@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     # no credit card for the free tier). If absent, the pipeline falls back to yfinance.
     polygon_api_key: str = ""
 
+    # Company fundamentals (TTM valuation / profitability / leverage ratios) from the
+    # Massive/Polygon financials & ratios endpoint — requires the Stocks Advanced plan
+    # (or the ratios add-on). Fed into the LLM synthesis prompt as a quality/valuation
+    # overlay. Key-gated + fail-graceful: inert (no block) without the entitlement.
+    enable_fundamentals: bool = True
+
+    # Corporate actions (dividends + splits) from Massive/Polygon — upcoming ex-dividend
+    # dates + recent/upcoming splits, fed to synthesis as a WHEN/mechanics overlay (§29).
+    enable_corporate_actions: bool = True
+    corp_actions_div_lookahead_days: int = 14   # surface ex-dividends within this many days
+    corp_actions_split_window_days: int = 30    # surface splits within ± this many days
+
+    # Related-company peer discovery (Massive related-companies graph) — widens the
+    # universe with peers of the watchlist + held names (liquidity-gated in Step 0).
+    enable_related_discovery: bool = True
+    related_discovery_max: int = 25
+
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
 
@@ -78,15 +95,16 @@ class Settings(BaseSettings):
     # COVERAGE; the provider-sentiment LLM-skip is driven by Polygon insights.
     finnhub_api_key: str = ""
     enable_finnhub_news: bool = False
-    # Polygon news + per-article sentiment "insights" (verified on the free key:
-    # each article carries {ticker, sentiment, reasoning}). Feeds the provider-
-    # sentiment hybrid below so the LLM scorer can be skipped for these articles.
-    enable_polygon_news: bool = False
+    # Polygon/Massive news + per-article sentiment "insights" (each article carries
+    # {ticker, sentiment, reasoning}). ON by default now that we're on the Advanced
+    # plan — real-time Benzinga-sourced coverage; feeds the provider-sentiment hybrid
+    # below so the LLM scorer can be skipped for these articles.
+    enable_polygon_news: bool = True
     # Provider-sentiment hybrid: when an article carries a provider sentiment
     # (Polygon insights), derive the per-ticker news score from those instead of
     # calling the DeepSeek/Haiku scorer — a latency + cost win. Falls back to the
-    # LLM when too few provider-scored articles exist. OFF by default for A/B.
-    enable_provider_sentiment: bool = False
+    # LLM when too few provider-scored articles exist. ON by default (Advanced plan).
+    enable_provider_sentiment: bool = True
     provider_sentiment_min_articles: int = 2   # min provider-scored relevant articles to skip the LLM
     provider_sentiment_magnitude: float = 0.6  # |score| a positive/negative label maps to ([-1,1] scale)
 

@@ -348,3 +348,92 @@ def get_intraday_bars(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
     df = pd.DataFrame(rows).set_index("ts").sort_index()
     df.index.name = None
     return _rth_only_30m(df)
+
+
+def get_ratios_batch(tickers: List[str], chunk: int = 100) -> Dict[str, dict]:
+    """TTM financial ratios for many *tickers* via the financials/ratios endpoint.
+
+    Requires the **Stocks Advanced** plan (or the ratios add-on); the free tier
+    403s. One request per ``chunk`` symbols (``ticker.any_of``); returns
+    ``{ticker: ratios_dict}`` with the latest row per ticker. Empty dict when
+    unavailable / not entitled, so the caller degrades gracefully.
+
+    Ratio fields include: ``price_to_earnings``, ``price_to_book``,
+    ``price_to_sales``, ``ev_to_ebitda``, ``return_on_equity``,
+    ``return_on_assets``, ``debt_to_equity``, ``dividend_yield``, ``current``,
+    ``free_cash_flow``, ``market_cap``, ``enterprise_value`` (plus ``ticker``,
+    ``date``)."""
+    if not is_available() or not tickers:
+        return {}
+    out: Dict[str, dict] = {}
+    uniq = list(dict.fromkeys(tickers))
+    for i in range(0, len(uniq), chunk):
+        group = uniq[i:i + chunk]
+        # The endpoint returns the latest daily snapshot (one row per ticker). It
+        # rejects sort=date (only ratio columns are sortable), so we don't sort —
+        # setdefault keeps the first (current) row per ticker.
+        j = _get(
+            "/stocks/financials/v1/ratios",
+            {"ticker.any_of": ",".join(group), "limit": 1000},
+        )
+        for row in (j or {}).get("results", []) or []:
+            tk = row.get("ticker")
+            if tk:
+                out.setdefault(tk, row)
+    return out
+
+
+def _get_paginated(path: str, params: dict, max_pages: int = 10) -> List[dict]:
+    """GET a v3 reference endpoint following ``next_url`` cursors. Returns the
+    concatenated ``results`` (capped at ``max_pages`` pages). Empty on failure."""
+    out: List[dict] = []
+    j = _get(path, params)
+    pages = 0
+    while j and j.get("results"):
+        out.extend(j["results"])
+        nxt = j.get("next_url")
+        if not nxt or pages >= max_pages:
+            break
+        pages += 1
+        try:
+            r = httpx.get(nxt, params={"apiKey": settings.polygon_api_key}, timeout=_TIMEOUT)
+            r.raise_for_status()
+            j = r.json()
+        except Exception:
+            break
+    return out
+
+
+def get_dividends_calendar(start: str, end: str) -> List[dict]:
+    """Market-wide dividends with ``ex_dividend_date`` in [start, end] (ISO dates).
+
+    One paginated call covers the whole market — the caller filters to its universe.
+    Rows carry ``ticker``, ``ex_dividend_date``, ``cash_amount``, ``frequency``,
+    ``pay_date``, ``dividend_type``. Empty list when Polygon is unavailable."""
+    if not is_available():
+        return []
+    return _get_paginated("/v3/reference/dividends", {
+        "ex_dividend_date.gte": start, "ex_dividend_date.lte": end, "limit": 1000,
+    })
+
+
+def get_splits_calendar(start: str, end: str) -> List[dict]:
+    """Market-wide stock splits with ``execution_date`` in [start, end] (ISO dates).
+
+    Rows carry ``ticker``, ``execution_date``, ``split_from``, ``split_to``. Splits
+    are rare, so one page nearly always suffices. Empty list when unavailable."""
+    if not is_available():
+        return []
+    return _get_paginated("/v3/reference/splits", {
+        "execution_date.gte": start, "execution_date.lte": end, "limit": 1000,
+    })
+
+
+def get_related_companies(ticker: str) -> List[str]:
+    """Massive's peer graph for *ticker* — up to ~10 related tickers (one call).
+
+    Returns a list of peer symbols; empty when unavailable / none found."""
+    if not is_available() or not ticker:
+        return []
+    j = _get(f"/v1/related-companies/{ticker}", {})
+    return [r["ticker"] for r in (j or {}).get("results", []) or [] if r.get("ticker")]
