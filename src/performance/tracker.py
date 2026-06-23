@@ -409,6 +409,16 @@ METHOD_LABELS.update({
     for suffix, label in (("30m", "30m"), ("1w", "Weekly"))
 })
 
+# Massive fundamentals factor diagnostics (panel-only IC columns).
+METHOD_LABELS.update({
+    "f_value":         "Value (Massive: cheap P/E·P/B)",
+    "f_quality":       "Quality (Massive: ROE·margin)",
+    "f_growth":        "Growth (Massive: rev YoY)",
+    "f_short_squeeze": "Short Squeeze (Massive: short%·days-to-cover)",
+    "f_split":         "Split direction (Massive: forward+ / reverse−)",
+    "f_dividend":      "Dividend change (Massive: increase+ / cut−)",
+})
+
 
 def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: Optional[dict]) -> dict:
     """Extract per-method scores from the TickerSignal for a given ticker."""

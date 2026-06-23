@@ -42,6 +42,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(cac.settings, "enable_corporate_actions", True)
     monkeypatch.setattr(cac.settings, "enable_fetch_data", True)
     monkeypatch.setattr(cac.polygon_client, "is_available", lambda: True)
+    # default: no per-ticker dividend history (tests opt in) — never hits the network
+    monkeypatch.setattr(cac.polygon_client, "get_dividend_history", lambda tk, limit=6: [])
 
 
 def test_fetch_filters_to_universe_and_builds(monkeypatch, tmp_path):
@@ -49,7 +51,7 @@ def test_fetch_filters_to_universe_and_builds(monkeypatch, tmp_path):
     exd = (_TODAY + timedelta(days=5)).isoformat()
     exe = (_TODAY + timedelta(days=10)).isoformat()
     monkeypatch.setattr(cac.polygon_client, "get_dividends_calendar",
-        lambda s, e: [
+        lambda s, e, order="asc", max_pages=10: [
             {"ticker": "KO", "ex_dividend_date": exd, "cash_amount": 0.5, "frequency": 4, "pay_date": exd},
             {"ticker": "ZZZZ", "ex_dividend_date": exd, "cash_amount": 1.0},   # outside universe
         ])
@@ -72,9 +74,46 @@ def test_fetch_disabled_returns_none(monkeypatch, tmp_path):
 
 def test_fetch_empty_returns_none(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
-    monkeypatch.setattr(cac.polygon_client, "get_dividends_calendar", lambda s, e: [])
+    monkeypatch.setattr(cac.polygon_client, "get_dividends_calendar", lambda s, e, order="asc", max_pages=10: [])
     monkeypatch.setattr(cac.polygon_client, "get_splits_calendar", lambda s, e: [])
     assert cac.fetch_corporate_actions_context(["KO"]) is None
+
+
+# ── directional factors (f_split, f_dividend) ─────────────────────────────────
+
+def test_split_factor_direction():
+    from src.models import SplitEvent
+    fwd = [SplitEvent(ticker="X", execution_date=_TODAY, split_from=1, split_to=4, days_until=0)]
+    rev = [SplitEvent(ticker="Y", execution_date=_TODAY, split_from=10, split_to=1, days_until=0)]
+    assert cac._split_factor(fwd, 30) > 0       # forward → bullish
+    assert cac._split_factor(rev, 30) < 0       # reverse → bearish (distress)
+    assert cac._split_factor([], 30) is None
+
+
+def test_dividend_factor_direction():
+    inc = [{"cash_amount": 0.27, "frequency": 4}, {"cash_amount": 0.26, "frequency": 4},
+           {"cash_amount": 0.26, "frequency": 4}, {"cash_amount": 0.26, "frequency": 4},
+           {"cash_amount": 0.24, "frequency": 4}]                       # latest 0.27 vs ~1yr 0.24
+    assert cac._dividend_factor(inc) > 0
+    cut = [{"cash_amount": 0.10, "frequency": 4}] + [{"cash_amount": 0.30, "frequency": 4}] * 4
+    assert cac._dividend_factor(cut) < 0
+    assert cac._dividend_factor([{"cash_amount": 0.5, "frequency": 4}]) == 0.4   # initiation
+    assert cac._dividend_factor([]) is None
+
+
+def test_context_carries_factor_scores(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    # KO per-ticker dividend history: latest 0.53 vs ~1yr-ago 0.48 → increase
+    monkeypatch.setattr(cac.polygon_client, "get_dividend_history",
+        lambda tk, limit=6: ([{"cash_amount": 0.53, "frequency": 4}, {"cash_amount": 0.53, "frequency": 4},
+                              {"cash_amount": 0.48, "frequency": 4}, {"cash_amount": 0.48, "frequency": 4},
+                              {"cash_amount": 0.48, "frequency": 4}] if tk == "KO" else []))
+    monkeypatch.setattr(cac.polygon_client, "get_splits_calendar",
+        lambda s, e: [{"ticker": "NVDA", "execution_date": _TODAY.isoformat(), "split_from": 1, "split_to": 10}])
+    ctx = cac.fetch_corporate_actions_context(["KO", "NVDA"])
+    assert ctx is not None
+    assert ctx.factor_scores["KO"]["f_dividend"] > 0      # 0.53 vs ~1yr 0.48 → increase
+    assert ctx.factor_scores["NVDA"]["f_split"] > 0       # forward 1→10 split
 
 
 # ── prompt injection ───────────────────────────────────────────────────────────

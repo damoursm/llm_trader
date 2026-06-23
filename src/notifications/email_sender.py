@@ -4876,6 +4876,8 @@ HTML_TEMPLATE = """
         <th style="padding:5px 6px;">ROE</th>
         <th style="padding:5px 6px;">D/E</th>
         <th style="padding:5px 6px;">Div&nbsp;Yld</th>
+        <th style="padding:5px 6px;">Rev&nbsp;YoY</th>
+        <th style="padding:5px 6px;">Short%</th>
         <th style="padding:5px 6px;">Mkt&nbsp;Cap</th>
       </tr>
     </thead>
@@ -4889,6 +4891,8 @@ HTML_TEMPLATE = """
         <td style="padding:5px 6px;">{{ '%.0f%%'|format(s.roe * 100) if s.roe is not none else '—' }}</td>
         <td style="padding:5px 6px;">{{ '%.2f'|format(s.debt_to_equity) if s.debt_to_equity is not none else '—' }}</td>
         <td style="padding:5px 6px;">{{ '%.1f%%'|format(s.dividend_yield * 100) if s.dividend_yield else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%+.0f%%'|format(s.rev_growth_yoy) if s.rev_growth_yoy is not none else '—' }}</td>
+        <td style="padding:5px 6px;">{{ '%.1f%%'|format(s.short_pct) if s.short_pct is not none else '—' }}</td>
         <td style="padding:5px 6px;">${{ '%.0f'|format(s.market_cap / 1e9) }}B</td>
       </tr>
     {% endfor %}

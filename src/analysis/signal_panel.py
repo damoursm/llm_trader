@@ -35,7 +35,8 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
-from src.db.schema import SIGNAL_METHOD_COLUMNS, SIGNAL_TIMEFRAME_COLUMNS
+from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_TIMEFRAME_COLUMNS,
+                           SIGNAL_FUNDAMENTAL_COLUMNS)
 
 # Scored columns the IC report covers: every per-method column plus the
 # aggregator's weighted combined score (the "all methods together" row).
@@ -50,10 +51,13 @@ PANEL_SCORE_COLUMNS = list(SIGNAL_METHOD_COLUMNS) + ["combined_score"]
 IC_CATEGORY_30M = "Technical · 30-min"
 IC_CATEGORY_1D = "Technical · Daily"
 IC_CATEGORY_1W = "Technical · Weekly"
+IC_CATEGORY_FUND = "Fundamentals & corporate actions (Massive: value · quality · growth · short · split · dividend)"
 IC_CATEGORY_OTHER = "Other (news · sentiment · smart money · options · catalysts)"
-IC_CATEGORY_ORDER = (IC_CATEGORY_30M, IC_CATEGORY_1D, IC_CATEGORY_1W, IC_CATEGORY_OTHER)
+IC_CATEGORY_ORDER = (IC_CATEGORY_30M, IC_CATEGORY_1D, IC_CATEGORY_1W,
+                     IC_CATEGORY_FUND, IC_CATEGORY_OTHER)
 
 _DAILY_TECHNICAL = frozenset(c[:-4] for c in SIGNAL_TIMEFRAME_COLUMNS if c.endswith("_30m"))
+_FUNDAMENTAL_SET = frozenset(SIGNAL_FUNDAMENTAL_COLUMNS)
 
 
 def category_for(method: str) -> str:
@@ -64,6 +68,8 @@ def category_for(method: str) -> str:
         return IC_CATEGORY_1W
     if method in _DAILY_TECHNICAL:
         return IC_CATEGORY_1D
+    if method in _FUNDAMENTAL_SET:
+        return IC_CATEGORY_FUND
     return IC_CATEGORY_OTHER
 
 

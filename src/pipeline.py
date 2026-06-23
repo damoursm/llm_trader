@@ -22,6 +22,7 @@ from src.data.eight_k import fetch_8k_articles
 from src.data.google_trends import fetch_google_trends
 from src.data.reddit_sentiment import fetch_reddit_sentiment
 from src.data.analyst_ratings import fetch_analyst_ratings
+from src.data.ticker_events import fetch_ticker_events
 from src.data.earnings import fetch_earnings_surprises, fetch_earnings_context
 from src.data.pead import fetch_pead_context
 from src.data.fundamentals import fetch_fundamentals_context
@@ -341,7 +342,8 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
             # alongside for the panel's IC table but excluded from those counts.
             base_scores = _method_scores_from_signal(tk, s.direction, signals_by_ticker)
             tf_scores = getattr(s, "timeframe_scores", None) or {}
-            all_scores = {**base_scores, **tf_scores} if tf_scores else base_scores
+            fund_scores = getattr(s, "fundamental_scores", None) or {}
+            all_scores = {**base_scores, **tf_scores, **fund_scores}
             sig_rows.append({
                 "ticker": tk,
                 "type": str(getattr(s, "type", "STOCK") or "STOCK"),
@@ -1013,6 +1015,12 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                                       lookback_days=settings.analyst_ratings_lookback_days)
                           if settings.enable_analyst_ratings else None)
 
+        # Ticker events (renames/delistings) — protective, only the held + watchlist
+        # names (one call each), not the whole universe.
+        f_ticker_events = (pool.submit(_safe, "ticker_events", fetch_ticker_events,
+                                       list(settings.stocks_list) + list(open_trade_tickers))
+                           if settings.enable_ticker_events else None)
+
         f_eps          = (pool.submit(_safe, "eps", fetch_earnings_surprises, tickers,
                                       lookback_days=settings.earnings_lookback_days)
                           if settings.enable_earnings else None)
@@ -1116,6 +1124,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "trends":       get(f_trends),
         "reddit":       get(f_reddit),
         "analyst":      get(f_analyst),
+        "ticker_events": get(f_ticker_events),
         "eps":          get(f_eps),
         "short":        get(f_short),
         "polygon_news": get(f_polygon_news),
@@ -1317,6 +1326,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         opex_context=opex_context,
         pead_context=pead_context,
         coint_context=coint_context,
+        corp_factors=(corporate_actions_context.factor_scores if corporate_actions_context else None),
     )
     signals = build_signals(
         all_tickers,
@@ -1326,6 +1336,26 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         **build_kwargs,
     )
     signals_by_ticker = {s.ticker: s for s in signals}
+
+    # Attach diagnostic FACTOR scores to each signal for the dashboard's Signal-IC
+    # table (IC + Sim win% + Sim ret%): Massive fundamentals (value/quality/growth/
+    # short-squeeze, panel-only) + corporate-action directional factors (f_split/
+    # f_dividend, which ALSO nudge combined_score via the aggregator overlay above).
+    from src.data.fundamentals import factor_scores as _ffactor
+    _fund_by_tk = ({fs.ticker: fs for fs in fundamentals_context.signals}
+                   if fundamentals_context and getattr(fundamentals_context, "signals", None) else {})
+    _corp_fs = getattr(corporate_actions_context, "factor_scores", None) or {}
+    if _fund_by_tk or _corp_fs:
+        for _tk, _sig in signals_by_ticker.items():
+            merged: dict = {}
+            _fs = _fund_by_tk.get(_tk) or _fund_by_tk.get(_tk.upper())
+            if _fs is not None:
+                merged.update(_ffactor(_fs))
+            _cf = _corp_fs.get(_tk) or _corp_fs.get(_tk.upper())
+            if _cf:
+                merged.update(_cf)
+            if merged:
+                _sig.fundamental_scores = merged
 
     # Update cluster watchlist: add newly detected clusters, expire stale entries
     _cluster_raw = update_cluster_watchlist(signals_by_ticker, _cluster_raw)

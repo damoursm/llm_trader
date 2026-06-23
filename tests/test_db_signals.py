@@ -31,10 +31,16 @@ def test_signal_timeframe_columns_convention():
     set without overlap."""
     from src.signals.multi_timeframe import TECHNICAL_METHODS, NON_DAILY_TIMEFRAMES
     valid = {f"{m}_{tf}" for m in TECHNICAL_METHODS for tf in NON_DAILY_TIMEFRAMES}
+    from src.db.schema import SIGNAL_FUNDAMENTAL_COLUMNS
     assert set(SIGNAL_TIMEFRAME_COLUMNS) == valid
-    assert tuple(SIGNAL_METHOD_COLUMNS) == tuple(SIGNAL_BASE_METHOD_COLUMNS) + tuple(SIGNAL_TIMEFRAME_COLUMNS)
+    # Panel columns = base (trade-attributed) + timeframe + fundamentals factors
+    # (the latter two are panel-only diagnostics, NOT in _ALL_METHODS).
+    assert tuple(SIGNAL_METHOD_COLUMNS) == (tuple(SIGNAL_BASE_METHOD_COLUMNS)
+                                            + tuple(SIGNAL_TIMEFRAME_COLUMNS)
+                                            + tuple(SIGNAL_FUNDAMENTAL_COLUMNS))
     assert len(set(SIGNAL_METHOD_COLUMNS)) == len(SIGNAL_METHOD_COLUMNS)   # no dupes
     assert not (set(SIGNAL_BASE_METHOD_COLUMNS) & set(SIGNAL_TIMEFRAME_COLUMNS))
+    assert not (set(SIGNAL_BASE_METHOD_COLUMNS) & set(SIGNAL_FUNDAMENTAL_COLUMNS))
 
 
 # ── insert_signals round-trip (temporary DuckDB file) ─────────────────────

@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # behavior); 0.0 = always DeepSeek-first.
     llm_ab_anthropic_share: float = 0.5
 
+    # SENTIMENT engine policy. When False (default), per-ticker news sentiment is
+    # scored by DeepSeek ONLY — Claude/Haiku is never called for sentiment (not even
+    # as fallback or via a hold-review engine pin); Claude is reserved for SYNTHESIS.
+    # Set True to restore the Haiku ⇄ DeepSeek A/B on sentiment (governed by
+    # llm_ab_anthropic_share). Synthesis routing is unaffected either way.
+    enable_claude_sentiment: bool = False
+
     # SYNTHESIS-only N-way model bake-off. When set to a comma-separated list of
     # model ids, the per-run synthesis engine is picked UNIFORMLY from this pool
     # (equal split) instead of the binary llm_ab_anthropic_share flip — so 3+
@@ -72,12 +79,27 @@ class Settings(BaseSettings):
     # (or the ratios add-on). Fed into the LLM synthesis prompt as a quality/valuation
     # overlay. Key-gated + fail-graceful: inert (no block) without the entitlement.
     enable_fundamentals: bool = True
+    # Per-ticker fundamentals ENRICHMENT (Massive short-interest + short-volume +
+    # income-statement margin/YoY-growth) on top of the batched ratios — ~3 extra
+    # calls/ticker, so capped to the first N (watchlist + early discovery). 0 = off.
+    fundamentals_enrich_max_tickers: int = 50
+
+    # Ticker-events watch (Massive corporate ticker-events: symbol/name changes,
+    # delistings) — surfaces recent events on held + watchlist names as material
+    # NewsArticles so a rename/delisting can't silently strand a position.
+    enable_ticker_events: bool = True
+    ticker_events_lookback_days: int = 45
 
     # Corporate actions (dividends + splits) from Massive/Polygon — upcoming ex-dividend
     # dates + recent/upcoming splits, fed to synthesis as a WHEN/mechanics overlay (§29).
     enable_corporate_actions: bool = True
     corp_actions_div_lookahead_days: int = 14   # surface ex-dividends within this many days
     corp_actions_split_window_days: int = 30    # surface splits within ± this many days
+    corp_actions_div_max_tickers: int = 60      # per-ticker dividend-history fetches for the increase/cut factor (0 = off)
+    # Additive (NOT normalised-pool) overlay weight for the directional corporate-action
+    # factors (f_split + f_dividend) on combined_score — event-driven so it never dampens
+    # the ~95% of tickers with no action. Placeholder; tune once IC data accrues.
+    corp_action_factor_weight: float = 0.10
 
     # Related-company peer discovery (Massive related-companies graph) — widens the
     # universe with peers of the watchlist + held names (liquidity-gated in Step 0).

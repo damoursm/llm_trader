@@ -364,6 +364,9 @@ def test_generate_recommendations_force_engine_no_fallback(monkeypatch):
 
 def test_analyse_sentiment_force_engine_pins_to_anthropic(monkeypatch):
     import src.analysis.sentiment as sent
+    # An anthropic pin is only honored when Claude sentiment is enabled; with it
+    # off (the default) the pin coerces to deepseek (Claude never scores sentiment).
+    monkeypatch.setattr(sent.settings, "enable_claude_sentiment", True)
     calls = []
 
     class _Msgs:

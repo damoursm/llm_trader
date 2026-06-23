@@ -404,17 +404,21 @@ def _get_paginated(path: str, params: dict, max_pages: int = 10) -> List[dict]:
     return out
 
 
-def get_dividends_calendar(start: str, end: str) -> List[dict]:
+def get_dividends_calendar(start: str, end: str, order: str = "asc",
+                           max_pages: int = 10) -> List[dict]:
     """Market-wide dividends with ``ex_dividend_date`` in [start, end] (ISO dates).
 
     One paginated call covers the whole market — the caller filters to its universe.
     Rows carry ``ticker``, ``ex_dividend_date``, ``cash_amount``, ``frequency``,
-    ``pay_date``, ``dividend_type``. Empty list when Polygon is unavailable."""
+    ``pay_date``, ``dividend_type``. ``order='desc'`` (newest first) + a higher
+    ``max_pages`` is used when pulling history for the dividend-change factor. Empty
+    list when Polygon is unavailable."""
     if not is_available():
         return []
     return _get_paginated("/v3/reference/dividends", {
-        "ex_dividend_date.gte": start, "ex_dividend_date.lte": end, "limit": 1000,
-    })
+        "ex_dividend_date.gte": start, "ex_dividend_date.lte": end,
+        "order": order, "limit": 1000,
+    }, max_pages=max_pages)
 
 
 def get_splits_calendar(start: str, end: str) -> List[dict]:
@@ -427,6 +431,17 @@ def get_splits_calendar(start: str, end: str) -> List[dict]:
     return _get_paginated("/v3/reference/splits", {
         "execution_date.gte": start, "execution_date.lte": end, "limit": 1000,
     })
+
+
+def get_dividend_history(ticker: str, limit: int = 6) -> List[dict]:
+    """Recent dividends for a single *ticker*, NEWEST first (the increase/cut factor
+    needs reliable per-ticker history — the market-wide calendar truncates it). []
+    when unavailable."""
+    if not is_available() or not ticker:
+        return []
+    j = _get("/v3/reference/dividends",
+             {"ticker": ticker, "order": "desc", "limit": limit})
+    return (j or {}).get("results") or []
 
 
 def get_related_companies(ticker: str) -> List[str]:
@@ -470,3 +485,53 @@ def get_macd(ticker: str) -> Optional[dict]:
                 "histogram": float(v["histogram"])}
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def get_short_interest(ticker: str) -> Optional[dict]:
+    """Latest FINRA short interest for *ticker* — ``{short_interest, days_to_cover,
+    avg_daily_volume, settlement_date}``. None when unavailable. (These endpoints
+    default to ASCENDING, so the newest row needs ``sort=<col>.desc``.)"""
+    if not is_available() or not ticker:
+        return None
+    j = _get("/stocks/v1/short-interest",
+             {"ticker": ticker, "sort": "settlement_date.desc", "limit": 1})
+    res = (j or {}).get("results") or []
+    return res[0] if res else None
+
+
+def get_short_volume(ticker: str) -> Optional[dict]:
+    """Latest daily short-volume row for *ticker* (carries ``short_volume_ratio``).
+    None when unavailable."""
+    if not is_available() or not ticker:
+        return None
+    j = _get("/stocks/v1/short-volume",
+             {"ticker": ticker, "sort": "date.desc", "limit": 1})
+    res = (j or {}).get("results") or []
+    return res[0] if res else None
+
+
+def get_income_statements(ticker: str, limit: int = 8) -> list:
+    """Recent QUARTERLY income statements for *ticker*, newest first.
+
+    Used for margins (gross/net), EBITDA, shares outstanding (a float proxy — the
+    dedicated float endpoint isn't on this plan), and YoY revenue growth. []
+    when unavailable."""
+    if not is_available() or not ticker:
+        return []
+    # NB: this endpoint filters on `tickers` (plural) — a `ticker=` param is silently
+    # ignored and returns unfiltered global rows.
+    j = _get("/stocks/financials/v1/income-statements",
+             {"tickers": ticker, "timeframe": "quarterly",
+              "sort": "period_end.desc", "limit": limit})
+    return (j or {}).get("results") or []
+
+
+def get_ticker_events(ticker: str) -> list:
+    """Corporate ticker EVENTS for *ticker* — symbol changes, name changes,
+    delistings/relistings (`/vX/reference/tickers/{t}/events`). Returns the raw
+    events list (``[{type, date, ...}]``); [] when unavailable."""
+    if not is_available() or not ticker:
+        return []
+    j = _get(f"/vX/reference/tickers/{ticker}/events", {})
+    results = (j or {}).get("results") or {}
+    return results.get("events") or []

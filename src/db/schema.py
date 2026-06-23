@@ -54,8 +54,17 @@ SIGNAL_TIMEFRAME_COLUMNS = tuple(
     f"{m}_{tf}" for tf in _MTF_TIMEFRAMES for m in _MTF_METHODS
 )
 
+# Fundamentals factor columns (Massive value / quality / growth / short-squeeze) —
+# signed diagnostic scores (+ = hypothesized bullish) persisted to the panel ONLY so
+# the Signal-IC table measures whether each factor predicts forward returns. Like the
+# timeframe columns these are PANEL-ONLY: NOT in tracker._ALL_METHODS (not weighted
+# into combined_score, not trade-attributed). New columns need the ALTER below.
+SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squeeze",
+                              "f_split", "f_dividend")
+
 # Full set of method-score columns persisted to the `signals` panel.
-SIGNAL_METHOD_COLUMNS = SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
+SIGNAL_METHOD_COLUMNS = (SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
+                         + SIGNAL_FUNDAMENTAL_COLUMNS)
 
 SCHEMA_STATEMENTS = [
     """
@@ -238,6 +247,8 @@ _ADD_COLUMNS = (
     ("signals", "massive", "DOUBLE"),
     # Multi-timeframe technical columns on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_TIMEFRAME_COLUMNS),
+    # Fundamentals factor diagnostic columns on an existing signals table.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_FUNDAMENTAL_COLUMNS),
 )
 
 

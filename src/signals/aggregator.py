@@ -783,6 +783,7 @@ def build_signals(
     snapshots=None,           # Optional[List[TickerSnapshot]] — live prices for ext_gap
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
     force_sentiment_engine: Optional[str] = None,  # pin news scoring to one engine (hold-review)
+    corp_factors: Optional[dict] = None,  # {ticker: {f_split, f_dividend}} — additive corporate-action overlay
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods.
 
@@ -1213,6 +1214,17 @@ def build_signals(
                 combined, sentiment_score, technical_score,
                 insider_sc, pc_score, vol_ratio,
             )
+
+        # ── Corporate-action directional overlay (additive, event-driven) ──
+        # f_split (forward-drift / reverse-distress) + f_dividend (increase / cut),
+        # added OUTSIDE the normalised weight pool so a corporate action nudges the
+        # handful of event tickers without dampening everyone else. Weight is a
+        # placeholder — review once the f_split/f_dividend IC accrues.
+        if corp_factors:
+            _cf = corp_factors.get(ticker) or corp_factors.get(ticker.upper())
+            if _cf:
+                combined += settings.corp_action_factor_weight * (
+                    float(_cf.get("f_split", 0.0)) + float(_cf.get("f_dividend", 0.0)))
 
         # ── Direction ─────────────────────────────────────────────────────
         direction: Direction

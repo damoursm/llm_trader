@@ -62,13 +62,37 @@ def reset_sentiment_providers() -> None:
     global _PRIMARY_SENTIMENT_ENGINE
     with _PROVIDER_LOCK:
         _PROVIDER_COUNTS.clear()
+    # Sentiment is DeepSeek-only unless Claude sentiment is explicitly enabled
+    # (Claude is otherwise reserved for synthesis).
     _PRIMARY_SENTIMENT_ENGINE = (
-        "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
+        "anthropic"
+        if settings.enable_claude_sentiment and random.random() < settings.llm_ab_anthropic_share
+        else "deepseek"
     )
-    logger.info(
-        f"[sentiment] A/B routing this run: primary={_PRIMARY_SENTIMENT_ENGINE} "
-        f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
-    )
+    if settings.enable_claude_sentiment:
+        logger.info(
+            f"[sentiment] A/B routing this run: primary={_PRIMARY_SENTIMENT_ENGINE} "
+            f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
+        )
+    else:
+        logger.info("[sentiment] DeepSeek-only this run (Claude sentiment disabled)")
+
+
+def _sentiment_engine_order(force_engine: Optional[str]) -> list:
+    """Engine try-order for one sentiment call (primary first, the other as fallback).
+
+    DeepSeek-only unless ``enable_claude_sentiment`` is set — when disabled, anthropic
+    is stripped entirely (even a ``force_engine='anthropic'`` hold-review pin coerces
+    to deepseek), so Claude is never called for sentiment."""
+    if force_engine in ("deepseek", "anthropic"):
+        order = [force_engine]
+    elif _PRIMARY_SENTIMENT_ENGINE == "deepseek":
+        order = ["deepseek", "anthropic"]
+    else:
+        order = ["anthropic", "deepseek"]
+    if not settings.enable_claude_sentiment:
+        order = [e for e in order if e != "anthropic"] or ["deepseek"]
+    return order
 
 
 def _record_sentiment_provider(provider: str) -> None:
@@ -374,10 +398,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
     # other provider remains the error fallback. Determinism per engine:
     # temperature=0 (+ a stable seed on DeepSeek; Anthropic exposes no seed)
     # so two runs scoring the same digest on the same engine agree.
-    if force_engine in ("deepseek", "anthropic"):
-        order = [force_engine]   # pinned hold-review: this engine ONLY, no fallback
-    else:
-        order = ["deepseek", "anthropic"] if _PRIMARY_SENTIMENT_ENGINE == "deepseek" else ["anthropic", "deepseek"]
+    order = _sentiment_engine_order(force_engine)
     last_err: Exception | None = None
     for engine in order:
         try:

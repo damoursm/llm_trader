@@ -312,6 +312,13 @@ class FundamentalsSignal(BaseModel):
     fcf: Optional[float] = None            # free cash flow (TTM, USD)
     market_cap: Optional[float] = None     # USD
     enterprise_value: Optional[float] = None
+    # Positioning / squeeze (Massive short-interest + short-volume endpoints) + growth/
+    # quality (income-statements). Populated only for the capped enrichment subset.
+    short_pct: Optional[float] = None          # short interest as % of shares outstanding
+    days_to_cover: Optional[float] = None      # short interest / avg daily volume
+    short_volume_ratio: Optional[float] = None # latest daily short volume as % of total
+    net_margin: Optional[float] = None         # latest-quarter net income / revenue (%)
+    rev_growth_yoy: Optional[float] = None     # latest-quarter revenue YoY growth (%)
     as_of: Optional[date] = None
     summary: str = ""
 
@@ -359,6 +366,11 @@ class CorporateActionsContext(BaseModel):
     dividends & splits calendars, filtered to the scored universe."""
     dividends: List[DividendEvent] = []
     splits: List[SplitEvent] = []
+    # Directional factor scores per ticker (+ = hypothesized bullish): {ticker:
+    # {"f_split":…, "f_dividend":…}}. f_split = forward-split drift (+) / reverse-split
+    # distress (−); f_dividend = dividend increase·initiation (+) / cut (−). Consumed by
+    # the panel IC, the aggregator overlay, and the synthesis prompt's §29 directional block.
+    factor_scores: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     report_date: date
     summary: str = ""
 
@@ -1261,6 +1273,10 @@ class TickerSignal(BaseModel):
     # 4-category Information-Coefficient table; the live combined_score uses the
     # renormalised blend of these with the daily component.
     timeframe_scores: Dict[str, float] = Field(default_factory=dict)
+    # Signed fundamentals FACTOR scores (Massive value/quality/growth/short-squeeze;
+    # + = hypothesized bullish), attached post-build from the fundamentals context.
+    # Panel-only diagnostics for the Signal-IC table — NOT in the weighted combine.
+    fundamental_scores: Dict[str, float] = Field(default_factory=dict)
 
 
 class Recommendation(BaseModel):

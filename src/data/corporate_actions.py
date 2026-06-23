@@ -13,13 +13,15 @@ Cached daily. Fail-graceful: any error / no entitlement → None (run continues)
 
 import json
 from datetime import date, timedelta
+from math import log, tanh
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
 from config import settings
 from src.data import polygon_client
+from src.data.market_data import is_valid_ticker
 from src.models import CorporateActionsContext, DividendEvent, SplitEvent
 
 CACHE_DIR = Path("cache")
@@ -42,6 +44,40 @@ def _split_ratio(frm: float, to: float) -> str:
         return f"{int(to)}:{int(frm)}" if frm and to else ""
     except (TypeError, ValueError):
         return ""
+
+
+def _split_factor(split_evs: List[SplitEvent], window: int) -> Optional[float]:
+    """Directional split factor (+ = bullish). Forward split → + (post-split drift
+    anomaly); reverse split → − (delisting-distress, the more robust side). Magnitude
+    scales with the ratio and decays with distance from the execution date."""
+    if not split_evs:
+        return None
+    latest = min(split_evs, key=lambda s: abs(s.days_until))   # most recent / imminent
+    frm, to = latest.split_from, latest.split_to
+    if not frm or not to:
+        return None
+    mag = tanh(log(max(to / frm, frm / to)))                   # 2:1 → 0.6, 10:1 → 0.98
+    decay = max(0.3, 1.0 - abs(latest.days_until) / max(window, 1))
+    if to > frm:                                               # forward split
+        return round(min(1.0, mag * decay), 3)
+    return round(max(-1.0, -max(0.5, mag * decay)), 3)         # reverse: stronger negative
+
+
+def _dividend_factor(div_rows: List[dict]) -> Optional[float]:
+    """Directional dividend factor (+ = bullish). + for an increase / initiation, − for
+    a cut, from the latest declared cash amount vs ~1 year earlier. ``div_rows`` are the
+    raw dividend rows for one ticker, NEWEST first."""
+    pays = [d for d in div_rows if d.get("cash_amount")]
+    if not pays:
+        return None
+    latest = float(pays[0]["cash_amount"])
+    if len(pays) == 1:
+        return 0.4                                            # initiation / single payment → mild +
+    freq = int(pays[0].get("frequency") or 4) or 4
+    prior = float(pays[min(freq, len(pays) - 1)].get("cash_amount") or 0)   # ~1yr back
+    if prior <= 0:
+        return None
+    return round(max(-1.0, min(1.0, tanh((latest - prior) / prior * 8))), 3)
 
 
 def fetch_corporate_actions_context(tickers: List[str]) -> Optional[CorporateActionsContext]:
@@ -68,6 +104,7 @@ def fetch_corporate_actions_context(tickers: List[str]) -> Optional[CorporateAct
     split_lo = today - timedelta(days=settings.corp_actions_split_window_days)
     split_hi = today + timedelta(days=settings.corp_actions_split_window_days)
 
+    # Upcoming ex-dividends (narrow window, market-wide) → §29 mechanics overlay.
     dividends: List[DividendEvent] = []
     for r in polygon_client.get_dividends_calendar(today.isoformat(), div_end.isoformat()):
         tk = (r.get("ticker") or "").upper()
@@ -80,27 +117,55 @@ def fetch_corporate_actions_context(tickers: List[str]) -> Optional[CorporateAct
                 days_until_ex=(exd - today).days,
             ))
 
+    splits_by_tk: Dict[str, List[SplitEvent]] = {}
     splits: List[SplitEvent] = []
     for r in polygon_client.get_splits_calendar(split_lo.isoformat(), split_hi.isoformat()):
         tk = (r.get("ticker") or "").upper()
         exe = _pdate(r.get("execution_date"))
         frm, to = r.get("split_from"), r.get("split_to")
         if tk in universe and exe is not None and frm and to:
-            splits.append(SplitEvent(
-                ticker=tk, execution_date=exe, split_from=float(frm), split_to=float(to),
-                ratio=_split_ratio(frm, to), days_until=(exe - today).days,
-            ))
+            ev = SplitEvent(ticker=tk, execution_date=exe, split_from=float(frm), split_to=float(to),
+                            ratio=_split_ratio(frm, to), days_until=(exe - today).days)
+            splits.append(ev)
+            splits_by_tk.setdefault(tk, []).append(ev)
 
-    if not dividends and not splits:
-        logger.info("[corp_actions] no upcoming dividends/splits in the universe")
+    # f_dividend needs reliable per-ticker history (the market-wide calendar truncates
+    # it → false "initiations"), so pull each ticker's recent dividends directly —
+    # capped to the first N universe names (one call each; non-payers return []).
+    div_factor_by_tk: Dict[str, float] = {}
+    cap = settings.corp_actions_div_max_tickers
+    seen = 0
+    for tk in dict.fromkeys(t.upper() for t in tickers if is_valid_ticker(t)):
+        if cap > 0 and seen >= cap:
+            break
+        seen += 1
+        df = _dividend_factor(polygon_client.get_dividend_history(tk, limit=6))
+        if df is not None:
+            div_factor_by_tk[tk] = df
+
+    # Directional factor scores per ticker — consumed by the panel IC, the aggregator
+    # overlay, and the §29 synthesis block.
+    factor_scores: Dict[str, Dict[str, float]] = {}
+    for tk in set(div_factor_by_tk) | set(splits_by_tk):
+        f: Dict[str, float] = {}
+        sf = _split_factor(splits_by_tk.get(tk, []), settings.corp_actions_split_window_days)
+        if sf is not None:
+            f["f_split"] = sf
+        if tk in div_factor_by_tk:
+            f["f_dividend"] = div_factor_by_tk[tk]
+        if f:
+            factor_scores[tk] = f
+
+    if not dividends and not splits and not factor_scores:
+        logger.info("[corp_actions] no dividends/splits in the universe")
         return None
 
     dividends.sort(key=lambda d: d.days_until_ex)
     splits.sort(key=lambda s: abs(s.days_until))
     ctx = CorporateActionsContext(
-        dividends=dividends, splits=splits, report_date=today,
-        summary=(f"{len(dividends)} upcoming ex-dividend(s) (≤{settings.corp_actions_div_lookahead_days}d) "
-                 f"and {len(splits)} split(s) (±{settings.corp_actions_split_window_days}d) in the universe."),
+        dividends=dividends, splits=splits, factor_scores=factor_scores, report_date=today,
+        summary=(f"{len(dividends)} upcoming ex-dividend(s), {len(splits)} split(s), and "
+                 f"{len(factor_scores)} ticker(s) with a directional split/dividend signal."),
     )
 
     CACHE_DIR.mkdir(exist_ok=True)

@@ -3026,19 +3026,30 @@ Regime guide:
             + (f"in {s.days_until}d" if s.days_until >= 0 else f"{abs(s.days_until)}d ago")
             for s in corporate_actions_context.splits if s.ticker in _ca_tickers
         )
-        if _div_lines or _split_lines:
+        _cafs = getattr(corporate_actions_context, "factor_scores", None) or {}
+        _dir_lines = "\n".join(
+            f"  {tk}: " + ", ".join(
+                ([f"split {v['f_split']:+.2f} ({'forward → bullish drift' if v['f_split'] > 0 else 'reverse → distress/bearish'})"]
+                 if v.get("f_split") is not None else [])
+                + ([f"dividend {v['f_dividend']:+.2f} ({'increase/initiation → bullish' if v['f_dividend'] > 0 else 'cut → bearish'})"]
+                   if v.get("f_dividend") is not None else [])
+            )
+            for tk, v in _cafs.items()
+            if tk in _ca_tickers and (v.get("f_split") is not None or v.get("f_dividend") is not None)
+        )
+        if _div_lines or _split_lines or _dir_lines:
             corporate_actions_block = (
-                "INPUT — corporate actions (Massive/Polygon; a WHEN/mechanics overlay, not a directional signal):\n"
+                "INPUT — corporate actions (Massive/Polygon):\n"
                 "<corporate_actions_context>\n"
-                + (f"Upcoming ex-dividends:\n{_div_lines}\n" if _div_lines else "")
+                + (f"Directional signals (academic anomalies — weigh as conviction):\n{_dir_lines}\n" if _dir_lines else "")
+                + (f"Upcoming ex-dividends (mechanics — price drops ~the dividend):\n{_div_lines}\n" if _div_lines else "")
                 + (f"Splits (price/share rescale):\n{_split_lines}\n" if _split_lines else "")
                 + "</corporate_actions_context>\n\n"
             )
             corporate_actions_instructions = """
-29. Corporate-actions overlay (mechanics & timing — never a directional trigger):
-    - On a ticker's EX-DIVIDEND date the price drops by roughly the dividend: do NOT read that mechanical gap as fresh weakness or trade purely because of it. A near-term dividend is mild income support, not a thesis.
-    - Around a SPLIT execution date, price and share count rescale (a 3:2 lifts share count; a reverse 1:10 cuts it): treat OHLCV-derived signals (momentum, gaps, pattern) on that name with caution near the date — the level shift can masquerade as a move.
-    - These refine entries/exits and conviction on names you are ALREADY evaluating on other evidence; they never create a call.
+29. Corporate-actions overlay — DIRECTIONAL signals + mechanics:
+    - DIRECTIONAL (a conviction input — corroborate, don't trade on it alone): a FORWARD split signals optimism + better liquidity → mild bullish drift; a REVERSE split is usually delisting-distress → bearish. A dividend INCREASE / INITIATION signals confidence in future cash flows → bullish; a CUT / OMISSION is a distress signal → bearish (the strongest of the four). Let these raise/lower conviction and shape horizon.
+    - MECHANICS (NOT directional): on the EX-DIVIDEND date price drops ~the dividend — don't read that gap as weakness; around a SPLIT execution date price/share count rescale — treat OHLCV signals near the date with caution (the level shift can masquerade as a move).
 """
 
     prompt = f"""You are an elite portfolio manager with a verified 30-year track record of market-beating returns. You combine the analytical precision of a quant, the pattern recognition of a seasoned discretionary trader, and the macro intuition of a global macro fund manager. You have studied every major market cycle since 1990 and have an exceptional ability to identify when multiple independent evidence layers converge on the same directional call — these are the moments of highest expected value.

@@ -253,6 +253,10 @@ When `ENABLE_FUNDAMENTALS=true` (default), fetches trailing-twelve-month valuati
 
 Unlike the per-ticker scorers, fundamentals are **not** combined into the aggregator score. They are passed into the Claude synthesis prompt as a `<fundamentals_context>` block (instruction §28) — a slow-moving **quality/valuation overlay** that shapes conviction and holding horizon (a cheap, profitable name supports a POSITION-length hold; a richly-valued, leveraged one argues for caution), never a standalone BUY/SELL trigger. Surfaced in the email's **Fundamentals** section.
 
+The first `FUNDAMENTALS_ENRICH_MAX_TICKERS` (50) names also get a **positioning + growth enrichment**: short interest (% of shares + days-to-cover), short-volume ratio, latest-quarter net margin, and YoY revenue growth — appended to each ticker's line (e.g. a high short %/days-to-cover flags squeeze candidates). The dedicated float endpoint isn't on the plan, so shares are derived from `market_cap/price`.
+
+**Ticker events** (`src/data/ticker_events.py`, `ENABLE_TICKER_EVENTS`) — separately, recent **symbol/name changes and delistings** on held + watchlist names are surfaced as material NewsArticles (pre-scored: delisting → negative, rename → neutral). Protective: a rename or delisting can otherwise silently strand a position or break the OHLCV cache.
+
 ---
 
 ### Step 3G — Corporate Actions (`src/data/corporate_actions.py`)

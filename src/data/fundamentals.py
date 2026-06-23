@@ -78,6 +78,102 @@ def _build_signal(ticker: str, row: dict) -> FundamentalsSignal:
     )
 
 
+def _enrich_signal(sig: FundamentalsSignal, ratios_row: dict) -> None:
+    """Add positioning (short interest/volume) + growth/quality (latest income
+    statement) to a signal, and extend its prompt summary. Best-effort per field —
+    the polygon fetchers return None/[] on any miss, so this never raises."""
+    tk = sig.ticker
+    mc, px = ratios_row.get("market_cap"), ratios_row.get("price")
+    shares = (mc / px) if mc and px else None   # float endpoint isn't on plan → implied shares
+
+    si = polygon_client.get_short_interest(tk)
+    if si:
+        if shares and si.get("short_interest"):
+            sig.short_pct = round(si["short_interest"] / shares * 100, 2)
+        try:
+            sig.days_to_cover = round(float(si["days_to_cover"]), 1) if si.get("days_to_cover") is not None else None
+        except (TypeError, ValueError):
+            pass
+
+    sv = polygon_client.get_short_volume(tk)
+    if sv and sv.get("short_volume_ratio") is not None:
+        try:
+            sig.short_volume_ratio = round(float(sv["short_volume_ratio"]), 1)
+        except (TypeError, ValueError):
+            pass
+
+    inc = polygon_client.get_income_statements(tk, limit=6)
+    if inc:
+        r0 = inc[0]
+        rev = r0.get("revenue")
+        ni = r0.get("consolidated_net_income_loss")
+        if rev and ni is not None:
+            sig.net_margin = round(ni / rev * 100, 1)
+        yago = next((r for r in inc[1:]
+                     if r.get("fiscal_quarter") == r0.get("fiscal_quarter") and r.get("revenue")), None)
+        if rev and yago:
+            sig.rev_growth_yoy = round((rev - yago["revenue"]) / yago["revenue"] * 100, 1)
+
+    extra = []
+    if sig.short_pct is not None:
+        extra.append(f"short {sig.short_pct}%" + (f"/{sig.days_to_cover}d" if sig.days_to_cover else ""))
+    if sig.rev_growth_yoy is not None:
+        extra.append(f"rev {sig.rev_growth_yoy:+.0f}% YoY")
+    if sig.net_margin is not None:
+        extra.append(f"net margin {sig.net_margin:.0f}%")
+    if extra:
+        sig.summary += " | " + ", ".join(extra)
+
+
+def _c(x: float) -> float:
+    return max(-1.0, min(1.0, x))
+
+
+def factor_scores(fs: FundamentalsSignal) -> dict:
+    """Signed [-1, +1] factor scores from a FundamentalsSignal (+ = hypothesized bullish).
+
+    Panel-ONLY diagnostics — persisted as the ``f_*`` signals columns so the dashboard's
+    Signal-IC table measures whether each Massive factor predicts forward returns
+    (IC + Sim win% + Sim ret%). NOT weighted into combined_score and NOT trade-attributed.
+    A missing input omits that factor (no fake 0 that would dilute its IC)."""
+    from math import tanh
+    out: dict = {}
+
+    # VALUE — cheap (high earnings / book yield) hypothesised to outperform.
+    vparts = []
+    if fs.pe and fs.pe > 0:
+        vparts.append(tanh((1.0 / fs.pe - 0.05) * 20))     # earnings-yield pivot ~5% (P/E 20)
+    if fs.pb and fs.pb > 0:
+        vparts.append(tanh((1.0 / fs.pb - 0.15) * 4))      # book-yield pivot ~0.15 (P/B ~6.7)
+    if vparts:
+        out["f_value"] = round(_c(sum(vparts) / len(vparts)), 3)
+
+    # QUALITY — high ROE / net margin.
+    qparts = []
+    if fs.roe is not None:
+        qparts.append(tanh(fs.roe * 2.0))                  # ROE 0.30 → 0.54
+    if fs.net_margin is not None:
+        qparts.append(tanh(fs.net_margin / 25.0))          # 25% → 0.76
+    if qparts:
+        out["f_quality"] = round(_c(sum(qparts) / len(qparts)), 3)
+
+    # GROWTH — high YoY revenue growth.
+    if fs.rev_growth_yoy is not None:
+        out["f_growth"] = round(_c(tanh(fs.rev_growth_yoy / 25.0)), 3)
+
+    # SHORT SQUEEZE — crowded short (high short% + days-to-cover); the IC reveals
+    # whether that precedes up-moves (squeeze) or down-moves (shorts right).
+    sparts = []
+    if fs.short_pct is not None:
+        sparts.append(tanh(fs.short_pct / 10.0))           # 10% → 0.76
+    if fs.days_to_cover is not None:
+        sparts.append(tanh(fs.days_to_cover / 8.0))        # 8d → 0.76
+    if sparts:
+        out["f_short_squeeze"] = round(_c(sum(sparts) / len(sparts)), 3)
+
+    return out
+
+
 def fetch_fundamentals_context(tickers: List[str]) -> Optional[FundamentalsContext]:
     """Fetch TTM valuation/quality ratios for ``tickers`` → FundamentalsContext.
 
@@ -106,12 +202,31 @@ def fetch_fundamentals_context(tickers: List[str]) -> Optional[FundamentalsConte
         logger.info("[fundamentals] no ratios returned (entitlement / coverage) — skipping")
         return None
 
-    signals = sorted((_build_signal(tk, r) for tk, r in rows.items()),
-                     key=lambda s: s.ticker)
+    sig_by_ticker = {tk: _build_signal(tk, r) for tk, r in rows.items()}
+
+    # Capped enrichment: short interest/volume + statement margin/growth for the
+    # first N tickers in ratios/universe order (watchlist + early discovery first),
+    # ~3 extra calls each. 0 disables; -1/large = all.
+    cap = settings.fundamentals_enrich_max_tickers
+    enriched = 0
+    if cap != 0:
+        for tk in rows:
+            if cap > 0 and enriched >= cap:
+                break
+            try:
+                _enrich_signal(sig_by_ticker[tk], rows[tk])
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"[fundamentals] enrich {tk} failed: {e}")
+            enriched += 1
+        logger.info(f"[fundamentals] enriched {enriched} ticker(s) with short-interest/volume + growth")
+
+    signals = sorted(sig_by_ticker.values(), key=lambda s: s.ticker)
+    n_pos = sum(1 for s in signals if s.short_pct is not None or s.rev_growth_yoy is not None)
     ctx = FundamentalsContext(
         signals=signals,
         report_date=date.today(),
-        summary=f"TTM valuation/quality ratios for {len(signals)} tickers (Massive/Polygon).",
+        summary=(f"TTM valuation/quality ratios for {len(signals)} tickers "
+                 f"({n_pos} with short-interest + revenue growth) — Massive/Polygon."),
     )
 
     CACHE_DIR.mkdir(exist_ok=True)

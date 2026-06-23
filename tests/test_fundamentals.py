@@ -146,3 +146,66 @@ def test_no_fundamentals_block_when_context_absent(monkeypatch):
     except Exception:
         pass
     assert "<fundamentals_context>" not in captured.get("prompt", "")
+
+
+# ── enrichment: short interest/volume + statement margin/growth ────────────────
+
+def test_enrich_signal(monkeypatch):
+    monkeypatch.setattr(fund.polygon_client, "get_short_interest",
+                        lambda tk: {"short_interest": 1.5e8, "days_to_cover": 3.4})
+    monkeypatch.setattr(fund.polygon_client, "get_short_volume",
+                        lambda tk: {"short_volume_ratio": 42.0})
+    monkeypatch.setattr(fund.polygon_client, "get_income_statements", lambda tk, limit=6: [
+        {"period_end": "2026-03-28", "fiscal_quarter": 2, "revenue": 111e9, "consolidated_net_income_loss": 29.5e9},
+        {"period_end": "2025-12-27", "fiscal_quarter": 1, "revenue": 143e9, "consolidated_net_income_loss": 40e9},
+        {"period_end": "2025-09-28", "fiscal_quarter": 4, "revenue": 95e9,  "consolidated_net_income_loss": 23e9},
+        {"period_end": "2025-06-28", "fiscal_quarter": 3, "revenue": 85e9,  "consolidated_net_income_loss": 21e9},
+        {"period_end": "2025-03-29", "fiscal_quarter": 2, "revenue": 95e9,  "consolidated_net_income_loss": 24e9},  # year-ago Q2
+    ])
+    sig = FundamentalsSignal(ticker="AAPL", summary="AAPL: P/E 35")
+    fund._enrich_signal(sig, {"market_cap": 4.377e12, "price": 298.0})
+
+    assert 0.9 <= sig.short_pct <= 1.1            # 1.5e8 / (4.377e12/298) ≈ 1.02%
+    assert sig.days_to_cover == 3.4
+    assert sig.short_volume_ratio == 42.0
+    assert 26 <= sig.net_margin <= 27            # 29.5 / 111
+    assert 16 <= sig.rev_growth_yoy <= 18        # 111 vs year-ago Q2 95 → +16.8%
+    assert "short" in sig.summary and "YoY" in sig.summary
+
+
+def test_enrich_signal_no_data(monkeypatch):
+    monkeypatch.setattr(fund.polygon_client, "get_short_interest", lambda tk: None)
+    monkeypatch.setattr(fund.polygon_client, "get_short_volume", lambda tk: None)
+    monkeypatch.setattr(fund.polygon_client, "get_income_statements", lambda tk, limit=6: [])
+    sig = FundamentalsSignal(ticker="X", summary="X: P/E 10")
+    fund._enrich_signal(sig, {})
+    assert sig.short_pct is None and sig.rev_growth_yoy is None
+    assert sig.summary == "X: P/E 10"            # unchanged when nothing to add
+
+
+# ── factor scores (panel-only IC diagnostics) ─────────────────────────────────
+
+def test_factor_scores_directions():
+    cheap = FundamentalsSignal(ticker="X", pe=8, pb=1.0, roe=0.40, net_margin=30,
+                               rev_growth_yoy=25, short_pct=15, days_to_cover=10)
+    f = fund.factor_scores(cheap)
+    assert f["f_value"] > 0 and f["f_quality"] > 0 and f["f_growth"] > 0 and f["f_short_squeeze"] > 0
+    assert all(-1.0 <= v <= 1.0 for v in f.values())
+
+    rich = FundamentalsSignal(ticker="Y", pe=60, pb=20, roe=-0.1, net_margin=-5, rev_growth_yoy=-10)
+    f2 = fund.factor_scores(rich)
+    assert f2["f_value"] < 0 and f2["f_quality"] < 0 and f2["f_growth"] < 0
+    assert "f_short_squeeze" not in f2          # no short data → factor omitted
+
+
+def test_factor_scores_omits_missing():
+    assert fund.factor_scores(FundamentalsSignal(ticker="Z")) == {}
+
+
+def test_fundamental_factors_ic_category():
+    from src.analysis.signal_panel import category_for, IC_CATEGORY_FUND, IC_CATEGORY_ORDER
+    from src.db.schema import SIGNAL_FUNDAMENTAL_COLUMNS, SIGNAL_METHOD_COLUMNS
+    assert IC_CATEGORY_FUND in IC_CATEGORY_ORDER
+    for c in SIGNAL_FUNDAMENTAL_COLUMNS:
+        assert category_for(c) == IC_CATEGORY_FUND   # own dashboard IC section
+        assert c in SIGNAL_METHOD_COLUMNS            # persisted → IC computed
