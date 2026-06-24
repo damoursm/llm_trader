@@ -60,7 +60,11 @@ EXPECTED_SPARSE_SOURCES = frozenset({
     # off by default, and event/coverage-sparse (no qualifying article/chatter).
     "av_news", "stocktwits",
     # Quiver alt-data — all event-driven (a ticker may have no congress trade /
-    # contract / lobbying / dark-pool shift in the window).
+    # contract / lobbying / dark-pool shift in the window). NOTE: quiver_congress
+    # stays here because its FILTERED result is often legitimately empty (none of
+    # the tracked names traded), but a genuine OUTAGE is NOT hidden — fetch_congress_trades
+    # raises QuiverFeedError on a transport failure or an empty market-wide feed, so
+    # an outage lands as an `error` (success-rate drop) rather than a benign `empty`.
     "quiver_congress", "quiver_contracts", "quiver_lobbying", "quiver_offexchange",
 })
 

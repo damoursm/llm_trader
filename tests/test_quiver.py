@@ -3,6 +3,8 @@
 import types
 from datetime import date
 
+import pytest
+
 import src.data.quiver as q
 
 
@@ -32,7 +34,7 @@ def test_congress_maps_to_insider_trades(monkeypatch):
          "Range": "$1,001 - $15,000", "TransactionDate": "2020-01-01", "ReportDate": "2020-01-01",
          "House": "Senate"},
     ]
-    monkeypatch.setattr(q, "_get", lambda path: rows)
+    monkeypatch.setattr(q, "_get", lambda path, **kw: rows)
     trades = q.fetch_congress_trades()
     assert len(trades) == 2                                # OLD excluded by lookback
     by = {t.ticker: t for t in trades}
@@ -40,6 +42,44 @@ def test_congress_maps_to_insider_trades(monkeypatch):
     assert by["AAPL"].trader_type == "politician" and by["AAPL"].role == "Representative"
     assert by["NVDA"].transaction_type == "sale" and by["NVDA"].is_bullish is False
     assert by["NVDA"].role == "Senator"
+
+
+def test_congress_outage_raises_on_empty_feed(monkeypatch):
+    """An empty market-wide congress feed is an OUTAGE (broken/stale endpoint), not a
+    quiet window — it must raise so _safe records an ERROR, not a benign empty."""
+    _enable(monkeypatch)
+    monkeypatch.setattr(q, "_get", lambda path, **kw: [])
+    with pytest.raises(q.QuiverFeedError):
+        q.fetch_congress_trades()
+
+
+def test_congress_filtered_empty_is_benign(monkeypatch):
+    """The key Option-B distinction: a POPULATED feed filtered down to nothing (none
+    of the tracked names traded) is benign — returns [], never raises."""
+    _enable(monkeypatch)
+    monkeypatch.setattr(type(q.settings), "tracked_politicians_list",
+                        property(lambda self: ["Nobody Here"]), raising=False)
+    today = date.today().isoformat()
+    rows = [{"Ticker": "AAPL", "Representative": "Nancy Pelosi", "Transaction": "Purchase",
+             "Range": "$1,001 - $15,000", "TransactionDate": today, "ReportDate": today,
+             "House": "Representatives"}]
+    monkeypatch.setattr(q, "_get", lambda path, **kw: rows)
+    assert q.fetch_congress_trades() == []        # filtered out, but NO raise
+
+
+def test_get_fail_soft_by_default_raises_only_when_requested(monkeypatch, tmp_path):
+    """_get swallows HTTP failures by default (the other event-driven feeds rely on
+    that); raise_on_error flips it to QuiverFeedError for the congress feed."""
+    monkeypatch.setattr(q.settings, "quiver_api_key", "x")
+    monkeypatch.setattr(q, "_cache_path", lambda path: tmp_path / "absent.json")
+
+    def boom(*a, **k):
+        raise RuntimeError("401 Unauthorized")
+    monkeypatch.setattr(q.httpx, "get", boom)
+
+    assert q._get("/live/congresstrading") == []                      # fail-soft default
+    with pytest.raises(q.QuiverFeedError):
+        q._get("/live/congresstrading", raise_on_error=True)          # opt-in raising
 
 
 def test_gov_contracts_filtered_to_universe(monkeypatch):

@@ -41,6 +41,17 @@ _CACHE_DIR = Path("cache")
 _TIMEOUT = 30.0
 
 
+class QuiverFeedError(RuntimeError):
+    """An always-populated Quiver feed (congress) is unreachable or returned nothing
+    market-wide — a real OUTAGE (expired/invalid key, endpoint change, rate-limit),
+    distinct from a legitimately empty *filtered* window (your tracked names simply
+    didn't trade). Raising it lets ``pipeline._safe`` record the source as an ERROR
+    (surfaced worst-first in the Data Quality tab) instead of a benign, suppressed
+    'empty' — congress is in ``EXPECTED_SPARSE_SOURCES`` precisely because the
+    filtered result is often legitimately empty, which would otherwise hide an
+    outage. See ``data_quality.EXPECTED_SPARSE_SOURCES``."""
+
+
 def is_available() -> bool:
     return bool(settings.quiver_api_key)
 
@@ -55,9 +66,15 @@ def _cache_path(path: str) -> Path:
     return _CACHE_DIR / f"quiver_{slug}_{date.today().isoformat()}.json"
 
 
-def _get(path: str) -> list:
+def _get(path: str, *, raise_on_error: bool = False) -> list:
     """GET a Quiver endpoint → list of row dicts. Daily-cached (raw JSON); empty
-    on any failure (NOT cached, so the next tick retries)."""
+    on any failure (NOT cached, so the next tick retries).
+
+    With ``raise_on_error=True`` a transport/HTTP failure or a non-list payload is
+    re-raised as ``QuiverFeedError`` instead of returning ``[]`` — used by the
+    always-populated congress feed so an outage surfaces as a source ERROR. The
+    other event-driven feeds keep the fail-soft default (an empty return is normal
+    for them, so they must not raise)."""
     if not is_available():
         return []
     cache = _cache_path(path)
@@ -72,9 +89,13 @@ def _get(path: str) -> list:
         data = r.json()
     except Exception as e:
         logger.warning(f"[quiver] GET {path} failed: {e}")
+        if raise_on_error:
+            raise QuiverFeedError(f"GET {path} failed: {e}") from e
         return []
     if not isinstance(data, list):
         logger.warning(f"[quiver] GET {path}: unexpected payload type {type(data).__name__}")
+        if raise_on_error:
+            raise QuiverFeedError(f"GET {path}: unexpected payload type {type(data).__name__}")
         return []
     try:
         _CACHE_DIR.mkdir(exist_ok=True)
@@ -126,10 +147,27 @@ def fetch_congress_trades(tickers: Optional[List[str]] = None) -> List[InsiderTr
     smart-money discovery can surface new tickers (then the liquidity gate filters
     them). Optionally narrowed to ``tracked_politicians_list`` when configured.
     Mapped to InsiderTrade(trader_type="politician") so it flows through the
-    existing insider-score + discovery path exactly like the old feed did."""
+    existing insider-score + discovery path exactly like the old feed did.
+
+    Raises ``QuiverFeedError`` on a genuine OUTAGE — a transport/HTTP failure or an
+    empty market-wide response — so ``pipeline._safe`` records the source as an
+    ERROR in the Data Quality tab. This is the only live congressional feed (the
+    House/Senate Stock Watcher buckets are dead), so a silent outage would let
+    politician tracking go fully dark unnoticed. A benign filtered-empty (the feed
+    was populated but none of the tracked names traded) still returns ``[]``."""
     if not (settings.enable_quiver_congress and is_available()):
         return []
-    rows = _get("/live/congresstrading")
+    # raise_on_error: a transport/HTTP failure must surface as a source ERROR, not a
+    # benign empty that EXPECTED_SPARSE would suppress.
+    rows = _get("/live/congresstrading", raise_on_error=True)
+    if not rows:
+        # The market-wide congress feed is essentially never empty over any recent
+        # window (Congress files constantly), so a raw-empty 200 means a broken/stale
+        # endpoint — flag it rather than let it masquerade as 'none of my tracked
+        # names traded' (that case is a populated-then-filtered-empty, handled below).
+        raise QuiverFeedError(
+            "/live/congresstrading returned no rows market-wide — likely an outage "
+            "(expired key / endpoint change / rate-limit), not a quiet window")
     cutoff = date.today() - timedelta(days=settings.quiver_lookback_days)
     tracked = [p.lower() for p in (settings.tracked_politicians_list or [])]
     out: List[InsiderTrade] = []
