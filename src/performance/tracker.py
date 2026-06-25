@@ -362,7 +362,7 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
@@ -389,6 +389,7 @@ METHOD_LABELS: Dict[str, str] = {
     "pattern":  "Pattern Recognition",
     "momentum":   "Price Momentum",
     "sector_momentum": "Sector-Relative Momentum",
+    "market_momentum": "Market-Relative Momentum (vs SPY)",
     "money_flow": "Money Flow (MFI+CMF+OBV)",
     "trend_strength": "Trend Strength (ADX/DMI+Donchian)",
     "pead":       "Post-Earnings Drift (PEAD)",
@@ -441,6 +442,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "pattern":    getattr(sig, "pattern_score", 0.0),
         "momentum":   getattr(sig, "momentum_score", 0.0),
         "sector_momentum": getattr(sig, "sector_momentum_score", 0.0),
+        "market_momentum": getattr(sig, "market_momentum_score", 0.0),
         "money_flow": getattr(sig, "money_flow_score", 0.0),
         "trend_strength": getattr(sig, "trend_strength_score", 0.0),
         "pead":       getattr(sig, "pead_score", 0.0),
@@ -449,6 +451,9 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "coint":      getattr(sig, "coint_score", 0.0),
         "cross_sectional": getattr(sig, "cross_sectional_score", 0.0),
         "ext_gap":    getattr(sig, "ext_gap_score", 0.0),
+        # Fundamental + corp-action factors live on the signal's fundamental_scores dict.
+        **{m: float((getattr(sig, "fundamental_scores", None) or {}).get(m, 0.0))
+           for m in ("f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")},
     }
 
 

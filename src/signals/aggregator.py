@@ -81,6 +81,7 @@ _BASE_WEIGHTS = {
     "news":      0.40,
     "sent_velocity": 0.12,  # Δsentiment (rate of change of news tone) — short-horizon timing overlay
     "tech":      0.30,
+    "massive":   0.15,   # Massive/Polygon server-side RSI+MACD composite — overlaps `tech`, so kept modest
     "insider":   0.30,
     "put_call":  0.15,
     "max_pain":  0.12,   # options-expiry gravity; weight fades automatically via expiry_factor
@@ -89,6 +90,7 @@ _BASE_WEIGHTS = {
     "pattern":    0.18,   # chart pattern recognition: historical win-rate based score
     "momentum":   0.18,   # perceived value: normalised 1m/3m price trend vs own history
     "sector_momentum": 0.20,  # sector-relative momentum: ticker − sector ETF (cleaner alpha factor)
+    "market_momentum": 0.08,  # market-relative (ticker − SPY) — LIGHT: overlaps sector_momentum (shared idiosyncratic move), so kept small to bound the beta double-count
     "money_flow": 0.15,   # accumulation/distribution: MFI + CMF + OBV slope composite
     "trend_strength": 0.15,  # ADX/DMI trend quality + Donchian breakout (trend-following)
     "pead":       0.15,   # Post-Earnings Announcement Drift: SUE × time-decay
@@ -784,6 +786,7 @@ def build_signals(
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
     force_sentiment_engine: Optional[str] = None,  # pin news scoring to one engine (hold-review)
     corp_factors: Optional[dict] = None,  # {ticker: {f_split, f_dividend}} — additive corporate-action overlay
+    fundamental_factors: Optional[dict] = None,  # {ticker: {f_value, f_quality, f_growth, f_short_squeeze}} — additive overlay
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods.
 
@@ -797,11 +800,12 @@ def build_signals(
     # Sentiment velocity reuses article timestamps; no live fetch / LLM call required.
     use_sent_velocity = settings.enable_sentiment_velocity
     use_tech      = settings.enable_technical_analysis and settings.enable_fetch_data
-    # Massive server-side technicals (RSI+MACD), scored alongside `tech` for a
-    # head-to-head dashboard comparison. Tracked/persisted only — NOT folded into
-    # the weighted combined_score yet (weights are normalised over active methods, so
-    # weighting a capped method would dampen every ticker). Promote it later by
-    # adding "massive" to _BASE_WEIGHTS + active_flags + the combine.
+    # Massive/Polygon server-side technicals (RSI+MACD). PROMOTED into the weighted
+    # combined_score (2026-06-24) — in _BASE_WEIGHTS + active_flags + the combine +
+    # coherence, and scored for ALL tickers (massive_tech_max_tickers defaults to 0,
+    # so a weighted method never leaves capped-out tickers dampened). Still scored
+    # alongside `tech` for the dashboard head-to-head; the two overlap, so the weight
+    # is kept modest.
     use_massive   = settings.enable_massive_tech
     use_insider   = (
         (settings.enable_insider_trades or
@@ -904,6 +908,7 @@ def build_signals(
         "news":       use_news,
         "sent_velocity": use_sent_velocity,
         "tech":       use_tech,
+        "massive":    use_massive,
         "insider":    use_insider,
         "put_call":   use_put_call,
         "max_pain":   use_max_pain,
@@ -912,6 +917,7 @@ def build_signals(
         "pattern":    use_pattern,
         "momentum":   use_momentum,
         "sector_momentum": use_sector_momentum,
+        "market_momentum": use_market_momentum,
         "money_flow": use_money_flow,
         "trend_strength": use_trend_strength,
         "pead":       use_pead,
@@ -927,11 +933,12 @@ def build_signals(
     logger.info(
         f"Signal weights{mode_label} — "
         f"news={weights['news']:.0%}  sv={weights['sent_velocity']:.0%}  tech={weights['tech']:.0%}  "
+        f"massive={weights['massive']:.0%}  "
         f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
         f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
         f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
         f"momentum={weights['momentum']:.0%}  "
-        f"sector_mom={weights['sector_momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
+        f"sector_mom={weights['sector_momentum']:.0%}  market_mom={weights['market_momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
         f"trend={weights['trend_strength']:.0%}  "
         f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
         f"coint={weights['coint']:.0%}  ext_gap={weights['ext_gap']:.0%}"
@@ -939,13 +946,40 @@ def build_signals(
 
     signals        = []
     combined_scores: dict = {}
-    # Bounds how many tickers attempt the rate-limited 30-min fetch this run
-    # (intraday_30m_max_tickers; 0 = unbounded). Weekly is free (resampled) and
-    # always runs.
-    n30_used = 0
-    n_massive_used = 0   # bounds Massive RSI+MACD fetches (massive_tech_max_tickers)
 
-    for ticker in tickers:
+    # Per-ticker scoring is parallelised across a bounded thread pool — the loop body
+    # is independent per ticker (DeepSeek sentiment + Massive/OHLCV reads are the
+    # cost, all I/O-bound), so concurrency collapses the wall time from sum→max with
+    # IDENTICAL scores. The two per-run caps that were sequential counters
+    # (intraday_30m_max_tickers / massive_tech_max_tickers = "first N in order") are
+    # PRE-SELECTED into deterministic sets, so which tickers get the capped treatment
+    # is unchanged and order-independent. build_signals is already invoked
+    # concurrently from the hold-review pool, so this whole stack is proven
+    # thread-safe (sentiment counters are lock-guarded; the OHLCV cache is per-ticker).
+    _n30_cap = settings.intraday_30m_max_tickers
+    if not settings.enable_intraday_30m or _n30_cap <= 0:
+        allow_30m_set = frozenset(tickers)
+    else:
+        allow_30m_set = frozenset(tickers[:_n30_cap])
+    _mass_cap = settings.massive_tech_max_tickers
+    if not use_massive or _mass_cap <= 0:
+        allow_massive_set = frozenset(tickers)
+    else:
+        allow_massive_set = frozenset(tickers[:_mass_cap])
+
+    # Pre-import the lazily-loaded scorers ONCE (not per worker thread) so the pool
+    # never contends on the import lock / first-import.
+    _compute_tf = _blend_tf = None
+    if settings.enable_multi_timeframe_signals:
+        from src.signals.multi_timeframe import (
+            compute_timeframe_scores as _compute_tf,
+            blend_timeframes as _blend_tf,
+        )
+    _compute_massive = None
+    if use_massive:
+        from src.signals.massive_tech import compute_massive_tech_score as _compute_massive
+
+    def _score_ticker(ticker):
 
         # ── Method 1: News sentiment (the LEVEL) ──────────────────────────
         sentiment_score = 0.0
@@ -1150,15 +1184,11 @@ def build_signals(
         trend_strength_eff, iv_rank_eff, pattern_eff, sector_momentum_eff = (
             trend_strength_score, iv_rank_score_v, pattern_score, sector_momentum_score)
         if settings.enable_multi_timeframe_signals:
-            from src.signals.multi_timeframe import compute_timeframe_scores, blend_timeframes
-            allow_30m = (settings.intraday_30m_max_tickers <= 0
-                         or n30_used < settings.intraday_30m_max_tickers)
-            tf_scores = compute_timeframe_scores(ticker, allow_30m=allow_30m)
-            if allow_30m and settings.enable_intraday_30m:
-                n30_used += 1
+            allow_30m = ticker in allow_30m_set
+            tf_scores = _compute_tf(ticker, allow_30m=allow_30m)
 
             def _eff(method: str, daily_v: float) -> float:
-                return blend_timeframes({
+                return _blend_tf({
                     "30m": tf_scores.get(f"{method}_30m"),
                     "1d":  daily_v,
                     "1w":  tf_scores.get(f"{method}_1w"),
@@ -1173,14 +1203,12 @@ def build_signals(
             pattern_eff         = _eff("pattern", pattern_score)
             sector_momentum_eff = _eff("sector_momentum", sector_momentum_score)
 
-        # ── Massive server-side technicals (RSI+MACD), capped per tick ─────
-        # Scored for comparison vs `tech`; persisted but NOT in the combine below.
+        # ── Massive server-side technicals (RSI+MACD) ─────────────────────
+        # A WEIGHTED member of the combine below. allow_massive_set is every ticker
+        # when massive_tech_max_tickers=0 (the default), so the pool is never dampened.
         massive_score = 0.0
-        if use_massive and (settings.massive_tech_max_tickers <= 0
-                            or n_massive_used < settings.massive_tech_max_tickers):
-            from src.signals.massive_tech import compute_massive_tech_score
-            massive_score = compute_massive_tech_score(ticker)
-            n_massive_used += 1
+        if use_massive and ticker in allow_massive_set:
+            massive_score = _compute_massive(ticker)
 
         # ── Weighted combination ──────────────────────────────────────────
         # Technical methods use their multi-timeframe BLEND (*_eff); non-OHLCV
@@ -1189,6 +1217,7 @@ def build_signals(
             weights["news"]       * sentiment_score +
             weights["sent_velocity"] * sent_velocity_score +
             weights["tech"]       * tech_eff +
+            weights["massive"]    * massive_score +
             weights["insider"]    * insider_sc +
             weights["put_call"]   * pc_score +
             weights["max_pain"]   * mp_score +
@@ -1197,6 +1226,7 @@ def build_signals(
             weights["pattern"]    * pattern_eff +
             weights["momentum"]   * momentum_eff +
             weights["sector_momentum"] * sector_momentum_eff +
+            weights["market_momentum"] * market_momentum_score +
             weights["money_flow"] * money_flow_eff +
             weights["trend_strength"] * trend_strength_eff +
             weights["pead"]       * pead_score_v +
@@ -1226,6 +1256,17 @@ def build_signals(
                 combined += settings.corp_action_factor_weight * (
                     float(_cf.get("f_split", 0.0)) + float(_cf.get("f_dividend", 0.0)))
 
+        # ── Massive fundamental factors directional overlay (additive) ─────
+        # value/quality/growth/short-squeeze, added OUTSIDE the normalised pool
+        # (same idiom as corp_factors) so the capped/sparse fundamentals nudge the
+        # event tickers without dampening the rest. Already IC-monitored in the panel.
+        if fundamental_factors:
+            _ff = fundamental_factors.get(ticker) or fundamental_factors.get(ticker.upper())
+            if _ff:
+                combined += settings.fundamental_factor_weight * (
+                    float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
+                    + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
+
         # ── Direction ─────────────────────────────────────────────────────
         direction: Direction
         if combined >= 0.15:
@@ -1242,6 +1283,7 @@ def build_signals(
             (use_news,       sentiment_score),
             (use_sent_velocity, sent_velocity_score),
             (use_tech,       tech_eff),
+            (use_massive,    massive_score),
             (use_insider,    insider_sc),
             (use_put_call,   pc_score),
             (use_max_pain,   mp_score),
@@ -1250,6 +1292,7 @@ def build_signals(
             (use_pattern,    pattern_eff),
             (use_momentum,   momentum_eff),
             (use_sector_momentum, sector_momentum_eff),
+            (use_market_momentum, market_momentum_score),
             (use_money_flow, money_flow_eff),
             (use_trend_strength, trend_strength_eff),
             (use_pead,       pead_score_v),
@@ -1291,8 +1334,7 @@ def build_signals(
             rationale_parts.append(f"Put/call signal: {pc_score:+.2f}")
         rationale = " | ".join(rationale_parts) if rationale_parts else "No rationale available."
 
-        combined_scores[ticker] = combined
-        signals.append(TickerSignal(
+        _sig = TickerSignal(
             ticker=ticker,
             direction=direction,
             confidence=confidence,
@@ -1354,7 +1396,7 @@ def build_signals(
             ext_gap_score=round(ext_gap_score_v, 3),
             ext_gap_pct=round(ext_gap_pct_v, 2),
             timeframe_scores=tf_scores,
-        ))
+        )
 
         gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
         mp_str      = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
@@ -1388,6 +1430,23 @@ def build_signals(
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"
         )
+        return ticker, combined, _sig
+
+    # Run the per-ticker scoring concurrently (bounded) — identical scores, ~max
+    # wall time instead of the serial sum (DeepSeek sentiment was the long pole).
+    # ex.map preserves input order, so `signals` is assembled in `tickers` order,
+    # exactly as the sequential loop produced it. workers<=1 keeps the legacy path.
+    _workers = max(1, int(getattr(settings, "signal_scoring_max_workers", 8) or 1))
+    if _workers > 1 and len(tickers) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_workers, len(tickers)),
+                                thread_name_prefix="score") as _ex:
+            _results = list(_ex.map(_score_ticker, tickers))
+    else:
+        _results = [_score_ticker(t) for t in tickers]
+    for _tk, _combined, _sig in _results:
+        combined_scores[_tk] = _combined
+        signals.append(_sig)
 
     # ── Second pass: cross-sectional ranking overlay ─────────────────────────
     # Computes how each ticker's per-method scores deviate from the universe

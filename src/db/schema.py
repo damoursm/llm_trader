@@ -35,9 +35,14 @@ from __future__ import annotations
 # an existing DB needs a one-time ALTER TABLE signals ADD COLUMN <m> DOUBLE).
 SIGNAL_BASE_METHOD_COLUMNS = (
     "news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain",
-    "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "money_flow",
-    "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
+    "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum",
+    "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
     "ext_gap",
+    # Massive fundamental + corp-action directional factors — promoted into the
+    # trade-attribution set (2026-06-24) so they appear in the solo/eval Method-
+    # Performance tables. Still grouped under the IC table's "Fundamentals" category
+    # via SIGNAL_FUNDAMENTAL_COLUMNS (now a categorisation subset of this BASE set).
+    "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend",
 )
 
 # Multi-timeframe technical columns — the 30-min + weekly variants of the 8
@@ -54,17 +59,20 @@ SIGNAL_TIMEFRAME_COLUMNS = tuple(
     f"{m}_{tf}" for tf in _MTF_TIMEFRAMES for m in _MTF_METHODS
 )
 
-# Fundamentals factor columns (Massive value / quality / growth / short-squeeze) —
-# signed diagnostic scores (+ = hypothesized bullish) persisted to the panel ONLY so
-# the Signal-IC table measures whether each factor predicts forward returns. Like the
-# timeframe columns these are PANEL-ONLY: NOT in tracker._ALL_METHODS (not weighted
-# into combined_score, not trade-attributed). New columns need the ALTER below.
+# Fundamentals factor columns (Massive value/quality/growth/short-squeeze + corp-action
+# split/dividend). As of 2026-06-24 they are PART OF SIGNAL_BASE_METHOD_COLUMNS (so they
+# are trade-attributed in the solo/eval Method-Performance tables) AND fold into
+# combined_score via the fundamental/corp-action overlays. This tuple is now a
+# CATEGORISATION SUBSET of BASE — signal_panel groups them under the IC table's
+# "Fundamentals" category, and the _ADD_COLUMNS loop below keeps the columns on old DBs.
 SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squeeze",
                               "f_split", "f_dividend")
 
-# Full set of method-score columns persisted to the `signals` panel.
-SIGNAL_METHOD_COLUMNS = (SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
-                         + SIGNAL_FUNDAMENTAL_COLUMNS)
+# Full set of method-score columns persisted to the `signals` panel. The fundamental
+# factors now live IN the base set (trade-attributed); SIGNAL_FUNDAMENTAL_COLUMNS is a
+# categorisation SUBSET of it (the IC table's "Fundamentals" grouping), no longer a
+# separate appended group — so it is NOT added again here (that would duplicate columns).
+SIGNAL_METHOD_COLUMNS = SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
 
 SCHEMA_STATEMENTS = [
     """
@@ -245,6 +253,8 @@ _ADD_COLUMNS = (
     ("run_sources", "empty", "BOOLEAN"),
     # Massive server-side technical-indicator method column on an existing DB.
     ("signals", "massive", "DOUBLE"),
+    # Market-relative momentum promoted from diagnostic into the weighted combine.
+    ("signals", "market_momentum", "DOUBLE"),
     # Multi-timeframe technical columns on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_TIMEFRAME_COLUMNS),
     # Fundamentals factor diagnostic columns on an existing signals table.

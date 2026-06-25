@@ -25,6 +25,24 @@ def test_signal_base_columns_match_tracker():
     )
 
 
+def test_fundamentals_are_trade_attributed():
+    # The 6 fundamental/corp-action factors are now in _ALL_METHODS and read from the
+    # signal's fundamental_scores dict by _method_scores_from_signal → they show up in
+    # the solo/eval Method-Performance tables (not just the Signal-IC table).
+    from src.performance.tracker import _method_scores_from_signal, _ALL_METHODS
+    from src.models import TickerSignal
+    sig = TickerSignal(ticker="AAPL", direction="BULLISH", confidence=0.8,
+                       sentiment_score=0.0, technical_score=0.0, rationale="test")
+    sig.fundamental_scores = {"f_value": 0.6, "f_short_squeeze": -0.4}
+    scores = _method_scores_from_signal("AAPL", "BULLISH", {"AAPL": sig})
+    assert set(scores) == set(_ALL_METHODS)        # every attributed method present
+    assert scores["f_value"] == 0.6
+    assert scores["f_short_squeeze"] == -0.4
+    assert scores["f_growth"] == 0.0               # absent factor → 0.0 (no view)
+    for m in ("f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend"):
+        assert m in scores
+
+
 def test_signal_timeframe_columns_convention():
     """The panel-only multi-timeframe columns follow ``{method}_{tf}`` for a
     known technical method × non-daily timeframe, and compose with the base
@@ -33,14 +51,15 @@ def test_signal_timeframe_columns_convention():
     valid = {f"{m}_{tf}" for m in TECHNICAL_METHODS for tf in NON_DAILY_TIMEFRAMES}
     from src.db.schema import SIGNAL_FUNDAMENTAL_COLUMNS
     assert set(SIGNAL_TIMEFRAME_COLUMNS) == valid
-    # Panel columns = base (trade-attributed) + timeframe + fundamentals factors
-    # (the latter two are panel-only diagnostics, NOT in _ALL_METHODS).
+    # Panel columns = base (trade-attributed) + timeframe diagnostics. The fundamental
+    # factors are now PART OF the base set (solo-attributed, 2026-06-24);
+    # SIGNAL_FUNDAMENTAL_COLUMNS is a categorisation SUBSET of BASE (the IC table's
+    # "Fundamentals" grouping), no longer a separately-appended panel-only group.
     assert tuple(SIGNAL_METHOD_COLUMNS) == (tuple(SIGNAL_BASE_METHOD_COLUMNS)
-                                            + tuple(SIGNAL_TIMEFRAME_COLUMNS)
-                                            + tuple(SIGNAL_FUNDAMENTAL_COLUMNS))
+                                            + tuple(SIGNAL_TIMEFRAME_COLUMNS))
     assert len(set(SIGNAL_METHOD_COLUMNS)) == len(SIGNAL_METHOD_COLUMNS)   # no dupes
     assert not (set(SIGNAL_BASE_METHOD_COLUMNS) & set(SIGNAL_TIMEFRAME_COLUMNS))
-    assert not (set(SIGNAL_BASE_METHOD_COLUMNS) & set(SIGNAL_FUNDAMENTAL_COLUMNS))
+    assert set(SIGNAL_FUNDAMENTAL_COLUMNS) <= set(SIGNAL_BASE_METHOD_COLUMNS)
 
 
 # ── insert_signals round-trip (temporary DuckDB file) ─────────────────────

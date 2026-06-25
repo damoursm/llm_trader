@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # factors (f_split + f_dividend) on combined_score — event-driven so it never dampens
     # the ~95% of tickers with no action. Placeholder; tune once IC data accrues.
     corp_action_factor_weight: float = 0.10
+    # Additive-overlay weight for the 4 Massive fundamental factors (value/quality/
+    # growth/short-squeeze), folded into combined_score 2026-06-24. Applied OUTSIDE
+    # the normalised pool (like corp_action_factor_weight) so the capped/sparse
+    # fundamentals nudge the combine without dampening non-enriched tickers. Small +
+    # tunable; they remain forward-IC-validated in the dashboard Signal-IC table.
+    fundamental_factor_weight: float = 0.08
 
     # Related-company peer discovery (Massive related-companies graph) — widens the
     # universe with peers of the watchlist + held names (liquidity-gated in Step 0).
@@ -111,7 +117,10 @@ class Settings(BaseSettings):
     # comparison. 2 API calls/ticker, so capped per tick. Set the weight via
     # aggregator `_BASE_WEIGHTS["massive"]`; off → the method scores 0 (no effect).
     enable_massive_tech: bool = True
-    massive_tech_max_tickers: int = 40   # 0 = every ticker (heavier: 2 calls each)
+    massive_tech_max_tickers: int = 0    # 0 = every ticker. Now a WEIGHTED member of
+    # combined_score (promoted 2026-06-24), so it must score every ticker — a positive
+    # cap would leave capped-out tickers with massive=0 while still reserving its weight
+    # in the normalised pool, dampening their combined_score. Keep 0 unless reverting.
 
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
@@ -639,6 +648,13 @@ class Settings(BaseSettings):
     intraday_30m_max_tickers: int = 0
     # Re-fetch the 30-min OHLCV cache when its newest bar is older than this (minutes).
     intraday_30m_ttl_minutes: int = 25
+    # Per-ticker scoring concurrency. The build_signals loop is I/O-bound (DeepSeek
+    # sentiment ~7s/ticker + Massive/OHLCV reads), so a bounded thread pool collapses
+    # the serial sum to ~max wall-time with IDENTICAL scores. 1 = sequential (legacy).
+    # DeepSeek (sentiment = deepseek-v4-flash) caps at 2500 CONCURRENT, not RPM, and
+    # throttles by latency, not 429s — so 16 has huge headroom; past ~16 Amdahl (the
+    # serial synthesis call + fetch) dominates. Override per-deploy via the env var.
+    signal_scoring_max_workers: int = 16
 
     # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
     # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the

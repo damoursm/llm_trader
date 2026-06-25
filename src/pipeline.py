@@ -1318,6 +1318,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # opener-pinned hold-review (fix #2) — the review reuses them verbatim so it
     # runs the identical algorithm, only with fresh news/prices + a pinned
     # sentiment engine. (tickers / articles / snapshots are supplied fresh there.)
+    # Massive fundamental factor scores (value/quality/growth/short-squeeze) per
+    # ticker — computed BEFORE build_signals so they can be folded into combined_score
+    # as an additive overlay (fundamental_factor_weight), then reused for the panel.
+    from src.data.fundamentals import factor_scores as _ffactor
+    _fund_by_tk = ({fs.ticker: fs for fs in fundamentals_context.signals}
+                   if fundamentals_context and getattr(fundamentals_context, "signals", None) else {})
+    _fund_factors = {tk: _ffactor(fs) for tk, fs in _fund_by_tk.items()}
+
     build_kwargs = dict(
         insider_trades=insider_trades,
         put_call_context=put_call_context,
@@ -1327,6 +1335,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         pead_context=pead_context,
         coint_context=coint_context,
         corp_factors=(corporate_actions_context.factor_scores if corporate_actions_context else None),
+        fundamental_factors=_fund_factors,
     )
     signals = build_signals(
         all_tickers,
@@ -1341,16 +1350,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # table (IC + Sim win% + Sim ret%): Massive fundamentals (value/quality/growth/
     # short-squeeze, panel-only) + corporate-action directional factors (f_split/
     # f_dividend, which ALSO nudge combined_score via the aggregator overlay above).
-    from src.data.fundamentals import factor_scores as _ffactor
-    _fund_by_tk = ({fs.ticker: fs for fs in fundamentals_context.signals}
-                   if fundamentals_context and getattr(fundamentals_context, "signals", None) else {})
     _corp_fs = getattr(corporate_actions_context, "factor_scores", None) or {}
-    if _fund_by_tk or _corp_fs:
+    if _fund_factors or _corp_fs:
         for _tk, _sig in signals_by_ticker.items():
             merged: dict = {}
-            _fs = _fund_by_tk.get(_tk) or _fund_by_tk.get(_tk.upper())
-            if _fs is not None:
-                merged.update(_ffactor(_fs))
+            _ff = _fund_factors.get(_tk) or _fund_factors.get(_tk.upper())
+            if _ff:
+                merged.update(_ff)
             _cf = _corp_fs.get(_tk) or _corp_fs.get(_tk.upper())
             if _cf:
                 merged.update(_cf)
