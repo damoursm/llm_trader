@@ -1167,6 +1167,17 @@ class TickerSignal(BaseModel):
     combined_score: float = 0.0 # -1.0 to +1.0 weighted sum of method scores (pre-confidence factors).
                                 # Stored so monitor_open_positions can compare today's signal
                                 # against signal_at_entry to detect thesis decay.
+    # Horizon synthesis (term-structure of edge) — populated when enable_horizon_synthesis=true.
+    # target_horizon is the mechanical argmax-net-edge holding horizon (one of the
+    # simulated-trade horizons, e.g. "1w"); horizon_label maps it to the LLM bucket;
+    # horizon_curve holds the per-horizon NET edge (expected gross return − cost, %),
+    # for the synthesis prompt + dashboard.
+    target_horizon: str = ""               # "30m".."1m" — argmax net-edge horizon ("" = no view)
+    horizon_label: str = "N/A"             # SHORT-TERM | SWING | POSITION
+    horizon_conviction: float = 0.0        # |edge(target_horizon)| ∈ [0,1]
+    horizon_net_edge_pct: float = 0.0      # net(target_horizon) = exp_gross − cost (%)
+    horizon_tradeable: bool = True         # does any horizon clear the cost hurdle?
+    horizon_curve: Dict[str, float] = Field(default_factory=dict)  # horizon -> net edge %
     sentiment_score: float      # -1.0 to +1.0  (news + all article-based sources; the LEVEL)
     # Sentiment velocity (Δsentiment, not level) — populated when enable_sentiment_velocity=true.
     # = recent-window news tone − prior-window news tone; the rate of change leads short-horizon moves.

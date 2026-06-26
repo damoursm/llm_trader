@@ -119,6 +119,38 @@ def test_save_trades_is_full_replace(tmp_path, monkeypatch):
     assert loaded[0]["return_pct"] == 2.0
 
 
+# ── Direction (Long / Short) filter — dashboard Model Performance + Returns ──
+
+def test_direction_filter_splits_long_short(tmp_path, monkeypatch):
+    """get_performance_for_email(direction=...) restricts to BUY (long) / SELL
+    (short) entries; long + short == all, with no leakage. Backs the dashboard's
+    Long/Short/both toggle on the Model Performance and Returns tabs."""
+    from config.settings import settings
+    from src.db import repo
+    monkeypatch.setattr(tracker, "TRADES_FILE", tmp_path / "no-legacy.json")
+    monkeypatch.setattr(settings, "enable_fetch_data", False)   # no network
+
+    longs = [{"ticker": f"LNG{i}", "type": "STOCK", "action": "BUY", "direction": "BULLISH",
+              "status": "CLOSED", "confidence": 0.8, "position_size_multiplier": 1.0,
+              "entry_date": "2026-06-10", "entry_price": 10.0, "return_pct": 5.0,
+              "exit_date": "2026-06-11", "exit_price": 10.5} for i in range(3)]
+    shorts = [{"ticker": f"SHT{i}", "type": "STOCK", "action": "SELL", "direction": "BEARISH",
+               "status": "CLOSED", "confidence": 0.8, "position_size_multiplier": 1.0,
+               "entry_date": "2026-06-10", "entry_price": 20.0, "return_pct": -2.0,
+               "exit_date": "2026-06-11", "exit_price": 20.4} for i in range(2)]
+    repo.save_trades(longs + shorts)
+
+    all_p   = tracker.get_performance_for_email()
+    long_p  = tracker.get_performance_for_email(direction="long")
+    short_p = tracker.get_performance_for_email(direction="short")
+
+    assert all_p["stats"]["total_all"] == 5
+    assert long_p["stats"]["total_all"] == 3
+    assert short_p["stats"]["total_all"] == 2
+    assert all(t["action"] == "BUY" for t in long_p["closed_trades"])
+    assert all(t["action"] == "SELL" for t in short_p["closed_trades"])
+
+
 # ── Ledger-corruption regression (2026-06-10 production incident) ─────────
 
 def _poisoned_ledger():

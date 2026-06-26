@@ -603,8 +603,22 @@ def _synthesis_model_for_rec(value: Optional[str]) -> Optional[str]:
     return _synthesis_model_for_provider(v) or v
 
 
+def _match_direction(t: dict, direction: Optional[str]) -> bool:
+    """Whether trade/call ``t`` matches a LONG/SHORT filter (None/'' = both).
+    Long = BUY / BULLISH entry; Short = SELL / BEARISH."""
+    if not direction:
+        return True
+    tag = str(t.get("action") or t.get("direction") or "").upper()
+    if direction == "long":
+        return tag in ("BUY", "BULLISH")
+    if direction == "short":
+        return tag in ("SELL", "BEARISH")
+    return True
+
+
 def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
-                         bars_memo: Optional[dict] = None) -> List[dict]:
+                         bars_memo: Optional[dict] = None,
+                         direction: Optional[str] = None) -> List[dict]:
     """Mark a list of directional *calls* to forward returns as pseudo-trades.
 
     Shared scoring core for the unbiased recommendation/signal streams (used by
@@ -641,6 +655,8 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
     for c in calls:
         row_session = _trade_session(c)
         if session and row_session != session:
+            continue
+        if not _match_direction(c, direction):
             continue
         bars = _bars(c["ticker"])
         if bars is None:
@@ -692,7 +708,8 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
 
 
 def _compute_llm_perf(window_days: Optional[int] = None,
-                      session: Optional[str] = None) -> dict:
+                      session: Optional[str] = None,
+                      direction: Optional[str] = None) -> dict:
     """Per-LLM engine stats over EVERY recommended trade, executed or not.
 
     The real ledger only holds recommendations that survived the actionable +
@@ -754,7 +771,7 @@ def _compute_llm_perf(window_days: Optional[int] = None,
             "llm_sentiment_model": sent,
         }
 
-    pseudo = _build_pseudo_trades(list(deduped.values()), session)
+    pseudo = _build_pseudo_trades(list(deduped.values()), session, direction=direction)
 
     groups: Dict[str, Dict[str, List[dict]]] = {"synthesis": {}, "sentiment": {}}
     for t in pseudo:
@@ -785,7 +802,8 @@ _MACRO_HEADLINE_ORDER = ("synthesis", "aggregator")
 
 
 def compute_macro_eval(window_days: Optional[int] = None,
-                       session: Optional[str] = None) -> List[dict]:
+                       session: Optional[str] = None,
+                       direction: Optional[str] = None) -> List[dict]:
     """Performance rows for the dashboard's Macro Evaluation table — the
     aggregated decision layers, each scored on its OWN full stream of directional
     calls via the same pseudo-trade model as ``_compute_llm_perf``.
@@ -805,7 +823,7 @@ def compute_macro_eval(window_days: Optional[int] = None,
     rows: List[dict] = []
 
     def _emit(label: str, group: str, calls: List[dict]) -> None:
-        st = _compute_segment_stats(_build_pseudo_trades(calls, session, bars_memo))
+        st = _compute_segment_stats(_build_pseudo_trades(calls, session, bars_memo, direction))
         if st:
             rows.append({"label": label, "group": group, **st})
 
@@ -1369,6 +1387,18 @@ def record_new_trades(
         # so sub-penny stocks/warrants retain their genuine decimals — the old
         # 4-decimal rounding lost up to ~5% of accuracy on names like TALKW.
         # Display formatting is handled by fmt_price() at render time.
+        # Horizon synthesis: cap the LLM's time_horizon to the mechanical target
+        # (it may confirm or SHORTEN, never lengthen) and stamp the effective
+        # holding horizon for the matched exit + the dashboard.
+        _sig = (signals_by_ticker or {}).get(rec.ticker)
+        eff_horizon, horizon_label, horizon_net = "", "", 0.0
+        if (_sig is not None and settings.enable_horizon_synthesis
+                and getattr(_sig, "target_horizon", "")):
+            from src.signals.edge_curve import cap_horizon, HORIZON_BUCKET
+            eff_horizon = cap_horizon(_sig.target_horizon, rec.time_horizon)
+            horizon_label = HORIZON_BUCKET.get(eff_horizon, "")
+            horizon_net = float(getattr(_sig, "horizon_net_edge_pct", 0.0) or 0.0)
+
         new_trade = {
             "ticker": rec.ticker,
             "run_id": run_id,
@@ -1397,6 +1427,12 @@ def record_new_trades(
             "entry_ref_close": ref["close"] if ref else None,
             "entry_ref_close_date": ref["date"] if ref else None,
             "rationale": rec.rationale,
+            # Horizon synthesis — the LLM bucket, the mechanical/capped holding
+            # horizon (drives the matched exit's time-stop), and its net edge.
+            "time_horizon":        rec.time_horizon,
+            "target_horizon":      eff_horizon,
+            "horizon_label":       horizon_label,
+            "horizon_net_edge_pct": horizon_net,
             "current_price": float(price),
             "current_price_datetime": decision_at,
             "return_pct": 0.0,
@@ -1630,6 +1666,46 @@ def _confidence_floor(entry_conf) -> float:
     return max(absf, float(settings.signal_decay_confidence_floor_relative) * float(entry_conf))
 
 
+def _held_hours(trade: dict) -> Optional[float]:
+    """Wall-clock hours a trade has been open (entry → now, ET). None if unknown."""
+    raw = trade.get("entry_datetime") or trade.get("entry_date")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ET)
+        return max(0.0, (datetime.now(ET) - dt.astimezone(ET)).total_seconds() / 3600.0)
+    except (ValueError, TypeError):
+        return None
+
+
+def _horizon_expired_floor(trade: dict) -> Optional[float]:
+    """The RAISED hold-review confidence floor a position must clear once it has
+    outlived its target-horizon window, else ``None`` (still within window, or
+    horizon synthesis / matched exit disabled, or no target horizon stored).
+
+    The matched exit: a position held past the horizon its measured edge supports
+    must be STRONGLY re-confirmed by its opener to keep running — short-horizon
+    trades therefore exit promptly once their edge window passes, long-horizon
+    trades are left patient. A still-conviction winner above the raised floor is
+    NOT cut."""
+    if not (settings.enable_horizon_synthesis and settings.enable_horizon_matched_exit):
+        return None
+    target_h = trade.get("target_horizon")
+    if not target_h:
+        return None
+    from src.signals.edge_curve import horizon_hours
+    window = horizon_hours(target_h)
+    if not window:
+        return None
+    held = _held_hours(trade)
+    if held is None or held < window:
+        return None
+    base = _confidence_floor(trade.get("confidence"))
+    return min(0.99, base * float(settings.horizon_expiry_floor_mult))
+
+
 def _evaluate_decay(
     trade: dict,
     today_signal,
@@ -1684,9 +1760,20 @@ def _evaluate_decay(
     opener_is_llm = open_provider in ("anthropic", "deepseek")
     if settings.enable_llm_hold_review and hold_review is not None:
         rev_action = getattr(hold_review, "action", None)
+        conv = float(getattr(hold_review, "confidence", 0.0) or 0.0)
         # Flip — the engine now actively calls the OTHER way.
         if (action == "BUY" and rev_action == "SELL") or (action == "SELL" and rev_action == "BUY"):
             return "llm_signal_flipped"
+        # Horizon-matched time-stop: once the position has outlived the horizon its
+        # measured edge supports, it must be STRONGLY re-confirmed (same direction,
+        # conviction ≥ the raised floor) to survive — a neutral HOLD/WATCH or a
+        # faded conviction closes it. Short-horizon trades thus exit promptly once
+        # their window passes; long-horizon winners still in conviction are kept.
+        exp_floor = _horizon_expired_floor(trade)
+        if exp_floor is not None:
+            if rev_action != action or conv < exp_floor:
+                return "horizon_expired"
+            return None
         # Same-direction re-affirmation whose conviction collapsed below the
         # entry-relative floor. A neutral HOLD/WATCH is NOT a close: the engine
         # isn't calling the other way, and on hold-prompt-OFF runs it judges a
@@ -1695,7 +1782,6 @@ def _evaluate_decay(
         # closes through another door. Only an explicit reversal or a genuine
         # same-direction conviction collapse closes.
         if rev_action == action:
-            conv = float(getattr(hold_review, "confidence", 0.0) or 0.0)
             if conv < _confidence_floor(trade.get("confidence")):  # entry conf = the LLM number that gated the open
                 return "llm_confidence_loss"
         return None
@@ -2628,7 +2714,8 @@ def _eval_stats(entries: list) -> dict:
 
 
 def compute_solo_method_performance(split: Optional[str] = None, window_days: Optional[int] = None,
-                                    session: Optional[str] = None) -> dict:
+                                    session: Optional[str] = None,
+                                    direction: Optional[str] = None) -> dict:
     """Simulate performance for each signal method used in isolation, split by direction.
 
     For each closed trade with stored method_scores, each method is asked:
@@ -2660,6 +2747,8 @@ def compute_solo_method_performance(split: Optional[str] = None, window_days: Op
         closed = [t for t in closed if (t.get("entry_date") or "") >= _cutoff]
     if session:
         closed = [t for t in closed if _trade_session(t) == session]
+    if direction:
+        closed = [t for t in closed if _match_direction(t, direction)]
     if not closed:
         return {}
 
@@ -2900,7 +2989,8 @@ def _displayed_one_way_cost_pct(trades: List[dict], real_frac: Optional[float]) 
 
 
 def get_performance_for_email(window_days: Optional[int] = None,
-                              session: Optional[str] = None) -> dict:
+                              session: Optional[str] = None,
+                              direction: Optional[str] = None) -> dict:
     """Return structured performance data for inclusion in the email report.
 
     When ``window_days`` is set, only trades ENTERED within the last N calendar
@@ -2919,6 +3009,8 @@ def get_performance_for_email(window_days: Optional[int] = None,
         trades = [t for t in trades if (t.get("entry_date") or "") >= _cutoff]
     if session:
         trades = [t for t in trades if _trade_session(t) == session]
+    if direction:
+        trades = [t for t in trades if _match_direction(t, direction)]
     open_trades   = [t for t in trades if t["status"] == "OPEN"]
     closed_trades = [t for t in trades if t["status"] == "CLOSED"]
     # Open trades carry a current M2M return_pct (updated each run by update_open_trades()).
@@ -2980,9 +3072,9 @@ def get_performance_for_email(window_days: Optional[int] = None,
     performance_table    = _compute_performance_table(all_trades) if all_trades else []
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
-    solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session)
-    llm_perf             = _compute_llm_perf(window_days=window_days, session=session)
-    macro_eval           = compute_macro_eval(window_days=window_days, session=session)
+    solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session, direction=direction)
+    llm_perf             = _compute_llm_perf(window_days=window_days, session=session, direction=direction)
+    macro_eval           = compute_macro_eval(window_days=window_days, session=session, direction=direction)
     method_eval_stats    = compute_method_eval_stats()
     oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)

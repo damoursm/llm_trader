@@ -43,6 +43,7 @@ def _retry(fn, what: str = ""):
 
 _REC_COLS = (
     "generated_at, ticker, type, direction, action, confidence, time_horizon, "
+    "target_horizon, horizon_net_edge_pct, "
     "actionable, dominant_method, llm_provider, rationale"
 )
 
@@ -96,16 +97,17 @@ _PERF_TTL = 60.0
 
 
 def performance(window_days: Optional[int] = None, session: Optional[str] = None,
-                force: bool = False) -> dict:
-    """Windowed + session-filtered performance bundle. ``window_days`` = 7 / 30
-    (None = inception); ``session`` = rth / extended / overnight (None = all)."""
-    key = ("all" if window_days is None else int(window_days), session or "all")
+                direction: Optional[str] = None, force: bool = False) -> dict:
+    """Windowed + session + direction-filtered performance bundle. ``window_days`` =
+    7 / 30 (None = inception); ``session`` = rth / extended / overnight (None = all);
+    ``direction`` = long / short (None = both)."""
+    key = ("all" if window_days is None else int(window_days), session or "all", direction or "all")
     now = time.time()
     entry = _perf_cache.get(key)
     if not force and entry is not None and (now - entry["ts"]) < _PERF_TTL:
         return entry["data"]
     from src.performance.tracker import get_performance_for_email
-    result = _retry(lambda: get_performance_for_email(window_days=window_days, session=session), "performance")
+    result = _retry(lambda: get_performance_for_email(window_days=window_days, session=session, direction=direction), "performance")
     _perf_cache[key] = {"ts": now, "data": result}
     return result
 
@@ -185,20 +187,39 @@ def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) 
     return result
 
 
-def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None) -> dict:
-    """Confidence-calibration report (buckets + slope) over the windowed/session
-    perf bundle's closed + open trades — so it tracks the tab's toggles and
-    reuses the cached perf computation."""
-    perf = performance(window_days=window_days, session=session)
+def simulated_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
+    """Per-method directional win rate + mean gross return at 30m/3h/6h/1d/3d/1w/2w/1m
+    over the ``simulated_trades`` table (every scored ticker treated as a solo
+    single-method trade). Cached (the OHLCV join is heavy); run-based, so it
+    ignores the window/session toggles like the IC table. Empty until forward
+    returns exist."""
+    key = ("sim_method_perf", days, int(min_n))
+    now = time.time()
+    entry = _perf_cache.get(key)
+    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.analysis.simulated_trades import compute_method_perf
+    result = _retry(lambda: compute_method_perf(days=days, min_n=min_n), "simulated_method_perf")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
+
+
+def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None,
+                           direction: Optional[str] = None) -> dict:
+    """Confidence-calibration report (buckets + slope) over the windowed/session/
+    direction perf bundle's closed + open trades — so it tracks the tab's toggles
+    and reuses the cached perf computation."""
+    perf = performance(window_days=window_days, session=session, direction=direction)
     from src.analysis.confidence_calibration import compute_calibration
     trades = (perf.get("closed_trades") or []) + (perf.get("open_trades") or [])
     return compute_calibration(trades)
 
 
-def exit_quality(window_days: Optional[int] = None, session: Optional[str] = None) -> dict:
-    """MFE/MAE exit-quality report over the windowed/session closed trades (the
-    sim ledger carries the excursion fields)."""
-    perf = performance(window_days=window_days, session=session)
+def exit_quality(window_days: Optional[int] = None, session: Optional[str] = None,
+                 direction: Optional[str] = None) -> dict:
+    """MFE/MAE exit-quality report over the windowed/session/direction closed trades
+    (the sim ledger carries the excursion fields)."""
+    perf = performance(window_days=window_days, session=session, direction=direction)
     from src.analysis.exit_quality import compute_exit_quality
     return compute_exit_quality(perf.get("closed_trades") or [])
 

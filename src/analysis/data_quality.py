@@ -66,6 +66,12 @@ EXPECTED_SPARSE_SOURCES = frozenset({
     # raises QuiverFeedError on a transport failure or an empty market-wide feed, so
     # an outage lands as an `error` (success-rate drop) rather than a benign `empty`.
     "quiver_congress", "quiver_contracts", "quiver_lobbying", "quiver_offexchange",
+    # Massive ticker events (renames/delistings on the held + watchlist names) —
+    # protective + event-driven: established large-caps almost never have a rename/
+    # delisting inside the lookback window, so an empty return is the NORMAL case.
+    # The /vX/reference/tickers/{t}/events fetch is verified working (it returns each
+    # name's OLD events — e.g. FB→META 2022 — just none recent enough to surface).
+    "ticker_events",
 })
 
 

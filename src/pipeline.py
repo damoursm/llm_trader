@@ -287,6 +287,7 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         for r in recommendations:
             scores = _method_scores_from_signal(r.ticker, r.direction, signals_by_ticker)
             gen_at = r.generated_at
+            _hsig = (signals_by_ticker or {}).get(r.ticker)
             rec_rows.append({
                 "rec_id": hashlib.sha1(f"{run_id}|{r.ticker}".encode("utf-8")).hexdigest()[:16],
                 "run_id": run_id,
@@ -303,6 +304,8 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "methods_agreeing": _methods_agreeing(scores, r.direction),
                 "contributing_scores": scores,
                 "llm_provider": rec_llm,
+                "target_horizon": getattr(_hsig, "target_horizon", "") if _hsig else "",
+                "horizon_net_edge_pct": float(getattr(_hsig, "horizon_net_edge_pct", 0.0) or 0.0) if _hsig else 0.0,
             })
 
         repo.insert_run({
@@ -357,12 +360,39 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
             })
         if sig_rows:
             from src.utils import ET
+            generated_at = start.isoformat()
+            signal_date = start.astimezone(ET).date().isoformat()
             repo.insert_signals(
                 run_id,
-                generated_at=start.isoformat(),
-                signal_date=start.astimezone(ET).date().isoformat(),
+                generated_at=generated_at,
+                signal_date=signal_date,
                 rows=sig_rows,
             )
+            # Long-format reshape: one simulated single-method trade per
+            # (ticker, method) with a non-zero score — the unbiased dataset for
+            # "would this method alone have called the direction right" over
+            # EVERY scored ticker (vs the gate-selected ledger). combined_score
+            # rides along as the synthesized-baseline "method".
+            sim_rows = []
+            for sr in sig_rows:
+                px = sr.get("price")
+                scores = dict(sr.get("scores") or {})
+                scores["combined_score"] = sr.get("combined_score")
+                for method, score in scores.items():
+                    if score is None or abs(float(score)) < 1e-9:
+                        continue  # exactly-zero / no-view methods are not a trade
+                    sim_rows.append({
+                        "ticker": sr["ticker"],
+                        "method": method,
+                        "score": float(score),
+                        "direction": "BUY" if float(score) > 0 else "SELL",
+                        "entry_price": px,
+                    })
+            if sim_rows:
+                repo.insert_simulated_trades(
+                    run_id, generated_at=generated_at, signal_date=signal_date,
+                    rows=sim_rows,
+                )
 
         logger.info(
             f"[db] Persisted run {run_id}: {len(rec_rows)} recommendation(s), "
@@ -1362,6 +1392,42 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                 merged.update(_cf)
             if merged:
                 _sig.fundamental_scores = merged
+
+    # ── Step 4.4: Horizon synthesis (term-structure of edge) ─────────────
+    # Weight every method's LIVE score by its MEASURED per-horizon IC (sign-aware,
+    # from the simulated_trades panel), pick the cost-aware holding horizon, and
+    # stamp it on each signal — so the LLM reasons WITH it (confirm or shorten,
+    # never lengthen) and the matched exit can close a position once its edge
+    # window passes. Pure IC weighting (no static blend) by design.
+    if settings.enable_horizon_synthesis:
+        try:
+            from src.signals import edge_curve
+            ic_matrix = edge_curve.get_ic_matrix()
+            if ic_matrix:
+                n_tradeable = 0
+                for _tk, _sig in signals_by_ticker.items():
+                    _base = _method_scores_from_signal(_tk, _sig.direction, signals_by_ticker)
+                    _scores = {**_base,
+                               **(getattr(_sig, "timeframe_scores", None) or {}),
+                               **(getattr(_sig, "fundamental_scores", None) or {}),
+                               "combined_score": float(getattr(_sig, "combined_score", 0.0))}
+                    _curve = edge_curve.compute_edge_curve(_scores, ic_matrix)
+                    _sel = edge_curve.select_horizon(_curve)
+                    _sig.target_horizon = _sel["target_horizon"]
+                    _sig.horizon_label = _sel["horizon_label"]
+                    _sig.horizon_conviction = _sel["conviction"]
+                    _sig.horizon_net_edge_pct = _sel["net_edge_pct"]
+                    _sig.horizon_tradeable = _sel["tradeable"]
+                    _sig.horizon_curve = {h: c["net"] for h, c in _curve.items()}
+                    n_tradeable += int(_sel["tradeable"])
+                logger.info(
+                    f"[horizon] edge curve stamped on {len(signals_by_ticker)} ticker(s); "
+                    f"{n_tradeable} have a cost-clearing horizon "
+                    f"(IC matrix: {len(ic_matrix)} method(s))")
+            else:
+                logger.info("[horizon] IC matrix empty — horizon synthesis idle (panel still thin)")
+        except Exception as e:
+            logger.warning(f"[horizon] synthesis skipped ({type(e).__name__}: {e})")
 
     # Update cluster watchlist: add newly detected clusters, expire stale entries
     _cluster_raw = update_cluster_watchlist(signals_by_ticker, _cluster_raw)

@@ -361,7 +361,7 @@ class Settings(BaseSettings):
     enable_breadth: bool = True
 
     # Google Trends — search interest spike/drop as retail attention proxy (no API key required)
-    enable_google_trends: bool = True   # uses pytrends (unofficial API); cached daily
+    enable_google_trends: bool = False  # OFF 2026-06-25: pytrends' unofficial API is chronically 429'd by Google (low-value retail-attention proxy, no clean fix). Cached daily when on.
 
     # Ticker discovery — extra sources that widen the analysis universe (Step 0, fail-graceful).
     # WSB cashtag discovery: most-mentioned valid tickers across r/wallstreetbets, r/stocks,
@@ -642,6 +642,30 @@ class Settings(BaseSettings):
     tf_blend_30m: float = 0.20
     tf_blend_1d: float = 0.60
     tf_blend_1w: float = 0.20
+
+    # ── Horizon synthesis (term-structure of edge) ─────────────────────────
+    # Per-ticker edge curve: each method's LIVE score weighted by its MEASURED
+    # per-horizon information coefficient (from the simulated_trades panel) — pure
+    # IC, no static blend, SIGN-AWARE (a negative-IC method is flipped, a no-skill
+    # one drops out). Evaluated at every simulated-trade horizon
+    # (30m/3h/6h/1d/3d/1w/2w/1m), then COST-AWARE selection picks the holding
+    # horizon whose net-of-cost expected gross return is highest. The LLM may
+    # CONFIRM or SHORTEN it (never lengthen — enforced mechanically at trade time);
+    # the matched exit raises the hold-review floor once a position outlives its
+    # horizon window. Judge nothing until the IC panel is thick.
+    enable_horizon_synthesis: bool = True
+    horizon_ic_days: int = 120            # lookback window for the per-horizon IC matrix
+    horizon_ic_min_n: int = 15            # min joint obs before a (method,horizon) IC is used
+    horizon_min_conviction: float = 0.05  # min |edge(h)| for a horizon to be a trade candidate
+    horizon_cost_hurdle_pct: float = 0.40  # round-trip cost the net edge must clear (~27-41bp)
+    horizon_ic_cache_seconds: int = 1800  # reuse the heavy IC matrix across ticks (30 min)
+    # Matched exit: once a position is held ≥ its target-horizon duration, multiply
+    # the opener-pinned hold-review confidence floor by this so it must still be
+    # STRONGLY confirmed to survive past its edge window (short-horizon trades exit
+    # sooner; a still-conviction winner is not cut). Own flag so it can be disabled
+    # independently of the horizon assignment + dashboard.
+    enable_horizon_matched_exit: bool = True
+    horizon_expiry_floor_mult: float = 1.5
     # 0 = attempt every ticker (full coverage). A positive cap throttles the fetch;
     # only needed on the yfinance fallback path (≤60d history, per-IP 429s) — the
     # Massive/Polygon Advanced plan is unlimited-rate, so leave at 0 when configured.

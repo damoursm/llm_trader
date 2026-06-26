@@ -265,6 +265,39 @@ def _call_deepseek_analyst(prompt: str, model: Optional[str] = None,
     return "".join(raw_parts).strip()
 
 
+def _recommendations_from_data(data, analyst_source: str, now) -> List["Recommendation"]:
+    """Build ``Recommendation`` objects from parsed LLM JSON, DEFENSIVELY.
+
+    An LLM recommendation object can be missing a field (observed 2026-06-25:
+    deepseek-v4-flash-thinking omitted ``rationale`` on one object of a 312-rec
+    array) or carry an unparseable confidence. A single bad object must NOT crash
+    the whole tick — it is skipped (its ticker is back-filled by the rule-based
+    pass in the caller) and the non-essential ``rationale`` defaults to "".
+    """
+    out: List[Recommendation] = []
+    for r in data:
+        if not isinstance(r, dict):
+            logger.warning(f"[claude] {analyst_source} non-object recommendation skipped: {str(r)[:120]}")
+            continue
+        try:
+            out.append(Recommendation(
+                ticker=r["ticker"],
+                type=r.get("type", "STOCK"),
+                direction=r["direction"],
+                action=r["action"],
+                confidence=float(r["confidence"]),
+                time_horizon=r.get("time_horizon", "N/A"),
+                rationale=r.get("rationale", ""),
+                generated_at=now,
+            ))
+        except Exception as e:
+            logger.warning(
+                f"[claude] {analyst_source} recommendation skipped — missing/invalid field "
+                f"({type(e).__name__}: {e}): {str(r)[:160]}"
+            )
+    return out
+
+
 def generate_recommendations(
     signals: List[TickerSignal],
     insider_trades: Optional[List["InsiderTrade"]] = None,
@@ -349,6 +382,14 @@ def generate_recommendations(
     signal_lines = []
     for s in signals_for_claude:
         parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, sources_agreeing={s.sources_agreeing}"]
+        if settings.enable_horizon_synthesis and getattr(s, "target_horizon", ""):
+            _tradeable = "" if getattr(s, "horizon_tradeable", True) else " — NO horizon clears cost, prefer WATCH/HOLD"
+            parts.append(
+                f"  HORIZON MODEL: per-method per-horizon IC favours a {s.target_horizon} "
+                f"({s.horizon_label}) hold, net edge {s.horizon_net_edge_pct:+.2f}% after costs "
+                f"(conviction {s.horizon_conviction:.2f}){_tradeable}. Set time_horizon to CONFIRM "
+                f"or SHORTEN this — never longer than {s.horizon_label}."
+            )
         if use_news:
             parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
         if getattr(s, "ext_gap_score", 0.0):
@@ -3201,20 +3242,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
             f"recovered {len(data)}/{len(signals)} tickers. "
             f"Consider switching to a model with higher output limits."
         )
-    now = now_et()
-    recommendations = [
-        Recommendation(
-            ticker=r["ticker"],
-            type=r.get("type", "STOCK"),
-            direction=r["direction"],
-            action=r["action"],
-            confidence=float(r["confidence"]),
-            time_horizon=r.get("time_horizon", "N/A"),
-            rationale=r["rationale"],
-            generated_at=now,
-        )
-        for r in data
-    ]
+    recommendations = _recommendations_from_data(data, analyst_source, now_et())
 
     # An LLM response can repeat a ticker (DeepSeek, 2026-06-11 16:30 tick:
     # XLE/SPY/ITA/USO twice each). Downstream consumers assume one

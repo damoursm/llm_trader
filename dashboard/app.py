@@ -167,7 +167,9 @@ _REC_COL_SPEC = [
     ("action", "Action", None, "The call: BUY, SELL, HOLD or WATCH. Only BUY/SELL are actionable (paper-traded)."),
     ("direction", "Direction", None, "Directional lean behind the call — BULLISH or BEARISH."),
     ("confidence", "Confidence %", _INT, "Model confidence, 0–100%. A BUY/SELL is actionable only above the regime-adjusted threshold (≈78%) with ≥2 agreeing signal sources."),
-    ("time_horizon", "Horizon", None, "Intended holding window (e.g. SWING, POSITION)."),
+    ("time_horizon", "Horizon (LLM)", None, "The LLM's intended holding window (SHORT-TERM / SWING / POSITION). Capped at trade time to the mechanical edge horizon — the LLM may confirm or shorten it, never lengthen."),
+    ("target_horizon", "Edge horizon", None, "Horizon synthesis: the cost-aware holding horizon (30m/3h/6h/1d/3d/1w/2w/1m) whose net-of-cost expected gross return is highest, from each method's MEASURED per-horizon IC (sign-aware). Blank when the IC panel is too thin or horizon synthesis is off."),
+    ("horizon_net_edge_pct", "Net edge %", _NUM2, "Expected GROSS return at the edge horizon minus the round-trip cost hurdle. Positive = the edge clears costs at that horizon; ≤0 means no horizon is worth trading (prefer WATCH/HOLD)."),
     ("actionable", "Actionable", None, "TRUE = passed the confidence + sources-agreeing gate and was paper-traded. FALSE = monitor only."),
     ("dominant_method", "Top Method", None, "The signal method that contributed most to this call (e.g. news, technical, momentum)."),
     ("type", "Type", None, "Asset class — STOCK, ETF or COMMODITY."),
@@ -187,10 +189,12 @@ _TRADE_COL_SPEC = [
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
     ("exit_price", "Exit $", _NUM2, "Fill price at exit. Blank while the position is open."),
     ("held", "Held", None, "Wall-clock holding time: days + hours (e.g. 2d 5h), hours (6h), or minutes (45m) for the freshest entries. Open positions measure entry → now; closed ones entry → exit. Legacy date-only rows fall back to the trading-days count (Nd)."),
+    ("target_horizon", "Target horizon", None, "Horizon synthesis: the cost-aware holding horizon the position was opened for (e.g. 6h, 1w), capped to the LLM's call. Drives the matched exit time-stop — once held past this window the position must stay strongly confirmed to keep running. Blank for trades opened before horizon synthesis."),
     ("return_pct", "Return %", _NUM2, "Spread-adjusted % return. For OPEN positions this is the live mark-to-market — 'what if you closed right now'."),
     ("position_size_multiplier", "Size ×", _NUM2, "Capital weight from the confidence tier (1.0× / 1.5× / 2.0×), after the correlation haircut."),
     ("filled_notional_usd", "Notional $", _NUM2, "Actual dollars at risk: filled shares × average fill price (real-executions view only)."),
     ("status", "Status", None, "OPEN (held, live mark) or CLOSED (realised)."),
+    ("exit_reason", "Exit reason", None, "Why the position closed: llm_signal_flipped / llm_confidence_loss (the opener's fresh re-judgment), horizon_expired (held past its target-horizon window without strong re-confirmation — the matched exit), macro_regime_exit, intraday_reversal, or a signal-decay backstop. Blank while open."),
     ("broker_entry", "IBKR entry", None, "Did the entry order really execute at the broker? ✓ filled (shares) · ⏳ working / partial · ↻ re-anchoring (tick-scoped cancel; resubmits at the current mark) · ✕ cancelled · ✗ rejected/failed · – never sent (broker off, duplicate twin, sizing skip, or pre-broker history). Simulated view only — the IBKR view contains only filled orders by construction."),
     ("broker_exit", "IBKR exit", None, "Same for the closing order. ⏳ pending = the ledger closed the trade and the exit goes out on the next sync. Blank while the position is open."),
 ]
@@ -540,6 +544,68 @@ def _session_value(value):
     return None if value in (None, "all") else value
 
 
+# ── Direction toggle (long / short / both) ───────────────────────────────────
+_DIRECTION_OPTIONS = [
+    {"label": "Long + Short", "value": "all"},
+    {"label": "Long only", "value": "long"},
+    {"label": "Short only", "value": "short"},
+]
+
+
+def _direction_toggle(component_id: str) -> html.Div:
+    """Long (BUY) / Short (SELL) / both selector. Filters the tab's metrics and
+    plots to positions ENTERED in that direction."""
+    return html.Div(
+        [
+            html.Label("Direction:  ",
+                       title="Filter to LONG positions (BUY entries), SHORT positions (SELL entries), or both.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_DIRECTION_OPTIONS, value="all", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _direction_value(value):
+    """RadioItems value → 'long' | 'short', or None for both."""
+    return None if value in (None, "all") else value
+
+
+# ── Method-Performance evidence source (gated ledger vs all-scored panel) ────
+_METHOD_SOURCE_OPTIONS = [
+    {"label": "Ledger (gated trades)", "value": "ledger"},
+    {"label": "All scored tickers (simulated)", "value": "panel"},
+]
+
+
+def _method_source_toggle(component_id: str) -> html.Div:
+    """The solo-method table's evidence base. Ledger = only the gate-selected
+    trades that actually opened (small, selection-biased). All scored tickers =
+    every method's implied BUY/SELL on EVERY scored ticker each run (the
+    simulated_trades panel), scored on gross forward returns — thousands of
+    observations, unbiased by the trading gates."""
+    return html.Div(
+        [
+            html.Label("Source:  ",
+                       title="Ledger (gated trades): solo-method performance over only the trades the gates let through — apples-to-apples with the real book but a small, selection-biased sample. "
+                             "All scored tickers (simulated): treat every method's sign on EVERY scored ticker as a hypothetical solo trade, scored on GROSS forward returns at 30m/3h/6h/1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date); ignores Session/Direction.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_METHOD_SOURCE_OPTIONS, value="ledger", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
 # ── Trade-source toggle (simulated ledger vs actual IBKR fills) ──────────────
 _SOURCE_OPTIONS = [
     {"label": "Simulated (model)", "value": "sim"},
@@ -665,6 +731,140 @@ def _ic_section():
     return html.Div(children)
 
 
+_SIM_PERF_TOOLTIP = (
+    "Every method's implied BUY/SELL (sign of its score) on EVERY scored ticker each "
+    "run — the `simulated_trades` panel — scored on GROSS close-to-close forward "
+    "returns (no costs; the question is directional predictiveness, not net P&L). This "
+    "is the unbiased counterpart to the ledger solo table: it counts thousands of "
+    "observations instead of only the gate-selected trades that opened. 'Trades' = "
+    "total simulated solo trades for the method. Per horizon (30m/3h/6h/1d/3d/1w/2w/1m): "
+    "'n@' = joint observations with a forward return, 'IC@' = Spearman rank correlation "
+    "between the method's score and the forward return (ranking skill; a persistent "
+    "positive IC is real edge, a persistent negative IC is sign-inverted), 'Win@ %' = "
+    "share of the method's solo calls that were directionally right, 'Ret@ %' = mean "
+    "signed forward return. Forward returns come from the OHLCV cache, so 1w/2w/1m fill "
+    "in only after a post-close cache warm. Use the Horizons/Metrics pickers above to "
+    "trim the columns. Run-based; honors the Window toggle by signal date. A method "
+    "predictive of direction shows IC > 0 / Win > 50 PERSISTING across horizons; judge "
+    "nothing on a thin n.")
+
+_SIM_HORIZONS = ("30m", "3h", "6h", "1d", "3d", "1w", "2w", "1m")
+
+# Per-horizon metric columns, in display order (matches the IC table: n, IC, win,
+# ret). Each: (header template, id template, numeric format).
+_SIM_METRIC_ORDER = ("n", "ic", "win", "ret")
+_SIM_METRIC_SPECS = {
+    "n":   ("n@{}", "n_{}", _INT),
+    "ic":  ("IC@{}", "ic_{}", _NUM2),
+    "win": ("Win@{} %", "win_{}", _NUM2),
+    "ret": ("Ret@{} %", "ret_{}", _NUM2),
+}
+_SIM_METRIC_LABELS = {"n": "n (obs)", "ic": "IC", "win": "Win %", "ret": "Ret %"}
+
+
+def _sim_column_filters() -> html.Div:
+    """Horizons + metrics multi-selects that trim the columns of every simulated
+    table below. Empty selection falls back to all (never an empty table)."""
+    return html.Div(
+        [
+            html.Label("Simulated columns:  ",
+                       title="Pick which horizons and which metrics (n / IC / Win % / Ret %) "
+                             "appear in the 'All scored tickers' tables below. Applies to all "
+                             "category tables at once; clearing a picker shows everything.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 8}),
+            dcc.Dropdown(id="sim-horizons",
+                         options=[{"label": h, "value": h} for h in _SIM_HORIZONS],
+                         value=list(_SIM_HORIZONS), multi=True, placeholder="Horizons…",
+                         persistence=True, persistence_type="session",
+                         style={"flex": 2, "minWidth": 320}),
+            dcc.Dropdown(id="sim-metrics",
+                         options=[{"label": _SIM_METRIC_LABELS[m], "value": m} for m in _SIM_METRIC_ORDER],
+                         value=list(_SIM_METRIC_ORDER), multi=True, placeholder="Metrics…",
+                         persistence=True, persistence_type="session",
+                         style={"flex": 1, "minWidth": 220, "marginLeft": 8}),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _sim_perf_table(subset, labels, horizons, metrics):
+    """One IC-category's simulated-performance DataTable, limited to the chosen
+    horizons × metrics (IC/win/ret/n)."""
+    horizons = [h for h in _SIM_HORIZONS if h in horizons] or list(_SIM_HORIZONS)
+    metrics = [m for m in _SIM_METRIC_ORDER if m in metrics] or list(_SIM_METRIC_ORDER)
+    rows = []
+    for _, r in subset.iterrows():
+        row = {"method": labels.get(r["method"], r["method"]), "views": int(r["views"])}
+        for lbl in horizons:
+            for m in metrics:
+                cid = _SIM_METRIC_SPECS[m][1].format(lbl)
+                v = r.get(cid)
+                if m == "n":
+                    row[cid] = int(v) if pd.notna(v) else 0
+                else:
+                    row[cid] = round(float(v), 3) if pd.notna(v) else None
+        rows.append(row)
+    cols = [{"name": "Method", "id": "method"},
+            {"name": "Trades", "id": "views", "type": "numeric", "format": _INT}]
+    for lbl in horizons:
+        for m in metrics:
+            name_t, id_t, fmt = _SIM_METRIC_SPECS[m]
+            cols.append({"name": name_t.format(lbl), "id": id_t.format(lbl),
+                         "type": "numeric", "format": fmt})
+    cond = []
+    for lbl in horizons:
+        if "win" in metrics:
+            wc = f"win_{lbl}"
+            cond += [
+                {"if": {"filter_query": f"{{{wc}}} >= 50", "column_id": wc},
+                 "color": figures.POS, "fontWeight": "bold"},
+                {"if": {"filter_query": f"{{{wc}}} < 50", "column_id": wc},
+                 "color": figures.NEG, "fontWeight": "bold"},
+            ]
+        for mc in ("ic", "ret"):
+            if mc in metrics:
+                c = f"{mc}_{lbl}"
+                cond += [
+                    {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c}, "color": figures.POS},
+                    {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": figures.NEG},
+                ]
+    return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
+
+
+def _simulated_perf_section(window_days, sel_horizons=None, sel_metrics=None):
+    """Per-method directional win rate + IC + gross return over ALL scored tickers
+    (the simulated_trades panel), grouped by the same IC categories. The
+    horizons/metrics selections trim every category table's columns."""
+    from src.performance.tracker import METHOD_LABELS
+    from src.analysis.signal_panel import IC_CATEGORY_ORDER
+    sel_horizons = sel_horizons or list(_SIM_HORIZONS)
+    sel_metrics = sel_metrics or list(_SIM_METRIC_ORDER)
+    df = data.simulated_method_perf(days=window_days)
+    heading = _h3("Simulated single-method performance — all scored tickers", _SIM_PERF_TOOLTIP)
+    if df is None or getattr(df, "empty", True):
+        return html.Div([
+            heading,
+            html.Div("No simulated single-method trades with forward returns yet. They "
+                     "accrue every run; materialise existing history with "
+                     "`python -m src.analysis.simulated_trades --backfill`.",
+                     style={"color": "#6b7280"}),
+        ])
+    labels = dict(METHOD_LABELS)
+    labels["combined_score"] = "All methods (combined)"
+    children = [heading]
+    has_cat = "category" in df.columns
+    for category in IC_CATEGORY_ORDER:
+        subset = df[df["category"] == category] if has_cat else df
+        if subset is None or subset.empty:
+            continue
+        children.append(html.Div(category, style={
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}))
+        children.append(_sim_perf_table(subset, labels, sel_horizons, sel_metrics))
+        if not has_cat:
+            break
+    return html.Div(children)
+
+
 def _methods_tab():
     # The LLM-models-used table is run-based (not trade-windowed), so it lives
     # outside the windowed body. The per-method performance section (bar + table)
@@ -681,6 +881,9 @@ def _methods_tab():
     return html.Div([
         _window_toggle("methods-window"),
         _session_toggle("methods-session"),
+        _direction_toggle("methods-direction"),
+        _method_source_toggle("methods-source"),
+        _sim_column_filters(),
         dcc.Loading(html.Div(id="methods-body")),
         _safe(_ic_section),
         _h3("LLM models used (synthesis & sentiment)",
@@ -690,15 +893,26 @@ def _methods_tab():
 
 
 @app.callback(Output("methods-body", "children"),
-              Input("methods-window", "value"), Input("methods-session", "value"))
-def _methods_body(window_value, session_value):
-    return _safe(lambda: _methods_perf_section(_window_days(window_value), _session_value(session_value)))
+              Input("methods-window", "value"), Input("methods-session", "value"),
+              Input("methods-direction", "value"), Input("methods-source", "value"),
+              Input("sim-horizons", "value"), Input("sim-metrics", "value"))
+def _methods_body(window_value, session_value, direction_value, source_value,
+                  sim_horizons, sim_metrics):
+    if source_value == "panel":
+        # All scored tickers — run-based; honors the window (by signal date) and
+        # the Horizons/Metrics column pickers, ignores session/direction (the
+        # panel has no per-session split and the method's sign already IS its
+        # direction).
+        return _safe(lambda: _simulated_perf_section(_window_days(window_value),
+                                                     sim_horizons, sim_metrics))
+    return _safe(lambda: _methods_perf_section(_window_days(window_value), _session_value(session_value),
+                                               _direction_value(direction_value)))
 
 
-def _calibration_block(window_days, session):
+def _calibration_block(window_days, session, direction=None):
     """Confidence-calibration buckets + slope (item #2) — the formal summary of
     the return-vs-confidence scatter above it."""
-    cal = data.confidence_calibration(window_days, session)
+    cal = data.confidence_calibration(window_days, session, direction)
     rows = [{"bucket": b["label"], "trades": b["trades"], "win": b["win_rate"],
              "avg": b["avg_return"], "median": b["median_return"], "wtd": b["wtd_avg_return"],
              "best": b["best"], "worst": b["worst"]} for b in (cal.get("buckets") or [])]
@@ -729,8 +943,8 @@ def _calibration_block(window_days, session):
     ])
 
 
-def _methods_perf_section(window_days, session=None):
-    perf = data.performance(window_days=window_days, session=session)
+def _methods_perf_section(window_days, session=None, direction=None):
+    perf = data.performance(window_days=window_days, session=session, direction=direction)
     solo = perf.get("solo_method_perf") or {}
     labels = perf.get("method_labels") or {}
     order = perf.get("method_order_by_winrate") or list(solo.keys())
@@ -822,7 +1036,7 @@ def _methods_perf_section(window_days, session=None):
             "the sizing is justified; a flat or downward line means confidence isn't carrying directional information. Respects the "
             "window + session toggles above."),
         dcc.Graph(figure=figures.confidence_return_fig(perf)),
-        _calibration_block(window_days, session),
+        _calibration_block(window_days, session, direction),
         _h3("Macro evaluation — decision layers (LLM synthesis vs aggregator vs bundles)",
             "Head-to-head performance of the aggregated decision layers, all scored on the SAME unbiased basis: "
             "every directional call each layer made — not just the few that became trades — entered at the call-time "
@@ -964,17 +1178,18 @@ def _returns_tab():
         _source_toggle("returns-source"),
         _window_toggle("returns-window"),
         _session_toggle("returns-session"),
+        _direction_toggle("returns-direction"),
         dcc.Loading(html.Div(id="returns-body")),
     ])
 
 
 @app.callback(Output("returns-body", "children"),
               Input("returns-window", "value"), Input("returns-session", "value"),
-              Input("returns-source", "value"))
-def _returns_body(window_value, session_value, source_value):
+              Input("returns-direction", "value"), Input("returns-source", "value"))
+def _returns_body(window_value, session_value, direction_value, source_value):
     if (source_value or "sim") == "broker":
-        return _safe(lambda: _broker_returns_section(window_value, session_value))
-    return _safe(lambda: _returns_section(window_value, session_value))
+        return _safe(lambda: _broker_returns_section(window_value, session_value, direction_value))
+    return _safe(lambda: _returns_section(window_value, session_value, direction_value))
 
 
 @app.callback(Output("returns-review-plot", "children"),
@@ -1001,7 +1216,7 @@ def _returns_review_plot(open_cell, closed_cell):
     return _safe(lambda: _review_timeline_section(ticker))
 
 
-def _broker_returns_section(window_value, session_value=None):
+def _broker_returns_section(window_value, session_value=None, direction_value=None):
     """The IBKR view: what actually executed, at actual prices and commissions.
     Dollar P&L leads — real fills have real notionals, so percentages alone
     hide sizing. No modeled costs anywhere in this view."""
@@ -1016,6 +1231,10 @@ def _broker_returns_section(window_value, session_value=None):
     sess = _session_value(session_value)
     if sess:
         trades = [t for t in trades if (t.get("entry_session") or "rth") == sess]
+    dirn = _direction_value(direction_value)
+    if dirn:
+        want = "BUY" if dirn == "long" else "SELL"
+        trades = [t for t in trades if (t.get("action") or "").upper() == want]
     if not trades:
         return html.Div(
             "No IBKR fills recorded in this window yet — either broker_mode is "
@@ -1067,10 +1286,11 @@ def _broker_returns_section(window_value, session_value=None):
     ])
 
 
-def _exit_quality_block(window_value, session_value):
+def _exit_quality_block(window_value, session_value, direction_value=None):
     """MFE/MAE exit-quality (item #5). Sim-ledger only — the excursion fields are
     maintained on the simulated trade, not the broker view."""
-    rep = data.exit_quality(_window_days(window_value), _session_value(session_value))
+    rep = data.exit_quality(_window_days(window_value), _session_value(session_value),
+                            _direction_value(direction_value))
     heading = _h3("Exit quality — MFE / MAE",
                   "Where the exit landed inside each trade's own MFE→MAE range. Exit "
                   "placement 1.0 = sold at the peak; 0.0 = cut at the worst point. Capture "
@@ -1118,8 +1338,9 @@ def _exit_quality_block(window_value, session_value):
     ])
 
 
-def _returns_section(window_value, session_value=None):
-    perf = data.performance(window_days=_window_days(window_value), session=_session_value(session_value))
+def _returns_section(window_value, session_value=None, direction_value=None):
+    perf = data.performance(window_days=_window_days(window_value), session=_session_value(session_value),
+                            direction=_direction_value(direction_value))
     stats = perf.get("stats") or {}
     pm = perf.get("portfolio_metrics") or {}
     wlabel = _window_label(window_value)
@@ -1164,7 +1385,7 @@ def _returns_section(window_value, session_value=None):
         _trades_table(perf.get("open_trades") or [], table_id="returns-open-table"),
         _h3("Closed trades", "Realised round-trips, with their final spread-adjusted return. Filtered to the selected entry window. Click a row to chart that ticker's confidence-over-time below."),
         _trades_table(perf.get("closed_trades") or [], table_id="returns-closed-table"),
-        _exit_quality_block(window_value, session_value),
+        _exit_quality_block(window_value, session_value, direction_value),
         dcc.Loading(html.Div(id="returns-review-plot", style={"marginTop": 16})),
     ])
 

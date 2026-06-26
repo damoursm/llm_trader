@@ -210,6 +210,7 @@ _REC_COLS = [
     "rec_id", "run_id", "generated_at", "ticker", "type", "direction", "action",
     "confidence", "time_horizon", "rationale", "actionable", "dominant_method",
     "methods_agreeing", "contributing_scores", "llm_provider",
+    "target_horizon", "horizon_net_edge_pct",
 ]
 
 
@@ -237,6 +238,8 @@ def insert_recommendations(recs: List[dict]) -> None:
             _json(r.get("methods_agreeing")),
             _json(r.get("contributing_scores")),
             r.get("llm_provider"),
+            r.get("target_horizon"),
+            _f(r.get("horizon_net_edge_pct")),
         ))
     placeholders = ", ".join(["?"] * len(_REC_COLS))
     with connect() as conn:
@@ -290,6 +293,43 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
         conn.execute("DELETE FROM signals WHERE run_id = ?", [run_id])
         conn.executemany(
             f"INSERT INTO signals ({', '.join(_SIGNAL_COLS)}) VALUES ({placeholders})",
+            out,
+        )
+        conn.execute("COMMIT")
+
+
+# ── simulated single-method trades (long-format reshape of `signals`) ──────
+
+_SIM_TRADE_COLS = [
+    "run_id", "generated_at", "signal_date", "ticker", "method",
+    "score", "direction", "entry_price",
+]
+
+
+def insert_simulated_trades(run_id: str, generated_at: str, signal_date: str,
+                            rows: List[dict]) -> None:
+    """Persist one row per (ticker, method) that had a non-zero score this run.
+
+    The long-format counterpart to ``insert_signals`` (which stores the same
+    scores WIDE, one column per method). Each row records the method's implied
+    side — BUY when score>0, SELL when score<0 — at the decision-time price, so a
+    single method's directional accuracy can be measured over EVERY scored ticker
+    (not just the gate-selected few that became real trades). Idempotent per
+    ``run_id``. Each ``rows`` dict carries ticker/method/score/direction/entry_price.
+    """
+    if not rows:
+        return
+    out = [(
+        run_id, generated_at, signal_date,
+        r.get("ticker"), r.get("method"),
+        _f(r.get("score")), r.get("direction"), _f(r.get("entry_price")),
+    ) for r in rows]
+    placeholders = ", ".join(["?"] * len(_SIM_TRADE_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM simulated_trades WHERE run_id = ?", [run_id])
+        conn.executemany(
+            f"INSERT INTO simulated_trades ({', '.join(_SIM_TRADE_COLS)}) VALUES ({placeholders})",
             out,
         )
         conn.execute("COMMIT")

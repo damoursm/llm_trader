@@ -23,6 +23,15 @@ signals             — the full per-ticker signal cross-section of EVERY run (n
                       news/options inputs can't be reconstructed historically, so
                       forward collection here is the only path to a
                       backtest-quality dataset.
+simulated_trades    — the LONG-format reshape of `signals`: one row per
+                      (run, ticker, method) with a non-zero score, carrying the
+                      method's implied side (BUY if score>0 else SELL) + entry
+                      price. Lets every single method be evaluated as if it alone
+                      decided the trade — its directional win rate over ALL scored
+                      tickers, even when the synthesized recommendation went the
+                      other way. Outcomes (forward returns at 30m/1d/3d/1w/2w/1m)
+                      are computed on demand from cache/ohlcv (they are future
+                      data, never knowable at write time).
 """
 
 from __future__ import annotations
@@ -121,7 +130,9 @@ SCHEMA_STATEMENTS = [
         dominant_method      VARCHAR,
         methods_agreeing     VARCHAR,
         contributing_scores  VARCHAR,
-        llm_provider         VARCHAR
+        llm_provider         VARCHAR,
+        target_horizon       VARCHAR,
+        horizon_net_edge_pct DOUBLE
     );
     """,
     """
@@ -242,6 +253,18 @@ SCHEMA_STATEMENTS = [
         sentiment_model   VARCHAR
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS simulated_trades (
+        run_id        VARCHAR,
+        generated_at  VARCHAR,
+        signal_date   VARCHAR,
+        ticker        VARCHAR,
+        method        VARCHAR,
+        score         DOUBLE,
+        direction     VARCHAR,
+        entry_price   DOUBLE
+    );
+    """,
 ]
 
 
@@ -259,6 +282,9 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_TIMEFRAME_COLUMNS),
     # Fundamentals factor diagnostic columns on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_FUNDAMENTAL_COLUMNS),
+    # Horizon synthesis on an existing recommendations table.
+    ("recommendations", "target_horizon", "VARCHAR"),
+    ("recommendations", "horizon_net_edge_pct", "DOUBLE"),
 )
 
 
