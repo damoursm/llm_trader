@@ -222,6 +222,96 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
     return out.sort_values("views", ascending=False).reset_index(drop=True)
 
 
+# ── direction-conditional, market-neutral skill (for the shadow edge curve) ─
+
+def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
+                             benchmark: str = "SPY", dedupe: str = "last",
+                             sim_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Per-(method, side) MARKET-RELATIVE skill at each horizon.
+
+    Splits every simulated solo trade by side (``bull`` = score>0, ``bear`` =
+    score<0, plus a pooled ``both``) and scores it on returns NET OF the benchmark's
+    same-horizon move (``ticker_fwd − benchmark_fwd``), so market drift can't make
+    one side look skilful. Per (method, side, horizon): ``n_H`` obs, ``hit_H`` =
+    % of that side's calls that BEAT the market in the traded direction, ``yield_H``
+    = mean market-relative return in the traded direction (%), ``ic_H`` =
+    Spearman(score, market-relative return). The basis for the direction-aware
+    shadow edge curve. Below ``min_n`` a cell reports NaN."""
+    df = sim_df if sim_df is not None else load_sim_trades(days)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if dedupe == "last" and "generated_at" in df.columns:
+        df = (df.sort_values("generated_at")
+                .groupby(["signal_date", "ticker", "method"], as_index=False).tail(1))
+    df["sigd"] = df["signal_date"].map(date.fromisoformat)
+
+    tickers = df["ticker"].unique()
+    daily = {tk: _daily_series(tk) for tk in tickers}
+    intra: Dict[str, list] = {}
+    b_dates, b_closes = _daily_series(benchmark)
+    b_intra = _intraday_series(benchmark)
+
+    d_fwd: dict = {}; i_fwd: dict = {}; bd_fwd: dict = {}; bi_fwd: dict = {}
+    acc: Dict[tuple, Dict[str, Dict[str, list]]] = defaultdict(
+        lambda: {lbl: {"s": [], "m": []} for lbl in HORIZON_LABELS})
+
+    for row in df.itertuples(index=False):
+        tk, sc, method, sigd, gen = (row.ticker, row.score, row.method, row.sigd, row.generated_at)
+        side = "bull" if sc > 0 else "bear"
+        dts, cls = daily.get(tk, ([], {}))
+        for lbl, interval, steps in HORIZONS:
+            if interval == "30m":
+                k = (tk, gen, steps)
+                if k not in i_fwd:
+                    if tk not in intra:
+                        intra[tk] = _intraday_series(tk)
+                    i_fwd[k] = _fwd_intraday(intra[tk], gen, steps)
+                fwd = i_fwd[k]
+                bk = (gen, steps)
+                if bk not in bi_fwd:
+                    bi_fwd[bk] = _fwd_intraday(b_intra, gen, steps)
+                bfwd = bi_fwd[bk]
+            else:
+                k = (tk, sigd, steps)
+                if k not in d_fwd:
+                    d_fwd[k] = _fwd_daily(dts, cls, sigd, steps)
+                fwd = d_fwd[k]
+                bk = (sigd, steps)
+                if bk not in bd_fwd:
+                    bd_fwd[bk] = _fwd_daily(b_dates, b_closes, sigd, steps)
+                bfwd = bd_fwd[bk]
+            if fwd is None or bfwd is None:
+                continue                      # need both legs to neutralise the market
+            mktrel = fwd - bfwd
+            for s in (side, "both"):
+                cell = acc[(method, s)][lbl]
+                cell["s"].append(sc)
+                cell["m"].append(mktrel)
+
+    rows = []
+    for (method, side), by_h in acc.items():
+        rec: dict = {"method": method, "side": side}
+        for lbl in HORIZON_LABELS:
+            s_list, m_list = by_h[lbl]["s"], by_h[lbl]["m"]
+            n = len(m_list)
+            rec[f"n_{lbl}"] = n
+            if n >= min_n:
+                # signed = market-relative return in the method's TRADED direction
+                signed = [m if s > 0 else -m for s, m in zip(s_list, m_list)]
+                wins = sum(1 for x in signed if x > 0)
+                ic = _spearman(pd.Series(s_list), pd.Series(m_list))
+                rec[f"hit_{lbl}"] = round(wins / n * 100, 1)
+                rec[f"yield_{lbl}"] = round(sum(signed) / n, 4)
+                rec[f"ic_{lbl}"] = round(ic, 3) if ic is not None else None
+            else:
+                rec[f"hit_{lbl}"] = None
+                rec[f"yield_{lbl}"] = None
+                rec[f"ic_{lbl}"] = None
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
 # ── backfill (reshape existing signals → simulated_trades) ─────────────────
 
 def backfill_from_signals() -> int:

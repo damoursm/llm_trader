@@ -101,8 +101,102 @@ def get_ic_matrix(days: Optional[int] = None, min_n: Optional[int] = None,
 
 
 def reset_cache() -> None:
-    """Drop the cached IC matrix (tests / forced refresh)."""
+    """Drop the cached IC matrices (tests / forced refresh)."""
     _ic_cache.clear()
+    _dir_cache.clear()
+
+
+# Cache the heavy direction-conditional matrix (separate from the pooled one).
+_dir_cache: dict = {}
+
+
+def get_directional_ic_matrix(days: Optional[int] = None, min_n: Optional[int] = None,
+                              ) -> Dict[str, Dict[str, Dict[str, Tuple[float, float, int]]]]:
+    """``{method: {horizon: {"bull"|"bear"|"both": (skill, mkt_rel_yield, n)}}}``.
+
+    From ``simulated_trades.compute_directional_perf`` (market-relative, split by
+    side). ``skill = 2·(market-relative hit% / 100 − 0.5)`` ∈ [-1, 1] — 0 at a
+    market coin-flip (drift removed), +1 if the side's calls always beat the
+    market, negative if they lose (→ the side gets flipped). Cached like the pooled
+    matrix. Returns ``{}`` when the panel has no usable directional skill yet."""
+    days = settings.horizon_ic_days if days is None else days
+    min_n = settings.horizon_ic_min_n if min_n is None else min_n
+    key = (days, min_n)
+    now = time.time()
+    hit = _dir_cache.get(key)
+    if hit and (now - hit["ts"]) < settings.horizon_ic_cache_seconds:
+        return hit["matrix"]
+
+    matrix: Dict[str, Dict[str, Dict[str, Tuple[float, float, int]]]] = {}
+    try:
+        from src.analysis.simulated_trades import compute_directional_perf
+        df = compute_directional_perf(days=days, min_n=min_n,
+                                      benchmark=settings.horizon_market_benchmark)
+        if df is not None and not df.empty:
+            for _, r in df.iterrows():
+                method, side = str(r["method"]), str(r["side"])
+                for h in HORIZON_LABELS:
+                    hitpct = _num(r.get(f"hit_{h}"))
+                    yld = _num(r.get(f"yield_{h}"))
+                    n = _num(r.get(f"n_{h}"))
+                    if hitpct is None or yld is None:
+                        continue
+                    skill = 2.0 * (hitpct / 100.0 - 0.5)
+                    (matrix.setdefault(method, {}).setdefault(h, {})
+                        [side]) = (skill, yld, int(n or 0))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"[edge_curve] directional matrix unavailable ({e}) — shadow curve idle")
+    _dir_cache[key] = {"ts": now, "matrix": matrix}
+    return matrix
+
+
+def compute_directional_edge_curve(scores: Dict[str, float],
+                                   dmatrix: Dict[str, Dict[str, Dict[str, Tuple[float, float, int]]]],
+                                   cost_hurdle_pct: Optional[float] = None,
+                                   prior_n: Optional[int] = None) -> Dict[str, dict]:
+    """Direction-aware, MARKET-NEUTRAL edge curve.
+
+    For each method, the side matching the live score's sign (bull/bear) is used,
+    its per-side skill SHRUNK toward the method's both-sides skill by sample size
+    (the thin per-side estimate borrows strength from the pooled one — still a
+    measured prior, not a static weight). ``edge``/``exp_gross``/``net`` mirror the
+    pooled curve but on market-relative yields, so ``net`` is alpha over the market
+    net of cost."""
+    hurdle = float(settings.horizon_cost_hurdle_pct if cost_hurdle_pct is None else cost_hurdle_pct)
+    prior_n = int(settings.horizon_dir_shrink_prior_n if prior_n is None else prior_n)
+    out: Dict[str, dict] = {}
+    for h in HORIZON_LABELS:
+        w_num = w_den = a_num = a_den = 0.0
+        for method, s in scores.items():
+            if not s:
+                continue
+            cells = dmatrix.get(method, {}).get(h)
+            if not cells:
+                continue
+            side = "bull" if s > 0 else "bear"
+            side_cell, both_cell = cells.get(side), cells.get("both")
+            if side_cell is None and both_cell is None:
+                continue
+            if side_cell is not None:
+                skill, yld, n = side_cell
+                if both_cell is not None:           # shrink toward the both-sides skill
+                    b_skill, b_yld, _bn = both_cell
+                    denom = n + prior_n
+                    if denom > 0:
+                        skill = (n * skill + prior_n * b_skill) / denom
+                        yld = (n * yld + prior_n * b_yld) / denom
+            else:
+                skill, yld, n = both_cell
+            w_num += skill * s
+            w_den += abs(skill)
+            a = abs(skill * s)
+            a_num += a * (yld if skill >= 0 else -yld)   # sign-corrected market-rel yield
+            a_den += a
+        edge = (w_num / w_den) if w_den > 1e-12 else 0.0
+        exp_gross = (a_num / a_den) if a_den > 1e-12 else 0.0
+        out[h] = {"edge": round(edge, 4), "exp_gross": round(exp_gross, 4),
+                  "net": round(exp_gross - hurdle, 4)}
+    return out
 
 
 def compute_edge_curve(scores: Dict[str, float],
@@ -163,6 +257,7 @@ def select_horizon(curve: Dict[str, dict]) -> dict:
         "direction": direction,
         "conviction": round(abs(c["edge"]), 4),
         "net_edge_pct": c["net"],
+        "expected_move_pct": c["exp_gross"],   # gross expected FAVOURABLE move (magnitude, pre-cost)
         "tradeable": tradeable,
     }
 
@@ -185,3 +280,37 @@ def cap_horizon(mechanical_h: str, llm_bucket: Optional[str]) -> str:
 def horizon_hours(h: str) -> Optional[float]:
     """Wall-clock duration of a horizon label, or None if unknown/empty."""
     return HORIZON_HOURS.get(h)
+
+
+# ── Expected-move / market-aligned upside ranking ──────────────────────────
+
+def market_direction_from_regime(regime: Optional[str]) -> str:
+    """Map a macro-regime label to a coarse market direction: UP | DOWN | NEUTRAL.
+    The regime layer owns the market call (alpha/beta split) — selection only
+    amplifies in the direction the regime already chose."""
+    r = (regime or "").upper()
+    if r == "RISK_ON":
+        return "UP"
+    if r in ("RISK_OFF", "PANIC"):
+        return "DOWN"
+    return "NEUTRAL"
+
+
+def market_alignment(position_direction, market_direction: str) -> str:
+    """``aligned`` | ``counter`` | ``neutral`` — does the position lean with the
+    regime? (A long in a risk-on regime is aligned — beta is a tailwind.)"""
+    pos = str(getattr(position_direction, "value", position_direction) or "").upper()
+    if market_direction == "NEUTRAL" or pos not in ("BULLISH", "BEARISH"):
+        return "neutral"
+    is_long = pos == "BULLISH"
+    if (is_long and market_direction == "UP") or (not is_long and market_direction == "DOWN"):
+        return "aligned"
+    return "counter"
+
+
+def upside_score(conviction: float, expected_move_pct: float, alignment: str) -> float:
+    """The selection rank key — probability (≈conviction) × magnitude (expected
+    FAVOURABLE move %) × alignment factor. Picks the biggest expected move in the
+    regime's direction; a counter-regime position is haircut (soft, not banned)."""
+    factor = float(settings.horizon_counter_market_mult) if alignment == "counter" else 1.0
+    return round(max(0.0, conviction) * max(0.0, expected_move_pct) * factor, 5)

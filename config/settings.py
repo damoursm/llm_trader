@@ -666,6 +666,33 @@ class Settings(BaseSettings):
     # independently of the horizon assignment + dashboard.
     enable_horizon_matched_exit: bool = True
     horizon_expiry_floor_mult: float = 1.5
+
+    # ── Direction-aware, market-neutral edge curve (SHADOW MODE) ───────────
+    # A second edge curve that weights each method by its DIRECTION-CONDITIONAL,
+    # MARKET-RELATIVE skill: a method's bullish calls and bearish calls are scored
+    # separately (some methods are reliable one way only), on returns net of SPY's
+    # same-horizon move (so market drift can't masquerade as directional skill).
+    # Per-side skill = 2·(market-relative hit rate − 0.5), shrunk toward the
+    # method's both-sides skill by sample size. SHADOW ONLY — it is computed,
+    # persisted, and shown on the dashboard next to the live (pooled) horizon, but
+    # does NOT drive entries or exits, so it can be validated against outcomes
+    # before promotion.
+    enable_directional_shadow: bool = True
+    horizon_dir_shrink_prior_n: int = 30   # virtual both-sides obs the per-side skill shrinks toward
+    horizon_market_benchmark: str = "SPY"  # market leg subtracted to neutralise drift
+
+    # ── Expected-move / market-aligned upside ranking ──────────────────────
+    # Selection should favour the names with the biggest EXPECTED FAVOURABLE MOVE
+    # (probability × magnitude) in the MARKET's direction: when the regime is
+    # risk-on, the highest-upside longs; when risk-off, the biggest-downside shorts
+    # (beta as a deliberate tailwind, decided by the regime layer — not the
+    # drift-contaminated stock skill). expected_move = the edge curve's gross
+    # expected favourable return at the target horizon; upside = conviction ×
+    # expected_move × an alignment factor. SOFT: counter-market candidates are
+    # haircut, not banned. Fed to the synthesis prompt + persisted; does not change
+    # the actionable gate mechanics.
+    enable_expected_move_ranking: bool = True
+    horizon_counter_market_mult: float = 0.5   # upside haircut for a position fighting the regime
     # 0 = attempt every ticker (full coverage). A positive cap throttles the fetch;
     # only needed on the yfinance fallback path (≤60d history, per-IP 429s) — the
     # Massive/Polygon Advanced plan is unlimited-rate, so leave at 0 when configured.
@@ -940,6 +967,18 @@ class Settings(BaseSettings):
     # In "observe" mode it only shapes the persisted `actionable` flag; in
     # "trade" mode it directly gates which extended signals become positions.
     extended_confidence_bump: float = 0.06
+
+    # ── Aggregator-agreement entry gate (combined_score) ───────────────────
+    # A trade is accepted ONLY when BOTH decision-makers endorse it: the synthesis
+    # (the LLM produced a BUY/SELL above the confidence threshold) AND the
+    # aggregator (its weighted combined_score points the SAME way with at least
+    # this magnitude). Prevents the LLM from opening a position the underlying
+    # weighted methods don't support. Empirically accepted trades cluster at
+    # |combined_score| 0.20–0.46 in their direction (none have ever opposed), so the
+    # default is a floor that catches future weak/contradicted calls without
+    # blocking well-formed ones — raise it to demand stronger method agreement.
+    enable_combined_score_gate: bool = True
+    min_combined_score_for_entry: float = 0.15
     # Position-size multiplier applied ON TOP of the confidence tier and the
     # correlation haircut for trades ENTERED outside RTH. Extended books are
     # thin and the modeled spread 4× wider, so pre-prod sizes off-hours

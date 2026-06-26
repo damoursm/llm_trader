@@ -390,6 +390,17 @@ def generate_recommendations(
                 f"(conviction {s.horizon_conviction:.2f}){_tradeable}. Set time_horizon to CONFIRM "
                 f"or SHORTEN this — never longer than {s.horizon_label}."
             )
+            if settings.enable_expected_move_ranking and getattr(s, "expected_move_pct", 0.0):
+                _alnote = {
+                    "aligned": "WITH the market regime (beta tailwind — favour these)",
+                    "counter": "AGAINST the market regime (beta headwind — needs a stronger stock-specific edge to justify)",
+                    "neutral": "market regime neutral",
+                }.get(getattr(s, "market_aligned", "") or "neutral", "market regime neutral")
+                parts.append(
+                    f"  EXPECTED MOVE: ~{s.expected_move_pct:+.2f}% favourable at {s.target_horizon} "
+                    f"(upside rank {s.upside_score:.3f}), {_alnote}. Prioritise the names with the "
+                    f"largest expected favourable move in the market's direction."
+                )
         if use_news:
             parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
         if getattr(s, "ext_gap_score", 0.0):

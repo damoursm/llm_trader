@@ -132,7 +132,13 @@ SCHEMA_STATEMENTS = [
         contributing_scores  VARCHAR,
         llm_provider         VARCHAR,
         target_horizon       VARCHAR,
-        horizon_net_edge_pct DOUBLE
+        horizon_net_edge_pct DOUBLE,
+        shadow_target_horizon       VARCHAR,
+        shadow_direction            VARCHAR,
+        shadow_horizon_net_edge_pct DOUBLE,
+        expected_move_pct           DOUBLE,
+        market_aligned              VARCHAR,
+        upside_score                DOUBLE
     );
     """,
     """
@@ -285,6 +291,14 @@ _ADD_COLUMNS = (
     # Horizon synthesis on an existing recommendations table.
     ("recommendations", "target_horizon", "VARCHAR"),
     ("recommendations", "horizon_net_edge_pct", "DOUBLE"),
+    # Direction-aware market-neutral shadow horizon.
+    ("recommendations", "shadow_target_horizon", "VARCHAR"),
+    ("recommendations", "shadow_direction", "VARCHAR"),
+    ("recommendations", "shadow_horizon_net_edge_pct", "DOUBLE"),
+    # Expected-move / market-aligned upside ranking.
+    ("recommendations", "expected_move_pct", "DOUBLE"),
+    ("recommendations", "market_aligned", "VARCHAR"),
+    ("recommendations", "upside_score", "DOUBLE"),
 )
 
 

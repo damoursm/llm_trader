@@ -76,3 +76,36 @@ def test_horizon_hours_known():
     assert ec.horizon_hours("6h") == 6.0
     assert ec.horizon_hours("1w") == 168.0
     assert ec.horizon_hours("nonsense") is None
+
+
+def test_select_horizon_returns_expected_move(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "horizon_min_conviction", 0.05)
+    sel = ec.select_horizon({"1d": {"edge": 0.30, "exp_gross": 0.70, "net": 0.30}})
+    assert sel["expected_move_pct"] == pytest.approx(0.70)   # gross favourable move (pre-cost)
+
+
+def test_market_direction_from_regime():
+    assert ec.market_direction_from_regime("RISK_ON") == "UP"
+    assert ec.market_direction_from_regime("RISK_OFF") == "DOWN"
+    assert ec.market_direction_from_regime("PANIC") == "DOWN"
+    assert ec.market_direction_from_regime("CAUTION") == "NEUTRAL"
+    assert ec.market_direction_from_regime(None) == "NEUTRAL"
+
+
+def test_market_alignment():
+    assert ec.market_alignment("BULLISH", "UP") == "aligned"     # long into risk-on
+    assert ec.market_alignment("BEARISH", "DOWN") == "aligned"   # short into risk-off
+    assert ec.market_alignment("BULLISH", "DOWN") == "counter"
+    assert ec.market_alignment("BEARISH", "UP") == "counter"
+    assert ec.market_alignment("BULLISH", "NEUTRAL") == "neutral"
+    assert ec.market_alignment("NEUTRAL", "UP") == "neutral"
+
+
+def test_upside_score_probability_times_magnitude(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "horizon_counter_market_mult", 0.5)
+    assert ec.upside_score(0.5, 1.0, "aligned") == pytest.approx(0.5)   # conviction × move
+    assert ec.upside_score(0.5, 1.0, "neutral") == pytest.approx(0.5)
+    assert ec.upside_score(0.5, 1.0, "counter") == pytest.approx(0.25)  # haircut
+    assert ec.upside_score(0.5, -1.0, "aligned") == 0.0                 # no negative upside

@@ -306,6 +306,12 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "llm_provider": rec_llm,
                 "target_horizon": getattr(_hsig, "target_horizon", "") if _hsig else "",
                 "horizon_net_edge_pct": float(getattr(_hsig, "horizon_net_edge_pct", 0.0) or 0.0) if _hsig else 0.0,
+                "shadow_target_horizon": getattr(_hsig, "shadow_target_horizon", "") if _hsig else "",
+                "shadow_direction": getattr(_hsig, "shadow_direction", "") if _hsig else "",
+                "shadow_horizon_net_edge_pct": float(getattr(_hsig, "shadow_horizon_net_edge_pct", 0.0) or 0.0) if _hsig else 0.0,
+                "expected_move_pct": float(getattr(_hsig, "expected_move_pct", 0.0) or 0.0) if _hsig else 0.0,
+                "market_aligned": getattr(_hsig, "market_aligned", "") if _hsig else "",
+                "upside_score": float(getattr(_hsig, "upside_score", 0.0) or 0.0) if _hsig else 0.0,
             })
 
         repo.insert_run({
@@ -1403,29 +1409,62 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         try:
             from src.signals import edge_curve
             ic_matrix = edge_curve.get_ic_matrix()
-            if ic_matrix:
-                n_tradeable = 0
+            dmatrix = (edge_curve.get_directional_ic_matrix()
+                       if settings.enable_directional_shadow else {})
+            if ic_matrix or dmatrix:
+                n_tradeable = n_shadow_flip = 0
+                # The regime layer owns the market direction (alpha/beta split);
+                # selection then amplifies the biggest expected move in that direction.
+                _mkt_dir = edge_curve.market_direction_from_regime(
+                    getattr(macro_regime_context, "regime", ""))
                 for _tk, _sig in signals_by_ticker.items():
                     _base = _method_scores_from_signal(_tk, _sig.direction, signals_by_ticker)
                     _scores = {**_base,
                                **(getattr(_sig, "timeframe_scores", None) or {}),
                                **(getattr(_sig, "fundamental_scores", None) or {}),
                                "combined_score": float(getattr(_sig, "combined_score", 0.0))}
-                    _curve = edge_curve.compute_edge_curve(_scores, ic_matrix)
-                    _sel = edge_curve.select_horizon(_curve)
-                    _sig.target_horizon = _sel["target_horizon"]
-                    _sig.horizon_label = _sel["horizon_label"]
-                    _sig.horizon_conviction = _sel["conviction"]
-                    _sig.horizon_net_edge_pct = _sel["net_edge_pct"]
-                    _sig.horizon_tradeable = _sel["tradeable"]
-                    _sig.horizon_curve = {h: c["net"] for h, c in _curve.items()}
-                    n_tradeable += int(_sel["tradeable"])
+                    # Live (pooled, gross) curve — drives target_horizon + matched exit.
+                    if ic_matrix:
+                        _curve = edge_curve.compute_edge_curve(_scores, ic_matrix)
+                        _sel = edge_curve.select_horizon(_curve)
+                        _sig.target_horizon = _sel["target_horizon"]
+                        _sig.horizon_label = _sel["horizon_label"]
+                        _sig.horizon_conviction = _sel["conviction"]
+                        _sig.horizon_net_edge_pct = _sel["net_edge_pct"]
+                        _sig.horizon_tradeable = _sel["tradeable"]
+                        _sig.horizon_curve = {h: c["net"] for h, c in _curve.items()}
+                        n_tradeable += int(_sel["tradeable"])
+                        # Expected favourable move (magnitude) + market-aligned upside
+                        # rank key — selection should prefer the biggest expected
+                        # mover in the regime's direction.
+                        _sig.expected_move_pct = _sel.get("expected_move_pct", 0.0)
+                        if settings.enable_expected_move_ranking:
+                            _align = edge_curve.market_alignment(_sig.direction, _mkt_dir)
+                            _sig.market_aligned = _align
+                            _sig.upside_score = edge_curve.upside_score(
+                                _sel["conviction"], _sel.get("expected_move_pct", 0.0), _align)
+                    # Shadow (direction-aware, market-neutral) curve — persisted +
+                    # displayed only; does NOT touch entries/exits.
+                    if dmatrix:
+                        _dcurve = edge_curve.compute_directional_edge_curve(_scores, dmatrix)
+                        _dsel = edge_curve.select_horizon(_dcurve)
+                        _sig.shadow_target_horizon = _dsel["target_horizon"]
+                        _sig.shadow_horizon_label = _dsel["horizon_label"]
+                        _sig.shadow_direction = _dsel["direction"]
+                        _sig.shadow_horizon_net_edge_pct = _dsel["net_edge_pct"]
+                        _sig.shadow_horizon_tradeable = _dsel["tradeable"]
+                        _sig.shadow_horizon_curve = {h: c["net"] for h, c in _dcurve.items()}
+                        _live_dir = str(getattr(_sig.direction, "value", _sig.direction)).upper()
+                        if _dsel["direction"] in ("BULLISH", "BEARISH") and _live_dir != _dsel["direction"]:
+                            n_shadow_flip += 1
                 logger.info(
                     f"[horizon] edge curve stamped on {len(signals_by_ticker)} ticker(s); "
-                    f"{n_tradeable} have a cost-clearing horizon "
-                    f"(IC matrix: {len(ic_matrix)} method(s))")
+                    f"{n_tradeable} cost-clearing"
+                    + (f"; shadow (dir/mkt-neutral) {len(dmatrix)} method(s), "
+                       f"{n_shadow_flip} direction disagreement(s)" if dmatrix else "")
+                    + f" (IC matrix: {len(ic_matrix)} method(s))")
             else:
-                logger.info("[horizon] IC matrix empty — horizon synthesis idle (panel still thin)")
+                logger.info("[horizon] IC matrices empty — horizon synthesis idle (panel still thin)")
         except Exception as e:
             logger.warning(f"[horizon] synthesis skipped ({type(e).__name__}: {e})")
 
@@ -1592,6 +1631,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     gate_diag: dict = {
         "buy_sell_candidates":          0,
         "dropped_below_threshold":      0,
+        "dropped_low_combined_score":   0,
         "dropped_buy_blocked":          0,
         "dropped_earnings_blackout":    0,
         "actionable_survivors":         0,

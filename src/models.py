@@ -1178,6 +1178,22 @@ class TickerSignal(BaseModel):
     horizon_net_edge_pct: float = 0.0      # net(target_horizon) = exp_gross − cost (%)
     horizon_tradeable: bool = True         # does any horizon clear the cost hurdle?
     horizon_curve: Dict[str, float] = Field(default_factory=dict)  # horizon -> net edge %
+    # Direction-aware, MARKET-NEUTRAL shadow curve (enable_directional_shadow) —
+    # each method weighted by its per-side (bull/bear) market-relative skill. SHADOW
+    # ONLY: persisted + shown next to the live horizon, never drives trades. The
+    # shadow direction can DIFFER from the live one (it flips a method that is
+    # anti-predictive on that side) — that disagreement is the thing to watch.
+    shadow_target_horizon: str = ""        # "30m".."1m" from the direction-aware curve
+    shadow_horizon_label: str = "N/A"      # SHORT-TERM | SWING | POSITION
+    shadow_direction: str = ""             # BULLISH | BEARISH | NEUTRAL (may differ from live)
+    shadow_horizon_net_edge_pct: float = 0.0   # market-relative net edge at the shadow horizon (%)
+    shadow_horizon_tradeable: bool = False
+    shadow_horizon_curve: Dict[str, float] = Field(default_factory=dict)  # horizon -> mkt-neutral net edge %
+    # Expected-move / market-aligned upside (enable_expected_move_ranking) — picks the
+    # names with the biggest expected FAVOURABLE move in the regime's direction.
+    expected_move_pct: float = 0.0         # gross expected favourable return at the target horizon (%)
+    market_aligned: str = ""               # aligned | counter | neutral (position vs regime direction)
+    upside_score: float = 0.0              # conviction × expected_move × alignment factor — the selection rank key
     sentiment_score: float      # -1.0 to +1.0  (news + all article-based sources; the LEVEL)
     # Sentiment velocity (Δsentiment, not level) — populated when enable_sentiment_velocity=true.
     # = recent-window news tone − prior-window news tone; the rate of change leads short-horizon moves.

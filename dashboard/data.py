@@ -44,6 +44,8 @@ def _retry(fn, what: str = ""):
 _REC_COLS = (
     "generated_at, ticker, type, direction, action, confidence, time_horizon, "
     "target_horizon, horizon_net_edge_pct, "
+    "shadow_target_horizon, shadow_direction, shadow_horizon_net_edge_pct, "
+    "expected_move_pct, market_aligned, upside_score, "
     "actionable, dominant_method, llm_provider, rationale"
 )
 

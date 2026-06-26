@@ -211,6 +211,8 @@ _REC_COLS = [
     "confidence", "time_horizon", "rationale", "actionable", "dominant_method",
     "methods_agreeing", "contributing_scores", "llm_provider",
     "target_horizon", "horizon_net_edge_pct",
+    "shadow_target_horizon", "shadow_direction", "shadow_horizon_net_edge_pct",
+    "expected_move_pct", "market_aligned", "upside_score",
 ]
 
 
@@ -240,6 +242,12 @@ def insert_recommendations(recs: List[dict]) -> None:
             r.get("llm_provider"),
             r.get("target_horizon"),
             _f(r.get("horizon_net_edge_pct")),
+            r.get("shadow_target_horizon"),
+            r.get("shadow_direction"),
+            _f(r.get("shadow_horizon_net_edge_pct")),
+            _f(r.get("expected_move_pct")),
+            r.get("market_aligned"),
+            _f(r.get("upside_score")),
         ))
     placeholders = ", ".join(["?"] * len(_REC_COLS))
     with connect() as conn:
