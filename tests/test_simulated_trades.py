@@ -175,6 +175,84 @@ def test_compute_method_perf_ic_spearman(monkeypatch):
     assert vwap[vwap.method == "vwap"].iloc[0]["ic_1d"] == pytest.approx(-1.0)
 
 
+def test_compute_method_perf_emits_icstd_and_icir(monkeypatch):
+    """icstd_<h>/icir_<h> = stdev & info-ratio of the PER-DAY IC. Three days with a
+    daily IC of +1 / -1 / +1 ⇒ std=1.1547, ICIR=0.289 (same fixture as the panel test)."""
+    from datetime import timedelta
+    import src.analysis.simulated_trades as st
+
+    def mkseries(base, pct):
+        nxt = base + timedelta(days=1)
+        return ([base, nxt], {base: 100.0, nxt: 100.0 * (1 + pct / 100.0)})
+
+    series = {
+        "A1": mkseries(date(2026, 6, 1), 1), "A2": mkseries(date(2026, 6, 1), 2),
+        "A3": mkseries(date(2026, 6, 1), 3),
+        "B1": mkseries(date(2026, 6, 2), 3), "B2": mkseries(date(2026, 6, 2), 2),
+        "B3": mkseries(date(2026, 6, 2), 1),
+        "C1": mkseries(date(2026, 6, 3), 1), "C2": mkseries(date(2026, 6, 3), 2),
+        "C3": mkseries(date(2026, 6, 3), 3),
+    }
+    monkeypatch.setattr(st, "_daily_series", lambda tk: series[tk])
+    monkeypatch.setattr(st, "_intraday_series", lambda tk: [])
+
+    rows = []
+    for day, tks in (("2026-06-01", ["A1", "A2", "A3"]),
+                     ("2026-06-02", ["B1", "B2", "B3"]),
+                     ("2026-06-03", ["C1", "C2", "C3"])):
+        for sc, tk in zip([0.1, 0.2, 0.3], tks):
+            rows.append({"generated_at": f"{day}T20:00", "signal_date": day, "ticker": tk,
+                         "method": "tech", "score": sc, "direction": "BUY"})
+    perf = st.compute_method_perf(sim_df=pd.DataFrame(rows), min_n=9,
+                                  min_per_day=3, min_days=3)
+    tech = perf[perf.method == "tech"].iloc[0]
+    assert tech["n_1d"] == 9
+    assert tech["icstd_1d"] == pytest.approx(1.1547, abs=1e-3)
+    assert tech["icir_1d"] == pytest.approx(0.289, abs=1e-3)
+    # Intraday horizons have no 30m data → IC and its confidence are unreported.
+    assert pd.isna(tech["icstd_3h"]) and pd.isna(tech["icir_3h"])
+
+
+def test_compute_directional_perf_emits_icstd_and_icir(monkeypatch):
+    """The market-neutral path also reports the per-day IC's stdev/ICIR — the
+    inversion readout. With a FLAT benchmark, market-relative return == raw return,
+    so the per-day ICs are again +1 / -1 / +1 ⇒ std=1.1547, ICIR=0.289."""
+    from datetime import timedelta
+    import src.analysis.simulated_trades as st
+
+    def mkseries(base, pct):
+        nxt = base + timedelta(days=1)
+        return ([base, nxt], {base: 100.0, nxt: 100.0 * (1 + pct / 100.0)})
+
+    series = {
+        "A1": mkseries(date(2026, 6, 1), 1), "A2": mkseries(date(2026, 6, 1), 2),
+        "A3": mkseries(date(2026, 6, 1), 3),
+        "B1": mkseries(date(2026, 6, 2), 3), "B2": mkseries(date(2026, 6, 2), 2),
+        "B3": mkseries(date(2026, 6, 2), 1),
+        "C1": mkseries(date(2026, 6, 3), 1), "C2": mkseries(date(2026, 6, 3), 2),
+        "C3": mkseries(date(2026, 6, 3), 3),
+        # Flat benchmark across all sessions → market-relative return == raw return.
+        "SPY": ([date(2026, 6, d) for d in (1, 2, 3, 4)],
+                {date(2026, 6, d): 100.0 for d in (1, 2, 3, 4)}),
+    }
+    monkeypatch.setattr(st, "_daily_series", lambda tk: series[tk])
+    monkeypatch.setattr(st, "_intraday_series", lambda tk: [])
+
+    rows = []
+    for day, tks in (("2026-06-01", ["A1", "A2", "A3"]),
+                     ("2026-06-02", ["B1", "B2", "B3"]),
+                     ("2026-06-03", ["C1", "C2", "C3"])):
+        for sc, tk in zip([0.1, 0.2, 0.3], tks):
+            rows.append({"generated_at": f"{day}T20:00", "signal_date": day, "ticker": tk,
+                         "method": "tech", "score": sc, "direction": "BUY"})
+    dperf = st.compute_directional_perf(sim_df=pd.DataFrame(rows), benchmark="SPY",
+                                        min_n=9, min_per_day=3, min_days=3)
+    bull = dperf[(dperf.method == "tech") & (dperf.side == "bull")].iloc[0]
+    assert bull["n_1d"] == 9
+    assert bull["icstd_1d"] == pytest.approx(1.1547, abs=1e-3)
+    assert bull["icir_1d"] == pytest.approx(0.289, abs=1e-3)
+
+
 def test_compute_method_perf_horizon_steps(monkeypatch):
     """3d/1w/2w/1m return None when the cache doesn't reach that many sessions
     forward — only the 1d horizon has data in a 2-row series."""

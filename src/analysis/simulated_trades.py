@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from src.analysis.signal_panel import category_for, _spearman
+from src.analysis.signal_panel import category_for, _spearman, periodic_ic_stats
 
 # (label, cache interval, forward steps). Daily steps are trading sessions;
 # the 30m step is one 30-minute bar. 1w=5 sessions, 2w=10, 1m=21.
@@ -136,15 +136,19 @@ def _fwd_intraday(series: List[Tuple[int, float]], generated_at: str,
 
 def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
                         min_n: int = 10, sim_df: Optional[pd.DataFrame] = None,
+                        min_per_day: int = 5, min_days: int = 3,
                         ) -> pd.DataFrame:
     """Per-method directional win rate + mean gross directional return per horizon.
 
     Returns one row per method with: ``method``, ``category``, ``views`` (total
     simulated trades), and for each horizon label H: ``n_H`` (joint obs),
     ``win_H`` (% of trades whose signed forward return was positive), ``ret_H``
-    (mean signed forward return %, gross), and ``ic_H`` (Spearman rank IC between
-    the method's raw score and the forward return — ranking skill, same basis as
-    the signals-panel IC table). Win/return/IC are NaN below ``min_n``. Sorted by
+    (mean signed forward return %, gross), ``ic_H`` (Spearman rank IC between the
+    method's raw score and the forward return — ranking skill, same basis as the
+    signals-panel IC table), and the IC's confidence ``icstd_H`` / ``icir_H``
+    (stdev and information ratio of the PER-DAY IC; see
+    ``signal_panel.periodic_ic_stats`` — populate once ``min_days`` signal-days of
+    ``min_per_day`` names accrue). Win/return/IC are NaN below ``min_n``. Sorted by
     views desc."""
     df = sim_df if sim_df is not None else load_sim_trades(days)
     if df is None or df.empty:
@@ -169,7 +173,7 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
     # Per (method, horizon): collect the (score, forward-return) pairs so n, win
     # rate, mean signed return AND the Spearman IC all come from one source.
     acc: Dict[str, Dict[str, Dict[str, list]]] = defaultdict(
-        lambda: {lbl: {"s": [], "f": []} for lbl in HORIZON_LABELS})
+        lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS})
 
     for row in df.itertuples(index=False):
         tk, sc, method, sigd, gen = (row.ticker, row.score, row.method,
@@ -193,6 +197,7 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
             cell = acc[method][lbl]
             cell["s"].append(sc)
             cell["f"].append(fwd)
+            cell["d"].append(sigd)
 
     views = df.groupby("method").size().to_dict()
     rows = []
@@ -200,7 +205,7 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
         rec: dict = {"method": method, "category": category_for(method),
                      "views": int(views.get(method, 0))}
         for lbl in HORIZON_LABELS:
-            s_list, f_list = by_h[lbl]["s"], by_h[lbl]["f"]
+            s_list, f_list, d_list = by_h[lbl]["s"], by_h[lbl]["f"], by_h[lbl]["d"]
             n = len(f_list)
             rec[f"n_{lbl}"] = n
             if n >= min_n:
@@ -211,10 +216,17 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
                 rec[f"win_{lbl}"] = round(wins / n * 100, 1)
                 rec[f"ret_{lbl}"] = round(sum(signed) / n, 3)
                 rec[f"ic_{lbl}"] = round(ic, 3) if ic is not None else None
+                # Reliability of that IC: stdev + info-ratio of the per-day IC.
+                _, ic_std, icir, _ = periodic_ic_stats(d_list, s_list, f_list,
+                                                       min_per_day, min_days)
+                rec[f"icstd_{lbl}"] = round(ic_std, 4) if ic_std is not None else None
+                rec[f"icir_{lbl}"] = round(icir, 3) if icir is not None else None
             else:
                 rec[f"win_{lbl}"] = None
                 rec[f"ret_{lbl}"] = None
                 rec[f"ic_{lbl}"] = None
+                rec[f"icstd_{lbl}"] = None
+                rec[f"icir_{lbl}"] = None
         rows.append(rec)
     out = pd.DataFrame(rows)
     if out.empty:
@@ -226,7 +238,8 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
 
 def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
                              benchmark: str = "SPY", dedupe: str = "last",
-                             sim_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                             sim_df: Optional[pd.DataFrame] = None,
+                             min_per_day: int = 5, min_days: int = 3) -> pd.DataFrame:
     """Per-(method, side) MARKET-RELATIVE skill at each horizon.
 
     Splits every simulated solo trade by side (``bull`` = score>0, ``bear`` =
@@ -235,8 +248,13 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
     one side look skilful. Per (method, side, horizon): ``n_H`` obs, ``hit_H`` =
     % of that side's calls that BEAT the market in the traded direction, ``yield_H``
     = mean market-relative return in the traded direction (%), ``ic_H`` =
-    Spearman(score, market-relative return). The basis for the direction-aware
-    shadow edge curve. Below ``min_n`` a cell reports NaN."""
+    Spearman(score, market-relative return), and the IC's confidence ``icstd_H`` /
+    ``icir_H`` (stdev and information-ratio of the PER-DAY market-relative IC; see
+    ``signal_panel.periodic_ic_stats``). The basis for the direction-aware shadow
+    edge curve — and the readout for whether a side should be INVERTED: a side whose
+    ``icir_H`` is confidently negative (and stays negative across horizons) is
+    reliably anti-predictive net of the benchmark. Below ``min_n`` a cell reports
+    NaN; ``icstd``/``icir`` need ``min_days`` signal-days of ``min_per_day`` names."""
     df = sim_df if sim_df is not None else load_sim_trades(days)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -254,7 +272,7 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
 
     d_fwd: dict = {}; i_fwd: dict = {}; bd_fwd: dict = {}; bi_fwd: dict = {}
     acc: Dict[tuple, Dict[str, Dict[str, list]]] = defaultdict(
-        lambda: {lbl: {"s": [], "m": []} for lbl in HORIZON_LABELS})
+        lambda: {lbl: {"s": [], "m": [], "d": []} for lbl in HORIZON_LABELS})
 
     for row in df.itertuples(index=False):
         tk, sc, method, sigd, gen = (row.ticker, row.score, row.method, row.sigd, row.generated_at)
@@ -288,12 +306,13 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
                 cell = acc[(method, s)][lbl]
                 cell["s"].append(sc)
                 cell["m"].append(mktrel)
+                cell["d"].append(sigd)
 
     rows = []
     for (method, side), by_h in acc.items():
         rec: dict = {"method": method, "side": side}
         for lbl in HORIZON_LABELS:
-            s_list, m_list = by_h[lbl]["s"], by_h[lbl]["m"]
+            s_list, m_list, d_list = by_h[lbl]["s"], by_h[lbl]["m"], by_h[lbl]["d"]
             n = len(m_list)
             rec[f"n_{lbl}"] = n
             if n >= min_n:
@@ -304,10 +323,18 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
                 rec[f"hit_{lbl}"] = round(wins / n * 100, 1)
                 rec[f"yield_{lbl}"] = round(sum(signed) / n, 4)
                 rec[f"ic_{lbl}"] = round(ic, 3) if ic is not None else None
+                # Reliability of that market-relative IC: stdev + info-ratio of the
+                # per-day IC — the inversion readout (confidently negative ⇒ flip side).
+                _, ic_std, icir, _ = periodic_ic_stats(d_list, s_list, m_list,
+                                                       min_per_day, min_days)
+                rec[f"icstd_{lbl}"] = round(ic_std, 4) if ic_std is not None else None
+                rec[f"icir_{lbl}"] = round(icir, 3) if icir is not None else None
             else:
                 rec[f"hit_{lbl}"] = None
                 rec[f"yield_{lbl}"] = None
                 rec[f"ic_{lbl}"] = None
+                rec[f"icstd_{lbl}"] = None
+                rec[f"icir_{lbl}"] = None
         rows.append(rec)
     return pd.DataFrame(rows)
 
@@ -370,9 +397,11 @@ def print_report(perf: pd.DataFrame) -> None:
         return
     head = f"{'method':<34}{'views':>7}"
     for lbl in HORIZON_LABELS:
-        head += f"{f'n@{lbl}':>7}{f'IC@{lbl}':>9}{f'win@{lbl}':>9}{f'ret@{lbl}':>9}"
+        head += (f"{f'n@{lbl}':>7}{f'IC@{lbl}':>9}{f'ICsd@{lbl}':>9}{f'ICIR@{lbl}':>8}"
+                 f"{f'win@{lbl}':>9}{f'ret@{lbl}':>9}")
     print("\nSimulated single-method performance — directional, GROSS, over ALL scored "
-          "tickers.\nIC = Spearman(score, forward return); win = % of this method's solo "
+          "tickers.\nIC = Spearman(score, forward return); ICsd/ICIR = stdev & info-ratio "
+          "of the per-day IC (the IC's reliability); win = % of this method's solo "
           "BUY/SELL calls that were right; ret = mean signed forward return %.\n")
     print(head)
     print("-" * len(head))
@@ -380,13 +409,63 @@ def print_report(perf: pd.DataFrame) -> None:
         line = f"{labels.get(r['method'], r['method']):<34}{int(r['views']):>7}"
         for lbl in HORIZON_LABELS:
             n, ic, win, ret = r[f"n_{lbl}"], r[f"ic_{lbl}"], r[f"win_{lbl}"], r[f"ret_{lbl}"]
+            icsd, icir = r.get(f"icstd_{lbl}"), r.get(f"icir_{lbl}")
             line += f"{int(n):>7}"
             line += f"{ic:>+9.3f}" if pd.notna(ic) else f"{'—':>9}"
+            line += f"{icsd:>9.3f}" if pd.notna(icsd) else f"{'—':>9}"
+            line += f"{icir:>+8.2f}" if pd.notna(icir) else f"{'—':>8}"
             line += f"{win:>8.1f}%" if pd.notna(win) else f"{'—':>9}"
             line += f"{ret:>+9.2f}" if pd.notna(ret) else f"{'—':>9}"
         print(line)
     print("\nn grows every run; 5d/10d/21d horizons need a post-close cache warm "
           "(--refresh) to populate. Judge nothing on a thin panel.")
+
+
+def print_directional_report(perf: pd.DataFrame) -> None:
+    """Per-(method, side) MARKET-RELATIVE skill + IC reliability — the readout for
+    deciding whether a method's score should be INVERTED on a given side.
+
+    Read it as: a side whose market-relative ICIR is confidently negative (≲ −0.5)
+    AND stays negative across horizons is reliably anti-predictive net of the
+    benchmark → invert that side. An ICIR ≈ 0 is noise (do NOT invert — a negative
+    IC at ICIR ≈ 0 is a few bad days, not skill); a side flagged here whose live
+    (absolute-return) IC is positive is the clearest beta-vs-alpha disagreement."""
+    try:
+        from src.performance.tracker import METHOD_LABELS
+    except Exception:
+        METHOD_LABELS = {}
+    labels = dict(METHOD_LABELS)
+    labels["combined_score"] = "All methods (combined)"
+    if perf is None or perf.empty:
+        print("\nNo directional simulated trades with forward returns yet — they accrue "
+              "every run (or run --backfill to materialise existing signals history).")
+        return
+    perf = perf.copy()
+    perf["_so"] = perf["side"].map({"bull": 0, "bear": 1, "both": 2}).fillna(3)
+    perf = perf.sort_values(["method", "_so"])
+    head = f"{'method':<26}{'side':<6}"
+    for lbl in HORIZON_LABELS:
+        head += f"{f'n@{lbl}':>7}{f'IC@{lbl}':>9}{f'ICIR@{lbl}':>8}{f'hit@{lbl}':>9}"
+    print("\nDirectional (market-relative) single-method skill — net of the benchmark, "
+          "split by side.\nIC = Spearman(score, market-rel return); ICIR = info-ratio of "
+          "the per-day IC (reliability); hit = % of that side's calls that beat the market.\n"
+          "Score convention: + = predicted UP, so a NEGATIVE IC means the score points the "
+          "wrong way. INVERT a side when its ICIR is confidently NEGATIVE (<= -0.5) AND stays "
+          "negative across ALL horizons (a real sign bug). A mean-reversion method that is "
+          "negative at SHORT horizons but positive at longer ones is a HORIZON effect, NOT an "
+          "inversion (the edge curve already flips it per-horizon); ICIR ~ 0 is noise.\n")
+    print(head)
+    print("-" * len(head))
+    for _, r in perf.iterrows():
+        line = f"{labels.get(r['method'], r['method'])[:25]:<26}{str(r['side']):<6}"
+        for lbl in HORIZON_LABELS:
+            n, ic, icir, hit = (r[f"n_{lbl}"], r[f"ic_{lbl}"],
+                                r.get(f"icir_{lbl}"), r[f"hit_{lbl}"])
+            line += f"{int(n):>7}"
+            line += f"{ic:>+9.3f}" if pd.notna(ic) else f"{'—':>9}"
+            line += f"{icir:>+8.2f}" if pd.notna(icir) else f"{'—':>8}"
+            line += f"{hit:>8.1f}%" if pd.notna(hit) else f"{'—':>9}"
+        print(line)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -398,11 +477,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p = argparse.ArgumentParser(description="Per-method simulated-trade directional performance.")
     p.add_argument("--days", type=int, default=None, help="only signals from the last N days")
     p.add_argument("--min-n", type=int, default=10, help="min joint obs before win/ret is reported")
+    p.add_argument("--min-per-day", type=int, default=5,
+                   help="min cross-section per signal-day before that day's IC counts toward ICstd/ICIR (default 5)")
+    p.add_argument("--min-days", type=int, default=3,
+                   help="min usable signal-days before IC stdev/ICIR is reported (default 3)")
     p.add_argument("--dedupe", choices=("last", "all"), default="last")
     p.add_argument("--backfill", action="store_true",
                    help="materialise simulated_trades from existing signals, then report")
     p.add_argument("--refresh", action="store_true",
                    help="force-warm the daily OHLCV cache for panel tickers first")
+    p.add_argument("--directional", action="store_true",
+                   help="also print the per-(method, side) MARKET-RELATIVE skill table with "
+                        "ICIR — the readout for deciding score inversion per side")
     args = p.parse_args(list(argv) if argv is not None else None)
 
     if args.backfill:
@@ -411,14 +497,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     from src.db import repo
     repo.set_read_only(not args.backfill)  # backfill needs write; reporting is read-only
 
+    from config import settings
     if args.refresh:
         df = load_sim_trades(args.days)
         if not df.empty:
             from src.analysis.signal_panel import refresh_panel_ohlcv
-            refresh_panel_ohlcv(df["ticker"].unique().tolist())
+            tickers = df["ticker"].unique().tolist()
+            if args.directional:
+                tickers.append(settings.horizon_market_benchmark)   # the shadow needs the benchmark leg
+            refresh_panel_ohlcv(tickers)
 
-    perf = compute_method_perf(days=args.days, dedupe=args.dedupe, min_n=args.min_n)
+    perf = compute_method_perf(days=args.days, dedupe=args.dedupe, min_n=args.min_n,
+                               min_per_day=args.min_per_day, min_days=args.min_days)
     print_report(perf)
+
+    if args.directional:
+        dperf = compute_directional_perf(days=args.days, dedupe=args.dedupe, min_n=args.min_n,
+                                         benchmark=settings.horizon_market_benchmark,
+                                         min_per_day=args.min_per_day, min_days=args.min_days)
+        print_directional_report(dperf)
 
 
 if __name__ == "__main__":

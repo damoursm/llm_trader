@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_left
 from datetime import date, timedelta
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -175,16 +175,58 @@ def _spearman(a: pd.Series, b: pd.Series) -> Optional[float]:
     return None if pd.isna(ic) else float(ic)
 
 
+def periodic_ic_stats(days: Sequence, scores: Sequence, fwd: Sequence,
+                      min_per_day: int = 5, min_days: int = 3,
+                      ) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+    """``(mean, std, icir, n_days)`` over the PER-DAY Spearman IC — the IC's confidence.
+
+    The three inputs are aligned sequences for ONE method × horizon, already
+    filtered to non-zero scores that have a forward return. A Spearman IC is
+    computed within every signal-day carrying ≥ ``min_per_day`` joint
+    observations; the sample stdev (``ddof=1``) and ``icir = mean / std`` are then
+    taken ACROSS those daily ICs. Each DAY counts once, so the dispersion measures
+    day-to-day stability — it is NOT inflated the way a standard error off the
+    pooled stock-day ``n`` would be (same-day names share market/sector moves, so
+    they are not independent draws). ``icir`` is the standard information-ratio
+    reliability score (|ICIR| ≳ 0.5 is a stable signal, ≈ 0 is noise).
+
+    Returns ``(None, None, None, n_days)`` when fewer than ``max(2, min_days)``
+    usable daily ICs exist (a stdev needs ≥ 2 points; the floor stops a 1–2-day
+    estimate from masquerading as real), or when the daily ICs are degenerate
+    (std ≈ 0 ⇒ ``icir`` is None but std is still reported)."""
+    floor = max(2, int(min_days))
+    tmp = pd.DataFrame({"d": list(days), "s": list(scores), "f": list(fwd)})
+    ics: list = []
+    for _, g in tmp.groupby("d", sort=True):
+        if len(g) < min_per_day:
+            continue
+        ic = _spearman(g["s"], g["f"])
+        if ic is not None:
+            ics.append(ic)
+    n_days = len(ics)
+    if n_days < floor:
+        return None, None, None, n_days
+    ser = pd.Series(ics)
+    std = float(ser.std(ddof=1))
+    mean = float(ser.mean())
+    icir = (mean / std) if std > 1e-12 else None
+    return mean, std, icir, n_days
+
+
 def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
-               min_n: int = 20) -> pd.DataFrame:
+               min_n: int = 20, min_per_day: int = 5, min_days: int = 3) -> pd.DataFrame:
     """Per-method IC table: for each score column × horizon, the observation
     count ``n_<h>d``, Spearman ``ic_<h>d``, directional ``hit_<h>d`` (the
     **simulated win rate** — % of non-zero scores whose sign matched the forward
     return's), and ``simret_<h>d`` (the **simulated return** — mean of
     ``sign(score) × forward_return`` over the same rows, i.e. the gross P&L if
-    that method alone had decided the trade direction). Methods with fewer than
-    ``min_n`` joint observations report NaN. Sorted by |IC| at the longest
-    horizon. Each row is also tagged with its ``category``."""
+    that method alone had decided the trade direction). It also reports the IC's
+    confidence — ``icstd_<h>d`` (stdev of the per-day IC) and ``icir_<h>d`` (its
+    information ratio, ``mean / std`` of the per-day IC; see ``periodic_ic_stats``)
+    — which populate only once ``min_days`` signal-days each carrying
+    ``min_per_day`` names have accrued. Methods with fewer than ``min_n`` joint
+    observations report NaN. Sorted by |IC| at the longest horizon. Each row is
+    also tagged with its ``category``."""
     rows = []
     for method in PANEL_SCORE_COLUMNS:
         if method not in panel.columns:
@@ -201,11 +243,19 @@ def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
             row[f"n_{h}d"] = n
             if n < min_n:
                 row[f"ic_{h}d"] = None
+                row[f"icstd_{h}d"] = None
+                row[f"icir_{h}d"] = None
                 row[f"hit_{h}d"] = None
                 row[f"simret_{h}d"] = None
                 continue
             s, f = s_all[valid], f_all[valid]
             row[f"ic_{h}d"] = _spearman(s, f)
+            # Confidence: stdev + information-ratio of the PER-DAY IC (each day one
+            # observation → not inflated by same-day cross-sectional correlation).
+            _, ic_std, icir, _ = periodic_ic_stats(
+                panel.loc[valid, "signal_date"], s, f, min_per_day, min_days)
+            row[f"icstd_{h}d"] = round(ic_std, 4) if ic_std is not None else None
+            row[f"icir_{h}d"] = round(icir, 3) if icir is not None else None
             moved = f != 0
             row[f"hit_{h}d"] = (float(((s > 0) == (f > 0))[moved].mean() * 100)
                                 if moved.any() else None)
@@ -235,11 +285,13 @@ def print_report(panel: pd.DataFrame, ic: pd.DataFrame,
     print(f"\nSignals panel — {len(panel)} rows · {panel['ticker'].nunique()} tickers · "
           f"{days[0]} → {days[-1]} ({len(days)} signal day(s))")
     print("IC = Spearman(score, forward close-to-close return); zero scores excluded.  "
+          "ICsd/ICIR = stdev & info-ratio of the per-day IC (the IC's reliability).  "
           "win = simulated solo win rate (sign-agreement %); sim = simulated solo "
           "return % (mean sign(score)×fwd_ret).\n")
     head = f"{'method':<34}{'views':>7}"
     for h in horizons:
-        head += f"{f'n@{h}':>7}{f'IC@{h}':>8}{f'win@{h}':>8}{f'sim@{h}':>9}"
+        head += (f"{f'n@{h}':>7}{f'IC@{h}':>8}{f'ICsd@{h}':>9}{f'ICIR@{h}':>8}"
+                 f"{f'win@{h}':>8}{f'sim@{h}':>9}")
     width = len(head)
 
     def _emit_rows(subset: pd.DataFrame) -> None:
@@ -249,8 +301,11 @@ def print_report(panel: pd.DataFrame, ic: pd.DataFrame,
             for h in horizons:
                 n, icv, hit, sim = (r[f"n_{h}d"], r[f"ic_{h}d"],
                                     r[f"hit_{h}d"], r[f"simret_{h}d"])
+                icsd, icir = r.get(f"icstd_{h}d"), r.get(f"icir_{h}d")
                 line += f"{int(n):>7}"
                 line += f"{icv:>+8.3f}" if pd.notna(icv) else f"{'—':>8}"
+                line += f"{icsd:>9.3f}" if pd.notna(icsd) else f"{'—':>9}"
+                line += f"{icir:>+8.2f}" if pd.notna(icir) else f"{'—':>8}"
                 line += f"{hit:>7.1f}%" if pd.notna(hit) else f"{'—':>8}"
                 line += f"{sim:>+9.2f}" if pd.notna(sim) else f"{'—':>9}"
             print(line)
@@ -288,6 +343,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                    help="only signals from the last N calendar days (default: all)")
     p.add_argument("--min-n", type=int, default=20,
                    help="minimum joint observations before an IC is reported (default 20)")
+    p.add_argument("--min-per-day", type=int, default=5,
+                   help="min cross-section per signal-day before that day's IC counts toward ICstd/ICIR (default 5)")
+    p.add_argument("--min-days", type=int, default=3,
+                   help="min usable signal-days before IC stdev/ICIR is reported (default 3)")
     p.add_argument("--dedupe", choices=("last", "all"), default="last",
                    help="'last' keeps one row per (day, ticker) — the day's final run (default)")
     p.add_argument("--refresh", action="store_true",
@@ -304,7 +363,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                             max_tickers=args.refresh_max or None)
     panel = build_panel(horizons=horizons, days=args.days, dedupe=args.dedupe,
                         signals_df=signals_df)
-    ic = compute_ic(panel, horizons=horizons, min_n=args.min_n) if not panel.empty else pd.DataFrame()
+    ic = (compute_ic(panel, horizons=horizons, min_n=args.min_n,
+                     min_per_day=args.min_per_day, min_days=args.min_days)
+          if not panel.empty else pd.DataFrame())
     print_report(panel, ic, horizons)
 
 

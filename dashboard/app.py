@@ -662,8 +662,12 @@ _IC_TOOLTIP = (
     "money, options, catalysts — most-recent data). 'Sim win %' = simulated solo win "
     "rate (share of non-zero scores whose sign matched the move); 'Sim ret %' = "
     "simulated solo return (mean sign(score)×forward-return — the gross P&L if that "
-    "method alone decided the trade). A persistent NEGATIVE IC is sign-inverted (a "
-    "logic bug); IC ≈ 0 at large n is dead weight. 'Views' = scored, non-zero "
+    "method alone decided the trade). 'IC std' = standard deviation of the PER-DAY IC "
+    "and 'ICIR' = mean(daily IC)/std(daily IC) — the IC's reliability: each signal-day "
+    "counts once, so they are NOT inflated by same-day cross-sectional correlation the "
+    "way a standard error off the raw n would be (|ICIR| ≳ 0.5 is a stable edge, ≈ 0 is "
+    "noise); both need several signal-days before they populate. A persistent NEGATIVE "
+    "IC is sign-inverted (a logic bug); IC ≈ 0 at large n is dead weight. 'Views' = scored, non-zero "
     "observations. Run/forward-return based (NOT affected by the window toggle); "
     "n grows every run — judge nothing on a thin panel.")
 
@@ -678,8 +682,11 @@ def _ic_category_table(subset, labels):
         for h in _IC_HORIZONS:
             n, ic, hit, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
                                r.get(f"hit_{h}d"), r.get(f"simret_{h}d"))
+            icstd, icir = r.get(f"icstd_{h}d"), r.get(f"icir_{h}d")
             row[f"n_{h}d"] = int(n) if pd.notna(n) else None
             row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
+            row[f"icstd_{h}d"] = round(float(icstd), 3) if pd.notna(icstd) else None
+            row[f"icir_{h}d"] = round(float(icir), 2) if pd.notna(icir) else None
             row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
             row[f"simret_{h}d"] = round(float(sim), 2) if pd.notna(sim) else None
         rows.append(row)
@@ -689,12 +696,14 @@ def _ic_category_table(subset, labels):
         cols += [
             {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
             {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"IC std@{h}d", "id": f"icstd_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"ICIR@{h}d", "id": f"icir_{h}d", "type": "numeric", "format": _NUM2},
             {"name": f"Sim win@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
             {"name": f"Sim ret@{h}d %", "id": f"simret_{h}d", "type": "numeric", "format": _NUM2},
         ]
     longest = max(_IC_HORIZONS)
     cond = []
-    for c in (f"ic_{longest}d", f"simret_{longest}d"):
+    for c in (f"ic_{longest}d", f"icir_{longest}d", f"simret_{longest}d"):
         cond += [
             {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c},
              "color": figures.POS, "fontWeight": "bold"},
@@ -746,7 +755,11 @@ _SIM_PERF_TOOLTIP = (
     "total simulated solo trades for the method. Per horizon (30m/3h/6h/1d/3d/1w/2w/1m): "
     "'n@' = joint observations with a forward return, 'IC@' = Spearman rank correlation "
     "between the method's score and the forward return (ranking skill; a persistent "
-    "positive IC is real edge, a persistent negative IC is sign-inverted), 'Win@ %' = "
+    "positive IC is real edge, a persistent negative IC is sign-inverted), 'IC std@' / "
+    "'ICIR@' = the IC's reliability — stdev and information-ratio (mean/std) of the "
+    "PER-DAY IC, where each signal-day counts once so they aren't inflated by same-day "
+    "cross-sectional correlation (|ICIR| ≳ 0.5 is stable, ≈ 0 is noise; need several days), "
+    "'Win@ %' = "
     "share of the method's solo calls that were directionally right, 'Ret@ %' = mean "
     "signed forward return. Forward returns come from the OHLCV cache, so 1w/2w/1m fill "
     "in only after a post-close cache warm. Use the Horizons/Metrics pickers above to "
@@ -758,14 +771,17 @@ _SIM_HORIZONS = ("30m", "3h", "6h", "1d", "3d", "1w", "2w", "1m")
 
 # Per-horizon metric columns, in display order (matches the IC table: n, IC, win,
 # ret). Each: (header template, id template, numeric format).
-_SIM_METRIC_ORDER = ("n", "ic", "win", "ret")
+_SIM_METRIC_ORDER = ("n", "ic", "icstd", "icir", "win", "ret")
 _SIM_METRIC_SPECS = {
-    "n":   ("n@{}", "n_{}", _INT),
-    "ic":  ("IC@{}", "ic_{}", _NUM2),
-    "win": ("Win@{} %", "win_{}", _NUM2),
-    "ret": ("Ret@{} %", "ret_{}", _NUM2),
+    "n":     ("n@{}", "n_{}", _INT),
+    "ic":    ("IC@{}", "ic_{}", _NUM2),
+    "icstd": ("IC std@{}", "icstd_{}", _NUM2),
+    "icir":  ("ICIR@{}", "icir_{}", _NUM2),
+    "win":   ("Win@{} %", "win_{}", _NUM2),
+    "ret":   ("Ret@{} %", "ret_{}", _NUM2),
 }
-_SIM_METRIC_LABELS = {"n": "n (obs)", "ic": "IC", "win": "Win %", "ret": "Ret %"}
+_SIM_METRIC_LABELS = {"n": "n (obs)", "ic": "IC", "icstd": "IC std", "icir": "ICIR",
+                      "win": "Win %", "ret": "Ret %"}
 
 
 def _sim_column_filters() -> html.Div:
@@ -827,7 +843,7 @@ def _sim_perf_table(subset, labels, horizons, metrics):
                 {"if": {"filter_query": f"{{{wc}}} < 50", "column_id": wc},
                  "color": figures.NEG, "fontWeight": "bold"},
             ]
-        for mc in ("ic", "ret"):
+        for mc in ("ic", "icir", "ret"):
             if mc in metrics:
                 c = f"{mc}_{lbl}"
                 cond += [

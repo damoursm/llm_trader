@@ -1,6 +1,40 @@
 """
 Build a TickerSignal for each ticker by combining all enabled analysis methods.
 
+Score sign convention (THE invariant the combine, direction, IC + inversion rely on)
+────────────────────────────────────────────────────────────────────────────────────
+EVERY method returns a score in [-1, +1] whose SIGN is the predicted direction of
+the STOCK's forward return — never the raw indicator state, and never relative to a
+position you happen to hold:
+
+    score > 0  →  the stock is more likely to go UP    (bullish)
+    score < 0  →  the stock is more likely to go DOWN  (bearish)
+    score ≈ 0  →  no view
+
+Mean-reversion / contrarian methods bake the reversal INTO the sign; they do NOT
+report state. So "stretched / extreme" never decides the sign — the EXPECTED NEXT
+MOVE does:
+    • vwap     → + when price is BELOW its VWAP (expects a bounce UP), − when above.
+    • put_call → + on EXTREME_PUTS (fear ⇒ contrarian bullish), − on EXTREME_CALLS.
+    • iv_rank  → + on a high-vol capitulation selloff (CAPITULATION_BUY), − on a
+                 high-vol euphoric rally (FADE_EXTREME).
+    • coint    → + when the ticker is the cheap/long leg of a stretched pair.
+
+Because the sign is uniform, everything downstream is unambiguous and position-
+independent:
+    combined_score = Σ wᵢ·scoreᵢ ;  ≥ +0.15 → BULLISH → BUY/long,  ≤ −0.15 → BEARISH
+    → SELL/short. The score describes the STOCK, so a BEARISH (negative) read is ONE
+    action set: it OPENS a short when flat AND CLOSES a long when held (a positive
+    score is NOT "good for a short" — it is "the stock should rise").
+
+Inversion is therefore just "use −score": a method whose score is anti-correlated
+with forward returns (negative IC / ICIR) is flipped. It is applied PER HORIZON
+(``edge_curve``), which is exactly what keeps it correct for mean-reversion methods —
+their sign can be momentum-like at very short horizons and reversion-like at longer
+ones, so a method may legitimately flip at some horizons and not others. Only a sign
+that is wrong across ALL horizons is a true sign bug worth a permanent inversion (or a
+scorer fix). See ``simulated_trades --directional`` for the per-side ICIR readout.
+
 Methods
 ───────
   1  News sentiment        (enable_news_sentiment)
