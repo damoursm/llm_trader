@@ -251,6 +251,7 @@ def test_compute_directional_perf_emits_icstd_and_icir(monkeypatch):
     assert bull["n_1d"] == 9
     assert bull["icstd_1d"] == pytest.approx(1.1547, abs=1e-3)
     assert bull["icir_1d"] == pytest.approx(0.289, abs=1e-3)
+    assert int(bull["icdays_1d"]) == 3        # day count the shadow IC weighting gates on
 
 
 def test_compute_method_perf_horizon_steps(monkeypatch):

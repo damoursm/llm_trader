@@ -132,10 +132,15 @@ def _c(x: float) -> float:
 def factor_scores(fs: FundamentalsSignal) -> dict:
     """Signed [-1, +1] factor scores from a FundamentalsSignal (+ = hypothesized bullish).
 
-    Panel-ONLY diagnostics — persisted as the ``f_*`` signals columns so the dashboard's
-    Signal-IC table measures whether each Massive factor predicts forward returns
-    (IC + Sim win% + Sim ret%). NOT weighted into combined_score and NOT trade-attributed.
-    A missing input omits that factor (no fake 0 that would dilute its IC)."""
+    Sign follows the universal convention (see ``aggregator`` docstring): + = the
+    factor's hypothesised UP direction (cheap value / high quality / high growth /
+    crowded short → squeeze), − = down; magnitude (tanh-scaled) = how extreme the
+    factor is. The Signal-IC table is what reveals whether each actually predicts
+    forward returns. Persisted as the ``f_*`` signals columns for IC/Sim-win/Sim-ret
+    AND folded into combined_score as a small additive overlay
+    (``fundamental_factor_weight``, applied OUTSIDE the normalised weight pool) — but
+    NOT in ``_ALL_METHODS`` / the solo perf tables. A missing input omits that factor
+    (no fake 0 that would dilute its IC)."""
     from math import tanh
     out: dict = {}
 

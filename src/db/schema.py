@@ -47,6 +47,8 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum",
     "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
     "ext_gap",
+    # Broker-aware group (IBKR account / short-borrow). First method, 2026-06-28.
+    "broker_advisor",
     # Massive fundamental + corp-action directional factors — promoted into the
     # trade-attribution set (2026-06-24) so they appear in the solo/eval Method-
     # Performance tables. Still grouped under the IC table's "Fundamentals" category
@@ -288,6 +290,8 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_TIMEFRAME_COLUMNS),
     # Fundamentals factor diagnostic columns on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_FUNDAMENTAL_COLUMNS),
+    # Broker-advisor method column on an existing signals table.
+    ("signals", "broker_advisor", "DOUBLE"),
     # Horizon synthesis on an existing recommendations table.
     ("recommendations", "target_horizon", "VARCHAR"),
     ("recommendations", "horizon_net_edge_pct", "DOUBLE"),

@@ -12,7 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 def _utcnow_iso() -> str:
@@ -64,6 +64,21 @@ class AccountSnapshot:
     buying_power: float
     account_id: str = ""
     currency: str = "USD"                # base currency of the equity figure
+
+
+@dataclass
+class BorrowInfo:
+    """Short-borrow availability / cost for one ticker (IBKR-unique data).
+
+    A low/zero ``shortable_shares`` or a high ``fee_pct`` means the name is hard or
+    expensive to short — a squeeze tell the ``broker_advisor`` method scores
+    bullishly (which fades a SELL). All fields are optional/best-effort: IBKR
+    streams shortable shares (generic tick 236) reliably; the annualised fee rate
+    needs the stock-loan feed and may be ``None``."""
+    ticker: str
+    shortable_shares: Optional[float] = None   # shares available to short; low/0 = hard to borrow
+    fee_pct: Optional[float] = None            # annualised borrow fee % (if available); high = expensive
+    is_shortable: Optional[bool] = None        # convenience flag (None = unknown)
 
 
 @dataclass
@@ -154,6 +169,14 @@ class Broker(ABC):
         that fills the orders — over yfinance. Read-only; never places an order.
         """
         return None
+
+    def get_short_borrow(self, tickers: List[str]) -> Dict[str, BorrowInfo]:
+        """Short-borrow availability / cost per ticker (the ``broker_advisor`` input).
+
+        Default: none ({}). IBKRBroker overrides this to stream shortable-shares
+        (and fee where available). Read-only; never places an order.
+        """
+        return {}
 
     def disconnect(self) -> None:  # optional; default no-op
         return None

@@ -1291,6 +1291,10 @@ class TickerSignal(BaseModel):
     # ATR units: pre-market gap-and-go / after-hours catalyst reaction.
     ext_gap_score: float = 0.0   # [-1, +1] tanh(gap_atr / scale), deadbanded
     ext_gap_pct: float = 0.0     # raw extended-session move vs reference close (%)
+    # Broker advisor — IBKR short-borrow-aware tilt (enable_broker_advisor). + =
+    # hard/expensive to short (squeeze tell → bullish, fades a SELL); 0 = easy borrow
+    # / no data. The first method in the broker-aware group.
+    broker_advisor_score: float = 0.0   # [-1, +1] short-borrow squeeze tilt
 
     # Multi-timeframe technical components — populated when
     # enable_multi_timeframe_signals=true. The non-daily per-(method, timeframe)

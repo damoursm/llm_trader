@@ -245,6 +245,7 @@ def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
                 row[f"ic_{h}d"] = None
                 row[f"icstd_{h}d"] = None
                 row[f"icir_{h}d"] = None
+                row[f"icdays_{h}d"] = 0
                 row[f"hit_{h}d"] = None
                 row[f"simret_{h}d"] = None
                 continue
@@ -252,10 +253,13 @@ def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
             row[f"ic_{h}d"] = _spearman(s, f)
             # Confidence: stdev + information-ratio of the PER-DAY IC (each day one
             # observation → not inflated by same-day cross-sectional correlation).
-            _, ic_std, icir, _ = periodic_ic_stats(
+            # ``icdays`` = how many signal-days backed it (the evidence the IC-weight
+            # shrinkage uses; a column the dashboard ignores).
+            _, ic_std, icir, ic_days = periodic_ic_stats(
                 panel.loc[valid, "signal_date"], s, f, min_per_day, min_days)
             row[f"icstd_{h}d"] = round(ic_std, 4) if ic_std is not None else None
             row[f"icir_{h}d"] = round(icir, 3) if icir is not None else None
+            row[f"icdays_{h}d"] = int(ic_days)
             moved = f != 0
             row[f"hit_{h}d"] = (float(((s > 0) == (f > 0))[moved].mean() * 100)
                                 if moved.any() else None)

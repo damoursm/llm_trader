@@ -1362,6 +1362,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                    if fundamentals_context and getattr(fundamentals_context, "signals", None) else {})
     _fund_factors = {tk: _ffactor(fs) for tk, fs in _fund_by_tk.items()}
 
+    # Broker advisor (IBKR short-borrow) — fetched from the live broker before
+    # build_signals so the broker_advisor method can score it. Gated + fail-soft
+    # (returns {} when off / no gateway), capped per tick (each ticker costs a
+    # market-data request). None ⇒ method inactive. The reconciler reuses this same
+    # broker connection later in the tick.
+    borrow_context = None
+    if settings.enable_broker_advisor and settings.broker_mode and settings.broker_mode != "off":
+        from src.signals.broker_advisor import fetch_borrow_context
+        borrow_context = fetch_borrow_context(
+            list(all_tickers)[:settings.broker_advisor_max_tickers]) or None
+
     build_kwargs = dict(
         insider_trades=insider_trades,
         put_call_context=put_call_context,
@@ -1372,6 +1383,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         coint_context=coint_context,
         corp_factors=(corporate_actions_context.factor_scores if corporate_actions_context else None),
         fundamental_factors=_fund_factors,
+        borrow_context=borrow_context,
     )
     signals = build_signals(
         all_tickers,

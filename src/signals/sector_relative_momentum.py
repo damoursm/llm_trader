@@ -11,11 +11,12 @@ Two public scorers share the same core machinery:
     ``sector_benchmark.get_sector_benchmark``. Feeds the weighted aggregator
     as a real method.
   * ``compute_market_relative_momentum_score(ticker)`` — benchmark is SPY
-    (the broad market). Used as a **diagnostic** so the email/prompt can
-    show whether a stock is lagging because its *sector* is weak vs the
-    market, or genuinely underperforming on its own merits. It is NOT
-    added to the weighted combo: market_relative = sector_relative
-    + (sector − market), so weighting it again would double-count beta.
+    (the broad market). PROMOTED into the weighted combine but kept LIGHT
+    (``market_momentum`` = 0.08): market_relative = sector_relative
+    + (sector − market), so a heavy weight would double-count the beta already
+    in ``sector_momentum`` — the small weight bounds that overlap. Also feeds
+    the email/prompt to show whether a stock lags because its *sector* is weak
+    vs the market, or on its own merits.
 
 Why these are cleaner factors than absolute momentum
 ----------------------------------------------------
@@ -211,14 +212,13 @@ def compute_market_relative_momentum_score(
 ) -> Tuple[float, float, float, str]:
     """Return ``(score, rel_1m_pct, rel_3m_pct, "SPY")`` — broad-market benchmark.
 
-    Always benchmarked against SPY (broad market). Used as a diagnostic to
-    answer "is this name lagging the market?" independently of whether
-    it's lagging its sector. The score is NOT added to the weighted
-    aggregator combo because
+    Always benchmarked against SPY (broad market). Answers "is this name lagging
+    the market?" independently of whether it's lagging its sector. Weighted into
+    the aggregator combine but kept LIGHT (``market_momentum`` = 0.08) because
 
         market_rel = sector_rel + (sector − market)
 
-    so weighting it on top of ``sector_momentum`` would double-count beta.
+    so a heavy weight would double-count the beta already in ``sector_momentum``.
 
     Applies to commodities too — e.g. GLD leading SPY in a risk-off tape
     is a useful read even though it lacks a sector ETF.

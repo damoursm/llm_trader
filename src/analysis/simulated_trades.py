@@ -324,17 +324,21 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
                 rec[f"yield_{lbl}"] = round(sum(signed) / n, 4)
                 rec[f"ic_{lbl}"] = round(ic, 3) if ic is not None else None
                 # Reliability of that market-relative IC: stdev + info-ratio of the
-                # per-day IC — the inversion readout (confidently negative ⇒ flip side).
-                _, ic_std, icir, _ = periodic_ic_stats(d_list, s_list, m_list,
-                                                       min_per_day, min_days)
+                # per-day IC — the inversion readout (confidently negative ⇒ flip side)
+                # AND the source the shadow-basis IC weighting gates on (icdays = the
+                # signal-day count the confidence t-stat uses).
+                _, ic_std, icir, ic_days = periodic_ic_stats(d_list, s_list, m_list,
+                                                             min_per_day, min_days)
                 rec[f"icstd_{lbl}"] = round(ic_std, 4) if ic_std is not None else None
                 rec[f"icir_{lbl}"] = round(icir, 3) if icir is not None else None
+                rec[f"icdays_{lbl}"] = int(ic_days)
             else:
                 rec[f"hit_{lbl}"] = None
                 rec[f"yield_{lbl}"] = None
                 rec[f"ic_{lbl}"] = None
                 rec[f"icstd_{lbl}"] = None
                 rec[f"icir_{lbl}"] = None
+                rec[f"icdays_{lbl}"] = 0
         rows.append(rec)
     return pd.DataFrame(rows)
 

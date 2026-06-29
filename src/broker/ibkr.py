@@ -11,13 +11,13 @@ IBKRBroker requires it.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
 from config.settings import settings
 from src.broker.base import (
-    AccountSnapshot, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
+    AccountSnapshot, BorrowInfo, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
 )
 
 # Non-USD base currencies already flagged this process — the account config is
@@ -339,6 +339,37 @@ class IBKRBroker(Broker):
         except Exception as e:
             logger.debug(f"[broker:ibkr] get_market_price {ticker} failed: {e}")
         return None
+
+    def get_short_borrow(self, tickers: List[str]) -> Dict[str, BorrowInfo]:
+        """Short-borrow availability per ticker via the shortable-shares tick (236).
+
+        Read-only. Streams ``ticker.shortableShares`` (shares available to short;
+        low/0 = hard to borrow) plus IBKR's ``shortable`` score (>2.5 = easily
+        available). The annualised fee rate is not on the standard tick feed, so
+        ``fee_pct`` is left None here (availability is the v1 signal). Best-effort
+        and fail-soft per ticker — NEEDS a live-gateway smoke-test to confirm the
+        field names before relying on it. Bounded by the caller's ticker list.
+        """
+        if not self.is_connected():
+            return {}
+        out: Dict[str, BorrowInfo] = {}
+        for tk in tickers:
+            try:
+                contract = self._qualify(tk)
+                t = self._ib.reqMktData(contract, genericTickList="236", snapshot=False)
+                self._ib.sleep(0.25)                       # let the 236 tick arrive
+                ss = getattr(t, "shortableShares", None)
+                score = getattr(t, "shortable", None)
+                try:
+                    self._ib.cancelMktData(contract)
+                except Exception:
+                    pass
+                ss_f = float(ss) if (ss is not None and ss == ss) else None   # ss==ss filters NaN
+                is_short = bool(score > 2.5) if (score is not None and score == score) else None
+                out[tk] = BorrowInfo(ticker=tk, shortable_shares=ss_f, is_shortable=is_short)
+            except Exception as e:
+                logger.debug(f"[broker:ibkr] short-borrow fetch failed for {tk}: {e}")
+        return out
 
     def cancel_order(self, client_ref: str) -> bool:
         """Cancel the working order tagged *client_ref*; True only on a

@@ -79,6 +79,37 @@ def test_flip_trade_inverts_action_and_direction_together():
     assert back["action"] == "BUY" and back["direction"] == "BULLISH"
 
 
+def _trending_ohlcv(daily_drift: float, n: int = 260, noise: float = 0.003, seed: int = 0):
+    """Synthetic OHLCV with a controllable daily drift + small noise (deterministic)."""
+    rng = np.random.default_rng(seed)
+    rets = daily_drift + rng.normal(0.0, noise, n)
+    close = 100.0 * np.exp(np.cumsum(rets))
+    return pd.DataFrame({"Open": close, "High": close * 1.004, "Low": close * 0.996,
+                         "Close": close, "Volume": 1_000_000.0})
+
+
+@pytest.mark.parametrize("drift, want", [(+0.005, 1), (-0.005, -1)])
+def test_directional_methods_sign_follows_trend(drift, want):
+    # The trend-following family scores + on an uptrend and − on a downtrend
+    # (price direction == predicted direction). This is the OTHER half of the
+    # convention from the mean-reversion methods above — both honour "+ = up", they
+    # just disagree about what a given move implies.
+    from src.signals.price_momentum import compute_price_momentum_score
+    from src.signals.trend_strength import compute_trend_strength_score
+    df = _trending_ohlcv(drift)
+    assert np.sign(compute_price_momentum_score("T", df=df)[0]) == want
+    assert np.sign(compute_trend_strength_score("T", df=df)[0]) == want
+
+
+def test_score_magnitude_grows_with_conviction():
+    # |score| = confidence: a stronger trend yields a larger-magnitude momentum score
+    # than a marginal one (same noise draw, so the difference is pure conviction).
+    from src.signals.price_momentum import compute_price_momentum_score
+    mild = compute_price_momentum_score("T", df=_trending_ohlcv(0.0006, noise=0.004))[0]
+    strong = compute_price_momentum_score("T", df=_trending_ohlcv(0.0020, noise=0.004))[0]
+    assert 0 < mild < strong
+
+
 def test_solo_method_direction_follows_score_sign():
     # The inversion-relevant mapping used by both the ledger solo perf and the
     # simulated panel: a method's standalone call is LONG iff its score is positive.

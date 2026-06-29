@@ -802,6 +802,42 @@ class Settings(BaseSettings):
     adaptive_weight_min_multiplier: float = 0.5    # floor: a bad method keeps at least half its baseline
     adaptive_weight_max_multiplier: float = 2.0    # cap:   a great method gets at most double
 
+    # ── IC-informed adaptive weights (panel-driven; ON, but CONFIDENCE-GATED) ──
+    # A better-founded sibling of the win-rate layer above. Instead of solo win rate
+    # from the gate-selected (thin, biased) trade ledger, it tilts each method's weight
+    # by its RELIABILITY-ADJUSTED information coefficient — ICIR = mean(daily IC)/
+    # std(daily IC) — measured over the UNBIASED `signals` panel (every scored ticker,
+    # not just the trades the gates let through). By default the IC is MARKET-NEUTRAL
+    # (shadow basis — ticker return minus SPY, pooled both directions), so a method is
+    # weighted by its regime-robust SELECTION skill (alpha), NOT by how much market beta
+    # it happened to ride in the lookback window (which may not repeat if the regime
+    # turns); the market-direction call is owned separately by the regime/mode layers.
+    # Set ic_weight_basis="edge" to weight by absolute-return IC instead. By design:
+    #   • CONFIDENCE GATE: a method is reweighted ONLY when its mean-daily-IC t-stat
+    #     clears the bar — t = |ICIR|·sqrt(n_days) ≥ ic_weight_min_t (t≥2 ≈ 95%). A
+    #     method whose IC is not yet statistically distinguishable from zero keeps its
+    #     base weight untouched. So on a thin panel NOTHING clears the gate and this is
+    #     a pure NO-OP; methods earn a tilt only once the data proves their IC is real.
+    #     (This is what makes it safe to run live now — it respects "judge nothing on a
+    #     thin panel" automatically, then reweights method-by-method as each matures.)
+    #   • Positive-only among the confident: a confident method's boost = clip(ICIR /
+    #     median(confident positive ICIR), min, max) — the typical confident method is
+    #     unchanged (1.0×), better ones boosted, weaker-but-still-positive ones trimmed.
+    #     A confidently NON-positive method is floored to ic_weight_min_multiplier (it
+    #     is anti-predictive — minimise it until the inversion switch flips its sign).
+    # Applied as a multiplier on the active weight profile, exactly like the win-rate
+    # layer (the two STACK if both on; set enable_adaptive_weights=false to use IC alone).
+    enable_ic_weights: bool = True
+    ic_weight_basis: str = "shadow"        # "shadow" = market-neutral IC (alpha, regime-robust) | "edge" = absolute-return IC
+    ic_weight_horizon_days: int = 5        # EDGE-basis forward horizon in sessions (≈ a typical hold)
+    ic_weight_shadow_horizon: str = "1w"   # SHADOW-basis horizon LABEL (30m|3h|6h|1d|3d|1w|2w|1m); "1w" = 5 sessions = the 5d edge horizon
+    ic_weight_min_days: int = 5            # min distinct signal-days before an ICIR is even computed
+    ic_weight_min_per_day: int = 5         # min cross-section per day for that day's IC to count toward ICIR
+    ic_weight_min_t: float = 2.0           # CONFIDENCE GATE: reweight only if |ICIR|·sqrt(n_days) ≥ this
+    ic_weight_min_multiplier: float = 0.25 # floor for a confidently anti-predictive method
+    ic_weight_max_multiplier: float = 3.0  # cap on a strongly-predictive method's boost
+    ic_weight_cache_seconds: int = 1800    # reuse the heavy panel IC across ticks / hold-review calls
+
     # ── Macro News Regime (geopolitics / oil / tariffs / policy) ────────────
     # Scans the day's news flow for macro-level themes (active wars and
     # geopolitical escalation, trade / tariff actions, oil/energy shocks,
@@ -1068,6 +1104,17 @@ class Settings(BaseSettings):
     #   ibkr_paper — submit to IB Gateway PAPER account
     #   ibkr_live  — submit to IB Gateway LIVE account  [gated: only after paper validation]
     broker_mode: str = "off"
+    # ── Broker advisor (IBKR account / short-borrow-aware method group) ──
+    # First method in a broker-aware group: scores short-borrow state (hard/expensive
+    # to short → bullish squeeze tilt → fades a SELL). The only method aware of
+    # IBKR-unique data; decision-only (never trades). Needs a live IBKR connection,
+    # so it is OFF unless broker_mode != off AND this flag is on. Each scored ticker
+    # costs one market-data request, so the per-tick fetch is capped.
+    enable_broker_advisor: bool = False
+    broker_advisor_max_score: float = 0.6          # cap on the squeeze tilt (a single tell can't dominate)
+    broker_advisor_expensive_fee_pct: float = 10.0 # borrow fee %/yr mapping to a strong tilt (tanh scale)
+    broker_advisor_hard_shares: float = 200000.0   # shortable shares at/below which a name is "hard to borrow"
+    broker_advisor_max_tickers: int = 60           # cap on per-tick borrow fetches (held names + universe slice)
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 4002              # IB Gateway: 4002 paper / 4001 live  (TWS: 7497 / 7496)
     ibkr_client_id: int = 11           # any stable int unique to this API connection

@@ -362,7 +362,7 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
@@ -373,6 +373,7 @@ METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr"],
     "Fundamental": ["pead"],
     "Relative":    ["cross_sectional", "coint"],
+    "Broker":      ["broker_advisor"],
 }
 
 # Human-readable method labels for reports
@@ -398,6 +399,7 @@ METHOD_LABELS: Dict[str, str] = {
     "coint":      "Cointegration Pairs",
     "cross_sectional": "Cross-Sectional Ranking",
     "ext_gap":    "Extended-Session Gap",
+    "broker_advisor": "Broker Advisor (IBKR short-borrow)",
 }
 
 # Multi-timeframe technical labels (panel-only) — derived from the base daily
@@ -451,6 +453,7 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "coint":      getattr(sig, "coint_score", 0.0),
         "cross_sectional": getattr(sig, "cross_sectional_score", 0.0),
         "ext_gap":    getattr(sig, "ext_gap_score", 0.0),
+        "broker_advisor": getattr(sig, "broker_advisor_score", 0.0),
         # Fundamental + corp-action factors live on the signal's fundamental_scores dict.
         **{m: float((getattr(sig, "fundamental_scores", None) or {}).get(m, 0.0))
            for m in ("f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")},

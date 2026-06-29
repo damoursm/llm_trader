@@ -94,6 +94,7 @@ from src.signals.trend_strength import compute_trend_strength_score
 from src.signals.iv_rank import compute_iv_rank_score
 from src.signals.iv_expr import compute_iv_expr_score
 from src.signals.extended_session import compute_extended_gap_score
+from src.signals.broker_advisor import compute_broker_advisor_score
 
 
 # ── Smart-money signal direction + strength ──────────────────────────────────
@@ -132,6 +133,7 @@ _BASE_WEIGHTS = {
     "iv_expr":    0.12,   # IV Expression: stock-vs-options bias from real chain IV + oi_skew
     "coint":      0.12,   # Cointegration pairs: per-ticker lean from stat-arb spread z-scores
     "ext_gap":    0.15,   # Extended-session gap momentum: live off-hours print vs last close / ATR
+    "broker_advisor": 0.10,  # IBKR short-borrow squeeze tilt (hard/expensive to short → bullish, fades a SELL)
 }
 
 # Extended-session weight overlay (runs outside RTH). Options chains close at
@@ -260,6 +262,130 @@ def _apply_adaptive_multipliers(weight_profile: dict) -> tuple[dict, dict]:
         for m in weight_profile
     }
     return new_profile, mults
+
+
+# ── IC-informed adaptive weights (panel-driven; default off) ─────────────────
+
+_IC_WEIGHT_CACHE: dict = {}
+
+
+def _ic_mults_from_ic_table(ic, key: str) -> dict:
+    """Map an IC table (``icir_<key>`` + ``icdays_<key>`` columns) → ``{method:
+    multiplier}``, reweighting ONLY methods whose IC is statistically confident.
+
+    ``key`` selects the horizon column: ``"5d"`` for the edge basis
+    (``signal_panel.compute_ic``), ``"1w"`` for the shadow basis (the ``both``-side
+    rows of ``simulated_trades.compute_directional_perf``).
+
+    A method is reweighted only when its mean-daily-IC t-statistic clears the bar::
+
+        t = |ICIR| · sqrt(n_days)  ≥  ic_weight_min_t        (t ≥ 2 ≈ 95% significant)
+
+    Methods below the bar are OMITTED → they keep their base weight (we are not yet
+    confident the IC is real, so we do not touch it). Among the CONFIDENT methods::
+
+        ICIR > 0 → boost: mult = clip(ICIR / median(confident positive ICIR), min, max)
+                   (typical confident method → 1.0×, better → up, weaker → down)
+        ICIR ≤ 0 → floor: mult = ic_weight_min_multiplier
+                   (confidently anti-predictive — minimise until inversion flips it)
+
+    Returns ``{}`` when no method clears the bar (a thin panel ⇒ a pure no-op)."""
+    import pandas as pd
+    from math import sqrt
+    if ic is None or getattr(ic, "empty", True):
+        return {}
+    icir_col, days_col = f"icir_{key}", f"icdays_{key}"
+    if icir_col not in ic.columns or days_col not in ic.columns:
+        return {}
+    lo = float(settings.ic_weight_min_multiplier)
+    hi = float(settings.ic_weight_max_multiplier)
+    min_t = max(0.0, float(settings.ic_weight_min_t))
+
+    by_method = {str(r["method"]): r for _, r in ic.iterrows()}
+
+    # Pass 1 — keep only pool methods whose IC clears the confidence (t-stat) gate.
+    confident: dict = {}    # method -> ICIR
+    for m in _BASE_WEIGHTS:
+        r = by_method.get(m)
+        if r is None:
+            continue
+        icir, n_days = r.get(icir_col), r.get(days_col)
+        if (icir is None or pd.isna(icir) or n_days is None or pd.isna(n_days)
+                or int(n_days) <= 0):
+            continue                  # no usable ICIR yet → keep base weight
+        if abs(float(icir)) * sqrt(int(n_days)) >= min_t:
+            confident[m] = float(icir)
+    if not confident:
+        return {}                     # nothing is confident yet → no-op (base weights)
+
+    pos = [v for v in confident.values() if v > 0]
+    if not pos:                       # every confident method is anti-predictive → floor all
+        return {m: lo for m in confident}
+    from statistics import median
+    ref = median(pos)                 # typical confident positive ICIR = the 1.0× anchor
+    if ref <= 1e-9:
+        return {m: lo for m in confident}
+
+    mults: dict = {}
+    for m, icir in confident.items():
+        mults[m] = lo if icir <= 0 else round(max(lo, min(hi, icir / ref)), 3)
+    return mults
+
+
+def _ic_weight_multipliers() -> dict:
+    """``{method: multiplier}`` from each method's confidence-gated IC over the
+    unbiased signals panel (see ``_ic_mults_from_ic_table``).
+
+    ``ic_weight_basis`` selects the IC:
+      * ``"shadow"`` (default) — MARKET-NEUTRAL IC (ticker − SPY, pooled both
+        directions): the ``both``-side rows of ``compute_directional_perf`` at the
+        ``ic_weight_shadow_horizon`` label. Weights by regime-robust alpha, not beta.
+      * ``"edge"`` — absolute-return IC: ``compute_ic`` at ``ic_weight_horizon_days``.
+
+    Cached for ``ic_weight_cache_seconds`` because ``build_signals`` runs many times
+    per tick (the hold-review pool). Returns ``{}`` (→ no tilt) when disabled or when
+    no method clears the confidence gate yet."""
+    if not settings.enable_ic_weights:
+        return {}
+    import time
+    now = time.time()
+    hit = _IC_WEIGHT_CACHE.get("v")
+    if hit and (now - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["mults"]
+    mults: dict = {}
+    try:
+        if str(settings.ic_weight_basis).lower() == "edge":
+            from src.analysis.signal_panel import build_panel, compute_ic
+            h = max(1, int(settings.ic_weight_horizon_days))
+            panel = build_panel(horizons=(h,), days=settings.horizon_ic_days)
+            if panel is not None and not panel.empty:
+                ic = compute_ic(panel, horizons=(h,),
+                                min_n=settings.horizon_ic_min_n,
+                                min_per_day=settings.ic_weight_min_per_day,
+                                min_days=settings.ic_weight_min_days)
+                mults = _ic_mults_from_ic_table(ic, f"{h}d")
+        else:  # shadow (default) — market-neutral, pooled-both-directions IC
+            from src.analysis.simulated_trades import compute_directional_perf
+            lbl = str(settings.ic_weight_shadow_horizon)
+            df = compute_directional_perf(days=settings.horizon_ic_days,
+                                          benchmark=settings.horizon_market_benchmark,
+                                          min_n=settings.horizon_ic_min_n,
+                                          min_per_day=settings.ic_weight_min_per_day,
+                                          min_days=settings.ic_weight_min_days)
+            if df is not None and not df.empty and "side" in df.columns:
+                both = df[df["side"] == "both"]
+                if not both.empty:
+                    mults = _ic_mults_from_ic_table(both, lbl)
+    except Exception as e:  # pragma: no cover - defensive (DB / cache hiccup)
+        logger.debug(f"[aggregator] IC weights unavailable ({e}) — base weights used")
+        mults = {}
+    _IC_WEIGHT_CACHE["v"] = {"ts": now, "mults": mults}
+    return mults
+
+
+def reset_ic_weight_cache() -> None:
+    """Drop the cached IC-weight multipliers (tests / forced refresh)."""
+    _IC_WEIGHT_CACHE.clear()
 
 
 # ── Per-method score helpers ──────────────────────────────────────────────────
@@ -821,6 +947,7 @@ def build_signals(
     force_sentiment_engine: Optional[str] = None,  # pin news scoring to one engine (hold-review)
     corp_factors: Optional[dict] = None,  # {ticker: {f_split, f_dividend}} — additive corporate-action overlay
     fundamental_factors: Optional[dict] = None,  # {ticker: {f_value, f_quality, f_growth, f_short_squeeze}} — additive overlay
+    borrow_context: Optional[dict] = None,  # {ticker: BorrowInfo} — IBKR short-borrow for the broker_advisor method
 ) -> List[TickerSignal]:
     """Build a TickerSignal for each ticker using all enabled methods.
 
@@ -885,6 +1012,9 @@ def build_signals(
         {s.ticker: float(s.price) for s in (snapshots or []) if getattr(s, "price", None)}
         if use_ext_gap else {}
     )
+    # Broker advisor — IBKR short-borrow tilt. Needs the borrow context (fetched by
+    # the pipeline from the live broker); inactive otherwise → method scores 0.
+    use_broker_advisor = settings.enable_broker_advisor and borrow_context is not None
 
     if not use_news and not use_tech and not use_insider and not use_put_call:
         logger.warning("All analysis methods disabled — no signals will be generated.")
@@ -911,6 +1041,27 @@ def build_signals(
                 "Adaptive weights — solo-WR multipliers: "
                 + "  ".join(f"{m}={v:.2f}x" for m, v in ranked)
             )
+
+    # IC-informed weights — tilt by reliability-adjusted IC (ICIR) over the UNBIASED
+    # signals panel, shrunk toward the base weight by evidence. Default off; composes
+    # as another multiplier on whatever profile is active (stacks with the win-rate
+    # layer above when both are on). A thin panel ⇒ {} ⇒ base weights unchanged.
+    if settings.enable_ic_weights:
+        ic_mults = _ic_weight_multipliers()
+        if ic_mults:
+            base_for_ic = dict(weight_profile or _BASE_WEIGHTS)
+            weight_profile = {
+                m: base_for_ic.get(m, _BASE_WEIGHTS.get(m, 0.0)) * ic_mults.get(m, 1.0)
+                for m in base_for_ic
+            }
+            ranked = sorted(ic_mults.items(), key=lambda kv: -kv[1])
+            logger.info(
+                f"IC weights — {len(ic_mults)} method(s) cleared the confidence gate "
+                f"(t≥{settings.ic_weight_min_t:g}): "
+                + "  ".join(f"{m}={v:.2f}x" for m, v in ranked))
+        else:
+            logger.debug("IC weights — no method cleared the confidence gate yet "
+                         "(panel too thin); base weights unchanged")
 
     # OpEx max-pain amplifier — boost max_pain weight during OpEx / Triple Witching week
     if (settings.enable_catalyst_timing
@@ -959,6 +1110,7 @@ def build_signals(
         "iv_expr":    use_iv_expr,
         "coint":      use_coint,
         "ext_gap":    use_ext_gap,
+        "broker_advisor": use_broker_advisor,
     }
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     active_count = sum(active_flags.values())
@@ -975,7 +1127,8 @@ def build_signals(
         f"sector_mom={weights['sector_momentum']:.0%}  market_mom={weights['market_momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
         f"trend={weights['trend_strength']:.0%}  "
         f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
-        f"coint={weights['coint']:.0%}  ext_gap={weights['ext_gap']:.0%}"
+        f"coint={weights['coint']:.0%}  ext_gap={weights['ext_gap']:.0%}  "
+        f"broker_advisor={weights['broker_advisor']:.0%}"
     )
 
     signals        = []
@@ -1121,13 +1274,13 @@ def build_signals(
             (sector_momentum_score, sector_momentum_1m_pct,
              sector_momentum_3m_pct, sector_benchmark_used) = compute_sector_relative_momentum_score(ticker)
 
-        # ── Method 9c: Market-Relative Momentum (DIAGNOSTIC) ─────────────
-        # Ticker − SPY residual. Stored on the signal for the email / Claude
-        # prompt so divergences from sector_momentum are visible, but NOT
-        # added to the weighted combo: market_rel = sector_rel + (sector −
-        # market), so weighting it would double-count beta. Acts purely as a
-        # diagnostic — answers "is this name lagging the market?" alongside
-        # the sector-specific read.
+        # ── Method 9c: Market-Relative Momentum (ticker − SPY) ───────────
+        # Residual vs the broad market. PROMOTED into the weighted combine
+        # (2026-06-24) but kept LIGHT (market_momentum=0.08): market_rel =
+        # sector_rel + (sector − market), so a heavy weight would double-count
+        # the beta already carried by sector_momentum — the small weight bounds
+        # that overlap. Also stored on the signal for the email / Claude prompt
+        # so divergences from sector_momentum stay visible.
         market_momentum_score   = 0.0
         market_momentum_1m_pct  = 0.0
         market_momentum_3m_pct  = 0.0
@@ -1206,6 +1359,13 @@ def build_signals(
                 ticker, snap_price_by_ticker.get(ticker), session=session,
             )
 
+        # ── Method 16: Broker advisor (IBKR short-borrow squeeze tilt) ────
+        # + = hard/expensive to short (squeeze tell → bullish, fades a SELL); 0 =
+        # easy borrow / no data. The first method in the broker-aware group.
+        broker_advisor_score_v = 0.0
+        if use_broker_advisor:
+            broker_advisor_score_v = compute_broker_advisor_score(borrow_context.get(ticker))
+
         # ── Multi-timeframe blend (30m / daily / weekly) ──────────────────
         # Recompute the 8 OHLCV methods on the faster + slower candles and
         # renormalise-blend them with the daily score. The blended value is what
@@ -1267,7 +1427,8 @@ def build_signals(
             weights["iv_rank"]    * iv_rank_eff +
             weights["iv_expr"]    * iv_expr_score_v +
             weights["coint"]      * coint_score_v +
-            weights["ext_gap"]    * ext_gap_score_v
+            weights["ext_gap"]    * ext_gap_score_v +
+            weights["broker_advisor"] * broker_advisor_score_v
         )
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -1334,6 +1495,7 @@ def build_signals(
             (use_iv_expr,    iv_expr_score_v),
             (use_coint,      coint_score_v),
             (use_ext_gap,    ext_gap_score_v),
+            (use_broker_advisor, broker_advisor_score_v),
         ]
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
 
@@ -1429,6 +1591,7 @@ def build_signals(
             coint_score=round(coint_score_v, 3),
             ext_gap_score=round(ext_gap_score_v, 3),
             ext_gap_pct=round(ext_gap_pct_v, 2),
+            broker_advisor_score=round(broker_advisor_score_v, 3),
             timeframe_scores=tf_scores,
         )
 
