@@ -73,7 +73,11 @@ def test_persist_exit_signals_hook_end_to_end(tmp_db):
                        sentiment_score=0.5, technical_score=0.0, rationale="t")
     sig.combined_score = 0.4
     open_trades = [{"ticker": "AAA", "action": "BUY", "direction": "BULLISH",
-                    "recommendation_id": "pos-1", "current_price": 100.0}]
+                    "recommendation_id": "pos-1", "current_price": 100.0,
+                    # position path: peak +6% given back to −2% (mfe exit), −6% low
+                    # partly recovered (mae exit) → both excursion methods fire.
+                    "return_pct": -2.0, "max_favorable_excursion": 6.0,
+                    "max_adverse_excursion": -6.0}]
     hold_reviews = {"AAA": NS(action="BUY", confidence=0.75, direction="BULLISH")}
     pipeline._persist_exit_signals("run-1", hold_reviews, open_trades,
                                    {"AAA": sig}, NS(regime="PANIC"))
@@ -81,10 +85,12 @@ def test_persist_exit_signals_hook_end_to_end(tmp_db):
     from src.db import repo
     df = repo.fetch_df("SELECT * FROM exit_signals", read_only=False)
     by_method = {r["method"]: r for _, r in df.iterrows()}
-    assert {"llm_review", "aggregator", "macro_regime", "news"} <= set(by_method)
+    assert {"llm_review", "aggregator", "macro_regime", "news", "mfe", "mae"} <= set(by_method)
     assert by_method["llm_review"]["score"] == pytest.approx(0.75)     # reaffirmed BUY
     assert by_method["aggregator"]["score"] == pytest.approx(0.4)      # combined × +1
     assert by_method["macro_regime"]["score"] == pytest.approx(-1.0)   # long in PANIC → exit
     assert by_method["news"]["score"] == pytest.approx(0.5)            # bullish news = hold a long
+    assert by_method["mfe"]["score"] == pytest.approx(-1.0)            # peak given back → exit
+    assert by_method["mae"]["score"] < 0                              # deep drawdown, not fully recovered
     assert by_method["llm_review"]["position_id"] == "pos-1"
     assert set(df["entry_direction"]) == {"BULLISH"}

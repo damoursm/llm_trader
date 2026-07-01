@@ -141,10 +141,47 @@ def test_zero_scores_are_omitted():
     assert sc == {}                                     # nothing non-zero → empty
 
 
+# ── MFE / MAE excursion signals (position-path, held-only) ─────────────────
+
+def _exc(**kw):
+    # isolate the excursion scores: no review, no signal, neutral regime, no horizon.
+    return build_exit_scores(_long(**kw), None, {}, NS(regime="NEUTRAL"))
+
+
+def test_mfe_peak_is_hold_giveback_is_exit():
+    assert _exc(return_pct=5, max_favorable_excursion=5, max_adverse_excursion=0)["mfe"] == pytest.approx(1.0)
+    assert _exc(return_pct=0, max_favorable_excursion=5, max_adverse_excursion=0)["mfe"] == pytest.approx(-1.0)
+    # halfway give-back → 0 → omitted (no view)
+    assert "mfe" not in _exc(return_pct=2.5, max_favorable_excursion=5, max_adverse_excursion=0)
+
+
+def test_mfe_omitted_without_a_real_peak():
+    assert "mfe" not in _exc(return_pct=0.3, max_favorable_excursion=0.5, max_adverse_excursion=0)
+
+
+def test_mae_deep_lows_is_exit_recovered_is_omitted():
+    # at the lows of an 8% drawdown (scale 8) → severity 1, recovery 0 → −1
+    assert _exc(return_pct=-8, max_favorable_excursion=0, max_adverse_excursion=-8)["mae"] == pytest.approx(-1.0)
+    # recovered to entry off a −6% low → 0 → omitted
+    assert "mae" not in _exc(return_pct=0, max_favorable_excursion=0, max_adverse_excursion=-6)
+
+
+def test_mae_omitted_without_a_real_drawdown():
+    assert "mae" not in _exc(return_pct=1, max_favorable_excursion=2, max_adverse_excursion=-0.3)
+
+
+def test_excursion_already_position_oriented_for_short():
+    # A winning SHORT (stock fell → +6% P&L) sits at its favorable peak → mfe +1
+    # (hold). MFE/MAE are P&L-signed, so NO dir_sign is applied (no double-orient).
+    sc = build_exit_scores(_short(return_pct=6, max_favorable_excursion=6, max_adverse_excursion=-1),
+                           None, {}, NS(regime="NEUTRAL"))
+    assert sc["mfe"] == pytest.approx(1.0)
+
+
 # ── category mapping ────────────────────────────────────────────────────────
 
 def test_exit_category_for():
-    for m in ("llm_review", "aggregator", "macro_regime", "horizon"):
+    for m in ("llm_review", "aggregator", "macro_regime", "horizon", "mfe", "mae"):
         assert exit_category_for(m) == EXIT_CATEGORY_DECISION
     for m in ("news", "tech", "momentum", "pead"):
         assert exit_category_for(m) == EXIT_CATEGORY_SIGNAL

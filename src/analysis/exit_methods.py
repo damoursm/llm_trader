@@ -20,7 +20,8 @@ Two families of exit method:
 * **Exit-decision overlays** — the exit-specific inputs to
   ``tracker._evaluate_decay``: the synthesized ``llm_review`` (the method that
   actually decides), the ``aggregator`` combined score, the ``macro_regime``
-  risk overlay, and the ``horizon`` time-stop.
+  risk overlay, the ``horizon`` time-stop, and the position-path excursion
+  signals ``mfe`` (peak give-back / trailing) and ``mae`` (drawdown / stop).
 * **Signal methods** — the same per-ticker entry methods (news, tech, momentum,
   …), re-read on the held ticker and oriented to the position, so we learn which
   entry signals are also good EXIT predictors.
@@ -34,8 +35,10 @@ from __future__ import annotations
 from typing import Dict
 
 # The exit-specific overlay methods (distinct from the entry signal methods,
-# which are ALSO re-scored as exit signals on a held position).
-EXIT_DECISION_METHODS = ("llm_review", "aggregator", "macro_regime", "horizon")
+# which are ALSO re-scored as exit signals on a held position). ``mfe`` / ``mae``
+# are held-only path signals — they need a position's ratcheted excursions, so
+# (like horizon / llm_review) they never appear in the universe shadow book.
+EXIT_DECISION_METHODS = ("llm_review", "aggregator", "macro_regime", "horizon", "mfe", "mae")
 
 # Dashboard Exit-IC table grouping (mirrors signal_panel.IC_CATEGORY_ORDER).
 EXIT_CATEGORY_DECISION = "Exit decision (synthesized review + overlays)"
@@ -49,12 +52,21 @@ EXIT_METHOD_LABELS: Dict[str, str] = {
     "aggregator":   "Aggregator combined score",
     "macro_regime": "Macro regime overlay",
     "horizon":      "Horizon time-stop",
+    "mfe":          "Favorable excursion / give-back (trailing)",
+    "mae":          "Adverse excursion / drawdown (stop)",
 }
 
 # Regime → hold-pressure for a LONG position (× the position's dir_sign). Only
 # the regimes the exit rule actually reacts to are non-zero; NEUTRAL/CAUTION → 0
 # (no exit view). Mirrors tracker._evaluate_decay's PANIC/RISK_OFF long-exit.
 _REGIME_PRESSURE = {"RISK_ON": 0.5, "RISK_OFF": -0.7, "PANIC": -1.0}
+
+# MFE / MAE excursion-signal scaling (all in position-P&L %). A peak worth
+# protecting must exceed _MFE_MIN_PCT; a drawdown must be deeper than _MAE_MIN_PCT
+# to signal; _MAE_SCALE_PCT is the depth at which the drawdown exit saturates to −1.
+_MFE_MIN_PCT = 1.0
+_MAE_MIN_PCT = 1.0
+_MAE_SCALE_PCT = 8.0
 
 
 def exit_category_for(method: str) -> str:
@@ -65,6 +77,41 @@ def exit_category_for(method: str) -> str:
 def _dir_sign(trade: dict) -> int:
     """+1 for a long (BUY) position, −1 for a short (SELL)."""
     return 1 if (trade.get("action") or "").upper() == "BUY" else -1
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _excursion_scores(trade: dict) -> Dict[str, float]:
+    """Hold-conviction from the position's OWN path — the max favorable / adverse
+    excursion vs the current mark (a trailing-profit + drawdown pair):
+
+    * ``mfe`` — peak RETENTION: ``+1`` while the mark sits at its high-water peak
+      (still running), ramping to ``−1`` as that peak is given back (momentum
+      exhaustion → exit). Meaningful only once a real peak formed (MFE >
+      ``_MFE_MIN_PCT``).
+    * ``mae`` — drawdown SEVERITY relieved by recovery: negative, deeper the further
+      the position bled (vs ``_MAE_SCALE_PCT``), fading to ``0`` as it recovers off
+      its lows. Exit-biased (≤ 0); fires only past a real drawdown (> ``_MAE_MIN_PCT``).
+
+    Both are ALREADY position-oriented — ``return_pct`` / MFE / MAE are P&L-signed
+    (a short's favorable excursion is positive when the stock falls) — so they are
+    NOT multiplied by ``dir_sign``. Whether give-back actually predicts reversal (or
+    a deep MAE predicts further decline) is exactly what the exit-panel IC measures."""
+    out: Dict[str, float] = {}
+    cur = float(trade.get("return_pct") or 0.0)
+    mfe = float(trade.get("max_favorable_excursion") or 0.0)
+    mae = float(trade.get("max_adverse_excursion") or 0.0)
+    if mfe > _MFE_MIN_PCT:
+        give_back = (mfe - cur) / mfe              # 0 at the peak, 1 back at entry, >1 below
+        out["mfe"] = _clip(1.0 - 2.0 * give_back, -1.0, 1.0)
+    depth = -mae                                   # ≥ 0 once the position has drawn down
+    if depth > _MAE_MIN_PCT:
+        severity = _clip(depth / _MAE_SCALE_PCT, 0.0, 1.0)
+        recovery = _clip((cur - mae) / depth, 0.0, 1.0)   # 0 at the lows → 1 recovered to entry
+        out["mae"] = -severity * (1.0 - recovery)
+    return out
 
 
 def _horizon_pressure(trade: dict) -> float:
@@ -120,6 +167,10 @@ def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_
 
     # 4. Horizon time-stop pressure (one-sided: 0 within window, negative past it).
     scores["horizon"] = _horizon_pressure(trade)
+
+    # 4b. MFE / MAE excursion signals from the position's own path (already
+    #     position-oriented — P&L terms — so no dir_sign). Held-only.
+    scores.update(_excursion_scores(trade))
 
     # 5. The entry signal methods, re-scored on the held ticker and oriented.
     if today_signal is not None:

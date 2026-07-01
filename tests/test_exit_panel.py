@@ -150,8 +150,9 @@ def test_shadow_excludes_held_only_methods(monkeypatch):
     df = ep.compute_shadow_exit_method_perf(min_n=1, min_per_day=1, min_days=1, signals_df=sig)
     methods = set(df["method"])
     assert {"aggregator", "news"} <= methods
-    # horizon / llm_review / macro_regime need a real entry / opener → held-only, never here.
-    assert not ({"horizon", "llm_review", "macro_regime"} & methods)
+    # horizon / llm_review / macro_regime / mfe / mae need a real held position
+    # (entry, opener, or excursion history) → held-only, never in the shadow book.
+    assert not ({"horizon", "llm_review", "macro_regime", "mfe", "mae"} & methods)
 
 
 def test_shadow_category_grouping(monkeypatch):
