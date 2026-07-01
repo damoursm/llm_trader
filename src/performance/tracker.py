@@ -1551,6 +1551,27 @@ def compute_hold_prompt_eval(trades: Optional[List[dict]] = None) -> dict:
     return {"on": _seg(True), "off": _seg(False)}
 
 
+def compute_exit_reason_perf() -> List[dict]:
+    """Per exit-reason performance over CLOSED trades — one row per ``exit_reason``
+    with the standard segment stats (trades / win_rate / avg / median / compound /
+    best / worst via ``_compute_segment_stats``). Groups by the reason stamped when
+    the position closed (``llm_signal_flipped``, ``llm_confidence_loss``,
+    ``horizon_expired``, ``macro_regime_exit``, ``signal_flipped``, ``signal_decay``,
+    ``confidence_loss``, ``intraday_reversal`` …). This is the realized outcome of
+    each exit RULE — the day-one companion to the forward-looking exit-method IC
+    table (both live in the Exit Performance tab). Sorted by trade count desc."""
+    closed = [t for t in _load_trades() if t.get("status") == "CLOSED"]
+    by_reason: Dict[str, List[dict]] = {}
+    for t in closed:
+        by_reason.setdefault(t.get("exit_reason") or "(unspecified)", []).append(t)
+    rows: List[dict] = []
+    for reason, seg in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+        stats = _compute_segment_stats(seg)
+        if stats:
+            rows.append({"exit_reason": reason, **stats})
+    return rows
+
+
 def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
                                     hold_prompt_active: Optional[bool] = None) -> int:
     """Close open trades whose direction has reversed in today's actionable recommendations.
@@ -1685,16 +1706,19 @@ def _held_hours(trade: dict) -> Optional[float]:
         return None
 
 
-def _horizon_expired_floor(trade: dict) -> Optional[float]:
-    """The RAISED hold-review confidence floor a position must clear once it has
-    outlived its target-horizon window, else ``None`` (still within window, or
-    horizon synthesis / matched exit disabled, or no target horizon stored).
+def _horizon_expiry(trade: dict) -> Optional[dict]:
+    """Matched-exit state once a position outlives its target-horizon window, else
+    ``None`` (still inside the window, horizon synthesis / matched exit disabled, or
+    no target horizon). Returns ``{"floor", "ramp"}``.
 
-    The matched exit: a position held past the horizon its measured edge supports
-    must be STRONGLY re-confirmed by its opener to keep running — short-horizon
-    trades therefore exit promptly once their edge window passes, long-horizon
-    trades are left patient. A still-conviction winner above the raised floor is
-    NOT cut."""
+    CONTINUOUS, not a cliff: the required re-confirmation ``floor`` ramps from the
+    normal base floor (``ramp`` 0, AT the window — so nothing changes the instant a
+    position crosses its horizon) up to ``base × horizon_expiry_floor_mult``
+    (``ramp`` 1), reaching full strength ``horizon_expiry_ramp_windows`` windows
+    past expiry. A same-direction position whose conviction drops below the ramped
+    floor closes; a still-conviction winner is NOT cut. Short-horizon trades tighten
+    fast (the window is small), long-horizon trades stay patient — the ramp is in
+    units of the position's OWN horizon."""
     if not (settings.enable_horizon_synthesis and settings.enable_horizon_matched_exit):
         return None
     target_h = trade.get("target_horizon")
@@ -1707,8 +1731,20 @@ def _horizon_expired_floor(trade: dict) -> Optional[float]:
     held = _held_hours(trade)
     if held is None or held < window:
         return None
+    overage = held / window - 1.0                              # 0 at the window, grows after
+    ramp_windows = max(1e-9, float(settings.horizon_expiry_ramp_windows))
+    ramp = min(1.0, max(0.0, overage / ramp_windows))
     base = _confidence_floor(trade.get("confidence"))
-    return min(0.99, base * float(settings.horizon_expiry_floor_mult))
+    floor = min(0.99, base * (1.0 + (float(settings.horizon_expiry_floor_mult) - 1.0) * ramp))
+    return {"floor": floor, "ramp": ramp}
+
+
+def _horizon_expired_floor(trade: dict) -> Optional[float]:
+    """The (ramped) matched-exit confidence floor, or ``None`` when the position is
+    within its window / the matched exit is off. Thin accessor over
+    ``_horizon_expiry`` (kept for callers that only need the floor value)."""
+    st = _horizon_expiry(trade)
+    return st["floor"] if st else None
 
 
 def _evaluate_decay(
@@ -1769,15 +1805,20 @@ def _evaluate_decay(
         # Flip — the engine now actively calls the OTHER way.
         if (action == "BUY" and rev_action == "SELL") or (action == "SELL" and rev_action == "BUY"):
             return "llm_signal_flipped"
-        # Horizon-matched time-stop: once the position has outlived the horizon its
-        # measured edge supports, it must be STRONGLY re-confirmed (same direction,
-        # conviction ≥ the raised floor) to survive — a neutral HOLD/WATCH or a
-        # faded conviction closes it. Short-horizon trades thus exit promptly once
-        # their window passes; long-horizon winners still in conviction are kept.
-        exp_floor = _horizon_expired_floor(trade)
-        if exp_floor is not None:
-            if rev_action != action or conv < exp_floor:
-                return "horizon_expired"
+        # Horizon-matched time-stop (CONTINUOUS): once the position outlives the
+        # horizon its measured edge supports, the required re-confirmation floor
+        # RAMPS up with age (see _horizon_expiry) — no cliff at the boundary. A
+        # same-direction re-affirmation whose conviction has faded below that ramped
+        # floor closes. A neutral HOLD/WATCH is NOT cut at the boundary (that
+        # contradicted the never-close-on-neutral rule below and drove premature
+        # exits); it is flushed only once FULLY past the window (ramp saturated) and
+        # only when horizon_expiry_flush_neutral is on. A flip already closed above.
+        exp = _horizon_expiry(trade)
+        if exp is not None:
+            if rev_action == action:
+                return "horizon_expired" if conv < exp["floor"] else None
+            if settings.horizon_expiry_flush_neutral and exp["ramp"] >= 1.0:
+                return "horizon_expired"        # persistent neutral, well past its window
             return None
         # Same-direction re-affirmation whose conviction collapsed below the
         # entry-relative floor. A neutral HOLD/WATCH is NOT a close: the engine

@@ -276,6 +276,19 @@ SCHEMA_STATEMENTS = [
         entry_price   DOUBLE
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS exit_signals (
+        run_id          VARCHAR,
+        reviewed_at     VARCHAR,
+        signal_date     VARCHAR,
+        ticker          VARCHAR,
+        position_id     VARCHAR,
+        entry_direction VARCHAR,
+        method          VARCHAR,
+        score           DOUBLE,
+        price           DOUBLE
+    );
+    """,
 ]
 
 

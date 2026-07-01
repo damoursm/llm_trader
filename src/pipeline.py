@@ -733,6 +733,43 @@ def _persist_trade_reviews(run_id, hold_reviews, open_trades):
         logger.warning(f"[hold_review] persisting trade_reviews failed: {e}")
 
 
+def _persist_exit_signals(run_id, hold_reviews, open_trades, signals_by_ticker, macro_regime_context):
+    """Append this tick's per-held-position exit-method scores to the ``exit_signals``
+    panel — the unbiased dataset that powers the dashboard's Exit Performance IC
+    table. One row per (open position, non-zero exit method): the synthesized
+    ``llm_review`` that actually decides plus the macro/horizon/aggregator overlays
+    and the entry signal methods re-scored as exit signals, each as a signed
+    hold-conviction (see ``analysis.exit_methods``). Exception-safe: a DB hiccup
+    never breaks the run."""
+    if not open_trades:
+        return
+    from src.analysis.exit_methods import build_exit_scores
+    from src.utils import ET
+    now = datetime.now(timezone.utc).isoformat()
+    signal_date = datetime.now(ET).date().isoformat()
+    rows = []
+    for t in open_trades:
+        hr = (hold_reviews or {}).get(t["ticker"])
+        scores = build_exit_scores(t, hr, signals_by_ticker, macro_regime_context)
+        for method, score in scores.items():
+            rows.append({
+                "reviewed_at": now,
+                "signal_date": signal_date,
+                "ticker": t["ticker"],
+                "position_id": t.get("recommendation_id"),
+                "entry_direction": t.get("direction"),
+                "method": method,
+                "score": score,
+                "price": t.get("current_price"),
+            })
+    try:
+        repo.insert_exit_signals(run_id, rows)
+        logger.info(f"[exit_panel] persisted {len(rows)} exit-method score(s) across "
+                    f"{len(open_trades)} held position(s) to exit_signals")
+    except Exception as e:
+        logger.warning(f"[exit_panel] persisting exit_signals failed: {e}")
+
+
 def _run_yf_options_tasks(all_tickers):
     """Run options_flow and GEX sequentially inside one thread.
 
@@ -1730,6 +1767,10 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # Persist the trajectory (confidence/action vs entry + price) BEFORE the
         # monitor may close on it, so the review that triggered a close is recorded.
         _persist_trade_reviews(run_id, hold_reviews, _open_trades_now)
+        # Decompose the exit decision into per-method hold-conviction scores and
+        # persist them (exit_signals panel) for the Exit Performance IC table.
+        _persist_exit_signals(run_id, hold_reviews, _open_trades_now,
+                              signals_by_ticker, macro_regime_context)
         # Open-position monitor: opener-pinned LLM exits (+ macro-regime, + the
         # aggregator backstop for legacy trades) BEFORE the counter-recommendation
         # exit path.

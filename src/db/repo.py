@@ -343,6 +343,43 @@ def insert_simulated_trades(run_id: str, generated_at: str, signal_date: str,
         conn.execute("COMMIT")
 
 
+# ── per-tick exit-method scores (held positions) — the exit learning panel ──
+
+_EXIT_SIGNAL_COLS = [
+    "run_id", "reviewed_at", "signal_date", "ticker", "position_id",
+    "entry_direction", "method", "score", "price",
+]
+
+
+def insert_exit_signals(run_id: str, rows: List[dict]) -> None:
+    """Persist one row per (held position, exit method) re-scored this tick.
+
+    The exit-side counterpart to ``insert_simulated_trades``: each row records an
+    exit method's signed **hold-conviction** score (+ = the position should keep
+    running, − = it should reverse/exit) on one open position at one tick, so the
+    predictiveness of each individual exit method — and of the synthesized
+    ``llm_review`` that actually decides — can be measured over EVERY held tick,
+    not just the few positions that closed. Idempotent per ``run_id``. Each dict
+    carries reviewed_at/signal_date/ticker/position_id/entry_direction/method/
+    score/price."""
+    if not rows:
+        return
+    out = [(
+        run_id, r.get("reviewed_at"), r.get("signal_date"),
+        r.get("ticker"), r.get("position_id"), r.get("entry_direction"),
+        r.get("method"), _f(r.get("score")), _f(r.get("price")),
+    ) for r in rows]
+    placeholders = ", ".join(["?"] * len(_EXIT_SIGNAL_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM exit_signals WHERE run_id = ?", [run_id])
+        conn.executemany(
+            f"INSERT INTO exit_signals ({', '.join(_EXIT_SIGNAL_COLS)}) VALUES ({placeholders})",
+            out,
+        )
+        conn.execute("COMMIT")
+
+
 # ── broker execution record (write path from reconcile, via the pipeline) ──
 
 _BROKER_RECONCILE_COLS = [

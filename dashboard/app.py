@@ -340,6 +340,8 @@ def serve_layout() -> html.Div:
                             children=dcc.Loading(html.Div(_safe(_rationale_tab), style=body))),
                     dcc.Tab(label="Method Performance", value="methods",
                             children=dcc.Loading(html.Div(_safe(_methods_tab), style=body))),
+                    dcc.Tab(label="Exit Performance", value="exit_perf",
+                            children=dcc.Loading(html.Div(_safe(_exit_perf_tab), style=body))),
                     dcc.Tab(label="Returns", value="returns",
                             children=dcc.Loading(html.Div(_safe(_returns_tab), style=body))),
                     dcc.Tab(label="Execution", value="execution",
@@ -787,22 +789,24 @@ _SIM_METRIC_LABELS = {"n": "n (obs)", "ic": "IC", "icstd": "IC std", "icir": "IC
                       "win": "Win %", "ret": "Ret %"}
 
 
-def _sim_column_filters() -> html.Div:
+def _sim_column_filters(h_id: str = "sim-horizons", m_id: str = "sim-metrics") -> html.Div:
     """Horizons + metrics multi-selects that trim the columns of every simulated
-    table below. Empty selection falls back to all (never an empty table)."""
+    table below. Empty selection falls back to all (never an empty table). The
+    ids are parameterised so the Method-Performance and Exit-Performance tabs each
+    get an independent pair (duplicate component ids would break Dash)."""
     return html.Div(
         [
             html.Label("Simulated columns:  ",
                        title="Pick which horizons and which metrics (n / IC / Win % / Ret %) "
-                             "appear in the 'All scored tickers' tables below. Applies to all "
+                             "appear in the category tables below. Applies to all "
                              "category tables at once; clearing a picker shows everything.",
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 8}),
-            dcc.Dropdown(id="sim-horizons",
+            dcc.Dropdown(id=h_id,
                          options=[{"label": h, "value": h} for h in _SIM_HORIZONS],
                          value=list(_SIM_HORIZONS), multi=True, placeholder="Horizons…",
                          persistence=True, persistence_type="session",
                          style={"flex": 2, "minWidth": 320}),
-            dcc.Dropdown(id="sim-metrics",
+            dcc.Dropdown(id=m_id,
                          options=[{"label": _SIM_METRIC_LABELS[m], "value": m} for m in _SIM_METRIC_ORDER],
                          value=list(_SIM_METRIC_ORDER), multi=True, placeholder="Metrics…",
                          persistence=True, persistence_type="session",
@@ -1077,6 +1081,162 @@ def _methods_perf_section(window_days, session=None, direction=None):
             "deduped to the engine's last call per ticker per day. The 50/50 A/B routing flip gives each engine its own runs to be judged on. Hover the column headers for details."),
         table,
     ])
+
+
+# ── Tab: Exit Performance ──────────────────────────────────────────────────
+
+_EXIT_PERF_TOOLTIP = (
+    "Every held position, every tick, has its exit decision decomposed into signed "
+    "HOLD-CONVICTION scores (+ = the position should keep running, − = it should "
+    "reverse/exit) — the synthesized `llm_review` that actually decides, the macro / "
+    "horizon / aggregator overlays, and the entry signal methods re-scored as exit "
+    "signals — persisted to the `exit_signals` panel. Each is joined to the position's "
+    "DIRECTION-ORIENTED forward return (a short's forward return is negated), so a "
+    "persistently POSITIVE IC means the method correctly holds winners / exits losers. "
+    "Per horizon (30m…1m): 'n@' = joint observations, 'IC@' = Spearman correlation of the "
+    "hold-conviction vs the oriented forward return, 'IC std@' / 'ICIR@' = the IC's "
+    "reliability (stdev / information-ratio of the per-day IC; |ICIR| ≳ 0.5 stable, ≈ 0 "
+    "noise — needs several days), 'Win@ %' = share of ticks the method's sign matched the "
+    "position's forward move, 'Ret@ %' = mean signed forward return. The synthesized "
+    "`llm_review` row is history-backed from `trade_reviews`; the decomposed methods accrue "
+    "as the panel fills. Forward-collected — judge nothing on a thin n. Later, these weight "
+    "an exit combined score.")
+
+_EXIT_SHADOW_TOOLTIP = (
+    "The SIMULATED exit book: every scored ticker (the signals panel) treated as a hypothetical "
+    "position held in its own aggregate direction, with each position-independent exit method scored "
+    "as a signed hold-conviction (method score × the ticker's direction; aggregator = combined_score) "
+    "and joined to the direction-oriented forward return — the SAME IC/win/ret engine as the held book, "
+    "but over the WHOLE UNIVERSE instead of only the gate-selected positions we actually held. This "
+    "escapes the held book's tiny, selection-biased sample and backfills instantly from months of stored "
+    "signals. A positive IC = conditional on holding in the aggregate direction, the method predicts "
+    "continuation. Only the position-INDEPENDENT methods appear here (aggregator + the signal-methods-as-"
+    "exits); `horizon` and the synthesized `llm_review` need a real entry, so they exist ONLY in the Held "
+    "view. Where shadow-IC and held-IC agree, the signal is trustworthy for weighting an exit combined score.")
+
+
+# ── Exit-perf source toggle (real held book vs simulated universe shadow) ────
+_EXIT_SOURCE_OPTIONS = [
+    {"label": "Held positions (ledger)", "value": "held"},
+    {"label": "All scored tickers (simulated)", "value": "shadow"},
+]
+
+
+def _exit_source_toggle(component_id: str) -> html.Div:
+    """The exit-IC evidence base. Held = the exit methods scored on the positions we
+    actually held (real book; the only place horizon / llm_review exist). Simulated =
+    every scored ticker as a hypothetical position held in its aggregate direction —
+    the position-independent methods over the whole universe (large, unbiased)."""
+    return html.Div(
+        [
+            html.Label("Source:  ",
+                       title="Held positions (ledger): the exit methods scored on the positions we ACTUALLY held each tick — the real book (small, selection-biased), and the ONLY view with horizon + the synthesized llm_review. "
+                             "All scored tickers (simulated): treat EVERY scored ticker as a hypothetical position held in its aggregate direction and score the position-independent exit methods (aggregator + the signal-methods-as-exits) over the whole universe — thousands of observations, backfilled from the signals panel. horizon / llm_review are held-only and don't appear here.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_EXIT_SOURCE_OPTIONS, value="held", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _exit_perf_section(window_days, source="held", sel_horizons=None, sel_metrics=None):
+    """Per-exit-method IC / win / ret, grouped by the two exit categories. ``source``
+    picks the evidence base: 'held' = the real exit_signals + trade_reviews book;
+    'shadow' = the simulated universe (all scored tickers). A caption states which is
+    shown so the source is never ambiguous. Reuses the simulated-perf table renderer."""
+    from src.performance.tracker import METHOD_LABELS
+    from src.analysis.exit_methods import EXIT_CATEGORY_ORDER, EXIT_METHOD_LABELS
+    sel_horizons = sel_horizons or list(_SIM_HORIZONS)
+    sel_metrics = sel_metrics or list(_SIM_METRIC_ORDER)
+    shadow = (source == "shadow")
+    if shadow:
+        df = data.shadow_exit_method_perf(days=window_days)
+        heading = _h3("Exit-method performance — ALL scored tickers (simulated shadow book)",
+                      _EXIT_SHADOW_TOOLTIP)
+        caption = ("Source: SIMULATED — every scored ticker as a hypothetical position held in its "
+                   "aggregate direction, over the whole universe (backfilled from the signals panel). "
+                   "Position-independent methods only; horizon + llm_review are held-only and not shown here.")
+        empty_msg = ("No simulated exit returns yet — the signals panel needs forward-return history "
+                     "(warm it with `python -m src.analysis.signal_panel --refresh`).")
+    else:
+        df = data.exit_method_perf(days=window_days)
+        heading = _h3("Exit-method performance — HELD positions (ledger)", _EXIT_PERF_TOOLTIP)
+        caption = ("Source: HELD (ledger) — the exit methods scored on the positions we ACTUALLY held "
+                   "each tick. The only view with horizon + the synthesized llm_review; small + "
+                   "selection-biased. Switch Source to 'All scored tickers' for the large simulated sample.")
+        empty_msg = ("No exit-method forward returns yet. The synthesized hold-review row populates "
+                     "from `trade_reviews`; the decomposed methods accrue once positions are held.")
+    cap = html.Div(caption, style={"color": "#94a3b8", "fontSize": 12, "marginBottom": 8})
+    if df is None or getattr(df, "empty", True):
+        return html.Div([heading, cap, html.Div(empty_msg, style={"color": "#6b7280"})])
+    labels = dict(METHOD_LABELS)
+    labels.update(EXIT_METHOD_LABELS)
+    children = [heading, cap]
+    has_cat = "category" in df.columns
+    for category in EXIT_CATEGORY_ORDER:
+        subset = df[df["category"] == category] if has_cat else df
+        if subset is None or subset.empty:
+            continue
+        children.append(html.Div(category, style={
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}))
+        children.append(_sim_perf_table(subset, labels, sel_horizons, sel_metrics))
+        if not has_cat:
+            break
+    return html.Div(children)
+
+
+def _exit_reason_block():
+    """Realized outcome per exit RULE (exit_reason) over closed trades — the
+    concrete, ledger-based companion to the forward-looking IC table above."""
+    rows = data.exit_reason_breakdown()
+    if not rows:
+        return html.Div("No closed trades yet.", style={"color": "#6b7280"})
+    data_rows = [{
+        "reason": r["exit_reason"], "trades": r["trades"], "win": r["win_rate"],
+        "avg": r["avg_return"], "median": r.get("median_return"),
+        "compound": r["compound_return"], "best": r["best"], "worst": r["worst"],
+    } for r in rows]
+    cols = [
+        {"name": "Exit reason", "id": "reason"},
+        {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT},
+        {"name": "Win rate %", "id": "win", "type": "numeric", "format": _NUM2},
+        {"name": "Avg return %", "id": "avg", "type": "numeric", "format": _NUM2},
+        {"name": "Median %", "id": "median", "type": "numeric", "format": _NUM2},
+        {"name": "Compound %", "id": "compound", "type": "numeric", "format": _NUM2},
+        {"name": "Best %", "id": "best", "type": "numeric", "format": _NUM2},
+        {"name": "Worst %", "id": "worst", "type": "numeric", "format": _NUM2},
+    ]
+    return dash_table.DataTable(data=data_rows, columns=cols, **_TABLE_KW)
+
+
+def _exit_perf_tab():
+    return html.Div([
+        _window_toggle("exit-window"),
+        _exit_source_toggle("exit-source"),
+        _sim_column_filters("exit-horizons", "exit-metrics"),
+        dcc.Loading(html.Div(id="exit-body")),
+        _h3("Exit-reason outcomes — realized P&L by exit rule (closed ledger trades)",
+            "For every CLOSED trade, the realized return grouped by the exit_reason that "
+            "fired (llm_signal_flipped / llm_confidence_loss / horizon_expired / "
+            "macro_regime_exit / the aggregator backstops / intraday_reversal). Always the "
+            "real ledger (independent of the Source toggle above) — the concrete realized "
+            "outcome of each exit rule, companion to the forward-looking IC table. Open "
+            "trades excluded (no exit yet)."),
+        _safe(_exit_reason_block),
+    ])
+
+
+@app.callback(Output("exit-body", "children"),
+              Input("exit-window", "value"), Input("exit-source", "value"),
+              Input("exit-horizons", "value"), Input("exit-metrics", "value"))
+def _exit_body(window_value, source_value, sim_horizons, sim_metrics):
+    return _safe(lambda: _exit_perf_section(_window_days(window_value), source_value,
+                                            sim_horizons, sim_metrics))
 
 
 # ── Tab 3: Returns ─────────────────────────────────────────────────────────

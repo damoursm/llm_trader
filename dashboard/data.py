@@ -261,6 +261,50 @@ def simulated_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.Dat
     return result
 
 
+def exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
+    """Per-EXIT-method win rate / IC / IC-std / ICIR / signed return at
+    30m/3h/6h/1d/3d/1w/2w/1m over the ``exit_signals`` panel (every held position
+    re-scored each tick), plus the synthesized ``llm_review`` row from
+    ``trade_reviews``. The exit-side counterpart to ``simulated_method_perf``.
+    Cached (the OHLCV join is heavy); run-based. Empty until forward returns exist."""
+    key = ("exit_method_perf", days, int(min_n))
+    now = time.time()
+    entry = _perf_cache.get(key)
+    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.analysis.exit_panel import compute_exit_method_perf
+    result = _retry(lambda: compute_exit_method_perf(days=days, min_n=min_n), "exit_method_perf")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
+
+
+def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
+    """Simulated exit-method performance over ALL scored tickers — every ticker in
+    the signals panel treated as a hypothetical position held in its aggregate
+    direction. The large-sample, selection-bias-free counterpart to
+    ``exit_method_perf``; covers the position-independent methods (aggregator +
+    the signal-methods-as-exits). ``horizon`` / ``llm_review`` are held-only and
+    not present here. Cached (the OHLCV join is heavy); run-based."""
+    key = ("shadow_exit_method_perf", days, int(min_n))
+    now = time.time()
+    entry = _perf_cache.get(key)
+    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    from src.analysis.exit_panel import compute_shadow_exit_method_perf
+    result = _retry(lambda: compute_shadow_exit_method_perf(days=days, min_n=min_n),
+                    "shadow_exit_method_perf")
+    _perf_cache[key] = {"ts": now, "data": result}
+    return result
+
+
+def exit_reason_breakdown() -> list:
+    """Per-exit-reason realized performance over CLOSED trades (trades / win_rate /
+    avg / median / compound / best / worst) — the realized outcome of each exit
+    RULE. Cheap; not windowed."""
+    from src.performance.tracker import compute_exit_reason_perf
+    return _retry(lambda: compute_exit_reason_perf(), "exit_reason_breakdown")
+
+
 def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None,
                            direction: Optional[str] = None) -> dict:
     """Confidence-calibration report (buckets + slope) over the windowed/session/

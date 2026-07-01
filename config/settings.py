@@ -666,6 +666,21 @@ class Settings(BaseSettings):
     # independently of the horizon assignment + dashboard.
     enable_horizon_matched_exit: bool = True
     horizon_expiry_floor_mult: float = 1.5
+    # The matched-exit floor is CONTINUOUS, not a cliff: past the horizon the
+    # required re-confirmation floor ramps from the normal base floor (at the
+    # window) up to base × horizon_expiry_floor_mult, reaching full strength
+    # horizon_expiry_ramp_windows windows past expiry (1.0 → full effect at 2× the
+    # horizon window; short-horizon trades still tighten fast, long-horizon trades
+    # stay patient). A same-direction position whose conviction drops below the
+    # ramped floor closes (horizon_expired). Set ramp_windows→0 for the old cliff.
+    horizon_expiry_ramp_windows: float = 1.0
+    # A neutral HOLD/WATCH re-judgment past the horizon does NOT close at the
+    # boundary (that was a premature-cut bug — it contradicted the same
+    # never-close-on-neutral rule the within-window gate enforces). Instead a
+    # persistent neutral position is flushed only once FULLY past the window
+    # (ramp saturated) — and only when this is on. False = the matched exit is
+    # purely a ramped conviction bar and never force-closes a neutral hold.
+    horizon_expiry_flush_neutral: bool = True
 
     # ── Direction-aware, market-neutral edge curve (SHADOW MODE) ───────────
     # A second edge curve that weights each method by its DIRECTION-CONDITIONAL,
