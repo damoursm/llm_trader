@@ -1263,7 +1263,8 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
             "off/dry_run, or no submitted order has filled.",
             style={"color": "#6b7280", "padding": 20})
 
-    s = summarize_broker_trades(trades)
+    equity_usd = data.broker_account_equity_usd()
+    s = summarize_broker_trades(trades, account_equity_usd=equity_usd)
     from src.performance.broker_view import avg_one_way_cost_pct_from_legs
     lmt_cost = avg_one_way_cost_pct_from_legs(data.filled_lmt_legs())
     # "Size ×" is a sim concept; in this view the dedicated Shares/Notional
@@ -1282,10 +1283,17 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
             _kpi("Open P&L", _usd(s.get("unrealized_pnl_usd")),
                  figures.POS if (s.get("unrealized_pnl_usd") or 0) >= 0 else figures.NEG,
                  tooltip="Mark-to-market of positions still held at the broker, vs their actual entry fills, minus entry commissions (exit cost unknown until it happens)."),
+            _kpi("Return (wtd)", _pct(s.get("weighted_return"), signed=True),
+                 figures.POS if (s.get("weighted_return") or 0) >= 0 else figures.NEG,
+                 tooltip="Total % return on actual fills over CLOSED round-trips, each weighted by its REAL filled notional (so sizing counts — more precise than the equal-weighted 'Avg return'). Net of actual commissions."),
+            *([_kpi("P&L vs equity", _pct(s.get("account_return_pct"), signed=True),
+                    figures.POS if (s.get("account_return_pct") or 0) >= 0 else figures.NEG,
+                    tooltip="Cumulative P&L of these trades (realized + open, this window) as a % of your LATEST IBKR account NAV (NetLiquidation), converted to USD — the account-relative impact. Uses the real account equity, not just per-trade fills; approximate (latest NAV vs windowed P&L).")]
+              if s.get("account_return_pct") is not None else []),
             _kpi("Win rate", _pct(s.get("win_rate")),
                  tooltip="Share of CLOSED broker round-trips with a positive net return on actual fills."),
             _kpi("Avg return", _pct(s.get("avg_return"), signed=True),
-                 tooltip="Mean per-round-trip % return on actual fill prices net of actual commissions, equal-weighted."),
+                 tooltip="Mean per-round-trip % return on actual fill prices net of actual commissions, EQUAL-weighted (compare with 'Return (wtd)', which weights by real dollars)."),
             _kpi("Commissions", _usd(s.get("commissions_usd"), signed=False),
                  tooltip="Total commissions IBKR actually charged on these fills (exit legs counted once filled)."),
             _kpi("Avg 1-way cost (LMT)", _pct4(lmt_cost),
@@ -1296,8 +1304,35 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
         style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
     )
 
+    ibkr_pnl = data.broker_account_pnl()
+    pnl_block = []
+    if ibkr_pnl:
+        pnl_block = [
+            _h3("IBKR account P&L (live — straight from IBKR)",
+                "IBKR's own account P&L via reqPnL — ground truth including ALL fees, FX, and "
+                "dividends, which the fill-derived numbers above can only approximate. "
+                "ACCOUNT-LEVEL (all positions), NOT per-trade: 'Unrealized' is the current open "
+                "P&L; 'Realized today' and 'Daily' are TODAY's figures (they reset each session). "
+                "Converted to USD."),
+            html.Div(
+                [
+                    _kpi("IBKR Unrealized", _usd(ibkr_pnl.get("unrealized")),
+                         figures.POS if (ibkr_pnl.get("unrealized") or 0) >= 0 else figures.NEG,
+                         tooltip="Current open-position P&L across the whole account, straight from IBKR (reqPnL.unrealizedPnL) — includes fees/FX/dividends."),
+                    _kpi("IBKR Realized today", _usd(ibkr_pnl.get("realized")),
+                         figures.POS if (ibkr_pnl.get("realized") or 0) >= 0 else figures.NEG,
+                         tooltip="Today's realized P&L across the account, straight from IBKR (resets each session)."),
+                    _kpi("IBKR Daily P&L", _usd(ibkr_pnl.get("daily")),
+                         figures.POS if (ibkr_pnl.get("daily") or 0) >= 0 else figures.NEG,
+                         tooltip="Today's total account P&L change, straight from IBKR (reqPnL.dailyPnL)."),
+                ],
+                style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
+            ),
+        ]
+
     return html.Div([
         cards,
+        *pnl_block,
         _h3("Open broker positions",
             "Shares genuinely held at IBKR right now (entry filled; exit not filled yet — even if the simulated ledger already closed the trade), marked at the latest price. Click a row to chart that ticker's confidence-over-time below."),
         _trades_table(open_trades, table_id="returns-open-table"),

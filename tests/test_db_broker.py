@@ -61,6 +61,43 @@ def test_insert_broker_report_roundtrip(tmp_db):
     assert od.iloc[0]["commission"] == pytest.approx(0.35)
 
 
+def test_insert_broker_report_roundtrips_ibkr_pnl(tmp_db):
+    # The reqPnL snapshot persists into broker_reconciles (validates the schema
+    # column + repo col/tuple alignment — a misalignment would land values in the
+    # wrong columns).
+    from src.db import repo
+    rep = _report()
+    rep["pnl_daily"] = 12.5
+    rep["pnl_unrealized"] = -8.0
+    rep["pnl_realized"] = 20.5
+    repo.insert_broker_report("run-1", rep)
+    df = repo.fetch_df(
+        "SELECT account_equity, pnl_daily, pnl_unrealized, pnl_realized, "
+        "entries_submitted FROM broker_reconciles", read_only=False)
+    row = df.iloc[0]
+    assert row["account_equity"] == pytest.approx(99000.0)   # neighbours stayed put
+    assert row["pnl_daily"] == pytest.approx(12.5)
+    assert row["pnl_unrealized"] == pytest.approx(-8.0)
+    assert row["pnl_realized"] == pytest.approx(20.5)
+    assert int(row["entries_submitted"]) == 1
+
+
+def test_insert_broker_report_pnl_defaults_null(tmp_db):
+    # A report without P&L (broker returned None) persists NULLs, not garbage.
+    from src.db import repo
+    repo.insert_broker_report("run-1", _report())
+    df = repo.fetch_df("SELECT pnl_daily, pnl_unrealized, pnl_realized "
+                       "FROM broker_reconciles", read_only=False)
+    row = df.iloc[0]
+    assert row["pnl_daily"] is None or pd_isna(row["pnl_daily"])
+    assert row["pnl_unrealized"] is None or pd_isna(row["pnl_unrealized"])
+
+
+def pd_isna(v):
+    import pandas as pd
+    return pd.isna(v)
+
+
 def test_insert_broker_report_idempotent_per_run(tmp_db):
     from src.db import repo
 

@@ -148,10 +148,16 @@ def avg_one_way_cost_pct_from_legs(legs: List[dict]) -> Optional[float]:
     return round(sum(pcts) / len(pcts), 4) if pcts else None
 
 
-def summarize_broker_trades(btrades: List[dict]) -> dict:
-    """Headline numbers for the dashboard's IBKR view. Dollar P&L is the
-    primary lens here — real executions have real notionals, so percentages
-    alone hide sizing."""
+def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[float] = None) -> dict:
+    """Headline numbers for the dashboard's IBKR view.
+
+    Dollar P&L is the primary lens, but ``weighted_return`` is the precise total
+    % — each CLOSED round-trip weighted by its REAL filled notional, so sizing
+    counts (the equal-weighted ``avg_return`` is kept alongside for comparison).
+    When ``account_equity_usd`` (the IBKR account NAV, in USD) is supplied,
+    ``account_return_pct`` expresses cumulative P&L over the real account size —
+    the account-relative impact, using more of the IBKR account data than fills
+    alone."""
     closed = [b for b in btrades if b["status"] == "CLOSED"]
     open_ = [b for b in btrades if b["status"] == "OPEN"]
     wins = [b for b in closed if (b.get("return_pct") or 0.0) > 0]
@@ -163,6 +169,23 @@ def summarize_broker_trades(btrades: List[dict]) -> dict:
         + ((_f(b.get("broker_exit_commission")) or 0.0) if b["status"] == "CLOSED" else 0.0)
         for b in btrades
     )
+    realized = round(sum(_dollar_pnl(b) for b in closed), 2)
+    unrealized = round(sum(_dollar_pnl(b) for b in open_), 2)
+    total_pnl = round(realized + unrealized, 2)
+    # Notional-weighted return — weight each closed round-trip by its REAL filled
+    # dollars, so a $9k winner doesn't count the same as a $900 scratch (the
+    # equal-weighted avg_return hides sizing; this is the precise total %).
+    w_num = w_den = 0.0
+    for b in closed:
+        r = b.get("return_pct")
+        nz = _f(b.get("filled_notional_usd")) or 0.0
+        if r is not None and nz > 0:
+            w_num += float(r) * nz
+            w_den += nz
+    weighted_return = round(w_num / w_den, 2) if w_den > 0 else None
+    # Account-relative return — cumulative P&L over the IBKR account NAV (USD).
+    account_return_pct = (round(total_pnl / account_equity_usd * 100.0, 2)
+                          if account_equity_usd and account_equity_usd > 0 else None)
     # NOTE: the average one-way COST is no longer computed here — it is sourced
     # from real LMT fills in broker_orders (avg_one_way_cost_pct_from_legs), so
     # MKT fills are excluded and the figure matches the sim calibration.
@@ -172,7 +195,11 @@ def summarize_broker_trades(btrades: List[dict]) -> dict:
         "open": len(open_),
         "win_rate": round(100.0 * len(wins) / len(closed), 1) if closed else None,
         "avg_return": round(sum(rets) / len(rets), 2) if rets else None,
-        "realized_pnl_usd": round(sum(_dollar_pnl(b) for b in closed), 2),
-        "unrealized_pnl_usd": round(sum(_dollar_pnl(b) for b in open_), 2),
+        "weighted_return": weighted_return,
+        "realized_pnl_usd": realized,
+        "unrealized_pnl_usd": unrealized,
+        "total_pnl_usd": total_pnl,
+        "account_return_pct": account_return_pct,
+        "account_equity_usd": round(float(account_equity_usd), 2) if account_equity_usd else None,
         "commissions_usd": round(commissions, 2),
     }

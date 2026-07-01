@@ -347,7 +347,9 @@ def insert_simulated_trades(run_id: str, generated_at: str, signal_date: str,
 
 _BROKER_RECONCILE_COLS = [
     "run_id", "created_at", "mode", "connected", "ok", "account_id",
-    "account_equity", "account_currency", "entries_submitted", "exits_submitted",
+    "account_equity", "account_currency",
+    "pnl_daily", "pnl_unrealized", "pnl_realized",
+    "entries_submitted", "exits_submitted",
     "fills_repaired", "rejects", "n_drift", "drift", "errors",
 ]
 
@@ -409,6 +411,9 @@ def insert_broker_report(run_id: str, report: dict) -> None:
         report.get("account_id"),
         _f(report.get("account_equity")),
         report.get("account_currency"),
+        _f(report.get("pnl_daily")),
+        _f(report.get("pnl_unrealized")),
+        _f(report.get("pnl_realized")),
         int(report.get("entries_submitted") or 0),
         int(report.get("exits_submitted") or 0),
         int(report.get("fills_repaired") or 0),

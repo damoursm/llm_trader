@@ -3,8 +3,11 @@
 The pipeline operates on live prices and completed-only daily bars, so it is run
 intraday on a 30-minute cadence (09:30–16:00 ET, Mon-Fri) rather than once
 pre-market. Each 30-min boundary in the session window is a "slot"; the runner
-fires one tick per slot and sends the daily email on the closing (16:00) slot only
-(or on every slot when `scheduler_email_every_tick` is on).
+fires one tick per slot and emails the report at the slots listed in
+`scheduler_email_times` (default 04:00, 09:30, 16:00, 19:50 ET — pre-market open,
+RTH open, RTH close, last after-hours tick), or on every slot when
+`scheduler_email_every_tick` is on, or — if `scheduler_email_times` is cleared —
+only on the closing (16:00) slot.
 
 When `extended_hours_mode` != "off", additional tagged slots cover the
 extended sessions (`extended_windows`, default 04:00–09:30 pre-market and
@@ -15,8 +18,9 @@ pipeline with persistence but no ledger/broker mutation
 (`run_pipeline(observe_only=True)`); "trade" (Phase 1, default) runs it as a
 FULL trading tick — entries/exits/marks and broker paper orders happen
 off-hours too, with session-aware costs and sizing applied by the tracker.
-The daily email fires only on the closing RTH slot in every mode — an
-after-hours trading tick past 16:00 must not re-send the daily report.
+The report emails at the `scheduler_email_times` slots regardless of session
+(so an after-hours slot like 19:50 can send one) — the time-set gate replaces the
+old "16:00 close only" rule, so a non-listed after-hours tick no longer emails.
 NYSE holidays are skipped entirely (no session, regular or extended, on a
 closed market).
 
@@ -78,7 +82,7 @@ def _release_keep_awake() -> None:
         pass
 
 
-def _parse_hhmm(s: str, default: _time) -> _time:
+def _parse_hhmm(s: str, default: _time | None) -> _time | None:
     try:
         h, m = str(s).split(":")
         return _time(int(h), int(m))
@@ -158,23 +162,44 @@ def _session_slots() -> tuple[list[tuple[_time, str]], _time]:
     return slots, end
 
 
+def _email_slot_times() -> set[_time]:
+    """ET slot times at which the scheduled report emails, from
+    ``scheduler_email_times`` (CSV of HH:MM). Empty/unset → empty set, so the
+    caller falls back to the 16:00-close default. Each time only fires if it is an
+    actual tick slot (see ``_session_slots``); ``start_scheduler`` warns otherwise."""
+    out: set[_time] = set()
+    for tok in str(settings.scheduler_email_times or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        t = _parse_hhmm(tok, None)
+        if t is not None:
+            out.add(t)
+    return out
+
+
 def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
     """Per-slot decisions as ``(observe, send_email)``.
 
     observe    — True only for extended slots while NOT in "trade" mode
                  (Phase 0 observation; "trade" runs them as full ticks).
-    send_email — with ``scheduler_email_every_tick`` on, EVERY slot emails —
-                 RTH and extended alike (extended ticks are full trading ticks,
-                 so their report is as real as an RTH one). With it off, only
-                 the closing RTH slot sends the daily report (the ``kind``
-                 gate matters there: after-hours slots are past 16:00, so a
-                 plain time>=close check would re-send it every extended tick).
+    send_email — precedence: (1) ``scheduler_email_every_tick`` on ⇒ EVERY slot
+                 emails (RTH + extended alike); else (2) ``scheduler_email_times``
+                 set ⇒ ONLY slots whose time is in that set email (this is the
+                 default — 04:00/09:30/16:00/19:50 ET — and works for extended
+                 slots too, e.g. the 19:50 after-hours close report); else
+                 (3) legacy: only the closing RTH slot (``time >= end`` — the
+                 ``kind`` gate stops an after-hours slot past 16:00 re-sending it).
     """
     mode = (settings.extended_hours_mode or "off").lower()
     observe = kind == "extended" and mode != "trade"
-    send_email = settings.scheduler_email_every_tick or (
-        kind == "rth" and slot_t >= end_t
-    )
+    email_times = _email_slot_times()
+    if settings.scheduler_email_every_tick:
+        send_email = True
+    elif email_times:
+        send_email = slot_t in email_times
+    else:
+        send_email = kind == "rth" and slot_t >= end_t
     return observe, send_email
 
 
@@ -230,9 +255,24 @@ def start_scheduler() -> None:
             f"{ext_slots[0].strftime('%H:%M')}–{ext_slots[-1].strftime('%H:%M')} ET): "
             f"{', '.join(t.strftime('%H:%M') for t in ext_slots)} — {_what}."
         )
+    email_times = _email_slot_times()
+    if settings.scheduler_email_every_tick:
+        logger.info("Email: EVERY tick (scheduler_email_every_tick on).")
+    elif email_times:
+        slot_times = {t for t, _ in slots}
+        logger.info("Email: report sends at "
+                    f"{', '.join(t.strftime('%H:%M') for t in sorted(email_times))} ET.")
+        missing = sorted(t for t in email_times if t not in slot_times)
+        if missing:
+            logger.warning(
+                "[scheduler] scheduler_email_times not matching any tick slot — these "
+                f"will NEVER email: {', '.join(t.strftime('%H:%M') for t in missing)}. "
+                "Add them to the RTH grid / extended_windows (or fix the time)."
+            )
+    else:
+        logger.info("Email: 16:00 close only (scheduler_email_times empty).")
     logger.info(
-        f"Poll: {poll}s; misfire grace: {grace}s; "
-        f"email_every_tick: {settings.scheduler_email_every_tick}; keep-awake: {settings.scheduler_keep_awake}."
+        f"Poll: {poll}s; misfire grace: {grace}s; keep-awake: {settings.scheduler_keep_awake}."
     )
     logger.info("Press Ctrl+C to stop.")
 

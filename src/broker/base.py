@@ -67,6 +67,19 @@ class AccountSnapshot:
 
 
 @dataclass
+class AccountPnl:
+    """IBKR's own account P&L snapshot (``reqPnL``) — ground truth incl. all fees,
+    FX, and dividends. ``daily`` and ``realized`` are TODAY's figures (they reset at
+    the session boundary); ``unrealized`` is the CURRENT open-position P&L across the
+    whole account. Values are in the account base currency (see the reconcile's
+    ``account_currency``). This is account-level, NOT per-round-trip — IBKR does not
+    track the strategy's individual trades."""
+    daily: Optional[float] = None
+    unrealized: Optional[float] = None
+    realized: Optional[float] = None
+
+
+@dataclass
 class BorrowInfo:
     """Short-borrow availability / cost for one ticker (IBKR-unique data).
 
@@ -177,6 +190,13 @@ class Broker(ABC):
         (and fee where available). Read-only; never places an order.
         """
         return {}
+
+    def get_pnl(self) -> Optional[AccountPnl]:
+        """IBKR's own account P&L snapshot (ground truth: all fees / FX / dividends).
+
+        Default: None. IBKRBroker overrides via ``reqPnL``. Read-only.
+        """
+        return None
 
     def disconnect(self) -> None:  # optional; default no-op
         return None

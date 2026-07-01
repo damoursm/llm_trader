@@ -42,6 +42,34 @@ def test_closed_short_signs_the_move():
     assert b["return_pct"] == pytest.approx(expected, abs=1e-6)
 
 
+def test_weighted_return_weights_by_real_notional():
+    # A $1000 winner (+10%) and a $100 loser (-10%): equal-weighted avg ≈ 0, but
+    # notional-weighted return is dominated by the bigger position (+8.18%).
+    big = _trade(broker_fill_qty=100, broker_fill_price=10.0, broker_exit_fill_price=11.0,
+                 broker_commission=0.0, broker_exit_commission=0.0)
+    small = _trade(broker_fill_qty=10, broker_fill_price=10.0, broker_exit_fill_price=9.0,
+                   broker_commission=0.0, broker_exit_commission=0.0)
+    s = summarize_broker_trades(build_broker_trades([big, small]))
+    assert s["avg_return"] == pytest.approx(0.0, abs=1e-6)
+    assert s["weighted_return"] == pytest.approx((10 * 1000 + -10 * 100) / 1100, abs=1e-2)
+
+
+def test_account_return_pct_uses_equity():
+    big = _trade(broker_fill_qty=100, broker_fill_price=10.0, broker_exit_fill_price=11.0,
+                 broker_commission=0.0, broker_exit_commission=0.0)
+    s = summarize_broker_trades(build_broker_trades([big]), account_equity_usd=10000.0)
+    assert s["total_pnl_usd"] == pytest.approx(100.0)          # (11-10)*100
+    assert s["account_return_pct"] == pytest.approx(1.0, abs=1e-3)   # 100 / 10000
+    assert s["account_equity_usd"] == pytest.approx(10000.0)
+
+
+def test_account_return_pct_none_without_equity():
+    s = summarize_broker_trades(build_broker_trades([_trade()]))
+    assert s["account_return_pct"] is None
+    assert s["account_equity_usd"] is None
+    assert s["weighted_return"] is not None                   # still computed (closed trade)
+
+
 def test_ledger_closed_but_exit_unfilled_is_open_in_real_view():
     """The sim closed the trade, but the shares are genuinely still held —
     the real view must show an OPEN position marked at current_price."""

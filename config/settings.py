@@ -1072,10 +1072,18 @@ class Settings(BaseSettings):
     # How late a 30-min slot may still run after its boundary. If the machine was
     # suspended past this, the slot is skipped (logged) rather than run stale.
     scheduler_misfire_grace_sec: int = 1500
-    # Normally only the 16:00 closing tick emails the daily report. Flip this on to
-    # email on EVERY in-window tick (every 30 min) — handy for confirming the
-    # scheduler actually fires. Turn back off once verified to avoid 13 emails/day.
+    # Flip this on to email on EVERY in-window tick (every 30 min) — handy for
+    # confirming the scheduler fires. Turn back off once verified to avoid 13/day.
+    # Takes precedence over scheduler_email_times below.
     scheduler_email_every_tick: bool = False
+    # Comma-separated ET slot times (HH:MM) at which the daily report is emailed.
+    # Non-empty (default) → the report sends ONLY at these slots; each MUST be an
+    # actual tick slot (the RTH 30-min grid or an extended_windows boundary) to fire
+    # — the scheduler logs a warning at startup for any configured time that isn't a
+    # slot. Empty "" → legacy behaviour (only the 16:00 close). Overridden by
+    # scheduler_email_every_tick. Default = 4 AM (pre-market open), 9:30 (RTH open),
+    # 4 PM (RTH close), 7:50 PM (last after-hours tick).
+    scheduler_email_times: str = "04:00,09:30,16:00,19:50"
 
     # Intraday timing overlay (Hybrid: daily trend decides direction; a 30-min
     # momentum read only gates entry/exit *timing*).

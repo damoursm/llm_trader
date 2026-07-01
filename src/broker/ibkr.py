@@ -17,7 +17,7 @@ from loguru import logger
 
 from config.settings import settings
 from src.broker.base import (
-    AccountSnapshot, BorrowInfo, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
+    AccountPnl, AccountSnapshot, BorrowInfo, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
 )
 
 # Non-USD base currencies already flagged this process — the account config is
@@ -370,6 +370,46 @@ class IBKRBroker(Broker):
             except Exception as e:
                 logger.debug(f"[broker:ibkr] short-borrow fetch failed for {tk}: {e}")
         return out
+
+    def get_pnl(self) -> Optional[AccountPnl]:
+        """Account P&L straight from IBKR via ``reqPnL`` — daily / unrealized /
+        realized, in the account base currency, with ALL fees, FX, and dividends
+        already applied (the ground truth our fill-derived P&L can only approximate).
+
+        ``reqPnL`` is a streaming subscription: we subscribe, let the first update
+        arrive, read, and cancel. Best-effort and fail-soft (None on any miss).
+        NEEDS a live-gateway smoke-test to confirm the field names before relying on
+        it (mirror ``python -m src.broker.smoketest``)."""
+        if not self.is_connected():
+            return None
+        acct = ""
+        try:
+            acct = self._account()
+            pnl = self._ib.reqPnL(acct)
+            self._ib.sleep(0.5)                  # let the first PnL update populate
+
+            def num(x):
+                try:
+                    f = float(x)
+                    return f if f == f else None  # f==f filters NaN (unpopulated)
+                except (TypeError, ValueError):
+                    return None
+
+            out = AccountPnl(
+                daily=num(getattr(pnl, "dailyPnL", None)),
+                unrealized=num(getattr(pnl, "unrealizedPnL", None)),
+                realized=num(getattr(pnl, "realizedPnL", None)),
+            )
+            return out
+        except Exception as e:
+            logger.warning(f"[broker:ibkr] get_pnl failed: {e}")
+            return None
+        finally:
+            try:
+                if acct:
+                    self._ib.cancelPnL(acct)
+            except Exception:
+                pass
 
     def cancel_order(self, client_ref: str) -> bool:
         """Cancel the working order tagged *client_ref*; True only on a

@@ -31,9 +31,47 @@ from src.performance.spread import _pct_return
 def test_tick_plan(monkeypatch, mode, kind, slot, want_observe, want_email):
     monkeypatch.setattr(settings, "extended_hours_mode", mode)
     monkeypatch.setattr(settings, "scheduler_email_every_tick", False)
+    monkeypatch.setattr(settings, "scheduler_email_times", "16:00")  # pin to the close for this case set
     from src.scheduler.runner import _tick_plan
     observe, send_email = _tick_plan(kind, slot, time(16, 0))
     assert (observe, send_email) == (want_observe, want_email)
+
+
+def test_tick_plan_email_times_selective(monkeypatch):
+    """scheduler_email_times → ONLY those slot times email, including after-hours
+    slots (19:50), and NOT the non-listed intraday ticks."""
+    monkeypatch.setattr(settings, "extended_hours_mode", "trade")
+    monkeypatch.setattr(settings, "scheduler_email_every_tick", False)
+    monkeypatch.setattr(settings, "scheduler_email_times", "04:00,09:30,16:00,19:50")
+    from src.scheduler.runner import _tick_plan
+    end = time(16, 0)
+    for kind, slot in (("extended", time(4, 0)), ("rth", time(9, 30)),
+                       ("rth", time(16, 0)), ("extended", time(19, 50))):
+        assert _tick_plan(kind, slot, end)[1] is True, slot
+    for kind, slot in (("rth", time(10, 0)), ("rth", time(12, 0)),
+                       ("extended", time(17, 0)), ("extended", time(8, 0))):
+        assert _tick_plan(kind, slot, end)[1] is False, slot
+
+
+def test_tick_plan_email_times_empty_falls_back_to_close(monkeypatch):
+    """Empty scheduler_email_times → legacy behaviour (only the 16:00 RTH close)."""
+    monkeypatch.setattr(settings, "extended_hours_mode", "trade")
+    monkeypatch.setattr(settings, "scheduler_email_every_tick", False)
+    monkeypatch.setattr(settings, "scheduler_email_times", "")
+    from src.scheduler.runner import _tick_plan
+    end = time(16, 0)
+    assert _tick_plan("rth", time(16, 0), end)[1] is True
+    assert _tick_plan("rth", time(10, 0), end)[1] is False
+    assert _tick_plan("extended", time(4, 0), end)[1] is False     # 04:00 no longer special
+    assert _tick_plan("extended", time(19, 50), end)[1] is False
+
+
+def test_tick_plan_every_tick_overrides_email_times(monkeypatch):
+    """scheduler_email_every_tick takes precedence over scheduler_email_times."""
+    monkeypatch.setattr(settings, "scheduler_email_every_tick", True)
+    monkeypatch.setattr(settings, "scheduler_email_times", "04:00")   # selective, but overridden
+    from src.scheduler.runner import _tick_plan
+    assert _tick_plan("rth", time(10, 0), time(16, 0))[1] is True
 
 
 def test_tick_plan_email_every_tick_covers_all_slots(monkeypatch):

@@ -193,6 +193,9 @@ SCHEMA_STATEMENTS = [
         account_id        VARCHAR,
         account_equity    DOUBLE,
         account_currency  VARCHAR,
+        pnl_daily         DOUBLE,
+        pnl_unrealized    DOUBLE,
+        pnl_realized      DOUBLE,
         entries_submitted INTEGER,
         exits_submitted   INTEGER,
         fills_repaired    INTEGER,
@@ -292,6 +295,10 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_FUNDAMENTAL_COLUMNS),
     # Broker-advisor method column on an existing signals table.
     ("signals", "broker_advisor", "DOUBLE"),
+    # IBKR account P&L snapshot (reqPnL) on an existing broker_reconciles table.
+    ("broker_reconciles", "pnl_daily", "DOUBLE"),
+    ("broker_reconciles", "pnl_unrealized", "DOUBLE"),
+    ("broker_reconciles", "pnl_realized", "DOUBLE"),
     # Horizon synthesis on an existing recommendations table.
     ("recommendations", "target_horizon", "VARCHAR"),
     ("recommendations", "horizon_net_edge_pct", "DOUBLE"),

@@ -161,6 +161,61 @@ def broker_trades(force: bool = False) -> list:
     return result
 
 
+def broker_account_equity_usd() -> Optional[float]:
+    """Latest IBKR account NAV (NetLiquidation) in USD from the most recent
+    ``broker_reconciles`` row, or None when there's no reconcile / no equity yet.
+    A non-USD account (e.g. CAD) is converted via live FX (fail-soft). Used by the
+    IBKR Returns view for the account-relative return %."""
+    def _q():
+        df = repo.fetch_df(
+            "SELECT account_equity, account_currency FROM broker_reconciles "
+            "WHERE account_equity IS NOT NULL AND account_equity > 0 "
+            "ORDER BY created_at DESC LIMIT 1")
+        if df is None or df.empty:
+            return None
+        eq = float(df.iloc[0]["account_equity"])
+        ccy = str(df.iloc[0]["account_currency"] or "USD").upper()
+        if ccy == "USD":
+            return round(eq, 2)
+        from src.broker.fx import usd_per_unit
+        return round(eq * usd_per_unit(ccy), 2)
+    try:
+        return _retry(_q, "broker_account_equity")
+    except Exception:
+        return None
+
+
+def broker_account_pnl() -> Optional[dict]:
+    """Latest IBKR account P&L snapshot (``reqPnL``) from ``broker_reconciles``,
+    converted to USD: ``{"daily", "unrealized", "realized"}``. Ground truth (all
+    fees / FX / dividends), account-level — ``unrealized`` is the current open P&L;
+    ``daily``/``realized`` are TODAY's. None when no reconcile has captured P&L yet."""
+    def _q():
+        df = repo.fetch_df(
+            "SELECT pnl_daily, pnl_unrealized, pnl_realized, account_currency "
+            "FROM broker_reconciles WHERE (pnl_daily IS NOT NULL OR pnl_unrealized "
+            "IS NOT NULL OR pnl_realized IS NOT NULL) ORDER BY created_at DESC LIMIT 1")
+        if df is None or df.empty:
+            return None
+        row = df.iloc[0]
+        ccy = str(row["account_currency"] or "USD").upper()
+        rate = 1.0
+        if ccy != "USD":
+            from src.broker.fx import usd_per_unit
+            rate = usd_per_unit(ccy)
+
+        def conv(v):
+            return round(float(v) * rate, 2) if v is not None and pd.notna(v) else None
+
+        out = {"daily": conv(row["pnl_daily"]), "unrealized": conv(row["pnl_unrealized"]),
+               "realized": conv(row["pnl_realized"])}
+        return out if any(v is not None for v in out.values()) else None
+    try:
+        return _retry(_q, "broker_account_pnl")
+    except Exception:
+        return None
+
+
 # ── Diagnostics accessors (IC · calibration · exit quality · execution) ──────
 
 def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) -> dict:

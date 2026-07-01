@@ -109,6 +109,7 @@ def _new_report() -> dict:
         "retries": 0, "stale_cancels": 0, "entry_cancels_on_close": 0, "drift_flattened": 0,
         "settled_fills": 0, "settle_reanchors": 0, "unfilled_killed": 0,
         "drift": [], "slippage": [], "orders": [], "errors": [], "account_equity": None,
+        "pnl_daily": None, "pnl_unrealized": None, "pnl_realized": None,
     }
 
 
@@ -988,6 +989,19 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         report["account_equity"] = equity
         report["account_currency"] = acct_ccy
         report["account_id"] = acct.account_id if acct else None
+
+        # IBKR's own account P&L (reqPnL) — ground truth incl. all fees / FX /
+        # dividends. Account-level (today's daily/realized + current unrealized),
+        # not per-trade. Fully fail-soft (own try): a broker without get_pnl or a
+        # reqPnL hiccup must never abort the reconcile — the fields just stay blank.
+        try:
+            pnl = broker.get_pnl()
+        except Exception as exc:
+            logger.debug(f"[broker] get_pnl unavailable: {exc}")
+            pnl = None
+        report["pnl_daily"] = pnl.daily if pnl else None
+        report["pnl_unrealized"] = pnl.unrealized if pnl else None
+        report["pnl_realized"] = pnl.realized if pnl else None
 
         # SAFETY: in paper mode, only ever trade a paper account. IBKR paper account
         # numbers are D-prefixed (e.g. DU…); live accounts are U-prefixed. A non-D
