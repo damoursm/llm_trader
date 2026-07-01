@@ -83,11 +83,21 @@ except ImportError:  # pragma: no cover
 _NY_TZ = _ZoneInfo("America/New_York")
 
 
+# Process-level cache of the parsed close series, keyed by ticker and invalidated
+# by the OHLCV file's mtime. The date→close build (read_json + a per-row loop) is
+# pure and repeated heavily — every daily-NAV walk, the macro-eval decision layers
+# (~10× the same tickers), and the simulated/shadow/signal-IC joins all funnel
+# through here. Re-reading only when the pipeline rewrites the file keeps it fresh
+# with no staleness. Returned dicts are consumed read-only, so sharing is safe.
+_close_series_cache: Dict[str, tuple] = {}
+
+
 def _load_close_series(ticker: str) -> Dict[date, float]:
     """Return ``{session_date: close}`` for a ticker from the on-disk OHLCV cache.
 
     Returns ``{}`` when the ticker has no cached history.  Pure file read —
-    no network access, no fallback.
+    no network access, no fallback.  Cached in-process, keyed by the OHLCV file's
+    mtime (re-read only after the pipeline updates it).
 
     Two important filters:
       * Non-positive closes (corrupt rows, the rare negative-price futures
@@ -99,10 +109,20 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
         the ET-localised ``date.today()`` the tracker uses on the user's
         machine — no off-by-one between trade dates and OHLCV dates.
     """
-    from src.data.cache import load_ohlcv
+    from src.data.cache import load_ohlcv, _ohlcv_path
+
+    try:
+        path = _ohlcv_path(ticker, "1d")
+        mtime = path.stat().st_mtime if path.exists() else None
+    except OSError:
+        mtime = None
+    hit = _close_series_cache.get(ticker)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
 
     df = load_ohlcv(ticker)
     if df is None or df.empty or "Close" not in df.columns:
+        _close_series_cache[ticker] = (mtime, {})
         return {}
 
     series: Dict[date, float] = {}
@@ -116,6 +136,7 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
                 series[d] = c
         except Exception:
             continue
+    _close_series_cache[ticker] = (mtime, series)
     return series
 
 

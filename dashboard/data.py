@@ -92,10 +92,46 @@ def latest_run_failures() -> list:
     return failed.to_dict("records")
 
 
-# performance() is heavy (NAV walk + per-method solo simulation) — cache briefly,
-# keyed by time window so the dashboard's 1w / 1m / inception toggle stays snappy.
-_perf_cache: dict = {}          # window key -> {"ts": float, "data": dict}
-_PERF_TTL = 60.0
+# The heavy accessors (NAV walks, per-method solo/IC/shadow OHLCV joins) are memoised
+# and, crucially, invalidated by DATA VERSION rather than a short timer: the underlying
+# data only changes when a new pipeline run persists, so we key each cache entry on the
+# latest run_id and recompute ONLY when that changes. Between runs every tab switch /
+# revisit is instant instead of re-triggering the joins every 60 s. _PERF_TTL is just a
+# safety cap (recompute at least this often even if version detection ever misses).
+_perf_cache: dict = {}          # key -> {"ts": float, "data": Any, "ver": str|None}
+_PERF_TTL = 1800.0
+_DATA_VER_TTL = 15.0
+_data_ver: dict = {"ts": 0.0, "val": None}
+
+
+def _data_version() -> Optional[str]:
+    """The latest run_id — the cache's data version. Cheap (LIMIT 1) and itself
+    re-checked at most every _DATA_VER_TTL s. Returns the last-known value on a
+    transient read error so a momentary write-lock never forces a recompute storm."""
+    now = time.time()
+    if (now - _data_ver["ts"]) < _DATA_VER_TTL:
+        return _data_ver["val"]
+    try:
+        df = repo.fetch_df("SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1")
+        val = None if df is None or df.empty else str(df.iloc[0]["run_id"])
+    except Exception:
+        val = _data_ver["val"]
+    _data_ver.update(ts=now, val=val)
+    return val
+
+
+def _cached(key, producer, force: bool = False):
+    """Version-aware memo: serve the cached value until a NEW pipeline run lands
+    (data version changed) or the safety TTL lapses; otherwise recompute via
+    ``producer``. Shared by every heavy accessor."""
+    now = time.time()
+    ver = _data_version()
+    entry = _perf_cache.get(key)
+    if not force and entry is not None and entry.get("ver") == ver and (now - entry["ts"]) < _PERF_TTL:
+        return entry["data"]
+    data = producer()
+    _perf_cache[key] = {"ts": now, "data": data, "ver": ver}
+    return data
 
 
 def performance(window_days: Optional[int] = None, session: Optional[str] = None,
@@ -103,15 +139,11 @@ def performance(window_days: Optional[int] = None, session: Optional[str] = None
     """Windowed + session + direction-filtered performance bundle. ``window_days`` =
     7 / 30 (None = inception); ``session`` = rth / extended / overnight (None = all);
     ``direction`` = long / short (None = both)."""
-    key = ("all" if window_days is None else int(window_days), session or "all", direction or "all")
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if not force and entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.performance.tracker import get_performance_for_email
-    result = _retry(lambda: get_performance_for_email(window_days=window_days, session=session, direction=direction), "performance")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    key = ("all" if window_days is None else int(window_days), session or "all", direction or "all")
+    return _cached(key, lambda: _retry(
+        lambda: get_performance_for_email(window_days=window_days, session=session, direction=direction),
+        "performance"), force=force)
 
 
 def filled_lmt_legs() -> list:
@@ -150,15 +182,10 @@ def broker_trades(force: bool = False) -> list:
     commissions — see ``src.performance.broker_view``), cached briefly.
     Reads through ``repo.load_trades()`` so the read-only mode set above
     applies; never touches the tracker's write paths."""
-    now = time.time()
-    entry = _perf_cache.get("broker_trades")
-    if not force and entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.performance.broker_view import build_broker_trades
-    trades = _retry(lambda: repo.load_trades(), "broker_trades")
-    result = build_broker_trades(trades)
-    _perf_cache["broker_trades"] = {"ts": now, "data": result}
-    return result
+    return _cached("broker_trades",
+                   lambda: build_broker_trades(_retry(lambda: repo.load_trades(), "broker_trades")),
+                   force=force)
 
 
 def broker_account_equity_usd() -> Optional[float]:
@@ -223,11 +250,6 @@ def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) 
     joined with forward returns. Cached (the OHLCV join is heavy). Returns
     ``{panel_rows, tickers, ic}`` where ``ic`` is a DataFrame (empty until the
     panel has enough forward-return history)."""
-    key = ("signal_ic", days, tuple(horizons), int(min_n))
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.analysis.signal_panel import build_panel, compute_ic
 
     def _q():
@@ -239,9 +261,8 @@ def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) 
             "tickers":    0 if panel is None or panel.empty else int(panel["ticker"].nunique()),
             "ic":         ic,
         }
-    result = _retry(_q, "signal_ic")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    key = ("signal_ic", days, tuple(horizons), int(min_n))
+    return _cached(key, lambda: _retry(_q, "signal_ic"))
 
 
 def simulated_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
@@ -250,15 +271,9 @@ def simulated_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.Dat
     single-method trade). Cached (the OHLCV join is heavy); run-based, so it
     ignores the window/session toggles like the IC table. Empty until forward
     returns exist."""
-    key = ("sim_method_perf", days, int(min_n))
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.analysis.simulated_trades import compute_method_perf
-    result = _retry(lambda: compute_method_perf(days=days, min_n=min_n), "simulated_method_perf")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    return _cached(("sim_method_perf", days, int(min_n)),
+                   lambda: _retry(lambda: compute_method_perf(days=days, min_n=min_n), "simulated_method_perf"))
 
 
 def exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
@@ -267,15 +282,9 @@ def exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFram
     re-scored each tick), plus the synthesized ``llm_review`` row from
     ``trade_reviews``. The exit-side counterpart to ``simulated_method_perf``.
     Cached (the OHLCV join is heavy); run-based. Empty until forward returns exist."""
-    key = ("exit_method_perf", days, int(min_n))
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.analysis.exit_panel import compute_exit_method_perf
-    result = _retry(lambda: compute_exit_method_perf(days=days, min_n=min_n), "exit_method_perf")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    return _cached(("exit_method_perf", days, int(min_n)),
+                   lambda: _retry(lambda: compute_exit_method_perf(days=days, min_n=min_n), "exit_method_perf"))
 
 
 def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
@@ -285,16 +294,10 @@ def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.D
     ``exit_method_perf``; covers the position-independent methods (aggregator +
     the signal-methods-as-exits). ``horizon`` / ``llm_review`` are held-only and
     not present here. Cached (the OHLCV join is heavy); run-based."""
-    key = ("shadow_exit_method_perf", days, int(min_n))
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.analysis.exit_panel import compute_shadow_exit_method_perf
-    result = _retry(lambda: compute_shadow_exit_method_perf(days=days, min_n=min_n),
-                    "shadow_exit_method_perf")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    return _cached(("shadow_exit_method_perf", days, int(min_n)),
+                   lambda: _retry(lambda: compute_shadow_exit_method_perf(days=days, min_n=min_n),
+                                  "shadow_exit_method_perf"))
 
 
 def exit_reason_breakdown() -> list:
@@ -345,30 +348,18 @@ def tracking_error() -> dict:
 def source_reliability(days: int = 14) -> list:
     """Per-source success rate + latency over the last N days (from run_sources)
     — surfaces chronically-flaky or slow data sources. Cached + retry."""
-    key = ("source_reliability", int(days))
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.analysis.data_quality import compute_source_reliability, load_source_rows
-    result = _retry(lambda: compute_source_reliability(load_source_rows(days)), "source_reliability")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    return _cached(("source_reliability", int(days)),
+                   lambda: _retry(lambda: compute_source_reliability(load_source_rows(days)), "source_reliability"))
 
 
 def method_coverage(days: int = 14) -> dict:
     """Per-method data coverage (% of tickers with a real, non-zero score) + a
     recent-vs-prior delta to flag feeds that went dark. From the signals panel.
     Cached + retry."""
-    key = ("method_coverage", int(days))
-    now = time.time()
-    entry = _perf_cache.get(key)
-    if entry is not None and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
     from src.analysis.data_quality import compute_method_coverage, load_signal_rows
-    result = _retry(lambda: compute_method_coverage(load_signal_rows(days)), "method_coverage")
-    _perf_cache[key] = {"ts": now, "data": result}
-    return result
+    return _cached(("method_coverage", int(days)),
+                   lambda: _retry(lambda: compute_method_coverage(load_signal_rows(days)), "method_coverage"))
 
 
 def latest_gate_diag() -> dict:
