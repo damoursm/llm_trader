@@ -29,6 +29,7 @@ Used by the dashboard's Simulated ⇄ IBKR-fills toggle (``dashboard/data.py``).
 """
 from __future__ import annotations
 
+from statistics import median
 from typing import List, Optional
 
 
@@ -195,6 +196,7 @@ def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[fl
         "open": len(open_),
         "win_rate": round(100.0 * len(wins) / len(closed), 1) if closed else None,
         "avg_return": round(sum(rets) / len(rets), 2) if rets else None,
+        "median_return": round(median(rets), 2) if rets else None,
         "weighted_return": weighted_return,
         "realized_pnl_usd": realized,
         "unrealized_pnl_usd": unrealized,

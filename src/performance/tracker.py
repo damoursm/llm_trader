@@ -12,6 +12,7 @@ Trades are stored in cache/trades.json. Each daily run:
 import hashlib
 import json
 import yfinance as yf
+from statistics import median
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -516,6 +517,7 @@ def _compute_segment_stats(trades: List[dict]) -> Optional[dict]:
         "win_rate":        round(len(wins) / len(returns) * 100, 1),
         "compound_return": _compute_nav_compound(trades) or 0.0,
         "avg_return":      round(sum(returns) / len(returns), 2),
+        "median_return":   round(median(returns), 2),
         "wtd_avg_return":  round(weighted_avg, 2),
         "best":            round(max(returns), 2),
         "worst":           round(min(returns), 2),
@@ -657,7 +659,7 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
     out: List[dict] = []
     for c in calls:
         row_session = _trade_session(c)
-        if session and row_session != session:
+        if not _session_matches(c, session):
             continue
         if not _match_direction(c, direction):
             continue
@@ -2749,7 +2751,7 @@ def compute_solo_method_performance(split: Optional[str] = None, window_days: Op
         _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
         closed = [t for t in closed if (t.get("entry_date") or "") >= _cutoff]
     if session:
-        closed = [t for t in closed if _trade_session(t) == session]
+        closed = [t for t in closed if _session_matches(t, session)]
     if direction:
         closed = [t for t in closed if _match_direction(t, direction)]
     if not closed:
@@ -2941,6 +2943,48 @@ def _trade_session(trade: dict) -> str:
     return _session_of_iso(trade.get("entry_datetime"))
 
 
+def _session_of_iso_fine(raw) -> str:
+    """Finer session split: ``rth | premarket | afterhours | overnight``.
+
+    Splits the coarse ``extended`` session into its two halves — pre-market
+    (04:00–09:30 ET) and after-hours (16:00–20:00 ET). Used ONLY for the
+    dashboard's session filter/display; the stored ``entry_session`` /
+    ``exit_session`` stamps stay coarse because the cost/spread/size
+    multipliers key on ``extended``. Date-only/missing values default to
+    'rth' (matches every legacy record)."""
+    if not raw or ("T" not in str(raw) and ":" not in str(raw)):
+        return "rth"
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        dt = dt.astimezone(ET) if dt.tzinfo is not None else dt.replace(tzinfo=ET)
+        mins = dt.hour * 60 + dt.minute
+    except Exception:
+        return "rth"
+    if 9 * 60 + 30 <= mins < 16 * 60:
+        return "rth"
+    if 4 * 60 <= mins < 9 * 60 + 30:
+        return "premarket"
+    if 16 * 60 <= mins < 20 * 60:
+        return "afterhours"
+    return "overnight"
+
+
+def _trade_session_fine(trade: dict) -> str:
+    """Fine session (rth|premarket|afterhours|overnight) a trade was ENTERED in."""
+    return _session_of_iso_fine(trade.get("entry_datetime"))
+
+
+def _session_matches(trade: dict, session: Optional[str]) -> bool:
+    """Session-filter predicate understanding BOTH the coarse stamp values
+    (``rth|extended|overnight``) and the finer dashboard values
+    (``premarket|afterhours``). ``None`` → always matches (no filter)."""
+    if not session:
+        return True
+    if session in ("premarket", "afterhours"):
+        return _trade_session_fine(trade) == session
+    return _trade_session(trade) == session
+
+
 def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
     """Install the real-fill cost calibration (see settings.sim_use_real_fill_costs).
 
@@ -2998,9 +3042,11 @@ def get_performance_for_email(window_days: Optional[int] = None,
 
     When ``window_days`` is set, only trades ENTERED within the last N calendar
     days are included (1w = 7, 1m = 30); ``None`` = inception (every trade ever).
-    ``session`` (rth | extended | overnight) additionally restricts to trades
-    entered in that US-market session; None = all sessions. The dashboard's
-    window + session toggles pass these so its metrics/plots recompute to match.
+    ``session`` additionally restricts to trades entered in that US-market
+    session — the coarse ``rth | extended | overnight`` or the finer
+    ``premarket | afterhours`` (the two halves of ``extended``); None = all
+    sessions. The dashboard's window + session toggles pass these so its
+    metrics/plots recompute to match.
     """
     trades = _load_trades()
     # Calibrate the sim cost to real IBKR fills (no-op when disabled / too few
@@ -3011,7 +3057,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         _cutoff = (date.today() - timedelta(days=window_days)).isoformat()
         trades = [t for t in trades if (t.get("entry_date") or "") >= _cutoff]
     if session:
-        trades = [t for t in trades if _trade_session(t) == session]
+        trades = [t for t in trades if _session_matches(t, session)]
     if direction:
         trades = [t for t in trades if _match_direction(t, direction)]
     open_trades   = [t for t in trades if t["status"] == "OPEN"]
@@ -3064,6 +3110,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         stats.update({
             "win_rate":            round(len([r for r in returns if r > 0]) / len(returns) * 100, 1),
             "avg_return":          round(sum(returns) / len(returns), 2),
+            "median_return":       round(median(returns), 2),
             "weighted_avg_return": round(weighted_avg, 2),
             "compound_return":     round((compound - 1) * 100, 2),
             "best":                round(max(returns), 2),

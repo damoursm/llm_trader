@@ -189,7 +189,7 @@ _TRADE_COL_SPEC = [
     ("action", "Action", None, "BUY (long) or SELL (short) — how the position was opened."),
     ("direction", "Direction", None, "BULLISH (long) or BEARISH (short)."),
     ("entry_dt", "Entry (ET)", None, "When the position was opened, in US/Eastern time."),
-    ("session", "Session", None, "US-market session the position was ENTERED in: rth (09:30–16:00 ET), extended (pre-market 04:00–09:30 + after-hours 16:00–20:00), or overnight (20:00–04:00). Extended entries are sized down and bear the wider extended spread in their return."),
+    ("session", "Session", None, "US-market session the position was ENTERED in: rth (09:30–16:00 ET), premarket (04:00–09:30), afterhours (16:00–20:00), or overnight (20:00–04:00). Pre-market + after-hours make up the 'extended' session: those entries are sized down and bear the wider extended spread in their return."),
     ("entry_price", "Entry $", _NUM2, "Fill price at entry (the bid-ask spread is applied in the return, not here)."),
     ("filled_qty", "Shares", None, "Shares actually filled at IBKR (real-executions view only)."),
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
@@ -515,24 +515,26 @@ def _window_label(value) -> str:
     return {"7": "1 week", "30": "1 month"}.get(str(value), "inception")
 
 
-# ── Trading-session toggle (RTH / extended / overnight) ──────────────────────
+# ── Trading-session toggle (RTH / pre-market / after-hours / overnight) ───────
 _SESSION_OPTIONS = [
     {"label": "All sessions", "value": "all"},
     {"label": "RTH", "value": "rth"},
-    {"label": "Extended", "value": "extended"},
+    {"label": "Pre-market", "value": "premarket"},
+    {"label": "After-hours", "value": "afterhours"},
     {"label": "Overnight", "value": "overnight"},
 ]
 
 
 def _session_toggle(component_id: str) -> html.Div:
-    """RTH / extended-hours / overnight selector. Filters the tab's metrics and
-    plots to trades ENTERED in that US-market session. Extended-hours trading
-    is live (Phase 1): the scheduler trades 04:00–20:00 ET, so RTH and
-    Extended populate side by side for comparison."""
+    """RTH / pre-market / after-hours / overnight selector. Filters the tab's
+    metrics and plots to trades ENTERED in that US-market session. Extended-hours
+    trading is live (Phase 1): the scheduler trades 04:00–20:00 ET, so RTH,
+    Pre-market and After-hours populate side by side for comparison. Pre-market
+    and After-hours are the two halves of the coarse 'extended' session."""
     return html.Div(
         [
             html.Label("Session:  ",
-                       title="Filter to trades entered during Regular hours (09:30–16:00 ET), Extended hours (pre-market 04:00–09:30 + after-hours 16:00–20:00), or Overnight (20:00–04:00). The bot trades RTH and Extended; Overnight entries only occur from manual off-schedule runs (snapped to the next session).",
+                       title="Filter to trades entered during Regular hours (09:30–16:00 ET), Pre-market (04:00–09:30), After-hours / post-market (16:00–20:00), or Overnight (20:00–04:00). The bot trades RTH and extended (pre-market + after-hours); Overnight entries only occur from manual off-schedule runs (snapped to the next session).",
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
             dcc.RadioItems(
                 id=component_id, options=_SESSION_OPTIONS, value="all", inline=True,
@@ -546,7 +548,8 @@ def _session_toggle(component_id: str) -> html.Div:
 
 
 def _session_value(value):
-    """RadioItems value → session string ('rth'|'extended'|'overnight'), or None for all."""
+    """RadioItems value → session string ('rth'|'premarket'|'afterhours'|'overnight'),
+    or None for all. 'premarket'/'afterhours' are the two halves of 'extended'."""
     return None if value in (None, "all") else value
 
 
@@ -1163,10 +1166,11 @@ def _trades_table(trades: list, table_id: str | None = None):
     # date-only field for any legacy row missing the full datetime.
     df["entry_dt"] = [_fmt_et(t.get("entry_datetime")) or (t.get("entry_date") or "") for t in trades]
     df["exit_dt"] = [_fmt_et(t.get("exit_datetime")) or (t.get("exit_date") or "") for t in trades]
-    # Entry session (rth / extended / overnight). Stamped on new trades;
-    # derived from entry_datetime for legacy rows (date-only → rth).
-    from src.performance.tracker import _trade_session
-    df["session"] = [t.get("entry_session") or _trade_session(t) for t in trades]
+    # Entry session, shown at the finer premarket/afterhours grain so the column
+    # agrees with the session filter (derived from entry_datetime; date-only
+    # legacy rows → rth). The stored coarse 'extended' stamp is split here.
+    from src.performance.tracker import _trade_session_fine
+    df["session"] = [_trade_session_fine(t) for t in trades]
     df["held"] = [_held_disp(t) for t in trades]
     # IBKR order-status columns — simulated view only: the IBKR view contains
     # filled orders by construction, so the columns would be all-✓ noise there.
@@ -1252,7 +1256,8 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
         trades = [t for t in trades if str(t.get("entry_date") or "") >= cutoff]
     sess = _session_value(session_value)
     if sess:
-        trades = [t for t in trades if (t.get("entry_session") or "rth") == sess]
+        from src.performance.tracker import _session_matches
+        trades = [t for t in trades if _session_matches(t, sess)]
     dirn = _direction_value(direction_value)
     if dirn:
         want = "BUY" if dirn == "long" else "SELL"
@@ -1294,6 +1299,8 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
                  tooltip="Share of CLOSED broker round-trips with a positive net return on actual fills."),
             _kpi("Avg return", _pct(s.get("avg_return"), signed=True),
                  tooltip="Mean per-round-trip % return on actual fill prices net of actual commissions, EQUAL-weighted (compare with 'Return (wtd)', which weights by real dollars)."),
+            _kpi("Median return", _pct(s.get("median_return"), signed=True),
+                 tooltip="Median per-round-trip % return on actual fills, net of actual commissions — the middle round-trip, unaffected by a single outsized win/loss."),
             _kpi("Commissions", _usd(s.get("commissions_usd"), signed=False),
                  tooltip="Total commissions IBKR actually charged on these fills (exit legs counted once filled)."),
             _kpi("Avg 1-way cost (LMT)", _pct4(lmt_cost),
@@ -1412,6 +1419,8 @@ def _returns_section(window_value, session_value=None, direction_value=None):
                  tooltip="Share of trades with a positive spread-adjusted return. A flat round-trip is a loss (you pay the bid-ask spread). Open positions count at their live mark."),
             _kpi("Avg return", _pct(stats.get("avg_return"), signed=True),
                  tooltip="Mean per-trade % return, equal-weighted across all trades in the window (open trades at their live mark)."),
+            _kpi("Median return", _pct(stats.get("median_return"), signed=True),
+                 tooltip="Median per-trade % return in the window — the middle trade, unaffected by a single outsized win/loss (open trades at their live mark). Compare with 'Avg return': a median well below the average means a few big winners are lifting the mean."),
             _kpi("Weighted avg", _pct(stats.get("weighted_avg_return"), signed=True),
                  tooltip="Per-trade % return weighted by position size (the confidence-tier multiplier), so larger positions count more."),
             _kpi("Best", _pct(stats.get("best"), signed=True), figures.POS,
