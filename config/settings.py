@@ -1013,6 +1013,33 @@ class Settings(BaseSettings):
     spread_extended_multiplier: float = 4.0
     spread_overnight_multiplier: float = 10.0
 
+    # ── Overnight session (20:00 ET → 04:00 ET; IBKR overnight venue) ───────
+    # Same three-state rollout as extended_hours_mode, for the OVERNIGHT
+    # session. "trade": overnight slots are FULL trading ticks — the ledger
+    # enters/exits/marks at the (heavily penalised: ×10 spread,
+    # overnight_size_multiplier, overnight_confidence_bump) overnight terms and
+    # the broker leg routes to IBKR's overnight venue (broker_overnight_routing).
+    # The venue trades Sunday night → Thursday night, 20:00–03:50 ET
+    # (market_calendar.is_overnight_session_open — Friday/Saturday/holiday-eve
+    # nights have NO session and are never ticked or booked).
+    overnight_hours_mode: str = "trade"       # "off" | "observe" | "trade"
+    # Overnight tick slots (same "HH:MM-HH:MM[@MM]" grammar as extended_windows;
+    # windows may NOT cross midnight — list the evening and morning halves
+    # separately). Hourly: overnight books are the thinnest of the day and the
+    # hourly cadence matches the news-cache TTL. The 20:30 first slot lets the
+    # 20:00 close of after-hours settle; the 03:30 single slot is the last tick
+    # whose orders can still work the book before the venue's 03:50 close
+    # (mirroring the 19:50-not-20:00 rule) — 04:00 is already the first
+    # extended slot.
+    overnight_windows: str = "20:30-23:30@60,01:00-03:00@60,03:30-03:30"
+    # Off-RTH entry sizing: overnight entries are sized harder down than
+    # extended ones (×0.25 vs ×0.5) — the modeled spread is 10× RTH and no
+    # fill evidence exists yet; accumulate evidence at low weight first.
+    overnight_size_multiplier: float = 0.25
+    # Actionable-threshold bump for OVERNIGHT runs (replaces, not stacks with,
+    # extended_confidence_bump): the thinnest books demand the most conviction.
+    overnight_confidence_bump: float = 0.10
+
     # ── Price-provenance health check ───────────────────────────────────────
     # Per-run guard against the stale-price class (the 2026-06-15 CRDO bug: an
     # entry booked at Friday's stale close while the live pre-market print — and
@@ -1212,6 +1239,18 @@ class Settings(BaseSettings):
     # the decision tick at the current (wide) spread rather than later at a
     # drifted price.
     broker_limit_cap_bps_extended: float = 80.0   # LMT cap outside regular hours
+    # Overnight LMT cap: the overnight book is thinner still (sim models it at
+    # ×10 RTH spread) — a cap inside the spread can never fill. Placeholder to
+    # calibrate against real overnight paper fills, like the extended cap.
+    broker_limit_cap_bps_overnight: float = 150.0
+    # Route overnight-session orders to IBKR's overnight venue (contract
+    # exchange "OVERNIGHT" instead of SMART; LMT-only, TIF DAY, ~10k eligible
+    # US stocks/ETFs). Fail-soft: an ineligible symbol / unentitled account
+    # rejects, lands as SUBMIT_FAILED, and the tick-scoped lifecycle retries or
+    # kills it — never breaking the run. False = legacy behavior (off-venue
+    # orders rest until the 04:00 pre-market open, where the settle pass kills
+    # them — i.e. no overnight broker fills).
+    broker_overnight_routing: bool = True
     broker_paper_equity: float = 100000.0         # USD equity used for the exposure cap in dry_run
 
     # ── Order-submission reliability (acceptance check + bounded retry) ──

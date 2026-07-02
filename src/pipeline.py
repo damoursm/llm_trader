@@ -1743,15 +1743,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             f"(default 78%) | allow_buys={_allow_buys}"
         )
 
-    # Extended-session gate — thin books and wide spreads demand more
-    # conviction off-hours, so the regime threshold is bumped further for any
-    # run outside RTH. Phase 0 only shapes the persisted `actionable` flag
-    # (observation ticks never trade); a future trade mode inherits it as-is.
-    if run_session != "rth" and settings.extended_confidence_bump > 0:
-        _confidence_threshold = min(0.95, _confidence_threshold + settings.extended_confidence_bump)
+    # Off-RTH gate — thin books and wide spreads demand more conviction, so the
+    # regime threshold is bumped further for any run outside RTH. Overnight
+    # (the thinnest book of the day) carries its own, larger bump. Observation
+    # ticks only shape the persisted `actionable` flag; trade mode inherits it.
+    _session_bump = (settings.overnight_confidence_bump if run_session == "overnight"
+                     else settings.extended_confidence_bump)
+    if run_session != "rth" and _session_bump > 0:
+        _confidence_threshold = min(0.95, _confidence_threshold + _session_bump)
         logger.info(
             f"[extended] {run_session}-session threshold bump: "
-            f"+{settings.extended_confidence_bump:.0%} → {_confidence_threshold:.0%}"
+            f"+{_session_bump:.0%} → {_confidence_threshold:.0%}"
         )
 
     # Catalyst timing enforcement — the context was computed BEFORE synthesis

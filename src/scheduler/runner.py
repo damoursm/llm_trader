@@ -43,7 +43,7 @@ from datetime import datetime, time as _time, timedelta
 from loguru import logger
 
 from config import settings
-from src.performance.market_calendar import current_session, is_market_day
+from src.performance.market_calendar import current_session, is_market_day, is_overnight_session_open
 from src.pipeline import run_pipeline
 from src.utils import now_et
 
@@ -133,10 +133,13 @@ def _session_slots() -> tuple[list[tuple[_time, str]], _time]:
     kind = "rth": the regular 30-min session slots (email fires on the closing
     one). kind = "extended": observation slots from ``extended_windows``,
     generated only when ``extended_hours_mode`` != "off"; each window ticks at
-    its own ``@MM`` cadence (default ``extended_tick_minutes``). A slot
-    colliding with an already-emitted slot time is dropped — the RTH tick owns
-    its boundaries (e.g. a 07:00–09:30 window yields 07:00…09:00 and cedes
-    09:30 to RTH), and adjacent windows sharing an endpoint fire it once.
+    its own ``@MM`` cadence (default ``extended_tick_minutes``). kind =
+    "overnight": slots from ``overnight_windows`` when ``overnight_hours_mode``
+    != "off" — their market-day validity is decided per-slot in
+    ``_slot_is_valid`` (an evening slot belongs to the NEXT day's session).
+    A slot colliding with an already-emitted slot time is dropped — the RTH
+    tick owns its boundaries (e.g. a 07:00–09:30 window yields 07:00…09:00 and
+    cedes 09:30 to RTH), and adjacent windows sharing an endpoint fire it once.
     """
     start = _parse_hhmm(settings.intraday_session_start, _time(9, 30))
     end = _parse_hhmm(settings.intraday_session_end, _time(16, 0))
@@ -146,18 +149,24 @@ def _session_slots() -> tuple[list[tuple[_time, str]], _time]:
     while cur <= end_dt:
         slots.append((cur.time(), "rth"))
         cur += timedelta(minutes=30)
-    if (settings.extended_hours_mode or "off").lower() != "off":
-        seen = {t for t, _ in slots}
-        default_step = max(5, int(settings.extended_tick_minutes))
-        for w_start, w_end, w_step in _parse_windows(settings.extended_windows):
+    seen = {t for t, _ in slots}
+    default_step = max(5, int(settings.extended_tick_minutes))
+
+    def _add_windows(spec: str, kind: str) -> None:
+        for w_start, w_end, w_step in _parse_windows(spec):
             step = w_step or default_step
-            cur = datetime(2000, 1, 1, w_start.hour, w_start.minute)
+            w_cur = datetime(2000, 1, 1, w_start.hour, w_start.minute)
             w_end_dt = datetime(2000, 1, 1, w_end.hour, w_end.minute)
-            while cur <= w_end_dt:
-                if cur.time() not in seen:
-                    slots.append((cur.time(), "extended"))
-                    seen.add(cur.time())
-                cur += timedelta(minutes=step)
+            while w_cur <= w_end_dt:
+                if w_cur.time() not in seen:
+                    slots.append((w_cur.time(), kind))
+                    seen.add(w_cur.time())
+                w_cur += timedelta(minutes=step)
+
+    if (settings.extended_hours_mode or "off").lower() != "off":
+        _add_windows(settings.extended_windows, "extended")
+    if (settings.overnight_hours_mode or "off").lower() != "off":
+        _add_windows(settings.overnight_windows, "overnight")
     slots.sort(key=lambda p: (p[0].hour, p[0].minute))
     return slots, end
 
@@ -181,8 +190,9 @@ def _email_slot_times() -> set[_time]:
 def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
     """Per-slot decisions as ``(observe, send_email)``.
 
-    observe    — True only for extended slots while NOT in "trade" mode
-                 (Phase 0 observation; "trade" runs them as full ticks).
+    observe    — True only for extended/overnight slots while their session's
+                 mode is NOT "trade" (Phase 0 observation; "trade" runs them as
+                 full ticks). Each session has its OWN mode knob.
     send_email — precedence: (1) ``scheduler_email_every_tick`` on ⇒ EVERY slot
                  emails (RTH + extended alike); else (2) ``scheduler_email_times``
                  set ⇒ ONLY slots whose time is in that set email (this is the
@@ -191,8 +201,11 @@ def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
                  (3) legacy: only the closing RTH slot (``time >= end`` — the
                  ``kind`` gate stops an after-hours slot past 16:00 re-sending it).
     """
-    mode = (settings.extended_hours_mode or "off").lower()
-    observe = kind == "extended" and mode != "trade"
+    if kind == "overnight":
+        observe = (settings.overnight_hours_mode or "off").lower() != "trade"
+    else:
+        mode = (settings.extended_hours_mode or "off").lower()
+        observe = kind == "extended" and mode != "trade"
     email_times = _email_slot_times()
     if settings.scheduler_email_every_tick:
         send_email = True
@@ -220,37 +233,52 @@ def _alert(subject: str, body: str) -> None:
 
 def _missed_slots_between(start: datetime, end: datetime, slots: list[tuple[_time, str]],
                           grace: int) -> list[datetime]:
-    """Market-day slot boundaries that fell inside ``(start, end - grace]`` —
-    the ticks a suspend/outage swallowed whole."""
+    """Valid slot boundaries that fell inside ``(start, end - grace]`` —
+    the ticks a suspend/outage swallowed whole (per-slot session calendar,
+    so Sunday-evening overnight slots count and Friday-evening ones don't)."""
     out: list[datetime] = []
     day = start.date()
     while day <= end.date():
-        if is_market_day(day):
-            for t, _kind in slots:
-                slot_dt = datetime.combine(day, t)
-                if start < slot_dt <= end - timedelta(seconds=grace):
-                    out.append(slot_dt)
+        for t, kind in slots:
+            slot_dt = datetime.combine(day, t)
+            if start < slot_dt <= end - timedelta(seconds=grace) and _slot_is_valid(day, t, kind):
+                out.append(slot_dt)
         day += timedelta(days=1)
     return out
 
 
-def _current_slot(now_naive: datetime, slots: list[tuple[_time, str]]) -> tuple[datetime, str] | None:
-    """Latest ``(slot boundary, kind)`` at/before `now` on a market day, or None.
+def _slot_is_valid(day, t: _time, kind: str) -> bool:
+    """Does this slot belong to a live session on this calendar day?
 
-    Weekends AND NYSE holidays yield None — there is no session (regular or
-    extended) on a closed market, so ticking would only burn LLM calls
-    marking stale prices.
+    rth/extended slots require the day itself to be a market day. An OVERNIGHT
+    slot follows the venue's Sunday-night→Thursday-night schedule: the evening
+    half (≥ 20:00) is valid when the NEXT day is a market day (Sunday evening
+    ticks — it leads into Monday; Friday/holiday-eve evenings don't), the
+    morning half (< 04:00) when TODAY is one.
     """
-    if not is_market_day(now_naive.date()):
-        return None
+    if kind == "overnight":
+        if t >= _time(20, 0):
+            return is_market_day(day + timedelta(days=1))
+        return is_market_day(day)
+    return is_market_day(day)
+
+
+def _current_slot(now_naive: datetime, slots: list[tuple[_time, str]]) -> tuple[datetime, str] | None:
+    """Latest valid ``(slot boundary, kind)`` at/before `now`, or None.
+
+    Validity is per-slot (``_slot_is_valid``): weekends and NYSE holidays yield
+    None for rth/extended slots — no session on a closed market, so ticking
+    would only burn LLM calls marking stale prices — while overnight slots
+    follow the overnight venue's own calendar (Sunday evening IS valid).
+    """
     today = now_naive.date()
     candidate: tuple[datetime, str] | None = None
     for t, kind in slots:
         slot_dt = datetime.combine(today, t)
-        if slot_dt <= now_naive:
-            candidate = (slot_dt, kind)
-        else:
+        if slot_dt > now_naive:
             break
+        if _slot_is_valid(today, t, kind):
+            candidate = (slot_dt, kind)
     return candidate
 
 
@@ -268,6 +296,7 @@ def start_scheduler() -> None:
     slots, end_t = _session_slots()
     rth_slots = [t for t, k in slots if k == "rth"]
     ext_slots = [t for t, k in slots if k == "extended"]
+    on_slots = [t for t, k in slots if k == "overnight"]
 
     logger.info(
         f"Scheduler started (poll loop). RTH slots: {rth_slots[0].strftime('%H:%M')}–"
@@ -285,6 +314,18 @@ def start_scheduler() -> None:
             f"Extended slots ({_mode}, "
             f"{ext_slots[0].strftime('%H:%M')}–{ext_slots[-1].strftime('%H:%M')} ET): "
             f"{', '.join(t.strftime('%H:%M') for t in ext_slots)} — {_what}."
+        )
+    if on_slots:
+        _omode = (settings.overnight_hours_mode or "off").lower()
+        _owhat = (
+            "FULL TRADING ticks — ×10 modeled spread, "
+            f"×{settings.overnight_size_multiplier:g} sizing, overnight-venue broker routing"
+            if _omode == "trade"
+            else "observation — full pipeline + persistence, no ledger/broker mutations"
+        )
+        logger.info(
+            f"Overnight slots ({_omode}, Sun–Thu nights per the overnight venue calendar): "
+            f"{', '.join(t.strftime('%H:%M') for t in on_slots)} ET — {_owhat}."
         )
     email_times = _email_slot_times()
     if settings.scheduler_email_every_tick:
@@ -390,9 +431,17 @@ def start_scheduler() -> None:
                             "still live."
                         )
                     # Catch-up: manage positions late rather than not at all — but
-                    # only while a session is live (marking stale overnight prices
-                    # would burn LLM calls for nothing).
-                    if settings.scheduler_catchup_tick and current_session() in ("rth", "extended"):
+                    # only while a session is live (marking prices on a closed
+                    # market would burn LLM calls for nothing). The overnight
+                    # session counts only when overnight trading is on AND the
+                    # venue is actually open (Sun–Thu nights).
+                    _sess = current_session()
+                    _session_live = _sess in ("rth", "extended") or (
+                        _sess == "overnight"
+                        and (settings.overnight_hours_mode or "off").lower() == "trade"
+                        and is_overnight_session_open()
+                    )
+                    if settings.scheduler_catchup_tick and _session_live:
                         observe, _ = _tick_plan(kind, slot_dt.time(), end_t)
                         logger.info(
                             f"[scheduler] CATCH-UP tick for missed "

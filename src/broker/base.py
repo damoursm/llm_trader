@@ -31,6 +31,12 @@ class OrderRequest:
     outside_rth: bool = False # allow the order to trade in extended sessions
                               # (IBKR: order.outsideRth; requires LMT — IBKR
                               # rejects MKT outside regular hours)
+    overnight: bool = False   # route to IBKR's OVERNIGHT venue (20:00–03:50 ET
+                              # Sun–Thu nights: contract exchange "OVERNIGHT"
+                              # instead of SMART; LMT-only; outsideRth is NOT
+                              # sent alongside — the venue defines its own
+                              # hours). Ineligible symbols / unentitled
+                              # accounts reject fail-soft (SUBMIT_FAILED).
 
 
 @dataclass

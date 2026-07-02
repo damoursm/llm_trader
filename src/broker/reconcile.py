@@ -89,17 +89,36 @@ def _limit_price_for(side: str, model: float, outside_rth: bool = False) -> Opti
     cap is never tighter than configured. Off-RTH uses the wider
     ``broker_limit_cap_bps_extended`` — the extended-book spread runs ~4× RTH,
     and a cap inside the spread can never fill (the order would rest, get
-    cancelled next tick, and chase the market on stale data). None for
-    unusable model prices."""
+    cancelled next tick, and chase the market on stale data) — and the
+    OVERNIGHT session the wider-still ``broker_limit_cap_bps_overnight``
+    (derived live from the clock: the session is fixed for a tick in practice).
+    None for unusable model prices."""
     if not model or model <= 0:
         return None
-    bps = float(settings.broker_limit_cap_bps_extended if outside_rth
-                else settings.broker_limit_cap_bps)
+    if outside_rth:
+        from src.performance.market_calendar import current_session
+        bps = float(settings.broker_limit_cap_bps_overnight
+                    if current_session() == "overnight"
+                    else settings.broker_limit_cap_bps_extended)
+    else:
+        bps = float(settings.broker_limit_cap_bps)
     cap = model * (1 + bps / 10000.0) if side == "BUY" else model * (1 - bps / 10000.0)
     tick = 0.01 if model >= 1.0 else 0.0001
     steps = cap / tick
     cap = (math.ceil(steps) if side == "BUY" else math.floor(steps)) * tick
     return round(cap, 2 if model >= 1.0 else 4)
+
+
+def _overnight_routing_active() -> bool:
+    """True when THIS submission moment is inside the live overnight session
+    (Sun–Thu nights, 20:00–03:50 ET) and overnight venue routing is enabled —
+    the ``OrderRequest.overnight`` flag. Off-venue overnight submissions can
+    never fill (outsideRth covers only 04:00–20:00), so without routing the
+    tick-scoped lifecycle just kills them."""
+    if not settings.broker_overnight_routing:
+        return False
+    from src.performance.market_calendar import current_session, is_overnight_session_open
+    return current_session() == "overnight" and is_overnight_session_open()
 
 
 def _new_report() -> dict:
@@ -657,6 +676,7 @@ def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
         order_type="LMT", limit_price=limit,
         client_ref=f"{ref_prefix}{run_id or _utcnow_iso()}",
         intent="EXIT", outside_rth=outside_rth,
+        overnight=_overnight_routing_active(),
     )
     res = _submit_with_retry(broker, req, model_price=live, report=report,
                              intent="DRIFT_FLATTEN")
@@ -825,6 +845,7 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
                     ticker=t["ticker"], side=side, quantity=qty,
                     order_type="LMT", limit_price=limit,
                     client_ref=new_ref, intent=intent, outside_rth=outside_rth,
+                    overnight=_overnight_routing_active(),
                 ), model_price=live, report=report, intent=intent)
                 if intent == "ENTRY":
                     _apply_entry_result(t, res)
@@ -1045,21 +1066,32 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         # ── DRIFT PREVENTION: cancel working entries behind CLOSED trades ──
         changed = _cancel_entries_for_closed(broker, trades, report) or changed
 
-        # Extended-session submissions: IBKR rejects MKT outside regular hours,
-        # so off-RTH ticks force a marketable LMT (model price ± cap) flagged
-        # outsideRth. An order submitted overnight rests until the 04:00
-        # pre-market open — consistent with the tracker snapping the fill
-        # timestamp to the next tradeable moment. RTH keeps the configured type.
+        # Off-RTH submissions: IBKR rejects MKT outside regular hours, so
+        # off-RTH ticks force a marketable LMT (model price ± the session's
+        # cap). Extended (04:00–20:00) orders are flagged outsideRth; live
+        # OVERNIGHT-session orders route to the overnight venue instead
+        # (_overnight_routing_active → OrderRequest.overnight). With routing
+        # off (or the venue closed — Fri/Sat nights) an overnight submission
+        # rests until 04:00, where the tick-scoped lifecycle kills it. RTH
+        # keeps the configured type.
         from src.performance.market_calendar import current_session
-        outside_rth = current_session() != "rth"
+        _sess = current_session()
+        outside_rth = _sess != "rth"
         use_limit = settings.broker_order_type == "LMT" or outside_rth
         order_type = "LMT" if use_limit else "MKT"
         if outside_rth:
-            logger.info(
-                "[broker] off-RTH tick — orders submitted as marketable LMT "
-                f"(extended cap {settings.broker_limit_cap_bps_extended:g} bp) "
-                "with outsideRth=True"
-            )
+            if _overnight_routing_active():
+                logger.info(
+                    "[broker] overnight tick — orders routed to the OVERNIGHT "
+                    f"venue as marketable LMT (cap {settings.broker_limit_cap_bps_overnight:g} bp)"
+                )
+            else:
+                _cap = (settings.broker_limit_cap_bps_overnight if _sess == "overnight"
+                        else settings.broker_limit_cap_bps_extended)
+                logger.info(
+                    "[broker] off-RTH tick — orders submitted as marketable LMT "
+                    f"({_sess} cap {_cap:g} bp) with outsideRth=True"
+                )
 
         # ── ENTRIES: OPEN trades not yet sent to the broker ──────────────
         # One broker order per client_ref, ever: the ref is the idempotency
@@ -1116,6 +1148,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 order_type=order_type, limit_price=limit,
                 client_ref=ref,
                 intent="ENTRY", outside_rth=outside_rth,
+                overnight=_overnight_routing_active(),
             ), model_price=price, report=report, intent="ENTRY")
             submitted_refs.add(ref)
             _apply_entry_result(t, res)
@@ -1206,6 +1239,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 order_type=order_type, limit_price=limit,
                 client_ref=ref,
                 intent="EXIT", outside_rth=outside_rth,
+                overnight=_overnight_routing_active(),
             ), model_price=model, report=report, intent="EXIT")
             submitted_refs.add(ref)
             _apply_exit_result(t, res)

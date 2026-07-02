@@ -31,6 +31,17 @@ _HEAVY_METHOD_FLAGS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _no_default_time_stop(monkeypatch):
+    """This module tests the WITHIN-WINDOW decay semantics (flip / conviction
+    collapse / neutral-hold). The fixtures carry fixed old entry_datetimes, so
+    the default horizon fallback (horizon_default_window — the zombie-loser
+    time-stop) would shove every case into the expiry branch as wall-clock time
+    passes. Pin it off here; the time-stop has its own tests in
+    test_audit_fixes_2026_07.py."""
+    monkeypatch.setattr(settings, "horizon_default_window", "")
+
+
 def _rec(ticker="XLE", action="BUY", confidence=0.85, direction=None):
     return Recommendation(
         ticker=ticker, type="ETF",

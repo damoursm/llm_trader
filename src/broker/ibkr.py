@@ -97,9 +97,14 @@ class IBKRBroker(Broker):
         managed = self._ib.managedAccounts() or [""]
         return managed[0]
 
-    def _qualify(self, ticker: str):
+    def _qualify(self, ticker: str, overnight: bool = False):
+        """SMART-routed US stock contract; ``overnight=True`` routes to IBKR's
+        OVERNIGHT venue (the 20:00–03:50 ET Sun–Thu session — SMART does not
+        match overnight). Qualification of an overnight-ineligible symbol
+        fails → the caller's exception handling records SUBMIT_FAILED and the
+        tick-scoped lifecycle retries/kills it (fail-soft by design)."""
         from ib_async import Stock
-        contract = Stock(to_ib_symbol(ticker), "SMART", "USD")
+        contract = Stock(to_ib_symbol(ticker), "OVERNIGHT" if overnight else "SMART", "USD")
         self._ib.qualifyContracts(contract)
         return contract
 
@@ -171,7 +176,8 @@ class IBKRBroker(Broker):
                                status="DISCONNECTED", error="broker not connected")
         try:
             from ib_async import LimitOrder, MarketOrder
-            contract = self._qualify(req.ticker)
+            overnight = bool(getattr(req, "overnight", False))
+            contract = self._qualify(req.ticker, overnight=overnight)
             if req.order_type == "LMT" and req.limit_price and req.limit_price > 0:
                 order = LimitOrder(req.side, req.quantity, req.limit_price)
             else:
@@ -185,11 +191,13 @@ class IBKRBroker(Broker):
             # the preset to coerce. DAY is correct here — the settle pass cancels any
             # still-unfilled order each tick, so orders never need to live past the day.
             order.tif = "DAY"
-            if req.outside_rth:
+            if req.outside_rth and not overnight:
                 # Extended-session eligibility. IBKR accepts this only on
                 # limit orders; the reconciler forces LMT off-hours, so a MKT
                 # falling through here would be an upstream bug surfaced by
-                # IBKR's reject (captured in OrderResult.error).
+                # IBKR's reject (captured in OrderResult.error). NOT set on
+                # OVERNIGHT-routed orders — that venue defines its own hours
+                # and outsideRth applies to the 04:00–20:00 sessions only.
                 order.outsideRth = True
             if req.client_ref:
                 order.orderRef = req.client_ref      # idempotency / reconciliation tag

@@ -64,6 +64,33 @@ def current_session(now: Optional[datetime] = None) -> str:
     return "overnight"
 
 
+# IBKR's overnight venue (IBEOS) stops matching at 03:50 ET, ten minutes before
+# the 04:00 pre-market open.
+OVERNIGHT_VENUE_CLOSE_LOCAL = time(3, 50)
+
+
+def is_overnight_session_open(now: Optional[datetime] = None) -> bool:
+    """True when the US OVERNIGHT session (IBKR: 20:00 ET → 03:50 ET next day,
+    Sunday night through Thursday night) is actually trading at *now*.
+
+    The ``overnight`` label from :func:`current_session` is purely clock-based —
+    it is also "overnight" all Saturday, Friday night, and holiday eves, when no
+    venue is open. Trading decisions need this stricter test: the EVENING half
+    (≥ 20:00) is open only when the NEXT day is a market day (Sunday evening
+    leads into Monday ✓; Friday evening → Saturday ✗; the eve of a holiday ✗),
+    and the MORNING half (< 03:50) only when TODAY is a market day. Naive
+    datetimes are assumed Eastern.
+    """
+    dt = now or datetime.now(NY_TZ)
+    dt = dt.astimezone(NY_TZ) if dt.tzinfo is not None else dt
+    t = dt.time()
+    if t >= EXTENDED_CLOSE_LOCAL:                       # 20:00–23:59 evening half
+        return is_market_day(dt.date() + timedelta(days=1))
+    if t < OVERNIGHT_VENUE_CLOSE_LOCAL:                 # 00:00–03:50 morning half
+        return is_market_day(dt.date())
+    return False                                        # 03:50–04:00 gap / daytime
+
+
 # NYSE full-day holidays, 2024–2030.  Includes observance shifts (e.g.
 # Independence Day 2026 falls on Saturday → observed Friday 2026-07-03).
 # When the table runs out, _is_market_day() falls back to "weekday".

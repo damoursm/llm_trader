@@ -244,15 +244,22 @@ def _execution_iso() -> str:
     RTH: now (a fill can happen immediately). Extended sessions when
     ``extended_hours_mode="trade"``: also now — extended fills are real fills
     (the broker leg submits marketable LMT + outsideRth orders, and the cost
-    model charges the wider extended spread on that leg). Everything else
-    (overnight, weekends/holidays, or extended hours while NOT in trade mode)
-    snaps forward to the next NYSE regular-session open, so the recorded
-    execution time always corresponds to a moment the system could actually
-    have traded.
+    model charges the wider extended spread on that leg). Overnight when
+    ``overnight_hours_mode="trade"`` AND the overnight venue is actually open
+    (Sun–Thu nights, 20:00–03:50 ET — ``is_overnight_session_open``): also now,
+    at the ×10-spread overnight cost. Everything else (Friday/Saturday nights,
+    holidays, or off-RTH sessions while NOT in trade mode) snaps forward to the
+    next NYSE regular-session open, so the recorded execution time always
+    corresponds to a moment the system could actually have traded.
     """
-    from src.performance.market_calendar import current_session, effective_execution_iso
-    if ((settings.extended_hours_mode or "").lower() == "trade"
-            and current_session() == "extended"):
+    from src.performance.market_calendar import (
+        current_session, effective_execution_iso, is_overnight_session_open)
+    session = current_session()
+    if session == "extended" and (settings.extended_hours_mode or "").lower() == "trade":
+        return _now_iso()
+    if (session == "overnight"
+            and (settings.overnight_hours_mode or "").lower() == "trade"
+            and is_overnight_session_open()):
         return _now_iso()
     return effective_execution_iso()
 
@@ -1364,12 +1371,14 @@ def record_new_trades(
         decision_at = _now_iso()
         executed_at = _execution_iso()
 
-        # ── Step 3: extended-session sizing haircut ───────────────────────
+        # ── Step 3: off-RTH sizing haircut ─────────────────────────────────
         # Entries filled outside RTH are sized down: the book is thin, the
-        # modeled spread is 4× wider, and the pre-prod goal is to accumulate
-        # evidence at reduced weight until paper fills prove the edge.
+        # modeled spread is 4× (extended) / 10× (overnight) wider, and the
+        # pre-prod goal is to accumulate evidence at reduced weight until
+        # paper fills prove the edge. Overnight gets its own (harder) haircut.
         entry_session = _session_of_iso(executed_at)
-        ext_mult = float(settings.extended_size_multiplier)
+        ext_mult = float(settings.overnight_size_multiplier if entry_session == "overnight"
+                         else settings.extended_size_multiplier)
         if entry_session != "rth" and ext_mult < 0.999:
             multiplier = round(multiplier * ext_mult, 3)
             diag["extended_haircut_applied"] += 1
