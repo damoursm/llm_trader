@@ -83,7 +83,11 @@ def get_ic_matrix(days: Optional[int] = None, min_n: Optional[int] = None,
     matrix: Dict[str, Dict[str, Tuple[float, float]]] = {}
     try:
         from src.analysis.simulated_trades import compute_method_perf
-        df = compute_method_perf(days=days, min_n=min_n)
+        # dedupe="last" PINNED: the horizon system's live IC matrix keeps the
+        # documented one-row-per-(day, ticker, method) convention. The dashboard's
+        # trades view moved to entry-EVENT semantics (dedupe="events", 2026-07-02)
+        # — a live decision input must not change as a side effect of that.
+        df = compute_method_perf(days=days, min_n=min_n, dedupe="last")
         if df is not None and not df.empty:
             for _, r in df.iterrows():
                 cells: Dict[str, Tuple[float, float]] = {}

@@ -175,6 +175,39 @@ def _spearman(a: pd.Series, b: pd.Series) -> Optional[float]:
     return None if pd.isna(ic) else float(ic)
 
 
+# ── Session filtering (shared by the simulated/exit panels) ──────────────────
+
+def session_of_ts(series: pd.Series) -> pd.Series:
+    """Fine US-market session (``rth|premarket|afterhours|overnight``) of each
+    ISO timestamp, vectorized. The panel writers store tz-aware UTC ISO strings;
+    a rare naive value is assumed UTC. Unparseable → "" (matches no filter).
+    Boundaries mirror ``tracker._session_of_iso_fine``."""
+    dt = pd.to_datetime(series, errors="coerce", utc=True)
+    try:
+        dt = dt.dt.tz_convert("America/New_York")
+    except Exception:
+        return pd.Series([""] * len(series), index=series.index)
+    mins = dt.dt.hour * 60 + dt.dt.minute
+    out = pd.Series("overnight", index=series.index, dtype=object)
+    out[(mins >= 9 * 60 + 30) & (mins < 16 * 60)] = "rth"
+    out[(mins >= 4 * 60) & (mins < 9 * 60 + 30)] = "premarket"
+    out[(mins >= 16 * 60) & (mins < 20 * 60)] = "afterhours"
+    out[dt.isna()] = ""
+    return out
+
+
+def session_filter_mask(ts_series: pd.Series, session: Optional[str]) -> pd.Series:
+    """Boolean mask selecting rows whose timestamp falls in *session* — the fine
+    dashboard values (``rth|premarket|afterhours|overnight``) plus the coarse
+    ``extended`` (= premarket ∪ afterhours). None/empty → all rows."""
+    if not session:
+        return pd.Series(True, index=ts_series.index)
+    sess = session_of_ts(ts_series)
+    if session == "extended":
+        return sess.isin(("premarket", "afterhours"))
+    return sess == session
+
+
 def periodic_ic_stats(days: Sequence, scores: Sequence, fwd: Sequence,
                       min_per_day: int = 5, min_days: int = 3,
                       ) -> Tuple[Optional[float], Optional[float], Optional[float], int]:

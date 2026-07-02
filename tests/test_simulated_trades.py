@@ -132,21 +132,53 @@ def test_compute_method_perf_min_n_gate(monkeypatch):
     assert pd.isna(tech["ret_1d"])
 
 
-def test_compute_method_perf_dedupes_to_last_run(monkeypatch):
+def test_compute_method_perf_dedupe_modes(monkeypatch):
     st = _patch_series(monkeypatch)
     sim = pd.DataFrame([
         {"generated_at": "2026-06-01T14:00", "signal_date": "2026-06-01",
          "ticker": "STK", "method": "tech", "score": 0.5, "direction": "BUY"},
         {"generated_at": "2026-06-01T20:00", "signal_date": "2026-06-01",
-         "ticker": "STK", "method": "tech", "score": -0.5, "direction": "SELL"},  # wins
+         "ticker": "STK", "method": "tech", "score": -0.5, "direction": "SELL"},
     ])
-    perf = st.compute_method_perf(sim_df=sim, min_n=1)        # default dedupe="last"
+    # "last" — the legacy one-row-per-(day, ticker, method) panel convention,
+    # PINNED by the live horizon/edge-curve IC matrix: only the later run kept.
+    perf = st.compute_method_perf(sim_df=sim, min_n=1, dedupe="last")
     tech = perf[perf.method == "tech"].iloc[0]
-    assert tech["views"] == 1                            # only the later run kept
+    assert tech["views"] == 1
     assert tech["win_1d"] == pytest.approx(0.0)          # SELL into +10% → wrong
-    # dedupe="all" keeps both legs → win 50%
+    # "events" (default) — BUY→SELL is a sign flip: BOTH are entry decisions.
+    ev = st.compute_method_perf(sim_df=sim, min_n=1)
+    assert ev[ev.method == "tech"].iloc[0]["views"] == 2
+    # dedupe="all" keeps raw rows → also both legs here.
     both = st.compute_method_perf(sim_df=sim, min_n=1, dedupe="all")
     assert both[both.method == "tech"].iloc[0]["views"] == 2
+
+
+def test_compute_method_perf_events_collapse_standing_calls(monkeypatch):
+    """A call re-affirmed run after run is ONE trade (the method can't re-enter a
+    position it already holds); a sign flip or a >3-day gap opens a new one.
+    Events are unique moments, so session buckets partition them (All = Σ)."""
+    st = _patch_series(monkeypatch)
+    sim = pd.DataFrame([
+        # Three consecutive re-affirmations of the same BUY call → 1 trade.
+        {"generated_at": "2026-06-01T14:00:00+00:00", "signal_date": "2026-06-01",
+         "ticker": "STK", "method": "tech", "score": 0.5, "direction": "BUY"},
+        {"generated_at": "2026-06-01T14:30:00+00:00", "signal_date": "2026-06-01",
+         "ticker": "STK", "method": "tech", "score": 0.6, "direction": "BUY"},
+        {"generated_at": "2026-06-01T15:00:00+00:00", "signal_date": "2026-06-01",
+         "ticker": "STK", "method": "tech", "score": 0.4, "direction": "BUY"},
+        # Sign flip → a second trade (the SELL entry).
+        {"generated_at": "2026-06-01T20:00:00+00:00", "signal_date": "2026-06-01",
+         "ticker": "STK", "method": "tech", "score": -0.5, "direction": "SELL"},
+        # Same sign again after a >3-day silence → a third trade (re-entry).
+        {"generated_at": "2026-06-08T14:00:00+00:00", "signal_date": "2026-06-08",
+         "ticker": "STK", "method": "tech", "score": -0.5, "direction": "SELL"},
+    ])
+    ev = st.extract_entry_events(sim)
+    assert len(ev) == 3
+    assert list(ev["generated_at"]) == ["2026-06-01T14:00:00+00:00",
+                                        "2026-06-01T20:00:00+00:00",
+                                        "2026-06-08T14:00:00+00:00"]
 
 
 def test_compute_method_perf_ic_spearman(monkeypatch):

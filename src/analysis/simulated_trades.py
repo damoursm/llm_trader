@@ -134,14 +134,39 @@ def _fwd_intraday(series: List[Tuple[int, float]], generated_at: str,
 
 # ── core computation ───────────────────────────────────────────────────────
 
-def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
+def extract_entry_events(df: pd.DataFrame, max_gap_days: float = 3.0) -> pd.DataFrame:
+    """Reduce the per-run simulated rows to ENTRY EVENTS — the tick where a
+    method NEWLY decided to enter (its first call, a sign flip, or a re-emerged
+    call after ``max_gap_days`` without one). A method already in a position
+    doesn't re-enter, so the run-after-run re-affirmations of a standing call
+    are NOT separate trades — they were pseudo-replicating the sample and, being
+    re-dedupled inside each session filter, made the per-session trade counts
+    sum to more than "All sessions". Events are unique moments: sessions
+    partition them exactly (All = Σ sessions)."""
+    if df is None or df.empty or "generated_at" not in df.columns:
+        return df
+    df = df.sort_values("generated_at").copy()
+    ts = pd.to_datetime(df["generated_at"], errors="coerce", utc=True)
+    sign = (df["score"] > 0).astype(int) - (df["score"] < 0).astype(int)
+    g = df.groupby(["ticker", "method"], sort=False)
+    prev_sign = g["score"].shift().pipe(lambda s: (s > 0).astype(int) - (s < 0).astype(int))
+    has_prev = g["score"].shift().notna()
+    prev_ts = ts.groupby([df["ticker"], df["method"]], sort=False).shift()
+    gap_days = (ts - prev_ts).dt.total_seconds() / 86400.0
+    is_event = (~has_prev) | (sign != prev_sign) | (gap_days > max_gap_days)
+    return df[is_event]
+
+
+def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
                         min_n: int = 10, sim_df: Optional[pd.DataFrame] = None,
                         min_per_day: int = 5, min_days: int = 3,
+                        session: Optional[str] = None,
+                        direction: Optional[str] = None,
                         ) -> pd.DataFrame:
     """Per-method directional win rate + mean gross directional return per horizon.
 
     Returns one row per method with: ``method``, ``category``, ``views`` (total
-    simulated trades), and for each horizon label H: ``n_H`` (joint obs),
+    simulated ENTRY events), and for each horizon label H: ``n_H`` (joint obs),
     ``win_H`` (% of trades whose signed forward return was positive), ``ret_H``
     (mean signed forward return %, gross), ``ic_H`` (Spearman rank IC between the
     method's raw score and the forward return — ranking skill, same basis as the
@@ -149,15 +174,38 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
     (stdev and information ratio of the PER-DAY IC; see
     ``signal_panel.periodic_ic_stats`` — populate once ``min_days`` signal-days of
     ``min_per_day`` names accrue). Win/return/IC are NaN below ``min_n``. Sorted by
-    views desc."""
+    views desc.
+
+    ``dedupe="events"`` (default): a simulated trade is the tick a method NEWLY
+    called the direction (``extract_entry_events``) — one trade per call, not one
+    per run/day, so the session buckets are a true partition. ``"last"`` = the
+    legacy one-row-per-(day, ticker, method) convention; ``"all"`` = raw rows.
+
+    ``session`` restricts to entries DECIDED in that US-market session
+    (``rth|premarket|afterhours|overnight|extended``); ``direction``
+    (``long|short``) to the side of the method's call (a positive score is its
+    long call). Both filters apply AFTER event extraction — filtering first
+    would manufacture phantom transitions across excluded ticks. A window
+    (``days``) edge can make a pre-existing call look new at the boundary."""
     df = sim_df if sim_df is not None else load_sim_trades(days)
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
 
-    if dedupe == "last" and "generated_at" in df.columns:
+    if dedupe == "events":
+        df = extract_entry_events(df)
+    elif dedupe == "last" and "generated_at" in df.columns:
         df = (df.sort_values("generated_at")
                 .groupby(["signal_date", "ticker", "method"], as_index=False).tail(1))
+
+    if direction and "direction" in df.columns:
+        want = "BUY" if str(direction).lower() in ("long", "buy") else "SELL"
+        df = df[df["direction"] == want]
+    if session and "generated_at" in df.columns:
+        from src.analysis.signal_panel import session_filter_mask
+        df = df[session_filter_mask(df["generated_at"], session)]
+    if df.empty:
+        return pd.DataFrame()
 
     df["sigd"] = df["signal_date"].map(date.fromisoformat)
 
@@ -201,7 +249,12 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "last",
 
     views = df.groupby("method").size().to_dict()
     rows = []
-    for method, by_h in acc.items():
+    # Rows come from the views keys, not only the accumulator: a method whose
+    # only entries are too recent to have ANY forward return yet still renders
+    # (views > 0, every n = 0), so a session/direction filter isolating such an
+    # event can't silently drop the row and break All = Σ sessions.
+    for method in dict.fromkeys(list(views) + list(acc)):
+        by_h = acc.get(method) or {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS}
         rec: dict = {"method": method, "category": category_for(method),
                      "views": int(views.get(method, 0))}
         for lbl in HORIZON_LABELS:
@@ -259,9 +312,13 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
-    if dedupe == "last" and "generated_at" in df.columns:
+    if dedupe == "events":
+        df = extract_entry_events(df)
+    elif dedupe == "last" and "generated_at" in df.columns:
         df = (df.sort_values("generated_at")
                 .groupby(["signal_date", "ticker", "method"], as_index=False).tail(1))
+    if df.empty:
+        return pd.DataFrame()
     df["sigd"] = df["signal_date"].map(date.fromisoformat)
 
     tickers = df["ticker"].unique()
@@ -485,7 +542,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                    help="min cross-section per signal-day before that day's IC counts toward ICstd/ICIR (default 5)")
     p.add_argument("--min-days", type=int, default=3,
                    help="min usable signal-days before IC stdev/ICIR is reported (default 3)")
-    p.add_argument("--dedupe", choices=("last", "all"), default="last")
+    p.add_argument("--dedupe", choices=("events", "last", "all"), default="events",
+                   help="'events' = one trade per NEW directional call (entry-event "
+                        "semantics, the dashboard's view); 'last' = one row per "
+                        "(day, ticker, method) — the legacy panel convention the live "
+                        "horizon/edge-curve system still pins; 'all' = raw rows")
     p.add_argument("--backfill", action="store_true",
                    help="materialise simulated_trades from existing signals, then report")
     p.add_argument("--refresh", action="store_true",

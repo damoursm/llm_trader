@@ -265,47 +265,66 @@ def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) 
     return _cached(key, lambda: _retry(_q, "signal_ic"))
 
 
-def simulated_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
+def simulated_method_perf(days: Optional[int] = None, min_n: int = 10,
+                          session: Optional[str] = None,
+                          direction: Optional[str] = None) -> pd.DataFrame:
     """Per-method directional win rate + mean gross return at 30m/3h/6h/1d/3d/1w/2w/1m
     over the ``simulated_trades`` table (every scored ticker treated as a solo
-    single-method trade). Cached (the OHLCV join is heavy); run-based, so it
-    ignores the window/session toggles like the IC table. Empty until forward
+    single-method trade). Cached (the OHLCV join is heavy). ``session`` filters
+    by the session the signal was GENERATED in; ``direction`` by the side of the
+    method's own call (positive score = its long call). Empty until forward
     returns exist."""
     from src.analysis.simulated_trades import compute_method_perf
-    return _cached(("sim_method_perf", days, int(min_n)),
-                   lambda: _retry(lambda: compute_method_perf(days=days, min_n=min_n), "simulated_method_perf"))
+    return _cached(("sim_method_perf", days, int(min_n), session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_method_perf(days=days, min_n=min_n,
+                                                              session=session, direction=direction),
+                                  "simulated_method_perf"))
 
 
-def exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
+def exit_method_perf(days: Optional[int] = None, min_n: int = 10,
+                     session: Optional[str] = None,
+                     direction: Optional[str] = None) -> pd.DataFrame:
     """Per-EXIT-method win rate / IC / IC-std / ICIR / signed return at
     30m/3h/6h/1d/3d/1w/2w/1m over the ``exit_signals`` panel (every held position
     re-scored each tick), plus the synthesized ``llm_review`` row from
     ``trade_reviews``. The exit-side counterpart to ``simulated_method_perf``.
-    Cached (the OHLCV join is heavy); run-based. Empty until forward returns exist."""
+    ``session`` filters by the session the REVIEW happened in; ``direction`` by
+    the held position's side. Cached (the OHLCV join is heavy). Empty until
+    forward returns exist."""
     from src.analysis.exit_panel import compute_exit_method_perf
-    return _cached(("exit_method_perf", days, int(min_n)),
-                   lambda: _retry(lambda: compute_exit_method_perf(days=days, min_n=min_n), "exit_method_perf"))
+    return _cached(("exit_method_perf", days, int(min_n), session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_exit_method_perf(days=days, min_n=min_n,
+                                                                   session=session, direction=direction),
+                                  "exit_method_perf"))
 
 
-def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
+def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10,
+                            session: Optional[str] = None,
+                            direction: Optional[str] = None) -> pd.DataFrame:
     """Simulated exit-method performance over ALL scored tickers — every ticker in
     the signals panel treated as a hypothetical position held in its aggregate
     direction. The large-sample, selection-bias-free counterpart to
     ``exit_method_perf``; covers the position-independent methods (aggregator +
     the signal-methods-as-exits). ``horizon`` / ``llm_review`` are held-only and
-    not present here. Cached (the OHLCV join is heavy); run-based."""
+    not present here. ``session`` filters by signal-generation session;
+    ``direction`` by the hypothetical position's side. Cached (the OHLCV join is
+    heavy)."""
     from src.analysis.exit_panel import compute_shadow_exit_method_perf
-    return _cached(("shadow_exit_method_perf", days, int(min_n)),
-                   lambda: _retry(lambda: compute_shadow_exit_method_perf(days=days, min_n=min_n),
+    return _cached(("shadow_exit_method_perf", days, int(min_n), session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_shadow_exit_method_perf(days=days, min_n=min_n,
+                                                                          session=session, direction=direction),
                                   "shadow_exit_method_perf"))
 
 
-def exit_reason_breakdown() -> list:
+def exit_reason_breakdown(session: Optional[str] = None,
+                          direction: Optional[str] = None) -> list:
     """Per-exit-reason realized performance over CLOSED trades (trades / win_rate /
     avg / median / compound / best / worst) — the realized outcome of each exit
-    RULE. Cheap; not windowed."""
+    RULE. ``session`` filters by the session the trade EXITED in (the rule's
+    firing moment); ``direction`` by the position's side. Cheap; not windowed."""
     from src.performance.tracker import compute_exit_reason_perf
-    return _retry(lambda: compute_exit_reason_perf(), "exit_reason_breakdown")
+    return _retry(lambda: compute_exit_reason_perf(session=session, direction=direction),
+                  "exit_reason_breakdown")
 
 
 def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None,

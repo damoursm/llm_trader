@@ -77,6 +77,29 @@ def _dir_sign_of(direction) -> int:
     return 1 if ("BULL" in d or d in ("BUY", "LONG")) else -1
 
 
+def extract_activation_events(df: pd.DataFrame, group_cols, ts_col: str,
+                              epoch_col: Optional[str] = None) -> pd.DataFrame:
+    """Reduce per-tick hold-conviction rows to ACTIVATION EVENTS — the tick where
+    an exit method first turned against the position (score crossed into
+    negative territory: no previous tick, previous ≥ 0, or a new position epoch
+    — e.g. the shadow book's aggregate direction flipped). A method that keeps
+    saying "exit" tick after tick fired ONCE; counting every tick both
+    pseudo-replicated the sample and made per-session counts sum past "All
+    sessions". Events are unique moments, so sessions partition them exactly.
+    ``group_cols`` identifies one position × method series (held book:
+    position_id+method; shadow book: ticker+method)."""
+    if df is None or df.empty:
+        return df
+    df = df.sort_values(ts_col).copy()
+    g = df.groupby(list(group_cols), sort=False)
+    prev_score = g["score"].shift()
+    new_epoch = pd.Series(False, index=df.index)
+    if epoch_col is not None and epoch_col in df.columns:
+        new_epoch = g[epoch_col].shift().ne(df[epoch_col]) & g[epoch_col].shift().notna()
+    is_activation = (df["score"] < 0) & (prev_score.isna() | (prev_score >= 0) | new_epoch)
+    return df[is_activation]
+
+
 # ── core computation ───────────────────────────────────────────────────────
 
 def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
@@ -119,9 +142,16 @@ def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
 def _perf_rows(acc: Dict[str, Dict[str, dict]], views: Dict[str, int],
                min_n: int, min_per_day: int, min_days: int) -> List[dict]:
     """Turn the accumulator into per-method rows (same schema as
-    ``simulated_trades.compute_method_perf``: n/win/ret/ic/icstd/icir per horizon)."""
+    ``simulated_trades.compute_method_perf``: n/win/ret/ic/icstd/icir per horizon).
+
+    Rows come from the ``views`` keys, NOT only the accumulator: a method whose
+    only events are too recent to have ANY forward return yet must still render
+    (views > 0, every n = 0) — otherwise a session filter that isolates such an
+    event silently drops the whole row and the per-session trade counts no
+    longer sum to the All-sessions view."""
     rows: List[dict] = []
-    for method, by_h in acc.items():
+    for method in dict.fromkeys(list(views) + list(acc)):
+        by_h = acc.get(method) or {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS}
         rec: dict = {"method": method, "category": exit_category_for(method),
                      "views": int(views.get(method, 0))}
         for lbl in HORIZON_LABELS:
@@ -153,12 +183,18 @@ def _perf_rows(acc: Dict[str, Dict[str, dict]], views: Dict[str, int],
 
 def compute_llm_review_perf_from_reviews(days: Optional[int] = None, min_n: int = MIN_N,
                                          min_per_day: int = 5, min_days: int = 3,
-                                         review_df: Optional[pd.DataFrame] = None) -> Optional[dict]:
+                                         review_df: Optional[pd.DataFrame] = None,
+                                         session: Optional[str] = None,
+                                         direction: Optional[str] = None) -> Optional[dict]:
     """The ``llm_review`` row (the synthesized decider) from the ``trade_reviews``
     table: hold-conviction = ``+confidence`` when the review reaffirms the entry
-    action, ``−confidence`` when it flips (HOLD/WATCH skipped), joined to the
-    position's direction-oriented forward return. Returns one row dict (same schema
-    as ``compute_exit_method_perf``) or ``None`` when there is nothing usable."""
+    action, ``−confidence`` when it flips (HOLD/WATCH skipped), reduced to
+    ACTIVATION EVENTS — the review tick where the engine first turned against the
+    position — joined to the position's direction-oriented forward return.
+    Returns one row dict (same schema as ``compute_exit_method_perf``) or ``None``
+    when there is nothing usable. ``session`` filters by the session the
+    activation FIRED in; ``direction`` (long|short) by the position's side —
+    both applied after event extraction, so sessions partition the events."""
     df = review_df if review_df is not None else _load_trade_reviews(days)
     if df is None or getattr(df, "empty", True):
         return None
@@ -178,11 +214,19 @@ def compute_llm_review_perf_from_reviews(days: Optional[int] = None, min_n: int 
             continue
         recs.append({"ticker": getattr(r, "ticker"), "method": "llm_review", "score": score,
                      "sigd": sigd, "ts": str(getattr(r, "reviewed_at")),
+                     "position_id": getattr(r, "position_id", None) or getattr(r, "ticker"),
                      "dir_sign": 1 if ea == "BUY" else -1})
     if not recs:
         return None
-    rdf = pd.DataFrame(recs).sort_values("ts").groupby(
-        ["sigd", "ticker"], as_index=False).tail(1)
+    rdf = extract_activation_events(pd.DataFrame(recs), ("position_id",), "ts")
+    if session and not rdf.empty:
+        from src.analysis.signal_panel import session_filter_mask
+        rdf = rdf[session_filter_mask(rdf["ts"], session)]
+    if direction and not rdf.empty:
+        want = 1 if str(direction).lower() in ("long", "buy") else -1
+        rdf = rdf[rdf["dir_sign"] == want]
+    if rdf.empty:
+        return None
     acc = _accumulate(rdf)
     rows = _perf_rows(acc, {"llm_review": int(len(rdf))}, min_n, min_per_day, min_days)
     return rows[0] if rows else None
@@ -191,20 +235,36 @@ def compute_llm_review_perf_from_reviews(days: Optional[int] = None, min_n: int 
 def compute_exit_method_perf(days: Optional[int] = None, min_n: int = MIN_N,
                              min_per_day: int = 5, min_days: int = 3,
                              exit_df: Optional[pd.DataFrame] = None,
-                             review_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                             review_df: Optional[pd.DataFrame] = None,
+                             session: Optional[str] = None,
+                             direction: Optional[str] = None) -> pd.DataFrame:
     """Per exit-method win rate / signed return / IC / IC-std / ICIR per horizon.
 
     All methods come from the ``exit_signals`` panel except ``llm_review`` (the
     synthesized decider), which is taken from ``trade_reviews`` — same derivation,
     but with the history that panel lacks on day one. Dedupes to one row per
-    (signal_date, ticker, position_id, method). Empty until forward returns exist."""
+    (signal_date, ticker, position_id, method). Empty until forward returns exist.
+
+    A row here is an ACTIVATION EVENT — the tick a method first turned against
+    the held position (``extract_activation_events``), per the exit rule
+    "evaluate every subsequent tick; when the method activates, it enters the
+    data in that tick's session". ``session`` restricts to activations that
+    fired in that US-market session (``rth|premarket|afterhours|overnight|
+    extended``); ``direction`` (``long|short``) to the held position's side.
+    Filters apply AFTER event extraction, so sessions partition the events
+    (All = Σ sessions)."""
     ex = exit_df if exit_df is not None else _load_exit_signals(days)
     rows: List[dict] = []
     if ex is not None and not ex.empty:
+        ex = extract_activation_events(ex, ("position_id", "method"), "reviewed_at")
+        if direction and not ex.empty and "entry_direction" in ex.columns:
+            want = 1 if str(direction).lower() in ("long", "buy") else -1
+            ex = ex[ex["entry_direction"].map(_dir_sign_of) == want]
+        if session and not ex.empty and "reviewed_at" in ex.columns:
+            from src.analysis.signal_panel import session_filter_mask
+            ex = ex[session_filter_mask(ex["reviewed_at"], session)]
+    if ex is not None and not ex.empty:
         ex = ex.copy()
-        ex = (ex.sort_values("reviewed_at")
-                .groupby(["signal_date", "ticker", "position_id", "method"],
-                         as_index=False).tail(1))
         ex["sigd"] = ex["signal_date"].map(date.fromisoformat)
         ex["dir_sign"] = ex["entry_direction"].map(_dir_sign_of)
         ex["ts"] = ex["reviewed_at"]
@@ -215,7 +275,8 @@ def compute_exit_method_perf(days: Optional[int] = None, min_n: int = MIN_N,
     out = pd.DataFrame(rows)
     # Replace the panel's llm_review row with the history-backed trade_reviews one.
     review_row = compute_llm_review_perf_from_reviews(days, min_n, min_per_day, min_days,
-                                                      review_df=review_df)
+                                                      review_df=review_df,
+                                                      session=session, direction=direction)
     if review_row is not None:
         if not out.empty:
             out = out[out["method"] != "llm_review"]
@@ -243,7 +304,9 @@ def shadow_exit_methods() -> tuple:
 
 def compute_shadow_exit_method_perf(days: Optional[int] = None, min_n: int = MIN_N,
                                     min_per_day: int = 5, min_days: int = 3,
-                                    signals_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                                    signals_df: Optional[pd.DataFrame] = None,
+                                    session: Optional[str] = None,
+                                    direction: Optional[str] = None) -> pd.DataFrame:
     """Simulate the position-independent exit methods over ALL scored tickers.
 
     Reads the ``signals`` panel, treats each ticker as a hypothetical position held
@@ -253,40 +316,46 @@ def compute_shadow_exit_method_perf(days: Optional[int] = None, min_n: int = MIN
     SAME engine as the held book. Deduped to the last run per (signal_date, ticker).
     The large-sample, selection-bias-free counterpart to ``compute_exit_method_perf``
     — but only for methods that don't need a real entry (``horizon`` / ``llm_review``
-    stay held-only)."""
-    from src.analysis.signal_panel import _load_signals
+    stay held-only).
+
+    A row here is an ACTIVATION EVENT: the run where a method's hold-conviction
+    for the ticker's hypothetical position first turned negative (per
+    ``extract_activation_events``; an aggregate-direction flip starts a new
+    position epoch). ``session`` restricts to activations that FIRED in that
+    US-market session; ``direction`` (``long|short``) to hypothetical positions
+    of that side (mirroring ``_dir_sign_of``). Filters apply after event
+    extraction, so sessions partition the events (All = Σ sessions)."""
+    from src.analysis.signal_panel import _load_signals, session_filter_mask
     df = signals_df if signals_df is not None else _load_signals(days)
     if df is None or getattr(df, "empty", True):
         return pd.DataFrame()
     df = df.copy()
-    if "generated_at" in df.columns:
-        df = (df.sort_values("generated_at")
-                .groupby(["signal_date", "ticker"], as_index=False).tail(1))
     # (method, source column) pairs whose column is actually present in the panel.
     pairs = [(m, "combined_score" if m == "aggregator" else m) for m in shadow_exit_methods()]
     pairs = [(m, c) for (m, c) in pairs if c in df.columns]
-    meta = ["signal_date", "ticker", "direction", "generated_at"]
-    cols = [c for c in dict.fromkeys(meta + [c for _, c in pairs]) if c in df.columns]
-    rows: List[dict] = []
-    for r in df[cols].itertuples(index=False):
-        dsign = _dir_sign_of(getattr(r, "direction", None))
-        try:
-            sigd = date.fromisoformat(getattr(r, "signal_date"))
-        except Exception:
-            continue
-        ts, tk = getattr(r, "generated_at", None), getattr(r, "ticker")
-        for m, col in pairs:
-            try:
-                raw = float(getattr(r, col))
-            except (TypeError, ValueError):
-                continue
-            if raw != raw or raw == 0.0:           # NaN or no-view → skip
-                continue
-            rows.append({"ticker": tk, "method": m, "score": raw * dsign,
-                         "sigd": sigd, "ts": ts, "dir_sign": dsign})
-    if not rows:
+    meta = [c for c in ("signal_date", "ticker", "direction", "generated_at") if c in df.columns]
+    value_cols = list(dict.fromkeys(c for _, c in pairs))
+    long = df[meta + value_cols].melt(id_vars=meta, var_name="col", value_name="raw")
+    long = long.dropna(subset=["raw"])
+    long = long[long["raw"] != 0.0]                      # no view → not scored
+    if long.empty:
         return pd.DataFrame()
-    ldf = pd.DataFrame(rows)
+    col2method = {c: m for m, c in pairs}
+    long["method"] = long["col"].map(col2method)
+    long["dir_sign"] = long["direction"].map(_dir_sign_of)
+    long["score"] = long["raw"].astype(float) * long["dir_sign"]
+    long["ts"] = long["generated_at"]
+    long = extract_activation_events(long, ("ticker", "method"), "ts", epoch_col="dir_sign")
+    if session and not long.empty:
+        long = long[session_filter_mask(long["ts"], session)]
+    if direction and not long.empty:
+        want = 1 if str(direction).lower() in ("long", "buy") else -1
+        long = long[long["dir_sign"] == want]
+    if long.empty:
+        return pd.DataFrame()
+    date_map = {d: date.fromisoformat(d) for d in long["signal_date"].unique()}
+    long["sigd"] = long["signal_date"].map(date_map)
+    ldf = long[["ticker", "method", "score", "sigd", "ts", "dir_sign"]]
     acc = _accumulate(ldf)
     out = pd.DataFrame(_perf_rows(acc, ldf.groupby("method").size().to_dict(),
                                  min_n, min_per_day, min_days))

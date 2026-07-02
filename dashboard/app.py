@@ -549,16 +549,23 @@ _SESSION_OPTIONS = [
 ]
 
 
-def _session_toggle(component_id: str) -> html.Div:
+_SESSION_TOGGLE_TITLE = (
+    "Filter to trades entered during Regular hours (09:30–16:00 ET), Pre-market "
+    "(04:00–09:30), After-hours / post-market (16:00–20:00), or Overnight "
+    "(20:00–04:00). The bot trades all four sessions (overnight on the Sun–Thu-night "
+    "venue calendar).")
+
+
+def _session_toggle(component_id: str, title: str = _SESSION_TOGGLE_TITLE) -> html.Div:
     """RTH / pre-market / after-hours / overnight selector. Filters the tab's
-    metrics and plots to trades ENTERED in that US-market session. Extended-hours
-    trading is live (Phase 1): the scheduler trades 04:00–20:00 ET, so RTH,
-    Pre-market and After-hours populate side by side for comparison. Pre-market
-    and After-hours are the two halves of the coarse 'extended' session."""
+    metrics and plots to that US-market session (what "session" means per tab is
+    stated in ``title`` — trades are filtered by ENTRY session, exit analyses by
+    the review/exit moment, panels by signal-generation time). Pre-market and
+    After-hours are the two halves of the coarse 'extended' session."""
     return html.Div(
         [
             html.Label("Session:  ",
-                       title="Filter to trades entered during Regular hours (09:30–16:00 ET), Pre-market (04:00–09:30), After-hours / post-market (16:00–20:00), or Overnight (20:00–04:00). The bot trades RTH and extended (pre-market + after-hours); Overnight entries only occur from manual off-schedule runs (snapped to the next session).",
+                       title=title,
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
             dcc.RadioItems(
                 id=component_id, options=_SESSION_OPTIONS, value="all", inline=True,
@@ -626,7 +633,7 @@ def _method_source_toggle(component_id: str) -> html.Div:
         [
             html.Label("Source:  ",
                        title="Ledger (gated trades): solo-method performance over only the trades the gates let through — apples-to-apples with the real book but a small, selection-biased sample. "
-                             "All scored tickers (simulated): treat every method's sign on EVERY scored ticker as a hypothetical solo trade, scored on GROSS forward returns at 30m/3h/6h/1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date); ignores Session/Direction.",
+                             "All scored tickers (simulated): one simulated trade per NEW directional call a method makes (the run it first called the direction — not one per run/day), scored on GROSS forward returns at 30m/3h/6h/1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date), Session (the session the ENTRY was decided in — sessions partition the trades, so All = their sum), and Direction (the side of the method's call — a positive score is its long call).",
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
             dcc.RadioItems(
                 id=component_id, options=_METHOD_SOURCE_OPTIONS, value="ledger", inline=True,
@@ -774,12 +781,14 @@ def _ic_section():
 
 
 _SIM_PERF_TOOLTIP = (
-    "Every method's implied BUY/SELL (sign of its score) on EVERY scored ticker each "
-    "run — the `simulated_trades` panel — scored on GROSS close-to-close forward "
-    "returns (no costs; the question is directional predictiveness, not net P&L). This "
-    "is the unbiased counterpart to the ledger solo table: it counts thousands of "
-    "observations instead of only the gate-selected trades that opened. 'Trades' = "
-    "total simulated solo trades for the method. Per horizon (30m/3h/6h/1d/3d/1w/2w/1m): "
+    "Each method's simulated solo ENTRIES — one trade per NEW directional call: the run "
+    "where the method first called the direction (its first view, a sign flip, or a "
+    "re-emerged call after a gap), NOT one per run/day, so a standing call isn't "
+    "pseudo-replicated and the Session buckets are a true partition (All sessions = the "
+    "sum of the four sessions). Scored on GROSS close-to-close forward returns from the "
+    "entry tick (no costs; the question is directional predictiveness, not net P&L). This "
+    "is the unbiased counterpart to the ledger solo table: every scored ticker counts, "
+    "not only the gate-selected trades that opened. 'Trades' = the method's entry events. Per horizon (30m/3h/6h/1d/3d/1w/2w/1m): "
     "'n@' = joint observations with a forward return, 'IC@' = Spearman rank correlation "
     "between the method's score and the forward return (ranking skill; a persistent "
     "positive IC is real edge, a persistent negative IC is sign-inverted), 'IC std@' / "
@@ -882,27 +891,40 @@ def _sim_perf_table(subset, labels, horizons, metrics):
     return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
 
 
-def _simulated_perf_section(window_days, sel_horizons=None, sel_metrics=None):
+def _simulated_perf_section(window_days, session=None, direction=None,
+                            sel_horizons=None, sel_metrics=None):
     """Per-method directional win rate + IC + gross return over ALL scored tickers
     (the simulated_trades panel), grouped by the same IC categories. The
-    horizons/metrics selections trim every category table's columns."""
+    horizons/metrics selections trim every category table's columns. ``session``
+    filters by signal-generation session; ``direction`` by the method's own call
+    side (a filter caption states any active filter so the basis is unambiguous)."""
     from src.performance.tracker import METHOD_LABELS
     from src.analysis.signal_panel import IC_CATEGORY_ORDER
     sel_horizons = sel_horizons or list(_SIM_HORIZONS)
     sel_metrics = sel_metrics or list(_SIM_METRIC_ORDER)
-    df = data.simulated_method_perf(days=window_days)
+    df = data.simulated_method_perf(days=window_days, session=session, direction=direction)
     heading = _h3("Simulated single-method performance — all scored tickers", _SIM_PERF_TOOLTIP)
+    filt_bits = []
+    if session:
+        filt_bits.append(f"session = {session} (signal-generation time)")
+    if direction:
+        filt_bits.append(f"direction = {direction} calls only")
+    filt_note = (html.Div("Filtered: " + " · ".join(filt_bits),
+                          style={"color": "#94a3b8", "fontSize": 12, "marginBottom": 8})
+                 if filt_bits else None)
     if df is None or getattr(df, "empty", True):
         return html.Div([
             heading,
-            html.Div("No simulated single-method trades with forward returns yet. They "
-                     "accrue every run; materialise existing history with "
+            *( [filt_note] if filt_note is not None else [] ),
+            html.Div("No simulated single-method trades with forward returns match "
+                     "this window/session/direction yet. They accrue every run; "
+                     "materialise existing history with "
                      "`python -m src.analysis.simulated_trades --backfill`.",
                      style={"color": "#6b7280"}),
         ])
     labels = dict(METHOD_LABELS)
     labels["combined_score"] = "All methods (combined)"
-    children = [heading]
+    children = [heading] + ([filt_note] if filt_note is not None else [])
     has_cat = "category" in df.columns
     for category in IC_CATEGORY_ORDER:
         subset = df[df["category"] == category] if has_cat else df
@@ -950,11 +972,12 @@ def _methods_tab():
 def _methods_body(window_value, session_value, direction_value, source_value,
                   sim_horizons, sim_metrics):
     if source_value == "panel":
-        # All scored tickers — run-based; honors the window (by signal date) and
-        # the Horizons/Metrics column pickers, ignores session/direction (the
-        # panel has no per-session split and the method's sign already IS its
-        # direction).
+        # All scored tickers — honors the window (by signal date), the session
+        # the signal was GENERATED in, the direction of the method's own call
+        # (positive score = its long call), and the Horizons/Metrics pickers.
         return _safe(lambda: _simulated_perf_section(_window_days(window_value),
+                                                     _session_value(session_value),
+                                                     _direction_value(direction_value),
                                                      sim_horizons, sim_metrics))
     return _safe(lambda: _methods_perf_section(_window_days(window_value), _session_value(session_value),
                                                _direction_value(direction_value)))
@@ -1108,33 +1131,36 @@ def _methods_perf_section(window_days, session=None, direction=None):
 # ── Tab: Exit Performance ──────────────────────────────────────────────────
 
 _EXIT_PERF_TOOLTIP = (
-    "Every held position, every tick, has its exit decision decomposed into signed "
-    "HOLD-CONVICTION scores (+ = the position should keep running, − = it should "
-    "reverse/exit) — the synthesized `llm_review` that actually decides, the macro / "
-    "horizon / aggregator overlays, and the entry signal methods re-scored as exit "
-    "signals — persisted to the `exit_signals` panel. Each is joined to the position's "
-    "DIRECTION-ORIENTED forward return (a short's forward return is negated), so a "
-    "persistently POSITIVE IC means the method correctly holds winners / exits losers. "
-    "Per horizon (30m…1m): 'n@' = joint observations, 'IC@' = Spearman correlation of the "
-    "hold-conviction vs the oriented forward return, 'IC std@' / 'ICIR@' = the IC's "
-    "reliability (stdev / information-ratio of the per-day IC; |ICIR| ≳ 0.5 stable, ≈ 0 "
-    "noise — needs several days), 'Win@ %' = share of ticks the method's sign matched the "
-    "position's forward move, 'Ret@ %' = mean signed forward return. The synthesized "
-    "`llm_review` row is history-backed from `trade_reviews`; the decomposed methods accrue "
-    "as the panel fills. Forward-collected — judge nothing on a thin n. Later, these weight "
-    "an exit combined score.")
+    "Every held position is re-scored each tick with signed HOLD-CONVICTION per exit "
+    "method (+ = keep running, − = reverse/exit) — the `exit_signals` panel. The table "
+    "shows each method's ACTIVATION EVENTS: the tick the method first turned against the "
+    "position (its conviction crossed into negative — 'the exit fired'), attributed to "
+    "that tick's session, so a method repeating 'exit' for days counts once and the "
+    "Session buckets are a true partition (All sessions = the sum of the four). Each "
+    "activation is joined to the position's DIRECTION-ORIENTED forward return from that "
+    "tick (a short's forward return is negated) and scored in the direction the method "
+    "CALLED (sign(score)×forward), so the usual reading holds: 'Win@ %' > 50 = after the "
+    "method said get out, the position usually DID move adversely (the exit was right; "
+    "below 50 = it fires too early), 'Ret@ %' positive = the average post-activation move "
+    "vindicated the exit, 'IC@' positive = deeper exit-conviction ⇒ more adverse "
+    "subsequent move. Per horizon (30m…1m): 'n@' = activations with a forward return, "
+    "'IC std@' / 'ICIR@' = the IC's reliability (per-day; needs several days). The "
+    "synthesized `llm_review` row is history-backed from `trade_reviews`; the rest "
+    "accrue as the panel fills. Forward-collected — judge nothing on a thin n.")
 
 _EXIT_SHADOW_TOOLTIP = (
     "The SIMULATED exit book: every scored ticker (the signals panel) treated as a hypothetical "
     "position held in its own aggregate direction, with each position-independent exit method scored "
-    "as a signed hold-conviction (method score × the ticker's direction; aggregator = combined_score) "
-    "and joined to the direction-oriented forward return — the SAME IC/win/ret engine as the held book, "
-    "but over the WHOLE UNIVERSE instead of only the gate-selected positions we actually held. This "
-    "escapes the held book's tiny, selection-biased sample and backfills instantly from months of stored "
-    "signals. A positive IC = conditional on holding in the aggregate direction, the method predicts "
-    "continuation. Only the position-INDEPENDENT methods appear here (aggregator + the signal-methods-as-"
-    "exits); `horizon` and the synthesized `llm_review` need a real entry, so they exist ONLY in the Held "
-    "view. Where shadow-IC and held-IC agree, the signal is trustworthy for weighting an exit combined score.")
+    "as a signed hold-conviction (method score × the ticker's direction; aggregator = combined_score). "
+    "Shown as ACTIVATION EVENTS — the run where the method's conviction first crossed negative for "
+    "that hypothetical position (a direction flip starts a new position), attributed to that run's "
+    "session, so the Session buckets are a true partition (All sessions = the sum of the four). Each "
+    "activation joins the direction-oriented forward return through the SAME engine as the held book, "
+    "but over the WHOLE UNIVERSE instead of only the gate-selected positions we actually held — "
+    "escaping the held book's tiny, selection-biased sample. Read like the held table: Win% > 50 / "
+    "positive Ret / positive IC = the method's exit calls were vindicated by the subsequent move. "
+    "Only the position-INDEPENDENT methods appear here (aggregator + the signal-methods-as-exits); "
+    "`horizon` and the synthesized `llm_review` need a real entry, so they exist ONLY in the Held view.")
 
 
 # ── Exit-perf source toggle (real held book vs simulated universe shadow) ────
@@ -1152,8 +1178,8 @@ def _exit_source_toggle(component_id: str) -> html.Div:
     return html.Div(
         [
             html.Label("Source:  ",
-                       title="Held positions (ledger): the exit methods scored on the positions we ACTUALLY held each tick — the real book (small, selection-biased), and the ONLY view with horizon + the synthesized llm_review. "
-                             "All scored tickers (simulated): treat EVERY scored ticker as a hypothetical position held in its aggregate direction and score the position-independent exit methods (aggregator + the signal-methods-as-exits) over the whole universe — thousands of observations, backfilled from the signals panel. horizon / llm_review are held-only and don't appear here.",
+                       title="Held positions (ledger): each exit method's ACTIVATIONS against the positions we ACTUALLY held — the tick it first said 'get out' (conviction crossed negative), attributed to that tick's session. The real book (small, selection-biased), and the ONLY view with horizon + the synthesized llm_review. "
+                             "All scored tickers (simulated): the same activation events over EVERY scored ticker treated as a hypothetical position held in its aggregate direction (aggregator + the signal-methods-as-exits) — the large, unbiased sample backfilled from the signals panel. horizon / llm_review are held-only and don't appear here.",
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
             dcc.RadioItems(
                 id=component_id, options=_EXIT_SOURCE_OPTIONS, value="held", inline=True,
@@ -1166,33 +1192,43 @@ def _exit_source_toggle(component_id: str) -> html.Div:
     )
 
 
-def _exit_perf_section(window_days, source="held", sel_horizons=None, sel_metrics=None):
+def _exit_perf_section(window_days, source="held", sel_horizons=None, sel_metrics=None,
+                       session=None, direction=None):
     """Per-exit-method IC / win / ret, grouped by the two exit categories. ``source``
     picks the evidence base: 'held' = the real exit_signals + trade_reviews book;
-    'shadow' = the simulated universe (all scored tickers). A caption states which is
-    shown so the source is never ambiguous. Reuses the simulated-perf table renderer."""
+    'shadow' = the simulated universe (all scored tickers). ``session`` filters by
+    the session the review happened in (the exit decision's firing moment);
+    ``direction`` by the (hypothetical) position's side. A caption states which
+    basis + filters are shown so the view is never ambiguous. Reuses the
+    simulated-perf table renderer."""
     from src.performance.tracker import METHOD_LABELS
     from src.analysis.exit_methods import EXIT_CATEGORY_ORDER, EXIT_METHOD_LABELS
     sel_horizons = sel_horizons or list(_SIM_HORIZONS)
     sel_metrics = sel_metrics or list(_SIM_METRIC_ORDER)
     shadow = (source == "shadow")
     if shadow:
-        df = data.shadow_exit_method_perf(days=window_days)
+        df = data.shadow_exit_method_perf(days=window_days, session=session, direction=direction)
         heading = _h3("Exit-method performance — ALL scored tickers (simulated shadow book)",
                       _EXIT_SHADOW_TOOLTIP)
         caption = ("Source: SIMULATED — every scored ticker as a hypothetical position held in its "
                    "aggregate direction, over the whole universe (backfilled from the signals panel). "
                    "Position-independent methods only; horizon + llm_review are held-only and not shown here.")
-        empty_msg = ("No simulated exit returns yet — the signals panel needs forward-return history "
+        empty_msg = ("No simulated exit returns match this window/session/direction yet — the signals "
+                     "panel needs forward-return history "
                      "(warm it with `python -m src.analysis.signal_panel --refresh`).")
     else:
-        df = data.exit_method_perf(days=window_days)
+        df = data.exit_method_perf(days=window_days, session=session, direction=direction)
         heading = _h3("Exit-method performance — HELD positions (ledger)", _EXIT_PERF_TOOLTIP)
         caption = ("Source: HELD (ledger) — the exit methods scored on the positions we ACTUALLY held "
                    "each tick. The only view with horizon + the synthesized llm_review; small + "
                    "selection-biased. Switch Source to 'All scored tickers' for the large simulated sample.")
-        empty_msg = ("No exit-method forward returns yet. The synthesized hold-review row populates "
-                     "from `trade_reviews`; the decomposed methods accrue once positions are held.")
+        empty_msg = ("No exit-method forward returns match this window/session/direction yet. The "
+                     "synthesized hold-review row populates from `trade_reviews`; the decomposed "
+                     "methods accrue once positions are held.")
+    if session:
+        caption += f" — Session filter: {session} (review moment)."
+    if direction:
+        caption += f" — Direction filter: {direction} positions only."
     cap = html.Div(caption, style={"color": "#94a3b8", "fontSize": 12, "marginBottom": 8})
     if df is None or getattr(df, "empty", True):
         return html.Div([heading, cap, html.Div(empty_msg, style={"color": "#6b7280"})])
@@ -1212,12 +1248,15 @@ def _exit_perf_section(window_days, source="held", sel_horizons=None, sel_metric
     return html.Div(children)
 
 
-def _exit_reason_block():
+def _exit_reason_block(session=None, direction=None):
     """Realized outcome per exit RULE (exit_reason) over closed trades — the
-    concrete, ledger-based companion to the forward-looking IC table above."""
-    rows = data.exit_reason_breakdown()
+    concrete, ledger-based companion to the forward-looking IC table above.
+    ``session`` filters by the session the trade EXITED in; ``direction`` by
+    the position's side."""
+    rows = data.exit_reason_breakdown(session=session, direction=direction)
     if not rows:
-        return html.Div("No closed trades yet.", style={"color": "#6b7280"})
+        return html.Div("No closed trades match this session/direction yet.",
+                        style={"color": "#6b7280"})
     data_rows = [{
         "reason": r["exit_reason"], "trades": r["trades"], "win": r["win_rate"],
         "avg": r["avg_return"], "median": r.get("median_return"),
@@ -1236,29 +1275,48 @@ def _exit_reason_block():
     return dash_table.DataTable(data=data_rows, columns=cols, **_TABLE_KW)
 
 
+_EXIT_SESSION_TITLE = (
+    "Filter the exit analyses to a US-market session — Regular hours (09:30–16:00 ET), "
+    "Pre-market (04:00–09:30), After-hours (16:00–20:00), or Overnight (20:00–04:00). "
+    "For the exit-method tables this is the session the REVIEW happened in (the moment "
+    "the exit decision would fire); for the exit-reason table below it is the session "
+    "the trade actually EXITED in.")
+
+
 def _exit_perf_tab():
     return html.Div([
         _window_toggle("exit-window"),
+        _session_toggle("exit-session", title=_EXIT_SESSION_TITLE),
+        _direction_toggle("exit-direction"),
         _exit_source_toggle("exit-source"),
         _sim_column_filters("exit-horizons", "exit-metrics"),
         dcc.Loading(html.Div(id="exit-body")),
+    ])
+
+
+@app.callback(Output("exit-body", "children"),
+              Input("exit-window", "value"), Input("exit-session", "value"),
+              Input("exit-direction", "value"), Input("exit-source", "value"),
+              Input("exit-horizons", "value"), Input("exit-metrics", "value"))
+def _exit_body(window_value, session_value, direction_value, source_value,
+               sim_horizons, sim_metrics):
+    session = _session_value(session_value)
+    direction = _direction_value(direction_value)
+    return html.Div([
+        _safe(lambda: _exit_perf_section(_window_days(window_value), source_value,
+                                         sim_horizons, sim_metrics,
+                                         session=session, direction=direction)),
         _h3("Exit-reason outcomes — realized P&L by exit rule (closed ledger trades)",
             "For every CLOSED trade, the realized return grouped by the exit_reason that "
             "fired (llm_signal_flipped / llm_confidence_loss / horizon_expired / "
             "macro_regime_exit / the aggregator backstops / intraday_reversal). Always the "
             "real ledger (independent of the Source toggle above) — the concrete realized "
-            "outcome of each exit rule, companion to the forward-looking IC table. Open "
-            "trades excluded (no exit yet)."),
-        _safe(_exit_reason_block),
+            "outcome of each exit rule, companion to the forward-looking IC table. Honors "
+            "the Session (session the trade EXITED in) and Direction toggles; the Window "
+            "toggle does not apply (closed trades are few). Open trades excluded (no exit "
+            "yet)."),
+        _safe(lambda: _exit_reason_block(session=session, direction=direction)),
     ])
-
-
-@app.callback(Output("exit-body", "children"),
-              Input("exit-window", "value"), Input("exit-source", "value"),
-              Input("exit-horizons", "value"), Input("exit-metrics", "value"))
-def _exit_body(window_value, source_value, sim_horizons, sim_metrics):
-    return _safe(lambda: _exit_perf_section(_window_days(window_value), source_value,
-                                            sim_horizons, sim_metrics))
 
 
 # ── Tab 3: Returns ─────────────────────────────────────────────────────────

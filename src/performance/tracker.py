@@ -1611,7 +1611,22 @@ def compute_hold_prompt_eval(trades: Optional[List[dict]] = None) -> dict:
     return {"on": _seg(True), "off": _seg(False)}
 
 
-def compute_exit_reason_perf() -> List[dict]:
+def _exit_session_matches(trade: dict, session: Optional[str]) -> bool:
+    """Session-filter predicate on the session a trade EXITED in (the moment the
+    exit rule fired) — the exit-side mirror of ``_session_matches``. Understands
+    the fine dashboard values (``rth|premarket|afterhours|overnight``) plus the
+    coarse ``extended``. Derived from ``exit_datetime`` (legacy date-only rows
+    classify as rth, matching the entry-side convention). ``None`` → matches."""
+    if not session:
+        return True
+    fine = _session_of_iso_fine(trade.get("exit_datetime"))
+    if session == "extended":
+        return fine in ("premarket", "afterhours")
+    return fine == session
+
+
+def compute_exit_reason_perf(session: Optional[str] = None,
+                             direction: Optional[str] = None) -> List[dict]:
     """Per exit-reason performance over CLOSED trades — one row per ``exit_reason``
     with the standard segment stats (trades / win_rate / avg / median / compound /
     best / worst via ``_compute_segment_stats``). Groups by the reason stamped when
@@ -1619,8 +1634,16 @@ def compute_exit_reason_perf() -> List[dict]:
     ``horizon_expired``, ``macro_regime_exit``, ``signal_flipped``, ``signal_decay``,
     ``confidence_loss``, ``intraday_reversal`` …). This is the realized outcome of
     each exit RULE — the day-one companion to the forward-looking exit-method IC
-    table (both live in the Exit Performance tab). Sorted by trade count desc."""
+    table (both live in the Exit Performance tab). Sorted by trade count desc.
+
+    ``session`` filters by the session the trade EXITED in (the rule's firing
+    moment — ``_exit_session_matches``, unlike the entry-side filters elsewhere);
+    ``direction`` (``long|short``) by the position's side."""
     closed = [t for t in _load_trades() if t.get("status") == "CLOSED"]
+    if session:
+        closed = [t for t in closed if _exit_session_matches(t, session)]
+    if direction:
+        closed = [t for t in closed if _match_direction(t, direction)]
     by_reason: Dict[str, List[dict]] = {}
     for t in closed:
         by_reason.setdefault(t.get("exit_reason") or "(unspecified)", []).append(t)
