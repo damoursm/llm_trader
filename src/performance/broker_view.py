@@ -152,17 +152,32 @@ def avg_one_way_cost_pct_from_legs(legs: List[dict]) -> Optional[float]:
 def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[float] = None) -> dict:
     """Headline numbers for the dashboard's IBKR view.
 
+    ``win_rate`` / ``avg_return`` / ``median_return`` are OPEN-INCLUSIVE — every
+    trade counts, with an OPEN position's live-mark ``return_pct`` (already
+    computed by ``build_broker_trades``) treated as a hypothetical exit. This
+    mirrors the Simulated view's ``tracker._compute_segment_stats`` exactly, so
+    the two sides of the dashboard's Simulated⇄IBKR toggle share the same
+    trade-count denominator and differ ONLY in cost basis (modeled vs real
+    fills) — the toggle's actual purpose. Before this they didn't: a 7-day
+    window with 2 winners out of 7 CLOSED trades (28.6%) sat next to 8 winning
+    OPEN positions excluded from the ratio entirely, while the trade tables on
+    the same page told a 10-win/23-trade (43.5%) story a user counting by hand
+    would reach (observed 2026-07-02).
+
     Dollar P&L is the primary lens, but ``weighted_return`` is the precise total
     % — each CLOSED round-trip weighted by its REAL filled notional, so sizing
     counts (the equal-weighted ``avg_return`` is kept alongside for comparison).
+    ``weighted_return`` stays CLOSED-only deliberately (unlike the three above):
+    an open position's filled notional is capital still AT RISK, not yet a
+    realized dollar outcome to weight into a total-return figure.
     When ``account_equity_usd`` (the IBKR account NAV, in USD) is supplied,
     ``account_return_pct`` expresses cumulative P&L over the real account size —
     the account-relative impact, using more of the IBKR account data than fills
     alone."""
     closed = [b for b in btrades if b["status"] == "CLOSED"]
     open_ = [b for b in btrades if b["status"] == "OPEN"]
-    wins = [b for b in closed if (b.get("return_pct") or 0.0) > 0]
-    rets = [float(b["return_pct"]) for b in closed if b.get("return_pct") is not None]
+    all_rets = [float(b["return_pct"]) for b in btrades if b.get("return_pct") is not None]
+    wins = [r for r in all_rets if r > 0]
     # Exit commissions only count once the exit actually filled — a stale
     # field on a cancelled/unfilled exit is not money spent.
     commissions = sum(
@@ -176,6 +191,7 @@ def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[fl
     # Notional-weighted return — weight each closed round-trip by its REAL filled
     # dollars, so a $9k winner doesn't count the same as a $900 scratch (the
     # equal-weighted avg_return hides sizing; this is the precise total %).
+    # Deliberately CLOSED-only — see the docstring.
     w_num = w_den = 0.0
     for b in closed:
         r = b.get("return_pct")
@@ -194,9 +210,9 @@ def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[fl
         "trades": len(btrades),
         "closed": len(closed),
         "open": len(open_),
-        "win_rate": round(100.0 * len(wins) / len(closed), 1) if closed else None,
-        "avg_return": round(sum(rets) / len(rets), 2) if rets else None,
-        "median_return": round(median(rets), 2) if rets else None,
+        "win_rate": round(100.0 * len(wins) / len(all_rets), 1) if all_rets else None,
+        "avg_return": round(sum(all_rets) / len(all_rets), 2) if all_rets else None,
+        "median_return": round(median(all_rets), 2) if all_rets else None,
         "weighted_return": weighted_return,
         "realized_pnl_usd": realized,
         "unrealized_pnl_usd": unrealized,

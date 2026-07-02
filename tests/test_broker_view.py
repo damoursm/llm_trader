@@ -91,6 +91,8 @@ def test_unfilled_entries_do_not_exist_in_real_view():
 
 
 def test_summary_dollar_pnl_and_win_rate():
+    # win/loss are CLOSED (realized); open_t is a genuinely still-held position
+    # marked at current_price (+5% gross → a winner on paper).
     win = _trade()                                     # +0.25/share × 9 − $2
     loss = _trade(ticker="TRUP", broker_fill_price=23.30, broker_exit_fill_price=23.20,
                   broker_fill_qty=32, broker_commission=1.0, broker_exit_commission=1.0)
@@ -99,10 +101,33 @@ def test_summary_dollar_pnl_and_win_rate():
                     current_price=10.50)
     s = summarize_broker_trades(build_broker_trades([win, loss, open_t]))
     assert s["trades"] == 3 and s["closed"] == 2 and s["open"] == 1
-    assert s["win_rate"] == pytest.approx(50.0)
+    # OPEN-INCLUSIVE (2026-07-02): win/avg/median count all 3 positions, the
+    # open one at its live-mark return_pct — matching the Simulated view's
+    # _compute_segment_stats convention, so win_rate is 2 winners / 3 total
+    # (win + open_t), NOT the old closed-only 1/2 = 50%.
+    assert s["win_rate"] == pytest.approx(100 * 2 / 3, abs=0.05)
+    assert s["avg_return"] == pytest.approx(1.4028, abs=0.01)
+    assert s["median_return"] == pytest.approx(0.0486, abs=0.01)
     assert s["realized_pnl_usd"] == pytest.approx((0.25 * 9 - 2.0) + (-0.10 * 32 - 2.0), abs=0.01)
     assert s["unrealized_pnl_usd"] == pytest.approx(0.50 * 70 - 1.0, abs=0.01)
     assert s["commissions_usd"] == pytest.approx(2.0 + 2.0 + 1.0)
+
+
+def test_win_rate_avg_median_are_open_inclusive():
+    """Isolates the fix: an all-OPEN, all-winning book must show a 100% win
+    rate (not None/0% from an empty 'closed' population)."""
+    a = _trade(ticker="AAA", broker_exit_fill_qty=0, broker_exit_fill_price=None,
+               broker_fill_price=10.0, broker_fill_qty=10, broker_commission=0.0,
+               current_price=11.0)                      # +10% open winner
+    b = _trade(ticker="BBB", broker_exit_fill_qty=0, broker_exit_fill_price=None,
+               broker_fill_price=20.0, broker_fill_qty=10, broker_commission=0.0,
+               current_price=22.0)                       # +10% open winner
+    s = summarize_broker_trades(build_broker_trades([a, b]))
+    assert s["closed"] == 0 and s["open"] == 2
+    assert s["win_rate"] == pytest.approx(100.0)
+    assert s["avg_return"] == pytest.approx(10.0, abs=1e-6)
+    assert s["median_return"] == pytest.approx(10.0, abs=1e-6)
+    assert s["weighted_return"] is None                  # still CLOSED-only, by design
 
 
 def _leg(side="BUY", filled_qty=10, model_price=100.0, fill_price=100.0, commission=1.0):
