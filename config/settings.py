@@ -681,6 +681,27 @@ class Settings(BaseSettings):
     # (ramp saturated) — and only when this is on. False = the matched exit is
     # purely a ramped conviction bar and never force-closes a neutral hold.
     horizon_expiry_flush_neutral: bool = True
+    # Fallback horizon label for positions with NO target_horizon (opened before
+    # horizon synthesis existed, or a run where it failed). Without it those
+    # positions have no time-stop at all: a persistent-neutral loser rides
+    # forever (observed 2026-07-01: the June-17 cohort at −20% with HOLD-0.09
+    # reviews). Must be a HORIZON_HOURS label ("1w" → flush at 2× = 14 days with
+    # the default ramp). Empty string disables the fallback (legacy behavior).
+    horizon_default_window: str = "1w"
+    # Re-entry cooldown: skip a new entry when a SAME ticker + SAME direction
+    # trade was closed within this many hours. Stops the close→reopen churn where
+    # a rule-based exit (horizon_expired / llm_confidence_loss) fires and the same
+    # tick's entry pass immediately reopens the position (observed 2026-06-29: HUM
+    # closed 11:38:30, reopened 11:38:31 — a pure round-trip cost). 0 disables.
+    # Opposite-direction entries (a genuine flip) are never blocked.
+    reentry_cooldown_hours: float = 4.0
+    # When the opener-pinned hold-review engine is unavailable (e.g. Anthropic
+    # credits exhausted — observed 2026-06-26→07-01: Claude-opened positions went
+    # unreviewed for days, leaving them with NO exit gate), re-judge the position
+    # with the OTHER provider instead of holding blind. The review row records the
+    # actual reviewing engine, so provenance stays honest. False = strict pinning
+    # (no review ⇒ hold, the original Fix #2 behavior).
+    hold_review_engine_fallback: bool = True
 
     # ── Direction-aware, market-neutral edge curve (SHADOW MODE) ───────────
     # A second edge curve that weights each method by its DIRECTION-CONDITIONAL,
@@ -1301,6 +1322,22 @@ class Settings(BaseSettings):
     # the same DuckDB. Set False to keep the modeled cost.
     sim_use_real_fill_costs: bool = True
     sim_real_fill_costs_min_legs: int = 10
+    # The flat real-fill override is measured from LIQUID LMT fills; applying it
+    # to instruments far outside that basis grossly understates their cost (a
+    # $0.05 warrant with a ~35%-wide book was being charged 8 bp — observed
+    # ARQQW 2026-07-01). Legs priced below this floor keep the modeled
+    # price-tiered half-spread + commission instead of the flat override.
+    sim_real_fill_min_price: float = 1.0
+    # ── Scheduler outage alerting ────────────────────────────────────────
+    # Email an alert when the poll loop discovers it slept through tick slots
+    # (machine suspended — observed 2026-06-30: a full trading day dark with 24
+    # open positions and no notification). Uses the normal SMTP settings; off
+    # when email is unconfigured.
+    scheduler_alert_email: bool = True
+    # After a missed slot, run ONE catch-up tick immediately when a trading
+    # session (RTH or extended) is still live — managing positions late beats
+    # not at all. The catch-up never emails the report.
+    scheduler_catchup_tick: bool = True
 
     @property
     def tracked_politicians_list(self) -> List[str]:

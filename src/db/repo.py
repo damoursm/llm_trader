@@ -94,11 +94,28 @@ def load_trades() -> List[dict]:
     return [json.loads(r[0]) for r in rows]
 
 
-def save_trades(trades: List[dict]) -> None:
-    """Full-replace the trades table (matches the old whole-file rewrite semantics)."""
+def save_trades(trades: List[dict], allow_shrink: bool = False) -> None:
+    """Full-replace the trades table (matches the old whole-file rewrite semantics).
+
+    Wipe guard: in production the ledger only ever GROWS (closed trades stay), so
+    a save that would drop more than half of an established table means the caller
+    loaded a truncated/empty list (e.g. a lost lock race returning ``[]``) — the
+    exact failure mode of the 2026-06-11 ledger wipe. Refuse it loudly instead of
+    silently destroying history; pass ``allow_shrink=True`` for deliberate
+    maintenance (manual cleanup, migrations)."""
     rows = [_trade_row(i, t) for i, t in enumerate(trades)]
     placeholders = ", ".join(["?"] * len(_TRADE_COLS))
     with connect() as conn:
+        if not allow_shrink:
+            existing = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            if existing >= 4 and len(rows) < existing / 2:
+                raise RuntimeError(
+                    f"save_trades refused: would shrink the ledger {existing} → "
+                    f"{len(rows)} rows. If this is deliberate maintenance, call "
+                    f"with allow_shrink=True; otherwise the caller loaded a "
+                    f"truncated ledger (lock race / partial read) and saving it "
+                    f"would wipe history."
+                )
         conn.execute("BEGIN TRANSACTION")
         conn.execute("DELETE FROM trades")
         if rows:

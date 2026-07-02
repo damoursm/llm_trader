@@ -190,10 +190,17 @@ def _one_side_cost(price: float, asset_type: str = "STOCK", session=None) -> flo
     the measured average all-in one-way cost from actual IBKR fills), it is
     returned flat for every leg INSTEAD of the model, so the simulation
     charges what execution actually costs. The override already blends the
-    real session/price mix, so it intentionally ignores ``price``/``session``.
+    real session/price mix, so it intentionally ignores ``price``/``session``
+    — EXCEPT for legs priced below ``sim_real_fill_min_price``: the fills the
+    override is measured from are liquid names, and charging that flat cost to
+    a sub-$1 instrument grossly understates its spread (a $0.054 warrant with
+    a ~35%-wide book was being charged 8 bp — ARQQW, 2026-07-01). Those legs
+    keep the modeled price-tiered cost.
     """
     if _REAL_COST_OVERRIDE is not None:
-        return _REAL_COST_OVERRIDE
+        min_px = float(settings.sim_real_fill_min_price)
+        if price is not None and price >= min_px:
+            return _REAL_COST_OVERRIDE
     return _dynamic_half_spread(price, asset_type, session) + _commission_fraction(price)
 
 

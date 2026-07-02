@@ -362,6 +362,15 @@ def method_coverage(days: int = 14) -> dict:
                    lambda: _retry(lambda: compute_method_coverage(load_signal_rows(days)), "method_coverage"))
 
 
+def dark_sources(days: int = 14) -> list:
+    """Historically-populated feeds whose recent successful fetches are ALL
+    empty (the 0%→100% went-dark Δ — e.g. quiver_congress 2026-06-29). Powers
+    the amber feed-darkness banner. Cached + retry."""
+    from src.analysis.data_quality import compute_dark_sources, load_source_rows
+    return _cached(("dark_sources", int(days)),
+                   lambda: _retry(lambda: compute_dark_sources(load_source_rows(days)), "dark_sources"))
+
+
 def latest_gate_diag() -> dict:
     """gate_diag JSON of the most recent run (carries the price-provenance
     verdict for the banner + Execution tab). ``{}`` when unavailable."""

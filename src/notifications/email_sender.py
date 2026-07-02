@@ -5397,6 +5397,30 @@ def _build_chart_pngs(
     return charts, overview_png, equity_png
 
 
+def send_alert(subject: str, body: str) -> bool:
+    """Send a small plain-text operational alert (scheduler outage, missed
+    slots, …) through the same SMTP settings as the report email. Fail-soft:
+    returns False when email is unconfigured or the send fails — an alert must
+    never take down the process it is alerting about."""
+    if not (settings.smtp_user and settings.smtp_password and settings.recipients_list):
+        logger.debug("[alert] email not configured — alert suppressed")
+        return False
+    try:
+        msg = MIMEText(body, "plain")
+        msg["Subject"] = subject
+        msg["From"] = settings.smtp_user
+        msg["To"] = ", ".join(settings.recipients_list)
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
+            server.starttls()
+            server.login(settings.smtp_user, settings.smtp_password)
+            server.sendmail(settings.smtp_user, settings.recipients_list, msg.as_string())
+        logger.info(f"[alert] sent: {subject}")
+        return True
+    except Exception as e:
+        logger.error(f"[alert] failed to send ({subject}): {e}")
+        return False
+
+
 def send_recommendations(
     recommendations: List[Recommendation],
     total_analysed: int = 0,

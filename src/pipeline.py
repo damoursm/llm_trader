@@ -269,14 +269,23 @@ def _safe(label: str, fn, *args, **kwargs):
 def _persist_run(run_id, start, finished, all_tickers, recommendations, actionable,
                  gate_diag, market_mode_context, macro_regime_context,
                  confidence_threshold, allow_buys, signals_by_ticker,
-                 broker_report=None, snapshots=None) -> None:
+                 broker_report=None, snapshots=None,
+                 synthesis_meta=None, sentiment_summary=None) -> None:
     """Write the run, its per-source 'APIs used' record, every recommendation
     (with method attribution + the LLM provider that synthesised it), the
     broker reconcile report (per-order slippage/commission rows), and the FULL
-    per-ticker signal cross-section (the learning panel) to DuckDB."""
+    per-ticker signal cross-section (the learning panel) to DuckDB.
+
+    ``synthesis_meta`` / ``sentiment_summary`` MUST be the values captured right
+    after the MAIN synthesis: the opener-pinned hold-reviews call
+    ``generate_recommendations`` again before this persist runs and clobber the
+    process-global ``_LAST_SYNTHESIS_META`` / sentiment tallies, so re-reading
+    them here recorded whatever engine the LAST review used, not the engine that
+    produced the run's recommendations (observed 2026-07-01: a flash-thinking
+    run persisted as plain flash — the dashboard's per-LLM eval keyed on it)."""
     try:
         actionable_ids = {id(r) for r in actionable}
-        meta = get_last_synthesis_meta()
+        meta = synthesis_meta if synthesis_meta is not None else get_last_synthesis_meta()
         provider = meta.get("provider")
         # Per-rec attribution stores the EXACT engine id (legacy rows held only
         # the provider string) so the per-LLM evaluation never has to guess
@@ -327,7 +336,8 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
             "n_recommendations": len(recommendations),
             "n_actionable": len(actionable),
             "llm_synthesis_provider": provider,
-            "llm_sentiment_provider": get_sentiment_provider_summary(),
+            "llm_sentiment_provider": (sentiment_summary if sentiment_summary is not None
+                                       else get_sentiment_provider_summary()),
             "gate_diag": gate_diag,
         })
         sources = _collect_sources()
@@ -605,6 +615,14 @@ def _fetch_snapshots(all_tickers):
     return snapshots
 
 
+class _ReviewMap(dict):
+    """``{ticker: Recommendation}`` with an ``engines`` side-channel
+    (ticker → provider that actually judged it) so callers that only need the
+    reviews keep treating it as a plain dict, while ``_persist_trade_reviews``
+    can record which engine produced each row (pinned vs fallback)."""
+    engines: dict = {}
+
+
 def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
                         build_kwargs, synth_kwargs, session):
     """Fix #2 — opener-pinned, fresh-data hold-review (one entry per held position).
@@ -623,6 +641,14 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
 
     Off: the cheap fallback — reuse THIS run's recs, but only for positions whose
     opening engines BOTH match this run's engines (no extra LLM calls, no refetch).
+
+    Engine fallback (``hold_review_engine_fallback``): a combo whose pinned
+    synthesis engine produces nothing (e.g. Anthropic credits exhausted — observed
+    2026-06-26→07-01, which left every Claude-opened position ungoverned for days)
+    is re-judged once by the OTHER provider. Cross-engine confidence is not
+    apples-to-apples, but an available judge beats an absent one. The returned
+    mapping carries ``.engines`` (ticker → provider that actually judged it) so
+    ``_persist_trade_reviews`` records fallback reviews honestly.
     """
     from collections import defaultdict
 
@@ -665,18 +691,43 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
         logger.warning(f"[hold_review] fresh snapshot fetch failed ({e}) — proceeding without it")
         fresh_snaps = []
 
+    review_engines: dict = {}   # ticker → provider that actually judged it this tick
+
     def _review(item):
         (se, sy), tickers = item
-        try:
+
+        def _attempt(engine):
             sub = build_signals(tickers, fresh_articles, snapshots=fresh_snaps,
                                 session=session, force_sentiment_engine=se, **build_kwargs)
-            recs = generate_recommendations(sub, session=session, force_engine=sy, **synth_kwargs)
+            recs = generate_recommendations(sub, session=session, force_engine=engine, **synth_kwargs)
+            # force_engine returns [] on failure, so any non-empty result is from `engine`.
+            want = set(tickers)
+            return {r.ticker: r for r in (recs or []) if r.ticker in want}
+
+        out: dict = {}
+        engine_used = sy
+        try:
+            out = _attempt(sy)
         except Exception as e:
             logger.warning(f"[hold_review] combo (sent={se}, synth={sy}) failed: {e}")
-            return {}
-        # force_engine returns [] on failure, so any non-empty result is from `sy`.
-        want = set(tickers)
-        return {r.ticker: r for r in (recs or []) if r.ticker in want}
+        # Pinned engine unavailable → the OTHER provider re-judges rather than
+        # leaving the position with no exit gate this tick.
+        if not out and settings.hold_review_engine_fallback:
+            other = "deepseek" if sy == "anthropic" else "anthropic"
+            try:
+                out = _attempt(other)
+            except Exception as e:
+                logger.warning(f"[hold_review] fallback engine {other} failed too: {e}")
+                out = {}
+            if out:
+                engine_used = other
+                logger.warning(
+                    f"[hold_review] pinned engine {sy} produced no review — "
+                    f"{len(out)} position(s) re-judged by {other} (fallback)"
+                )
+        for tk in out:
+            review_engines[tk] = engine_used
+        return out
 
     reviews: dict = {}
     items = list(groups.items())
@@ -691,7 +742,9 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
         f"[hold_review] pinned: {len(reviews)}/{len(held)} held position(s) re-judged "
         f"by their opening engines across {len(items)} engine combo(s)"
     )
-    return reviews
+    out_map = _ReviewMap(reviews)
+    out_map.engines = dict(review_engines)
+    return out_map
 
 
 def _persist_trade_reviews(run_id, hold_reviews, open_trades):
@@ -704,16 +757,25 @@ def _persist_trade_reviews(run_id, hold_reviews, open_trades):
     if not hold_reviews:
         return
     by_ticker = {t["ticker"]: t for t in open_trades}
+    review_engines = getattr(hold_reviews, "engines", {}) or {}
     now = datetime.now(timezone.utc).isoformat()
     rows = []
     for ticker, rec in hold_reviews.items():
         t = by_ticker.get(ticker) or {}
         entry_conf = t.get("confidence")
+        # Normally the reviewing engine IS the opener (pinned), so the opener's
+        # exact model id is recorded. A fallback review (pinned engine down) is
+        # stamped with the provider that actually judged it, marked as such.
+        synth_stamp = t.get("llm_synthesis_model")
+        opener_prov = _provider_of_synth_model(synth_stamp)
+        reviewer = review_engines.get(ticker)
+        if reviewer and opener_prov in ("anthropic", "deepseek") and reviewer != opener_prov:
+            synth_stamp = f"{reviewer} (fallback)"
         rows.append({
             "run_id": run_id,
             "reviewed_at": now,
             "ticker": ticker,
-            "position_id": t.get("recommendation_id"),
+            "position_id": t.get("recommendation_id"),   # NOTE: recommendation_id, NOT trade_id
             "entry_datetime": t.get("entry_datetime"),
             "confidence": getattr(rec, "confidence", None),
             "action": getattr(rec, "action", None),
@@ -723,7 +785,7 @@ def _persist_trade_reviews(run_id, hold_reviews, open_trades):
             "entry_action": t.get("action"),
             "price": t.get("current_price"),
             "return_pct": t.get("return_pct"),
-            "synthesis_model": t.get("llm_synthesis_model"),
+            "synthesis_model": synth_stamp,
             "sentiment_model": t.get("llm_sentiment_model"),
         })
     try:
@@ -1385,6 +1447,36 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                 all_tickers = all_tickers + _peers
                 logger.info(f"[coint_peer] Injecting {len(_peers)} cointegration peer leg(s): {_peers}")
 
+    # ── Snapshot top-up for post-fetch discoveries ─────────────────────────
+    # The bulk snapshot fetch (Step 2) ran on the universe as of Step 1, but the
+    # expansions above (smart money, macro discovery, cointegration peers) can
+    # more than double it — those names were scored with NO snapshot price, so
+    # 2/3 of the signals panel had a NULL price anchor (observed 2026-07-01:
+    # 106 snapshotted vs 313 scored). Fetch the missing ones now so every scored
+    # ticker carries the same price context (ext_gap, prompt summaries,
+    # signals.price, provenance) as the original set, and merge the result back
+    # into the hourly snapshot cache so the next intra-hour tick reuses it.
+    if settings.enable_fetch_data:
+        _snapped = {s.ticker for s in snapshots}
+        _missing_snap = [t for t in all_tickers if t not in _snapped]
+        if _missing_snap:
+            try:
+                _extra_snaps = get_snapshots(_missing_snap)
+            except Exception as e:
+                logger.warning(f"[snapshots] top-up fetch failed ({e}) — "
+                               f"{len(_missing_snap)} discovered ticker(s) stay price-less")
+                _extra_snaps = []
+            if _extra_snaps:
+                snapshots = list(snapshots) + list(_extra_snaps)
+                logger.info(
+                    f"[snapshots] top-up: +{len(_extra_snaps)}/{len(_missing_snap)} "
+                    f"discovered ticker(s) snapshotted (universe total {len(snapshots)})"
+                )
+                try:
+                    save_snapshots(snapshots)
+                except Exception as e:
+                    logger.debug(f"[snapshots] top-up cache save failed: {e}")
+
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
     # Context kwargs shared by the main signal build AND the every-tick
@@ -1619,7 +1711,12 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # at Step 0, so each has a rec).
     _synth_meta = get_last_synthesis_meta()
     run_synthesis_provider = _synth_meta.get("provider")
-    run_sentiment_provider = _provider_of_synth_model(get_dominant_sentiment_model())
+    # Sentiment provenance snapshotted HERE too: the hold-reviews below re-score
+    # sentiment and re-run synthesis, mutating the process-global tallies — the
+    # run row / trade stamps must reflect the MAIN pass, not the last review.
+    _sent_model = get_dominant_sentiment_model()
+    _sent_summary = get_sentiment_provider_summary()
+    run_sentiment_provider = _provider_of_synth_model(_sent_model)
     _full_recs = list(recommendations)
 
     # Keep only the top 10 recommendations by conviction:
@@ -1792,7 +1889,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         trade_diag = record_new_trades(
             actionable, signals_by_ticker=signals_by_ticker, run_id=run_id,
             llm_synthesis_model=_synth_model,
-            llm_sentiment_model=get_dominant_sentiment_model(),
+            llm_sentiment_model=_sent_model,   # snapshotted before the hold-reviews
         ) or {}
 
         # Broker shadow execution (paper-first): once the internal ledger is final for
@@ -1812,6 +1909,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     gate_diag.update({
         "trade_considered":             int(trade_diag.get("considered", 0)),
         "trade_skipped_already_open":   int(trade_diag.get("skipped_already_open", 0)),
+        "trade_skipped_reentry_cooldown": int(trade_diag.get("skipped_reentry_cooldown", 0)),
         "trade_skipped_correlation_cap": int(trade_diag.get("skipped_correlation_cap", 0)),
         "trade_skipped_no_price":       int(trade_diag.get("skipped_no_price", 0)),
         "trade_haircut_applied":        int(trade_diag.get("haircut_applied", 0)),
@@ -1829,6 +1927,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f"trade entry: {gate_diag['trade_considered']} considered → "
         f"opened={gate_diag['trade_opened']} "
         f"(already_open={gate_diag['trade_skipped_already_open']}, "
+        f"reentry_cooldown={gate_diag['trade_skipped_reentry_cooldown']}, "
         f"corr_cap={gate_diag['trade_skipped_correlation_cap']}, "
         f"no_price={gate_diag['trade_skipped_no_price']}, "
         f"corr_haircut_applied={gate_diag['trade_haircut_applied']})"
@@ -1864,6 +1963,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         gate_diag, market_mode_context, macro_regime_context,
         _confidence_threshold, _allow_buys, signals_by_ticker,
         broker_report=broker_report, snapshots=snapshots,
+        synthesis_meta=_synth_meta, sentiment_summary=_sent_summary,
     )
 
     # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:

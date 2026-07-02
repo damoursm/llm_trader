@@ -91,6 +91,28 @@ def _health_banner():
                    "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
         ))
 
+    # Feeds that WENT DARK: historically-populated sources whose recent runs are
+    # all empty — invisible to the failed-sources banner (they return ok=true)
+    # and to any single run's status (event-driven feeds are often legitimately
+    # empty once). See data_quality.compute_dark_sources.
+    try:
+        dark = data.dark_sources()
+    except Exception as e:
+        logger.debug(f"[dashboard] dark-sources banner skipped: {e}")
+        dark = []
+    if dark:
+        items = [f"{d['source']} ({d['prior_empty_pct']:.0f}% → 100% empty over the "
+                 f"last {d['recent_empty']} fetches)" for d in dark]
+        blocks.append(html.Div(
+            [
+                html.B(f"📡 {len(dark)} data feed(s) went dark"),
+                html.Div(" · ".join(items) + " — see the Data Quality tab.",
+                         style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
+            ],
+            style={"background": "#fffbeb", "border": "1px solid #fcd34d", "color": "#92400e",
+                   "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
+        ))
+
     try:
         pp = (data.latest_gate_diag() or {}).get("price_provenance")
     except Exception as e:

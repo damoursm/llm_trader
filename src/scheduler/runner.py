@@ -43,7 +43,7 @@ from datetime import datetime, time as _time, timedelta
 from loguru import logger
 
 from config import settings
-from src.performance.market_calendar import is_market_day
+from src.performance.market_calendar import current_session, is_market_day
 from src.pipeline import run_pipeline
 from src.utils import now_et
 
@@ -203,6 +203,37 @@ def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
     return observe, send_email
 
 
+def _alert(subject: str, body: str) -> None:
+    """Operational alert email (fail-soft, gated by ``scheduler_alert_email``).
+    A suspended machine can't alert in the moment — these fire on wake, which is
+    still the difference between finding out at 19:10 and finding out never
+    (observed 2026-06-30: a full trading day dark, 24 open positions unmanaged,
+    no notification)."""
+    if not settings.scheduler_alert_email:
+        return
+    try:
+        from src.notifications.email_sender import send_alert
+        send_alert(subject, body)
+    except Exception as exc:
+        logger.warning(f"[scheduler] alert email failed: {exc}")
+
+
+def _missed_slots_between(start: datetime, end: datetime, slots: list[tuple[_time, str]],
+                          grace: int) -> list[datetime]:
+    """Market-day slot boundaries that fell inside ``(start, end - grace]`` —
+    the ticks a suspend/outage swallowed whole."""
+    out: list[datetime] = []
+    day = start.date()
+    while day <= end.date():
+        if is_market_day(day):
+            for t, _kind in slots:
+                slot_dt = datetime.combine(day, t)
+                if start < slot_dt <= end - timedelta(seconds=grace):
+                    out.append(slot_dt)
+        day += timedelta(days=1)
+    return out
+
+
 def _current_slot(now_naive: datetime, slots: list[tuple[_time, str]]) -> tuple[datetime, str] | None:
     """Latest ``(slot boundary, kind)`` at/before `now` on a market day, or None.
 
@@ -277,9 +308,41 @@ def start_scheduler() -> None:
     logger.info("Press Ctrl+C to stop.")
 
     last_run_slot: datetime | None = None
+    alerted_slots: set[datetime] = set()
+    prev_poll: datetime | None = None
     try:
         while True:
             now_naive = now_et().replace(tzinfo=None)
+
+            # Suspend/resume detector: a poll-to-poll wall-clock jump far beyond
+            # the cadence means the machine slept through the gap. Alert once per
+            # resume when trading slots were swallowed (the missed-slot branch
+            # below only sees the LATEST slot; the gap can hide a whole day).
+            if prev_poll is not None:
+                gap_s = (now_naive - prev_poll).total_seconds()
+                if gap_s > max(3 * poll, 300):
+                    missed = [m for m in _missed_slots_between(prev_poll, now_naive, slots, grace)
+                              if m != last_run_slot and m not in alerted_slots]
+                    logger.warning(
+                        f"[scheduler] wall clock jumped {gap_s / 60:.0f} min "
+                        f"(suspend/resume) — {len(missed)} tick slot(s) fell in the gap"
+                    )
+                    if missed:
+                        alerted_slots.update(missed)
+                        _alert(
+                            f"⚠️ LLM Trader scheduler: {len(missed)} tick(s) missed "
+                            f"(machine suspended ~{gap_s / 3600:.1f}h)",
+                            "The scheduler resumed after a wall-clock gap of "
+                            f"{gap_s / 60:.0f} minutes.\n\n"
+                            "Missed tick slots (ET): "
+                            f"{', '.join(m.strftime('%a %m-%d %H:%M') for m in missed)}\n\n"
+                            "Open positions were not marked or managed during the gap. "
+                            "A catch-up tick runs automatically if a trading session "
+                            "is still live; otherwise the next scheduled slot resumes "
+                            "normal operation. Keep the machine plugged in / awake."
+                        )
+            prev_poll = now_naive
+
             current = _current_slot(now_naive, slots)
 
             if current is not None and current[0] != last_run_slot:
@@ -310,6 +373,36 @@ def start_scheduler() -> None:
                         f"{lateness / 60:.1f} min (> {grace / 60:.0f} min grace) — skipping "
                         "(machine was suspended too long). Keep it plugged in / awake."
                     )
+                    if slot_dt not in alerted_slots:
+                        # Fresh-start case (the gap detector needs two polls to see a
+                        # jump): the scheduler came up and found the latest slot long
+                        # past — earlier slots today may have been missed too.
+                        alerted_slots.add(slot_dt)
+                        _alert(
+                            f"⚠️ LLM Trader scheduler: slot {slot_dt.strftime('%H:%M')} ET "
+                            f"missed by {lateness / 60:.0f} min",
+                            f"The scheduler found slot {slot_dt.strftime('%Y-%m-%d %H:%M')} ET "
+                            f"already {lateness / 60:.0f} minutes past on startup/resume — the "
+                            "machine was suspended or the scheduler was down. Earlier slots "
+                            "today may have been missed as well.\n\n"
+                            "Open positions were not marked or managed during the outage. "
+                            "A catch-up tick runs automatically if a trading session is "
+                            "still live."
+                        )
+                    # Catch-up: manage positions late rather than not at all — but
+                    # only while a session is live (marking stale overnight prices
+                    # would burn LLM calls for nothing).
+                    if settings.scheduler_catchup_tick and current_session() in ("rth", "extended"):
+                        observe, _ = _tick_plan(kind, slot_dt.time(), end_t)
+                        logger.info(
+                            f"[scheduler] CATCH-UP tick for missed "
+                            f"{slot_dt.strftime('%H:%M')} ET slot (email=False)"
+                        )
+                        try:
+                            run_pipeline(send_email=False, observe_only=observe,
+                                         email_if_configured=False)
+                        except Exception as exc:
+                            logger.exception(f"[scheduler] catch-up tick raised: {exc}")
                 last_run_slot = slot_dt  # mark even when skipped, so we don't retry this slot
 
             _time_module.sleep(poll)

@@ -240,6 +240,48 @@ def compute_source_reliability(df: pd.DataFrame) -> list:
     return out
 
 
+def compute_dark_sources(df: pd.DataFrame, recent_runs: int = 10,
+                         min_recent: int = 6, min_prior: int = 10,
+                         prior_max_empty_pct: float = 30.0) -> list:
+    """Sources that WENT DARK: historically populated feeds whose last
+    ``recent_runs`` successful fetches are ALL empty while their prior empty
+    rate was low. This is the Δ alarm the per-run status can't raise — an
+    event-driven source (``EXPECTED_SPARSE_SOURCES``) is legitimately empty on
+    any single run, but a 0%→100% flip over many runs means the feed died
+    (observed 2026-06-29: quiver_congress went 0% → 100% empty and nothing
+    surfaced it). Known-dead feeds are excluded (not actionable). Returns
+    ``[{source, prior_empty_pct, recent_empty, recent_runs}]`` sorted by how
+    populated the source used to be."""
+    if df is None or df.empty or "empty" not in df.columns:
+        return []
+    out = []
+    for source, g in df.groupby("source_label"):
+        source = str(source)
+        if source in KNOWN_DEAD_SOURCES:
+            continue
+        if "started_at" in g.columns:
+            g = g.sort_values("started_at")
+        oks = g[g["ok"].astype("boolean").fillna(False)]
+        known = oks[oks["empty"].notna()]
+        if len(known) < min_recent + min_prior:
+            continue
+        recent = known.tail(recent_runs)
+        prior = known.iloc[:-len(recent)]
+        if len(recent) < min_recent or len(prior) < min_prior:
+            continue
+        recent_empty = recent["empty"].astype(bool)
+        prior_empty_pct = 100.0 * prior["empty"].astype(bool).mean()
+        if recent_empty.all() and prior_empty_pct <= prior_max_empty_pct:
+            out.append({
+                "source":          source,
+                "prior_empty_pct": round(prior_empty_pct, 1),
+                "recent_empty":    int(len(recent)),
+                "recent_runs":     int(recent_runs),
+            })
+    out.sort(key=lambda r: r["prior_empty_pct"])
+    return out
+
+
 # ── Per-method coverage (from signals) ───────────────────────────────────────
 
 def compute_method_coverage(df: pd.DataFrame,

@@ -108,18 +108,23 @@ def _load_trades() -> List[dict]:
     cutover never loses history (even if the pipeline runs before
     ``python -m src.db.migrate``).
     """
-    try:
-        trades = _sanitize_trades(repo.load_trades())
-        if not trades and TRADES_FILE.exists():
+    # FAIL-CLOSED on DB errors: a transient lock/IO failure must ABORT the caller
+    # (connection.connect already retried with backoff), not masquerade as an
+    # empty ledger — returning [] here put every load→mutate→save cycle one step
+    # from a full wipe (observed lock race 2026-07-01 14:49; wipe class
+    # 2026-06-11). repo.save_trades' shrink guard is the second line of defense.
+    trades = _sanitize_trades(repo.load_trades())
+    if not trades and TRADES_FILE.exists():
+        try:
             legacy = _sanitize_trades(json.loads(TRADES_FILE.read_text(encoding="utf-8")))
-            if legacy:
-                repo.save_trades(legacy)
-                logger.info(f"[tracker] Seeded DuckDB from {TRADES_FILE} ({len(legacy)} trades)")
-                return legacy
-        return trades
-    except Exception as e:
-        logger.warning(f"[tracker] Could not load trades from DuckDB: {e}")
-        return []
+        except Exception as e:
+            logger.warning(f"[tracker] legacy {TRADES_FILE} unreadable ({e}) — starting from the empty DB")
+            return trades
+        if legacy:
+            repo.save_trades(legacy)
+            logger.info(f"[tracker] Seeded DuckDB from {TRADES_FILE} ({len(legacy)} trades)")
+            return legacy
+    return trades
 
 
 def _save_trades(trades: List[dict]) -> None:
@@ -666,7 +671,11 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
         bars = _bars(c["ticker"])
         if bars is None:
             continue
-        # Entry anchor: snapshot price recorded with the call, else that day's close.
+        # Entry anchor: snapshot price recorded with the call, else a close the
+        # caller could have KNOWN at call time — the same-day close only for a
+        # call generated after the RTH close, the PRIOR day's close otherwise
+        # (anchoring an intraday call at that day's 16:00 close is look-ahead:
+        # it erases the post-call drift from the engine's measured return).
         try:
             entry_price = float(c.get("snap_price"))
         except (TypeError, ValueError):
@@ -674,9 +683,14 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
         if entry_price is not None and not entry_price > 0:   # also catches NaN
             entry_price = None
         if entry_price is None:
-            day = [float(cl) for d, cl in zip(bars.index, bars["Close"])
-                   if d.date().isoformat() == c["entry_date"]]
-            entry_price = day[-1] if day and day[-1] > 0 else None
+            closes = [(d.date().isoformat(), float(cl))
+                      for d, cl in zip(bars.index, bars["Close"])]
+            if _generated_after_rth_close(c.get("entry_datetime")):
+                day = [cl for d, cl in closes if d == c["entry_date"]]
+                entry_price = day[-1] if day and day[-1] > 0 else None
+            if entry_price is None:
+                prior = [cl for d, cl in closes if d < c["entry_date"]]
+                entry_price = prior[-1] if prior and prior[-1] > 0 else None
         if entry_price is None:
             continue
         # End anchor: latest cached close (skip when no bar exists at/after entry yet).
@@ -1265,6 +1279,7 @@ def record_new_trades(
     diag = {
         "considered":           0,   # BUY/SELL recs received
         "skipped_already_open": 0,
+        "skipped_reentry_cooldown": 0,
         "skipped_correlation_cap": 0,
         "skipped_no_price":     0,
         "haircut_applied":      0,   # informational — size reduced, not skipped
@@ -1272,6 +1287,31 @@ def record_new_trades(
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
+
+    # Re-entry cooldown: the most recent exit instant per (ticker, action) among
+    # CLOSED trades. A rule-based exit (horizon_expired / llm_confidence_loss)
+    # firing while the entry side still likes the name produced close→reopen
+    # churn within the SAME tick (observed HUM 2026-06-29: closed 11:38:30,
+    # reopened 11:38:31 — a pure round-trip cost). Same direction only — an
+    # opposite-direction entry is a genuine flip and is never blocked.
+    cooldown_h = float(settings.reentry_cooldown_hours or 0.0)
+    recent_exits: Dict[tuple, datetime] = {}
+    if cooldown_h > 0:
+        for t in trades:
+            if t.get("status") != "CLOSED":
+                continue
+            raw = t.get("exit_datetime") or t.get("exit_date")
+            if not raw:
+                continue
+            try:
+                _dt = datetime.fromisoformat(str(raw))
+            except (ValueError, TypeError):
+                continue
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=ET)
+            key = (t.get("ticker"), t.get("action"))
+            if key not in recent_exits or _dt > recent_exits[key]:
+                recent_exits[key] = _dt
 
     new_count = 0
     for rec in recommendations:
@@ -1281,6 +1321,17 @@ def record_new_trades(
         if rec.ticker in already_open:
             diag["skipped_already_open"] += 1
             continue
+        if cooldown_h > 0:
+            prev_exit = recent_exits.get((rec.ticker, rec.action))
+            if prev_exit is not None:
+                age_h = (datetime.now(ET) - prev_exit.astimezone(ET)).total_seconds() / 3600.0
+                if 0 <= age_h < cooldown_h:
+                    diag["skipped_reentry_cooldown"] += 1
+                    logger.info(
+                        f"[tracker] Skipping {rec.ticker} {rec.action} — same-direction "
+                        f"position closed {age_h:.1f}h ago (< {cooldown_h:g}h re-entry cooldown)"
+                    )
+                    continue
 
         # ── Step 1: confidence tier (base size) ───────────────────────────
         conf_multiplier = _position_multiplier(rec.confidence)
@@ -1721,7 +1772,12 @@ def _horizon_expiry(trade: dict) -> Optional[dict]:
     units of the position's OWN horizon."""
     if not (settings.enable_horizon_synthesis and settings.enable_horizon_matched_exit):
         return None
-    target_h = trade.get("target_horizon")
+    # Positions without a target_horizon (opened before horizon synthesis, or a
+    # run where it failed) fall back to horizon_default_window so they still have
+    # a time-stop — without it a persistent-neutral loser rides forever (the
+    # HOLD/WATCH-never-closes rule has no counterweight). Empty setting = legacy
+    # behavior (no fallback, no time-stop).
+    target_h = trade.get("target_horizon") or (settings.horizon_default_window or "").strip()
     if not target_h:
         return None
     from src.signals.edge_curve import horizon_hours
@@ -3013,6 +3069,21 @@ def _session_of_iso_fine(raw) -> str:
 def _trade_session_fine(trade: dict) -> str:
     """Fine session (rth|premarket|afterhours|overnight) a trade was ENTERED in."""
     return _session_of_iso_fine(trade.get("entry_datetime"))
+
+
+def _generated_after_rth_close(raw) -> bool:
+    """True when an ISO timestamp falls at/after 16:00 ET on its own date — i.e.
+    that day's RTH close was already printed when the call was made, so the
+    same-day close is a legitimate (non-look-ahead) anchor for it. Unparseable
+    or date-only values return False (conservative → prior-day close)."""
+    if not raw or ("T" not in str(raw) and ":" not in str(raw)):
+        return False
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        dt = dt.astimezone(ET) if dt.tzinfo is not None else dt.replace(tzinfo=ET)
+    except Exception:
+        return False
+    return (dt.hour * 60 + dt.minute) >= 16 * 60
 
 
 def _session_matches(trade: dict, session: Optional[str]) -> bool:
