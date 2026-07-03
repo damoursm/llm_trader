@@ -1915,6 +1915,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "trade_skipped_correlation_cap": int(trade_diag.get("skipped_correlation_cap", 0)),
         "trade_skipped_no_price":       int(trade_diag.get("skipped_no_price", 0)),
         "trade_haircut_applied":        int(trade_diag.get("haircut_applied", 0)),
+        "trade_breadth_tier_applied":   int(trade_diag.get("breadth_tier_applied", 0)),
         "trade_opened":                 int(trade_diag.get("opened", 0)),
     })
     logger.info(
@@ -1932,7 +1933,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f"reentry_cooldown={gate_diag['trade_skipped_reentry_cooldown']}, "
         f"corr_cap={gate_diag['trade_skipped_correlation_cap']}, "
         f"no_price={gate_diag['trade_skipped_no_price']}, "
-        f"corr_haircut_applied={gate_diag['trade_haircut_applied']})"
+        f"corr_haircut_applied={gate_diag['trade_haircut_applied']}, "
+        f"breadth_tier={gate_diag['trade_breadth_tier_applied']})"
     )
     if not observe_only:
         log_performance_summary()

@@ -11,6 +11,8 @@ Trades are stored in cache/trades.json. Each daily run:
 
 import hashlib
 import json
+import statistics
+import time
 import yfinance as yf
 from statistics import median
 from datetime import date, datetime, timedelta, timezone
@@ -1171,37 +1173,157 @@ def _compute_confidence_ranked(closed_trades: List[dict]) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 def _position_multiplier(confidence: float) -> float:
-    """Map confidence to a position-size multiplier — continuous in [1.0, 2.0].
+    """Map confidence to a position-size multiplier.
 
-    Replaces the previous three-tier step function (1.0× / 1.5× / 2.0×)
-    with a piecewise-linear interpolation that pins the same anchor points
-    so the headline endpoints (the lowest actionable conf and the highest
-    realistic conf) still produce 1.0× and 2.0×, but a confidence of 0.86
-    no longer jumps a full 0.5× over 0.85.
+    The piecewise-linear LEGACY shape pins conf ≤0.78 → 1.0×, 0.85 → 1.50×,
+    0.92 → 1.85×, ≥0.95 → 2.00× (continuous — a confidence of 0.86 doesn't
+    jump a full 0.5× over 0.85). Its span above 1.0× is then compressed by
+    ``settings.confidence_size_span``:
 
-        conf ≤ 0.78  → 1.0× (baseline; anything below would have been
-                            filtered out by the actionable gate anyway)
-        conf = 0.85  → 1.50× (former Mid-tier midpoint)
-        conf = 0.92  → 1.85× (former High-tier entry)
-        conf ≥ 0.95  → 2.00× (cap)
+        multiplier = 1.0 + (legacy − 1.0) × confidence_size_span
 
-    Linear interpolation inside each of those three segments. The result
-    is rounded to 2 decimals for storage stability and so the multiplier
-    composes cleanly with the correlation haircut downstream.
+    because the 2026-07-02 ledger study (n=44) found entry confidence nearly
+    uninformative for outcomes (Spearman +0.10; the ≥0.92 bucket UNDERPERFORMED
+    0.85–0.92) — paying a full 2.0× for it was sizing on noise. span=1.0
+    restores the legacy ramp; 0.0 is confidence-blind. Agreement breadth
+    (``_breadth_multiplier``) is the evidence-backed conviction signal that
+    replaced the surrendered span. Rounded to 2 decimals for storage stability
+    and clean composition with the correlation haircut downstream.
     """
     if confidence <= 0.78:
-        return 1.00
-    if confidence >= 0.95:
-        return 2.00
-    if confidence <= SIZE_TIER_HALF:        # 0.78 → 0.85 ramps 1.00 → 1.50
+        legacy = 1.00
+    elif confidence >= 0.95:
+        legacy = 2.00
+    elif confidence <= SIZE_TIER_HALF:      # 0.78 → 0.85 ramps 1.00 → 1.50
         t = (confidence - 0.78) / (SIZE_TIER_HALF - 0.78)
-        return round(1.00 + t * 0.50, 2)
-    if confidence <= SIZE_TIER_FULL:        # 0.85 → 0.92 ramps 1.50 → 1.85
+        legacy = 1.00 + t * 0.50
+    elif confidence <= SIZE_TIER_FULL:      # 0.85 → 0.92 ramps 1.50 → 1.85
         t = (confidence - SIZE_TIER_HALF) / (SIZE_TIER_FULL - SIZE_TIER_HALF)
-        return round(1.50 + t * 0.35, 2)
-    # 0.92 → 0.95 ramps 1.85 → 2.00
-    t = (confidence - SIZE_TIER_FULL) / (0.95 - SIZE_TIER_FULL)
-    return round(1.85 + t * 0.15, 2)
+        legacy = 1.50 + t * 0.35
+    else:                                   # 0.92 → 0.95 ramps 1.85 → 2.00
+        t = (confidence - SIZE_TIER_FULL) / (0.95 - SIZE_TIER_FULL)
+        legacy = 1.85 + t * 0.15
+    span = float(settings.confidence_size_span)
+    return round(1.0 + (legacy - 1.0) * span, 2)
+
+
+# Breadth-ramp calibration cache — a pure function of the trade ledger, so it
+# only needs recomputing when trades change; the TTL just bounds staleness
+# inside a long-lived process (the pipeline passes its freshly-loaded ledger
+# anyway, making the cache mostly a convenience for ad-hoc callers).
+_BREADTH_CAL_TTL_S = 600.0
+_breadth_cal_cache: dict = {"ts": 0.0, "cal": None}
+
+
+def _trade_breadth_frac(trade: dict) -> Optional[float]:
+    """Set-normalized agreement breadth of a stored trade, recomputed from its
+    ``method_scores`` attribution dict: (methods agreeing with the trade's
+    direction) / (size of the attribution set). The DENOMINATOR is the full
+    set — NOT the count that voted — because normalizing by voters flips the
+    measured signal negative (information richness, how many methods had any
+    view at all, is part of the edge). Recomputable for every historical
+    attributed trade, so the calibration below needs no new stored fields.
+    None when the trade carries no attribution."""
+    ms = trade.get("method_scores") or {}
+    if not ms:
+        return None
+    sign = 1 if trade.get("action") == "BUY" else -1
+    agree = sum(1 for v in ms.values()
+                if isinstance(v, (int, float)) and v * sign > _METHOD_AGREE_THRESHOLD)
+    return agree / len(ms)
+
+
+def _breadth_calibration(trades: Optional[List[dict]] = None) -> dict:
+    """Self-calibrating parameters of the breadth sizing ramp, from the ledger.
+
+    Returns ``{"center", "half_width", "span_eff", "n_cal", "n_closed"}``:
+
+    * ``center`` / ``half_width`` — median and IQR (floored) of the
+      set-normalized breadth over the last ``breadth_adaptive_window``
+      attributed trades, so the ramp ranks a new entry against the CURRENT
+      book's breadth distribution. Method-set growth (19→28 already happened
+      once) or regime drift recenters automatically; below
+      ``breadth_adaptive_min_trades`` the measured priors hold.
+    * ``span_eff`` — the tilt's strength, throttled by REALIZED evidence with
+      Bayesian shrinkage toward the documented prior: split CLOSED trades at
+      the center, take the Laplace-smoothed win-rate gap d_obs, then
+      ``d_post = (prior_n·d_prior + n·d_obs) / (prior_n + n)`` and
+      ``span_eff = breadth_size_span × clamp(d_post / edge_ref, 0, 1)``.
+      More confirming closes → stronger tilt; a fading or reversing edge
+      decays it to NEUTRAL (0) — it never auto-inverts.
+
+    Deterministic given the ledger; cached ``_BREADTH_CAL_TTL_S`` for callers
+    that don't pass ``trades``.
+    """
+    now = time.time()
+    if trades is None and _breadth_cal_cache["cal"] is not None \
+            and (now - _breadth_cal_cache["ts"]) < _BREADTH_CAL_TTL_S:
+        return _breadth_cal_cache["cal"]
+    tl = trades if trades is not None else _load_trades()
+
+    center = float(settings.breadth_center_prior)
+    half = float(settings.breadth_halfwidth_floor)
+    attributed = [(t, f) for t in tl
+                  for f in [_trade_breadth_frac(t)] if f is not None]
+    recent = attributed[-max(1, int(settings.breadth_adaptive_window)):]
+    # Same-instrument filter: only trades measured on (approximately) the
+    # CURRENT attribution-set size calibrate the ramp. The set has already
+    # grown once (19 → 28 methods); a 10-of-19 trade reads frac 0.53 while the
+    # same absolute agreement on 28 methods reads 0.36, so mixing generations
+    # drags the center toward the old instrument and mis-ranks new entries.
+    # "Current" = the modal set size of the most recent trades; each future
+    # set-growth event re-bases automatically as new-instrument trades accrue
+    # (priors hold across the transition while the matching sample is thin).
+    if recent:
+        tail_dens = [len(t.get("method_scores") or {}) for t, _ in recent[-10:]]
+        ref_den = statistics.mode(tail_dens)
+        recent = [(t, f) for t, f in recent
+                  if abs(len(t.get("method_scores") or {}) - ref_den) <= 0.15 * ref_den]
+    fracs = sorted(f for _, f in recent)
+    if len(fracs) >= max(2, int(settings.breadth_adaptive_min_trades)):
+        center = median(fracs)
+        q = statistics.quantiles(fracs, n=4)
+        half = max(float(settings.breadth_halfwidth_floor), q[2] - q[0])
+
+    closed = [(f, (t.get("return_pct") or 0.0) > 0)
+              for t, f in recent if t.get("status") == "CLOSED"]
+    n_closed = len(closed)
+    d_prior = float(settings.breadth_edge_prior)
+    prior_n = max(0, int(settings.breadth_edge_prior_n))
+    if n_closed:
+        hi = [w for f, w in closed if f >= center]
+        lo = [w for f, w in closed if f < center]
+        p_hi = (sum(hi) + 1) / (len(hi) + 2)          # Laplace-smoothed win rates
+        p_lo = (sum(lo) + 1) / (len(lo) + 2)
+        d_post = (prior_n * d_prior + n_closed * (p_hi - p_lo)) / (prior_n + n_closed)
+    else:
+        d_post = d_prior
+    edge_ref = max(1e-9, float(settings.breadth_edge_ref))
+    edge = min(1.0, max(0.0, d_post / edge_ref))
+    cal = {"center": round(center, 4), "half_width": round(half, 4),
+           "span_eff": round(float(settings.breadth_size_span) * edge, 4),
+           "n_cal": len(recent), "n_closed": n_closed}
+    if trades is None:
+        _breadth_cal_cache.update(ts=now, cal=cal)
+    return cal
+
+
+def _breadth_multiplier(frac: Optional[float], cal: Optional[dict] = None) -> float:
+    """CONTINUOUS position-size tilt from set-normalized agreement breadth —
+    the strongest entry-time outcome discriminator in the 2026-07-02 ledger
+    study (see ``settings.breadth_sizing_enabled``):
+
+        mult = 1 + span_eff × clamp((frac − center) / half_width, −1, +1)
+
+    Monotone and bounded to [1−span_eff, 1+span_eff]; neutral exactly at the
+    ledger-calibrated center. ``None`` = breadth UNKNOWN (no signal attribution
+    this run) → neutral 1.0 — absence of evidence is not a narrow signal."""
+    if not settings.breadth_sizing_enabled or frac is None:
+        return 1.0
+    c = cal if cal is not None else _breadth_calibration()
+    ramp = (frac - c["center"]) / max(1e-9, c["half_width"])
+    ramp = min(1.0, max(-1.0, ramp))
+    return round(1.0 + c["span_eff"] * ramp, 3)
 
 
 def _sector_key(rec: Recommendation) -> str:
@@ -1291,6 +1413,7 @@ def record_new_trades(
         "skipped_no_price":     0,
         "haircut_applied":      0,   # informational — size reduced, not skipped
         "extended_haircut_applied": 0,  # entries sized down for an off-RTH fill
+        "breadth_tier_applied": 0,   # informational — sized up/down on agreement breadth
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
@@ -1301,6 +1424,11 @@ def record_new_trades(
     # churn within the SAME tick (observed HUM 2026-06-29: closed 11:38:30,
     # reopened 11:38:31 — a pure round-trip cost). Same direction only — an
     # opposite-direction entry is a genuine flip and is never blocked.
+    # Breadth-ramp calibration — once per call, from the ledger as it stands
+    # BEFORE this tick's entries (the right reference distribution; also keeps
+    # every entry in the batch on one consistent calibration).
+    breadth_cal = _breadth_calibration(trades)
+
     cooldown_h = float(settings.reentry_cooldown_hours or 0.0)
     recent_exits: Dict[tuple, datetime] = {}
     if cooldown_h > 0:
@@ -1340,8 +1468,30 @@ def record_new_trades(
                     )
                     continue
 
-        # ── Step 1: confidence tier (base size) ───────────────────────────
-        conf_multiplier = _position_multiplier(rec.confidence)
+        # ── Step 1: conviction tiers (confidence × agreement breadth) ─────
+        # Method attribution is computed HERE (not just at trade-dict build
+        # time) because breadth — len(methods agreeing with the direction) —
+        # is a sizing input: the 2026-07-02 ledger study found it the
+        # strongest entry-time outcome discriminator, while the LLM
+        # confidence number carried almost none (its ramp is compressed by
+        # confidence_size_span inside _position_multiplier).
+        mscores = _method_scores_from_signal(rec.ticker, rec.direction, signals_by_ticker)
+        agreed = _methods_agreeing(mscores, rec.direction)
+        # Breadth is UNKNOWN (→ neutral sizing) when the run has no signal for
+        # the ticker at all — _method_scores_from_signal returns a zero-filled
+        # dict there, which must not read as "zero methods agree".
+        _has_signal = bool(signals_by_ticker) and signals_by_ticker.get(rec.ticker) is not None
+        breadth = len(agreed) if _has_signal else None
+        breadth_frac = (breadth / len(mscores)) if (breadth is not None and mscores) else None
+        breadth_mult = _breadth_multiplier(breadth_frac, breadth_cal)
+        conf_multiplier = round(_position_multiplier(rec.confidence) * breadth_mult, 3)
+        if abs(breadth_mult - 1.0) >= 0.01:
+            diag["breadth_tier_applied"] += 1
+            logger.info(
+                f"[tracker] {rec.ticker}: agreement breadth {breadth}/{len(mscores)} "
+                f"(frac {breadth_frac:.2f} vs center {breadth_cal['center']:.2f}) → "
+                f"size ×{breadth_mult:g} (conviction base {conf_multiplier:.2f}×)"
+            )
         sector = _sector_key(rec)  # stored on the trade as a passive diagnostic
 
         # ── Step 2: correlation haircut against same-direction open peers ─
@@ -1414,9 +1564,8 @@ def record_new_trades(
                 )
                 continue
 
-        # Capture per-method scores for attribution analysis
-        mscores  = _method_scores_from_signal(rec.ticker, rec.direction, signals_by_ticker)
-        agreed   = _methods_agreeing(mscores, rec.direction)
+        # Per-method attribution: mscores/agreed were computed at Step 1 (they
+        # size the trade via the breadth tier); only dominance is derived here.
         dominant = _dominant_method(mscores, rec.direction)
 
         # Snapshot the entry-time signal state so monitor_open_positions can
@@ -1487,6 +1636,11 @@ def record_new_trades(
             "entry_datetime": executed_at,
             "entry_session": entry_session,
             "extended_size_multiplier": ext_mult if entry_session != "rth" else 1.0,
+            "breadth_size_multiplier": breadth_mult,      # agreement-breadth tilt (audit)
+            "breadth_at_entry": breadth,                  # len(methods_agreeing) | None
+            "breadth_frac_at_entry": (round(breadth_frac, 4)
+                                      if breadth_frac is not None else None),
+            "breadth_center_at_entry": breadth_cal["center"],   # calibration audit trail
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,

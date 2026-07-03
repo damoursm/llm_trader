@@ -1083,6 +1083,50 @@ class Settings(BaseSettings):
     # thin and the modeled spread 4× wider, so pre-prod sizes off-hours
     # entries at half weight until paper fills prove the edge. 1.0 = off.
     extended_size_multiplier: float = 0.5
+
+    # ── Evidence-based conviction sizing (2026-07-02 ledger study, n=44) ────
+    # Two findings from the attributed ledger drive these knobs:
+    # (1) LLM entry CONFIDENCE carries almost no return information (Spearman
+    #     +0.10 with outcome; calibration slope ~0; the ≥0.92 bucket actually
+    #     UNDERPERFORMED 0.85–0.92). The old ramp paid up to 2.0× for it. The
+    #     ramp's span above 1.0× is therefore compressed:
+    #       multiplier = 1.0 + (legacy_ramp − 1.0) × confidence_size_span
+    #     1.0 restores the legacy 1.0→2.0× ramp; 0.0 = confidence-blind sizing.
+    confidence_size_span: float = 0.5
+    # (2) Agreement BREADTH — how many methods agreed with the direction at
+    #     entry — was the strongest entry-time discriminator (Spearman +0.48;
+    #     realized-only win rates 46% above the median split vs 23% below,
+    #     Laplace-smoothed gap d≈0.20 over 26 closed trades; survives
+    #     excluding the 2026-06-25 winner cohort). The convergence multiplier
+    #     saturates at 2 agreeing methods, so breadth was previously unused
+    #     above that. Sizing tilt, CONTINUOUS + SELF-CALIBRATING (2026-07-03):
+    #       frac  = n_agreeing / len(attribution set)   ← survives method-set
+    #               growth (the set already grew 19→28 once; absolute
+    #               thresholds would have silently broken). NOT normalized by
+    #               "methods that voted" — that flips the signal negative
+    #               (the ledger shows information RICHNESS is the edge).
+    #       ramp  = clamp((frac − center) / half_width, −1, +1)
+    #       mult  = 1 + breadth_size_span × edge × ramp
+    #     center/half_width are re-estimated each tick from the ledger's own
+    #     recent breadth distribution (median / IQR over the last
+    #     breadth_adaptive_window attributed trades once ≥ min_trades exist;
+    #     the measured priors below until then), so the tilt ranks entries
+    #     against the CURRENT book — new methods or regime shifts recenter it
+    #     automatically. `edge` throttles the whole tilt by REALIZED evidence,
+    #     Bayesian-shrunk: d_post = (prior_n·d_prior + n·d_obs)/(prior_n+n),
+    #     edge = clamp(d_post / edge_ref, 0, 1) — grows toward full span as
+    #     closed trades keep confirming the effect, decays to NEUTRAL (never
+    #     auto-inverts) if it stops holding. Priors measured 2026-07-02.
+    breadth_sizing_enabled: bool = True
+    breadth_size_span: float = 0.2          # max ± size tilt at full evidence + saturation
+    breadth_center_prior: float = 0.46      # ledger median frac (measured)
+    breadth_halfwidth_floor: float = 0.09   # min ramp half-width (measured IQR)
+    breadth_adaptive_min_trades: int = 10   # attributed trades before center/width adapt
+    breadth_adaptive_window: int = 200      # recent attributed trades used to calibrate
+    breadth_edge_prior: float = 0.20        # prior hi−lo realized win-rate gap (measured)
+    breadth_edge_prior_n: int = 30          # pseudo-trades behind the prior (shrinkage)
+    breadth_edge_ref: float = 0.25          # gap that counts as FULL evidence (edge=1)
+
     # Master switch for the session-dependent SIGNAL profile (default OFF so
     # scores are comparable across the trading day — the requirement behind the
     # fix #2 confidence trajectory). When OFF: one fixed weight profile is used
