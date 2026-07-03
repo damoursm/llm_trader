@@ -47,18 +47,56 @@ from config.settings import settings
 # per-test by conftest). It is a single process-global, recomputed
 # deterministically from the DB's broker fills each run/perf call.
 _REAL_COST_OVERRIDE: Optional[float] = None
+# Per-SESSION calibrated one-way cost fractions ({"rth": f, "extended": f,
+# "overnight": f}) — installed alongside the flat override by
+# tracker.calibrate_sim_costs once real fills support a per-session split
+# (rth measured directly; off-RTH = rth × a shrunk session multiplier so the
+# documented ×4/×10 priors hold until that session's own fills accrue). When
+# absent, the flat blended override applies to every leg as before.
+_REAL_COST_SESSION: Optional[dict] = None
 
 
-def set_real_cost_override(fraction: Optional[float]) -> None:
+def set_real_cost_override(fraction: Optional[float],
+                           by_session: Optional[dict] = None) -> None:
     """Install (or clear with None) the real-fill one-way cost fraction that
-    _one_side_cost returns for every leg. Clamped ≥ 0 — a net-favorable fill
-    streak must never make the sim pay you to trade."""
-    global _REAL_COST_OVERRIDE
+    _one_side_cost returns for every leg, optionally with a per-session split.
+    Clamped ≥ 0 — a net-favorable fill streak must never make the sim pay you
+    to trade."""
+    global _REAL_COST_OVERRIDE, _REAL_COST_SESSION
     _REAL_COST_OVERRIDE = None if fraction is None else max(0.0, float(fraction))
+    if fraction is None or not by_session:
+        _REAL_COST_SESSION = None
+    else:
+        _REAL_COST_SESSION = {str(k): max(0.0, float(v))
+                              for k, v in by_session.items() if v is not None}
 
 
 def get_real_cost_override() -> Optional[float]:
     return _REAL_COST_OVERRIDE
+
+
+def get_real_cost_session_overrides() -> Optional[dict]:
+    return dict(_REAL_COST_SESSION) if _REAL_COST_SESSION else None
+
+
+def effective_cost_hurdle_pct() -> float:
+    """The round-trip cost hurdle a horizon's net edge must clear — DERIVED
+    from the calibrated real one-way cost when available:
+
+        hurdle% = 2 × one-way% × cost_hurdle_safety
+
+    so horizon selection self-tightens/loosens as measured execution costs
+    drift, instead of judging edges against the frozen
+    ``settings.horizon_cost_hurdle_pct`` (which stays as the fallback when no
+    real-fill calibration exists, and when ``cost_hurdle_use_calibrated`` is
+    off). Clamped to a sane [0.05, 2.0]% band — the hurdle is a decision
+    threshold, and a degenerate calibration must not zero it out or make every
+    horizon untradeable."""
+    static = float(settings.horizon_cost_hurdle_pct)
+    if not settings.cost_hurdle_use_calibrated or _REAL_COST_OVERRIDE is None:
+        return static
+    derived = 2.0 * _REAL_COST_OVERRIDE * 100.0 * float(settings.cost_hurdle_safety)
+    return min(2.0, max(0.05, derived))
 
 
 def _session_spread_multiplier(session) -> float:
@@ -188,18 +226,23 @@ def _one_side_cost(price: float, asset_type: str = "STOCK", session=None) -> flo
 
     When a real-fill calibration is installed (``set_real_cost_override`` —
     the measured average all-in one-way cost from actual IBKR fills), it is
-    returned flat for every leg INSTEAD of the model, so the simulation
-    charges what execution actually costs. The override already blends the
-    real session/price mix, so it intentionally ignores ``price``/``session``
-    — EXCEPT for legs priced below ``sim_real_fill_min_price``: the fills the
-    override is measured from are liquid names, and charging that flat cost to
-    a sub-$1 instrument grossly understates its spread (a $0.054 warrant with
-    a ~35%-wide book was being charged 8 bp — ARQQW, 2026-07-01). Those legs
+    returned for every leg INSTEAD of the model, so the simulation charges
+    what execution actually costs. When the calibration carries a per-SESSION
+    split (rth measured; extended/overnight = rth × shrunk multipliers toward
+    the ×4/×10 priors until those sessions' own fills accrue), the leg's own
+    session picks its cost — the flat blend is the fallback. EXCEPT for legs
+    priced below ``sim_real_fill_min_price``: the fills the calibration is
+    measured from are liquid names, and charging that cost to a sub-$1
+    instrument grossly understates its spread (a $0.054 warrant with a
+    ~35%-wide book was being charged 8 bp — ARQQW, 2026-07-01). Those legs
     keep the modeled price-tiered cost.
     """
     if _REAL_COST_OVERRIDE is not None:
         min_px = float(settings.sim_real_fill_min_price)
         if price is not None and price >= min_px:
+            if _REAL_COST_SESSION:
+                return _REAL_COST_SESSION.get(session or "rth",
+                                              _REAL_COST_SESSION.get("rth", _REAL_COST_OVERRIDE))
             return _REAL_COST_OVERRIDE
     return _dynamic_half_spread(price, asset_type, session) + _commission_fraction(price)
 

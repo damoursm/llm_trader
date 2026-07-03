@@ -166,7 +166,8 @@ def compute_directional_edge_curve(scores: Dict[str, float],
     measured prior, not a static weight). ``edge``/``exp_gross``/``net`` mirror the
     pooled curve but on market-relative yields, so ``net`` is alpha over the market
     net of cost."""
-    hurdle = float(settings.horizon_cost_hurdle_pct if cost_hurdle_pct is None else cost_hurdle_pct)
+    from src.performance.spread import effective_cost_hurdle_pct
+    hurdle = float(effective_cost_hurdle_pct() if cost_hurdle_pct is None else cost_hurdle_pct)
     prior_n = int(settings.horizon_dir_shrink_prior_n if prior_n is None else prior_n)
     out: Dict[str, dict] = {}
     for h in HORIZON_LABELS:
@@ -214,7 +215,8 @@ def compute_edge_curve(scores: Dict[str, float],
                    (sign-corrected per-method yield, weighted by reliability×strength)
     net(h)       = exp_gross(h) − cost_hurdle_pct
     """
-    hurdle = float(settings.horizon_cost_hurdle_pct if cost_hurdle_pct is None else cost_hurdle_pct)
+    from src.performance.spread import effective_cost_hurdle_pct
+    hurdle = float(effective_cost_hurdle_pct() if cost_hurdle_pct is None else cost_hurdle_pct)
     out: Dict[str, dict] = {}
     for h in HORIZON_LABELS:
         w_num = w_den = a_num = a_den = 0.0

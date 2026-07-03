@@ -308,6 +308,11 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_FUNDAMENTAL_COLUMNS),
     # Broker-advisor method column on an existing signals table.
     ("signals", "broker_advisor", "DOUBLE"),
+    # Universe provenance (2026-07-03): which discovery source first surfaced
+    # the ticker this run (watchlist / trending / screener / smart_money / …) —
+    # the measurement behind per-source hit rates and, later, an adaptive
+    # discovery budget. Trades carry the same stamp in their JSON.
+    ("signals", "universe_source", "VARCHAR"),
     # IBKR account P&L snapshot (reqPnL) on an existing broker_reconciles table.
     ("broker_reconciles", "pnl_daily", "DOUBLE"),
     ("broker_reconciles", "pnl_unrealized", "DOUBLE"),

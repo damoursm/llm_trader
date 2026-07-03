@@ -107,26 +107,33 @@ def _exec_cost_pct(leg_is_buy: bool, model: Optional[float], fill: Optional[floa
     return ((fill - model) if leg_is_buy else (model - fill)) / model * 100.0
 
 
+def leg_one_way_cost_pct(leg: dict) -> Optional[float]:
+    """All-in one-way cost (%) of ONE real filled LMT leg: real commission as %
+    of the leg's notional PLUS the cost-normalized execution cost vs the
+    decision price (the order's own side decides the adverse direction — a BUY
+    order is adverse filling higher, a SELL adverse filling lower, covering
+    entries and exits without needing to know which). None for unusable legs."""
+    fq = int(leg.get("filled_qty") or 0)
+    fp = _f(leg.get("fill_price"))
+    if fq <= 0 or not fp or fp <= 0:
+        return None
+    comm = _f(leg.get("commission")) or 0.0
+    comm_pct = comm / (fq * fp) * 100.0
+    slip = _exec_cost_pct(str(leg.get("side") or "").upper() == "BUY",
+                          _f(leg.get("model_price")), fp)
+    return comm_pct + slip
+
+
 def one_way_cost_pcts_from_legs(legs: List[dict]) -> List[float]:
-    """Per-leg all-in one-way cost (%) over real **LMT** filled legs from
-    ``broker_orders`` (``repo.fetch_filled_lmt_legs``): real commission as % of
-    the leg's notional PLUS the cost-normalized execution cost vs the decision
-    price (the order's own side decides the adverse direction — a BUY order is
-    adverse filling higher, a SELL adverse filling lower, which covers both
-    entries and exits without needing to know which). MKT legs never reach
+    """Per-leg all-in one-way costs (%) over real **LMT** filled legs from
+    ``broker_orders`` (``repo.fetch_filled_lmt_legs``). MKT legs never reach
     here — they're filtered out at the source, since LMT is what the system
-    uses going forward."""
+    uses going forward. See :func:`leg_one_way_cost_pct` for the per-leg math."""
     out: List[float] = []
     for r in legs:
-        fq = int(r.get("filled_qty") or 0)
-        fp = _f(r.get("fill_price"))
-        if fq <= 0 or not fp or fp <= 0:
-            continue
-        comm = _f(r.get("commission")) or 0.0
-        comm_pct = comm / (fq * fp) * 100.0
-        slip = _exec_cost_pct(str(r.get("side") or "").upper() == "BUY",
-                              _f(r.get("model_price")), fp)
-        out.append(comm_pct + slip)
+        pct = leg_one_way_cost_pct(r)
+        if pct is not None:
+            out.append(pct)
     return out
 
 

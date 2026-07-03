@@ -1303,6 +1303,16 @@ def _breadth_calibration(trades: Optional[List[dict]] = None) -> dict:
     cal = {"center": round(center, 4), "half_width": round(half, 4),
            "span_eff": round(float(settings.breadth_size_span) * edge, 4),
            "n_cal": len(recent), "n_closed": n_closed}
+    from src.performance.calibration import report_calibration
+    report_calibration("breadth_center", value=cal["center"],
+                       prior=float(settings.breadth_center_prior),
+                       n_evidence=cal["n_cal"], unit="agree frac",
+                       note="ramp neutral point (same-instrument ledger median)")
+    report_calibration("breadth_span_eff", value=cal["span_eff"],
+                       prior=float(settings.breadth_size_span)
+                             * min(1.0, max(0.0, d_prior / edge_ref)),
+                       n_evidence=cal["n_closed"], unit="± size tilt",
+                       note="evidence-throttled breadth sizing strength")
     if trades is None:
         _breadth_cal_cache.update(ts=now, cal=cal)
     return cal
@@ -1367,6 +1377,7 @@ def record_new_trades(
     run_id: Optional[str] = None,
     llm_synthesis_model: Optional[str] = None,
     llm_sentiment_model: Optional[str] = None,
+    universe_sources: Optional[dict] = None,
 ) -> dict:
     """Open a new trade for each BUY/SELL recommendation not already open today.
 
@@ -1414,6 +1425,7 @@ def record_new_trades(
         "haircut_applied":      0,   # informational — size reduced, not skipped
         "extended_haircut_applied": 0,  # entries sized down for an off-RTH fill
         "breadth_tier_applied": 0,   # informational — sized up/down on agreement breadth
+        "edge_blend_applied":   0,   # informational — learned-model size adjustment
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
@@ -1428,6 +1440,11 @@ def record_new_trades(
     # BEFORE this tick's entries (the right reference distribution; also keeps
     # every entry in the batch on one consistent calibration).
     breadth_cal = _breadth_calibration(trades)
+    # Learned expected-edge sizing model (the unified successor to the tiers) —
+    # fitted once per batch from the same pre-batch ledger; None while the
+    # realized sample is below edge_min_closed (→ the layer is inert).
+    from src.performance.edge_sizing import edge_blend_ratio, get_edge_model, trade_features
+    edge_model = get_edge_model(trades) if settings.edge_sizing_enabled else None
 
     cooldown_h = float(settings.reentry_cooldown_hours or 0.0)
     recent_exits: Dict[tuple, datetime] = {}
@@ -1537,6 +1554,28 @@ def record_new_trades(
                 f"size ×{ext_mult:g} → {multiplier:.2f}×"
             )
 
+        # ── Step 3b: learned expected-edge blend (unified sizing) ─────────
+        # The ratio hands conviction over from the tier product to the ridge
+        # model of realized returns in proportion to closed-trade evidence —
+        # exactly 1.0 while data is thin, so today's chain is the prior, not
+        # a casualty. Features built through the SAME helper the fit uses.
+        edge_feats = trade_features({
+            "method_scores": mscores if _has_signal else None,
+            "action": rec.action, "confidence": rec.confidence,
+            "signal_at_entry": {"combined_score": getattr(
+                (signals_by_ticker or {}).get(rec.ticker), "combined_score", 0.0) or 0.0},
+            "entry_session": entry_session,
+        }) if _has_signal else None
+        edge_ratio, edge_meta = edge_blend_ratio(edge_feats, conf_multiplier, edge_model)
+        if abs(edge_ratio - 1.0) >= 0.005:
+            multiplier = round(multiplier * edge_ratio, 3)
+            diag["edge_blend_applied"] += 1
+            logger.info(
+                f"[tracker] {rec.ticker}: expected-edge blend ×{edge_ratio:g} "
+                f"(model w={edge_meta['w']:.2f}, pred {edge_meta['pred']:+.2f}%) "
+                f"→ {multiplier:.2f}×"
+            )
+
         price = _fetch_price(rec.ticker)
         if price is None:
             diag["skipped_no_price"] += 1
@@ -1641,6 +1680,9 @@ def record_new_trades(
             "breadth_frac_at_entry": (round(breadth_frac, 4)
                                       if breadth_frac is not None else None),
             "breadth_center_at_entry": breadth_cal["center"],   # calibration audit trail
+            "edge_size_ratio": edge_ratio,                # learned-sizing adjustment (audit)
+            "edge_model_weight": edge_meta.get("w", 0.0),
+            "edge_pred_at_entry": edge_meta.get("pred"),
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,
@@ -1672,6 +1714,10 @@ def record_new_trades(
             # Exact LLM engines in use at entry (synthesis = final call,
             # sentiment = run-dominant per-ticker scorer) — per-LLM attribution.
             "llm_synthesis_model": llm_synthesis_model,
+            # Which discovery source first surfaced the ticker this run —
+            # the per-trade half of the provenance measurement (signals rows
+            # carry the same stamp), for future per-source hit-rate analysis.
+            "universe_source": (universe_sources or {}).get(str(rec.ticker).upper()),
             "llm_sentiment_model": llm_sentiment_model,
             # Open-position monitoring fields
             "signal_at_entry":  sig_at_entry,
@@ -1922,8 +1968,18 @@ def _confidence_floor(entry_conf) -> float:
     """The opener-review confidence a held position must clear to stay open:
     ``max(absolute backstop, relative × LLM ENTRY confidence)``. Shared by the
     exit gate (``_evaluate_decay``) and the persisted review trajectory so the
-    plotted close-threshold line always matches what actually fires."""
-    absf = float(settings.signal_decay_confidence_floor)
+    plotted close-threshold line always matches what actually fires.
+
+    The ABSOLUTE backstop is CALIBRATED from the recorded review→outcome
+    trajectory when evidence supports it (``exit_floor_calibration`` — shrunk
+    toward ``settings.signal_decay_confidence_floor``, clamped, fail-soft to
+    the static value; cached, so this stays cheap per call). The relative
+    component stays static by design."""
+    try:
+        from src.analysis.exit_floor_calibration import calibrated_exit_floor
+        absf = calibrated_exit_floor()
+    except Exception:
+        absf = float(settings.signal_decay_confidence_floor)
     if entry_conf is None:
         return absf
     return max(absf, float(settings.signal_decay_confidence_floor_relative) * float(entry_conf))
@@ -3301,14 +3357,63 @@ def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
     if not settings.sim_use_real_fill_costs:
         set_real_cost_override(None)
         return None
-    from src.performance.broker_view import real_one_way_cost_fraction
+    from src.performance.broker_view import leg_one_way_cost_pct, real_one_way_cost_fraction
+    from src.performance.calibration import report_calibration, shrink
+    from src.performance.spread import effective_cost_hurdle_pct
     legs = repo.fetch_filled_lmt_legs()
     frac = real_one_way_cost_fraction(legs, settings.sim_real_fill_costs_min_legs)
-    set_real_cost_override(frac)
+
+    # Per-SESSION split (2026-07-03): the flat blend under-charged off-RTH legs
+    # (most fills are RTH, so extended/overnight legs were billed near-RTH
+    # costs). RTH is measured directly once it has enough of its own legs;
+    # extended/overnight = RTH × a session multiplier Bayesian-shrunk from that
+    # session's own fills toward the documented ×4/×10 priors — conservative
+    # until measured, converging to reality as each session's fills accrue.
+    by_session = None
+    if frac is not None and settings.session_spread_calibration_enabled:
+        sess_costs: Dict[str, List[float]] = {"rth": [], "extended": [], "overnight": []}
+        for leg in legs:
+            pct = leg_one_way_cost_pct(leg)
+            if pct is None:
+                continue
+            sess_costs.setdefault(_session_of_iso(leg.get("submitted_at")), []).append(pct)
+        min_legs = max(1, int(settings.session_cost_min_legs))
+        rth = sess_costs["rth"]
+        rth_frac = max(0.0, (sum(rth) / len(rth)) / 100.0) if len(rth) >= min_legs else frac
+        by_session = {"rth": rth_frac}
+        for sess, prior_mult in (("extended", float(settings.spread_extended_multiplier)),
+                                 ("overnight", float(settings.spread_overnight_multiplier))):
+            cs = sess_costs[sess]
+            obs = None
+            if len(cs) >= min_legs and rth_frac > 1e-6:
+                # Observed session-vs-RTH cost ratio, sanity-clamped: never
+                # below 1 (off-hours can't be cheaper than RTH) nor past 2×
+                # the prior (a few bad fills must not explode the posterior).
+                obs = min(max((sum(cs) / len(cs)) / 100.0 / rth_frac, 1.0), prior_mult * 2)
+            mult = max(1.0, shrink(prior_mult, settings.session_spread_prior_n,
+                                   obs, len(cs) if obs is not None else 0))
+            by_session[sess] = rth_frac * mult
+            report_calibration(
+                f"spread_mult_{sess}", value=mult, prior=prior_mult,
+                n_evidence=len(cs), unit="× rth cost",
+                note=f"one-way {by_session[sess]*100:.3f}%/leg; shrunk from "
+                     f"{len(cs)} {sess} fill(s)")
+
+    set_real_cost_override(frac, by_session)
     if frac is not None:
+        report_calibration("sim_one_way_cost", value=frac * 100, prior=None,
+                           n_evidence=len(legs), unit="%/leg",
+                           note="flat blend over all real LMT fills (display + fallback)")
+        report_calibration("cost_hurdle", value=effective_cost_hurdle_pct(),
+                           prior=float(settings.horizon_cost_hurdle_pct),
+                           n_evidence=len(legs), unit="% round trip",
+                           note="2 × one-way × safety; horizon net-edge gate")
         logger.info(
             f"[costs] sim calibrated to real LMT fills ({len(legs)} legs): "
             f"{frac * 100:.3f}% one-way per leg"
+            + (f"; session split rth={by_session['rth']*100:.3f}% "
+               f"ext={by_session['extended']*100:.3f}% on={by_session['overnight']*100:.3f}%"
+               if by_session else "")
         )
     return frac
 

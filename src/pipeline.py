@@ -270,7 +270,8 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                  gate_diag, market_mode_context, macro_regime_context,
                  confidence_threshold, allow_buys, signals_by_ticker,
                  broker_report=None, snapshots=None,
-                 synthesis_meta=None, sentiment_summary=None) -> None:
+                 synthesis_meta=None, sentiment_summary=None,
+                 universe_sources=None) -> None:
     """Write the run, its per-source 'APIs used' record, every recommendation
     (with method attribution + the LLM provider that synthesised it), the
     broker reconcile report (per-order slippage/commission rows), and the FULL
@@ -372,6 +373,7 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "n_methods_agreeing": len(_methods_agreeing(base_scores, s.direction)),
                 "dominant_method": _dominant_method(base_scores, s.direction),
                 "price": price_by_ticker.get(tk),
+                "universe_source": (universe_sources or {}).get(str(tk).upper()),
                 "scores": all_scores,
             })
         if sig_rows:
@@ -939,9 +941,26 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # ── Step 0: Ticker discovery (serial — rest of pipeline depends on it) ──
     logger.info("Step 0: Discovering trending tickers...")
     all_tickers = get_trending_tickers(tickers, sectors)
+
+    # Universe PROVENANCE (2026-07-03): which discovery source first surfaced
+    # each ticker this run — stamped onto every signals row and every new trade
+    # so per-source hit rates become measurable (the prerequisite for an
+    # adaptive discovery budget). First source wins; the pinned watchlist /
+    # sector / commodity sets take precedence over the trending overlap.
+    universe_source: dict = {}
+
+    def _mark_source(tks, label):
+        for _t in tks or []:
+            universe_source.setdefault(str(_t).upper(), label)
+
+    _mark_source(tickers, "watchlist")
+    _mark_source(sectors, "sector_etf")
+    _mark_source(commodities, "commodity")
+    _mark_source(all_tickers, "trending")
     new_commodities = [t for t in commodities if t not in all_tickers]
     if new_commodities:
         all_tickers = all_tickers + new_commodities
+        _mark_source(new_commodities, "commodity")
         logger.info(f"Step 0: Pinned commodities: {new_commodities}")
 
     # Factor / thematic ETFs — pinned like commodities (Section E): broaden coverage beyond the
@@ -950,6 +969,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     new_factors = [t for t in settings.factor_list if t not in all_tickers]
     if new_factors:
         all_tickers = all_tickers + new_factors
+        _mark_source(new_factors, "factor_etf")
         logger.info(f"Step 0: Pinned factor/thematic ETFs: {new_factors}")
 
     # Opportunity screener — proactive setup discovery over a broad liquid universe
@@ -963,6 +983,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             new_from_screen = [h.ticker for h in screener_context.hits if h.ticker not in all_tickers]
             if new_from_screen:
                 all_tickers = all_tickers + new_from_screen
+                _mark_source(new_from_screen, "screener")
                 logger.info(
                     f"[screener] Injecting {len(new_from_screen)} setup(s) into universe: {new_from_screen}"
                 )
@@ -979,6 +1000,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         _new_earn = [t for t in _earn_disc if t not in all_tickers]
         if _new_earn:
             all_tickers = all_tickers + _new_earn
+            _mark_source(_new_earn, "earnings_discovery")
             logger.info(f"[earnings_disc] Injecting {len(_new_earn)} earnings name(s): {_new_earn}")
 
     if settings.enable_analyst_discovery:
@@ -991,6 +1013,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         _new_analyst = [t for t in _analyst_disc if t not in all_tickers]
         if _new_analyst:
             all_tickers = all_tickers + _new_analyst
+            _mark_source(_new_analyst, "analyst_discovery")
             logger.info(f"[analyst_disc] Injecting {len(_new_analyst)} analyst name(s): {_new_analyst}")
 
     # Load cluster watchlist and inject still-active tickers into the universe
@@ -1002,6 +1025,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         new_from_cluster = [t for t in _cluster_ctx_pre.active_tickers if t not in all_tickers]
         if new_from_cluster:
             all_tickers = all_tickers + new_from_cluster
+            _mark_source(new_from_cluster, "insider_cluster")
             logger.info(
                 f"[cluster_watch] Injecting {new_from_cluster} from cluster watchlist "
                 f"({len(_cluster_ctx_pre.active_tickers)} active)"
@@ -1018,6 +1042,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     new_from_trades = [t for t in open_trade_tickers if t not in all_tickers]
     if new_from_trades:
         all_tickers = all_tickers + new_from_trades
+        _mark_source(new_from_trades, "open_position_pin")
         logger.info(f"[tracker] Pinning open-trade tickers into universe: {new_from_trades}")
 
     # Pin hypothetical always-open trade tickers so their OHLCV cache stays
@@ -1026,6 +1051,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     new_from_hyp = [t for t in hypothetical_tickers if t not in all_tickers]
     if new_from_hyp:
         all_tickers = all_tickers + new_from_hyp
+        _mark_source(new_from_hyp, "hypothetical_pin")
         logger.info(f"[hypothetical] Pinning always-open tickers into universe: {new_from_hyp}")
 
     # Related-company peer discovery (Massive) — widen with peers of the watchlist +
@@ -1038,6 +1064,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             _new_rel = [t for t in _related if t not in all_tickers]
             if _new_rel:
                 all_tickers = all_tickers + _new_rel
+                _mark_source(_new_rel, "related_peer")
                 logger.info(f"[related] Peer-discovery added {len(_new_rel)} name(s): {_new_rel[:12]}")
         except Exception as e:
             logger.warning(f"[related] peer discovery failed: {e}")
@@ -1336,6 +1363,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         if new_from_smart:
             logger.info(f"Adding {new_from_smart} to universe from smart money signals")
             all_tickers = all_tickers + new_from_smart
+            _mark_source(new_from_smart, "smart_money")
 
     macro_context    = get(f_fred)
     cot_context      = get(f_cot)
@@ -1425,6 +1453,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             new_from_macro = apply_liquidity_gate(new_from_macro, source="macro_discovery", budget=gate_budget)
             if new_from_macro:
                 all_tickers = all_tickers + new_from_macro
+                _mark_source(new_from_macro, "macro_discovery")
                 logger.info(
                     f"[macro_discovery] Injecting {len(new_from_macro)} favored-sector name(s): {new_from_macro}"
                 )
@@ -1445,6 +1474,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             _peers = apply_liquidity_gate(_peers, source="coint_peer", budget=gate_budget)
             if _peers:
                 all_tickers = all_tickers + _peers
+                _mark_source(_peers, "coint_peer")
                 logger.info(f"[coint_peer] Injecting {len(_peers)} cointegration peer leg(s): {_peers}")
 
     # ── Snapshot top-up for post-fetch discoveries ─────────────────────────
@@ -1743,6 +1773,25 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             f"(default 78%) | allow_buys={_allow_buys}"
         )
 
+    # Engine-relative translation: the regime threshold is an ABSOLUTE
+    # confidence anchor, but confidence scales are engine-specific — translate
+    # it into THIS run's engine scale by matching gate selectivity over recent
+    # recommendations (shrunk + clamped; fail-soft to the static value).
+    threshold_meta = None
+    try:
+        from src.analysis.threshold_calibration import engine_relative_threshold
+        _confidence_threshold, threshold_meta = engine_relative_threshold(
+            _confidence_threshold, _synth_meta.get("model"))
+        if threshold_meta.get("applied"):
+            logger.info(
+                f"[threshold] engine-relative gate: static {threshold_meta['static']:.0%} "
+                f"→ {_confidence_threshold:.0%} for {threshold_meta['engine']} "
+                f"(selectivity {threshold_meta.get('selectivity', 0):.0%}, "
+                f"n={threshold_meta['n_engine']})"
+            )
+    except Exception as e:
+        logger.debug(f"[threshold] engine-relative translation skipped: {e}")
+
     # Off-RTH gate — thin books and wide spreads demand more conviction, so the
     # regime threshold is bumped further for any run outside RTH. Overnight
     # (the thinnest book of the day) carries its own, larger bump. Observation
@@ -1784,8 +1833,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "dropped_earnings_blackout":    0,
         "actionable_survivors":         0,
         "confidence_threshold":         round(_confidence_threshold, 2),
+        "threshold_calibration":        threshold_meta,   # engine-relative gate audit
         "allow_buys":                   _allow_buys,
         "session":                      run_session,
+        # This run's discovery-funnel shape: how many tickers each source
+        # contributed (first-source-wins). Trades/signals carry the per-ticker
+        # stamp; this is the run-level summary.
+        "universe_sources":             {s: sum(1 for v in universe_source.values() if v == s)
+                                         for s in sorted(set(universe_source.values()))},
         "regime":                       (macro_regime_context.regime
                                           if macro_regime_context else "NEUTRAL"),
         # Regime/mode INPUT COVERAGE — persisted per run so the dashboard can show
@@ -1892,6 +1947,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             actionable, signals_by_ticker=signals_by_ticker, run_id=run_id,
             llm_synthesis_model=_synth_model,
             llm_sentiment_model=_sent_model,   # snapshotted before the hold-reviews
+            universe_sources=universe_source,
         ) or {}
 
         # Broker shadow execution (paper-first): once the internal ledger is final for
@@ -1916,6 +1972,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "trade_skipped_no_price":       int(trade_diag.get("skipped_no_price", 0)),
         "trade_haircut_applied":        int(trade_diag.get("haircut_applied", 0)),
         "trade_breadth_tier_applied":   int(trade_diag.get("breadth_tier_applied", 0)),
+        "trade_edge_blend_applied":     int(trade_diag.get("edge_blend_applied", 0)),
         "trade_opened":                 int(trade_diag.get("opened", 0)),
     })
     logger.info(
@@ -1934,7 +1991,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f"corr_cap={gate_diag['trade_skipped_correlation_cap']}, "
         f"no_price={gate_diag['trade_skipped_no_price']}, "
         f"corr_haircut_applied={gate_diag['trade_haircut_applied']}, "
-        f"breadth_tier={gate_diag['trade_breadth_tier_applied']})"
+        f"breadth_tier={gate_diag['trade_breadth_tier_applied']}, "
+        f"edge_blend={gate_diag['trade_edge_blend_applied']})"
     )
     if not observe_only:
         log_performance_summary()
@@ -1959,6 +2017,19 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         if price_health["down"]:
             logger.critical(f"[price] PRICE PROVENANCE — {price_health['message']}.")
 
+    # Calibration snapshot: the exact self-calibrated parameter values this run
+    # traded with (real-fill cost, session spread multipliers, cost hurdle,
+    # breadth ramp, …) — stashed in gate_diag (the no-schema-change channel,
+    # like the provenance verdict) so every run's calibrations are durable and
+    # the dashboard's Data Quality tab can show current-vs-prior-vs-evidence.
+    try:
+        from src.performance.calibration import get_calibrations
+        cals = get_calibrations()
+        if cals:
+            gate_diag["calibrations"] = cals
+    except Exception as e:
+        logger.debug(f"[calibration] snapshot skipped: {e}")
+
     # Persist run + 'APIs used' + every recommendation (with attribution) +
     # the broker reconcile report (per-order slippage/commissions) + the full
     # per-ticker signal cross-section (the learning panel) to DuckDB.
@@ -1968,6 +2039,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         _confidence_threshold, _allow_buys, signals_by_ticker,
         broker_report=broker_report, snapshots=snapshots,
         synthesis_meta=_synth_meta, sentiment_summary=_sent_summary,
+        universe_sources=universe_source,
     )
 
     # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:

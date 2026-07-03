@@ -386,6 +386,7 @@ def start_scheduler() -> None:
 
             current = _current_slot(now_naive, slots)
 
+
             if current is not None and current[0] != last_run_slot:
                 slot_dt, kind = current
                 lateness = (now_naive - slot_dt).total_seconds()

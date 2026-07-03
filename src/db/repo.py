@@ -279,6 +279,7 @@ def insert_recommendations(recs: List[dict]) -> None:
 _SIGNAL_BASE_COLS = [
     "run_id", "generated_at", "signal_date", "ticker", "type", "direction",
     "combined_score", "confidence", "n_methods_agreeing", "dominant_method", "price",
+    "universe_source",
 ]
 _SIGNAL_COLS = _SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS) + ["scores"]
 
@@ -308,7 +309,8 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
              _f(r.get("confidence")),
              r.get("n_methods_agreeing"),
              r.get("dominant_method"),
-             _f(r.get("price"))]
+             _f(r.get("price")),
+             r.get("universe_source")]
             + [_f(scores.get(m)) for m in SIGNAL_METHOD_COLUMNS]
             + [_json(scores)]
         ))
@@ -537,7 +539,8 @@ def fetch_filled_lmt_legs() -> list:
     commission. Used to calibrate the sim cost (``tracker.calibrate_sim_costs``)
     and to show the IBKR one-way cost. ``[]`` when the table/file isn't there
     yet (fresh DB, tests). MKT fills never appear by construction."""
-    sql = ("SELECT client_ref, side, filled_qty, model_price, fill_price, commission "
+    sql = ("SELECT client_ref, side, filled_qty, model_price, fill_price, commission, "
+           "submitted_at "
            "FROM broker_orders "
            "WHERE upper(order_type) = 'LMT' AND filled_qty > 0 AND fill_price IS NOT NULL "
            "AND event <> 'DRIFT_FLATTEN' AND intent IN ('ENTRY', 'EXIT')")

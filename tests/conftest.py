@@ -50,12 +50,24 @@ def _spread_only_costs(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_real_cost_override():
-    """Reset the process-global real-fill cost override before AND after every
-    test. It's a module-global in spread.py installed by calibrate_sim_costs;
-    without this reset one test's calibration could leak into another's
-    hand-computed spread/NAV assertions."""
+    """Reset the process-global real-fill cost override (flat + per-session)
+    and the calibration registry before AND after every test. They're
+    module-globals installed by calibrate_sim_costs / the calibrated
+    computations; without this reset one test's calibration could leak into
+    another's hand-computed spread/NAV assertions."""
     from src.performance import spread
+    from src.performance.calibration import reset_calibrations
+    from src.analysis.exit_floor_calibration import reset_cache as _reset_exit_floor
+    from src.analysis.threshold_calibration import reset_cache as _reset_threshold
+    from src.performance.edge_sizing import reset_cache as _reset_edge
 
-    spread.set_real_cost_override(None)
+    def _reset_all():
+        spread.set_real_cost_override(None)
+        reset_calibrations()
+        _reset_exit_floor()
+        _reset_threshold()
+        _reset_edge()
+
+    _reset_all()
     yield
-    spread.set_real_cost_override(None)
+    _reset_all()

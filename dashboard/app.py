@@ -158,6 +158,7 @@ def _fmt_et(iso_str) -> str:
 
 _INT = Format(precision=0, scheme=Scheme.fixed)
 _NUM2 = Format(precision=2, scheme=Scheme.fixed)
+_NUM4 = Format(precision=4, scheme=Scheme.fixed)
 
 
 def _columns(spec):
@@ -1851,7 +1852,41 @@ def _data_quality_tab():
             style={"color": "#6b7280", "marginBottom": 12}),
         _safe(_source_reliability_section),
         _safe(_method_coverage_section),
+        _safe(_calibrations_section),
     ])
+
+
+def _calibrations_section():
+    """Live view of every SELF-CALIBRATED parameter: the exact value in force
+    on the latest run vs its documented prior and the evidence count behind it
+    — so a drifting or mis-learning parameter is as visible as a dark feed."""
+    cals = (data.latest_gate_diag() or {}).get("calibrations") or []
+    heading = _h3(
+        "Calibrations — self-adapting parameters (latest run)",
+        "Each row is a parameter the system LEARNS from its own data instead of a hardcoded "
+        "constant: real-fill trading cost, per-session spread multipliers, the horizon cost "
+        "hurdle, the breadth-sizing ramp, … 'Value' is what the latest run actually traded "
+        "with; 'Prior' is the documented fallback it shrinks toward when evidence is thin; "
+        "'Evidence n' is how many observations back the current value (0 = prior fully in "
+        "force). A value drifting far from its prior on strong evidence is the system "
+        "learning; on WEAK evidence it deserves a look. Snapshotted per run into gate_diag.")
+    if not cals:
+        return html.Div([heading, html.Div(
+            "No calibration snapshot yet — appears after the next pipeline run on this code.",
+            style={"color": "#6b7280"})])
+    rows = [{
+        "name": c.get("name"), "value": c.get("value"), "prior": c.get("prior"),
+        "n": c.get("n_evidence"), "unit": c.get("unit"), "note": c.get("note"),
+    } for c in cals]
+    cols = [
+        {"name": "Parameter", "id": "name"},
+        {"name": "Value", "id": "value", "type": "numeric", "format": _NUM4},
+        {"name": "Prior", "id": "prior", "type": "numeric", "format": _NUM4},
+        {"name": "Evidence n", "id": "n", "type": "numeric", "format": _INT},
+        {"name": "Unit", "id": "unit"},
+        {"name": "Basis", "id": "note"},
+    ]
+    return html.Div([heading, dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW)])
 
 
 def _source_reliability_section():

@@ -1405,6 +1405,76 @@ class Settings(BaseSettings):
     # the same DuckDB. Set False to keep the modeled cost.
     sim_use_real_fill_costs: bool = True
     sim_real_fill_costs_min_legs: int = 10
+    # ── Per-session cost calibration (2026-07-03) ────────────────────────
+    # The flat real-fill override blends all sessions into one number, which
+    # under-charges extended/overnight legs and slightly over-charges RTH.
+    # When enough fills exist the override carries a per-session split: RTH
+    # measured directly (needs ≥ session_cost_min_legs RTH legs); extended /
+    # overnight = RTH × a session multiplier Bayesian-shrunk from that
+    # session's own fills toward the documented ×4/×10 priors
+    # (spread_extended_multiplier / spread_overnight_multiplier), floored at
+    # 1.0 (off-hours never cheaper than RTH) and capped at 2× the prior. So
+    # the punitive ×10 overnight assumption relaxes toward MEASURED overnight
+    # costs as venue fills accrue — automatically, with the conservative
+    # prior in force until then. Deterministic (a pure function of the
+    # broker_orders fills in the same DuckDB).
+    session_spread_calibration_enabled: bool = True
+    session_cost_min_legs: int = 5        # min legs before a session's own mean counts
+    session_spread_prior_n: int = 20      # pseudo-legs behind the ×4/×10 priors
+    # ── Derived horizon cost hurdle (2026-07-03) ─────────────────────────
+    # horizon_cost_hurdle_pct froze the round-trip hurdle at 0.40% while the
+    # system MEASURES its real cost (~0.16% round trip from LMT fills). When
+    # a real-fill calibration is active the hurdle derives instead:
+    #   hurdle% = 2 × calibrated one-way% × cost_hurdle_safety
+    # (clamped to [0.05, 2.0]%), so horizon selection tracks actual execution
+    # costs. The static setting remains the no-calibration fallback.
+    cost_hurdle_use_calibrated: bool = True
+    cost_hurdle_safety: float = 1.5
+    # ── Engine-relative actionable threshold (2026-07-03) ────────────────
+    # Confidence distributions are ENGINE-specific (DeepSeek hands out 1.00s,
+    # Claude tops out lower), so absolute thresholds silently change meaning
+    # when the A/B flip or ANALYST_MODEL changes engines. When enabled, each
+    # static threshold (regime ladder included) is translated into the run
+    # engine's own confidence scale by matching the gate's SELECTIVITY —
+    # effective = Q_engine(F_global(static)) over the last
+    # threshold_calibration_days of BUY/SELL recommendations — then shrunk
+    # toward the static anchor while the engine's history is thin and clamped
+    # to ±threshold_max_shift (the gate drifts with evidence, never jumps).
+    threshold_engine_relative_enabled: bool = True
+    threshold_calibration_days: int = 30
+    threshold_min_global_recs: int = 300   # min all-engine sample before translating
+    threshold_engine_prior_n: int = 150    # pseudo-recs behind the static anchor
+    threshold_max_shift: float = 0.08      # max drift from the static threshold
+    # ── Calibrated exit-confidence floor (2026-07-03) ────────────────────
+    # signal_decay_confidence_floor froze the absolute close threshold at 0.45
+    # while trade_reviews records, every tick, exactly the evidence that
+    # decides it: re-affirmation confidence vs the position's oriented forward
+    # return. The calibrated floor = the lowest confidence where holding is
+    # still profitable (below-floor reviews lose money, above-floor make it),
+    # Bayesian-shrunk toward the static prior and clamped to the band below.
+    # The static setting remains the prior/fallback; the relative floor
+    # (× entry confidence) stays static by design.
+    exit_floor_calibration_enabled: bool = True
+    exit_floor_calibration_days: int = 60
+    exit_floor_prior_n: int = 150          # pseudo-reviews behind the static prior
+    exit_floor_min_side: int = 25          # min reviews on each side of a candidate
+    exit_floor_min: float = 0.30
+    exit_floor_max: float = 0.70
+    # ── Unified expected-edge sizing (2026-07-03) ────────────────────────
+    # The learned successor to the hand-shaped conviction tiers: a ridge model
+    # of REALIZED returns on standardized entry features (breadth · confidence
+    # · combined_score · news · momentum · off-RTH, direction-oriented) whose
+    # say over the final size grows with closed-trade evidence —
+    #   final = tier chain × ((1−w)·prior + w·edge_mult)/prior,
+    #   w = n_closed/(n_closed + edge_prior_n), 0 below edge_min_closed —
+    # so today it nudges (~15% weight) and takes over only as the ledger
+    # earns it. Never a gate, never flips direction; bounded by
+    # edge_size_span and a hard ratio clamp. See performance/edge_sizing.py.
+    edge_sizing_enabled: bool = True
+    edge_min_closed: int = 20              # realized closes before the model has ANY say
+    edge_prior_n: int = 150                # closes for a 50/50 split with the tier prior
+    edge_size_span: float = 0.25           # max ± tilt the model alone can express
+    edge_ridge_lambda: float = 1.0         # ridge strength (× n, standardized features)
     # The flat real-fill override is measured from LIQUID LMT fills; applying it
     # to instruments far outside that basis grossly understates their cost (a
     # $0.05 warrant with a ~35%-wide book was being charged 8 bp — observed
