@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python main.py                # Run once, console output only
 python main.py --email        # Run once and send email report
-python main.py --schedule     # Start the poll-loop runner (RTH every 30 min 9:30–16:00 ET + extended trading ticks 4:00–19:50 + overnight ticks 20:30–03:30 hourly on the overnight venue's own Sun–Thu-night calendar; NYSE market days for rth/extended; emails at the `scheduler_email_times` slots — default 04:00/09:30/16:00/19:50 ET; `scheduler_email_every_tick` overrides → every slot; empty `scheduler_email_times` → only the 16:00 close)
+python main.py --schedule     # Start the poll-loop runner (RTH every 30 min 9:30–16:00 ET + extended trading ticks 4:00–19:50 + overnight ticks 20:30–03:30 hourly on the overnight venue's own Sun–Thu-night calendar; NYSE market days for rth/extended; emails at the `scheduler_email_times` slots — default 04:00/09:30/16:00/19:50 ET; `scheduler_email_every_tick` overrides → every slot; empty `scheduler_email_times` → only the 16:00 close. Once per market day at/after `eod_maintenance_time` 16:20 ET the loop runs EOD maintenance — forward-return OHLCV cache warm (fuel for the IC panels / policy evals / calibrations, `data/cache_warm.py`) + `simulated_trades` retention (collapse old intraday bloat, age-prune, `db/retention.py`) — off the time-critical path, `enable_eod_maintenance`)
 python main.py --supervise    # PRODUCTION: run --schedule under an external auto-restart supervisor (src/scheduler/supervisor.py) that relaunches the scheduler if the process dies (it died silently — no traceback — under the kaleido email crash). To STOP a supervised scheduler, kill the `--supervise` parent FIRST (so it can't respawn), then the `--schedule` child.
 python main.py --dashboard    # Launch the read-only monitoring dashboard (Plotly Dash via waitress; in-process auto-restart)
 python main.py --backfill     # Pre-warm the OHLCV caches for the WHOLE universe via Massive/Polygon (deep daily history), then exit (add --backfill-30m to also warm the 30-min cache). Additive — merges into cache/ohlcv/, never deletes. Standalone: `python -m src.data.backfill [--days 730] [--with-30m] [--skip-daily] [--signal-days 90]` (`--skip-daily` = 30-min-only top-up when daily is already warm). WEEKLY needs no pass — it is resampled from the daily cache on demand, so a deep daily backfill gives deep weekly automatically. 30-min depth is Polygon-capped (~120 days via `intraday_30m_lookback_days`).
@@ -229,7 +229,7 @@ Available analyst models (set in `.env`):
 | Global macro (DXY + Cu/Au) | `YYYY-MM-DD` | 1 day | `cache/global_macro_*.json` |
 | Sector rotation (Ebb & Flow) | `YYYY-MM-DD` | 1 day | `cache/sector_rotation_*.json` |
 | Rotation Drivers (rate cycle) | `YYYY-MM-DD` | 1 day | `cache/rotation_drivers_*.json` |
-| OHLCV (charts, daily) | per ticker | incremental | `cache/ohlcv/*.json` |
+| OHLCV (charts, daily) | per ticker | incremental (+ daily EOD warm) | `cache/ohlcv/*.json` |
 | OHLCV 30-min (multi-timeframe) | per ticker | ~25 min (`intraday_30m_ttl_minutes`) | `cache/ohlcv_30m/*.json` |
 | COT positioning | ISO week | 1 week | `cache/cot_YYYY_WW.json` |
 | Insider cluster watchlist | ticker | 10 days | `cache/cluster_watchlist.json` |

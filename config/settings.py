@@ -1477,6 +1477,29 @@ class Settings(BaseSettings):
     exit_conviction_span_prior: float = 0.03   # floor nudge with ~no evidence (gentle)
     exit_conviction_span_max: float = 0.10     # bounded cap at full evidence
     exit_conviction_prior_n: int = 40          # closed trades for the ramp half-life
+
+    # ── End-of-day maintenance (2026-07-04) — scalability for the weeks ahead ──
+    # Once per market day, at/after eod_maintenance_time ET (robust to missed
+    # slots: fires on the first poll past the trigger), the scheduler (a) WARMS
+    # the forward-return OHLCV cache for every learning-panel ticker — the fuel
+    # for the IC panels / policy evals / calibrations, which otherwise starve on
+    # a stale cache (observed 2026-07-03) — and (b) runs table RETENTION.
+    enable_eod_maintenance: bool = True
+    eod_maintenance_time: str = "16:20"        # ET; after the 16:00 close tick settles
+    eod_cache_warm_days: int = 120             # panel lookback to warm
+    eod_cache_warm_max_tickers: int = 0        # 0 = all panel tickers
+    # Retention: simulated_trades is a derived long-format reshape of `signals`
+    # (~25×/row) growing ~130k rows/day. Keep a recent RAW window (the entry-
+    # event detector needs its intraday sequence), collapse older data to the
+    # deduped last-per-(day,ticker,method) the analysis reads (behavior-neutral
+    # over the old window), and hard-delete beyond the keep window. exit_signals
+    # is age-pruned only; `signals`/`trade_reviews` (source/primary) are left to
+    # a generous prune. Set enable_sim_retention=false to keep everything.
+    enable_sim_retention: bool = True
+    sim_retention_raw_days: int = 14           # keep full intraday resolution this recent
+                                               # (tune down to ~7 for a tighter bound)
+    sim_retention_keep_days: int = 150         # hard-delete simulated_trades beyond this
+    exit_signals_keep_days: int = 150          # hard-delete exit_signals beyond this
     # ── Unified expected-edge sizing (2026-07-03) ────────────────────────
     # The learned successor to the hand-shaped conviction tiers: a ridge model
     # of REALIZED returns on standardized entry features (breadth · confidence

@@ -216,6 +216,39 @@ def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
     return observe, send_email
 
 
+def _should_run_eod(now_naive: datetime, last_eod_date, eod_time: _time) -> bool:
+    """True on the first poll at/after ``eod_time`` ET on a market day it hasn't
+    yet run for. Independent of the slot grid, so a missed close slot never
+    blocks maintenance — it fires whenever the machine is next awake past the
+    trigger."""
+    if not settings.enable_eod_maintenance:
+        return False
+    return (last_eod_date != now_naive.date()
+            and now_naive.time() >= eod_time
+            and is_market_day(now_naive.date()))
+
+
+def _run_eod_maintenance() -> None:
+    """Warm the forward-return cache (fuel for every learning surface) then run
+    table retention. Heavy but off the time-critical path (after the close
+    tick). Each half is fail-soft so one failure never blocks the other."""
+    logger.info("[scheduler] EOD maintenance: warming forward-return cache + retention…")
+    try:
+        from src.data.cache_warm import warm_forward_return_cache
+        warm_forward_return_cache(
+            days=int(settings.eod_cache_warm_days),
+            max_tickers=(settings.eod_cache_warm_max_tickers or None))
+    except Exception as exc:
+        logger.warning(f"[scheduler] EOD cache warm failed: {exc}")
+    try:
+        from src.db.retention import run_retention
+        res = run_retention()
+        if res:
+            logger.info(f"[scheduler] EOD retention: {res}")
+    except Exception as exc:
+        logger.warning(f"[scheduler] EOD retention failed: {exc}")
+
+
 def _alert(subject: str, body: str) -> None:
     """Operational alert email (fail-soft, gated by ``scheduler_alert_email``).
     A suspended machine can't alert in the moment — these fire on wake, which is
@@ -351,6 +384,11 @@ def start_scheduler() -> None:
     last_run_slot: datetime | None = None
     alerted_slots: set[datetime] = set()
     prev_poll: datetime | None = None
+    last_eod_date = None
+    eod_time = _parse_hhmm(settings.eod_maintenance_time, _time(16, 20)) or _time(16, 20)
+    if settings.enable_eod_maintenance:
+        logger.info(f"EOD maintenance at/after {eod_time.strftime('%H:%M')} ET: "
+                    "forward-return cache warm + table retention (market days).")
     try:
         while True:
             now_naive = now_et().replace(tzinfo=None)
@@ -454,6 +492,15 @@ def start_scheduler() -> None:
                         except Exception as exc:
                             logger.exception(f"[scheduler] catch-up tick raised: {exc}")
                 last_run_slot = slot_dt  # mark even when skipped, so we don't retry this slot
+
+            # End-of-day maintenance — once per market day past the trigger,
+            # off the time-critical path (runs between ticks, after the close).
+            if _should_run_eod(now_naive, last_eod_date, eod_time):
+                last_eod_date = now_naive.date()
+                try:
+                    _run_eod_maintenance()
+                except Exception as exc:
+                    logger.exception(f"[scheduler] EOD maintenance raised: {exc}")
 
             _time_module.sleep(poll)
     except (KeyboardInterrupt, SystemExit):
