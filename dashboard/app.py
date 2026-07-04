@@ -939,6 +939,76 @@ def _simulated_perf_section(window_days, session=None, direction=None,
     return html.Div(children)
 
 
+_POLICY_TOOLTIP = (
+    "Offline policy evaluation — the COUNTERFACTUAL P&L of alternative sizing policies, "
+    "replayed over the signals panel (every scored ticker, not just the trades that opened, "
+    "so it's free of the ledger's selection bias). Because forward returns are observable for "
+    "EVERY candidate, no importance-sampling is needed — each policy is simply replayed with "
+    "known outcomes. All rows share the SAME actionable gate, so they trade the identical set "
+    "(same 'Decisions' and equal-weighted 'Avg net %'); they differ ONLY in how they SIZE, "
+    "which shows up in 'Cap-wtd net %' (capital-weighted return — where the sizing actually "
+    "lands the money). A sizing policy EARNS ITS KEEP only if its cap-weighted return beats "
+    "'flat (gate only)'. 'Info ratio' is mean/std of the per-day return (each day counted once). "
+    "Net of the same calibrated round-trip cost the ledger charges. Forward-collected + thin "
+    "(a 5-day horizon needs 5 sessions of cache past each signal) — directional, not yet "
+    "conclusive; watch it thicken.")
+
+
+def _policy_eval_section():
+    """Head-to-head counterfactual of the sizing policies over the unbiased
+    signals panel — the standing answer to 'does breadth/confidence sizing earn
+    its keep?'. Shown at 1-day and 5-day horizons (short horizons fill in first)."""
+    children = [_h3("Sizing policy comparison — counterfactual (offline eval)", _POLICY_TOOLTIP)]
+    any_data = False
+    for h in (1, 5):
+        df = data.policy_comparison(days=90, horizon=h)
+        if df is None or getattr(df, "empty", True):
+            continue
+        any_data = True
+        rows, flat = [], None
+        for _, r in df.iterrows():
+            if str(r["policy"]).startswith("flat"):
+                flat = r.get("cap_wtd_ret")
+        for _, r in df.iterrows():
+            cw = r.get("cap_wtd_ret")
+            vs = (round(float(cw) - float(flat), 3)
+                  if cw is not None and flat is not None and not str(r["policy"]).startswith("flat")
+                  else None)
+            rows.append({
+                "policy": r["policy"], "decisions": r.get("n_decisions"), "days": r.get("n_days"),
+                "win": r.get("win_rate"), "avg": r.get("avg_net_ret"),
+                "capwtd": cw, "vs_flat": vs, "ir": r.get("info_ratio"),
+            })
+        cols = [
+            {"name": "Policy", "id": "policy"},
+            {"name": "Decisions", "id": "decisions", "type": "numeric", "format": _INT},
+            {"name": "Days", "id": "days", "type": "numeric", "format": _INT},
+            {"name": "Win %", "id": "win", "type": "numeric", "format": _NUM2},
+            {"name": "Avg net %", "id": "avg", "type": "numeric", "format": _NUM2},
+            {"name": "Cap-wtd net %", "id": "capwtd", "type": "numeric", "format": _NUM2},
+            {"name": "vs flat", "id": "vs_flat", "type": "numeric", "format": _NUM2},
+            {"name": "Info ratio", "id": "ir", "type": "numeric", "format": _NUM2},
+        ]
+        children.append(html.Div(f"{h}-day horizon", style={
+            "fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#cbd5e1"}))
+        children.append(dash_table.DataTable(
+            data=rows, columns=cols,
+            style_data_conditional=[
+                {"if": {"filter_query": "{vs_flat} > 0", "column_id": "vs_flat"},
+                 "color": figures.POS, "fontWeight": "bold"},
+                {"if": {"filter_query": "{vs_flat} < 0", "column_id": "vs_flat"},
+                 "color": figures.NEG, "fontWeight": "bold"},
+                {"if": {"filter_query": '{policy} contains "flat"'}, "backgroundColor": "#1f2937"},
+            ],
+            **_TABLE_KW))
+    if not any_data:
+        children.append(html.Div(
+            "No decidable decisions yet — the signals panel needs forward-return history "
+            "(warm it with `python -m src.analysis.signal_panel --refresh`).",
+            style={"color": "#6b7280"}))
+    return html.Div(children)
+
+
 def _methods_tab():
     # The LLM-models-used table is run-based (not trade-windowed), so it lives
     # outside the windowed body. The per-method performance section (bar + table)
@@ -960,6 +1030,7 @@ def _methods_tab():
         _sim_column_filters(),
         dcc.Loading(html.Div(id="methods-body")),
         _safe(_ic_section),
+        _safe(_policy_eval_section),
         _h3("LLM models used (synthesis & sentiment)",
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
         models_table,
@@ -1317,7 +1388,75 @@ def _exit_body(window_value, session_value, direction_value, source_value,
             "toggle does not apply (closed trades are few). Open trades excluded (no exit "
             "yet)."),
         _safe(lambda: _exit_reason_block(session=session, direction=direction)),
+        _safe(_exit_policy_eval_section),
     ])
+
+
+_EXIT_POLICY_TOOLTIP = (
+    "Offline EXIT policy evaluation — the COUNTERFACTUAL value of alternative CLOSE rules, "
+    "the exit-side twin of the entry sizing comparison. Each held position-day is a "
+    "close-vs-hold decision; the reward is what the position DID NEXT: holding captures its "
+    "oriented forward return, closing captures 0. A good close rule therefore CLOSES the days "
+    "whose forward return is about to go negative (cutting losers) and HOLDS the rest. "
+    "'avg_fwd_on_close' is the mean oriented forward return of the days each rule closed — "
+    "you WANT it negative (you avoided a drop). 'exit_alpha' = held_mean − allhold_mean: how "
+    "much better the book you CARRY does than holding everything; > 0 means the rule earns its "
+    "keep, and 'always hold' is the 0 baseline. This validates whether an exit-BREADTH or "
+    "aggregator rule beats the current LLM-scalar close BEFORE any of it is wired live. "
+    "Replayed over the exit_signals panel (every held tick, deduped to last-per-day) + OHLCV "
+    "forward returns — but that panel is NEW, so this fills in slowly; judge nothing until it "
+    "spans many days (info_ratio populates only after >1 day).")
+
+
+def _exit_policy_eval_section():
+    """Counterfactual close-rule comparison — does exit-breadth / aggregator beat
+    the current LLM-scalar close? Shown at 1-day and 5-day horizons."""
+    children = [_h3("Close-rule comparison — counterfactual (offline exit eval)",
+                    _EXIT_POLICY_TOOLTIP)]
+    any_data = False
+    for h in (1, 5):
+        df = data.exit_policy_comparison(days=90, horizon=h)
+        if df is None or getattr(df, "empty", True):
+            continue
+        any_data = True
+        rows = [{
+            "policy": r["policy"], "decisions": r.get("n_decisions"), "days": r.get("n_days"),
+            "close_pct": r.get("close_rate"), "fwd_on_close": r.get("avg_fwd_on_close"),
+            "fwd_on_hold": r.get("avg_fwd_on_hold"), "alpha": r.get("exit_alpha"),
+            "ir": r.get("info_ratio"),
+        } for _, r in df.iterrows()]
+        cols = [
+            {"name": "Close rule", "id": "policy"},
+            {"name": "Decisions", "id": "decisions", "type": "numeric", "format": _INT},
+            {"name": "Days", "id": "days", "type": "numeric", "format": _INT},
+            {"name": "Close %", "id": "close_pct", "type": "numeric", "format": _NUM2},
+            {"name": "Fwd on close %", "id": "fwd_on_close", "type": "numeric", "format": _NUM2},
+            {"name": "Fwd on hold %", "id": "fwd_on_hold", "type": "numeric", "format": _NUM2},
+            {"name": "Exit alpha %", "id": "alpha", "type": "numeric", "format": _NUM2},
+            {"name": "Info ratio", "id": "ir", "type": "numeric", "format": _NUM2},
+        ]
+        children.append(html.Div(f"{h}-day horizon", style={
+            "fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#cbd5e1"}))
+        children.append(dash_table.DataTable(
+            data=rows, columns=cols,
+            style_data_conditional=[
+                {"if": {"filter_query": "{alpha} > 0", "column_id": "alpha"},
+                 "color": figures.POS, "fontWeight": "bold"},
+                {"if": {"filter_query": "{alpha} < 0", "column_id": "alpha"},
+                 "color": figures.NEG, "fontWeight": "bold"},
+                # A good close: forward return on the days it cut is negative.
+                {"if": {"filter_query": "{fwd_on_close} < 0", "column_id": "fwd_on_close"},
+                 "color": figures.POS},
+                {"if": {"filter_query": '{policy} contains "always hold"'},
+                 "backgroundColor": "#1f2937"},
+            ],
+            **_TABLE_KW))
+    if not any_data:
+        children.append(html.Div(
+            "No decidable exit decisions yet — the exit_signals panel needs forward-return "
+            "history (it is newer than the entry panel; accrues as positions are held and the "
+            "OHLCV cache warms past each review day).", style={"color": "#6b7280"}))
+    return html.Div(children)
 
 
 # ── Tab 3: Returns ─────────────────────────────────────────────────────────

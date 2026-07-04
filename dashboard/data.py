@@ -381,6 +381,34 @@ def method_coverage(days: int = 14) -> dict:
                    lambda: _retry(lambda: compute_method_coverage(load_signal_rows(days)), "method_coverage"))
 
 
+def policy_comparison(days: Optional[int] = 90, horizon: int = 5) -> pd.DataFrame:
+    """Counterfactual sizing-policy comparison over the signals panel (offline
+    policy evaluation). Cached (the OHLCV forward-return join is heavy);
+    run-based, so it ignores the window/session toggles. Empty until the panel
+    has forward-return history."""
+    from src.analysis.policy_eval import compare_policies
+
+    def _q():
+        try:                                   # match the ledger's calibrated cost basis
+            from src.performance.tracker import calibrate_sim_costs
+            calibrate_sim_costs()
+        except Exception:
+            pass
+        return compare_policies(days=days, horizon=horizon)
+    return _cached(("policy_comparison", days, int(horizon)), lambda: _retry(_q, "policy_comparison"))
+
+
+def exit_policy_comparison(days: Optional[int] = 90, horizon: int = 5) -> pd.DataFrame:
+    """Counterfactual CLOSE-rule comparison over the exit_signals panel (offline
+    exit policy evaluation — does exit-breadth/aggregator beat the current
+    LLM-scalar close?). Cached (the OHLCV forward-return join is heavy);
+    run-based. Empty until the exit panel has forward-return history."""
+    from src.analysis.exit_policy_eval import compare_exit_policies
+    return _cached(("exit_policy_comparison", days, int(horizon)),
+                   lambda: _retry(lambda: compare_exit_policies(days=days, horizon=horizon),
+                                  "exit_policy_comparison"))
+
+
 def dark_sources(days: int = 14) -> list:
     """Historically-populated feeds whose recent successful fetches are ALL
     empty (the 0%→100% went-dark Δ — e.g. quiver_congress 2026-06-29). Powers
