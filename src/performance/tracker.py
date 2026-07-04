@@ -2050,6 +2050,7 @@ def _evaluate_decay(
     today_signal,
     macro_regime_context,
     hold_review=None,
+    exit_conviction_adj: float = 0.0,
 ) -> Optional[str]:
     """Return an ``exit_reason`` when an open trade should close, else ``None``.
 
@@ -2126,7 +2127,16 @@ def _evaluate_decay(
         # closes through another door. Only an explicit reversal or a genuine
         # same-direction conviction collapse closes.
         if rev_action == action:
-            if conv < _confidence_floor(trade.get("confidence")):  # entry conf = the LLM number that gated the open
+            # Effective floor = the entry-relative calibrated floor, nudged by
+            # the raw-method EXIT CONSENSUS (evidence-throttled, bounded; 0 with
+            # no data → exactly the pre-2026-07-03 behavior). Consensus says
+            # exit → floor raised (close a lukewarm reaffirm the methods no
+            # longer support); says hold → floor lowered (a confident LLM hold
+            # is already above the floor, so this only makes borderline holds
+            # stickier). Clamped to a sane band so the nudge can't run away.
+            base_floor = _confidence_floor(trade.get("confidence"))  # entry conf = the LLM number that gated the open
+            effective_floor = min(0.95, max(0.20, base_floor + float(exit_conviction_adj or 0.0)))
+            if conv < effective_floor:
                 return "llm_confidence_loss"
         return None
     if settings.enable_llm_hold_review and opener_is_llm:
@@ -2211,13 +2221,29 @@ def monitor_open_positions(
     decision_at = _now_iso()
     executed_at = _execution_iso()
 
+    # Exit-conviction consensus (the entry-breadth analog): calibrated once from
+    # the pre-monitor ledger, then applied per position as a bounded, evidence-
+    # throttled nudge to the same-direction close floor. Inert (0) with no data.
+    from src.analysis.exit_conviction import exit_conviction_calibration, exit_floor_adjustment
+    from src.analysis.exit_methods import build_exit_scores
+    exit_conv_cal = exit_conviction_calibration(trades)
+
     for trade in trades:
         if trade.get("status") != "OPEN":
             continue
 
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
         hold_review = (hold_reviews or {}).get(trade["ticker"])
-        reason = _evaluate_decay(trade, today_signal, macro_regime_context, hold_review)
+        exit_adj = 0.0
+        if settings.enable_exit_conviction and hold_review is not None:
+            try:
+                _escores = build_exit_scores(trade, hold_review, signals_by_ticker,
+                                             macro_regime_context)
+                exit_adj = exit_floor_adjustment(_escores, exit_conv_cal)
+            except Exception as e:
+                logger.debug(f"[exit_conviction] adj skipped for {trade.get('ticker')}: {e}")
+        reason = _evaluate_decay(trade, today_signal, macro_regime_context, hold_review,
+                                 exit_conviction_adj=exit_adj)
         # Opt-in intraday exit: close when the 30-min trend has reversed hard
         # against the position (Hybrid model — intraday only times the exit).
         if reason is None and settings.enable_intraday_exit:

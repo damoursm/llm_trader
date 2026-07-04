@@ -1460,6 +1460,23 @@ class Settings(BaseSettings):
     exit_floor_min_side: int = 25          # min reviews on each side of a candidate
     exit_floor_min: float = 0.30
     exit_floor_max: float = 0.70
+    # ── Exit-conviction consensus (2026-07-03) — the entry-breadth analog ──
+    # The exit decision used a single LLM-scalar hold-review and ignored the
+    # 27-method exit-conviction panel. This nudges the same-direction close
+    # floor by the breadth-of-raw-methods EXIT CONSENSUS (mean of the signal
+    # methods' oriented exit scores; LLM review + aggregator excluded so Fix #2
+    # trigger-happiness isn't reintroduced): consensus says exit → floor raised
+    # (close more readily); says hold → floor lowered (hold more readily).
+    # EVIDENCE-THROTTLED + BOUNDED: span_eff ramps with the closed-trade sample
+    # from a small prior toward a cap, so a confident LLM hold is never
+    # overridden (only borderline convictions get tipped) and with no data it's
+    # a gentle nudge. UNVALIDATED by design — to be confirmed/denied over the
+    # coming weeks by the offline exit_policy_eval harness; set enabled=False to
+    # revert to the pure LLM-scalar close. See analysis/exit_conviction.py.
+    enable_exit_conviction: bool = True
+    exit_conviction_span_prior: float = 0.03   # floor nudge with ~no evidence (gentle)
+    exit_conviction_span_max: float = 0.10     # bounded cap at full evidence
+    exit_conviction_prior_n: int = 40          # closed trades for the ramp half-life
     # ── Unified expected-edge sizing (2026-07-03) ────────────────────────
     # The learned successor to the hand-shaped conviction tiers: a ridge model
     # of REALIZED returns on standardized entry features (breadth · confidence
