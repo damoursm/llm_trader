@@ -54,6 +54,10 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     # Performance tables. Still grouped under the IC table's "Fundamentals" category
     # via SIGNAL_FUNDAMENTAL_COLUMNS (now a categorisation subset of this BASE set).
     "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend",
+    # Trend-predictability methods — signed Kaufman efficiency + ADX·DMI, split into
+    # one-sided long/short methods (2026-07-04). Additive overlay on combined_score,
+    # tracked per-method here so each side's IC is measured independently.
+    "kaufman_long", "kaufman_short", "adx_long", "adx_short",
 )
 
 # Multi-timeframe technical columns — the 30-min + weekly variants of the 8
@@ -308,6 +312,11 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_FUNDAMENTAL_COLUMNS),
     # Broker-advisor method column on an existing signals table.
     ("signals", "broker_advisor", "DOUBLE"),
+    # Trend-predictability methods (Kaufman/ADX, split long/short) on an existing DB.
+    ("signals", "kaufman_long", "DOUBLE"),
+    ("signals", "kaufman_short", "DOUBLE"),
+    ("signals", "adx_long", "DOUBLE"),
+    ("signals", "adx_short", "DOUBLE"),
     # Universe provenance (2026-07-03): which discovery source first surfaced
     # the ticker this run (watchlist / trending / screener / smart_money / …) —
     # the measurement behind per-source hit rates and, later, an adaptive

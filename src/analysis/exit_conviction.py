@@ -40,7 +40,8 @@ from config.settings import settings
 # Method scores that are NOT part of the raw-method breadth consensus: the LLM
 # review (that IS the conviction the floor tests), the aggregator combined score
 # (Fix #2 distrusts it for exits), and the non-signal decision/excursion layers.
-_CONSENSUS_SKIP = frozenset({"llm_review", "aggregator", "horizon", "macro_regime", "mfe", "mae"})
+_CONSENSUS_SKIP = frozenset({"llm_review", "aggregator", "horizon", "edge_decay",
+                             "macro_regime", "mfe", "mae"})
 
 
 def exit_method_consensus(scores: Dict[str, float]) -> Optional[float]:

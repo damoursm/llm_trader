@@ -691,10 +691,12 @@ _IC_TOOLTIP = (
     "Spearman rank correlation between each method's score and the forward "
     "close-to-close return at 1/5/10 trading-day horizons. Computed over the "
     "persisted signals panel — EVERY scored ticker each run, not just the few that "
-    "became trades — so it is unbiased by the trading gates. Split into four "
+    "became trades — so it is unbiased by the trading gates. Split into five "
     "categories: the 8 OHLCV methods computed on 30-min, daily, and weekly candles "
-    "(the SAME indicators on different bar sizes), and Other (news, sentiment, smart "
-    "money, options, catalysts — most-recent data). 'Sim win %' = simulated solo win "
+    "(the SAME indicators on different bar sizes), Fundamentals, and Other (news, "
+    "sentiment, smart money, options, catalysts — most-recent data). The signed trend "
+    "signals (Kaufman efficiency / ADX·DMI) are evaluated separately in the 'Stock "
+    "discovery — trend signal IC by direction' table below. 'Sim win %' = simulated solo win "
     "rate (share of non-zero scores whose sign matched the move); 'Sim ret %' = "
     "simulated solo return (mean sign(score)×forward-return — the gross P&L if that "
     "method alone decided the trade). 'IC std' = standard deviation of the PER-DAY IC "
@@ -1009,6 +1011,227 @@ def _policy_eval_section():
     return html.Div(children)
 
 
+_PREDICT_TOOLTIP = (
+    "Predictability-feature IC — the measurement behind 'find stocks whose direction is easier to "
+    "forecast for swing trading'. For every scored ticker it computes cheap per-stock features from "
+    "OHLCV **as of the signal date** (no look-ahead), buckets the whole signals panel into quantiles "
+    "of each feature, and reports how well the aggregate combined_score predicted the forward return "
+    "INSIDE each bucket. Features: Kaufman trend efficiency (20d — clean move vs chop), ADX (14d — "
+    "trend strength), realized volatility (20d), and signal breadth (methods agreeing). Per horizon: "
+    "'IC' = Spearman(score, forward return), 'hit %' = directional accuracy, 'sim %' = mean signed "
+    "return. The signal is SEPARATION ACROSS BUCKETS, not the level: a feature is a useful "
+    "predictability filter iff hit/IC/sim climb Low→High (trend features) or peak in the MID bucket "
+    "(volatility). Uses the whole panel (features are OHLCV-derived, not stamp-dependent), so it has "
+    "signal now — but it is ~2 weeks of one regime; treat as directional, and lean on the 5-day "
+    "swing horizon (10-day n is still thin).")
+
+_PREDICT_EDGE_TOOLTIP = (
+    "The punchline: per feature, how much its buckets SEPARATE prediction quality — the "
+    "best-minus-worst-bucket spread in hit % and signed-return %, and which bucket is best, per "
+    "horizon. A large spread with a sensible best bucket (High for trend efficiency / ADX, Mid for "
+    "volatility) means that feature sorts predictable names from unpredictable ones and is worth "
+    "promoting to a discovery-prioritisation / sizing tilt (Tier 1). A spread ≈ 0, or a 'best' "
+    "bucket that contradicts the hypothesis, means it doesn't.")
+
+_PRED_HORIZONS = (1, 5, 10)
+
+
+def _predictability_section():
+    """Bucketed conditional IC of combined_score by per-stock predictability
+    feature — the Tier-0 measurement of which features make our direction call
+    more forecastable at a swing horizon."""
+    res = data.predictability()
+    buckets = res.get("buckets") if isinstance(res, dict) else None
+    edges = res.get("edges") if isinstance(res, dict) else None
+    heading = _h3("Predictability by stock feature (conditional IC)", _PREDICT_TOOLTIP)
+    if buckets is None or getattr(buckets, "empty", True):
+        return html.Div([heading, html.Div(
+            "No signals-panel rows with forward returns yet — warm forward closes with "
+            "`python -m src.analysis.signal_panel --refresh`. Accrues every run.",
+            style={"color": "#6b7280"})])
+
+    children = [heading]
+
+    # ── the edge summary (headline) ──
+    if edges is not None and not getattr(edges, "empty", True):
+        erows = []
+        for _, r in edges.iterrows():
+            row = {"label": r["label"]}
+            for h in _PRED_HORIZONS:
+                hs, hb, ss = (r.get(f"hit_spread_{h}d"), r.get(f"hit_best_{h}d"),
+                              r.get(f"simret_spread_{h}d"))
+                row[f"hitsp_{h}d"] = round(float(hs), 2) if pd.notna(hs) else None
+                row[f"best_{h}d"] = hb if (hb is not None and pd.notna(hb)) else "—"
+                row[f"simsp_{h}d"] = round(float(ss), 3) if pd.notna(ss) else None
+            erows.append(row)
+        ecols = [{"name": "Feature", "id": "label"}]
+        for h in _PRED_HORIZONS:
+            ecols += [
+                {"name": f"Hit spread@{h}d %", "id": f"hitsp_{h}d", "type": "numeric", "format": _NUM2},
+                {"name": f"Best@{h}d", "id": f"best_{h}d"},
+                {"name": f"Sim spread@{h}d %", "id": f"simsp_{h}d", "type": "numeric", "format": _NUM2},
+            ]
+        children += [
+            html.Div("Feature edge — best-minus-worst bucket separation", style={
+                "fontWeight": "bold", "marginTop": 8, "marginBottom": 4, "color": "#cbd5e1"}),
+            html.Div("Larger spread = the feature sorts predictable from unpredictable names. "
+                     "'Best' should be High for trend efficiency / ADX, Mid for volatility.",
+                     title=_PREDICT_EDGE_TOOLTIP,
+                     style={"color": "#94a3b8", "fontSize": 12, "marginBottom": 6, "cursor": "help"}),
+            dash_table.DataTable(data=erows, columns=ecols, **_TABLE_KW),
+        ]
+
+    # ── the bucketed detail ──
+    brows, cond = [], []
+    for _, r in buckets.iterrows():
+        is_base = r["feature"] == "(all rows)"
+        rng = "all" if pd.isna(r.get("lo")) else f"[{float(r['lo']):g}, {float(r['hi']):g}]"
+        row = {"label": "BASELINE (all)" if is_base else r["label"],
+               "bucket": "—" if is_base else r["bucket"], "range": rng,
+               "n_rows": int(r["n_rows"])}
+        for h in _PRED_HORIZONS:
+            n, ic, hit, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
+                               r.get(f"hit_{h}d"), r.get(f"simret_{h}d"))
+            row[f"n_{h}d"] = int(n) if pd.notna(n) else 0
+            row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
+            row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
+            row[f"sim_{h}d"] = round(float(sim), 2) if pd.notna(sim) else None
+        brows.append(row)
+    bcols = [{"name": "Feature", "id": "label"}, {"name": "Bucket", "id": "bucket"},
+             {"name": "Range", "id": "range"},
+             {"name": "Rows", "id": "n_rows", "type": "numeric", "format": _INT}]
+    for h in _PRED_HORIZONS:
+        bcols += [
+            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
+            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"Hit@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"Sim@{h}d %", "id": f"sim_{h}d", "type": "numeric", "format": _NUM2},
+        ]
+        for c in (f"ic_{h}d", f"sim_{h}d"):
+            cond += [
+                {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c}, "color": figures.POS},
+                {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": figures.NEG},
+            ]
+        hc = f"hit_{h}d"
+        cond += [
+            {"if": {"filter_query": f"{{{hc}}} >= 50", "column_id": hc}, "color": figures.POS},
+            {"if": {"filter_query": f"{{{hc}}} < 50", "column_id": hc}, "color": figures.NEG},
+        ]
+    cond.append({"if": {"filter_query": '{bucket} = "—"'}, "backgroundColor": "#1f2937"})
+    children += [
+        html.Div("Bucket detail — combined_score prediction quality within each feature bucket",
+                 style={"fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+        dash_table.DataTable(data=brows, columns=bcols, style_data_conditional=cond, **_TABLE_KW),
+    ]
+    return html.Div(children)
+
+
+_SOURCE_PERF_TOOLTIP = (
+    "Discovery-source performance — which parts of the universe-construction funnel actually "
+    "surface names that move. The pipeline stamps the FIRST discovery source that surfaced each "
+    "ticker (watchlist / trending / screener / macro→holdings / smart_money / sector_etf / "
+    "related-company / catalyst …) onto every scored row; this groups the signals panel (every "
+    "scored ticker, joined with forward returns — NOT just the gate-selected trades, so it's free "
+    "of selection bias) by that stamp. 'Rows' = scored ticker-rows; 'Funnel %' = the source's "
+    "slice of the STAMPED funnel (the '(unstamped)' bucket is pre-stamp history — the stamp is "
+    "forward-collected from 2026-07-03 — so it is excluded from that denominator and sinks to the "
+    "bottom; it still carries forward returns while the freshly-stamped sources' fill in). Per "
+    "horizon (1d/5d/10d): 'n@' = rows with a forward return; 'Fwd ret@ %' = mean RAW forward "
+    "return of the source's names (discovery quality — do these names tend to rise?, "
+    "direction-agnostic); 'Win@ %' = share of moved names that rose; 'IC@' = Spearman correlation "
+    "of the aggregate combined_score against the forward return (signal skill ON this source's "
+    "names — a persistent NEGATIVE IC means the source's names 'trade but predict backwards'). A "
+    "source earns more discovery budget when it combines a large-enough n with a positive Fwd ret "
+    "AND a non-negative IC; a big-share source that is flat-return / negative-IC is funnel noise "
+    "the near-zero-IC gates then have to sift. Run/forward-return based (ignores the window "
+    "toggle); forward-collected — n grows every run, judge nothing on a thin panel.")
+
+_SOURCE_TRADE_TOOLTIP = (
+    "Realized trade outcomes grouped by the discovery source that first surfaced the ticker — the "
+    "small-n, gate-selected counterpart to the forward-return table above (this is what actually "
+    "opened and made or lost money). Direction is baked into the return, so a win is simply "
+    "return > 0. Open trades contribute their live mark-to-market. Judge alongside the unbiased "
+    "panel view — a handful of trades from one source is anecdote, not evidence.")
+
+_SRC_HORIZONS = (1, 5, 10)
+
+
+def _source_perf_section():
+    """Per-discovery-source forward-return performance over the signals panel
+    (the unbiased accumulator behind an adaptive discovery budget) plus the
+    realized per-source trade outcomes from the ledger."""
+    children = [_h3("Discovery source performance (forward returns by provenance)",
+                    _SOURCE_PERF_TOOLTIP)]
+
+    perf = data.source_performance()
+    if perf is None or getattr(perf, "empty", True):
+        children.append(html.Div(
+            "No per-source signal rows with forward returns yet — the signals panel accrues "
+            "every run (warm forward closes with `python -m src.analysis.signal_panel --refresh`).",
+            style={"color": "#6b7280"}))
+    else:
+        rows = []
+        for _, r in perf.iterrows():
+            fp = r.get("funnel_pct")
+            row = {"source": r["source"], "rows": int(r["rows"]),
+                   "funnel_pct": round(float(fp), 1) if pd.notna(fp) else None}
+            for h in _SRC_HORIZONS:
+                n, fwd, win, ic = (r.get(f"n_{h}d"), r.get(f"fwd_{h}d"),
+                                   r.get(f"win_{h}d"), r.get(f"ic_{h}d"))
+                row[f"n_{h}d"] = int(n) if pd.notna(n) else 0
+                row[f"fwd_{h}d"] = round(float(fwd), 2) if pd.notna(fwd) else None
+                row[f"win_{h}d"] = round(float(win), 1) if pd.notna(win) else None
+                row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
+            rows.append(row)
+        cols = [{"name": "Source", "id": "source"},
+                {"name": "Rows", "id": "rows", "type": "numeric", "format": _INT},
+                {"name": "Funnel %", "id": "funnel_pct", "type": "numeric", "format": _NUM2}]
+        cond = []
+        for h in _SRC_HORIZONS:
+            cols += [
+                {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
+                {"name": f"Fwd ret@{h}d %", "id": f"fwd_{h}d", "type": "numeric", "format": _NUM2},
+                {"name": f"Win@{h}d %", "id": f"win_{h}d", "type": "numeric", "format": _NUM2},
+                {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
+            ]
+            for c in (f"fwd_{h}d", f"ic_{h}d"):
+                cond += [
+                    {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c}, "color": figures.POS},
+                    {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": figures.NEG},
+                ]
+            wc = f"win_{h}d"
+            cond += [
+                {"if": {"filter_query": f"{{{wc}}} >= 50", "column_id": wc}, "color": figures.POS},
+                {"if": {"filter_query": f"{{{wc}}} < 50", "column_id": wc}, "color": figures.NEG},
+            ]
+        children.append(dash_table.DataTable(data=rows, columns=cols,
+                                             style_data_conditional=cond, **_TABLE_KW))
+
+    trade_perf = data.source_trade_perf()
+    children.append(_h3("Realized trades by discovery source", _SOURCE_TRADE_TOOLTIP))
+    if not trade_perf:
+        children.append(html.Div("No attributed trades yet.", style={"color": "#6b7280"}))
+    else:
+        tcols = [
+            {"name": "Source", "id": "source"},
+            {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT},
+            {"name": "Win %", "id": "win_rate", "type": "numeric", "format": _NUM2},
+            {"name": "Avg return %", "id": "avg_return", "type": "numeric", "format": _NUM2},
+            {"name": "Median %", "id": "median_return", "type": "numeric", "format": _NUM2},
+            {"name": "Best %", "id": "best", "type": "numeric", "format": _NUM2},
+            {"name": "Worst %", "id": "worst", "type": "numeric", "format": _NUM2},
+        ]
+        tcond = [
+            {"if": {"filter_query": "{avg_return} > 0", "column_id": "avg_return"}, "color": figures.POS},
+            {"if": {"filter_query": "{avg_return} < 0", "column_id": "avg_return"}, "color": figures.NEG},
+            {"if": {"filter_query": "{win_rate} >= 50", "column_id": "win_rate"}, "color": figures.POS},
+            {"if": {"filter_query": "{win_rate} < 50", "column_id": "win_rate"}, "color": figures.NEG},
+        ]
+        children.append(dash_table.DataTable(data=trade_perf, columns=tcols,
+                                             style_data_conditional=tcond, **_TABLE_KW))
+    return html.Div(children)
+
+
 def _methods_tab():
     # The LLM-models-used table is run-based (not trade-windowed), so it lives
     # outside the windowed body. The per-method performance section (bar + table)
@@ -1031,6 +1254,8 @@ def _methods_tab():
         dcc.Loading(html.Div(id="methods-body")),
         _safe(_ic_section),
         _safe(_policy_eval_section),
+        _safe(_predictability_section),
+        _safe(_source_perf_section),
         _h3("LLM models used (synthesis & sentiment)",
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
         models_table,
@@ -1388,8 +1613,66 @@ def _exit_body(window_value, session_value, direction_value, source_value,
             "toggle does not apply (closed trades are few). Open trades excluded (no exit "
             "yet)."),
         _safe(lambda: _exit_reason_block(session=session, direction=direction)),
+        _safe(_horizon_edge_section),
         _safe(_exit_policy_eval_section),
     ])
+
+
+_HORIZON_EDGE_TOOLTIP = (
+    "The realized EDGE-DECAY of combined_score by holding horizon — measured tick-by-tick, "
+    "ticker-by-ticker over the whole signals panel (every scored ticker at every tick is a "
+    "hypothetical entry in its signal's direction), restricted to the ACTIONABLE subset "
+    "(confidence ≥ 0.78 — the traded population). This is the ground truth the horizon time-stop "
+    "rests on, at thousands of observations where the held-position `horizon` IC can't reach "
+    "(only ~5 real positions have ever outlived their window). Per horizon: 'n' = observations, "
+    "'IC' = Spearman(combined_score, forward return), 'win %' = directional hit, 'edge %' = mean "
+    "sign(score)×forward-return (the P&L of following the signal that long). A peak-then-decay "
+    "shape (edge positive early, ≤0 later) justifies a time-stop at the decay point. The measured "
+    "**edge window** (last horizon with positive edge) drives the `edge_decay` exit stop, which "
+    "evidence-throttled raises the close floor once a position is held past it. Run-based; "
+    "forward-collected — long horizons thin until the cache warms; ~one regime so far.")
+
+
+def _horizon_edge_section():
+    """The realized edge-decay curve + the calibrated edge-window that feeds the
+    edge-decay time-stop."""
+    res = data.horizon_edge_curve()
+    curve = res.get("curve") if isinstance(res, dict) else None
+    cal = res.get("cal") if isinstance(res, dict) else {}
+    heading = _h3("Signal edge by holding horizon (edge-decay time-stop)", _HORIZON_EDGE_TOOLTIP)
+    if curve is None or getattr(curve, "empty", True):
+        return html.Div([heading, html.Div(
+            "No forward-return history yet — accrues every run.", style={"color": "#6b7280"})])
+    ed, strength, peak = cal.get("edge_days"), cal.get("strength", 0.0), cal.get("peak_day")
+    cap = (f"Measured edge window: {ed} trading day(s) (peak ~{peak}d) · "
+           f"time-stop strength {strength:.2f} (evidence-throttled)"
+           if ed else "No edge-decay window measured yet (edge not yet observed to turn "
+                      "negative) — the stop stays inert until it does.")
+    rows = []
+    for _, r in curve.iterrows():
+        rows.append({"horizon": f"{int(r['horizon'])}d", "n": int(r["n"]),
+                     "ic": round(float(r["ic"]), 3) if pd.notna(r["ic"]) else None,
+                     "win": round(float(r["win"]), 1) if pd.notna(r["win"]) else None,
+                     "edge": round(float(r["edge"]), 3) if pd.notna(r["edge"]) else None})
+    cols = [{"name": "Hold", "id": "horizon"},
+            {"name": "n", "id": "n", "type": "numeric", "format": _INT},
+            {"name": "IC", "id": "ic", "type": "numeric", "format": _NUM2},
+            {"name": "Win %", "id": "win", "type": "numeric", "format": _NUM2},
+            {"name": "Edge %", "id": "edge", "type": "numeric", "format": _NUM2}]
+    cond = []
+    for c in ("edge", "ic"):
+        cond += [
+            {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c}, "color": figures.POS},
+            {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": figures.NEG},
+        ]
+    cond += [
+        {"if": {"filter_query": "{win} >= 50", "column_id": "win"}, "color": figures.POS},
+        {"if": {"filter_query": "{win} < 50", "column_id": "win"}, "color": figures.NEG},
+    ]
+    return html.Div([heading,
+                     html.Div(cap, style={"color": "#94a3b8", "fontSize": 12, "marginBottom": 8}),
+                     dash_table.DataTable(data=rows, columns=cols,
+                                          style_data_conditional=cond, **_TABLE_KW)])
 
 
 _EXIT_POLICY_TOOLTIP = (

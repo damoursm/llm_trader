@@ -442,8 +442,15 @@ class Settings(BaseSettings):
     # commodities, factor/thematic ETFs) or open-trade tickers. Cache-first with a bounded warm-up
     # fetch; a name whose liquidity can't be verified is dropped (fail-closed).
     enable_discovery_liquidity_gate: bool = True
-    discovery_min_price: float = 5.0                 # minimum last close ($)
-    discovery_min_dollar_volume: float = 20_000_000  # minimum 20-day average dollar volume ($)
+    # Loosened 2026-07-05 to WIDEN the net toward penny / lower-volume names so the
+    # predictability panel can measure whether they are easier or harder to
+    # predict (bucket features `price` + `dollar_vol`). The $1 floor keeps out
+    # sub-$1 OTC junk (awful spreads / data); the $5M dollar-volume floor still
+    # leaves every name plenty liquid for ~$1k positions. NOTE: dollar-volume is
+    # the main universe-SIZE lever (most tickers are gated by it, not price) — if
+    # ticks get slow or costly, raise it back toward 20M.
+    discovery_min_price: float = 1.0                 # minimum last close ($)
+    discovery_min_dollar_volume: float = 5_000_000   # minimum 20-day average dollar volume ($)
     discovery_gate_max_fetch: int = 25               # cap cold OHLCV fetches per run for the gate
     # Drop exotic security TYPES from discovery (preferred series, warrants, units,
     # rights, OTC foreign ordinaries) — redundant with a primary listing and/or not
@@ -1191,6 +1198,13 @@ class Settings(BaseSettings):
     # scheduler_email_every_tick. Default = 4 AM (pre-market open), 9:30 (RTH open),
     # 4 PM (RTH close), 7:50 PM (last after-hours tick).
     scheduler_email_times: str = "04:00,09:30,16:00,19:50"
+    # Always send the report email — even on a non-email slot — when this run
+    # detected a PROBLEM: a broker/execution issue (disconnect, rejects, drift),
+    # an LLM-layer outage (credits/keys), or a price-provenance flag. So an issue
+    # that surfaces between the scheduled email slots reaches you at the next tick
+    # (~30 min) instead of waiting for 09:30/16:00/19:50. The forced email carries
+    # the usual 🔔 banner + subject tag. Independent of scheduler_email_every_tick.
+    email_on_problem: bool = True
 
     # Intraday timing overlay (Hybrid: daily trend decides direction; a 30-min
     # momentum read only gates entry/exit *timing*).
@@ -1235,6 +1249,28 @@ class Settings(BaseSettings):
     ibkr_client_id: int = 11           # any stable int unique to this API connection
     ibkr_account: str = ""             # optional: pin a specific IBKR account id (else the sole/first)
     ibkr_connect_timeout: int = 15     # seconds to wait for the Gateway socket
+    # Bound every ib_async API REQUEST (reqExecutions / reqPositions / placeOrder /
+    # reqPnL / reqMktData) so a stuck request can't freeze the whole scheduler —
+    # the 2026-07-06 hang: the overnight reconcile blocked on reqExecutions after
+    # connecting, froze for 6+ h, missed every tick + the 04:00 email. ib_async's
+    # IB.RequestTimeout raises after this many seconds instead of waiting forever;
+    # the reconcile's fail-soft try/excepts then continue the tick. 0 = the old
+    # freeze-forever behaviour. See src/broker/ibkr.py.
+    broker_request_timeout_seconds: float = 45.0
+    # SHORT timeout for the real-time quote snapshot in get_market_price only. A
+    # live quote arrives in ~1-3s in RTH (reqTickers returns as soon as the snapshot
+    # completes, so this never delays a successful fetch); pre-market/thin data never
+    # arrives, so without a tighter bound each priced ticker would burn the full
+    # broker_request_timeout_seconds (45s) and the reconcile — which prices every
+    # open/drift position one-by-one — could march into the sync watchdog and force a
+    # pre-market respawn loop. Fail fast to None instead (caller falls back). 0 = use
+    # the global request timeout.
+    broker_price_timeout_seconds: float = 8.0
+    # Hard wall-clock backstop on the ENTIRE broker reconcile: if it somehow still
+    # exceeds this (a hang RequestTimeout doesn't cover), force-exit the process so
+    # the task manager restarts it (a fresh tick > a permanent freeze). Set well
+    # above a legitimate slow reconcile; 0 disables. See pipeline.py.
+    broker_sync_watchdog_seconds: int = 600
     # Prefer IBKR's real-time last/mark price (free Cboe One + IEX feed via the
     # broker connection) over yfinance in tracker._fetch_price — the same data
     # that fills the orders, so the mark matches the execution venue. Requires an
@@ -1318,14 +1354,26 @@ class Settings(BaseSettings):
     broker_connect_retry_wait_seconds: int = 10
     # ── Settle pass: fill fast or kill ───────────────────────────────────
     # After this tick's orders are submitted, actively watch them for up to
-    # this many seconds: fills are recorded the moment they land; an order
-    # still at ZERO fill halfway through the window is cancelled and
-    # re-anchored once at a fresh capped quote; anything still unfilled at
-    # the deadline is CANCELLED — nothing ever rests across ticks, so an
-    # order either executes within ~a minute of its decision or it does not
-    # exist (the next tick re-decides from fresh data and prices). Partial
-    # fills are left working. 0 = legacy behavior (rest until next tick).
-    broker_settle_seconds: int = 60
+    # this many seconds: fills are recorded the moment they land; a zero-fill
+    # order is cancelled and re-anchored at a fresh capped quote EARLY and
+    # REPEATEDLY (see broker_settle_reanchor_every) so a mispriced order is
+    # re-priced within seconds and keeps chasing the spread in bounded steps;
+    # anything still unfilled at the deadline is CANCELLED — nothing ever rests
+    # across ticks, so an order either executes within this window of its
+    # decision or it does not exist (the next tick re-decides from fresh data
+    # and prices). Partial fills are left working. 0 = legacy (rest until next
+    # tick). Lowered 60→30 (2026-07-07) to bound the added tick time while the
+    # tighter poll + repeated re-anchor keep fills fast.
+    broker_settle_seconds: int = 30
+    # Fill-poll cadence inside the settle window (seconds). Smaller = fills are
+    # detected + orders re-anchored sooner (more reliable), at more broker
+    # round-trips. 3s catches a fast fill in ~one poll; well inside IBKR pacing.
+    broker_settle_poll_seconds: int = 3
+    # Re-anchor a still-unfilled order every N settle polls (not just once at the
+    # halfway mark): with a 3s poll this re-prices at ~6s, ~12s, ~18s … so an
+    # order that missed on a moving book gets several fresh-quote retries within
+    # the budget instead of one. The final poll never re-anchors (it observes).
+    broker_settle_reanchor_every: int = 2
     # ── Order lifetime: tick-scoped (default) or age-based ──────────────
     # Tick-scoped (True): an order lives exactly one tick. Any order still
     # unfilled at the next sync is cancelled and re-decided from THIS tick's
@@ -1339,6 +1387,17 @@ class Settings(BaseSettings):
     # cancelled and resubmitted re-anchored at the current mark. Partial
     # fills are left working. 0 = never (no age rule).
     broker_unfilled_cancel_minutes: int = 90
+    # Price-aware next-tick resubmit for a previously-unfilled ENTRY. Instead of
+    # blindly chasing the current price on the next tick, decide per the fresh
+    # signal + the price vs the original decision: (a) still actionable same
+    # direction → resubmit; (b) decayed to non-actionable BUT the price is
+    # as-good-or-better than the decision (≤ entry for a long / ≥ entry for a
+    # short) → resubmit at the better price; (c) decayed AND the price drifted
+    # adverse → HOLD (don't chase — the tick after re-evaluates); (d) signal
+    # flipped to the opposite side → don't resubmit. EXITS are unaffected — they
+    # always resubmit to get flat. Needs the tick's actionable set threaded into
+    # reconcile.sync(); with none supplied it falls back to the legacy chase.
+    broker_price_aware_resubmit: bool = True
 
     # ── Drift auto-reconciliation ────────────────────────────────────────
     # The ledger is the source of truth; a broker position the ledger cannot
@@ -1477,6 +1536,23 @@ class Settings(BaseSettings):
     exit_conviction_span_prior: float = 0.03   # floor nudge with ~no evidence (gentle)
     exit_conviction_span_max: float = 0.10     # bounded cap at full evidence
     exit_conviction_prior_n: int = 40          # closed trades for the ramp half-life
+    # ── Edge-decay time-stop (2026-07-06) ─────────────────────────────────────
+    # The realized edge of combined_score decays with holding horizon (measured
+    # tick-by-tick over the signals panel — analysis/horizon_edge.py). On the
+    # traded subset the edge peaks ~1-2d and turns negative by ~5d. This layer
+    # measures the edge-positive WINDOW and, evidence-throttled, raises the
+    # confidence-loss close floor once a position is held past it — an
+    # edge-decay time-stop that fires around the realized decay point rather than
+    # only the entry target_horizon. Inert on today's thin long-horizon sample;
+    # firms up as the decay confirms. Also emitted as the `edge_decay` exit signal
+    # so its OWN exit-IC is measured before it earns real weight.
+    enable_edge_decay_exit: bool = True
+    edge_decay_conf_min: float = 0.78          # confidence subset the edge curve is measured on (the traded population)
+    edge_decay_cal_days: int = 90              # panel window for the edge curve
+    edge_decay_min_n: int = 20                 # min obs per horizon before it counts
+    edge_decay_prior_obs: int = 250            # obs prior shrinking the evidence strength (gentle now)
+    edge_decay_floor_cap: float = 0.08         # max confidence-loss-floor raise from the edge-decay stop
+    edge_decay_cal_ttl_seconds: int = 21600    # calibration cache TTL (6h; changes ~daily)
 
     # ── End-of-day maintenance (2026-07-04) — scalability for the weeks ahead ──
     # Once per market day, at/after eod_maintenance_time ET (robust to missed
@@ -1515,6 +1591,60 @@ class Settings(BaseSettings):
     edge_prior_n: int = 150                # closes for a 50/50 split with the tier prior
     edge_size_span: float = 0.25           # max ± tilt the model alone can express
     edge_ridge_lambda: float = 1.0         # ridge strength (× n, standardized features)
+    # ── Predictability sizing (Tier 1) ────────────────────────────────────────
+    # A per-stock "is this name's direction forecastable at a swing horizon"
+    # tilt, sized up for clean-trend names and down for chop. The score blends
+    # Kaufman trend efficiency + ADX (the Tier-0 predictability panel found both
+    # separate a ~60%-hit clean-trend cohort from a ~50% coin-flip at 5 days).
+    # SELF-CALIBRATING on the same evidence-throttled idiom as breadth sizing:
+    #   mult = 1 + span_eff × clamp((score − center)/half_width, −1, +1)
+    #   span_eff = predictability_size_span × clamp(d_post/edge_ref, 0, 1)
+    #   d_post = (prior_n·d_prior + n_days·d_obs)/(prior_n + n_days)
+    # where d_obs is the measured 5-day directional-hit gap (high vs low
+    # predictability) over the UNBIASED signals panel and n_days = signal-days of
+    # evidence — so it starts ~inert (heavily shrunk toward the small prior on
+    # ~2 weeks of one regime) and STRENGTHENS as the panel thickens over weeks/
+    # months, or fades to neutral if the edge doesn't hold. Never a gate (every
+    # name still trades — we keep accumulating outcomes), never inverts the sign.
+    # See performance/predictability_sizing.py.
+    enable_predictability_sizing: bool = True
+    predictability_size_span: float = 0.12      # max ± size tilt at full evidence
+    predictability_er_weight: float = 0.5       # Kaufman efficiency-ratio weight in the score
+    predictability_adx_weight: float = 0.5      # ADX weight in the score
+    predictability_adx_cap: float = 40.0        # ADX value that maps to a full 1.0 score component
+    predictability_er_window: int = 20          # efficiency-ratio lookback (sessions)
+    predictability_adx_period: int = 14         # Wilder ADX period
+    predictability_horizon: int = 5             # swing horizon the edge is measured at (sessions)
+    predictability_halfwidth_floor: float = 0.10   # min ramp half-width (guards a degenerate spread)
+    predictability_edge_prior: float = 0.02     # documented prior hit-gap (heavily shrunk early)
+    predictability_edge_prior_n: int = 40       # signal-DAYS for the prior to fade (≈2 months)
+    predictability_edge_ref: float = 0.10       # hit-gap that counts as FULL strength (edge=1)
+    predictability_cal_days: int = 60           # panel window used to calibrate (recent regime)
+    predictability_cal_min_rows: int = 60       # min panel rows before the edge is measured
+    predictability_cal_ttl_seconds: int = 21600  # calibration cache TTL (6h; changes ~daily)
+    # ── Trend-predictability METHODS (Kaufman/ADX × trend context) ─────────────
+    # The signed Kaufman efficiency ratio + ADX·DMI, expressed as four methods by
+    # trend CONTEXT — kaufman_long / kaufman_short = uptrend / downtrend context,
+    # same for adx_* — each active only in its context. They fold into
+    # combined_score (entry AND exit scores) as an additive overlay OUTSIDE the
+    # normalised weight pool (sparse/one-sided context, so pooling would dampen
+    # non-trending names — same idiom as the fundamental/corp-action f_* factors);
+    # tracked per-method in the signals panel + IC table + trade attribution.
+    #
+    # Each method's raw trend signal is multiplied by a LEARNED orientation ∈
+    # [−1,+1]: +1 predicts CONTINUATION (with the trend), −1 predicts REVERSAL
+    # (against it), magnitude = confidence. The orientation is measured per method
+    # from the signals panel — how often that trend context has CONTINUED vs
+    # reversed at the swing horizon — shrunk toward a CONTINUATION prior (+1) by
+    # signal-days, so each method starts as continuation and flips toward reversal
+    # only as the forward returns confirm it (e.g. it would learn "clean downtrends
+    # bounce" and predict the bounce). See signals/trend_predictability.py.
+    enable_trend_predictability_methods: bool = True
+    trend_method_weight: float = 0.10        # additive-overlay weight on the 4 oriented trend scores
+    trend_orientation_prior_n: int = 25      # signal-days of the +1 continuation prior (shrinkage)
+    trend_orientation_cal_days: int = 60     # panel window used to calibrate (recent regime)
+    trend_orientation_cal_min_rows: int = 40  # min active rows before a method's orientation is measured
+    trend_orientation_cal_ttl_seconds: int = 21600  # orientation cache TTL (6h; changes ~daily)
     # The flat real-fill override is measured from LIQUID LMT fills; applying it
     # to instruments far outside that basis grossly understates their cost (a
     # $0.05 warrant with a ~35%-wide book was being charged 8 bp — observed

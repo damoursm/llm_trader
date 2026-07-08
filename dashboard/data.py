@@ -316,6 +316,20 @@ def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10,
                                   "shadow_exit_method_perf"))
 
 
+def horizon_edge_curve(days: Optional[int] = 90, conf_min: float = 0.78) -> dict:
+    """The realized edge-decay curve of combined_score by holding horizon (the
+    ground truth behind the edge-decay time-stop) + its calibration
+    (``edge_days`` window / ``strength``). Cached (the OHLCV forward-return join is
+    heavy); run-based. ``{curve: DataFrame, cal: dict}``, empty until forward
+    returns exist."""
+    from src.analysis.horizon_edge import compute_horizon_edge_curve, calibrate_edge_horizon
+
+    def _q():
+        return {"curve": compute_horizon_edge_curve(days=days, conf_min=conf_min),
+                "cal": calibrate_edge_horizon()}
+    return _cached(("horizon_edge", days, conf_min), lambda: _retry(_q, "horizon_edge"))
+
+
 def exit_reason_breakdown(session: Optional[str] = None,
                           direction: Optional[str] = None) -> list:
     """Per-exit-reason realized performance over CLOSED trades (trades / win_rate /
@@ -407,6 +421,48 @@ def exit_policy_comparison(days: Optional[int] = 90, horizon: int = 5) -> pd.Dat
     return _cached(("exit_policy_comparison", days, int(horizon)),
                    lambda: _retry(lambda: compare_exit_policies(days=days, horizon=horizon),
                                   "exit_policy_comparison"))
+
+
+def source_performance(days: Optional[int] = None, horizons=(1, 5, 10),
+                       min_n: int = 10) -> pd.DataFrame:
+    """Per-discovery-source forward-return performance over the signals panel
+    (funnel share + mean forward return + up-share win % + combined_score IC per
+    horizon) — the unbiased evidence for an adaptive discovery budget. Cached
+    (the OHLCV forward-return join is heavy); run-based, so it ignores the window/
+    session toggles. Empty until the panel has forward-return history."""
+    from src.analysis.source_performance import load_source_performance
+    return _cached(("source_performance", days, tuple(horizons), int(min_n)),
+                   lambda: _retry(lambda: load_source_performance(
+                       horizons=horizons, days=days, min_n=min_n), "source_performance"))
+
+
+def predictability(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 30,
+                   n_buckets: int = 3) -> dict:
+    """Predictability-feature IC panel — does ``combined_score`` predict forward
+    returns better inside high-trend / moderate-vol / high-breadth buckets of the
+    signals panel? Returns ``{"buckets": df, "edges": df}`` (bucketed conditional
+    IC + the best-minus-worst-bucket edge summary). Cached (the OHLCV feature +
+    forward-return join is heavy); run-based, uses the WHOLE panel (features are
+    OHLCV-derived, not stamp-dependent) so it has signal immediately."""
+    from src.analysis.predictability import load_predictability
+
+    def _q():
+        buckets, edges = load_predictability(horizons=horizons, days=days,
+                                             min_n=min_n, n_buckets=n_buckets)
+        return {"buckets": buckets, "edges": edges}
+    return _cached(("predictability", days, tuple(horizons), int(min_n), int(n_buckets)),
+                   lambda: _retry(_q, "predictability"))
+
+
+def source_trade_perf() -> list:
+    """Realized per-source trade outcomes from the ledger (trades / win_rate /
+    avg / median / best / worst by ``universe_source``) — what actually traded
+    per discovery source. Cached + retry; small-n and gate-selection-biased, the
+    realized counterpart to ``source_performance``."""
+    from src.analysis.source_performance import compute_source_trade_perf
+    return _cached("source_trade_perf",
+                   lambda: compute_source_trade_perf(_retry(lambda: repo.load_trades(),
+                                                            "source_trade_perf")))
 
 
 def dark_sources(days: int = 14) -> list:

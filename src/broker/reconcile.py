@@ -746,6 +746,8 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
     budget = int(settings.broker_settle_seconds)
     if budget <= 0:
         return False
+    poll_seconds = max(1, int(getattr(settings, "broker_settle_poll_seconds", _SETTLE_POLL_SECONDS)))
+    reanchor_every = max(1, int(getattr(settings, "broker_settle_reanchor_every", 2)))
 
     def _pending() -> list:
         out = []
@@ -769,15 +771,15 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
     if not legs:
         return False
     changed = False
-    n_polls = max(1, budget // _SETTLE_POLL_SECONDS)
-    reanchor_poll = max(0, n_polls // 2)
+    n_polls = max(1, budget // poll_seconds)
     logger.info(
         f"[broker] settle: {len(legs)} order(s) unfilled after submission — "
-        f"watching ≤{budget}s (fill fast or kill)"
+        f"watching ≤{budget}s, poll {poll_seconds}s, re-anchor every {reanchor_every} "
+        f"poll(s) (fill fast or kill)"
     )
 
     for poll_i in range(n_polls):
-        time.sleep(_SETTLE_POLL_SECONDS)
+        time.sleep(poll_seconds)
         try:
             fills = {f.client_ref: f for f in broker.get_fills()}
         except Exception as e:
@@ -803,7 +805,7 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
                 )
                 logger.info(
                     f"[broker] settle: {intent} {t['ticker']} filled in-tick "
-                    f"@{fs.avg_fill_price} ({(poll_i + 1) * _SETTLE_POLL_SECONDS}s after submit)"
+                    f"@{fs.avg_fill_price} ({(poll_i + 1) * poll_seconds}s after submit)"
                 )
             else:
                 still.append((t, prefix, intent))
@@ -811,9 +813,12 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
         if not legs:
             return changed
 
-        if poll_i == reanchor_poll:
-            # Halfway: re-anchor zero-fill orders at a FRESH quote (the cap
-            # may simply be on the wrong side of a moving book).
+        if poll_i < n_polls - 1 and (poll_i + 1) % reanchor_every == 0:
+            # Every `reanchor_every` polls (never the final poll — leave one to
+            # observe the new order): re-anchor zero-fill orders at a FRESH
+            # quote (the cap may simply be on the wrong side of a moving book).
+            # Repeating this chases the spread in bounded steps so a mispriced
+            # order fills within seconds instead of resting the whole budget.
             for (t, prefix, intent) in list(legs):
                 if (t.get(f"{prefix}fill_qty") or 0) > 0:
                     continue   # partial — leave it working
@@ -959,11 +964,50 @@ def _cancel_entries_for_closed(broker: Broker, trades: List[dict], report: dict)
     return changed
 
 
+def _resubmit_decision(t: dict, actionable_by_ticker: Optional[dict]) -> str:
+    """Price-aware next-tick decision for a previously-unfilled ENTRY (ask 2).
+
+    Returns 'submit' (re-send, re-anchored at the current mark) or 'skip' (hold —
+    don't chase this tick; the next tick re-evaluates). Rule:
+      • still actionable this tick, SAME direction → submit (chase);
+      • signal flipped to the OPPOSITE actionable side → skip (never buy into a
+        bearish flip on a "better" price, and vice-versa);
+      • decayed to non-actionable, but the price is AS-GOOD-OR-BETTER than the
+        original decision (≤ entry for a long / ≥ entry for a short) → submit at
+        the better price;
+      • decayed AND the price drifted adverse → skip.
+    Only consulted when the caller supplies an actionable map (feature on); with
+    none, the caller keeps the legacy always-chase behavior. EXITS never use this.
+    """
+    action = (t.get("action") or "").upper()          # BUY (long) / SELL (short)
+    cur = ((actionable_by_ticker or {}).get(t.get("ticker")) or "").upper()
+    if cur == action:
+        return "submit"                               # still wants the trade
+    if cur in ("BUY", "SELL"):
+        return "skip"                                 # flipped to the other side
+    # Non-actionable now: resubmit only at an equal-or-better price than decision.
+    try:
+        entry = float(t.get("entry_price") or 0.0)
+        price = float(t.get("current_price") or 0.0)
+    except (TypeError, ValueError):
+        return "submit"
+    if entry <= 0 or price <= 0:
+        return "submit"                               # can't compare — don't strand
+    favorable = (price <= entry) if action == "BUY" else (price >= entry)
+    return "submit" if favorable else "skip"
+
+
 def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
-         run_id: Optional[str] = None) -> dict:
+         run_id: Optional[str] = None,
+         actionable_by_ticker: Optional[dict] = None) -> dict:
     """Reconcile the broker against the internal ledger. Returns a report dict.
 
     No-op (empty report, ok=True) when broker_mode=off.
+
+    ``actionable_by_ticker`` (optional) maps ticker → the tick's actionable
+    action ("BUY"/"SELL"); when supplied it drives the price-aware next-tick
+    resubmit for previously-unfilled entries (``_resubmit_decision``). Omitted →
+    the legacy always-chase behavior.
     """
     report = _new_report()
     report["run_id"] = run_id
@@ -1109,10 +1153,25 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             price = float(t.get("entry_price") or t.get("current_price") or 0.0)
             resubmit_n = int(t.get("broker_resubmit_n") or 0)
             if resubmit_n and t.get("current_price"):
-                # Stale-cancelled leg: re-anchor at the latest mark (refreshed
-                # by update_open_trades this tick) so the capped LMT follows
-                # the market in bounded steps instead of resting at the old
-                # entry price forever.
+                # Previously-unfilled entry being resubmitted. Price-aware gate
+                # (ask 2): chase only when the fresh signal still wants it OR the
+                # price is as-good-or-better than the decision; otherwise HOLD
+                # and let the next tick re-evaluate — never chase a decayed
+                # signal into an adverse price. Off / no map → legacy chase.
+                if (settings.broker_price_aware_resubmit
+                        and actionable_by_ticker is not None
+                        and _resubmit_decision(t, actionable_by_ticker) == "skip"):
+                    t["broker_status"] = "RESUBMIT_HELD_ADVERSE"
+                    changed = True
+                    logger.info(
+                        f"[broker] entry {t['ticker']}: resubmit HELD — signal "
+                        f"decayed and price {t.get('current_price')} drifted "
+                        f"adverse of decision {t.get('entry_price')} (re-eval next tick)"
+                    )
+                    continue
+                # Re-anchor at the latest mark (refreshed by update_open_trades
+                # this tick) so the capped LMT follows the market in bounded
+                # steps instead of resting at the old entry price forever.
                 price = float(t["current_price"])
             mult = t.get("position_size_multiplier", 1.0)
             if settings.broker_sizing_mode == "equity_pct":

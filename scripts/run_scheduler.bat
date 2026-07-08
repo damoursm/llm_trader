@@ -14,8 +14,11 @@ REM ============================================================================
 REM cd to the repo root (this script lives in <root>\scripts\)
 cd /d "%~dp0.."
 
-REM Run the scheduler with the project's venv python (absolute via CWD).
-".venv\Scripts\python.exe" main.py --schedule
+REM Run the scheduler under the auto-restart SUPERVISOR (production mode): it runs
+REM `main.py --schedule` as a child and relaunches it if the process ever dies —
+REM including the broker-reconcile watchdog's force-exit on a stuck broker call
+REM (the 2026-07-06 6-hour freeze). Bare `--schedule` has no such recovery.
+".venv\Scripts\python.exe" main.py --supervise
 
 REM If the process exits, %ERRORLEVEL% propagates so the service manager can
 REM detect the failure and restart it.

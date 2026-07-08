@@ -43,7 +43,7 @@ from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_TIMEFRAME_COLUMNS,
 PANEL_SCORE_COLUMNS = list(SIGNAL_METHOD_COLUMNS) + ["combined_score"]
 
 
-# ── IC categories (the dashboard's 4-section grouping) ─────────────────────
+# ── IC categories (the dashboard's section grouping) ───────────────────────
 # The OHLCV methods are split by candle size; everything else (news, sentiment,
 # smart money, options, PEAD, catalysts…) keeps using the most-recent data and
 # lands in "Other". The 8 daily-technical method names are exactly those that

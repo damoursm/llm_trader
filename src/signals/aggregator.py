@@ -91,6 +91,8 @@ from src.signals.sector_relative_momentum import (
 )
 from src.signals.money_flow import compute_money_flow_score
 from src.signals.trend_strength import compute_trend_strength_score
+from src.signals.trend_predictability import (calibrate_trend_orientation,
+                                              compute_trend_predictability_scores)
 from src.signals.iv_rank import compute_iv_rank_score
 from src.signals.iv_expr import compute_iv_expr_score
 from src.signals.extended_session import compute_extended_gap_score
@@ -1166,6 +1168,12 @@ def build_signals(
     if use_massive:
         from src.signals.massive_tech import compute_massive_tech_score as _compute_massive
 
+    # Learned continuation/reversal orientation for the trend-predictability
+    # methods — computed ONCE per batch (cached + fail-soft), captured by the
+    # per-ticker closure so every ticker is scored on one consistent calibration.
+    _trend_orientation = (calibrate_trend_orientation()
+                          if settings.enable_trend_predictability_methods else None)
+
     def _score_ticker(ticker):
 
         # ── Method 1: News sentiment (the LEVEL) ──────────────────────────
@@ -1307,6 +1315,19 @@ def build_signals(
         trend_label          = "NO_DATA"
         if use_trend_strength:
             trend_strength_score, adx_value, trend_label = compute_trend_strength_score(ticker)
+
+        # ── Method 10c: Trend-predictability (Kaufman/ADX, split long/short) ─
+        # Signed Kaufman efficiency + ADX·DMI as four one-sided methods. Sparse
+        # (a name is up- XOR down-trending), so they fold into combined_score as
+        # an additive overlay below, NOT the normalised pool. Cache-first fetch
+        # reuses the bar trend_strength just warmed above — no extra network hit.
+        kaufman_long_v = kaufman_short_v = adx_long_v = adx_short_v = 0.0
+        if settings.enable_trend_predictability_methods:
+            _tp = compute_trend_predictability_scores(ticker, orientation=_trend_orientation)
+            kaufman_long_v  = _tp["kaufman_long"]
+            kaufman_short_v = _tp["kaufman_short"]
+            adx_long_v      = _tp["adx_long"]
+            adx_short_v     = _tp["adx_short"]
 
         # ── Method 11: Post-Earnings Announcement Drift (PEAD) ───────────
         # SUE × time-decay. Positive = bullish drift from recent earnings beat;
@@ -1462,6 +1483,15 @@ def build_signals(
                     float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
                     + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
 
+        # ── Trend-predictability directional overlay (additive) ────────────
+        # The four scores are already oriented (continuation OR reversal, learned
+        # per method + scaled by trend strength/confidence), so a single symmetric
+        # weight suffices — the orientation, not the weight, encodes each context's
+        # direction quality. Added outside the normalised pool (sparse per context).
+        if settings.enable_trend_predictability_methods:
+            combined += settings.trend_method_weight * (
+                kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
+
         # ── Direction ─────────────────────────────────────────────────────
         direction: Direction
         if combined >= 0.15:
@@ -1577,6 +1607,10 @@ def build_signals(
             trend_strength_score=round(trend_strength_score, 3),
             adx_value=round(adx_value, 2),
             trend_strength_label=trend_label,
+            kaufman_long_score=round(kaufman_long_v, 3),
+            kaufman_short_score=round(kaufman_short_v, 3),
+            adx_long_score=round(adx_long_v, 3),
+            adx_short_score=round(adx_short_v, 3),
             pead_score=round(pead_score_v, 3),
             pead_surprise_pct=round(pead_surprise, 2),
             pead_days_since_report=int(pead_days),

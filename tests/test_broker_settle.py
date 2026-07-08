@@ -1,11 +1,12 @@
 """Settle pass — fill fast or kill (2026-06-12).
 
-An order either executes within ~a minute of its decision or it does not
-exist: the settle pass watches this tick's unfilled submissions, repairs
-fills the moment they land, re-anchors zero-fill orders once at a fresh
-quote mid-window, and CANCELS survivors at the deadline so nothing ever
-rests across ticks to fill late at a stale price. Plus: connect retries at
-sync start (gateway re-login window). All fakes, no sleeps, no network.
+An order either executes within ~its decision window or it does not exist:
+the settle pass watches this tick's unfilled submissions, repairs fills the
+moment they land, re-anchors zero-fill orders at a fresh quote EARLY and
+REPEATEDLY (every ``broker_settle_reanchor_every`` polls, 2026-07-07), and
+CANCELS survivors at the deadline so nothing ever rests across ticks to fill
+late at a stale price. Plus: connect retries at sync start (gateway re-login
+window). All fakes, no sleeps, no network.
 """
 
 import pytest
@@ -124,31 +125,40 @@ def test_settle_repairs_fill_that_lands_during_the_watch(monkeypatch):
     assert trade["broker_commission"] == pytest.approx(1.0)
 
 
-def test_settle_reanchors_once_then_kills_at_deadline(monkeypatch):
-    """Never fills: halfway through the budget the order is cancelled and
-    re-sent at a FRESH quote under -r1; at the deadline the survivor is
-    killed — nothing rests across ticks."""
+def test_settle_reanchors_repeatedly_then_kills_at_deadline(monkeypatch):
+    """Never fills: the order is re-anchored at a FRESH quote REPEATEDLY (every
+    `broker_settle_reanchor_every` polls, ask 1) within the budget — chasing the
+    spread in bounded steps — then the survivor is killed at the deadline so
+    nothing rests across ticks."""
+    monkeypatch.setattr(settings, "broker_settle_seconds", 30)         # 10 polls @3s
+    monkeypatch.setattr(settings, "broker_settle_poll_seconds", 3)
+    monkeypatch.setattr(settings, "broker_settle_reanchor_every", 2)   # polls 2,4,6,8 → r1..r4
     broker = _SettleBroker()
     trade = _open_trade()
     report = _sync(monkeypatch, broker, [trade], live_price=101.0)
-    # original + re-anchored both cancelled eventually
-    assert broker.cancelled == ["abc", "abc-r1"]
-    assert report["settle_reanchors"] == 1
+    assert report["settle_reanchors"] == 4     # re-anchored 4×, not once
     assert report["unfilled_killed"] == 1
-    reanchored = broker.requests[1]
-    assert reanchored.client_ref == "abc-r1"
-    assert reanchored.limit_price == pytest.approx(101.0 * 1.002, abs=0.01)
+    # original + each re-anchor cancelled in turn (last one killed at deadline)
+    assert broker.cancelled == ["abc", "abc-r1", "abc-r2", "abc-r3", "abc-r4"]
+    r1 = broker.requests[1]
+    assert r1.client_ref == "abc-r1"
+    assert r1.limit_price == pytest.approx(101.0 * 1.002, abs=0.01)   # fresh capped LMT
     assert trade["broker_order_id"] is None
     assert trade["broker_status"] == "UNFILLED_KILLED"
-    assert trade["broker_resubmit_n"] == 2     # re-anchor + kill → next tick is -r2
+    assert trade["broker_resubmit_n"] == 5     # 4 re-anchors + kill → next tick is -r5
 
 
-def test_settle_fill_on_the_reanchored_ref_is_repaired(monkeypatch):
-    """The re-anchored order (-r1) fills a few polls later — repaired, not killed."""
-    broker = _SettleBroker(fill_ref_after={"abc-r1": 9})
+def test_settle_fill_on_a_reanchored_ref_is_repaired(monkeypatch):
+    """A fill that lands on a re-anchored ref while it is the live order is
+    repaired (not killed), even though the pass re-anchors repeatedly."""
+    monkeypatch.setattr(settings, "broker_settle_seconds", 30)
+    monkeypatch.setattr(settings, "broker_settle_poll_seconds", 3)
+    monkeypatch.setattr(settings, "broker_settle_reanchor_every", 2)
+    # abc-r1 is submitted at poll_i=1 (get_fills call 2) and live until poll_i=3;
+    # make it fill at get_fills call 3 (poll_i=2), while it is the live ref.
+    broker = _SettleBroker(fill_ref_after={"abc-r1": 3})
     trade = _open_trade()
     report = _sync(monkeypatch, broker, [trade], live_price=101.0)
-    assert report["settle_reanchors"] == 1
     assert report["settled_fills"] == 1
     assert report["unfilled_killed"] == 0
     assert trade["broker_status"] == "Filled"
@@ -157,7 +167,10 @@ def test_settle_fill_on_the_reanchored_ref_is_repaired(monkeypatch):
 
 def test_killed_exit_is_resent_next_sync_sized_from_held(monkeypatch):
     """An exit killed at the deadline MUST come back next tick (the position
-    has to flatten) — re-anchored under -r1 and sized from the held qty."""
+    has to flatten) — re-anchored under a fresh ref and sized from the held qty."""
+    monkeypatch.setattr(settings, "broker_settle_seconds", 6)          # 2 polls @3s
+    monkeypatch.setattr(settings, "broker_settle_poll_seconds", 3)
+    monkeypatch.setattr(settings, "broker_settle_reanchor_every", 1)   # one re-anchor (r1) then kill
     broker = _SettleBroker(positions=[Position(ticker="TEST", quantity=10, avg_cost=100.0)])
     trade = _open_trade(
         status="CLOSED", exit_price=102.0,

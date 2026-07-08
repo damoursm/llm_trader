@@ -17,6 +17,7 @@ _OFF = [
     "enable_iv_expr", "enable_cointegration", "enable_cross_sectional",
     "enable_adaptive_weights", "enable_market_mode_switching", "enable_catalyst_timing",
     "enable_multi_timeframe_signals", "enable_extended_gap",
+    "enable_trend_predictability_methods",
 ]
 
 

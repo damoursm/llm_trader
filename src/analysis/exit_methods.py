@@ -32,13 +32,14 @@ from the panel, exactly like a ``0`` entry score is excluded from entry IC.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 # The exit-specific overlay methods (distinct from the entry signal methods,
 # which are ALSO re-scored as exit signals on a held position). ``mfe`` / ``mae``
 # are held-only path signals — they need a position's ratcheted excursions, so
 # (like horizon / llm_review) they never appear in the universe shadow book.
-EXIT_DECISION_METHODS = ("llm_review", "aggregator", "macro_regime", "horizon", "mfe", "mae")
+EXIT_DECISION_METHODS = ("llm_review", "aggregator", "macro_regime", "horizon",
+                         "edge_decay", "mfe", "mae")
 
 # Dashboard Exit-IC table grouping (mirrors signal_panel.IC_CATEGORY_ORDER).
 EXIT_CATEGORY_DECISION = "Exit decision (synthesized review + overlays)"
@@ -52,6 +53,7 @@ EXIT_METHOD_LABELS: Dict[str, str] = {
     "aggregator":   "Aggregator combined score",
     "macro_regime": "Macro regime overlay",
     "horizon":      "Horizon time-stop",
+    "edge_decay":   "Edge-decay time-stop (realized edge window)",
     "mfe":          "Favorable excursion / give-back (trailing)",
     "mae":          "Adverse excursion / drawdown (stop)",
 }
@@ -131,6 +133,41 @@ def _horizon_pressure(trade: dict) -> float:
     return -min(1.0, held / window - 1.0)
 
 
+def _held_trading_days(trade: dict) -> Optional[int]:
+    """NYSE trading days a position has been held (entry → today), for the
+    edge-decay window (measured in trading sessions, matching the panel's forward
+    horizons). None when the entry date is unparseable."""
+    import numpy as np
+    from datetime import date as _date, datetime
+    raw = trade.get("entry_date") or trade.get("entry_datetime")
+    if not raw:
+        return None
+    try:
+        ed = datetime.fromisoformat(str(raw)[:10]).date()
+    except (ValueError, TypeError):
+        return None
+    today = _date.today()
+    return int(np.busday_count(ed, today)) if today > ed else 0
+
+
+def _edge_decay_pressure(trade: dict) -> float:
+    """One-sided hold-conviction from the EDGE-DECAY time-stop: ``0`` while the
+    position is held within the measured edge-positive window, then increasingly
+    negative once past it. Distinct from ``horizon`` (which uses the entry
+    target-horizon): this uses the REALIZED edge-decay window measured over the
+    signals panel (``horizon_edge.calibrate_edge_horizon``). Raw / unthrottled —
+    the evidence strength is applied at the floor nudge, so the panel measures the
+    signal's own predictiveness cleanly. ``0`` when disabled / no measured window."""
+    from src.analysis.horizon_edge import calibrate_edge_horizon
+    edge_days = calibrate_edge_horizon().get("edge_days")
+    if not edge_days:
+        return 0.0
+    held = _held_trading_days(trade)
+    if held is None or held <= edge_days:
+        return 0.0
+    return -min(1.0, held / edge_days - 1.0)
+
+
 def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_context) -> Dict[str, float]:
     """Signed hold-conviction score per exit method for one held position.
 
@@ -167,6 +204,11 @@ def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_
 
     # 4. Horizon time-stop pressure (one-sided: 0 within window, negative past it).
     scores["horizon"] = _horizon_pressure(trade)
+
+    # 4a. Edge-decay time-stop — exit pressure once held past the REALIZED
+    #     edge-positive window (measured over the signals panel), distinct from the
+    #     entry target-horizon above. Its own exit-IC is measured in the panel.
+    scores["edge_decay"] = _edge_decay_pressure(trade)
 
     # 4b. MFE / MAE excursion signals from the position's own path (already
     #     position-oriented — P&L terms — so no dir_sign). Held-only.

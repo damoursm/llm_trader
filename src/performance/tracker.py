@@ -377,7 +377,7 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
@@ -435,6 +435,10 @@ METHOD_LABELS.update({
     "f_short_squeeze": "Short Squeeze (Massive: short%·days-to-cover)",
     "f_split":         "Split direction (Massive: forward+ / reverse−)",
     "f_dividend":      "Dividend change (Massive: increase+ / cut−)",
+    "kaufman_long":    "Kaufman Trend — Long (efficient uptrend)",
+    "kaufman_short":   "Kaufman Trend — Short (efficient downtrend)",
+    "adx_long":        "ADX Trend — Long (strong uptrend)",
+    "adx_short":       "ADX Trend — Short (strong downtrend)",
 })
 
 
@@ -469,6 +473,11 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "cross_sectional": getattr(sig, "cross_sectional_score", 0.0),
         "ext_gap":    getattr(sig, "ext_gap_score", 0.0),
         "broker_advisor": getattr(sig, "broker_advisor_score", 0.0),
+        # Trend-predictability methods (signed Kaufman efficiency + ADX·DMI, split long/short).
+        "kaufman_long":  getattr(sig, "kaufman_long_score", 0.0),
+        "kaufman_short": getattr(sig, "kaufman_short_score", 0.0),
+        "adx_long":      getattr(sig, "adx_long_score", 0.0),
+        "adx_short":     getattr(sig, "adx_short_score", 0.0),
         # Fundamental + corp-action factors live on the signal's fundamental_scores dict.
         **{m: float((getattr(sig, "fundamental_scores", None) or {}).get(m, 0.0))
            for m in ("f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")},
@@ -1426,6 +1435,7 @@ def record_new_trades(
         "extended_haircut_applied": 0,  # entries sized down for an off-RTH fill
         "breadth_tier_applied": 0,   # informational — sized up/down on agreement breadth
         "edge_blend_applied":   0,   # informational — learned-model size adjustment
+        "predictability_tilt_applied": 0,  # informational — sized on trend-predictability
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
@@ -1445,6 +1455,13 @@ def record_new_trades(
     # realized sample is below edge_min_closed (→ the layer is inert).
     from src.performance.edge_sizing import edge_blend_ratio, get_edge_model, trade_features
     edge_model = get_edge_model(trades) if settings.edge_sizing_enabled else None
+    # Predictability tilt calibration — measured ONCE per batch from the unbiased
+    # signals panel (cached + fail-soft). span_eff is ~0 until the panel proves a
+    # trend-predictability edge across enough signal-days, so this is inert today
+    # and strengthens over weeks/months. See predictability_sizing.py.
+    from src.performance.predictability_sizing import (
+        calibrate_predictability, predictability_multiplier, predictability_score)
+    pred_cal = calibrate_predictability() if settings.enable_predictability_sizing else None
 
     cooldown_h = float(settings.reentry_cooldown_hours or 0.0)
     recent_exits: Dict[tuple, datetime] = {}
@@ -1576,6 +1593,25 @@ def record_new_trades(
                 f"→ {multiplier:.2f}×"
             )
 
+        # ── Step 3c: predictability tilt (Tier 1) ─────────────────────────
+        # Size UP names whose direction is more forecastable at a swing horizon
+        # (clean trend: high efficiency ratio / ADX) and DOWN chop, by a strength
+        # that self-calibrates from the unbiased signals panel and grows with
+        # evidence. A standalone layer (not folded into the edge-blend prior) so
+        # the panel-measured edge isn't washed out as the trade ledger grows.
+        # Never a gate — chop still trades, so its outcomes keep the panel honest.
+        pred_score = predictability_score(rec.ticker) if settings.enable_predictability_sizing else None
+        pred_mult = predictability_multiplier(pred_score, pred_cal)
+        if abs(pred_mult - 1.0) >= 0.005:
+            multiplier = round(multiplier * pred_mult, 3)
+            diag["predictability_tilt_applied"] += 1
+            logger.info(
+                f"[tracker] {rec.ticker}: predictability tilt ×{pred_mult:g} "
+                f"(score {pred_score:.2f} vs center {pred_cal['center']:.2f}, "
+                f"span_eff {pred_cal['span_eff']:.3f} over {pred_cal['n_days']} day(s)) "
+                f"→ {multiplier:.2f}×"
+            )
+
         price = _fetch_price(rec.ticker)
         if price is None:
             diag["skipped_no_price"] += 1
@@ -1683,6 +1719,11 @@ def record_new_trades(
             "edge_size_ratio": edge_ratio,                # learned-sizing adjustment (audit)
             "edge_model_weight": edge_meta.get("w", 0.0),
             "edge_pred_at_entry": edge_meta.get("pred"),
+            "predictability_size_multiplier": pred_mult,  # trend-predictability tilt (audit)
+            "predictability_score_at_entry": (round(pred_score, 4)
+                                              if pred_score is not None else None),
+            "predictability_span_eff": (pred_cal.get("span_eff")
+                                        if pred_cal is not None else None),
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,
@@ -2226,7 +2267,12 @@ def monitor_open_positions(
     # throttled nudge to the same-direction close floor. Inert (0) with no data.
     from src.analysis.exit_conviction import exit_conviction_calibration, exit_floor_adjustment
     from src.analysis.exit_methods import build_exit_scores
+    from src.analysis.horizon_edge import calibrate_edge_horizon, edge_decay_floor_adjustment
     exit_conv_cal = exit_conviction_calibration(trades)
+    # Edge-decay time-stop calibration (the realized edge-positive window) — once
+    # per batch, cached + fail-soft, evidence-throttled (inert until the decay confirms).
+    edge_cal = calibrate_edge_horizon() if settings.enable_edge_decay_exit else None
+    _use_escores = settings.enable_exit_conviction or settings.enable_edge_decay_exit
 
     for trade in trades:
         if trade.get("status") != "OPEN":
@@ -2235,13 +2281,17 @@ def monitor_open_positions(
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
         hold_review = (hold_reviews or {}).get(trade["ticker"])
         exit_adj = 0.0
-        if settings.enable_exit_conviction and hold_review is not None:
+        if _use_escores and hold_review is not None:
             try:
                 _escores = build_exit_scores(trade, hold_review, signals_by_ticker,
                                              macro_regime_context)
-                exit_adj = exit_floor_adjustment(_escores, exit_conv_cal)
+                if settings.enable_exit_conviction:
+                    exit_adj += exit_floor_adjustment(_escores, exit_conv_cal)
+                if settings.enable_edge_decay_exit:
+                    # Held past the realized edge window → raise the close floor.
+                    exit_adj += edge_decay_floor_adjustment(_escores, edge_cal)
             except Exception as e:
-                logger.debug(f"[exit_conviction] adj skipped for {trade.get('ticker')}: {e}")
+                logger.debug(f"[exit_adj] skipped for {trade.get('ticker')}: {e}")
         reason = _evaluate_decay(trade, today_signal, macro_regime_context, hold_review,
                                  exit_conviction_adj=exit_adj)
         # Opt-in intraday exit: close when the 30-min trend has reversed hard

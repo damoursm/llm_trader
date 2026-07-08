@@ -885,6 +885,24 @@ def _run_edgar_tasks(all_tickers):
     return results
 
 
+def _email_decision(*, observe_only: bool, send_email: bool,
+                    email_if_configured: bool, email_configured: bool,
+                    health_problem: bool) -> str:
+    """Resolve the per-tick email gate to 'observe' | 'suppress' | 'send' | 'skip'.
+
+    A detected problem (``health_problem``) forces 'send' even on a non-email slot
+    — the always-alert-on-a-problem guarantee — and callers only set health_problem
+    when email is configured, so the forced send always has working SMTP. Pure, so
+    the gating is unit-tested directly (tests/test_email_on_problem.py)."""
+    if observe_only:
+        return "observe"
+    if not send_email and not email_if_configured and not health_problem:
+        return "suppress"
+    if send_email or email_configured or health_problem:
+        return "send"
+    return "skip"
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -1956,10 +1974,44 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # the reconciler is exception-safe and never breaks the run.
         if settings.broker_mode and settings.broker_mode != "off":
             from src.broker.reconcile import sync as _broker_sync
+            # Wall-clock watchdog: if the reconcile hangs past the cap (a stuck
+            # broker call RequestTimeout somehow didn't catch), force-exit so the
+            # task manager restarts a fresh process — a hung tick blocks the whole
+            # poll loop, and nothing else recovers a frozen (non-exited) process.
+            _wd = None
+            _wd_cap = float(getattr(settings, "broker_sync_watchdog_seconds", 0) or 0)
+            if _wd_cap > 0:
+                import os
+                import threading
+
+                def _broker_watchdog_kill():
+                    try:
+                        logger.critical(
+                            f"[broker] reconcile exceeded {_wd_cap:.0f}s wall-clock — a broker "
+                            "call is stuck; force-exiting so the scheduler restarts (this was the "
+                            "2026-07-06 6-hour freeze). Internal sim/ledger already persisted.")
+                    except Exception:
+                        pass
+                    os._exit(1)
+                _wd = threading.Timer(_wd_cap, _broker_watchdog_kill)
+                _wd.daemon = True
+                _wd.start()
             try:
-                broker_report = _broker_sync(run_id=run_id)
+                # The tick's actionable set (ticker → BUY/SELL) drives the
+                # price-aware next-tick resubmit for previously-unfilled entries
+                # (reconcile._resubmit_decision): still-wanted → chase; decayed →
+                # only resubmit at an equal-or-better price than the decision.
+                _actionable_by_ticker = {
+                    r.ticker: r.action for r in (actionable or [])
+                    if getattr(r, "ticker", None) and getattr(r, "action", None)
+                }
+                broker_report = _broker_sync(
+                    run_id=run_id, actionable_by_ticker=_actionable_by_ticker)
             except Exception as e:
                 logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
+            finally:
+                if _wd is not None:
+                    _wd.cancel()
 
     # Merge per-gate counters from the actionable filter + the trade-entry path
     # into one diagnostic blob so the user can see at a glance which constraints
@@ -2062,15 +2114,41 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     _print_summary(actionable, smart_money or [])
 
     email_configured = bool(settings.smtp_user and settings.email_recipients)
-    if observe_only:
+    # A detected PROBLEM this run (broker/execution issue, LLM-layer outage, or a
+    # price-provenance flag) forces the report email even on a non-email slot, so an
+    # issue surfacing between the scheduled slots reaches the user at the next tick
+    # rather than hours later (settings.email_on_problem). Gated on email being
+    # configured so the send branch below always has working SMTP.
+    health_problem = bool(
+        email_configured
+        and getattr(settings, "email_on_problem", True)
+        and (
+            (price_health and price_health.get("down"))
+            or (llm_health and llm_health.get("down"))
+            or (broker_health and broker_health.get("down"))
+        )
+    )
+    forced_by_problem = health_problem and not (send_email or email_if_configured)
+    _decision = _email_decision(
+        observe_only=observe_only, send_email=send_email,
+        email_if_configured=email_if_configured,
+        email_configured=email_configured, health_problem=health_problem,
+    )
+    if _decision == "observe":
         logger.info("[pipeline] Observation tick — email skipped by design.")
-    elif not send_email and not email_if_configured:
+    elif _decision == "suppress":
         logger.info(
             "[pipeline] Email suppressed for this tick (per-slot scheduler "
             "decision: with scheduler_email_every_tick off, only the 16:00 "
             "closing slot emails)."
         )
-    elif send_email or email_configured:
+    elif _decision == "send":
+        if forced_by_problem:
+            logger.warning(
+                "[pipeline] Forcing OUT-OF-SCHEDULE email — a problem was detected "
+                "this tick (broker / LLM / price health). See the banner + 🔔 "
+                "subject tag for details."
+            )
         send_recommendations(
             actionable,
             total_analysed=len(all_tickers),

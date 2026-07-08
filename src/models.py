@@ -1256,6 +1256,12 @@ class TickerSignal(BaseModel):
     trend_strength_score: float = 0.0   # [-1, +1] confirmed uptrend (+) / downtrend (−); ~0 = chop
     adx_value: float = 0.0              # raw ADX (trend strength: <20 chop, >25 trend, >40 strong)
     trend_strength_label: str = "NO_DATA"  # NO_TREND|UPTREND|STRONG_UPTREND|BREAKOUT_UP|…|DOWN…
+    # Trend-predictability methods — signed Kaufman efficiency + ADX·DMI, split
+    # into one-sided long/short methods (see signals/trend_predictability.py).
+    kaufman_long_score: float = 0.0     # [0, +1] efficient UPtrend (bullish); 0 = not an uptrend
+    kaufman_short_score: float = 0.0    # [-1, 0] efficient DOWNtrend (bearish); 0 = not a downtrend
+    adx_long_score: float = 0.0         # [0, +1] strong UPtrend via ADX·DMI (bullish); 0 = not an uptrend
+    adx_short_score: float = 0.0        # [-1, 0] strong DOWNtrend via ADX·DMI (bearish); 0 = not a downtrend
     # PEAD (Post-Earnings Announcement Drift) — populated when enable_pead=true
     pead_score: float = 0.0          # [-1, +1] SUE × time-decay
     pead_surprise_pct: float = 0.0   # most recent EPS surprise %

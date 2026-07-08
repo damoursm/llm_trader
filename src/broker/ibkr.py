@@ -67,6 +67,14 @@ class IBKRBroker(Broker):
                     "broker_mode=ibkr_paper / ibkr_live."
                 ) from e
             self._ib = IB()
+            # Bound EVERY API request so a stuck reqExecutions/reqPositions/placeOrder
+            # can't hang the tick forever (the 2026-07-06 6-hour freeze). 0 = no
+            # timeout (the old behaviour); a positive value raises after N seconds,
+            # which the reconcile's fail-soft handlers absorb so the tick continues.
+            try:
+                self._ib.RequestTimeout = float(settings.broker_request_timeout_seconds)
+            except Exception:
+                pass
         return self._ib
 
     def connect(self) -> bool:
@@ -333,9 +341,22 @@ class IBKRBroker(Broker):
         """
         if not self.is_connected():
             return None
+        ib = self._ib
+        prev_timeout = getattr(ib, "RequestTimeout", 0)
         try:
+            # Bound the snapshot to a SHORT timeout: a real quote returns in ~1-3s
+            # (reqTickers resolves the instant the snapshot completes, so success is
+            # unaffected), but a pre-market/thin-data ticker never resolves and would
+            # otherwise burn the full 45s request timeout — priced across every
+            # open/drift position that marches the reconcile into the sync watchdog.
+            price_to = float(getattr(settings, "broker_price_timeout_seconds", 0) or 0)
+            if price_to > 0:
+                try:
+                    ib.RequestTimeout = price_to
+                except Exception:
+                    pass
             contract = self._qualify(ticker)
-            tickers = self._ib.reqTickers(contract)
+            tickers = ib.reqTickers(contract)
             if not tickers:
                 return None
             t = tickers[0]
@@ -346,6 +367,11 @@ class IBKRBroker(Broker):
                     return float(px)
         except Exception as e:
             logger.debug(f"[broker:ibkr] get_market_price {ticker} failed: {e}")
+        finally:
+            try:
+                ib.RequestTimeout = prev_timeout          # restore the global bound
+            except Exception:
+                pass
         return None
 
     def get_short_borrow(self, tickers: List[str]) -> Dict[str, BorrowInfo]:
