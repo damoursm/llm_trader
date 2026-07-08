@@ -32,11 +32,18 @@ _EVAL_MIN_BARS  = 10    # below this, too little data to judge liquidity → fai
 
 
 def _load(ticker: str, budget: Dict[str, int]) -> Optional[pd.DataFrame]:
-    """Cache-first OHLCV; one bounded warm-up fetch when the cache is cold and allowed."""
+    """Cache-first OHLCV; one bounded warm-up fetch when the cache is cold and allowed.
+
+    ``budget["attempted"]`` (optional set) marks tickers the concurrent
+    pre-warm below already tried — they are never re-fetched here, so a failed
+    pre-warm can't double-spend the budget or re-trigger a rate-limit backoff.
+    """
     df = load_ohlcv(ticker)
     if df is not None and not df.empty and len(df) >= _CACHE_MIN_BARS:
         return df
-    if settings.enable_fetch_data and budget.get("n", 0) > 0:
+    attempted = budget.get("attempted")
+    already_attempted = attempted is not None and ticker in attempted
+    if settings.enable_fetch_data and budget.get("n", 0) > 0 and not already_attempted:
         budget["n"] -= 1
         try:
             fetched = get_history(ticker, period="3mo")
@@ -45,6 +52,47 @@ def _load(ticker: str, budget: Dict[str, int]) -> Optional[pd.DataFrame]:
         except Exception as e:
             logger.debug(f"[liquidity] fetch failed for {ticker}: {e}")
     return df
+
+
+def _prewarm_cold(cands: List[str], budget: Dict[str, int]) -> None:
+    """Concurrently warm the OHLCV cache for cold candidates, within the budget.
+
+    The sequential per-ticker cold fetch inside ``is_liquid`` was the 7-minute
+    stall on the first tick after midnight (2026-07-08 profile: ~200 uncached
+    smart-money names × sequential get_history with backoff). ``get_history``
+    is Polygon-first (no per-IP rate concern; yfinance only as fallback) and
+    SAVES to the OHLCV cache, so after this pass the ``is_liquid`` loop below
+    runs entirely on warm cache. Fail-soft: any fetch error just leaves that
+    ticker cold and it fails the gate closed, exactly as before.
+    """
+    workers = max(1, int(getattr(settings, "liquidity_gate_fetch_workers", 1) or 1))
+    if workers <= 1 or not settings.enable_fetch_data or budget.get("n", 0) <= 0:
+        return
+    cold = []
+    for t in cands:
+        if budget.get("n", 0) - len(cold) <= 0:
+            break
+        df = load_ohlcv(t)
+        if df is None or df.empty or len(df) < _CACHE_MIN_BARS:
+            cold.append(t)
+    if len(cold) <= 1:
+        return
+    attempted = budget.setdefault("attempted", set())
+
+    def _fetch(t: str) -> None:
+        try:
+            get_history(t, period="3mo")
+        except Exception as e:
+            logger.debug(f"[liquidity] pre-warm fetch failed for {t}: {e}")
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(workers, len(cold)),
+                            thread_name_prefix="liq-warm") as ex:
+        list(ex.map(_fetch, cold))
+    budget["n"] = max(0, budget.get("n", 0) - len(cold))
+    attempted.update(cold)
+    logger.info(f"[liquidity] pre-warmed {len(cold)} cold ticker(s) concurrently "
+                f"({budget['n']} fetch budget left)")
 
 
 def is_liquid(
@@ -118,6 +166,10 @@ def apply_liquidity_gate(
     mdv = settings.discovery_min_dollar_volume if min_dollar_volume is None else min_dollar_volume
     if budget is None:
         budget = {"n": max(0, settings.discovery_gate_max_fetch)}
+
+    # Warm the cold candidates' OHLCV concurrently first (bounded by the shared
+    # budget), so the sequential verdict loop below reads warm cache throughout.
+    _prewarm_cold(cands, budget)
 
     kept: List[str] = []
     dropped: List[str] = []

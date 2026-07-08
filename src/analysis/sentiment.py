@@ -12,11 +12,13 @@ Precision controls:
   - Relevance fallback fix: if <2 relevant articles found, return [] (not all articles)
 """
 
+import hashlib
 import json
 import math
 import random
 import re
 import threading
+import time
 import anthropic
 from datetime import datetime, timezone
 from openai import OpenAI
@@ -138,6 +140,114 @@ def get_dominant_sentiment_model() -> Optional[str]:
 # user requirement is that two pipeline runs over the same cached inputs
 # produce only marginally different recommendations.
 _LLM_SEED = 1729
+
+
+# ── Sentiment LLM cache (latency + cost) ─────────────────────────────────────
+# Caches the RAW LLM verdict per (ticker, engine, exact top-20 article set).
+# The key hashes the ARTICLE SET, so a new article (or one aging out of the
+# 7-day window / top-20 cutoff) changes the key and forces a fresh score —
+# the news fast-lane's reactivity is preserved exactly; only a repeat scoring
+# of the IDENTICAL digest is skipped (the common case: the next 30-min tick,
+# and the hold-review re-scoring held tickers minutes after the main pass).
+# Only the raw LLM output is cached; the count/diversity precision scales are
+# recomputed live (they are pure functions of the same article set), and the
+# recency decay lives in top-20 SELECTION + the digest's age labels — bounded
+# by the TTL (an unchanged set is re-judged at most every TTL even so).
+# Thread-safe (scoring runs on many worker threads) and persisted to disk so
+# the warm cache survives the supervisor's process restarts.
+_SENT_CACHE_LOCK = threading.Lock()
+_SENT_CACHE: Optional[dict] = None          # key → {"raw_score","rationale","engine","ts"}
+_SENT_CACHE_DIRTY = False
+_SENT_CACHE_LAST_FLUSH = 0.0
+_SENT_CACHE_FLUSH_EVERY_S = 20.0            # debounce disk writes
+
+
+def _sent_cache_path():
+    from src.data.cache import CACHE_DIR
+    return CACHE_DIR / "sentiment_llm.json"
+
+
+def _sent_cache_ttl_seconds() -> float:
+    return max(1.0, float(getattr(settings, "sentiment_cache_ttl_minutes", 180) or 180)) * 60.0
+
+
+def _sentiment_cache_key(ticker: str, engine: str, articles: List[NewsArticle]) -> str:
+    """Hash of the exact article set that would be sent to the LLM (order-free)."""
+    ids = sorted(
+        f"{a.url or ''}|{a.source}|{a.title}|{a.published_at.isoformat()}"
+        for a in articles
+    )
+    payload = f"{ticker.upper()}|{engine}|{SENTIMENT_PROVIDER_MODELS.get(engine, engine)}|" + "\n".join(ids)
+    return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _sent_cache_load_locked() -> dict:
+    """Load (once) + expire-prune the persisted cache. Caller holds the lock."""
+    global _SENT_CACHE
+    if _SENT_CACHE is None:
+        data: dict = {}
+        try:
+            path = _sent_cache_path()
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.debug(f"[sentiment] cache load failed ({e}) — starting empty")
+            data = {}
+        cutoff = time.time() - _sent_cache_ttl_seconds()
+        _SENT_CACHE = {k: v for k, v in data.items()
+                       if isinstance(v, dict) and float(v.get("ts", 0)) >= cutoff}
+    return _SENT_CACHE
+
+
+def _sent_cache_flush_locked(force: bool = False) -> None:
+    """Debounced disk write. Caller holds the lock."""
+    global _SENT_CACHE_DIRTY, _SENT_CACHE_LAST_FLUSH
+    if _SENT_CACHE is None or not _SENT_CACHE_DIRTY:
+        return
+    now = time.time()
+    if not force and now - _SENT_CACHE_LAST_FLUSH < _SENT_CACHE_FLUSH_EVERY_S:
+        return
+    try:
+        path = _sent_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp{threading.get_ident()}")
+        tmp.write_text(json.dumps(_SENT_CACHE), encoding="utf-8")
+        import os
+        os.replace(tmp, path)
+        _SENT_CACHE_DIRTY = False
+        _SENT_CACHE_LAST_FLUSH = now
+    except Exception as e:
+        logger.debug(f"[sentiment] cache flush failed: {e}")
+
+
+def _sentiment_cache_get(key: str) -> Optional[dict]:
+    if not getattr(settings, "enable_sentiment_cache", True):
+        return None
+    with _SENT_CACHE_LOCK:
+        entry = _sent_cache_load_locked().get(key)
+        if entry and time.time() - float(entry.get("ts", 0)) <= _sent_cache_ttl_seconds():
+            return dict(entry)
+    return None
+
+
+def _sentiment_cache_put(key: str, raw_score: float, rationale: str, engine: str) -> None:
+    global _SENT_CACHE_DIRTY
+    if not getattr(settings, "enable_sentiment_cache", True):
+        return
+    with _SENT_CACHE_LOCK:
+        cache = _sent_cache_load_locked()
+        cache[key] = {"raw_score": raw_score, "rationale": rationale,
+                      "engine": engine, "ts": time.time()}
+        _SENT_CACHE_DIRTY = True
+        _sent_cache_flush_locked()
+
+
+def _reset_sentiment_cache_for_tests() -> None:
+    """Test hook: drop the in-memory cache so a test's tmp CACHE_DIR is re-read."""
+    global _SENT_CACHE, _SENT_CACHE_DIRTY
+    with _SENT_CACHE_LOCK:
+        _SENT_CACHE = None
+        _SENT_CACHE_DIRTY = False
 
 # Recency decay: articles older than this many hours get progressively down-weighted.
 # Tightened 36h → 18h (2026-06-17) to react faster to news catalysts — a same-day
@@ -399,8 +509,28 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
     # temperature=0 (+ a stable seed on DeepSeek; Anthropic exposes no seed)
     # so two runs scoring the same digest on the same engine agree.
     order = _sentiment_engine_order(force_engine)
+
+    # Provenance rule: only UNforced calls tally into the run's provider counts —
+    # a forced (opener-pinned hold-review) call is not "the run's sentiment
+    # engine", and with the review branch running concurrently with the main
+    # scoring pass it would otherwise pollute llm_sentiment_provider mid-run.
+    _tally = force_engine is None
+
+    # Cache: identical (ticker, engine, article set) → reuse the raw LLM verdict.
+    # temperature=0 makes the call deterministic anyway; this skips the latency.
+    cache_key = _sentiment_cache_key(ticker, order[0], to_score)
+    cached = _sentiment_cache_get(cache_key)
+    if cached is not None:
+        raw_score = float(cached["raw_score"])
+        rationale = str(cached.get("rationale") or "Rationale unavailable (cached).")
+        if _tally:
+            _record_sentiment_provider(str(cached.get("engine") or order[0]))
+        logger.debug(
+            f"{ticker} raw_sentiment={raw_score:+.2f} "
+            f"({cached.get('engine')}, {len(to_score)} articles, cached)"
+        )
     last_err: Exception | None = None
-    for engine in order:
+    for engine in (order if raw_score is None else []):
         try:
             if engine == "deepseek":
                 deepseek = _get_deepseek()
@@ -426,7 +556,9 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                 )
                 raw_score, rationale = _parse_response(message.content[0].text.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} ({engine}, {len(to_score)} articles)")
-            _record_sentiment_provider(engine)
+            if _tally:
+                _record_sentiment_provider(engine)
+            _sentiment_cache_put(cache_key, raw_score, rationale, engine)
             break
         except Exception as e:
             last_err = e
@@ -434,7 +566,8 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
 
     if raw_score is None:
         logger.error(f"Sentiment analysis failed for {ticker}: {last_err}")
-        _record_sentiment_provider("none")
+        if _tally:
+            _record_sentiment_provider("none")
         return 0.0, f"Analysis error: {last_err}"
 
     # --- Precision adjustments ---

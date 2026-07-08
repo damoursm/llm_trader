@@ -758,9 +758,40 @@ class Settings(BaseSettings):
     # sentiment ~7s/ticker + Massive/OHLCV reads), so a bounded thread pool collapses
     # the serial sum to ~max wall-time with IDENTICAL scores. 1 = sequential (legacy).
     # DeepSeek (sentiment = deepseek-v4-flash) caps at 2500 CONCURRENT, not RPM, and
-    # throttles by latency, not 429s — so 16 has huge headroom; past ~16 Amdahl (the
-    # serial synthesis call + fetch) dominates. Override per-deploy via the env var.
-    signal_scoring_max_workers: int = 16
+    # throttles by latency, not 429s — so 32 still has huge headroom. Raised 16→32
+    # (2026-07-08): Step 4 wall time scales ≈ tickers ÷ workers (measured 229s at
+    # 433 tickers / 16 workers) — the latency-profile work. Watch for DeepSeek /
+    # yfinance 429s in the logs; revert per-deploy via the env var if they appear.
+    signal_scoring_max_workers: int = 32
+
+    # ── Tick→order latency levers (2026-07-08 latency profile) ──────────────
+    # Run the opener-pinned hold-review CONCURRENTLY with Steps 4–5 instead of
+    # strictly after Step 5 (the review needs no main-synthesis output — it
+    # refetches its own news/prices and re-judges with the OPENING engines; its
+    # pinned synthesis still waits for the completed synthesis context, so the
+    # review prompt is identical to the sequential path). Saved ~2.5 min/tick
+    # measured. False = legacy sequential review (same code path, inline).
+    # NOTE: the ledger-mark refresh (calibrate_sim_costs + update_open_trades)
+    # runs before Step 4 in BOTH modes now — marks are stamped ~5 min earlier.
+    enable_hold_review_overlap: bool = True
+    # Cache the raw per-ticker sentiment LLM verdict keyed by (ticker, engine,
+    # exact article set). A new article changes the key → fresh score, so news
+    # reactivity is unchanged; only re-scoring an IDENTICAL digest is skipped
+    # (the next 30-min tick, and the hold-review re-scoring held names minutes
+    # after the main pass). TTL bounds staleness of the digest's age labels.
+    enable_sentiment_cache: bool = True
+    sentiment_cache_ttl_minutes: int = 180
+    # Bounded concurrency for the per-ticker yfinance options-chain scan (the
+    # fetch pool's slowest source, ~64s median). Kept LOW deliberately: the scan
+    # shares yfinance's unofficial per-IP rate limit with the GEX pass (which
+    # stays sequential after it) — history shows ~20+ req/s combined causes 429s
+    # on every ticker. 1 = sequential (legacy).
+    options_flow_max_workers: int = 2
+    # Bounded concurrency for the discovery liquidity gate's COLD OHLCV warm-up
+    # fetches (Polygon-first, so per-IP rate limits are not a concern; yfinance
+    # is only the fallback). The sequential loop was the 7-minute stall on the
+    # first tick after midnight (~200 uncached smart-money names). 1 = legacy.
+    liquidity_gate_fetch_workers: int = 8
 
     # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
     # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the

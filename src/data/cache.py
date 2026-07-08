@@ -157,14 +157,31 @@ def load_ohlcv(ticker: str, interval: str = "1d") -> Optional["pd.DataFrame"]:
 
 
 def save_ohlcv(ticker: str, df: "pd.DataFrame", interval: str = "1d") -> None:
-    """Persist OHLCV DataFrame to disk, overwriting any previous version."""
+    """Persist OHLCV DataFrame to disk, overwriting any previous version.
+
+    Atomic (temp file + ``os.replace``): OHLCV caches are written from many
+    threads (the scorer pool's cache-miss fetches, the tracker's open-trade
+    refresh, the liquidity gate's pre-warm — some concurrent with readers), and
+    a direct truncate-write let a concurrent reader catch a half-written file.
+    The temp name embeds the thread id so concurrent writers of the SAME ticker
+    can't collide on the temp file; last replace wins, and readers always see a
+    complete document either way.
+    """
+    import os
+    import threading
     _ohlcv_dir(interval).mkdir(parents=True, exist_ok=True)
     path = _ohlcv_path(ticker, interval)
+    tmp = path.with_name(f"{path.name}.tmp{threading.get_ident()}")
     try:
-        path.write_text(df.to_json(orient="split", date_format="iso"), encoding="utf-8")
+        tmp.write_text(df.to_json(orient="split", date_format="iso"), encoding="utf-8")
+        os.replace(tmp, path)
         logger.debug(f"[cache] Saved OHLCV[{interval}] for {ticker} → {path.name}")
     except Exception as e:
         logger.warning(f"[cache] Failed to save OHLCV[{interval}] for {ticker}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -137,12 +137,13 @@ def fetch_options_flow(tickers: List[str]) -> List[InsiderTrade]:
     today   = date.today()
     results: List[InsiderTrade] = []
 
-    for ticker in tickers:
+    def _scan_ticker(ticker: str) -> List[InsiderTrade]:
+        out: List[InsiderTrade] = []
         try:
             yt = yf.Ticker(ticker)
             expirations = yt.options
             if not expirations:
-                continue
+                return out
 
             current_price: float = 0.0
             try:
@@ -150,17 +151,35 @@ def fetch_options_flow(tickers: List[str]) -> List[InsiderTrade]:
             except Exception:
                 pass
             if current_price <= 0:
-                continue
+                return out
 
             near_exps = [
                 e for e in expirations
                 if (exp_d := _parse_expiry(e)) and 0 <= (exp_d - today).days <= _MAX_DTE
             ]
             for expiry in near_exps[:4]:   # at most 4 expirations per ticker
-                results.extend(_scan_chain(ticker, yt, expiry, current_price, today))
+                out.extend(_scan_chain(ticker, yt, expiry, current_price, today))
 
         except Exception as e:
             logger.warning(f"[options] {ticker} scan failed: {e}")
+        return out
+
+    # Bounded concurrency (options_flow_max_workers, default 2): this scan is the
+    # fetch pool's slowest source (~64s median), but it shares yfinance's
+    # unofficial per-IP rate limit with the GEX pass that runs after it in the
+    # same pool thread — ~20+ combined req/s historically 429s on every ticker,
+    # so keep the worker count LOW. Per-ticker failures stay silent (unchanged);
+    # ex.map preserves input order, so `results` matches the sequential output.
+    _workers = max(1, int(getattr(settings, "options_flow_max_workers", 1) or 1))
+    if _workers > 1 and len(tickers) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_workers, len(tickers)),
+                                thread_name_prefix="options") as ex:
+            for part in ex.map(_scan_ticker, tickers):
+                results.extend(part)
+    else:
+        for ticker in tickers:
+            results.extend(_scan_ticker(ticker))
 
     call_sweeps = sum(1 for r in results if r.transaction_type == "unusual_call")
     put_sweeps  = sum(1 for r in results if r.transaction_type == "unusual_put")

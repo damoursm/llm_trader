@@ -635,36 +635,22 @@ class _ReviewMap(dict):
     engines: dict = {}
 
 
-def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
-                        build_kwargs, synth_kwargs, session):
-    """Fix #2 — opener-pinned, fresh-data hold-review (one entry per held position).
+def _hold_review_groups(open_trades, run_sent=None, run_synth=None):
+    """Group held positions by their OPENING (sentiment, synthesis) engine combo.
 
-    For every OPEN position opened by LLM engines, produce TODAY's recommendation
-    using the SAME synthesis + sentiment engines that opened it, on FRESHLY
-    refetched news + prices — so ``monitor_open_positions`` compares entry-vs-now
-    confidence apples-to-apples (identical engines, temperature=0 ⇒ low volatility).
-    Returns ``{ticker: Recommendation}``. Runs EVERY trading tick.
-
-    Default (``enable_pinned_hold_review``): refetch news + prices for the held set
-    (no hourly cache) and, per (sentiment, synthesis) engine combo, re-aggregate
-    with the pinned sentiment engine + re-synthesize with the pinned synthesis
-    engine — combos run concurrently. A combo whose forced synthesis engine fails
-    yields no reviews for its tickers (they hold this tick).
-
-    Off: the cheap fallback — reuse THIS run's recs, but only for positions whose
-    opening engines BOTH match this run's engines (no extra LLM calls, no refetch).
-
-    Engine fallback (``hold_review_engine_fallback``): a combo whose pinned
-    synthesis engine produces nothing (e.g. Anthropic credits exhausted — observed
-    2026-06-26→07-01, which left every Claude-opened position ungoverned for days)
-    is re-judged once by the OTHER provider. Cross-engine confidence is not
-    apples-to-apples, but an available judge beats an absent one. The returned
-    mapping carries ``.engines`` (ticker → provider that actually judged it) so
-    ``_persist_trade_reviews`` records fallback reviews honestly.
+    LLM-opened positions are pinned to their stamped engines (Fix #2). Legacy /
+    rule-based-opened positions have nothing to pin: when this run's engines are
+    KNOWN (``run_sent``/``run_synth`` supplied — the sequential path), they are
+    merged into that combo so the exit is still LLM-judged rather than handed to
+    the poor aggregator-decay backstop (30%-win historically); when they are NOT
+    yet known (the overlap branch starts before Step 5 resolves them), they are
+    returned separately so the branch can review them once the engines arrive.
+    Returns ``(pinned_groups, legacy_tickers)``.
     """
     from collections import defaultdict
 
     groups: dict = defaultdict(list)
+    legacy: list = []
     run_is_llm = run_sent in ("anthropic", "deepseek") and run_synth in ("anthropic", "deepseek")
     for t in open_trades:
         se = _provider_of_synth_model(t.get("llm_sentiment_model"))
@@ -672,25 +658,47 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
         if se in ("anthropic", "deepseek") and sy in ("anthropic", "deepseek"):
             groups[(se, sy)].append(t["ticker"])          # opener-pinned (Fix #2)
         elif run_is_llm:
-            # Rule-based / legacy-opened (no LLM opener to pin): review with THIS
-            # run's engines so the exit is still LLM-judged rather than handed to
-            # the poor aggregator-decay backstop (30%-win historically). Not
-            # engine-pinned (there is nothing to pin), but far better — this
-            # completes Fix #2 for the trades the LLM did NOT open.
             groups[(run_sent, run_synth)].append(t["ticker"])
-    if not groups:
+        elif run_sent is None and run_synth is None:
+            legacy.append(t["ticker"])                    # engines resolve later (branch)
+    return dict(groups), legacy
+
+
+def _run_hold_reviews(groups, legacy_tickers, sectors, build_kwargs, session,
+                      synth_kwargs_wait, run_engines_wait):
+    """The pinned hold-review machinery: fresh refetch + per-combo re-judgment.
+
+    For every held position, produce TODAY's recommendation using the SAME
+    synthesis + sentiment engines that opened it, on FRESHLY refetched news +
+    prices — so ``monitor_open_positions`` compares entry-vs-now confidence
+    apples-to-apples (identical engines, temperature=0 ⇒ low volatility).
+
+    Two blocking waits decouple this from the main pipeline so it can run
+    CONCURRENTLY with Steps 4–5 (the overlap branch) or inline (sequential path,
+    where both waits return immediately):
+      • ``synth_kwargs_wait()`` → the synthesis context kwargs. Each combo's
+        ``build_signals`` starts IMMEDIATELY (overlapping the main Step-4 scoring
+        pass); only the pinned SYNTHESIS blocks here, because the review prompt
+        must carry the identical context blocks as the main pass — including the
+        Step-4.5 catalyst timing context, which needs the main signals.
+      • ``run_engines_wait()`` → this run's (sentiment, synthesis) engines,
+        consulted only for legacy positions with no opener stamps (resolved
+        after Step 5).
+    Either wait returning None aborts that stage fail-soft — no review means the
+    position simply holds this tick, same as a failed news refetch.
+
+    Engine fallback (``hold_review_engine_fallback``): a combo whose pinned
+    synthesis engine produces nothing (e.g. Anthropic credits exhausted — observed
+    2026-06-26→07-01, which left every Claude-opened position ungoverned for days)
+    is re-judged once by the OTHER provider on the same freshly-built signals.
+    Cross-engine confidence is not apples-to-apples, but an available judge beats
+    an absent one. The returned mapping carries ``.engines`` (ticker → provider
+    that actually judged it) so ``_persist_trade_reviews`` records fallback
+    reviews honestly.
+    """
+    if not groups and not legacy_tickers:
         return {}
-
-    # Cheap fallback: reuse this run's recs for positions whose engines BOTH match.
-    if not settings.enable_pinned_hold_review:
-        by_ticker = {r.ticker: r for r in full_recs}
-        return {
-            tk: by_ticker[tk]
-            for (se, sy), tks in groups.items() if se == run_sent and sy == run_synth
-            for tk in tks if tk in by_ticker
-        }
-
-    held = sorted({tk for tks in groups.values() for tk in tks})
+    held = sorted({tk for tks in groups.values() for tk in tks} | set(legacy_tickers))
     # FRESH market data (bypassing the hourly caches), every tick, for the held set.
     try:
         fresh_articles = fetch_all_news(held, sectors)
@@ -707,17 +715,30 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
 
     def _review(item):
         (se, sy), tickers = item
-
-        def _attempt(engine):
-            sub = build_signals(tickers, fresh_articles, snapshots=fresh_snaps,
-                                session=session, force_sentiment_engine=se, **build_kwargs)
-            recs = generate_recommendations(sub, session=session, force_engine=engine, **synth_kwargs)
-            # force_engine returns [] on failure, so any non-empty result is from `engine`.
-            want = set(tickers)
-            return {r.ticker: r for r in (recs or []) if r.ticker in want}
+        want = set(tickers)
 
         out: dict = {}
         engine_used = sy
+        try:
+            # Signal build first — needs only build_kwargs, so in the overlap
+            # branch it runs while the main Step 4 is still scoring.
+            sub = build_signals(tickers, fresh_articles, snapshots=fresh_snaps,
+                                session=session, force_sentiment_engine=se, **build_kwargs)
+        except Exception as e:
+            logger.warning(f"[hold_review] combo (sent={se}, synth={sy}) signal build failed: {e}")
+            return {}
+        synth_kwargs = synth_kwargs_wait()
+        if synth_kwargs is None:
+            logger.warning(
+                f"[hold_review] synthesis context never arrived — combo "
+                f"(sent={se}, synth={sy}) skipped (positions hold this tick)")
+            return {}
+
+        def _attempt(engine):
+            recs = generate_recommendations(sub, session=session, force_engine=engine, **synth_kwargs)
+            # force_engine returns [] on failure, so any non-empty result is from `engine`.
+            return {r.ticker: r for r in (recs or []) if r.ticker in want}
+
         try:
             out = _attempt(sy)
         except Exception as e:
@@ -745,18 +766,128 @@ def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
     items = list(groups.items())
     if len(items) == 1:
         reviews.update(_review(items[0]))
-    else:
+    elif items:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=len(items)) as ex:
             for part in ex.map(_review, items):
                 reviews.update(part)
+
+    # Legacy / rule-based-opened positions (no opener stamps): reviewed with THIS
+    # run's engines once they are known — immediately on the sequential path,
+    # after Step 5 on the overlap branch. A non-LLM run leaves them unreviewed
+    # (the aggregator backstop still governs them), exactly as before.
+    if legacy_tickers:
+        engines = run_engines_wait()
+        if engines and all(e in ("anthropic", "deepseek") for e in engines):
+            reviews.update(_review((tuple(engines), sorted(set(legacy_tickers)))))
+        elif engines is None:
+            logger.warning(
+                "[hold_review] run engines never arrived — legacy positions not reviewed this tick")
+
     logger.info(
         f"[hold_review] pinned: {len(reviews)}/{len(held)} held position(s) re-judged "
-        f"by their opening engines across {len(items)} engine combo(s)"
+        f"by their opening engines across {len(items) + (1 if legacy_tickers else 0)} engine combo(s)"
     )
     out_map = _ReviewMap(reviews)
     out_map.engines = dict(review_engines)
     return out_map
+
+
+def _build_hold_reviews(open_trades, run_sent, run_synth, full_recs, sectors,
+                        build_kwargs, synth_kwargs, session):
+    """Fix #2 — opener-pinned, fresh-data hold-review (one entry per held position).
+
+    Sequential entry point (the overlap branch is ``_HoldReviewBranch``): groups
+    positions with this run's engines already known, then runs the pinned
+    machinery inline — both waits resolve immediately. Returns
+    ``{ticker: Recommendation}``.
+
+    Off (``enable_pinned_hold_review`` false): the cheap fallback — reuse THIS
+    run's recs, but only for positions whose opening engines BOTH match this
+    run's engines (no extra LLM calls, no refetch).
+    """
+    groups, _legacy = _hold_review_groups(open_trades, run_sent, run_synth)
+    if not groups:
+        return {}
+
+    # Cheap fallback: reuse this run's recs for positions whose engines BOTH match.
+    if not settings.enable_pinned_hold_review:
+        by_ticker = {r.ticker: r for r in full_recs}
+        return {
+            tk: by_ticker[tk]
+            for (se, sy), tks in groups.items() if se == run_sent and sy == run_synth
+            for tk in tks if tk in by_ticker
+        }
+
+    return _run_hold_reviews(
+        groups, [], sectors, build_kwargs, session,
+        synth_kwargs_wait=lambda: synth_kwargs,
+        run_engines_wait=lambda: (run_sent, run_synth),
+    )
+
+
+class _HoldReviewBranch:
+    """Runs the opener-pinned hold-review CONCURRENTLY with pipeline Steps 4–5.
+
+    The review needs no output of the main synthesis (it fetches its own fresh
+    news/snapshots and re-judges with the OPENING engines), yet it used to run
+    strictly after Step 5 — ~2.5 min of serial tick→order latency. Constructed
+    right after ``build_kwargs`` exists (pre-Step 4, after ``update_open_trades``
+    has refreshed marks + OHLCV on the main thread): the news refetch and each
+    combo's ``build_signals`` overlap the main Step-4 scoring pass, and each
+    combo's pinned synthesis blocks until ``supply_synth_kwargs`` (called once
+    the synthesis context is complete, just before Step 5) so the review prompt
+    carries the identical context blocks — including catalyst timing — as the
+    main pass. Legacy (unstamped) positions additionally wait for
+    ``supply_run_engines`` (right after Step 5). ``result()`` joins the branch
+    before the monitor consumes the reviews.
+
+    Provenance safety: forced-engine synthesis/sentiment calls do NOT touch the
+    process-global last-synthesis meta or the sentiment provider tallies (see
+    claude_analyst/_set_synthesis_meta and sentiment._record_sentiment_provider),
+    so running concurrently with the main pass cannot mis-stamp the run.
+
+    If the pipeline dies before supplying a future, the waits time out and the
+    branch returns fail-soft (no reviews → positions hold this tick), matching
+    the semantics of a failed news refetch.
+    """
+
+    _WAIT_TIMEOUT_S = 1200.0
+
+    def __init__(self, open_trades, sectors, build_kwargs, session):
+        from concurrent.futures import Future, ThreadPoolExecutor
+        self._synth_kwargs: "Future" = Future()
+        self._run_engines: "Future" = Future()
+        groups, legacy = _hold_review_groups(open_trades)
+        self._ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hold-review")
+        self._fut = self._ex.submit(
+            _run_hold_reviews, groups, legacy, sectors, build_kwargs, session,
+            self._waiter(self._synth_kwargs), self._waiter(self._run_engines),
+        )
+
+    def _waiter(self, fut):
+        timeout = self._WAIT_TIMEOUT_S
+
+        def wait():
+            try:
+                return fut.result(timeout=timeout)
+            except Exception:
+                return None
+        return wait
+
+    def supply_synth_kwargs(self, synth_kwargs) -> None:
+        if not self._synth_kwargs.done():
+            self._synth_kwargs.set_result(dict(synth_kwargs))
+
+    def supply_run_engines(self, run_sent, run_synth) -> None:
+        if not self._run_engines.done():
+            self._run_engines.set_result((run_sent, run_synth))
+
+    def result(self):
+        try:
+            return self._fut.result()
+        finally:
+            self._ex.shutdown(wait=False)
 
 
 def _persist_trade_reviews(run_id, hold_reviews, open_trades):
@@ -1586,6 +1717,31 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         fundamental_factors=_fund_factors,
         borrow_context=borrow_context,
     )
+
+    # ── Early ledger refresh + overlapped hold-review branch (2026-07-08) ────
+    # These used to run AFTER Step 5, back-to-back with the ~2-min hold-review
+    # behind them — ~2.5 min of serial tick→order latency. Everything they need
+    # exists HERE, so: refresh the ledger marks on the MAIN thread (the
+    # IBKR-first price path keeps its thread/event-loop affinity, and Step 4.6's
+    # open-position summaries then read FRESH marks instead of last tick's),
+    # then start the pinned hold-review branch whose signal build overlaps
+    # Step 4 and whose pinned synthesis overlaps Step 5. Trade-off accepted:
+    # position marks are stamped at Step-4 start (~5 min earlier than before) —
+    # well inside the 30-min tick resolution. Observation ticks skip all of it.
+    hold_review_branch = None
+    _open_trades_now: List = []
+    if not observe_only:
+        # Calibrate the sim cost to real IBKR fills BEFORE any cost-dependent
+        # step this tick (normalize / M2M / horizon hurdle / new entries / NAV),
+        # so every figure the run produces and persists shares one cost basis.
+        calibrate_sim_costs()
+        update_open_trades()   # also force-refreshes OHLCV for open tickers (fresh prices)
+        _open_trades_now = get_open_trades()
+        if (_open_trades_now and settings.enable_pinned_hold_review
+                and settings.enable_hold_review_overlap):
+            hold_review_branch = _HoldReviewBranch(
+                _open_trades_now, sectors, build_kwargs, run_session)
+
     signals = build_signals(
         all_tickers,
         articles,
@@ -1767,6 +1923,12 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         fundamentals_context=fundamentals_context,
         corporate_actions_context=corporate_actions_context,
     )
+    if hold_review_branch is not None:
+        # Unblock the branch's pinned synthesis calls: the context kwargs are
+        # complete (incl. the Step-4.5 catalyst timing block), identical to what
+        # the main synthesis below receives — so the reviews run concurrently
+        # with Step 5 on the same context the run's entries are judged on.
+        hold_review_branch.supply_synth_kwargs(synth_kwargs)
     recommendations = generate_recommendations(
         signals,
         open_positions=open_position_summaries if hold_prompt_active else None,
@@ -1775,21 +1937,23 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     )
 
     # ── Fix #2: capture this run's engines for the opener-pinned hold-review ──
-    # The actual review (fresh news/price refetch + per-opener-engine
-    # re-judgment of every held position) runs in the trading block below, so
-    # observation ticks pay nothing. Captured here BEFORE the top-10 truncation:
-    # this run's synthesis + sentiment engines (for the cheap fallback path) and
-    # the full pre-truncation recs (every held ticker is pinned into the universe
-    # at Step 0, so each has a rec).
+    # Captured here BEFORE the top-10 truncation: this run's synthesis +
+    # sentiment engines (for the legacy-position group + the cheap fallback
+    # path) and the full pre-truncation recs (every held ticker is pinned into
+    # the universe at Step 0, so each has a rec). The globals read here are
+    # safe against the concurrently-running review branch: forced-engine calls
+    # no longer touch the last-synthesis meta or the sentiment tallies, so both
+    # reflect the MAIN pass only.
     _synth_meta = get_last_synthesis_meta()
     run_synthesis_provider = _synth_meta.get("provider")
-    # Sentiment provenance snapshotted HERE too: the hold-reviews below re-score
-    # sentiment and re-run synthesis, mutating the process-global tallies — the
-    # run row / trade stamps must reflect the MAIN pass, not the last review.
     _sent_model = get_dominant_sentiment_model()
     _sent_summary = get_sentiment_provider_summary()
     run_sentiment_provider = _provider_of_synth_model(_sent_model)
     _full_recs = list(recommendations)
+    if hold_review_branch is not None:
+        # Unblock the branch's legacy-position group (positions with no opener
+        # stamps are reviewed with THIS run's engines, now known).
+        hold_review_branch.supply_run_engines(run_sentiment_provider, run_synthesis_provider)
 
     # Keep only the top 10 recommendations by conviction:
     # BUY/SELL first (sorted by confidence desc), then HOLD/WATCH to fill up to 10.
@@ -1958,20 +2122,19 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         trade_diag = {}
         perf, hypothetical_perf = {}, {}
     else:
-        # Calibrate the sim cost to real IBKR fills BEFORE any cost-dependent
-        # step this tick (normalize / M2M / new entries / NAV), so every figure
-        # the run produces and persists shares one real cost basis.
-        calibrate_sim_costs()
-        update_open_trades()   # also force-refreshes OHLCV for open tickers (fresh prices)
-        # Fix #2 — opener-pinned hold-review: re-judge every held LLM-opened
-        # position with the SAME engines that opened it, on fresh news + prices,
-        # EVERY tick. Built here (after update_open_trades' OHLCV refresh, before
-        # the monitor consumes it).
-        _open_trades_now = get_open_trades()
-        hold_reviews = _build_hold_reviews(
-            _open_trades_now, run_sentiment_provider, run_synthesis_provider,
-            _full_recs, sectors, build_kwargs, synth_kwargs, run_session,
-        )
+        # Sim-cost calibration + ledger mark refresh ran BEFORE Step 4 (the
+        # overlap block above), and the opener-pinned hold-review (fix #2) has
+        # been running concurrently with Steps 4–5 since then — join it here,
+        # before the monitor consumes it. When the overlap is off (or pinned
+        # reviews are disabled → the cheap reuse path), build them inline
+        # exactly as before.
+        if hold_review_branch is not None:
+            hold_reviews = hold_review_branch.result()
+        else:
+            hold_reviews = _build_hold_reviews(
+                _open_trades_now, run_sentiment_provider, run_synthesis_provider,
+                _full_recs, sectors, build_kwargs, synth_kwargs, run_session,
+            )
         # Persist the trajectory (confidence/action vs entry + price) BEFORE the
         # monitor may close on it, so the review that triggered a close is recorded.
         _persist_trade_reviews(run_id, hold_reviews, _open_trades_now)

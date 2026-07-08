@@ -3237,6 +3237,9 @@ Return ALL tickers from the input. No markdown, JSON only."""
         last_brace = raw.rfind("}")
         if last_brace == -1:
             logger.error(f"[claude] Could not parse {analyst_source} response")
+            if force_engine:
+                # Pinned hold-review: no rule-based fabrication — no review this tick.
+                return []
             _set_synthesis_meta("rule-based")
             return _fallback_recommendations(signals)
         repaired = raw[:last_brace + 1].rstrip().rstrip(",") + "]"
@@ -3246,6 +3249,8 @@ Return ALL tickers from the input. No markdown, JSON only."""
             data = json.loads(repaired)
         except json.JSONDecodeError:
             logger.error(f"[claude] Could not repair {analyst_source} response")
+            if force_engine:
+                return []
             _set_synthesis_meta("rule-based")
             return _fallback_recommendations(signals)
         logger.warning(
@@ -3278,7 +3283,12 @@ Return ALL tickers from the input. No markdown, JSON only."""
             f"— filled with rule-based fallback: {', '.join(s.ticker for s in missing)}"
         )
 
-    _set_synthesis_meta(_engine_of(analyst_source), analyst_source)
+    # Provenance: only the run's MAIN (unforced) synthesis owns the last-synthesis
+    # meta. A forced (opener-pinned hold-review) call must not stamp it — the
+    # review branch runs concurrently with the main pass, and the pipeline reads
+    # this meta right after its own call to attribute the run/trades.
+    if not force_engine:
+        _set_synthesis_meta(_engine_of(analyst_source), analyst_source)
     logger.info(f"Generated {len(recommendations)} recommendations via {analyst_source}")
     return recommendations
 

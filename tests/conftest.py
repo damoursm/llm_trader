@@ -49,6 +49,21 @@ def _spread_only_costs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_sentiment_cache(tmp_path, monkeypatch):
+    """Point the sentiment LLM cache at a throwaway file + drop the in-memory
+    copy for EVERY test. The cache is a process-global keyed by (ticker, engine,
+    article set) persisted under cache/ — without this, a test's canned LLM
+    response could leak into another test (or into the production cache file)."""
+    from src.analysis import sentiment
+
+    monkeypatch.setattr(sentiment, "_sent_cache_path",
+                        lambda: tmp_path / "sentiment_llm.json")
+    sentiment._reset_sentiment_cache_for_tests()
+    yield
+    sentiment._reset_sentiment_cache_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_cost_override():
     """Reset the process-global real-fill cost override (flat + per-session)
     and the calibration registry before AND after every test. They're
