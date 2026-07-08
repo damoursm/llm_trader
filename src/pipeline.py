@@ -476,15 +476,21 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
     if report.get("rejects"):
         problems.append(f"{report['rejects']} order(s) rejected")
     if report.get("drift"):
-        names = ", ".join(d["ticker"] for d in report["drift"][:6])
-        flattened = report.get("drift_flattened", 0)
-        suffix = (f"; auto-flatten submitted for {flattened}" if flattened
-                  else "; report-only" if all(
-                      d.get("action") in (None, "report") for d in report["drift"])
-                  else "; auto-flatten FAILED — check broker order log")
-        problems.append(
-            f"{len(report['drift'])} position(s) drifted from the ledger ({names}){suffix}"
-        )
+        # Overnight positions whose flatten the overnight venue won't accept are
+        # PENDING until the pre-market open (self-resolving), NOT a failure —
+        # exclude them so they don't force a CRITICAL/email every overnight tick
+        # (they stay visible in the drift list + broker order log + dashboard).
+        hard = [d for d in report["drift"] if d.get("action") != "flatten_pending_open"]
+        if hard:
+            names = ", ".join(d["ticker"] for d in hard[:6])
+            flattened = report.get("drift_flattened", 0)
+            suffix = (f"; auto-flatten submitted for {flattened}" if flattened
+                      else "; report-only" if all(
+                          d.get("action") in (None, "report") for d in hard)
+                      else "; auto-flatten FAILED — check broker order log")
+            problems.append(
+                f"{len(hard)} position(s) drifted from the ledger ({names}){suffix}"
+            )
     if not report.get("ok") and report.get("errors"):
         problems.append("reconcile error")
     return {
@@ -504,6 +510,10 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
         "entry_cancels_on_close": report.get("entry_cancels_on_close", 0),
         "drift_flattened": report.get("drift_flattened", 0),
         "drift":          report.get("drift", []),
+        # Benign: overnight positions awaiting flatten at the pre-market open —
+        # surfaced (not a problem, so no alert).
+        "drift_pending":  [d["ticker"] for d in report.get("drift", [])
+                           if d.get("action") == "flatten_pending_open"],
         "slippage":       report.get("slippage", []),
         "message":        "; ".join(problems),
     }
@@ -901,6 +911,20 @@ def _email_decision(*, observe_only: bool, send_email: bool,
     if send_email or email_configured or health_problem:
         return "send"
     return "skip"
+
+
+def _is_tradeable(ticker: str, budget: dict) -> bool:
+    """Tradeable-liquidity gate (Gate 4 of the actionable filter): True iff
+    ``ticker`` clears the higher TRADE price + 20-day dollar-volume floor
+    (``trade_min_price`` / ``trade_min_dollar_volume``). False → OBSERVE-ONLY: the
+    name is still scored + persisted to the signals panel (so penny / thin-volume
+    performance keeps accruing) but never opens a trade. Fail-closed (``is_liquid``
+    returns False when liquidity can't be verified). Gate off → always tradeable."""
+    if not getattr(settings, "enable_trade_liquidity_gate", False):
+        return True
+    from src.data.liquidity import is_liquid
+    return is_liquid(ticker, budget, settings.trade_min_price,
+                     settings.trade_min_dollar_volume)
 
 
 # ---------------------------------------------------------------------------
@@ -1849,6 +1873,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "dropped_low_combined_score":   0,
         "dropped_buy_blocked":          0,
         "dropped_earnings_blackout":    0,
+        "dropped_untradeable":          0,
         "actionable_survivors":         0,
         "confidence_threshold":         round(_confidence_threshold, 2),
         "threshold_calibration":        threshold_meta,   # engine-relative gate audit
@@ -1872,6 +1897,9 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "hold_prompt_n_positions":      len(open_position_summaries),
     }
 
+    # Fresh cold-fetch allowance for the trade gate (actionable tickers are almost
+    # always already cached from scoring, so this rarely fetches).
+    _trade_gate_budget = {"n": max(0, int(settings.discovery_gate_max_fetch))}
     actionable: List = []
     for r in recommendations:
         if r.action not in ("BUY", "SELL"):
@@ -1888,6 +1916,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # Gate 3 — earnings blackout window
         if r.ticker in earnings_blackout:
             gate_diag["dropped_earnings_blackout"] += 1
+            continue
+        # Gate 4 — tradeable liquidity floor: penny / thin names (< trade_min_price
+        # or < trade_min_dollar_volume 20d ADV) are OBSERVE-ONLY — still scored +
+        # persisted to the signals panel (penny-stock performance keeps accruing)
+        # but never actionable (no sim trade / broker order). Fail-closed via
+        # is_liquid; discovery admits them at the LOWER observation floor.
+        if not _is_tradeable(r.ticker, _trade_gate_budget):
+            gate_diag["dropped_untradeable"] += 1
             continue
         actionable.append(r)
         gate_diag["actionable_survivors"] += 1
@@ -2035,7 +2071,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f"survived={gate_diag['actionable_survivors']} "
         f"(rejected by threshold={gate_diag['dropped_below_threshold']}, "
         f"BUY-block={gate_diag['dropped_buy_blocked']}, "
-        f"earnings-blackout={gate_diag['dropped_earnings_blackout']}) | "
+        f"earnings-blackout={gate_diag['dropped_earnings_blackout']}, "
+        f"untradeable={gate_diag['dropped_untradeable']}) | "
         f"trade entry: {gate_diag['trade_considered']} considered → "
         f"opened={gate_diag['trade_opened']} "
         f"(already_open={gate_diag['trade_skipped_already_open']}, "

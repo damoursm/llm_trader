@@ -693,6 +693,16 @@ def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
             f"[broker] drift {ticker}: auto-flatten submitted — {side} {qty} "
             f"LMT @{limit} (live {live}); the broker converges to the ledger"
         )
+    elif _overnight_routing_active():
+        # The overnight venue won't accept this flatten (thin / ineligible book);
+        # it self-resolves at the pre-market open where it routes normally. Benign
+        # + expected — INFO, and NOT a reconcile error (so it doesn't force a
+        # broker-health alert every overnight tick). The caller marks it
+        # 'flatten_pending_open'.
+        logger.info(
+            f"[broker] drift {ticker}: overnight flatten not accepted by the "
+            f"overnight venue ({res.error}) — pending, retries at the pre-market open"
+        )
     else:
         report["errors"].append(f"drift flatten {ticker}: {res.error}")
         logger.warning(f"[broker] drift {ticker}: flatten failed — {res.error}")
@@ -1359,7 +1369,12 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 report["drift_flattened"] += 1
                 entry["action"] = "flatten_submitted"
             else:
-                entry["action"] = "flatten_failed"
+                # An overnight drift-flatten the overnight venue won't accept is
+                # EXPECTED and self-resolves at the pre-market open — mark it
+                # benign (pending) so it isn't a screaming FAILED alert every
+                # overnight tick. Daytime / extended failures stay a real problem.
+                entry["action"] = ("flatten_pending_open"
+                                   if _overnight_routing_active() else "flatten_failed")
 
         # ── SETTLE: fill fast or kill (this tick's submissions) ──────────
         # Watch unfilled orders ≤broker_settle_seconds, re-anchor once at a

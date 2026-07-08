@@ -58,6 +58,33 @@ def method_winrate_fig(perf: dict) -> go.Figure:
     return fig
 
 
+def bucket_bar_fig(buckets, title: str, y_title: str, pct: bool = False) -> go.Figure:
+    """Vertical bar of a metric per price/dollar-volume band (green ≥ 0, red < 0),
+    the sample size annotated on each bar. ``buckets`` = [{band, n, mean}] in band
+    order; bands with no data (mean None) are dropped. ``pct`` formats as a %."""
+    rows = [b for b in (buckets or []) if b.get("mean") is not None]
+    if not rows:
+        return _empty("No data in these buckets yet.")
+    bands = [b["band"] for b in rows]
+    means = [float(b["mean"]) for b in rows]
+    ns = [int(b.get("n", 0)) for b in rows]
+    colors = [POS if m >= 0 else NEG for m in means]
+    unit = "%" if pct else ""
+    fmt = (lambda m: f"{m:+.2f}%") if pct else (lambda m: f"{m:+.3f}")
+    fig = go.Figure(go.Bar(
+        x=bands, y=means, marker_color=colors, customdata=ns,
+        text=[f"{fmt(m)}<br>n={n}" for m, n in zip(means, ns)], textposition="auto",
+        hovertemplate="%{x}: %{y:.3f}" + unit + " (n=%{customdata})<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    fig.update_layout(
+        title=title, yaxis_title=y_title, xaxis_title="",
+        margin=dict(l=10, r=10, t=40, b=10), height=320,
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
 def confidence_return_fig(perf: dict) -> go.Figure:
     """Scatter of each trade's return against the confidence that opened it.
 

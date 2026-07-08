@@ -454,6 +454,22 @@ def predictability(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int =
                    lambda: _retry(_q, "predictability"))
 
 
+def price_volume_perf(force: bool = False) -> dict:
+    """Return & score bucketed by stock PRICE and DOLLAR VOLUME — do penny /
+    thin names diverge from pricier / liquid ones? ``{"trades": {...}, "signals":
+    {...}}``: realized ledger returns by band + combined_score / 5-day forward
+    return by band over the unbiased signals panel. Cached (the OHLCV join is
+    heavy); run-based so it refreshes when a new run lands."""
+    from src.analysis.price_volume_perf import (trade_return_by_price_volume,
+                                                 score_by_price_volume)
+
+    def _q():
+        trades = repo.load_trades()
+        return {"trades": trade_return_by_price_volume(trades),
+                "signals": score_by_price_volume()}
+    return _cached(("price_volume_perf",), lambda: _retry(_q, "price_volume_perf"), force=force)
+
+
 def source_trade_perf() -> list:
     """Realized per-source trade outcomes from the ledger (trades / win_rate /
     avg / median / best / worst by ``universe_source``) — what actually traded

@@ -2225,6 +2225,23 @@ def _evaluate_decay(
     return None
 
 
+def _trailing_exit_triggered(trade: dict) -> bool:
+    """Profit-capture trailing stop: once a position's MFE (cost-adjusted peak
+    return) has armed past ``trailing_arm_pct``, trigger once it has given back at
+    least ``trailing_give_back_frac`` of that peak — locking a consistent fraction of
+    every winner instead of round-tripping it (the scorecard's −58% give-back)."""
+    if not settings.enable_trailing_exit:
+        return False
+    try:
+        mfe = float(trade.get("max_favorable_excursion") or 0.0)
+        ret = float(trade.get("return_pct") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if mfe < float(settings.trailing_arm_pct):
+        return False                                    # peak not meaningful — don't arm
+    return ret <= mfe * (1.0 - float(settings.trailing_give_back_frac))
+
+
 def monitor_open_positions(
     signals_by_ticker: Optional[dict] = None,
     macro_regime_context=None,
@@ -2265,7 +2282,8 @@ def monitor_open_positions(
     # Exit-conviction consensus (the entry-breadth analog): calibrated once from
     # the pre-monitor ledger, then applied per position as a bounded, evidence-
     # throttled nudge to the same-direction close floor. Inert (0) with no data.
-    from src.analysis.exit_conviction import exit_conviction_calibration, exit_floor_adjustment
+    from src.analysis.exit_conviction import (exit_conviction_calibration, exit_floor_adjustment,
+                                              exit_method_consensus)
     from src.analysis.exit_methods import build_exit_scores
     from src.analysis.horizon_edge import calibrate_edge_horizon, edge_decay_floor_adjustment
     exit_conv_cal = exit_conviction_calibration(trades)
@@ -2281,19 +2299,35 @@ def monitor_open_positions(
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
         hold_review = (hold_reviews or {}).get(trade["ticker"])
         exit_adj = 0.0
-        if _use_escores and hold_review is not None:
+        _escores = None
+        # Exit scores drive BOTH the LLM floor nudge (needs a hold_review) and the
+        # mechanical-consensus exit (independent of the LLM) — compute once when
+        # either is wanted (build_exit_scores is hold_review-None-safe).
+        if _use_escores or settings.enable_mechanical_exit:
             try:
                 _escores = build_exit_scores(trade, hold_review, signals_by_ticker,
                                              macro_regime_context)
-                if settings.enable_exit_conviction:
-                    exit_adj += exit_floor_adjustment(_escores, exit_conv_cal)
-                if settings.enable_edge_decay_exit:
-                    # Held past the realized edge window → raise the close floor.
-                    exit_adj += edge_decay_floor_adjustment(_escores, edge_cal)
+                if hold_review is not None:
+                    if settings.enable_exit_conviction:
+                        exit_adj += exit_floor_adjustment(_escores, exit_conv_cal)
+                    if settings.enable_edge_decay_exit:
+                        # Held past the realized edge window → raise the close floor.
+                        exit_adj += edge_decay_floor_adjustment(_escores, edge_cal)
             except Exception as e:
                 logger.debug(f"[exit_adj] skipped for {trade.get('ticker')}: {e}")
         reason = _evaluate_decay(trade, today_signal, macro_regime_context, hold_review,
                                  exit_conviction_adj=exit_adj)
+        # Monitor-level exits (2026-07-08) — fire ONLY when the LLM exit logic above
+        # held, so they never override a macro/flip/confidence close. (1) Trailing
+        # profit-capture locks a winner before it round-trips (−58% MFE give-back);
+        # (2) the mechanical signal consensus (money_flow/max_pain/…; − = exit) closes
+        # off positive-exit-IC signals instead of waiting for the LATE LLM flip.
+        if reason is None and _trailing_exit_triggered(trade):
+            reason = "trailing_stop"
+        if reason is None and settings.enable_mechanical_exit and _escores is not None:
+            _mc = exit_method_consensus(_escores)
+            if _mc is not None and _mc <= -abs(float(settings.mechanical_exit_threshold)):
+                reason = "mechanical_exit"
         # Opt-in intraday exit: close when the 30-min trend has reversed hard
         # against the position (Hybrid model — intraday only times the exit).
         if reason is None and settings.enable_intraday_exit:
@@ -2342,7 +2376,17 @@ def monitor_open_positions(
 
         # Logging — branch by which decision-maker fired so the line is legible.
         regime = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
-        if reason in ("llm_signal_flipped", "llm_confidence_loss"):
+        if reason in ("trailing_stop", "mechanical_exit"):
+            if reason == "trailing_stop":
+                extra = (f"MFE peaked {trade.get('max_favorable_excursion')}% → gave back to "
+                         f"{ret:+.2f}% (≥{settings.trailing_give_back_frac:.0%} of the peak)")
+            else:
+                extra = "mechanical signal consensus said EXIT (money_flow/max_pain/…)"
+            logger.info(
+                f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
+                f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  ({extra})"
+            )
+        elif reason in ("llm_signal_flipped", "llm_confidence_loss"):
             # LLM exit: entry conf is the LLM number on the trade; today is the
             # opening engine's fresh re-judgment of the ticker (hold_review).
             entry_conf = trade.get("confidence")

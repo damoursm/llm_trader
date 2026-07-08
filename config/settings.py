@@ -445,12 +445,24 @@ class Settings(BaseSettings):
     # Loosened 2026-07-05 to WIDEN the net toward penny / lower-volume names so the
     # predictability panel can measure whether they are easier or harder to
     # predict (bucket features `price` + `dollar_vol`). The $1 floor keeps out
-    # sub-$1 OTC junk (awful spreads / data); the $5M dollar-volume floor still
-    # leaves every name plenty liquid for ~$1k positions. NOTE: dollar-volume is
-    # the main universe-SIZE lever (most tickers are gated by it, not price) — if
-    # ticks get slow or costly, raise it back toward 20M.
-    discovery_min_price: float = 1.0                 # minimum last close ($)
-    discovery_min_dollar_volume: float = 5_000_000   # minimum 20-day average dollar volume ($)
+    # sub-$1 OTC junk (awful spreads / data). NOTE: dollar-volume is the main
+    # universe-SIZE lever (most tickers are gated by it, not price) — if ticks get
+    # slow or costly, raise it. 2026-07-08: these are now the OBSERVATION floor —
+    # kept LOW so penny / thin-volume names enter the universe and keep accruing
+    # performance data (the signals panel + the price/volume + predictability
+    # panels); a SEPARATE, HIGHER TRADE floor (trade_min_* below) decides what can
+    # actually trade, so sub-threshold names are scored + tracked but observe-only.
+    discovery_min_price: float = 1.0                 # observation floor — min last close ($)
+    discovery_min_dollar_volume: float = 1_000_000   # observation floor — min 20d avg $ volume ($)
+    # TRADE liquidity floor (separate from + higher than the discovery/observation
+    # floor above): a BUY/SELL for a ticker below EITHER of these is OBSERVE-ONLY —
+    # still scored + persisted to the signals panel (so penny-stock performance
+    # keeps accruing) but NEVER actionable (no sim trade, no broker order). Applied
+    # in the pipeline actionable filter (Gate 4); fail-closed via is_liquid (a name
+    # whose liquidity can't be verified is not traded). Flag false = disable.
+    enable_trade_liquidity_gate: bool = True
+    trade_min_price: float = 5.0                      # min last close ($) to be tradeable
+    trade_min_dollar_volume: float = 5_000_000        # min 20d avg $ volume to be tradeable
     discovery_gate_max_fetch: int = 25               # cap cold OHLCV fetches per run for the gate
     # Drop exotic security TYPES from discovery (preferred series, warrants, units,
     # rights, OTC foreign ordinaries) — redundant with a primary listing and/or not
@@ -880,6 +892,17 @@ class Settings(BaseSettings):
     ic_weight_min_multiplier: float = 0.25 # floor for a confidently anti-predictive method
     ic_weight_max_multiplier: float = 3.0  # cap on a strongly-predictive method's boost
     ic_weight_cache_seconds: int = 1800    # reuse the heavy panel IC across ticks / hold-review calls
+    # Method INVERSION (manual, evidence-driven) — comma-separated method names whose
+    # RAW score is reliably anti-predictive NET OF BETA across horizons (confirm via
+    # `python -m src.analysis.scorecard` or `simulated_trades --directional`: a side
+    # whose market-relative ICIR is confidently negative and STAYS negative across
+    # horizons). Such a method contributes with a FLIPPED sign in combined_score — a
+    # reliably-backwards signal, corrected, is a reliably-right one — and is lifted
+    # off the IC anti-predictive floor to base weight. The signals panel keeps the RAW
+    # score, so the inversion stays re-validatable (raw IC still shows backwards ⇒
+    # keep inverting; raw IC flips positive ⇒ remove it). Empty = none. Set via
+    # INVERTED_METHODS in .env — a reversible ops call, not a baked-in regime bet.
+    inverted_methods: str = ""
 
     # ── Macro News Regime (geopolitics / oil / tariffs / policy) ────────────
     # Scans the day's news flow for macro-level themes (active wars and
@@ -1553,6 +1576,27 @@ class Settings(BaseSettings):
     edge_decay_prior_obs: int = 250            # obs prior shrinking the evidence strength (gentle now)
     edge_decay_floor_cap: float = 0.08         # max confidence-loss-floor raise from the edge-decay stop
     edge_decay_cal_ttl_seconds: int = 21600    # calibration cache TTL (6h; changes ~daily)
+    # ── Exit fixes (2026-07-08) — the scorecard flagged a −58% MFE give-back (no
+    # profit-taking: winners round-trip) and that `llm_signal_flipped` closes
+    # positions already ~5.6% DOWN (the LLM flip fires too LATE), while the mechanical
+    # exit signals carry POSITIVE exit-IC (money_flow +0.21, max_pain +0.34). Two
+    # monitor-level exits address both, leaning on the mechanical side — they only
+    # fire when the LLM exit logic (_evaluate_decay) did NOT already close.
+    #  (1) Trailing profit-capture: once a position's MFE (cost-adjusted peak return)
+    #      arms past trailing_arm_pct, close it if it has given back ≥
+    #      trailing_give_back_frac of that peak (exit_reason "trailing_stop") — locks a
+    #      consistent fraction of every winner instead of round-tripping it.
+    enable_trailing_exit: bool = True
+    trailing_arm_pct: float = 3.0              # arm the trail once MFE ≥ this (cost-adj %)
+    trailing_give_back_frac: float = 0.5       # close after giving back this fraction of the peak MFE
+    #  (2) Mechanical-consensus exit: close when the raw SIGNAL methods' exit
+    #      consensus (`exit_method_consensus`: money_flow / max_pain / …; − = exit,
+    #      LLM + aggregator + time-overlays EXCLUDED) is confidently "exit"
+    #      (≤ −mechanical_exit_threshold), independent of the LLM review (exit_reason
+    #      "mechanical_exit") — times the exit off positive-exit-IC signals rather
+    #      than waiting for the late LLM flip.
+    enable_mechanical_exit: bool = True
+    mechanical_exit_threshold: float = 0.35    # consensus ≤ −this → mechanical exit
 
     # ── End-of-day maintenance (2026-07-04) — scalability for the weeks ahead ──
     # Once per market day, at/after eod_maintenance_time ET (robust to missed

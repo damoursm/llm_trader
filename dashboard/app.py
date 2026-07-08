@@ -1035,6 +1035,58 @@ _PREDICT_EDGE_TOOLTIP = (
 
 _PRED_HORIZONS = (1, 5, 10)
 
+_PRICEVOL_TOOLTIP = (
+    "Do penny / thin-volume names behave differently from pricier / liquid ones — the question behind "
+    "widening the discovery filter to < $1 / < $5M? Two datasets on fixed, interpretable bands (aligned "
+    "to the $1/$5 price and $5M/$20M dollar-volume gate thresholds): (1) realized TRADE returns from the "
+    "ledger — the strategy's actual P&L, by the trade's entry price and the stock's as-of-entry 20-day "
+    "dollar volume (small + selection-biased, read the n on each bar); (2) combined_score across the "
+    "UNBIASED signals panel (thousands of rows) with the mean 5-day forward return alongside — the "
+    "large-sample view of how conviction and the realized move vary across the price/volume grid. Bars "
+    "are green ≥ 0 / red < 0.")
+
+
+def _pv_row(figs):
+    """A responsive flex row of dcc.Graphs (wraps on a narrow screen)."""
+    return html.Div(
+        [html.Div(dcc.Graph(figure=f), style={"flex": "1 1 440px", "minWidth": 0}) for f in figs],
+        style={"display": "flex", "flexWrap": "wrap", "gap": "10px"})
+
+
+def _price_volume_section():
+    """Return & score by stock price and dollar volume — the penny-vs-pricier
+    divergence behind the widened discovery filter."""
+    res = data.price_volume_perf()
+    tr = (res or {}).get("trades") or {}
+    sc = (res or {}).get("signals") or {}
+    children = [_h3("Return & score by price / dollar-volume", _PRICEVOL_TOOLTIP)]
+
+    # (1) realized trade returns from the ledger
+    children.append(html.Div(
+        f"Realized trade return — {tr.get('n_trades', 0)} trades "
+        f"({tr.get('n_with_dvol', 0)} with a volume read). Small, selection-biased sample — "
+        "watch the n on each bar.",
+        style={"fontWeight": "bold", "marginTop": 8, "marginBottom": 4, "color": "#cbd5e1"}))
+    children.append(_pv_row([
+        figures.bucket_bar_fig(tr.get("by_price"), "Trade return by stock price", "Avg return %", pct=True),
+        figures.bucket_bar_fig(tr.get("by_dvol"), "Trade return by dollar volume", "Avg return %", pct=True),
+    ]))
+
+    # (2) combined_score across the unbiased panel + the 5-day forward return
+    children.append(html.Div(
+        f"Signal conviction & realized move — combined_score and mean 5-day forward return over "
+        f"{sc.get('n_rows', 0):,} unbiased signals-panel rows.",
+        style={"fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#cbd5e1"}))
+    children.append(_pv_row([
+        figures.bucket_bar_fig(sc.get("by_price"), "Score by stock price", "Avg combined_score"),
+        figures.bucket_bar_fig(sc.get("by_dvol"), "Score by dollar volume", "Avg combined_score"),
+    ]))
+    children.append(_pv_row([
+        figures.bucket_bar_fig(sc.get("fwd_by_price"), "Forward 5d return by price (unbiased)", "Avg 5d fwd %", pct=True),
+        figures.bucket_bar_fig(sc.get("fwd_by_dvol"), "Forward 5d return by dollar volume (unbiased)", "Avg 5d fwd %", pct=True),
+    ]))
+    return html.Div(children)
+
 
 def _predictability_section():
     """Bucketed conditional IC of combined_score by per-stock predictability
@@ -1255,6 +1307,7 @@ def _methods_tab():
         _safe(_ic_section),
         _safe(_policy_eval_section),
         _safe(_predictability_section),
+        _safe(_price_volume_section),
         _safe(_source_perf_section),
         _h3("LLM models used (synthesis & sentiment)",
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),

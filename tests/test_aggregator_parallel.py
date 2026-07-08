@@ -90,6 +90,37 @@ def test_massive_is_weighted_into_combined_score(monkeypatch):
     assert all(s.combined_score < 0 for s in neg)           # −massive pushes it negative
 
 
+def test_inverted_methods_parsing(monkeypatch):
+    from src.signals.aggregator import _inverted_methods
+    monkeypatch.setattr(settings, "inverted_methods", "")
+    assert _inverted_methods() == frozenset()
+    monkeypatch.setattr(settings, "inverted_methods", " Insider ,MASSIVE, tech ")
+    assert _inverted_methods() == frozenset({"insider", "massive", "tech"})
+
+
+def test_inversion_flips_combined_score_but_keeps_panel_raw(monkeypatch):
+    """A method in inverted_methods contributes with a FLIPPED sign in
+    combined_score, while the signals panel keeps its RAW score (so the inversion
+    stays re-validatable). Exercised via `massive` (in _BASE_WEIGHTS, easy to inject)."""
+    _setup(monkeypatch, massive=True)
+    monkeypatch.setattr(agg, "analyse_sentiment", lambda t, a, force_engine=None: (0.0, "neutral"))
+    monkeypatch.setattr(settings, "enable_ic_weights", False)
+    monkeypatch.setattr(settings, "massive_tech_max_tickers", 0)
+    monkeypatch.setattr(settings, "signal_scoring_max_workers", 4)
+    import src.signals.massive_tech as mt
+    monkeypatch.setattr(mt, "compute_massive_tech_score", lambda t: 0.8)
+    tickers = ["AAA", "BBB"]
+
+    monkeypatch.setattr(settings, "inverted_methods", "")
+    base = agg.build_signals(list(tickers), [])
+    assert base and all(s.combined_score > 0 for s in base)       # +massive → positive
+
+    monkeypatch.setattr(settings, "inverted_methods", "massive")
+    inv = agg.build_signals(list(tickers), [])
+    assert inv and all(s.combined_score < 0 for s in inv)         # inverted → NEGATIVE
+    assert all(s.massive_score == 0.8 for s in inv)               # panel keeps the RAW score
+
+
 def test_market_momentum_weighted_into_combined_score(monkeypatch):
     # market_momentum promoted from diagnostic → weighted (light). News neutral, so
     # the sign of combined_score must track market_momentum.

@@ -271,6 +271,15 @@ def _apply_adaptive_multipliers(weight_profile: dict) -> tuple[dict, dict]:
 _IC_WEIGHT_CACHE: dict = {}
 
 
+def _inverted_methods() -> frozenset:
+    """Methods (lower-cased) flagged for sign INVERSION in the combine — their raw
+    score is treated as reliably-backwards and contributes with a flipped sign
+    (config ``inverted_methods``, comma-separated; empty = none). The panel keeps the
+    RAW score, so the inversion stays re-validatable."""
+    raw = str(getattr(settings, "inverted_methods", "") or "")
+    return frozenset(m.strip().lower() for m in raw.split(",") if m.strip())
+
+
 def _ic_mults_from_ic_table(ic, key: str) -> dict:
     """Map an IC table (``icir_<key>`` + ``icdays_<key>`` columns) → ``{method:
     multiplier}``, reweighting ONLY methods whose IC is statistically confident.
@@ -1050,6 +1059,12 @@ def build_signals(
     # layer above when both are on). A thin panel ⇒ {} ⇒ base weights unchanged.
     if settings.enable_ic_weights:
         ic_mults = _ic_weight_multipliers()
+        # An INVERTED method has been CORRECTED (its sign is flipped in the combine
+        # below), so the IC anti-predictive floor no longer applies — lift it to base
+        # weight rather than the 0.25× floor its (raw, backwards) IC would earn.
+        for _m in _inverted_methods():
+            if _m in ic_mults:
+                ic_mults[_m] = 1.0
         if ic_mults:
             base_for_ic = dict(weight_profile or _BASE_WEIGHTS)
             weight_profile = {
@@ -1115,6 +1130,18 @@ def build_signals(
         "broker_advisor": use_broker_advisor,
     }
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
+    # Method INVERSION: a method whose raw signal is reliably anti-predictive across
+    # horizons (net of beta) contributes with a FLIPPED sign — its backwards read
+    # becomes a correct one. Config-driven (inverted_methods) + reversible; the panel
+    # keeps the RAW score so the inversion stays re-validatable. (Coherence / source
+    # agreement read the raw scores — a minor, accepted inconsistency.)
+    _inv = _inverted_methods()
+    for _m in _inv:
+        if _m in weights and weights[_m]:
+            weights[_m] = -weights[_m]
+    if _inv:
+        logger.debug(f"[aggregator] method inversion active: {sorted(_inv)} "
+                     "(sign-flipped in the combine; raw kept in the panel)")
     active_count = sum(active_flags.values())
 
     mode_label = f" [{market_mode_context.mode}]" if market_mode_context else ""
