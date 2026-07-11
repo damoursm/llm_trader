@@ -162,9 +162,12 @@ def _fetch_price(ticker: str) -> Optional[float]:
 
     def _ibkr() -> Optional[float]:
         # Preferred when enabled: IBKR's real-time feed — the SAME data that
-        # fills the orders — over the existing broker connection (reused; no
-        # reconnect per call). Requires an IBKR broker_mode; silently yields to
-        # the other sources when off, disconnected, or no quote is returned.
+        # fills the orders — over the existing broker connection. A dropped
+        # session self-heals INSIDE get_market_price (IBKRBroker._ensure_connected,
+        # throttled by broker_reconnect_cooldown_seconds) — no explicit connect()
+        # here, so a wedged gateway can't charge every price fetch a full connect
+        # timeout. Requires an IBKR broker_mode; silently yields to the other
+        # sources when off, disconnected, or no quote is returned.
         if not settings.enable_ibkr_price_feed:
             return None
         try:
@@ -172,8 +175,6 @@ def _fetch_price(ticker: str) -> Optional[float]:
             broker = get_broker()
             if broker is None:
                 return None
-            if not broker.is_connected():
-                broker.connect()
             px = broker.get_market_price(ticker)
             if px and float(px) > 0:
                 _PRICE_HEALTH["ibkr"] = _PRICE_HEALTH.get("ibkr", 0) + 1
@@ -377,15 +378,15 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families
 METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Sentiment":   ["news", "sent_velocity"],
-    "Technical":   ["tech", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap"],
+    "Technical":   ["tech", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap", "hi52", "mom_12_1", "st_reversal", "squeeze", "avwap", "resid_mom", "vol_profile"],
     "Smart Money": ["insider"],
-    "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr"],
+    "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr", "iv_term"],
     "Fundamental": ["pead"],
     "Relative":    ["cross_sectional", "coint"],
     "Broker":      ["broker_advisor"],
@@ -441,6 +442,26 @@ METHOD_LABELS.update({
     "adx_short":       "ADX Trend — Short (strong downtrend)",
 })
 
+# Classic cross-sectional anomalies (2026-07-08, panel-first at weight 0).
+METHOD_LABELS.update({
+    "hi52":        "52-Week-High Proximity",
+    "mom_12_1":    "12-1 Momentum (skip-month)",
+    "st_reversal": "Short-Term Reversal (1w, liquid)",
+})
+
+# Tier-2 panel-first methods (2026-07-08, weight 0).
+METHOD_LABELS.update({
+    "squeeze": "TTM Squeeze (BB/Keltner coil)",
+    "iv_term": "IV Term Structure (front−back)",
+    "avwap":   "Anchored VWAP (52w anchors)",
+})
+
+# Tier-3 panel-first methods (2026-07-08, weight 0).
+METHOD_LABELS.update({
+    "resid_mom":   "Residual Momentum (beta-adj 12-1)",
+    "vol_profile": "Volume Profile (POC/Value Area)",
+})
+
 
 def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: Optional[dict]) -> dict:
     """Extract per-method scores from the TickerSignal for a given ticker."""
@@ -478,6 +499,19 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "kaufman_short": getattr(sig, "kaufman_short_score", 0.0),
         "adx_long":      getattr(sig, "adx_long_score", 0.0),
         "adx_short":     getattr(sig, "adx_short_score", 0.0),
+        # Classic anomalies (2026-07-08, panel-first at weight 0 — signals/classic_anomalies.py).
+        "hi52":        getattr(sig, "high_52w_score", 0.0),
+        "mom_12_1":    getattr(sig, "momentum_12_1_score", 0.0),
+        "st_reversal": getattr(sig, "st_reversal_score", 0.0),
+        # Tier-2 panel-first methods (2026-07-08, weight 0): TTM squeeze,
+        # IV term-structure slope, anchored VWAP.
+        "squeeze":     getattr(sig, "squeeze_score", 0.0),
+        "iv_term":     getattr(sig, "iv_term_score", 0.0),
+        "avwap":       getattr(sig, "avwap_score", 0.0),
+        # Tier-3 panel-first methods (2026-07-08, weight 0): residual momentum,
+        # volume profile (POC / value area).
+        "resid_mom":   getattr(sig, "resid_mom_score", 0.0),
+        "vol_profile": getattr(sig, "vol_profile_score", 0.0),
         # Fundamental + corp-action factors live on the signal's fundamental_scores dict.
         **{m: float((getattr(sig, "fundamental_scores", None) or {}).get(m, 0.0))
            for m in ("f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")},

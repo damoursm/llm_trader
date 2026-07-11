@@ -388,6 +388,12 @@ class GEXSignal(BaseModel):
     max_pain_bias: str           # BULLISH (price < max_pain) | BEARISH (price > max_pain) | NEUTRAL
     oi_skew: float = 0.0         # OI-weighted directional lean ∈ [-1,+1]; +ve = call-heavy (bullish)
     dominant_expiry: str         # nearest expiry with meaningful OI
+    # ATM IV term structure (2026-07-08) — captured for free while the chains are
+    # already in hand; feeds the panel-first iv_term method. None on old caches.
+    atm_iv_front: Optional[float] = None   # ATM IV of the nearest processed expiry (decimal, 0.45 = 45%)
+    atm_iv_back: Optional[float] = None    # ATM IV of the farthest processed expiry (≤30d window)
+    front_dte: Optional[int] = None        # days to the front expiry
+    back_dte: Optional[int] = None         # days to the back expiry
     report_date: date
     summary: str
 
@@ -1262,6 +1268,31 @@ class TickerSignal(BaseModel):
     kaufman_short_score: float = 0.0    # [-1, 0] efficient DOWNtrend (bearish); 0 = not a downtrend
     adx_long_score: float = 0.0         # [0, +1] strong UPtrend via ADX·DMI (bullish); 0 = not an uptrend
     adx_short_score: float = 0.0        # [-1, 0] strong DOWNtrend via ADX·DMI (bearish); 0 = not a downtrend
+    # Classic cross-sectional anomalies (2026-07-08, panel-first at weight 0 —
+    # see signals/classic_anomalies.py): IC-measured, NOT in combined_score yet.
+    high_52w_score: float = 0.0         # [-1, +1] 52-week-high proximity (George-Hwang continuation)
+    high_52w_ratio_pct: float = 0.0     # close / 52-week high, in % (100 = at the high)
+    momentum_12_1_score: float = 0.0    # [-1, +1] vol-normalised 12-1 (skip-month) momentum
+    momentum_12_1_pct: float = 0.0      # raw 12-1 return %
+    st_reversal_score: float = 0.0      # [-1, +1] prior-week return SIGN-FLIPPED (liquid names only)
+    st_reversal_ret_5d_pct: float = 0.0 # raw prior-5-day return %
+    # Tier-2 panel-first methods (2026-07-08, weight 0 — same contract):
+    squeeze_score: float = 0.0          # [-1, +1] TTM squeeze: momentum-signed coil/release (ttm_squeeze.py)
+    squeeze_label: str = "NONE"         # NONE | SQUEEZE_ON | FIRED_UP | FIRED_DOWN
+    squeeze_bars: int = 0               # bars in the coil (ON) / bars since release (FIRED)
+    iv_term_score: float = 0.0          # [-1, +1] −tanh(front−back ATM IV): backwardation bearish
+    iv_term_slope_pts: float = 0.0      # (front − back) ATM IV in vol points (+ = backwardation)
+    iv_term_label: str = "NO_DATA"      # BACKWARDATION | CONTANGO | FLAT | NO_DATA
+    avwap_score: float = 0.0            # [-1, +1] positioning vs 52w high/low anchored VWAPs (above = bullish)
+    avwap_hi_dist_pct: float = 0.0      # close vs high-anchored VWAP, %
+    avwap_lo_dist_pct: float = 0.0      # close vs low-anchored VWAP, %
+    # Tier-3 panel-first methods (2026-07-08, weight 0 — same contract):
+    resid_mom_score: float = 0.0        # [-1, +1] beta-adjusted 12-1 residual momentum vs SPY (BHM 2011)
+    resid_mom_12_1_pct: float = 0.0     # residual 12-1 return % (Σ daily stock − beta×market residuals)
+    resid_mom_beta: float = 0.0         # estimated 252d beta vs SPY
+    vol_profile_score: float = 0.0      # [-1, +1] acceptance outside the value area / POC gravity inside
+    vol_profile_label: str = "NO_DATA"  # ABOVE_VALUE | BELOW_VALUE | IN_VALUE | NO_DATA
+    vol_profile_poc_dist_pct: float = 0.0  # close vs Point of Control, % (+ = above POC)
     # PEAD (Post-Earnings Announcement Drift) — populated when enable_pead=true
     pead_score: float = 0.0          # [-1, +1] SUE × time-decay
     pead_surprise_pct: float = 0.0   # most recent EPS surprise %

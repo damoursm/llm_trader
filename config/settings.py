@@ -793,6 +793,45 @@ class Settings(BaseSettings):
     # first tick after midnight (~200 uncached smart-money names). 1 = legacy.
     liquidity_gate_fetch_workers: int = 8
 
+    # ── Classic cross-sectional anomalies (2026-07-08, panel-first) ─────────
+    # Three literature-proven OHLCV-only methods (signals/classic_anomalies.py):
+    # 52-week-high proximity (George-Hwang 2004 continuation), 12-1 skip-month
+    # momentum (Jegadeesh-Titman 1993), and short-term reversal (Lehmann 1990,
+    # 1-week, sign-flipped, liquid names only). Scored on every ticker and
+    # IC-tracked in the signals panel at ZERO combine weight — promotion into
+    # combined_score is a later, evidence-gated code change, not a flag flip.
+    enable_high_52w: bool = True
+    enable_momentum_12_1: bool = True
+    enable_st_reversal: bool = True
+    # Liquidity floor for the reversal signal (20-day average dollar volume) —
+    # deliberately far ABOVE the $5M trade floor: below institutional size the
+    # measured "reversal" is mostly bid-ask bounce, not a real snapback.
+    st_reversal_min_dollar_volume: float = 50_000_000
+
+    # ── Tier-2 panel-first methods (2026-07-08, weight 0 — same contract) ───
+    # TTM Squeeze: BB(20,2σ) coiling inside Keltner(20,1.5×ATR); the release
+    # fires in the direction of Carter's momentum oscillator (ttm_squeeze.py).
+    enable_ttm_squeeze: bool = True
+    # IV term-structure slope: front vs back ATM IV captured for free during
+    # the GEX chain fetch (needs enable_gex for coverage; sparse ⇒ no view).
+    # Backwardation = near-term event/stress premium → bearish tilt.
+    enable_iv_term_structure: bool = True
+    # Anchored VWAP from the 52-week high/low anchor days — POSITIONING read
+    # (above the anchor = support = bullish), deliberately the opposite
+    # convention of the mean-reversion rolling `vwap` method.
+    enable_anchored_vwap: bool = True
+
+    # ── Tier-3 panel-first methods (2026-07-08, weight 0 — same contract) ───
+    # Residual momentum (Blitz-Huij-Martens 2011): 12-1 momentum on the
+    # residual of a true-beta regression vs SPY — unlike sector/market
+    # momentum's implicit beta of 1, a high-beta name in an up-market gets no
+    # free momentum credit (residual_momentum.py).
+    enable_residual_momentum: bool = True
+    # Volume profile: 60-day volume-at-price histogram → POC + 70% value area;
+    # acceptance outside value = trend score, inside value = small POC gravity
+    # (volume_profile.py).
+    enable_volume_profile: bool = True
+
     # Business Cycle Rotation — Fidelity-style structural economic cycle phase → sector biases.
     # Derives EARLY_EXPANSION|MID_EXPANSION|LATE_EXPANSION|LATE_CYCLE|CONTRACTION from the
     # already-fetched FRED macro context (regime, yield curve, inflation, unemployment).
@@ -857,13 +896,27 @@ class Settings(BaseSettings):
     # Why entry-relative: a fixed 0.60 floor was firing on routine day-to-day signal
     # variance (78% entries decaying to 55% next day is normal noise), causing every
     # trade to exit on confidence_loss before the thesis got room to develop. Tying
-    # the floor to entry conviction means a high-conviction trade (0.92 entry) gets
-    # a tighter floor (~0.60) and must really collapse to trigger exit, while a
-    # borderline 0.78 entry gets a looser floor (~0.51) that tolerates routine
-    # variance. The absolute backstop only catches catastrophic drops for legacy /
-    # very-low-conviction trades.
+    # the floor to entry conviction means a high-conviction trade gets a tighter
+    # floor and must really collapse to trigger exit, while a borderline entry gets
+    # a looser floor that tolerates routine variance. The absolute backstop catches
+    # genuine conviction collapse.
+    #
+    # 2026-07-11 recalibration (post-exit forward-return monitor, exit_forward.py):
+    # at 0.65 the relative leg bound at ~0.52-0.65 and fired on reviews in the
+    # 0.50-0.62 band — closes that kept running +2.5% @1d / +7.2% @5d / +12.6% @10d
+    # in the position's direction (n=19). Sweeping candidate floors over those
+    # closes: 0.55 was the clean split — what it keeps ran +9.2% @5d, what it still
+    # fires (conviction ≤~0.45-0.50) genuinely bled (−6.2% @5d, ADBE −12% @10d
+    # avoided). The all-reviews panel agrees: NO confidence level separates
+    # hold-profitable from bleed (exit_floor_calibration boundary = None at 1d AND
+    # 5d over 162/67 review-days; the 0.5-0.6 bucket runs +6.8% @5d) — review-
+    # confidence LEVEL is ~uninformative, so the floor should only catch collapse,
+    # not lukewarmness. Freed trades stay governed by the flip / trailing-stop /
+    # mechanical / horizon-ramp / macro exits (horizon_expired measures GOOD:
+    # −1.4% @5d). Re-measure via `python -m src.analysis.exit_forward` as closes
+    # accrue; the absolute stays calibration-adaptive (exit_floor_calibration).
     signal_decay_confidence_floor: float = 0.45          # absolute hard backstop
-    signal_decay_confidence_floor_relative: float = 0.65  # factor × entry_confidence
+    signal_decay_confidence_floor_relative: float = 0.55  # factor × entry_confidence (2026-07-11: 0.65→0.55, measured)
     signal_decay_regime_exit: bool = True        # exit longs in PANIC/RISK_OFF
 
     # ── Adaptive signal weighting ────────────────────────────────────────────
@@ -1406,6 +1459,15 @@ class Settings(BaseSettings):
     # (observed 2026-06-11 15:41 ET: "not connected", 4 positions waited a tick).
     broker_connect_retries: int = 2           # extra connect attempts at sync start
     broker_connect_retry_wait_seconds: int = 10
+    # Automatic in-tick reconnect (2026-07-11): when the Gateway session DROPS
+    # (gateway restart, network blip, daily re-login), every IBKRBroker call
+    # revives it via a throttled implicit connect (_ensure_connected) instead of
+    # failing soft until the next tick's sync. After a failed dial, implicit
+    # revives pause this long so a down/wedged gateway can't charge each price
+    # fetch / sync step the full ibkr_connect_timeout; explicit connect() calls
+    # (the sync-start retry loop, _submit_with_retry) bypass the pause, and any
+    # successful dial clears it. 0 = no throttle (dial on every touchpoint).
+    broker_reconnect_cooldown_seconds: float = 60.0
     # ── Settle pass: fill fast or kill ───────────────────────────────────
     # After this tick's orders are submitted, actively watch them for up to
     # this many seconds: fills are recorded the moment they land; a zero-fill

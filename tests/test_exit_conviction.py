@@ -105,12 +105,12 @@ def _no_default_time_stop(monkeypatch):
 def test_exit_consensus_nudge_flips_a_borderline_close(monkeypatch):
     from src.performance import tracker
     monkeypatch.setattr(settings, "exit_floor_calibration_enabled", False)  # base floor = 0.45/rel
-    # entry_conf 0.85 → base floor = max(0.45, 0.65·0.85) = 0.5525. A same-dir
-    # reaffirm at conv 0.58 HOLDS at the base floor (0.58 > 0.5525)…
-    trade, rev = _held(entry_conf=0.85), _rev("BUY", 0.58)
+    # entry_conf 0.85 → base floor = max(0.45, 0.55·0.85) = 0.4675 (2026-07-11
+    # recalibration). A same-dir reaffirm at conv 0.49 HOLDS at the base floor…
+    trade, rev = _held(entry_conf=0.85), _rev("BUY", 0.49)
     assert tracker._evaluate_decay(trade, None, None, rev, exit_conviction_adj=0.0) is None
     # …but with the methods corroborating an EXIT (+0.05 raises the floor to
-    # 0.6025), 0.58 < 0.6025 → close.
+    # 0.5175), 0.49 < 0.5175 → close.
     assert tracker._evaluate_decay(trade, None, None, rev,
                                    exit_conviction_adj=+0.05) == "llm_confidence_loss"
     # Methods corroborating a HOLD (−0.05 lowers the floor) keeps it open, and a

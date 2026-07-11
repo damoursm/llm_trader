@@ -341,6 +341,17 @@ def exit_reason_breakdown(session: Optional[str] = None,
                   "exit_reason_breakdown")
 
 
+def exit_forward(session: Optional[str] = None,
+                 direction: Optional[str] = None) -> dict:
+    """Post-exit forward-return report over CLOSED trades — what each exited
+    position would have earned held 1/3/5/10 more sessions, per trade and per
+    exit rule (analysis/exit_forward.py). Same session (exit session) /
+    direction filter semantics as ``exit_reason_breakdown``; not windowed."""
+    from src.analysis.exit_forward import compute_exit_forward_report
+    return _retry(lambda: compute_exit_forward_report(session=session, direction=direction),
+                  "exit_forward")
+
+
 def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None,
                            direction: Optional[str] = None) -> dict:
     """Confidence-calibration report (buckets + slope) over the windowed/session/

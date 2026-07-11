@@ -157,6 +157,7 @@ def _fmt_et(iso_str) -> str:
 
 
 _INT = Format(precision=0, scheme=Scheme.fixed)
+_NUM1 = Format(precision=1, scheme=Scheme.fixed)
 _NUM2 = Format(precision=2, scheme=Scheme.fixed)
 _NUM4 = Format(precision=4, scheme=Scheme.fixed)
 
@@ -1625,6 +1626,52 @@ def _exit_reason_block(session=None, direction=None):
     return dash_table.DataTable(data=data_rows, columns=cols, **_TABLE_KW)
 
 
+def _exit_forward_block(session=None, direction=None):
+    """Post-exit forward returns — what each CLOSED trade would have earned if
+    held 1/3/5/10 more sessions, anchored at the actual exit fill and oriented
+    by the position's side. Positive = the exit left money on the table."""
+    rep = data.exit_forward(session=session, direction=direction)
+    if not rep.get("n"):
+        return html.Div(rep.get("verdict") or "No closed trades with post-exit bars yet.",
+                        style={"color": "#6b7280"})
+    hs = rep["horizons"]
+
+    reason_rows = [{
+        "reason": r["exit_reason"], "trades": r["trades"],
+        **{f"mean_{h}": r.get(f"mean_{h}d") for h in hs},
+        **{f"pos_{h}": r.get(f"pct_pos_{h}d") for h in hs},
+    } for r in rep["by_reason"] + [{"exit_reason": "ALL exits", **rep["overall"]}]]
+    reason_cols = ([{"name": "Exit reason", "id": "reason"},
+                    {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT}]
+                   + [{"name": f"Mean +{h}d %", "id": f"mean_{h}", "type": "numeric", "format": _NUM2}
+                      for h in hs]
+                   + [{"name": f"%+ @{h}d", "id": f"pos_{h}", "type": "numeric", "format": _NUM1}
+                      for h in hs])
+
+    trade_rows = [{
+        "ticker": r["ticker"], "exit_date": r["exit_date"], "ret": r["return_pct"],
+        **{f"fwd_{h}": r.get(f"fwd_{h}d") for h in hs},
+        "reason": r["exit_reason"],
+    } for r in rep["per_trade"]]
+    trade_cols = ([{"name": "Ticker", "id": "ticker"},
+                   {"name": "Exit date", "id": "exit_date"},
+                   {"name": "Realized %", "id": "ret", "type": "numeric", "format": _NUM2}]
+                  + [{"name": f"Fwd +{h}d %", "id": f"fwd_{h}", "type": "numeric", "format": _NUM2}
+                     for h in hs]
+                  + [{"name": "Exit reason", "id": "reason"}])
+
+    pending = (f" · {rep['n_pending']} exit(s) pending forward bars"
+               if rep.get("n_pending") else "")
+    return html.Div([
+        html.Div(f"{rep['verdict']}  ({rep['n']} closed trade(s) with forward bars{pending})",
+                 style={"color": "#cbd5e1", "marginBottom": 8}),
+        dash_table.DataTable(data=reason_rows, columns=reason_cols, **_TABLE_KW),
+        html.Div("Per-trade detail (most recent exits first)", style={
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+        dash_table.DataTable(data=trade_rows, columns=trade_cols, **_TABLE_KW),
+    ])
+
+
 _EXIT_SESSION_TITLE = (
     "Filter the exit analyses to a US-market session — Regular hours (09:30–16:00 ET), "
     "Pre-market (04:00–09:30), After-hours (16:00–20:00), or Overnight (20:00–04:00). "
@@ -1666,6 +1713,19 @@ def _exit_body(window_value, session_value, direction_value, source_value,
             "toggle does not apply (closed trades are few). Open trades excluded (no exit "
             "yet)."),
         _safe(lambda: _exit_reason_block(session=session, direction=direction)),
+        _h3("Post-exit forward returns — what if we had held longer? (closed ledger trades)",
+            "For every CLOSED trade, the oriented return the position would have earned had it "
+            "stayed on 1/3/5/10 more trading sessions — anchored at the ACTUAL exit fill "
+            "(sign × (close_{exit+N} / exit_price − 1); long +, short −), forward closes from the "
+            "daily OHLCV cache (recently-exited tickers stay warmed by the EOD maintenance pass). "
+            "Positive = the position kept moving our way after we left it (the exit left money on "
+            "the table); negative = the exit dodged a drawdown. Gross of costs (holding defers the "
+            "same exit cost rather than adding one). '%+ @Nd' = share of exits still going our way "
+            "at that horizon — a rule with a persistently positive mean is firing too early. "
+            "Grouped by exit rule; always the real ledger. Honors the Session (exit session) and "
+            "Direction toggles; the Window toggle does not apply. Exits without forward bars yet "
+            "(closed today / cache gap) are counted as pending, never guessed."),
+        _safe(lambda: _exit_forward_block(session=session, direction=direction)),
         _safe(_horizon_edge_section),
         _safe(_exit_policy_eval_section),
     ])

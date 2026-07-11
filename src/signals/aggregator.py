@@ -97,6 +97,14 @@ from src.signals.iv_rank import compute_iv_rank_score
 from src.signals.iv_expr import compute_iv_expr_score
 from src.signals.extended_session import compute_extended_gap_score
 from src.signals.broker_advisor import compute_broker_advisor_score
+from src.signals.classic_anomalies import (compute_high_52w_score,
+                                           compute_momentum_12_1_score,
+                                           compute_st_reversal_score)
+from src.signals.ttm_squeeze import compute_ttm_squeeze_score
+from src.signals.iv_term_structure import compute_iv_term_score
+from src.signals.anchored_vwap import compute_anchored_vwap_score
+from src.signals.residual_momentum import compute_residual_momentum_score
+from src.signals.volume_profile import compute_volume_profile_score
 
 
 # ── Smart-money signal direction + strength ──────────────────────────────────
@@ -1356,6 +1364,55 @@ def build_signals(
             adx_long_v      = _tp["adx_long"]
             adx_short_v     = _tp["adx_short"]
 
+        # ── Method 10d: Classic anomalies (PANEL-FIRST, weight 0) ─────────
+        # 52-week-high proximity + 12-1 skip-month momentum + short-term
+        # reversal (signals/classic_anomalies.py). Scored on every ticker and
+        # persisted to the signals panel for IC accrual, but deliberately KEPT
+        # OUT of the weighted combine, the coherence pool, and sources_agreeing
+        # below — combined_score/confidence are bit-identical with these flags
+        # on or off. Promotion once the IC clears the confidence gate =
+        # a _BASE_WEIGHTS entry + a combine line + a method_scores row.
+        hi52_v = hi52_ratio_pct = 0.0
+        if settings.enable_high_52w:
+            hi52_v, hi52_ratio_pct = compute_high_52w_score(ticker)
+        mom_12_1_v = mom_12_1_pct = 0.0
+        if settings.enable_momentum_12_1:
+            mom_12_1_v, mom_12_1_pct = compute_momentum_12_1_score(ticker)
+        st_reversal_v = st_rev_5d_pct = 0.0
+        if settings.enable_st_reversal:
+            st_reversal_v, st_rev_5d_pct = compute_st_reversal_score(ticker)
+
+        # ── Method 10e: Tier-2 panel-first methods (weight 0, same contract) ──
+        # TTM squeeze (vol coil/release, momentum-signed), IV term-structure
+        # slope (front vs back ATM IV from the GEX chains — backwardation
+        # bearish), anchored VWAP (52w high/low anchors, positioning read —
+        # deliberately the OPPOSITE sign convention of the mean-reversion
+        # rolling `vwap` method; the panel adjudicates both hypotheses).
+        # Excluded from the combine / coherence / sources_agreeing below AND
+        # from the exit consensus (exit_conviction._CONSENSUS_SKIP).
+        squeeze_v, squeeze_label_v, squeeze_bars_v = 0.0, "NONE", 0
+        if settings.enable_ttm_squeeze:
+            squeeze_v, squeeze_label_v, squeeze_bars_v = compute_ttm_squeeze_score(ticker)
+        iv_term_v, iv_term_slope_v, iv_term_label_v = 0.0, 0.0, "NO_DATA"
+        if settings.enable_iv_term_structure:
+            iv_term_v, iv_term_slope_v, iv_term_label_v = compute_iv_term_score(ticker, gex_context)
+        avwap_v = avwap_hi_pct = avwap_lo_pct = 0.0
+        if settings.enable_anchored_vwap:
+            avwap_v, avwap_hi_pct, avwap_lo_pct = compute_anchored_vwap_score(ticker)
+
+        # ── Method 10f: Tier-3 panel-first methods (weight 0, same contract) ──
+        # Residual momentum (true-beta-adjusted 12-1 vs SPY — unlike
+        # sector/market momentum's implicit beta=1) and volume profile
+        # (POC / 70% value area: acceptance outside value = trend, inside =
+        # small POC gravity). Excluded from the combine / coherence /
+        # sources_agreeing and the exit consensus (_CONSENSUS_SKIP).
+        resid_mom_v = resid_mom_pct = resid_mom_beta_v = 0.0
+        if settings.enable_residual_momentum:
+            resid_mom_v, resid_mom_pct, resid_mom_beta_v = compute_residual_momentum_score(ticker)
+        vol_profile_v, vol_profile_label_v, vol_profile_poc_pct = 0.0, "NO_DATA", 0.0
+        if settings.enable_volume_profile:
+            vol_profile_v, vol_profile_label_v, vol_profile_poc_pct = compute_volume_profile_score(ticker)
+
         # ── Method 11: Post-Earnings Announcement Drift (PEAD) ───────────
         # SUE × time-decay. Positive = bullish drift from recent earnings beat;
         # negative = bearish drift from recent miss. Decays linearly to 0 over
@@ -1638,6 +1695,27 @@ def build_signals(
             kaufman_short_score=round(kaufman_short_v, 3),
             adx_long_score=round(adx_long_v, 3),
             adx_short_score=round(adx_short_v, 3),
+            high_52w_score=round(hi52_v, 3),
+            high_52w_ratio_pct=round(hi52_ratio_pct, 2),
+            momentum_12_1_score=round(mom_12_1_v, 3),
+            momentum_12_1_pct=round(mom_12_1_pct, 2),
+            st_reversal_score=round(st_reversal_v, 3),
+            st_reversal_ret_5d_pct=round(st_rev_5d_pct, 2),
+            squeeze_score=round(squeeze_v, 3),
+            squeeze_label=squeeze_label_v,
+            squeeze_bars=int(squeeze_bars_v),
+            iv_term_score=round(iv_term_v, 3),
+            iv_term_slope_pts=round(iv_term_slope_v, 2),
+            iv_term_label=iv_term_label_v,
+            avwap_score=round(avwap_v, 3),
+            avwap_hi_dist_pct=round(avwap_hi_pct, 2),
+            avwap_lo_dist_pct=round(avwap_lo_pct, 2),
+            resid_mom_score=round(resid_mom_v, 3),
+            resid_mom_12_1_pct=round(resid_mom_pct, 2),
+            resid_mom_beta=round(resid_mom_beta_v, 3),
+            vol_profile_score=round(vol_profile_v, 3),
+            vol_profile_label=vol_profile_label_v,
+            vol_profile_poc_dist_pct=round(vol_profile_poc_pct, 2),
             pead_score=round(pead_score_v, 3),
             pead_surprise_pct=round(pead_surprise, 2),
             pead_days_since_report=int(pead_days),
@@ -1677,13 +1755,21 @@ def build_signals(
         ivx_str  = f"  ivx={iv_expr_score_v:+.2f}(ir={iv_expr_rank_v:.0f},{iv_expr_label_v})" if iv_expr_score_v != 0.0 else ""
         coint_str = f"  coint={coint_score_v:+.2f}" if coint_score_v != 0.0 else ""
         gap_str  = f"  gap={ext_gap_score_v:+.2f}({ext_gap_pct_v:+.1f}%)" if ext_gap_score_v != 0.0 else ""
+        hi52_str = f"  hi52={hi52_v:+.2f}({hi52_ratio_pct:.0f}%)" if hi52_v != 0.0 else ""
+        m121_str = f"  m12-1={mom_12_1_v:+.2f}({mom_12_1_pct:+.0f}%)" if mom_12_1_v != 0.0 else ""
+        srev_str = f"  strev={st_reversal_v:+.2f}({st_rev_5d_pct:+.1f}%/5d)" if st_reversal_v != 0.0 else ""
+        sq_str   = f"  sq={squeeze_v:+.2f}[{squeeze_label_v}:{squeeze_bars_v}]" if squeeze_v != 0.0 else ""
+        ivt_str  = f"  ivt={iv_term_v:+.2f}({iv_term_slope_v:+.1f}pts,{iv_term_label_v})" if iv_term_v != 0.0 else ""
+        avw_str  = f"  avwap={avwap_v:+.2f}(hi{avwap_hi_pct:+.1f}%/lo{avwap_lo_pct:+.1f}%)" if avwap_v != 0.0 else ""
+        rmom_str = f"  rmom={resid_mom_v:+.2f}({resid_mom_pct:+.0f}%,β{resid_mom_beta_v:.1f})" if resid_mom_v != 0.0 else ""
+        vp_str   = f"  vp={vol_profile_v:+.2f}[{vol_profile_label_v}]" if vol_profile_v != 0.0 else ""
         cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
         persist_str = f"  PERSIST({persist_count}×)" if persist_detected else ""
         sv_str      = f"  sv={sent_velocity_score:+.2f}" if sent_velocity_score != 0.0 else ""
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}{hi52_str}{m121_str}{srev_str}{sq_str}{ivt_str}{avw_str}{rmom_str}{vp_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

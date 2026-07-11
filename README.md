@@ -1229,6 +1229,39 @@ Because a name is up- **or** down-trending, each method is sparse in its context
 
 ---
 
+### Step 3M-c — Classic Anomalies (`src/signals/classic_anomalies.py`) — panel-first at weight 0
+
+Three of the most-replicated cross-sectional return anomalies in the academic literature, added 2026-07-08 as **measurement-only** methods: scored on every ticker, persisted to the `signals` panel (Signal-IC / Sim win% / Sim ret%), and trade-attributed via `_ALL_METHODS` — but carrying **zero weight in `combined_score`**, excluded from the coherence factor and `sources_agreeing`, and skipped by the exit-consensus (`exit_conviction._CONSENSUS_SKIP`). Live entries, confidence, and exits are bit-identical with the flags on or off (test-guarded); promotion into the combine is a later, evidence-gated code change once weeks of forward returns accrue.
+
+- **`hi52` — 52-Week-High Proximity** (George & Hwang 2004, *JF*): `close ÷ max(High, 252 bars)`, linearly mapped (at the high → +1, ≤60% of it → −1). Anchoring/underreaction: nearness to the 52-week high predicts continuation and subsumes much of plain momentum in their head-to-heads. Requires ≥200 bars (recent IPOs get *no view*, not a truncated-window one).
+- **`mom_12_1` — 12-1 Momentum** (Jegadeesh & Titman 1993): trailing-year return **skipping the most recent month** (`close[t−21]/close[t−252] − 1` — the skipped month belongs to the reversal effect below), vol-normalised against the ticker's own 21-bar return distribution and tanh-mapped — the same self-normalising idiom as Price Momentum, which only covers 1m/3m. Requires a full 252 bars.
+- **`st_reversal` — Short-Term Reversal** (Lehmann 1990; Jegadeesh 1990): the prior ~1-week return **sign-flipped** per the house score convention (a sharp up-week emits a bearish snapback call). Gated to liquid names only — 20-day average dollar volume ≥ `ST_REVERSAL_MIN_DOLLAR_VOLUME` ($50M, deliberately far above the $5M trade floor; below institutional size the measured "reversal" is mostly bid-ask bounce) — with a z-score deadband so a quiet week is *no view* rather than noise in `methods_agreeing`.
+
+All three are daily-only by construction (a 30-min "52-week high" would be nonsense) and deliberately not in the multi-timeframe blend. Flags: `ENABLE_HIGH_52W` / `ENABLE_MOMENTUM_12_1` / `ENABLE_ST_REVERSAL` (all default on — they only measure).
+
+---
+
+### Step 3M-d — Tier-2 Panel-First Methods (squeeze · iv_term · avwap) — weight 0
+
+Three more measurement-only methods (2026-07-08, same contract as the classic anomalies: IC-tracked + trade-attributed, zero influence on `combined_score`, coherence, `sources_agreeing`, or the exit consensus until the panel earns them a weight):
+
+- **`squeeze` — TTM Squeeze** (`src/signals/ttm_squeeze.py`): John Carter's volatility coil — Bollinger Bands (20, 2σ) contracting **inside** the Keltner Channels (20, 1.5×ATR). The squeeze is a *state*, so the score is signed by Carter's momentum oscillator (linreg value of close − Donchian/SMA midline, ATR-normalised): a release within the last 3 bars after a ≥5-bar coil → full-strength score in the momentum direction (`FIRED_UP`/`FIRED_DOWN`); a coil still ON → small anticipatory score (×0.35, `SQUEEZE_ON`); no coil → **no view** — the method only speaks around compressions, so its panel IC measures exactly the release edge.
+- **`iv_term` — IV Term-Structure Slope** (`src/signals/iv_term_structure.py`): front vs back ATM implied vol, captured **for free** while `gamma_exposure` already has each near expiry's chain in hand (`GEXSignal.atm_iv_front/atm_iv_back` + DTEs; no new network calls; old GEX caches → `NO_DATA` fail-soft until the next fresh fetch). Backwardation (front above back — the market paying up for near-term event/stress protection) → bearish tilt, `score = −tanh(slope/0.10)`; contango → mildly bullish; needs a ≥7-day DTE gap, sane IVs (yfinance chains report junk on illiquid names), and a 2-vol-point deadband. GEX's ≤30-day window means this reads the *short end* of the curve — the most event-sensitive part.
+- **`avwap` — Anchored VWAP** (`src/signals/anchored_vwap.py`): VWAP anchored at the 52-week **high-close** and **low-close** days — the average price paid by everyone who bought since the top / since the bottom, levels institutional desks actually defend. Score = mean of `tanh(ATR-distance)` for the two legs: above both anchors → bullish, below both → bearish, between → small/mixed. **Sign-convention note:** this is *positioning* (above the anchor = absorbed supply = support), deliberately the **opposite** reading of the rolling `vwap` method's mean-reversion score — two different hypotheses about two different reference frames; the Signal-IC panel adjudicates both. Requires ≥200 bars + real volume (fail-closed).
+
+Flags: `ENABLE_TTM_SQUEEZE` / `ENABLE_IV_TERM_STRUCTURE` / `ENABLE_ANCHORED_VWAP` (default on — measurement only).
+
+---
+
+### Step 3M-e — Tier-3 Panel-First Methods (resid_mom · vol_profile) — weight 0
+
+- **`resid_mom` — Residual Momentum** (`src/signals/residual_momentum.py`): Blitz, Huij & Martens (2011) — momentum computed on the **residuals** of a factor regression keeps the premium with roughly half the volatility and far smaller crashes, because raw momentum is contaminated by a time-varying beta tilt (in an up-market the "winners" are just the high-beta names, and they crater together). Daily adaptation: estimate beta vs SPY over 252 aligned sessions (`cov/var`), take the **12-1 residual return** (stock 12-1 − β × market 12-1, same skip-month as `mom_12_1`), scale by residual daily σ×√window (the BHM construction — residual return *per unit of residual risk*), tanh-map. Unlike `sector_momentum`/`market_momentum` (one-for-one benchmark subtraction — implicit β=1), a 2-beta name in a +10% tape needs > +20% before it scores at all. SPY frame memoised per ~10-min bucket so 400 tickers/tick don't re-parse it. No view: <200 aligned sessions, degenerate market variance, or the benchmark itself.
+- **`vol_profile` — Volume Profile (POC / Value Area)** (`src/signals/volume_profile.py`): auction-market read of *where* the volume traded — each of the last 60 sessions' volume is spread uniformly across its [Low, High] range into 40 fixed price bins (deterministic daily-bar approximation; no intraday data). POC = the most-traded bin; the 70% **value area** expands from the POC toward the higher-volume neighbour (the standard market-profile construction). One coherent hypothesis: price **above** the value-area high = initiative buying / acceptance above value → bullish, ATR-scaled; **below** the value-area low → bearish; **inside** the area = balance → a small (×0.35) gravity score toward the POC magnet. Missing/zero volume fails closed.
+
+Both panel-first at weight 0 (IC-tracked + trade-attributed; zero combine/coherence/agreement/exit-consensus influence — test-guarded). Flags: `ENABLE_RESIDUAL_MOMENTUM` / `ENABLE_VOLUME_PROFILE` (default on — measurement only).
+
+---
+
 ### Step 3N — Extended-Session Gap (`src/signals/extended_session.py`)
 
 When `ENABLE_EXTENDED_GAP=true` AND the run executes **outside regular trading hours** (the scheduler's 04:00–09:30 / 16:00–20:00 ET observation ticks), scores the one signal that only exists off-hours: how far the live extended-session print has moved from the last **completed** daily close, in units of the ticker's own ATR. Pre-market this is the overnight gap forming in real time (gap-and-go candidates); after-hours it is the immediate reaction to a just-released catalyst (earnings, 8-K, guidance) — the move the next regular open inherits.

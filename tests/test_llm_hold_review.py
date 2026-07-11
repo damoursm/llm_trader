@@ -28,6 +28,10 @@ _HEAVY_METHOD_FLAGS = [
     "enable_money_flow", "enable_trend_strength", "enable_pead", "enable_iv_rank",
     "enable_iv_expr", "enable_cointegration", "enable_cross_sectional",
     "enable_adaptive_weights", "enable_market_mode_switching", "enable_catalyst_timing",
+    "enable_trend_predictability_methods", "enable_multi_timeframe_signals",
+    "enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+    "enable_ttm_squeeze", "enable_iv_term_structure", "enable_anchored_vwap",
+    "enable_residual_momentum", "enable_volume_profile",
 ]
 
 
@@ -100,7 +104,7 @@ def test_hold_keeps_position():
 
 
 def test_same_direction_conviction_collapse_closes():
-    # Still a BUY, but conviction fell below floor(0.85)=0.5525 → close.
+    # Still a BUY, but conviction fell below floor(0.85)=0.4675 → close.
     assert tracker._evaluate_decay(
         _claude_trade(entry_conf=0.85), today_signal=None, macro_regime_context=None,
         hold_review=_rec(action="BUY", confidence=0.40),
@@ -108,7 +112,7 @@ def test_same_direction_conviction_collapse_closes():
 
 
 def test_confidence_floor_boundary():
-    floor = max(0.45, 0.65 * 0.85)   # 0.5525
+    floor = max(0.45, 0.55 * 0.85)   # 0.4675 (2026-07-11 recalibration: 0.65→0.55)
     assert tracker._evaluate_decay(
         _claude_trade(entry_conf=0.85), today_signal=None, macro_regime_context=None,
         hold_review=_rec(action="BUY", confidence=floor - 0.01)) == "llm_confidence_loss"
@@ -408,7 +412,7 @@ def _restore_repo_rw():
 
 def test_confidence_floor_matches_evaluate_decay():
     # The persisted floor must equal what the exit gate uses.
-    assert tracker._confidence_floor(0.85) == max(0.45, 0.65 * 0.85)
+    assert tracker._confidence_floor(0.85) == max(0.45, 0.55 * 0.85)
     assert tracker._confidence_floor(None) == 0.45
 
 
@@ -440,7 +444,7 @@ def test_persist_trade_reviews_builds_rows():
     assert row["action"] == "SELL" and row["entry_action"] == "BUY"
     assert abs(float(row["confidence"]) - 0.48) < 1e-9
     assert abs(float(row["entry_confidence"]) - 0.85) < 1e-9
-    assert abs(float(row["conf_floor"]) - max(0.45, 0.65 * 0.85)) < 1e-9
+    assert abs(float(row["conf_floor"]) - max(0.45, 0.55 * 0.85)) < 1e-9
     assert row["position_id"] == "pos-xle-1"
     assert abs(float(row["price"]) - 57.5) < 1e-9
 

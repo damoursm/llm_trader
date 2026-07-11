@@ -130,6 +130,27 @@ def _bs_gamma(S: float, K: float, T: float, sigma: float) -> float:
 
 # ── Per-expiry helpers ────────────────────────────────────────────────────────
 
+def _atm_iv(spot: float, chain) -> Optional[float]:
+    """ATM implied vol for one expiry — the mean of the call and put IVs at the
+    strike nearest spot (both sides, to average the yfinance noise). None when
+    neither side has a sane IV (illiquid chains report 0 or absurd values)."""
+    try:
+        vals = []
+        for side in (chain.calls, chain.puts):
+            if side is None or len(side) == 0:
+                continue
+            df = side[["strike", "impliedVolatility"]].dropna()
+            if df.empty:
+                continue
+            row = df.iloc[(df["strike"] - spot).abs().argmin()]
+            iv = float(row["impliedVolatility"])
+            if 0.01 < iv < 5.0:
+                vals.append(iv)
+        return sum(vals) / len(vals) if vals else None
+    except Exception:
+        return None
+
+
 def _gex_for_expiry(
     spot: float,
     expiry: str,
@@ -372,6 +393,9 @@ def _fetch_gex_signal_once(ticker: str) -> Optional[GEXSignal]:
         oi_skew_val = 0.0
         dominant_expiry = near_expiries[0]
         has_bid_ask = False
+        # ATM IV per processed expiry — free while the chain is in hand; the
+        # nearest/farthest pair becomes the iv_term method's term-structure slope.
+        atm_ivs: Dict[str, float] = {}
 
         for i, expiry in enumerate(near_expiries):
             chain = tk.option_chain(expiry)
@@ -383,6 +407,10 @@ def _fetch_gex_signal_once(ticker: str) -> Optional[GEXSignal]:
             for k, v in gex_map.items():
                 combined_gex[k] = combined_gex.get(k, 0.0) + v
 
+            iv = _atm_iv(spot, chain)
+            if iv is not None:
+                atm_ivs[expiry] = iv
+
             # Only use the nearest expiry for max pain + expected move + skew
             if i == 0:
                 max_pain_val = _compute_max_pain(chain.calls, chain.puts)
@@ -392,6 +420,18 @@ def _fetch_gex_signal_once(ticker: str) -> Optional[GEXSignal]:
                 oi_skew_val = _compute_oi_skew(spot, chain.calls, chain.puts)
 
             time.sleep(_REQUEST_DELAY)
+
+        # Term-structure endpoints: nearest + farthest expiry with a valid ATM IV
+        # (needs two distinct expiries; the scorer enforces the DTE gap).
+        atm_iv_front = atm_iv_back = None
+        front_dte = back_dte = None
+        if len(atm_ivs) >= 2:
+            ordered = sorted(atm_ivs, key=lambda e: date.fromisoformat(e))
+            front_exp, back_exp = ordered[0], ordered[-1]
+            atm_iv_front = round(atm_ivs[front_exp], 4)
+            atm_iv_back  = round(atm_ivs[back_exp], 4)
+            front_dte = (date.fromisoformat(front_exp) - today).days
+            back_dte  = (date.fromisoformat(back_exp) - today).days
 
         total_oi = total_call_oi + total_put_oi
         if total_oi < _MIN_OI:
@@ -454,6 +494,10 @@ def _fetch_gex_signal_once(ticker: str) -> Optional[GEXSignal]:
             max_pain_bias=max_pain_bias,
             oi_skew=round(oi_skew_val, 3),
             dominant_expiry=dominant_expiry,
+            atm_iv_front=atm_iv_front,
+            atm_iv_back=atm_iv_back,
+            front_dte=front_dte,
+            back_dte=back_dte,
             report_date=date.today(),
             summary=summary,
         )

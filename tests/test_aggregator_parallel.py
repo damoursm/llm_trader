@@ -18,6 +18,9 @@ _OFF = [
     "enable_adaptive_weights", "enable_market_mode_switching", "enable_catalyst_timing",
     "enable_multi_timeframe_signals", "enable_extended_gap",
     "enable_trend_predictability_methods",
+    "enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+    "enable_ttm_squeeze", "enable_iv_term_structure", "enable_anchored_vwap",
+    "enable_residual_momentum", "enable_volume_profile",
 ]
 
 

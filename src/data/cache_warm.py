@@ -41,10 +41,19 @@ def _panel_tickers(days: int) -> list:
             logger.debug(f"[cache_warm] panel-ticker read failed ({e})")
     try:
         for t in repo.load_trades():
-            if t.get("status") == "OPEN" and t.get("ticker"):
+            if not t.get("ticker"):
+                continue
+            if t.get("status") == "OPEN":
+                tickers.add(str(t["ticker"]))
+            # Recently-CLOSED trades stay warm too: the post-exit forward-return
+            # monitor (analysis/exit_forward.py) needs bars AFTER the exit, and a
+            # ticker that leaves the book/universe on close would otherwise
+            # freeze in the cache at its exit date.
+            elif (t.get("status") == "CLOSED"
+                  and str(t.get("exit_date") or "") >= cutoff):
                 tickers.add(str(t["ticker"]))
     except Exception as e:
-        logger.debug(f"[cache_warm] open-trade read failed ({e})")
+        logger.debug(f"[cache_warm] trade read failed ({e})")
     return sorted(tickers)
 
 

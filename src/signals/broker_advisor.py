@@ -61,10 +61,11 @@ def fetch_borrow_context(tickers: List[str], broker=None) -> Dict[str, BorrowInf
     """Fetch short-borrow info for ``tickers`` via the broker (fail-soft → {}).
 
     Gated by ``enable_broker_advisor`` + a non-off ``broker_mode``. Uses the shared
-    broker singleton (``get_broker``) and connects it if needed — the reconciler
-    reuses that same connection later in the tick. Bounded by the caller (pass a
-    capped set — held names + a universe slice — since each ticker costs a
-    market-data request). Never raises."""
+    broker singleton (``get_broker``) — a disconnected/dropped session self-heals
+    inside ``get_short_borrow`` (IBKRBroker._ensure_connected, throttled), and the
+    reconciler reuses that same connection later in the tick. Bounded by the
+    caller (pass a capped set — held names + a universe slice — since each ticker
+    costs a market-data request). Never raises."""
     if not settings.enable_broker_advisor or not tickers:
         return {}
     if not settings.broker_mode or settings.broker_mode == "off":
@@ -75,8 +76,6 @@ def fetch_borrow_context(tickers: List[str], broker=None) -> Dict[str, BorrowInf
             broker = get_broker()
         if broker is None:
             return {}
-        if not broker.is_connected():
-            broker.connect()
         data = broker.get_short_borrow(list(tickers)) or {}
         if data:
             hard = settings.broker_advisor_hard_shares

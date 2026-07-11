@@ -58,6 +58,19 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     # one-sided long/short methods (2026-07-04). Additive overlay on combined_score,
     # tracked per-method here so each side's IC is measured independently.
     "kaufman_long", "kaufman_short", "adx_long", "adx_short",
+    # Classic cross-sectional anomalies (2026-07-08) — 52-week-high proximity,
+    # 12-1 skip-month momentum, short-term reversal. PANEL-FIRST at weight 0:
+    # IC-measured + trade-attributed but NOT in combined_score/coherence yet
+    # (signals/classic_anomalies.py).
+    "hi52", "mom_12_1", "st_reversal",
+    # Tier-2 panel-first methods (2026-07-08, weight 0): TTM squeeze
+    # (ttm_squeeze.py), IV term-structure slope (iv_term_structure.py, from the
+    # GEX chains), anchored VWAP (anchored_vwap.py, 52w high/low anchors).
+    "squeeze", "iv_term", "avwap",
+    # Tier-3 panel-first methods (2026-07-08, weight 0): residual momentum
+    # (residual_momentum.py, beta-adjusted 12-1 vs SPY) and volume profile
+    # (volume_profile.py, POC / 70% value area).
+    "resid_mom", "vol_profile",
 )
 
 # Multi-timeframe technical columns — the 30-min + weekly variants of the 8
@@ -317,6 +330,17 @@ _ADD_COLUMNS = (
     ("signals", "kaufman_short", "DOUBLE"),
     ("signals", "adx_long", "DOUBLE"),
     ("signals", "adx_short", "DOUBLE"),
+    # Classic anomalies (hi52 / 12-1 momentum / short-term reversal) on an existing DB.
+    ("signals", "hi52", "DOUBLE"),
+    ("signals", "mom_12_1", "DOUBLE"),
+    ("signals", "st_reversal", "DOUBLE"),
+    # Tier-2 panel-first methods (squeeze / iv_term / avwap) on an existing DB.
+    ("signals", "squeeze", "DOUBLE"),
+    ("signals", "iv_term", "DOUBLE"),
+    ("signals", "avwap", "DOUBLE"),
+    # Tier-3 panel-first methods (resid_mom / vol_profile) on an existing DB.
+    ("signals", "resid_mom", "DOUBLE"),
+    ("signals", "vol_profile", "DOUBLE"),
     # Universe provenance (2026-07-03): which discovery source first surfaced
     # the ticker this run (watchlist / trending / screener / smart_money / …) —
     # the measurement behind per-source hit rates and, later, an adaptive

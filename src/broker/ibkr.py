@@ -11,6 +11,7 @@ IBKRBroker requires it.
 """
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -55,6 +56,9 @@ class IBKRBroker(Broker):
         self.client_id = int(client_id if client_id is not None else settings.ibkr_client_id)
         self.account = account if account is not None else settings.ibkr_account
         self._ib = None
+        self._reconnect_block_until = 0.0    # monotonic deadline; throttles IMPLICIT revives
+        self._ever_connected = False         # "reconnected" vs "connected" log wording
+        self._expected_disconnect = False    # deliberate disconnects don't warn
 
     # ── connection ────────────────────────────────────────────────────────
     def _get_ib(self):
@@ -75,29 +79,83 @@ class IBKRBroker(Broker):
                 self._ib.RequestTimeout = float(settings.broker_request_timeout_seconds)
             except Exception:
                 pass
+            # Log the drop the moment it happens, not at the next broker call —
+            # the log timeline then shows exactly when the gateway went away.
+            try:
+                self._ib.disconnectedEvent += self._on_disconnected
+            except Exception:
+                pass
         return self._ib
 
+    def _on_disconnected(self):
+        if self._expected_disconnect:
+            return
+        logger.warning(
+            f"[broker:ibkr] session {self.host}:{self.port} dropped — "
+            f"auto-reconnect runs at the next broker call"
+        )
+
     def connect(self) -> bool:
+        """Establish/confirm the session (idempotent). An EXPLICIT dial: never
+        throttled by the reconnect cooldown (the reconciler's connect-retry loop
+        depends on that), and a failure arms the cooldown that gates the
+        implicit per-call revives in ``_ensure_connected``."""
         ib = self._get_ib()
         if ib.isConnected():
             return True
+        reconnecting = self._ever_connected
         try:
+            # Reset any half-dead client state a dropped session left behind —
+            # ib_async redials cleanly only from a fully disconnected client.
+            self._expected_disconnect = True
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            finally:
+                self._expected_disconnect = False
             ib.connect(self.host, self.port, clientId=self.client_id,
                        timeout=settings.ibkr_connect_timeout, readonly=False)
+            self._reconnect_block_until = 0.0
+            self._ever_connected = True
             logger.info(
-                f"[broker:ibkr] connected {self.host}:{self.port} (clientId={self.client_id})"
+                f"[broker:ibkr] {'reconnected' if reconnecting else 'connected'} "
+                f"{self.host}:{self.port} (clientId={self.client_id})"
             )
             return True
         except Exception as e:
+            cooldown = max(0.0, float(settings.broker_reconnect_cooldown_seconds or 0.0))
+            self._reconnect_block_until = time.monotonic() + cooldown
             logger.warning(f"[broker:ibkr] connect failed ({self.host}:{self.port}): {e}")
             return False
+
+    def _ensure_connected(self) -> bool:
+        """Live session, or an automatic throttled revival attempt.
+
+        Every public method gates on this instead of bare ``is_connected()`` so a
+        dropped/restarted gateway self-heals at the next broker touchpoint — mid-
+        tick too (price fetches, cancels, fills), not only at the reconciler's
+        sync-start connect loop. After a failed dial, implicit revives fast-fail
+        for ``broker_reconnect_cooldown_seconds`` so a down/wedged gateway can't
+        charge every touchpoint the full ``ibkr_connect_timeout``; explicit
+        ``connect()`` calls bypass the cooldown, and a successful dial clears it.
+        """
+        if self.is_connected():
+            return True
+        if time.monotonic() < self._reconnect_block_until:
+            return False
+        return self.connect()
 
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
 
     def disconnect(self) -> None:
         if self._ib is not None and self._ib.isConnected():
-            self._ib.disconnect()
+            self._expected_disconnect = True
+            try:
+                self._ib.disconnect()
+            finally:
+                self._expected_disconnect = False
 
     def _account(self) -> str:
         if self.account:
@@ -118,7 +176,7 @@ class IBKRBroker(Broker):
 
     # ── reads ─────────────────────────────────────────────────────────────
     def get_account(self) -> Optional[AccountSnapshot]:
-        if not self.is_connected():
+        if not self._ensure_connected():
             return None
         try:
             acct = self._account()
@@ -148,7 +206,7 @@ class IBKRBroker(Broker):
             return None
 
     def get_positions(self) -> List[Position]:
-        if not self.is_connected():
+        if not self._ensure_connected():
             return []
         out: List[Position] = []
         try:
@@ -178,7 +236,7 @@ class IBKRBroker(Broker):
 
     # ── orders ────────────────────────────────────────────────────────────
     def submit_order(self, req: OrderRequest) -> OrderResult:
-        if not self.is_connected():
+        if not self._ensure_connected():
             return OrderResult(ok=False, ticker=req.ticker, side=req.side,
                                requested_qty=req.quantity, client_ref=req.client_ref,
                                status="DISCONNECTED", error="broker not connected")
@@ -261,7 +319,7 @@ class IBKRBroker(Broker):
         execution, so the latest execution per ref carries the order-level
         totals; commissions are summed across the individual fills.
         """
-        if not self.is_connected():
+        if not self._ensure_connected():
             return []
         try:
             from ib_async import ExecutionFilter
@@ -310,7 +368,7 @@ class IBKRBroker(Broker):
         check "did my errored submission actually reach the broker?" and
         "which resting orders are stale?".
         """
-        if not self.is_connected():
+        if not self._ensure_connected():
             return []
         out: List[OpenOrderInfo] = []
         try:
@@ -339,7 +397,7 @@ class IBKRBroker(Broker):
         caller then falls back to yfinance/Polygon. Prefers last trade, then the
         bid/ask midpoint (``marketPrice``), then the prior close; all NaN-filtered.
         """
-        if not self.is_connected():
+        if not self._ensure_connected():
             return None
         ib = self._ib
         prev_timeout = getattr(ib, "RequestTimeout", 0)
@@ -384,7 +442,7 @@ class IBKRBroker(Broker):
         and fail-soft per ticker — NEEDS a live-gateway smoke-test to confirm the
         field names before relying on it. Bounded by the caller's ticker list.
         """
-        if not self.is_connected():
+        if not self._ensure_connected():
             return {}
         out: Dict[str, BorrowInfo] = {}
         for tk in tickers:
@@ -414,7 +472,7 @@ class IBKRBroker(Broker):
         arrive, read, and cancel. Best-effort and fail-soft (None on any miss).
         NEEDS a live-gateway smoke-test to confirm the field names before relying on
         it (mirror ``python -m src.broker.smoketest``)."""
-        if not self.is_connected():
+        if not self._ensure_connected():
             return None
         acct = ""
         try:
@@ -450,7 +508,7 @@ class IBKRBroker(Broker):
         confirmed cancel. An order that fills during the cancel race returns
         False — the caller leaves the trade leg intact and the fill-refresh
         pass records the execution instead."""
-        if not self.is_connected() or not client_ref:
+        if not client_ref or not self._ensure_connected():
             return False
         try:
             for tr in self._ib.openTrades():
