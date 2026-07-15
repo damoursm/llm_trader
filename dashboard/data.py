@@ -135,14 +135,18 @@ def _cached(key, producer, force: bool = False):
 
 
 def performance(window_days: Optional[int] = None, session: Optional[str] = None,
-                direction: Optional[str] = None, force: bool = False) -> dict:
-    """Windowed + session + direction-filtered performance bundle. ``window_days`` =
-    7 / 30 (None = inception); ``session`` = rth / extended / overnight (None = all);
-    ``direction`` = long / short (None = both)."""
+                direction: Optional[str] = None, asset_type: Optional[str] = None,
+                force: bool = False) -> dict:
+    """Windowed + session + direction + type-filtered performance bundle.
+    ``window_days`` = 7 / 30 (None = inception); ``session`` = rth / extended /
+    overnight (None = all); ``direction`` = long / short (None = both);
+    ``asset_type`` = stock / etf / commodity (None = all)."""
     from src.performance.tracker import get_performance_for_email
-    key = ("all" if window_days is None else int(window_days), session or "all", direction or "all")
+    key = ("all" if window_days is None else int(window_days), session or "all",
+           direction or "all", asset_type or "all")
     return _cached(key, lambda: _retry(
-        lambda: get_performance_for_email(window_days=window_days, session=session, direction=direction),
+        lambda: get_performance_for_email(window_days=window_days, session=session,
+                                          direction=direction, asset_type=asset_type),
         "performance"), force=force)
 
 

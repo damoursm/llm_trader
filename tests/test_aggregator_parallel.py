@@ -126,9 +126,13 @@ def test_inversion_flips_combined_score_but_keeps_panel_raw(monkeypatch):
 
 def test_market_momentum_weighted_into_combined_score(monkeypatch):
     # market_momentum promoted from diagnostic → weighted (light). News neutral, so
-    # the sign of combined_score must track market_momentum.
+    # the sign of combined_score must track market_momentum. Pin inverted_methods
+    # empty so this tests the RAW weighting mechanism independent of the ops
+    # inversion setting (which now inverts market_momentum by default — its
+    # sign-flip behaviour is covered by test_inversion_flips_combined_score_...).
     _setup(monkeypatch)
     monkeypatch.setattr(agg, "analyse_sentiment", lambda t, a, force_engine=None: (0.0, "neutral"))
+    monkeypatch.setattr(settings, "inverted_methods", "")
     monkeypatch.setattr(settings, "enable_market_relative_momentum", True)
     tickers = ["AAA", "BBB"]
     monkeypatch.setattr(settings, "signal_scoring_max_workers", 4)

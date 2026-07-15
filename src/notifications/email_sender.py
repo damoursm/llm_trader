@@ -163,8 +163,18 @@ HTML_TEMPLATE = """
 {% if broker_health and broker_health.down %}
 <div style="background:#7c2d12;border:1px solid #c2410c;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fed7aa;font-size:13px;">
   &#128276; <b>Broker execution issue ({{ broker_health.mode }})</b> &mdash; {{ broker_health.message }}.
-  <div style="margin-top:6px;color:#fdba74;line-height:1.7;">
-  Paper orders may not reflect the model this run &mdash; check IB Gateway connectivity and the broker order log.
+  {% if broker_health.errors %}
+  <div style="margin-top:8px;color:#fed7aa;font-weight:600;">Exact error{{ 's' if broker_health.errors|length != 1 else '' }}:</div>
+  <div style="margin-top:4px;padding:8px 10px;background:#450a0a;border-radius:6px;color:#fecaca;font-family:Consolas,'Courier New',monospace;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;">{% for e in broker_health.errors[:10] %}{{ e | e }}{% if not loop.last %}
+{% endif %}{% endfor %}{% if broker_health.errors|length > 10 %}
+&hellip; (+{{ broker_health.errors|length - 10 }} more &mdash; see the broker order log){% endif %}</div>
+  {% endif %}
+  <div style="margin-top:8px;color:#fdba74;line-height:1.7;">
+  Paper orders may not reflect the model this run.
+  {% if broker_health.broker_timeouts %}<br>&bull; <b>Requests timed out</b> &mdash; IB Gateway is likely wedged (process up, API dead). Restart the gateway / check IBC; the app auto-recovers the gateway in paper mode.{% endif %}
+  {% if broker_health.errors and '10329' in (broker_health.errors | join(' ')) %}<br>&bull; <b>Error 10329 (directly routed)</b> &mdash; a gateway API <i>Precautionary Setting</i> is discarding direct-routed orders. Set <code>BypassOrderPrecautions=yes</code> + <code>BypassRedirectOrderWarning=yes</code> in <code>C:\\IBC\\config.ini</code> and relaunch the gateway.{% endif %}
+  {% if not broker_health.connected %}<br>&bull; <b>Not connected</b> &mdash; check IB Gateway is running on the configured port and logged in.{% endif %}
+  <br>Full detail is in the broker order log (dashboard Execution tab).
   </div>
 </div>
 {% elif broker_health %}

@@ -91,7 +91,11 @@ def compute_technical_score(ticker: str, df: Optional[pd.DataFrame] = None) -> T
     if df is None:
         df = get_history(ticker, period="3mo")
     if df.empty or len(df) < 20:
-        logger.warning(f"Not enough history for technical analysis of {ticker}")
+        # DEBUG, not WARNING: a short-history ticker (newly-listed / thin name in
+        # the broad discovery universe) simply gets a neutral no-view here — it is
+        # expected and non-actionable, but at WARNING it fired ~1250-4000×/day and
+        # was ~90% of all warnings, burying real ones. Kept in the DEBUG file log.
+        logger.debug(f"Not enough history for technical analysis of {ticker}")
         return EMPTY_RESULT
 
     close = df["Close"]

@@ -43,8 +43,10 @@ class Settings(BaseSettings):
     # OTHER provider is the error fallback. Empty = legacy binary behavior above.
     # DeepSeek arms may carry a "-thinking" suffix (logical id → API model + reasoning
     # mode, decoded by claude_analyst._deepseek_spec). Sentiment is unaffected (stays
-    # Haiku ⇄ DeepSeek flash non-thinking via llm_ab_anthropic_share). Example:
-    #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking,deepseek-v4-pro-thinking
+    # Haiku ⇄ DeepSeek flash non-thinking via llm_ab_anthropic_share). Example (2026-07-11 —
+    # DeepSeek's reasoning family is V4, not R1; deepseek-v4-flash-thinking beat
+    # deepseek-v4-pro-thinking on live win rate, so only the flash-thinking arm remains):
+    #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking
     llm_ab_synthesis_models: str = ""
 
     # Anthropic prompt caching (cache_control) on the SYNTHESIS prompt. The large
@@ -124,6 +126,108 @@ class Settings(BaseSettings):
 
     # DeepSeek API (used for low-reasoning tasks)
     deepseek_api_key: str = ""
+
+    # Qwen (Alibaba Cloud Model Studio / DashScope, OpenAI-compatible). qwen3.7-max
+    # (May 2026): 1M context, ~66K max output, thinking via extra_body
+    # {"enable_thinking": bool}. Keys are REGION-BOUND: an international-console key
+    # only works on the intl endpoint below; a mainland-console key needs
+    # https://dashscope.aliyuncs.com/compatible-mode/v1 instead.
+    qwen_api_key: str = ""
+    qwen_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    # Model id for the active route: bare "qwen3.7-max" on DashScope direct,
+    # "qwen/qwen3.7-max" via OpenRouter (route derived from qwen_base_url —
+    # see src/analysis/qwen_api.py for the dialect differences).
+    qwen_model: str = "qwen3.7-max"
+    # PRIMARY OpenAI-compatible LLM provider ("deepseek" | "qwen") for every
+    # non-bake-off LLM call: per-ticker sentiment, the macro-news classifier, and
+    # the pinned hold-review COERCION target. "qwen" would route ALL LLM calls to
+    # Qwen and coerce every opener pin to qwen; "deepseek" (the 2026-07-13 cost tune)
+    # applies NO blanket coercion — hold-review pins honor the opener engine (Fix #2),
+    # macro-news classifies DeepSeek-only, and sentiment follows the 90/10 DeepSeek/
+    # Qwen per-run split (sentiment_qwen_share) rather than an all-qwen override.
+    # Synthesis routing is independent (llm_ab_synthesis_models — currently 50/50).
+    llm_primary_provider: str = "deepseek"
+
+    # SENTIMENT engine split (2026-07-13 cost tune): probability a given run scores
+    # per-ticker sentiment with Qwen (the pricier engine) vs DeepSeek-flash. A per-RUN
+    # flip (not per-call) so each engine accrues whole-run samples for the dashboard's
+    # per-LLM eval and the run's dominant sentiment model attributes cleanly. 0.10 ⇒
+    # ~10% Qwen / ~90% DeepSeek; the non-primary engine is the per-call error fallback.
+    # Ignored when enable_claude_sentiment runs its own anthropic A/B ahead of this,
+    # and only fires when a Qwen key is configured. 0.0 = DeepSeek-only sentiment.
+    sentiment_qwen_share: float = 0.0
+
+    # MAXIMUM-THINKING policy (2026-07-12 directive: "maximum thinking everywhere").
+    # ON → every LLM call reasons at the model's MAX budget:
+    #   • Qwen — enable_thinking=True with thinking_budget OMITTED (DashScope defaults
+    #     it to the model's maximum chain-of-thought; Qwen bills reasoning tokens
+    #     SEPARATELY from max_tokens, so the answer cap is untouched);
+    #   • DeepSeek (fallback) — reasoning mode ON, with a raised max_tokens because
+    #     DeepSeek counts thinking AGAINST max_tokens;
+    #   • Anthropic (if ever pooled) — adaptive thinking + output_config effort="max".
+    # This flips the two paths that were deliberately non-thinking for cost —
+    # per-ticker sentiment and the macro-news classifier — to thinking too, so
+    # reasoning is billed on every call (notably the high-volume sentiment path).
+    # OFF → the prior cost-tuned mix (decisions think; bulk sentiment/macro don't).
+    llm_max_thinking: bool = False
+
+    # BLIND-SYNTHESIS A/B (2026-07-12). The agreement eval found 96% of LLM calls
+    # simply ECHO the aggregator's verdict (the prompt leads every ticker line with
+    # direction= / combined_confidence= / sources_agreeing=, and §3 says "Trust
+    # it") — so the LLM is an expensive rubber stamp, not a second opinion, and it
+    # degrades performance on the way through (funnel: −2.06% in → −3.18% out).
+    # Share of runs whose MAIN synthesis goes BLIND: the aggregate verdict fields,
+    # the HORIZON MODEL / EXPECTED MOVE opinion lines, and the "trust the
+    # pre-computed confidence" instructions are removed, so the LLM must form its
+    # own direction/confidence from the RAW per-method evidence. The flip is
+    # stamped per run (gate_diag.blind_synthesis) and per trade
+    # (entry_blind_synthesis) → dashboard "Entry eval · blind-synthesis ON/OFF"
+    # rows accumulate the outcome comparison (same idiom as
+    # open_positions_prompt_share). Hold-review calls are NEVER blinded (stable
+    # exit governance; only the entry side is under test). 0.0 = off, 1.0 = always.
+    blind_synthesis_share: float = 0.5
+
+    # Two-tick confirmation on the NOISY LLM exits (llm_signal_flipped /
+    # llm_confidence_loss): with max thinking the hold-review is non-deterministic,
+    # and llm_confidence_loss was measured leaving ~+7% @5d on the table — so a
+    # single-review breach no longer closes. The breach ARMS a pending marker on
+    # the trade; only a SECOND consecutive breaching review closes (any LLM-exit
+    # reason counts as the confirmation). A review that says hold clears the
+    # marker; a tick with NO review leaves it armed (absence is not evidence).
+    # Mechanical/trailing/macro/horizon exits are NOT gated (they are not
+    # review-noise-driven). Off = the pre-2026-07-12 single-review behavior.
+    enable_llm_exit_confirmation: bool = True
+
+    # Qwen structured output: request response_format={"type":"json_object"} on the
+    # synthesis call so the answer is guaranteed-parseable JSON (the prompt asks for
+    # {"recommendations": [...]}; the parser accepts both the wrapped object and the
+    # legacy bare array). If DashScope rejects the parameter (e.g. an
+    # enable_thinking incompatibility), the call retries once WITHOUT it — Qwen
+    # stays primary either way. Off = free-text JSON + fence/truncation repair only.
+    qwen_json_mode: bool = True
+
+    # Confidence RECALIBRATION for sizing (2026-07-12): a standalone multiplicative
+    # tilt whose input is the LEDGER's empirical win rate for the trade's stated-
+    # confidence band, not the stated number (weakly calibrated, ρ≈+0.07 — the
+    # compressed ramp only LIMITS the damage; this layer follows the evidence,
+    # including sizing DOWN a high-stated band that empirically loses). House
+    # idiom: per-band win rates shrunk toward the pooled win rate by prior_n
+    # pseudo-observations (the shrinkage IS the evidence throttle — thin band ⇒
+    # neutral), tilt = 1 + span × clamp((p_band − p_pool)/half_width, ±1), inert
+    # below min_trades closes, fail-soft to 1.0, registry-reported
+    # (confidence_recal_spread). Bands shared with the dashboard's confidence-
+    # calibration buckets. See src/performance/confidence_sizing.py.
+    enable_confidence_recal_sizing: bool = True
+    confidence_recal_span: float = 0.25        # max ± size tilt at a ≥half_width win-rate gap
+    confidence_recal_half_width: float = 0.10  # win-rate gap (10 pp) that saturates the ramp
+    confidence_recal_prior_n: int = 20         # shrinkage strength (pseudo-observations toward pool)
+    confidence_recal_min_trades: int = 20      # eligible closes before the layer speaks at all
+    # max_tokens (ANSWER room) for the DeepSeek fallback on the normally-small
+    # sentiment / macro-news calls when llm_max_thinking is on — DeepSeek's thinking
+    # shares this budget, so it needs headroom the tiny answer wouldn't. Qwen ignores
+    # the slack (its reasoning has its own budget).
+    llm_thinking_sentiment_max_tokens: int = 16000
+    llm_thinking_macro_max_tokens: int = 8000
 
     # News sources
     newsapi_key: str = ""
@@ -1468,6 +1572,44 @@ class Settings(BaseSettings):
     # (the sync-start retry loop, _submit_with_retry) bypass the pause, and any
     # successful dial clears it. 0 = no throttle (dial on every touchpoint).
     broker_reconnect_cooldown_seconds: float = 60.0
+    # ALIVE-BUT-WEDGED gateway detection (2026-07-13). A wedged IB Gateway keeps
+    # the socket open — isConnected() stays True — while EVERY API request times
+    # out (blank-message TimeoutError). The plain reconnect never fires (the
+    # session reads as connected), so the whole tick burns request-timeouts and
+    # the failures get mislabeled "rejected". After this many CONSECUTIVE request
+    # timeouts the broker treats the session as effectively dropped and forces a
+    # fresh client dial: on a still-wedged gateway that dial also times out and
+    # arms the cooldown above, so the rest of the tick fast-fails instead of each
+    # call hanging — and it auto-recovers the instant the gateway (or IBC) is back.
+    # Counts CONSECUTIVE timeouts (any success resets), so on a healthy gateway the
+    # frequent successful reads keep it near 0 — a thin pre-market ticker whose
+    # reqTickers times out (bounded by broker_price_timeout_seconds) can't
+    # accumulate. Set >a handful so a run of thin-ticker price timeouts can't
+    # false-trip it, while a real wedge (EVERY request times out) trips within the
+    # first few calls. 0 = disable wedge detection (legacy: trust isConnected()).
+    broker_wedge_timeout_threshold: int = 5
+    # ── GATEWAY auto-recovery (2026-07-13, the last manual ops step automated) ──
+    # The app-side self-healing above (auto-reconnect, wedge detection + forced
+    # client recycle) can only fix the APP's side of the session. When the GATEWAY
+    # itself is the corpse — alive-but-wedged (process up, port open, API backend
+    # dead: 2026-07-06, 2026-07-13) or fully down — every redial hits a dead
+    # socket, and IBC's process watchdog can't see it (it only checks the process
+    # is alive). Recovery was a documented MANUAL procedure: kill the gateway java
+    # process, trigger the 'IBC Gateway' scheduled task (relaunch + auto-login).
+    # broker_gateway_auto_restart automates exactly that procedure, fired from the
+    # two places that KNOW the gateway is the problem: the sync-start connect loop
+    # exhausting its retries, and a wedge-forced redial failing. PAPER-MODE ONLY —
+    # ibkr_live downgrades to a CRITICAL log (bouncing a live-money gateway, which
+    # may need 2FA to re-login, is a human decision; same posture as drift
+    # auto-flatten). Cooldown-guarded so a persistently-broken gateway can't be
+    # kill-looped; every step fail-soft (a recovery failure never breaks the run).
+    broker_gateway_auto_restart: bool = True
+    broker_gateway_task_name: str = "IBC Gateway"   # the IBC relaunch scheduled task
+    broker_gateway_restart_cooldown_minutes: int = 30
+    # sync-path restarts wait up to this long for the fresh gateway's port before
+    # the final in-tick dial (the IBC relaunch + auto-login takes ~60s); the
+    # wedge-path fires without waiting (next touchpoint redials).
+    broker_gateway_restart_wait_seconds: int = 90
     # ── Settle pass: fill fast or kill ───────────────────────────────────
     # After this tick's orders are submitted, actively watch them for up to
     # this many seconds: fills are recorded the moment they land; a zero-fill

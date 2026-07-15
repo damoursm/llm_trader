@@ -125,6 +125,8 @@ def _new_report() -> dict:
     return {
         "run_id": None, "mode": settings.broker_mode, "connected": False, "ok": True,
         "entries_submitted": 0, "exits_submitted": 0, "fills_repaired": 0, "rejects": 0,
+        "broker_timeouts": 0,   # submits that failed because the gateway didn't respond (≠ real rejects)
+        "overnight_deferred": 0,  # overnight-venue refusals — benign, resubmitted at the pre-market open
         "retries": 0, "stale_cancels": 0, "entry_cancels_on_close": 0, "drift_flattened": 0,
         "settled_fills": 0, "settle_reanchors": 0, "unfilled_killed": 0,
         "drift": [], "slippage": [], "orders": [], "errors": [], "account_equity": None,
@@ -292,6 +294,45 @@ def _is_transient_failure(res: OrderResult) -> bool:
         return True
     blob = f"{res.status or ''} {res.error or ''}".lower()
     return any(m in blob for m in _TRANSIENT_MARKERS)
+
+
+# A failed submit whose cause is the gateway NOT RESPONDING (wedge / timeout /
+# dropped socket) is not a real IBKR reject — surfaced separately so the health
+# alert says "broker not responding" instead of mislabeling it "N rejected".
+_UNRESPONSIVE_MARKERS = ("disconnect", "not connected", "timeout", "timed out",
+                         "socket", "not responding", "no response")
+
+
+def _looks_unresponsive(res: OrderResult) -> bool:
+    blob = f"{res.status or ''} {res.error or ''}".lower()
+    return any(m in blob for m in _UNRESPONSIVE_MARKERS)
+
+
+def _tally_submit_failure(report: dict, kind: str, ticker: str, res: OrderResult) -> None:
+    """Count a failed entry/exit submit as a broker TIMEOUT (gateway unresponsive),
+    an OVERNIGHT DEFERRAL (benign), or a genuine REJECT, and record the error."""
+    if _looks_unresponsive(res):
+        report["broker_timeouts"] += 1
+    elif _overnight_routing_active() and (res.status or "") in (
+            "Cancelled", "ApiCancelled", "Inactive"):
+        # Instant kill of an overnight-routed order: overnight-ineligible symbol,
+        # closed book — or a gateway API precaution (2026-07-13: 'Error 10329 …
+        # directly routed to OVERNIGHT … Precautionary Settings' silently
+        # discarded EVERY overnight order; root fix = IBC BypassOrderPrecautions=
+        # yes). Benign + self-resolving: the tick-scoped lifecycle resubmits at
+        # the 04:00 pre-market open where it routes normally — the same treatment
+        # the drift pass already gives 'flatten_pending_open'. INFO + its own
+        # counter, NOT a reject, so it can't fire the broker-health CRITICAL
+        # (and its email) every overnight tick.
+        report["overnight_deferred"] += 1
+        logger.info(
+            f"[broker] {kind} {ticker}: not accepted for the overnight session "
+            f"({res.error or res.status}) — deferred to the pre-market open"
+        )
+        return
+    else:
+        report["rejects"] += 1
+    report["errors"].append(f"{kind} {ticker}: {res.error or res.status or 'unknown'}")
 
 
 def _known_order_result(broker: Broker, req: OrderRequest) -> Optional[OrderResult]:
@@ -1033,16 +1074,13 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
     # order cycle (every trade waits a full tick; observed 2026-06-11 15:41).
     attempts = 1 + max(0, int(settings.broker_connect_retries))
     wait = max(1, int(settings.broker_connect_retry_wait_seconds))
+    connect_err: Optional[BaseException] = None
     for attempt in range(attempts):
         try:
             report["connected"] = bool(broker.connect())
         except Exception as e:  # never let a broker hiccup break the pipeline
             report["connected"] = False
-            if attempt == attempts - 1:
-                report["ok"] = False
-                report["errors"].append(f"connect: {e}")
-                logger.warning(f"[broker] connect raised: {e}")
-                return report
+            connect_err = e
         if report["connected"]:
             break
         if attempt < attempts - 1:
@@ -1052,8 +1090,28 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             )
             time.sleep(wait)
     if not report["connected"]:
+        # Last resort — the GATEWAY itself may be dead or alive-but-wedged
+        # (IBC's watchdog only checks the process exists). Automate the manual
+        # recovery procedure: kill the gateway, fire the IBC relaunch task,
+        # wait for the fresh port, dial once more — so THIS tick's order cycle
+        # is saved instead of the next one's. Paper-only + cooldown-guarded +
+        # fail-soft inside gateway_recovery.
+        try:
+            from src.broker.gateway_recovery import maybe_restart_gateway
+            if maybe_restart_gateway("sync connect retries exhausted", wait=True):
+                report["connected"] = bool(broker.connect())
+        except Exception as e:
+            connect_err = e
+    if not report["connected"]:
         report["ok"] = False
-        report["errors"].append("not connected")
+        if connect_err is not None:
+            # str(exc) is '' for a bare TimeoutError — show the class so the
+            # broker-health email reason isn't blank (blank-error class).
+            _cdetail = str(connect_err) or type(connect_err).__name__
+            report["errors"].append(f"connect: {_cdetail}")
+            logger.warning(f"[broker] connect raised: {_cdetail}")
+        else:
+            report["errors"].append("not connected")
         logger.warning("[broker] not connected — skipping sync (internal sim unaffected)")
         return report
 
@@ -1238,8 +1296,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 _record_slippage(report, "ENTRY", t["ticker"], side,
                                  price, res.avg_fill_price, res.commission)
             else:
-                report["rejects"] += 1
-                report["errors"].append(f"entry {t['ticker']}: {res.error}")
+                _tally_submit_failure(report, "entry", t["ticker"], res)
 
         # ── EXITS: CLOSED trades that still hold a broker position ────────
         exited_this_tick: set = set()
@@ -1328,8 +1385,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 _record_slippage(report, "EXIT", t["ticker"], side,
                                  model, res.avg_fill_price, res.commission)
             else:
-                report["rejects"] += 1
-                report["errors"].append(f"exit {t['ticker']}: {res.error}")
+                _tally_submit_failure(report, "exit", t["ticker"], res)
 
         # ── DRIFT: broker positions the ledger cannot explain ─────────────
         # Exemptions (not drift, just close latency): an OPEN trade owns the
@@ -1367,7 +1423,13 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 entry["action"] = "flatten_skipped"
             elif res.ok:
                 report["drift_flattened"] += 1
-                entry["action"] = "flatten_submitted"
+                # Accepted-but-not-yet-filled off-RTH is the SAME self-resolving
+                # convergence as the outright-reject case below (PRCH 2026-07-10:
+                # 6 straight pre-market "submitted" alerts before a clean fill at
+                # a better-than-model price) — not a failure, just working. RTH
+                # keeps alerting: a capped marketable LMT not filling in a deep
+                # book there is genuinely unusual.
+                entry["action"] = "flatten_pending_fill" if outside_rth else "flatten_submitted"
             else:
                 # An overnight drift-flatten the overnight venue won't accept is
                 # EXPECTED and self-resolves at the pre-market open — mark it
@@ -1395,8 +1457,9 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
     logger.info(
         f"[broker:{settings.broker_mode}] sync — entries={report['entries_submitted']} "
         f"exits={report['exits_submitted']} fills_repaired={report['fills_repaired']} "
-        f"rejects={report['rejects']} drift={len(report['drift'])} "
-        f"equity={report['account_equity']:.0f}"
+        f"rejects={report['rejects']} timeouts={report['broker_timeouts']} "
+        f"overnight_deferred={report['overnight_deferred']} "
+        f"drift={len(report['drift'])} equity={report['account_equity']:.0f}"
     )
     return report
 

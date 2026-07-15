@@ -46,6 +46,41 @@ def from_ib_symbol(symbol: str) -> str:
     return symbol.strip().upper().replace(" ", "-")
 
 
+def _exc_text(e: BaseException) -> str:
+    """A human-usable error string even when the exception message is EMPTY.
+
+    ib_async's per-request timeout raises a bare ``TimeoutError()`` whose
+    ``str()`` is '' — which used to log as ``… failed:`` (blank) and persist a
+    blank ``broker_orders.error``, making a wedged-gateway incident undebuggable.
+    Falls back to the exception class name so the signal is never lost."""
+    return (str(e) or "").strip() or type(e).__name__
+
+
+def _is_timeout_exc(e: BaseException) -> bool:
+    """True for a request-timeout exception (builtin/asyncio TimeoutError, or any
+    exception whose text mentions a timeout) — the wedged-gateway signature."""
+    return isinstance(e, TimeoutError) or "timeout" in _exc_text(e).lower()
+
+
+def _trade_log_reason(trade) -> Optional[str]:
+    """IBKR's actual cancel/reject REASON for an order, from ``trade.log``.
+
+    ``orderStatus.status`` only says WHAT happened ('Cancelled'); WHY lives in
+    the trade-log messages (e.g. 'Error 10329 … directly routed to OVERNIGHT.
+    Restriction is specified in Precautionary Settings' — the gateway config
+    issue that silently discarded EVERY overnight order for two weeks while the
+    app recorded bare 'Cancelled'). Returns the last non-empty message, or None.
+    """
+    try:
+        for entry in reversed(getattr(trade, "log", None) or []):
+            msg = (getattr(entry, "message", "") or "").strip()
+            if msg:
+                return msg[:300]
+    except Exception:
+        pass
+    return None
+
+
 class IBKRBroker(Broker):
     name = "ibkr"
 
@@ -59,6 +94,7 @@ class IBKRBroker(Broker):
         self._reconnect_block_until = 0.0    # monotonic deadline; throttles IMPLICIT revives
         self._ever_connected = False         # "reconnected" vs "connected" log wording
         self._expected_disconnect = False    # deliberate disconnects don't warn
+        self._consecutive_timeouts = 0       # wedge detection: request timeouts since last success
 
     # ── connection ────────────────────────────────────────────────────────
     def _get_ib(self):
@@ -95,13 +131,34 @@ class IBKRBroker(Broker):
             f"auto-reconnect runs at the next broker call"
         )
 
-    def connect(self) -> bool:
+    def _note_request(self, exc: Optional[BaseException]) -> None:
+        """Track consecutive request TIMEOUTS so an alive-but-wedged gateway
+        (socket open → isConnected() True, but every request times out) is
+        detected. Any success resets the counter; a non-timeout error (a real
+        reject) leaves it unchanged (it is not evidence of a wedge)."""
+        if exc is None:
+            self._consecutive_timeouts = 0
+        elif _is_timeout_exc(exc):
+            self._consecutive_timeouts += 1
+
+    def is_wedged(self) -> bool:
+        """True when the session reads connected but has racked up
+        ``broker_wedge_timeout_threshold`` consecutive request timeouts — the
+        alive-but-wedged gateway the plain reconnect can't see."""
+        thr = int(getattr(settings, "broker_wedge_timeout_threshold", 0) or 0)
+        return thr > 0 and self._consecutive_timeouts >= thr
+
+    def connect(self, force: bool = False) -> bool:
         """Establish/confirm the session (idempotent). An EXPLICIT dial: never
         throttled by the reconnect cooldown (the reconciler's connect-retry loop
         depends on that), and a failure arms the cooldown that gates the
-        implicit per-call revives in ``_ensure_connected``."""
+        implicit per-call revives in ``_ensure_connected``.
+
+        ``force`` skips the ``isConnected()`` short-circuit — required to RECYCLE
+        a wedged client, whose socket still reads connected even though the API
+        backend is dead (else this would no-op and the wedge would persist)."""
         ib = self._get_ib()
-        if ib.isConnected():
+        if ib.isConnected() and not force:
             return True
         reconnecting = self._ever_connected
         try:
@@ -118,6 +175,7 @@ class IBKRBroker(Broker):
                        timeout=settings.ibkr_connect_timeout, readonly=False)
             self._reconnect_block_until = 0.0
             self._ever_connected = True
+            self._consecutive_timeouts = 0        # fresh session — clear the wedge counter
             logger.info(
                 f"[broker:ibkr] {'reconnected' if reconnecting else 'connected'} "
                 f"{self.host}:{self.port} (clientId={self.client_id})"
@@ -126,7 +184,11 @@ class IBKRBroker(Broker):
         except Exception as e:
             cooldown = max(0.0, float(settings.broker_reconnect_cooldown_seconds or 0.0))
             self._reconnect_block_until = time.monotonic() + cooldown
-            logger.warning(f"[broker:ibkr] connect failed ({self.host}:{self.port}): {e}")
+            # A failed forced (wedge-recovery) dial closed the socket, so the
+            # session now reads dropped — clear the counter so we don't loop on
+            # is_wedged() (the cooldown now gates the retries).
+            self._consecutive_timeouts = 0
+            logger.warning(f"[broker:ibkr] connect failed ({self.host}:{self.port}): {_exc_text(e)}")
             return False
 
     def _ensure_connected(self) -> bool:
@@ -140,11 +202,35 @@ class IBKRBroker(Broker):
         charge every touchpoint the full ``ibkr_connect_timeout``; explicit
         ``connect()`` calls bypass the cooldown, and a successful dial clears it.
         """
-        if self.is_connected():
+        # Alive-but-wedged detection: a connected-but-wedged session (isConnected()
+        # True, but broker_wedge_timeout_threshold consecutive request timeouts)
+        # is treated as dropped and force-recycled. On a still-wedged gateway that
+        # dial times out and arms the cooldown below, so the rest of the tick
+        # fast-fails instead of each call burning the full request timeout.
+        wedged = self.is_wedged()
+        if self.is_connected() and not wedged:
             return True
         if time.monotonic() < self._reconnect_block_until:
             return False
-        return self.connect()
+        if wedged:
+            logger.warning(
+                f"[broker:ibkr] session reads connected but {self._consecutive_timeouts} "
+                f"consecutive requests timed out — gateway WEDGED; force-recycling the client"
+            )
+        ok = self.connect(force=wedged)
+        if not ok and wedged:
+            # The forced recycle dialed a DEAD gateway — the gateway itself is the
+            # corpse (alive-but-wedged: process up, port open, API backend dead;
+            # IBC's watchdog can't see it). Fire the automated kill-and-relaunch,
+            # fire-and-forget: this path runs from every broker touchpoint, so the
+            # cooldown keeps it cheap and the next touchpoint redials the fresh
+            # gateway (paper-only + fail-soft inside).
+            try:
+                from src.broker.gateway_recovery import maybe_restart_gateway
+                maybe_restart_gateway("gateway wedged and forced redial failed", wait=False)
+            except Exception as e:
+                logger.warning(f"[broker:ibkr] gateway recovery hook failed: {e}")
+        return ok
 
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
@@ -197,12 +283,14 @@ class IBKRBroker(Broker):
                     "assumes USD. Set your IBKR paper account base currency to USD to avoid FX skew. "
                     "(warned once per run)"
                 )
+            self._note_request(None)
             return AccountSnapshot(
                 equity=num("NetLiquidation"), cash=num("TotalCashValue"),
                 buying_power=num("BuyingPower"), account_id=acct, currency=currency,
             )
         except Exception as e:
-            logger.warning(f"[broker:ibkr] get_account failed: {e}")
+            self._note_request(e)
+            logger.warning(f"[broker:ibkr] get_account failed: {_exc_text(e)}")
             return None
 
     def get_positions(self) -> List[Position]:
@@ -219,11 +307,15 @@ class IBKRBroker(Broker):
             # waits for positionEnd before we read.
             try:
                 self._ib.reqPositions()
+                self._note_request(None)          # reqPositions is the real round-trip
             except Exception as e:
+                self._note_request(e)             # its timeout is a wedge signal
                 logger.warning(
                     f"[broker:ibkr] reqPositions refresh failed — reading "
-                    f"cached positions: {e}"
+                    f"cached positions: {_exc_text(e)}"
                 )
+            # ib.positions() is a LOCAL cache read (no round-trip) — not evidence
+            # the gateway responded, so it does not touch the wedge counter.
             for p in self._ib.positions(self.account or ""):
                 out.append(Position(
                     ticker=from_ib_symbol(p.contract.symbol),
@@ -231,7 +323,8 @@ class IBKRBroker(Broker):
                     avg_cost=float(p.avgCost) if p.avgCost else None,
                 ))
         except Exception as e:
-            logger.warning(f"[broker:ibkr] get_positions failed: {e}")
+            self._note_request(e)
+            logger.warning(f"[broker:ibkr] get_positions failed: {_exc_text(e)}")
         return out
 
     # ── orders ────────────────────────────────────────────────────────────
@@ -290,19 +383,32 @@ class IBKRBroker(Broker):
                 cr = getattr(f, "commissionReport", None)
                 if cr is not None and cr.commission:
                     commission += float(cr.commission)
+            self._note_request(None)          # gateway responded — clear wedge counter
+            if not ok:
+                # Capture WHY from the trade log (status alone says 'Cancelled'
+                # with no reason — undebuggable; see _trade_log_reason).
+                reason = _trade_log_reason(trade)
+                err = f"{st.status or 'not filled'}: {reason}" if reason else (st.status or "not filled")
+                logger.warning(
+                    f"[broker:ibkr] order {req.side} {req.quantity} {req.ticker} "
+                    f"not accepted — {err}"
+                )
+            else:
+                err = None
             return OrderResult(
                 ok=ok, ticker=req.ticker, side=req.side, requested_qty=req.quantity,
                 filled_qty=filled,
                 avg_fill_price=float(st.avgFillPrice) if st.avgFillPrice else None,
                 order_id=str(trade.order.orderId), client_ref=req.client_ref,
                 status=st.status, commission=round(commission, 4) if commission else None,
-                error=None if ok else (st.status or "not filled"),
+                error=err,
             )
         except Exception as e:
-            logger.warning(f"[broker:ibkr] submit_order {req.side} {req.quantity} {req.ticker} failed: {e}")
+            self._note_request(e)             # count a timeout toward wedge detection
+            logger.warning(f"[broker:ibkr] submit_order {req.side} {req.quantity} {req.ticker} failed: {_exc_text(e)}")
             return OrderResult(ok=False, ticker=req.ticker, side=req.side,
                                requested_qty=req.quantity, client_ref=req.client_ref,
-                               status="ERROR", error=str(e))
+                               status="ERROR", error=_exc_text(e))
 
     # ── fills (today's executions, for the reconciler's repair pass) ───────
     def get_fills(self) -> List[FillSummary]:
@@ -324,8 +430,10 @@ class IBKRBroker(Broker):
         try:
             from ib_async import ExecutionFilter
             fills = self._ib.reqExecutions(ExecutionFilter())
+            self._note_request(None)
         except Exception as e:
-            logger.warning(f"[broker:ibkr] reqExecutions failed: {e}")
+            self._note_request(e)
+            logger.warning(f"[broker:ibkr] reqExecutions failed: {_exc_text(e)}")
             return []
 
         agg: dict = {}
@@ -415,6 +523,7 @@ class IBKRBroker(Broker):
                     pass
             contract = self._qualify(ticker)
             tickers = ib.reqTickers(contract)
+            self._note_request(None)              # gateway responded
             if not tickers:
                 return None
             t = tickers[0]
@@ -424,7 +533,8 @@ class IBKRBroker(Broker):
                 if px is not None and px == px and float(px) > 0:
                     return float(px)
         except Exception as e:
-            logger.debug(f"[broker:ibkr] get_market_price {ticker} failed: {e}")
+            self._note_request(e)                 # count a timeout toward wedge detection
+            logger.debug(f"[broker:ibkr] get_market_price {ticker} failed: {_exc_text(e)}")
         finally:
             try:
                 ib.RequestTimeout = prev_timeout          # restore the global bound

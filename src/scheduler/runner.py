@@ -50,23 +50,35 @@ from src.utils import now_et
 # Windows SetThreadExecutionState flags (winbase.h).
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
 
 
 def _keep_system_awake(enable: bool) -> None:
-    """Ask Windows not to idle into sleep/Modern-Standby while the scheduler runs.
+    """Ask Windows not to idle into sleep / Modern Standby while the scheduler runs.
 
-    Issues a continuous ES_SYSTEM_REQUIRED power request (the mechanism media players
-    use). Honored on AC; Windows may ignore it on battery. No-op off-Windows.
+    Issues a continuous power request (the mechanism media players use). Honored on
+    AC; Windows may ignore it on battery. No-op off-Windows.
+
+    CRITICAL on Modern Standby (S0) machines (2026-07-14): ``ES_SYSTEM_REQUIRED``
+    alone blocks classic S3 sleep but does NOT keep an S0 machine out of *connected
+    standby* — which FREEZES this process (the 6 h dark-loop / "wall clock jumped"
+    incidents: the OS enters Modern Standby when the DISPLAY turns off, regardless of
+    ES_SYSTEM_REQUIRED). Adding ``ES_DISPLAY_REQUIRED`` holds the display on, and an
+    on display keeps the box in the working state so background ticks keep firing.
+    Complementary to the OS power settings (display-off=never on AC, lid=do-nothing);
+    this in-app request is the portable belt that survives a settings reset.
     """
     if not enable or sys.platform != "win32":
         return
     try:
         import ctypes
 
-        if ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED) == 0:
+        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        if ctypes.windll.kernel32.SetThreadExecutionState(flags) == 0:
             logger.warning("[scheduler] keep-awake request was not honored by the OS")
         else:
-            logger.info("[scheduler] keep-awake requested (helps on AC; battery may override)")
+            logger.info("[scheduler] keep-awake requested — system + display held on "
+                        "(prevents Modern Standby freezing ticks; AC only, battery may override)")
     except Exception as exc:  # pragma: no cover - platform/edge guard
         logger.warning(f"[scheduler] could not enable keep-awake: {exc}")
 
@@ -264,6 +276,37 @@ def _alert(subject: str, body: str) -> None:
         logger.warning(f"[scheduler] alert email failed: {exc}")
 
 
+# Crash alerts were the remaining silent-failure class: a tick that RAISES was
+# only `logger.exception`'d (console + file), never emailed — so a persistently
+# crashing pipeline (bad deploy, dependency break, a data-shape change, a report-
+# template bug) could run a whole session dark with no notification, exactly like
+# the pre-2026-06-30 missed-slot gap but for crashes instead of suspends. Throttle
+# per exception TYPE so a repeating crash can't storm the inbox while a NEW kind of
+# crash still gets through promptly.
+_CRASH_ALERT_THROTTLE_S = 1800   # 30 min between alerts of the same crash type
+_last_crash_alert: dict[str, float] = {}
+
+
+def _alert_crash(context: str, exc: BaseException) -> None:
+    import traceback as _tb
+    key = type(exc).__name__
+    now = _time_module.monotonic()
+    if now - _last_crash_alert.get(key, 0.0) < _CRASH_ALERT_THROTTLE_S:
+        return                                    # same crash type recently alerted
+    _last_crash_alert[key] = now
+    detail = str(exc) or type(exc).__name__       # blank-message guard (bare TimeoutError)
+    tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))[-2500:]
+    _alert(
+        f"\U0001f6d1 LLM Trader: {context} crashed — {key}: {detail}",
+        f"A scheduled {context} raised an unhandled exception and was skipped. The "
+        f"loop keeps running, but this work did NOT complete this tick — open "
+        f"positions may be unmarked/unmanaged and no report was sent.\n\n"
+        f"{key}: {detail}\n\n{tb}\n\n"
+        f"(Repeat {key} crashes are throttled to one alert per "
+        f"{_CRASH_ALERT_THROTTLE_S // 60} min — check the log for the full run.)"
+    )
+
+
 def _missed_slots_between(start: datetime, end: datetime, slots: list[tuple[_time, str]],
                           grace: int) -> list[datetime]:
     """Valid slot boundaries that fell inside ``(start, end - grace]`` —
@@ -447,6 +490,7 @@ def start_scheduler() -> None:
                                      email_if_configured=False)
                     except Exception as exc:  # never let one tick kill the loop
                         logger.exception(f"[scheduler] tick raised: {exc}")
+                        _alert_crash("pipeline tick", exc)   # log-only was silent to the operator
                 else:
                     logger.warning(
                         f"[scheduler] slot {slot_dt.strftime('%H:%M')} ET missed by "
@@ -491,6 +535,7 @@ def start_scheduler() -> None:
                                          email_if_configured=False)
                         except Exception as exc:
                             logger.exception(f"[scheduler] catch-up tick raised: {exc}")
+                            _alert_crash("catch-up tick", exc)
                 last_run_slot = slot_dt  # mark even when skipped, so we don't retry this slot
 
             # End-of-day maintenance — once per market day past the trigger,
@@ -501,6 +546,7 @@ def start_scheduler() -> None:
                     _run_eod_maintenance()
                 except Exception as exc:
                     logger.exception(f"[scheduler] EOD maintenance raised: {exc}")
+                    _alert_crash("EOD maintenance", exc)
 
             _time_module.sleep(poll)
     except (KeyboardInterrupt, SystemExit):

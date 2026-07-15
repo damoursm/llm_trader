@@ -377,6 +377,12 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
     return [t for t in trades if _trade_split(t) == split]
 
 
+# The real LLM engines (a stamped synthesis/sentiment provider that is one of
+# these = an LLM ran; None/'rule-based' = no LLM). 'qwen' added 2026-07-11.
+# Single source of truth — pipeline imports this.
+_LLM_ENGINES = ("anthropic", "deepseek", "qwen")
+
+
 # ── Method attribution ────────────────────────────────────────────────────────
 _ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
@@ -613,6 +619,8 @@ def _synthesis_model_for_provider(provider: Optional[str]) -> Optional[str]:
         return settings.analyst_model
     if p == "deepseek":
         return "deepseek-v4-flash"
+    if p == "qwen":
+        return settings.qwen_model
     if p == "rule-based":
         return "rule-based (no LLM)"
     return None
@@ -678,9 +686,19 @@ def _match_direction(t: dict, direction: Optional[str]) -> bool:
     return True
 
 
+def _match_asset_type(t: dict, asset_type: Optional[str]) -> bool:
+    """Whether trade/call ``t`` matches an instrument-type filter (None/'' = all).
+    ``asset_type`` is the lower-cased type (``stock`` | ``etf`` | ``commodity``);
+    a trade with no stored ``type`` is treated as STOCK (the record-time default)."""
+    if not asset_type:
+        return True
+    return (str(t.get("type") or "STOCK").upper() == asset_type.upper())
+
+
 def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
                          bars_memo: Optional[dict] = None,
-                         direction: Optional[str] = None) -> List[dict]:
+                         direction: Optional[str] = None,
+                         asset_type: Optional[str] = None) -> List[dict]:
     """Mark a list of directional *calls* to forward returns as pseudo-trades.
 
     Shared scoring core for the unbiased recommendation/signal streams (used by
@@ -720,6 +738,8 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
             continue
         if not _match_direction(c, direction):
             continue
+        if not _match_asset_type(c, asset_type):
+            continue
         bars = _bars(c["ticker"])
         if bars is None:
             continue
@@ -745,10 +765,12 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
                 entry_price = prior[-1] if prior and prior[-1] > 0 else None
         if entry_price is None:
             continue
-        # End anchor: latest cached close (skip when no bar exists at/after entry yet).
+        # End anchor: latest cached close (skip when no bar exists at/after entry
+        # yet). `not > 0` also rejects a NaN close (NaN comparisons are False) —
+        # one NaN return would otherwise poison the whole stream's avg_return.
         last_close = float(bars["Close"].iloc[-1])
         last_date = bars.index[-1].date().isoformat()
-        if last_close <= 0 or last_date < c["entry_date"]:
+        if not last_close > 0 or last_date < c["entry_date"]:
             continue
         ctype = c.get("type") or "STOCK"
         t = {
@@ -780,7 +802,8 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
 
 def _compute_llm_perf(window_days: Optional[int] = None,
                       session: Optional[str] = None,
-                      direction: Optional[str] = None) -> dict:
+                      direction: Optional[str] = None,
+                      asset_type: Optional[str] = None) -> dict:
     """Per-LLM engine stats over EVERY recommended trade, executed or not.
 
     The real ledger only holds recommendations that survived the actionable +
@@ -842,7 +865,8 @@ def _compute_llm_perf(window_days: Optional[int] = None,
             "llm_sentiment_model": sent,
         }
 
-    pseudo = _build_pseudo_trades(list(deduped.values()), session, direction=direction)
+    pseudo = _build_pseudo_trades(list(deduped.values()), session, direction=direction,
+                                  asset_type=asset_type)
 
     groups: Dict[str, Dict[str, List[dict]]] = {"synthesis": {}, "sentiment": {}}
     for t in pseudo:
@@ -874,7 +898,9 @@ _MACRO_HEADLINE_ORDER = ("synthesis", "aggregator")
 
 def compute_macro_eval(window_days: Optional[int] = None,
                        session: Optional[str] = None,
-                       direction: Optional[str] = None) -> List[dict]:
+                       direction: Optional[str] = None,
+                       bars_memo: Optional[Dict[str, object]] = None,
+                       asset_type: Optional[str] = None) -> List[dict]:
     """Performance rows for the dashboard's Macro Evaluation table — the
     aggregated decision layers, each scored on its OWN full stream of directional
     calls via the same pseudo-trade model as ``_compute_llm_perf``.
@@ -890,11 +916,13 @@ def compute_macro_eval(window_days: Optional[int] = None,
         ``signals`` per-method columns, when |Σ| ≥ ``_BUNDLE_VIEW_FLOOR``.
     """
     cutoff = (date.today() - timedelta(days=window_days)).isoformat() if window_days is not None else None
-    bars_memo: Dict[str, object] = {}     # shared across every stream's NAV anchors
+    if bars_memo is None:
+        bars_memo = {}                    # shared across every stream's NAV anchors
     rows: List[dict] = []
 
     def _emit(label: str, group: str, calls: List[dict]) -> None:
-        st = _compute_segment_stats(_build_pseudo_trades(calls, session, bars_memo, direction))
+        st = _compute_segment_stats(_build_pseudo_trades(calls, session, bars_memo,
+                                                         direction, asset_type))
         if st:
             rows.append({"label": label, "group": group, **st})
 
@@ -964,6 +992,188 @@ def compute_macro_eval(window_days: Optional[int] = None,
     bundles = sorted((r for r in rows if r["group"] == "bundle"),
                      key=lambda x: -(x.get("win_rate") or 0))
     return head + bundles
+
+
+# ── Decision-funnel stage evaluation ─────────────────────────────────────────
+# Walks every deduped BUY/SELL recommendation through the SAME four gates the
+# pipeline applied (regime confidence threshold → PANIC/RISK_OFF BUY-block →
+# earnings blackout → tradeable-liquidity floor) and scores each stage's
+# surviving stream — plus each gate's DROPPED stream — as pseudo-trades, so
+# every stage of the decision pipeline is evaluated on the same basis:
+#   stage row improves on the previous one  ⇒ the gate filtered losers (helps);
+#   a gate's dropped row OUTPERFORMS its survivors ⇒ the gate discards winners.
+#
+# Gate outcomes per rec are reconstructed exactly for history:
+#   • Gate 1 — recommendations.confidence vs the run's persisted
+#     confidence_threshold (runs column, session/regime bump already baked in);
+#   • Gate 2 — runs.allow_buys (SELLs always pass);
+#   • Gate 4 survivors — recommendations.actionable is stamped by the pipeline
+#     as exactly "survived all four gates" (pre-sizing);
+#   • Gate 3 vs 4 attribution of the remaining drops — the run's
+#     gate_diag.gate_outcomes per-ticker stamp when present (written from
+#     2026-07-11 on), else the run's dropped_earnings_blackout /
+#     dropped_untradeable counters (no historical run has both non-zero, so the
+#     count attribution is exact; if both ever fire in one legacy run the
+#     leftovers default to the blackout label — pipeline gate order).
+
+_STAGE_OUTCOME_PASS = "pass"
+_STAGE_OUTCOME_G1 = "below_threshold"
+_STAGE_OUTCOME_G2 = "buy_blocked"
+_STAGE_OUTCOME_G3 = "earnings_blackout"
+_STAGE_OUTCOME_G4 = "untradeable"
+
+_STAGE_EMPTY_STATS = {"trades": 0, "win_rate": None, "compound_return": None,
+                      "avg_return": None, "wtd_avg_return": None,
+                      "best": None, "worst": None}
+
+
+def _stage_run_context() -> Dict[str, dict]:
+    """Per-run gate context: {run_id: {threshold, allow_buys, outcomes, eb, ut}}.
+    ``outcomes`` is the per-ticker gate_outcomes stamp (new runs; {} on legacy),
+    ``eb``/``ut`` the run's blackout/untradeable drop counters (legacy fallback)."""
+    try:
+        rdf = repo.fetch_df(
+            "SELECT run_id, confidence_threshold, allow_buys, gate_diag FROM runs")
+    except Exception as e:
+        logger.debug(f"[tracker] stage_eval runs query failed: {e}")
+        return {}
+    out: Dict[str, dict] = {}
+    for r in rdf.itertuples(index=False):
+        thr = r.confidence_threshold
+        thr = float(thr) if thr is not None and thr == thr else 0.78
+        ab = r.allow_buys
+        ab = bool(ab) if ab is not None and ab == ab else True
+        ctx = {"threshold": thr, "allow_buys": ab, "outcomes": {}, "eb": 0, "ut": 0}
+        try:
+            gd = json.loads(r.gate_diag) if r.gate_diag else {}
+            ctx["outcomes"] = gd.get("gate_outcomes") or {}
+            ctx["eb"] = int(gd.get("dropped_earnings_blackout") or 0)
+            ctx["ut"] = int(gd.get("dropped_untradeable") or 0)
+        except Exception:
+            pass
+        out[str(r.run_id)] = ctx
+    return out
+
+
+def _classify_stage_outcome(call: dict, ctx: dict) -> str:
+    """Which gate (if any) dropped this recommendation — the per-run stamp when
+    present, else the exact reconstruction described above."""
+    stamp = ctx.get("outcomes", {}).get(call["ticker"])
+    if stamp in (_STAGE_OUTCOME_PASS, _STAGE_OUTCOME_G1, _STAGE_OUTCOME_G2,
+                 _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4):
+        return stamp
+    if call["confidence"] < ctx["threshold"]:
+        return _STAGE_OUTCOME_G1
+    if call["action"] == "BUY" and not ctx["allow_buys"]:
+        return _STAGE_OUTCOME_G2
+    if call["actionable"]:
+        return _STAGE_OUTCOME_PASS
+    # Dropped by gate 3 or 4 — attribute via the run's counters (exact while at
+    # most one of the two fired that run; blackout-first mirrors gate order).
+    if ctx["ut"] and not ctx["eb"]:
+        return _STAGE_OUTCOME_G4
+    return _STAGE_OUTCOME_G3
+
+
+def compute_stage_eval(window_days: Optional[int] = None,
+                       session: Optional[str] = None,
+                       direction: Optional[str] = None,
+                       bars_memo: Optional[Dict[str, object]] = None,
+                       asset_type: Optional[str] = None) -> List[dict]:
+    """Decision-funnel rows for the dashboard: the aggregator, the LLM synthesis
+    stream, and the four mechanical gates — each stage's survivors AND each
+    gate's drops scored as pseudo-trades (same model as ``compute_macro_eval``).
+
+    Returns ``[{label, group ('stage'|'dropped'), trades, win_rate, ...}]`` in
+    funnel order, each gate's dropped row directly under its survivor row.
+    Empty stages report a zero row (a gate that never fired stays visible).
+    """
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat() if window_days is not None else None
+    if bars_memo is None:
+        bars_memo = {}
+    rows: List[dict] = []
+
+    def _emit(label: str, group: str, calls: List[dict]) -> None:
+        st = _compute_segment_stats(_build_pseudo_trades(calls, session, bars_memo,
+                                                         direction, asset_type))
+        rows.append({"label": label, "group": group, **(st or _STAGE_EMPTY_STATS)})
+
+    # ── Aggregator stream (identical dedupe to compute_macro_eval) ────────────
+    try:
+        sdf = repo.fetch_df(
+            "SELECT generated_at, ticker, type, direction, price "
+            "FROM signals WHERE direction IN ('BULLISH', 'BEARISH') "
+            "ORDER BY generated_at")
+    except Exception as e:
+        logger.debug(f"[tracker] stage_eval signals query failed: {e}")
+        sdf = None
+    agg_ded: Dict[tuple, dict] = {}
+    if sdf is not None and not sdf.empty:
+        for r in sdf.itertuples(index=False):
+            d = str(r.generated_at or "")[:10]
+            if not d or (cutoff and d < cutoff):
+                continue
+            agg_ded[(d, r.ticker)] = {
+                "ticker": r.ticker, "type": (r.type or "STOCK"),
+                "action": "BUY" if str(r.direction).upper() == "BULLISH" else "SELL",
+                "entry_date": d, "entry_datetime": str(r.generated_at or ""),
+                "snap_price": r.price,
+            }
+    _emit("Aggregator (combined signal)", "stage", list(agg_ded.values()))
+
+    # ── LLM synthesis stream + gate classification ────────────────────────────
+    try:
+        rdf = repo.fetch_df(
+            "SELECT r.run_id, r.generated_at, r.ticker, r.type, r.action, "
+            "       r.confidence, r.actionable, s.price AS snap_price "
+            "FROM recommendations r "
+            "LEFT JOIN signals s ON s.run_id = r.run_id AND s.ticker = r.ticker "
+            "WHERE r.action IN ('BUY', 'SELL') ORDER BY r.generated_at")
+    except Exception as e:
+        logger.debug(f"[tracker] stage_eval recommendations query failed: {e}")
+        rdf = None
+    if rdf is None or rdf.empty:
+        _emit("LLM Synthesis (all BUY/SELL)", "stage", [])
+        return rows
+
+    run_ctx = _stage_run_context()
+    ded: Dict[tuple, dict] = {}          # last BUY/SELL per (day, ticker) wins
+    for rec in rdf.itertuples(index=False):
+        d = str(rec.generated_at or "")[:10]
+        if not d or (cutoff and d < cutoff):
+            continue
+        conf = rec.confidence
+        act = rec.actionable
+        ded[(d, rec.ticker)] = {
+            "ticker": rec.ticker, "type": rec.type or "STOCK", "action": rec.action,
+            "entry_date": d, "entry_datetime": str(rec.generated_at or ""),
+            "snap_price": rec.snap_price,
+            "run_id": str(rec.run_id or ""),
+            "confidence": float(conf) if conf is not None and conf == conf else 0.0,
+            "actionable": bool(act) if act is not None and act == act else False,
+        }
+
+    calls = list(ded.values())
+    for c in calls:
+        c["_outcome"] = _classify_stage_outcome(c, run_ctx.get(c["run_id"], {
+            "threshold": 0.78, "allow_buys": True, "outcomes": {}, "eb": 0, "ut": 0}))
+
+    def _sub(outcomes: set) -> List[dict]:
+        return [c for c in calls if c["_outcome"] in outcomes]
+
+    _emit("LLM Synthesis (all BUY/SELL)", "stage", calls)
+    surviving = {_STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4, _STAGE_OUTCOME_PASS}
+    _emit("→ past Gate 1 · regime confidence threshold", "stage", _sub(surviving))
+    _emit("✂ Gate 1 drops (confidence below threshold)", "dropped", _sub({_STAGE_OUTCOME_G1}))
+    surviving -= {_STAGE_OUTCOME_G2}
+    _emit("→ past Gate 2 · PANIC/RISK_OFF BUY-block", "stage", _sub(surviving))
+    _emit("✂ Gate 2 drops (BUY blocked by regime)", "dropped", _sub({_STAGE_OUTCOME_G2}))
+    surviving -= {_STAGE_OUTCOME_G3}
+    _emit("→ past Gate 3 · earnings blackout", "stage", _sub(surviving))
+    _emit("✂ Gate 3 drops (earnings blackout)", "dropped", _sub({_STAGE_OUTCOME_G3}))
+    _emit("→ past Gate 4 · liquidity floor = ACTIONABLE", "stage", _sub({_STAGE_OUTCOME_PASS}))
+    _emit("✂ Gate 4 drops (untradeable / penny-thin)", "dropped", _sub({_STAGE_OUTCOME_G4}))
+    return rows
 
 
 _ASSET_TYPE_LABELS: Dict[str, str] = {
@@ -1421,6 +1631,7 @@ def record_new_trades(
     llm_synthesis_model: Optional[str] = None,
     llm_sentiment_model: Optional[str] = None,
     universe_sources: Optional[dict] = None,
+    blind_synthesis: Optional[bool] = None,
 ) -> dict:
     """Open a new trade for each BUY/SELL recommendation not already open today.
 
@@ -1470,6 +1681,7 @@ def record_new_trades(
         "breadth_tier_applied": 0,   # informational — sized up/down on agreement breadth
         "edge_blend_applied":   0,   # informational — learned-model size adjustment
         "predictability_tilt_applied": 0,  # informational — sized on trend-predictability
+        "confidence_recal_applied": 0,     # informational — sized on the band's EMPIRICAL win rate
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
@@ -1496,6 +1708,15 @@ def record_new_trades(
     from src.performance.predictability_sizing import (
         calibrate_predictability, predictability_multiplier, predictability_score)
     pred_cal = calibrate_predictability() if settings.enable_predictability_sizing else None
+    # Confidence-recalibration tilt (2026-07-12) — per-band empirical win rates
+    # from the SAME pre-batch ledger (one consistent calibration per batch);
+    # inert until confidence_recal_min_trades closes accrue. See
+    # confidence_sizing.py — the evidence-driven successor to trusting the
+    # LLM's stated number (weakly calibrated, ρ≈+0.07).
+    from src.performance.confidence_sizing import (
+        calibrate_confidence_sizing, confidence_sizing_multiplier)
+    conf_recal_cal = (calibrate_confidence_sizing(trades)
+                      if settings.enable_confidence_recal_sizing else None)
 
     cooldown_h = float(settings.reentry_cooldown_hours or 0.0)
     recent_exits: Dict[tuple, datetime] = {}
@@ -1646,6 +1867,25 @@ def record_new_trades(
                 f"→ {multiplier:.2f}×"
             )
 
+        # ── Step 3d: confidence-recalibration tilt ────────────────────────
+        # Size by what the trade's stated-confidence BAND has actually earned
+        # in the ledger (shrunk win rate vs the pooled win rate) — not by the
+        # stated number itself. Follows the evidence in either direction: a
+        # high-stated band that empirically loses is sized DOWN.
+        conf_recal_mult = confidence_sizing_multiplier(rec.confidence, conf_recal_cal)
+        _band = None
+        if abs(conf_recal_mult - 1.0) >= 0.005:
+            from src.performance.confidence_sizing import _band_for
+            _band = _band_for(float(rec.confidence), conf_recal_cal or {})
+            multiplier = round(multiplier * conf_recal_mult, 3)
+            diag["confidence_recal_applied"] += 1
+            logger.info(
+                f"[tracker] {rec.ticker}: confidence recal ×{conf_recal_mult:g} "
+                f"(band {_band['label'] if _band else '?'} win {_band['p_shrunk'] if _band else '?'} "
+                f"vs pool {conf_recal_cal.get('pool_win') if conf_recal_cal else '?'}, "
+                f"n={_band['n'] if _band else 0}) → {multiplier:.2f}×"
+            )
+
         price = _fetch_price(rec.ticker)
         if price is None:
             diag["skipped_no_price"] += 1
@@ -1758,6 +1998,10 @@ def record_new_trades(
                                               if pred_score is not None else None),
             "predictability_span_eff": (pred_cal.get("span_eff")
                                         if pred_cal is not None else None),
+            # Confidence-recal tilt (audit): the band's shrunk empirical win
+            # rate that sized this trade, and the multiplier it produced.
+            "confidence_recal_multiplier": conf_recal_mult,
+            "confidence_recal_band_win": (_band.get("p_shrunk") if _band else None),
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,
@@ -1789,6 +2033,10 @@ def record_new_trades(
             # Exact LLM engines in use at entry (synthesis = final call,
             # sentiment = run-dominant per-ticker scorer) — per-LLM attribution.
             "llm_synthesis_model": llm_synthesis_model,
+            # Blind-synthesis A/B arm of the entry run (True = the aggregator's
+            # verdict was hidden from the synthesis prompt) — the entry-side
+            # analog of exit_hold_prompt, aggregated by compute_blind_synthesis_eval.
+            "entry_blind_synthesis": blind_synthesis,
             # Which discovery source first surfaced the ticker this run —
             # the per-trade half of the provenance measurement (signals rows
             # carry the same stamp), for future per-source hit-rate analysis.
@@ -1873,6 +2121,34 @@ def compute_hold_prompt_eval(trades: Optional[List[dict]] = None) -> dict:
     def _seg(flag: bool) -> Optional[dict]:
         seg = [t for t in trades
                if t.get("status") == "CLOSED" and t.get("exit_hold_prompt") is flag]
+        if not seg:
+            return None
+        rets = [float(t.get("return_pct") or 0.0) for t in seg]
+        wins = sum(1 for r in rets if r > 0)
+        return {
+            "trades": len(seg),
+            "win_rate": round(100.0 * wins / len(seg), 1),
+            "avg_return": round(sum(rets) / len(rets), 2),
+        }
+
+    return {"on": _seg(True), "off": _seg(False)}
+
+
+def compute_blind_synthesis_eval(trades: Optional[List[dict]] = None) -> dict:
+    """A/B outcome comparison for the blind-synthesis experiment (entry-side).
+
+    Every trade OPENED on a run carries that run's coin flip
+    (``entry_blind_synthesis`` True/False — True = the aggregator's verdict was
+    hidden from the synthesis prompt, so the entry direction/confidence were the
+    LLM's own). Closed-trade outcomes grouped by that stamp answer whether
+    independent LLM judgment beats echoing the aggregator (the 2026-07-12
+    agreement eval found 96% of sighted calls were echoes). Same row shape as
+    ``compute_hold_prompt_eval``; pre-experiment entries (no stamp) excluded."""
+    trades = trades if trades is not None else _load_trades()
+
+    def _seg(flag: bool) -> Optional[dict]:
+        seg = [t for t in trades
+               if t.get("status") == "CLOSED" and t.get("entry_blind_synthesis") is flag]
         if not seg:
             return None
         rets = [float(t.get("return_pct") or 0.0) for t in seg]
@@ -1973,7 +2249,7 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
         # run's non-pinned actionable set, must not close them — it serves only
         # legacy / rule-based-opened trades (no LLM engine).
         open_provider = _provider_of_synth_model(trade.get("llm_synthesis_model"))
-        if settings.enable_llm_hold_review and open_provider in ("anthropic", "deepseek"):
+        if settings.enable_llm_hold_review and open_provider in _LLM_ENGINES:
             continue
 
         # Reuse the most recent intraday mark when available; otherwise
@@ -2025,13 +2301,15 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
 
 def _provider_of_synth_model(model: Optional[str]) -> Optional[str]:
     """Inverse of ``_synthesis_model_for_provider``: a stored synthesis model id
-    → its engine ('anthropic' | 'deepseek' | 'rule-based'). ``None`` for a
+    → its engine ('anthropic' | 'deepseek' | 'qwen' | 'rule-based'). ``None`` for a
     blank/unknown value (treated as "no LLM engine" → aggregator backstop)."""
     m = (model or "").strip().lower()
     if not m:
         return None
     if "deepseek" in m:
         return "deepseek"
+    if "qwen" in m:
+        return "qwen"
     if "claude" in m or "anthropic" in m:
         return "anthropic"
     if "rule" in m:
@@ -2172,7 +2450,7 @@ def _evaluate_decay(
     #    LLM-judged too instead of being handed to the aggregator-decay backstop
     #    (30%-win historically). A present review governs for ALL trades.
     open_provider = _provider_of_synth_model(trade.get("llm_synthesis_model"))
-    opener_is_llm = open_provider in ("anthropic", "deepseek")
+    opener_is_llm = open_provider in _LLM_ENGINES
     if settings.enable_llm_hold_review and hold_review is not None:
         rev_action = getattr(hold_review, "action", None)
         conv = float(getattr(hold_review, "confidence", 0.0) or 0.0)
@@ -2310,6 +2588,7 @@ def monitor_open_positions(
     trades = _load_trades()
     today = date.today().isoformat()
     closed_count = 0
+    pending_dirty = False        # llm_exit_pending armed/cleared → must persist even with 0 closes
     decision_at = _now_iso()
     executed_at = _execution_iso()
 
@@ -2351,6 +2630,11 @@ def monitor_open_positions(
                 logger.debug(f"[exit_adj] skipped for {trade.get('ticker')}: {e}")
         reason = _evaluate_decay(trade, today_signal, macro_regime_context, hold_review,
                                  exit_conviction_adj=exit_adj)
+        # Two-tick confirmation on the NOISY LLM exits (2026-07-12): a single
+        # breaching review arms a pending marker; only a second consecutive
+        # breach closes. Non-LLM reasons pass through untouched.
+        reason, _pend_dirty = _confirm_llm_exit(trade, reason, hold_review)
+        pending_dirty = pending_dirty or _pend_dirty
         # Monitor-level exits (2026-07-08) — fire ONLY when the LLM exit logic above
         # held, so they never override a macro/flip/confidence close. (1) Trailing
         # profit-capture locks a winner before it round-trips (−58% MFE give-back);
@@ -2458,9 +2742,59 @@ def monitor_open_positions(
                 f"conf_floor={eff_floor:.2f}({floor_kind})  regime={regime}"
             )
 
-    if closed_count:
+    if closed_count or pending_dirty:
         _save_trades(trades)
     return closed_count
+
+
+# LLM exit reasons subject to the two-tick confirmation (the review-noise-driven
+# pair; mechanical/trailing/macro/horizon exits are NOT review noise).
+_LLM_EXIT_REASONS = ("llm_signal_flipped", "llm_confidence_loss")
+
+
+def _confirm_llm_exit(trade: dict, reason: Optional[str], hold_review) -> tuple:
+    """Two-tick confirmation for the noisy LLM exits (``enable_llm_exit_confirmation``).
+
+    Max-thinking reviews are non-deterministic, and ``llm_confidence_loss`` was
+    measured closing winners (~+7% @5d left on the table) — so a single breaching
+    review no longer closes. The FIRST breach arms ``llm_exit_pending`` on the
+    trade and the position holds; a breach on the NEXT review confirms and the
+    close proceeds (either LLM reason counts — two consecutive "get out"
+    judgments). A review that says hold DISARMS the marker (the earlier breach
+    was noise); a tick with NO review leaves it untouched (absence of a judge is
+    not evidence). Non-LLM reasons pass through unchanged — and still close even
+    while a marker is armed (macro/horizon/trailing rules are not review noise).
+
+    Returns ``(effective_reason, dirty)`` — ``dirty`` flags a marker mutation the
+    caller must persist even when nothing closed this tick."""
+    if not settings.enable_llm_exit_confirmation:
+        return reason, False
+    if reason in _LLM_EXIT_REASONS:
+        pending = trade.get("llm_exit_pending")
+        if pending:
+            # Second consecutive breaching review → confirmed. Keep the first
+            # breach for forensics (which reason armed it, at what conviction).
+            trade["llm_exit_confirmed_from"] = pending
+            trade.pop("llm_exit_pending", None)
+            return reason, True
+        trade["llm_exit_pending"] = {
+            "reason": reason,
+            "at": _now_iso(),
+            "review_action": getattr(hold_review, "action", None),
+            "review_confidence": getattr(hold_review, "confidence", None),
+        }
+        logger.info(
+            f"[monitor] {reason} on {trade.get('ticker')} ARMED (1st breaching review) — "
+            f"a 2nd consecutive breach closes; a holding review disarms"
+        )
+        return None, True
+    if hold_review is not None and trade.get("llm_exit_pending"):
+        # The engine re-affirmed the hold — the earlier breach was noise.
+        logger.info(f"[monitor] llm-exit pending on {trade.get('ticker')} DISARMED "
+                    f"(review holds this tick)")
+        trade.pop("llm_exit_pending", None)
+        return reason, True
+    return reason, False
 
 
 def _normalize_closed_returns(trades: List[dict]) -> int:
@@ -3213,7 +3547,8 @@ def _eval_stats(entries: list) -> dict:
 
 def compute_solo_method_performance(split: Optional[str] = None, window_days: Optional[int] = None,
                                     session: Optional[str] = None,
-                                    direction: Optional[str] = None) -> dict:
+                                    direction: Optional[str] = None,
+                                    asset_type: Optional[str] = None) -> dict:
     """Simulate performance for each signal method used in isolation, split by direction.
 
     For each closed trade with stored method_scores, each method is asked:
@@ -3247,6 +3582,8 @@ def compute_solo_method_performance(split: Optional[str] = None, window_days: Op
         closed = [t for t in closed if _session_matches(t, session)]
     if direction:
         closed = [t for t in closed if _match_direction(t, direction)]
+    if asset_type:
+        closed = [t for t in closed if _match_asset_type(t, asset_type)]
     if not closed:
         return {}
 
@@ -3594,7 +3931,8 @@ def _displayed_one_way_cost_pct(trades: List[dict], real_frac: Optional[float]) 
 
 def get_performance_for_email(window_days: Optional[int] = None,
                               session: Optional[str] = None,
-                              direction: Optional[str] = None) -> dict:
+                              direction: Optional[str] = None,
+                              asset_type: Optional[str] = None) -> dict:
     """Return structured performance data for inclusion in the email report.
 
     When ``window_days`` is set, only trades ENTERED within the last N calendar
@@ -3602,8 +3940,9 @@ def get_performance_for_email(window_days: Optional[int] = None,
     ``session`` additionally restricts to trades entered in that US-market
     session — the coarse ``rth | extended | overnight`` or the finer
     ``premarket | afterhours`` (the two halves of ``extended``); None = all
-    sessions. The dashboard's window + session toggles pass these so its
-    metrics/plots recompute to match.
+    sessions. ``asset_type`` restricts to an instrument type (``stock`` | ``etf``
+    | ``commodity``; None = all). The dashboard's window / session / direction /
+    type toggles pass these so its metrics/plots recompute to match.
     """
     trades = _load_trades()
     # Calibrate the sim cost to real IBKR fills (no-op when disabled / too few
@@ -3617,6 +3956,8 @@ def get_performance_for_email(window_days: Optional[int] = None,
         trades = [t for t in trades if _session_matches(t, session)]
     if direction:
         trades = [t for t in trades if _match_direction(t, direction)]
+    if asset_type:
+        trades = [t for t in trades if _match_asset_type(t, asset_type)]
     open_trades   = [t for t in trades if t["status"] == "OPEN"]
     closed_trades = [t for t in trades if t["status"] == "CLOSED"]
     # Open trades carry a current M2M return_pct (updated each run by update_open_trades()).
@@ -3679,9 +4020,15 @@ def get_performance_for_email(window_days: Optional[int] = None,
     performance_table    = _compute_performance_table(all_trades) if all_trades else []
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
-    solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session, direction=direction)
-    llm_perf             = _compute_llm_perf(window_days=window_days, session=session, direction=direction)
-    macro_eval           = compute_macro_eval(window_days=window_days, session=session, direction=direction)
+    solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session,
+                                                           direction=direction, asset_type=asset_type)
+    llm_perf             = _compute_llm_perf(window_days=window_days, session=session,
+                                             direction=direction, asset_type=asset_type)
+    _eval_bars_memo: Dict[str, object] = {}   # share OHLCV loads across the two eval passes
+    macro_eval           = compute_macro_eval(window_days=window_days, session=session, direction=direction,
+                                              bars_memo=_eval_bars_memo, asset_type=asset_type)
+    stage_eval           = compute_stage_eval(window_days=window_days, session=session, direction=direction,
+                                              bars_memo=_eval_bars_memo, asset_type=asset_type)
     method_eval_stats    = compute_method_eval_stats()
     oos_comparison       = compute_oos_comparison()
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)
@@ -3711,9 +4058,11 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "solo_method_perf":         solo_method_perf,          # hypothetical per-method solo simulation
         "llm_perf":                 llm_perf,                  # actual trades grouped by LLM engine (synthesis / sentiment)
         "macro_eval":               macro_eval,                # aggregated decision layers (synthesis vs aggregator vs bundles)
+        "stage_eval":               stage_eval,                # decision funnel: aggregator → synthesis → gates 1-4 (survivors + drops)
         "sim_one_way_cost_pct":     _displayed_one_way_cost_pct(all_trades, real_cost_frac),  # per-leg 1-way cost shown in Returns
         "sim_cost_is_real":         real_cost_frac is not None,   # True = calibrated to real IBKR fills, False = modeled
         "hold_prompt_eval":         compute_hold_prompt_eval(trades),  # held-positions prompt A/B (exit outcomes ON vs OFF)
+        "blind_synthesis_eval":     compute_blind_synthesis_eval(trades),  # blind-synthesis A/B (entry outcomes ON vs OFF)
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
         "oos_comparison":           oos_comparison,            # train vs holdout accuracy (honest OOS)
         "method_labels":            METHOD_LABELS,

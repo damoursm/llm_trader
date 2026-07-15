@@ -32,18 +32,29 @@ Write-Host "Stopping..." -ForegroundColor Cyan
 foreach ($t in $Tasks) { Stop-ScheduledTask -TaskName $t }
 
 # 2. Wait for the underlying processes to actually exit; force-kill any straggler
-#    (covers ad-hoc-launched duplicates Task Scheduler isn't tracking).
+#    (covers ad-hoc-launched duplicates Task Scheduler isn't tracking). The match
+#    MUST include --supervise: a surviving supervisor (e.g. an orphan from an
+#    earlier logon that Stop-ScheduledTask didn't track) RESPAWNS its --schedule
+#    child, so leaving it out spawns a duplicate scheduler (observed 2026-07-13:
+#    the old supervisor outlived the restart and ran a second stack concurrently).
+$traderProc = { $_.CommandLine -match 'main\.py --(dashboard|schedule|supervise)' }
 $deadline = (Get-Date).AddSeconds(20)
 $left = $null
 do {
-    $left = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-            Where-Object { $_.CommandLine -match 'main\.py --(dashboard|schedule)' }
+    $left = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object $traderProc
     if (-not $left) { break }
     Start-Sleep -Seconds 1
 } while ((Get-Date) -lt $deadline)
 if ($left) {
     Write-Host "Force-killing straggler(s): $($left.ProcessId -join ', ')" -ForegroundColor Yellow
-    $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # SUPERVISORS FIRST so none can respawn a --schedule child during cleanup;
+    # pause, then RE-SCAN and kill everything remaining (incl. a child a dying
+    # supervisor respawned in the gap — the snapshot above can be stale).
+    $left | Where-Object { $_.CommandLine -match 'main\.py --supervise' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object $traderProc |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 # 3. Start both tasks.
@@ -66,7 +77,6 @@ if ($listening) {
 }
 
 Get-ScheduledTask -TaskName $Tasks | Select-Object TaskName, State | Format-Table -AutoSize
-Write-Host "Live processes:"
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -match 'main\.py --(dashboard|schedule)' } |
-    Select-Object ProcessId, CommandLine | Format-Table -AutoSize
+Write-Host "Live processes (expect exactly ONE each of --dashboard / --supervise / --schedule):"
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object $traderProc |
+    Select-Object ProcessId, CommandLine | Format-Table -AutoSize -Wrap

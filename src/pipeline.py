@@ -74,7 +74,7 @@ from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_prov
 from src.analysis.data_quality import EXPECTED_SPARSE_SOURCES, KNOWN_DEAD_SOURCES, is_context_populated
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -231,8 +231,11 @@ def _safe(label: str, fn, *args, **kwargs):
     try:
         result = fn(*args, **kwargs)
     except Exception as e:
-        ok, err = False, str(e)
-        logger.warning(f"[{label}] fetch failed: {e}")
+        # str(e) is '' for a bare TimeoutError etc. — fall back to the class name
+        # so the source-health email shows a reason, not a blank (same blank-error
+        # class fixed in ibkr._exc_text).
+        ok, err = False, (str(e) or type(e).__name__)
+        logger.warning(f"[{label}] fetch failed: {err}")
     finally:
         size = _result_size(result) if ok else None
         empty = bool(ok and size == 0)
@@ -446,7 +449,8 @@ def _assess_llm_health() -> dict:
     # (every per-ticker call recorded the "none" provider). No attempts at all
     # (sent_summary is None — e.g. no tickers had news) is not a degradation.
     sentiment_attempted = sent_summary is not None
-    sentiment_ok        = bool(sent_summary) and ("deepseek" in sent_summary or "anthropic" in sent_summary)
+    sentiment_ok        = bool(sent_summary) and any(
+        e in sent_summary for e in _LLM_ENGINES)
     sentiment_down      = sentiment_attempted and not sentiment_ok
 
     parts = []
@@ -465,6 +469,12 @@ def _assess_llm_health() -> dict:
     }
 
 
+# Drift actions that are self-resolving off-RTH convergence, not a failure —
+# see _assess_broker_health. Kept as a set so reconcile.py and here can't drift
+# apart on the label spelling.
+_PENDING_DRIFT_ACTIONS = {"flatten_pending_open", "flatten_pending_fill"}
+
+
 def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
     """Turn a broker reconcile report into a health verdict for the CRITICAL log
     and the email banner. Returns None when broker_mode=off / no report."""
@@ -473,14 +483,26 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
     problems = []
     if not report.get("connected"):
         problems.append("broker NOT connected — orders were not placed")
+    if report.get("broker_timeouts"):
+        # Not real IBKR rejects — the gateway did not respond (alive-but-wedged:
+        # socket open, API dead). Actionable wording so the operator restarts the
+        # gateway / checks IBC instead of hunting for a bad order.
+        problems.append(
+            f"broker NOT RESPONDING — {report['broker_timeouts']} request(s) timed out "
+            f"(IB Gateway likely wedged; restart it / check IBC auto-restart)"
+        )
     if report.get("rejects"):
         problems.append(f"{report['rejects']} order(s) rejected")
     if report.get("drift"):
-        # Overnight positions whose flatten the overnight venue won't accept are
-        # PENDING until the pre-market open (self-resolving), NOT a failure —
-        # exclude them so they don't force a CRITICAL/email every overnight tick
-        # (they stay visible in the drift list + broker order log + dashboard).
-        hard = [d for d in report["drift"] if d.get("action") != "flatten_pending_open"]
+        # Off-RTH positions still converging to the ledger are PENDING, NOT a
+        # failure — exclude them so they don't force a CRITICAL/email every
+        # off-RTH tick (they stay visible in the drift list + broker order log +
+        # dashboard). Two flavours: the overnight venue rejects the flatten
+        # outright ('flatten_pending_open', self-resolves at the pre-market
+        # open), or it's accepted and just working a thin off-RTH book
+        # ('flatten_pending_fill', e.g. PRCH 2026-07-10 — 6 pre-market ticks
+        # before a clean fill). RTH drift always stays hard.
+        hard = [d for d in report["drift"] if d.get("action") not in _PENDING_DRIFT_ACTIONS]
         if hard:
             names = ", ".join(d["ticker"] for d in hard[:6])
             flattened = report.get("drift_flattened", 0)
@@ -501,6 +523,10 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
         "exits":          report.get("exits_submitted", 0),
         "fills_repaired": report.get("fills_repaired", 0),
         "rejects":        report.get("rejects", 0),
+        "broker_timeouts": report.get("broker_timeouts", 0),   # gateway-unresponsive submits
+        # Benign: overnight-venue refusals resubmitted at the pre-market open
+        # (visible here, never a problem — see reconcile._tally_submit_failure).
+        "overnight_deferred": report.get("overnight_deferred", 0),
         # Reliability observability: transient submit retries this tick and
         # stale resting orders cancelled + re-anchored. Neither is a failure
         # by itself (the mechanism worked) — they appear in the healthy line
@@ -510,12 +536,18 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
         "entry_cancels_on_close": report.get("entry_cancels_on_close", 0),
         "drift_flattened": report.get("drift_flattened", 0),
         "drift":          report.get("drift", []),
-        # Benign: overnight positions awaiting flatten at the pre-market open —
-        # surfaced (not a problem, so no alert).
+        # Benign: off-RTH positions still converging to the ledger — surfaced
+        # (not a problem, so no alert).
         "drift_pending":  [d["ticker"] for d in report.get("drift", [])
-                           if d.get("action") == "flatten_pending_open"],
+                           if d.get("action") in _PENDING_DRIFT_ACTIONS],
         "slippage":       report.get("slippage", []),
         "message":        "; ".join(problems),
+        # The EXACT per-order failure reasons (e.g. "exit NET: Cancelled: Error
+        # 10329 … directly routed to OVERNIGHT … Precautionary Settings") — order-
+        # preserving dedupe. The concise `message` above is the count summary; this
+        # is what the operator actually needs to diagnose, surfaced in the email
+        # banner + the CRITICAL log so no one has to open the broker order log.
+        "errors":         list(dict.fromkeys(report.get("errors", []))),
     }
 
 
@@ -651,14 +683,23 @@ def _hold_review_groups(open_trades, run_sent=None, run_synth=None):
 
     groups: dict = defaultdict(list)
     legacy: list = []
-    run_is_llm = run_sent in ("anthropic", "deepseek") and run_synth in ("anthropic", "deepseek")
+    run_is_llm = run_sent in _LLM_ENGINES and run_synth in _LLM_ENGINES
+    # Group each LLM-opened position by the (sentiment, synthesis) engines that
+    # OPENED it, so the hold-review re-judges with the same engines (Fix #2). The
+    # legacy Qwen-primary override collapsed every opener into one ("qwen","qwen")
+    # review pass (all LLM calls on Qwen); under llm_primary_provider=="deepseek"
+    # (2026-07-13) it's off, restoring the per-opener same-engine invariant that the
+    # 50/50 DeepSeek/Qwen synthesis split needs. Re-arms only if provider→"qwen".
+    qwen_primary = settings.llm_primary_provider == "qwen"
     for t in open_trades:
         se = _provider_of_synth_model(t.get("llm_sentiment_model"))
         sy = _provider_of_synth_model(t.get("llm_synthesis_model"))
-        if se in ("anthropic", "deepseek") and sy in ("anthropic", "deepseek"):
-            groups[(se, sy)].append(t["ticker"])          # opener-pinned (Fix #2)
+        if se in _LLM_ENGINES and sy in _LLM_ENGINES:
+            key = ("qwen", "qwen") if qwen_primary else (se, sy)
+            groups[key].append(t["ticker"])               # opener-pinned (Fix #2)
         elif run_is_llm:
-            groups[(run_sent, run_synth)].append(t["ticker"])
+            key = ("qwen", "qwen") if qwen_primary else (run_sent, run_synth)
+            groups[key].append(t["ticker"])
         elif run_sent is None and run_synth is None:
             legacy.append(t["ticker"])                    # engines resolve later (branch)
     return dict(groups), legacy
@@ -746,7 +787,9 @@ def _run_hold_reviews(groups, legacy_tickers, sectors, build_kwargs, session,
         # Pinned engine unavailable → the OTHER provider re-judges rather than
         # leaving the position with no exit gate this tick.
         if not out and settings.hold_review_engine_fallback:
-            other = "deepseek" if sy == "anthropic" else "anthropic"
+            # DeepSeek is the resilient cross-engine fallback for both qwen and
+            # anthropic pins; a deepseek pin falls back to anthropic.
+            other = "anthropic" if sy == "deepseek" else "deepseek"
             try:
                 out = _attempt(other)
             except Exception as e:
@@ -778,7 +821,7 @@ def _run_hold_reviews(groups, legacy_tickers, sectors, build_kwargs, session,
     # (the aggregator backstop still governs them), exactly as before.
     if legacy_tickers:
         engines = run_engines_wait()
-        if engines and all(e in ("anthropic", "deepseek") for e in engines):
+        if engines and all(e in _LLM_ENGINES for e in engines):
             reviews.update(_review((tuple(engines), sorted(set(legacy_tickers)))))
         elif engines is None:
             logger.warning(
@@ -912,7 +955,7 @@ def _persist_trade_reviews(run_id, hold_reviews, open_trades):
         synth_stamp = t.get("llm_synthesis_model")
         opener_prov = _provider_of_synth_model(synth_stamp)
         reviewer = review_engines.get(ticker)
-        if reviewer and opener_prov in ("anthropic", "deepseek") and reviewer != opener_prov:
+        if reviewer and opener_prov in _LLM_ENGINES and reviewer != opener_prov:
             synth_stamp = f"{reviewer} (fallback)"
         rows.append({
             "run_id": run_id,
@@ -1928,11 +1971,22 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # complete (incl. the Step-4.5 catalyst timing block), identical to what
         # the main synthesis below receives — so the reviews run concurrently
         # with Step 5 on the same context the run's entries are judged on.
+        # NOTE blind_synthesis is deliberately NOT in synth_kwargs: reviews are
+        # never blinded (stable exit governance — only ENTRY judgment is A/B'd).
         hold_review_branch.supply_synth_kwargs(synth_kwargs)
+    # Blind-synthesis A/B (2026-07-12): a per-run coin flip hides the aggregator's
+    # verdict from the MAIN synthesis so the LLM's independent judgment becomes
+    # measurable (the agreement eval found 96% of sighted calls just echo the
+    # aggregator). Stamped into gate_diag + entry_blind_synthesis on new trades →
+    # the dashboard's "Entry eval · blind-synthesis ON/OFF" rows.
+    blind_synthesis = random.random() < float(settings.blind_synthesis_share)
+    logger.info(f"[blind_synth] {'BLIND' if blind_synthesis else 'SIGHTED'} this run "
+                f"(share={settings.blind_synthesis_share:g})")
     recommendations = generate_recommendations(
         signals,
         open_positions=open_position_summaries if hold_prompt_active else None,
         session=run_session,
+        blind_synthesis=blind_synthesis,
         **synth_kwargs,
     )
 
@@ -2059,11 +2113,19 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                                           "total":     getattr(market_mode_context, "inputs_total", 0)},
         "hold_prompt_active":           hold_prompt_active,
         "hold_prompt_n_positions":      len(open_position_summaries),
+        # Blind-synthesis A/B arm this run (entry-side prompt experiment).
+        "blind_synthesis":              blind_synthesis,
     }
 
     # Fresh cold-fetch allowance for the trade gate (actionable tickers are almost
     # always already cached from scoring, so this rarely fetches).
     _trade_gate_budget = {"n": max(0, int(settings.discovery_gate_max_fetch))}
+    # Per-ticker gate outcome, persisted in gate_diag so the dashboard's
+    # decision-funnel evaluation (tracker.compute_stage_eval) attributes each
+    # drop to its exact gate — the run-level counters alone can't split gate 3
+    # vs 4 when both fire in one run. Recs are deduped per ticker upstream, so
+    # one outcome per ticker per run.
+    _gate_outcomes: dict = {}
     actionable: List = []
     for r in recommendations:
         if r.action not in ("BUY", "SELL"):
@@ -2072,14 +2134,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # Gate 1 — regime-tightened confidence threshold
         if r.confidence < _confidence_threshold:
             gate_diag["dropped_below_threshold"] += 1
+            _gate_outcomes[r.ticker] = "below_threshold"
             continue
         # Gate 2 — BUY block (PANIC / RISK_OFF)
         if r.action == "BUY" and not _allow_buys:
             gate_diag["dropped_buy_blocked"] += 1
+            _gate_outcomes[r.ticker] = "buy_blocked"
             continue
         # Gate 3 — earnings blackout window
         if r.ticker in earnings_blackout:
             gate_diag["dropped_earnings_blackout"] += 1
+            _gate_outcomes[r.ticker] = "earnings_blackout"
             continue
         # Gate 4 — tradeable liquidity floor: penny / thin names (< trade_min_price
         # or < trade_min_dollar_volume 20d ADV) are OBSERVE-ONLY — still scored +
@@ -2088,9 +2153,12 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # is_liquid; discovery admits them at the LOWER observation floor.
         if not _is_tradeable(r.ticker, _trade_gate_budget):
             gate_diag["dropped_untradeable"] += 1
+            _gate_outcomes[r.ticker] = "untradeable"
             continue
         actionable.append(r)
         gate_diag["actionable_survivors"] += 1
+        _gate_outcomes[r.ticker] = "pass"
+    gate_diag["gate_outcomes"] = _gate_outcomes
 
     if gate_diag["dropped_earnings_blackout"]:
         logger.warning(
@@ -2165,6 +2233,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             llm_synthesis_model=_synth_model,
             llm_sentiment_model=_sent_model,   # snapshotted before the hold-reviews
             universe_sources=universe_source,
+            blind_synthesis=blind_synthesis,   # A/B arm stamp (entry_blind_synthesis)
         ) or {}
 
         # Broker shadow execution (paper-first): once the internal ledger is final for
@@ -2307,8 +2376,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # the same way — CRITICAL log here, email banner + subject tag below.
     broker_health = _assess_broker_health(broker_report)
     if broker_health and broker_health["down"]:
+        # Append the exact per-order reasons so the log line is self-contained
+        # (the concise message is only the count summary).
+        _berrs = broker_health.get("errors") or []
+        _bdetail = ("  ::  " + "  |  ".join(_berrs[:8])
+                    + (f"  (+{len(_berrs) - 8} more)" if len(_berrs) > 8 else "")) if _berrs else ""
         logger.critical(
-            f"[broker] EXECUTION ISSUE ({broker_health['mode']}) — {broker_health['message']}."
+            f"[broker] EXECUTION ISSUE ({broker_health['mode']}) — {broker_health['message']}.{_bdetail}"
         )
 
     _print_summary(actionable, smart_money or [])

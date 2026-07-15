@@ -237,6 +237,14 @@ _METHOD_HEADER_TIPS = {
     "Avg return %": "Average % return across those trades.",
 }
 
+# Decision-funnel table — header explanations (pipeline stage evaluation).
+_STAGE_HEADER_TIPS = {
+    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each of the four actionable gates. '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners.",
+    "Trades": "Directional calls in that stage's stream, deduped to the last call per ticker per day. The shrink from row to row is each gate's real selectivity.",
+    "Win rate %": "Share of the stage's calls currently positive, scored as pseudo-trades: snapshot price at call time → latest cached close, through the real cost model — every call counts, not just the ones that became ledger trades.",
+    "Avg return %": "Average forward % return across the stage's calls on the same pseudo-trade basis. A gate earns its place when this rises from the pre-gate row to the post-gate row.",
+}
+
 # Macro Performance table — header explanations (aggregated decision layers).
 _MACRO_HEADER_TIPS = {
     "Layer": "The aggregated decision layer being judged: 'LLM Synthesis' = the final BUY/SELL caller (all engines combined; the per-engine split is in the Model Evaluation table below), 'Aggregator' = the mechanical combined signal (the weighted blend of all method scores), or 'Bundle · X' = one method family (e.g. Technical, Options) voting by the sign of its summed scores. Each layer is scored on its OWN full stream of directional calls.",
@@ -253,12 +261,13 @@ _MACRO_HEADER_TIPS = {
 #   sentiment DeepSeek → sentiment.DEEPSEEK_MODEL                ("deepseek-v4-flash")
 #   sentiment Claude   → sentiment.HAIKU_MODEL                   ("claude-haiku-4-5-20251001")
 _PROVIDER_LABEL = {
-    "anthropic": "Anthropic (Claude)", "deepseek": "DeepSeek",
+    "anthropic": "Anthropic (Claude)", "deepseek": "DeepSeek", "qwen": "Qwen",
     "rule-based": "Rule-based", "none": "—", "": "—",
 }
 _SENTIMENT_MODEL = {
     "deepseek": "deepseek-v4-flash",
     "anthropic": "claude-haiku-4-5-20251001",
+    "qwen": settings.qwen_model,
     "none": "(none — cached / no LLM call)",
 }
 
@@ -270,6 +279,8 @@ def _synthesis_model(provider) -> str:
         return settings.analyst_model           # the configured Claude model
     if p == "deepseek":
         return "deepseek-v4-flash"               # DeepSeek V4-Flash analyst fallback
+    if p == "qwen":
+        return settings.qwen_model                # Qwen3.7-Max — 2026-07-11 primary
     if p == "rule-based":
         return "rule-based (no LLM)"
     return "—"
@@ -615,6 +626,42 @@ def _direction_toggle(component_id: str) -> html.Div:
 
 def _direction_value(value):
     """RadioItems value → 'long' | 'short', or None for both."""
+    return None if value in (None, "all") else value
+
+
+# ── Asset-type toggle (stocks / ETFs / commodities) ──────────────────────────
+_ASSET_OPTIONS = [
+    {"label": "All types", "value": "all"},
+    {"label": "Stocks", "value": "stock"},
+    {"label": "ETFs", "value": "etf"},
+    {"label": "Commodities", "value": "commodity"},
+]
+
+
+def _asset_toggle(component_id: str) -> html.Div:
+    """Instrument-type selector (Stocks / ETFs / Commodities / all). Filters the
+    tab's metrics and plots to trades whose instrument ``type`` matches (the same
+    STOCK / ETF / COMMODITY label stored at entry)."""
+    return html.Div(
+        [
+            html.Label("Type:  ",
+                       title="Filter to a single instrument type: individual Stocks, ETFs "
+                             "(sector / factor / index funds), or Commodities (metals, energy, "
+                             "agriculture ETFs). 'All types' = every instrument.",
+                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
+            dcc.RadioItems(
+                id=component_id, options=_ASSET_OPTIONS, value="all", inline=True,
+                persistence=True, persistence_type="session",
+                inputStyle={"marginLeft": 14, "marginRight": 4},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+    )
+
+
+def _asset_value(value):
+    """RadioItems value → 'stock' | 'etf' | 'commodity', or None for all types."""
     return None if value in (None, "all") else value
 
 
@@ -1302,6 +1349,7 @@ def _methods_tab():
         _window_toggle("methods-window"),
         _session_toggle("methods-session"),
         _direction_toggle("methods-direction"),
+        _asset_toggle("methods-asset"),
         _method_source_toggle("methods-source"),
         _sim_column_filters(),
         dcc.Loading(html.Div(id="methods-body")),
@@ -1318,20 +1366,24 @@ def _methods_tab():
 
 @app.callback(Output("methods-body", "children"),
               Input("methods-window", "value"), Input("methods-session", "value"),
-              Input("methods-direction", "value"), Input("methods-source", "value"),
+              Input("methods-direction", "value"), Input("methods-asset", "value"),
+              Input("methods-source", "value"),
               Input("sim-horizons", "value"), Input("sim-metrics", "value"))
-def _methods_body(window_value, session_value, direction_value, source_value,
+def _methods_body(window_value, session_value, direction_value, asset_value, source_value,
                   sim_horizons, sim_metrics):
     if source_value == "panel":
         # All scored tickers — honors the window (by signal date), the session
         # the signal was GENERATED in, the direction of the method's own call
         # (positive score = its long call), and the Horizons/Metrics pickers.
+        # (The unbiased signal panel has no instrument-type column, so the Type
+        # filter applies only to the ledger-based view below.)
         return _safe(lambda: _simulated_perf_section(_window_days(window_value),
                                                      _session_value(session_value),
                                                      _direction_value(direction_value),
                                                      sim_horizons, sim_metrics))
     return _safe(lambda: _methods_perf_section(_window_days(window_value), _session_value(session_value),
-                                               _direction_value(direction_value)))
+                                               _direction_value(direction_value),
+                                               _asset_value(asset_value)))
 
 
 def _calibration_block(window_days, session, direction=None):
@@ -1368,8 +1420,9 @@ def _calibration_block(window_days, session, direction=None):
     ])
 
 
-def _methods_perf_section(window_days, session=None, direction=None):
-    perf = data.performance(window_days=window_days, session=session, direction=direction)
+def _methods_perf_section(window_days, session=None, direction=None, asset_type=None):
+    perf = data.performance(window_days=window_days, session=session, direction=direction,
+                            asset_type=asset_type)
     solo = perf.get("solo_method_perf") or {}
     labels = perf.get("method_labels") or {}
     order = perf.get("method_order_by_winrate") or list(solo.keys())
@@ -1418,6 +1471,21 @@ def _methods_perf_section(window_days, session=None, direction=None):
                 "Avg return %": st.get("avg_return"),
             })
 
+    # Blind-synthesis A/B — entry outcomes grouped by whether the entry run hid
+    # the aggregator's verdict from the synthesis prompt (ON = the LLM's own
+    # independent judgment; OFF = the legacy echo-prone sighted prompt).
+    bs = perf.get("blind_synthesis_eval") or {}
+    for key, label in (("on", "Entry eval · blind-synthesis ON"),
+                       ("off", "Entry eval · blind-synthesis OFF")):
+        st = bs.get(key)
+        if st and st.get("trades"):
+            rows.append({
+                "Method": label,
+                "Win rate %": st.get("win_rate"),
+                "Trades": st.get("trades"),
+                "Avg return %": st.get("avg_return"),
+            })
+
     table = dash_table.DataTable(
         data=rows,
         columns=[{"name": c, "id": c} for c in ["Method", "Win rate %", "Trades", "Avg return %"]],
@@ -1425,6 +1493,7 @@ def _methods_perf_section(window_days, session=None, direction=None):
         style_data_conditional=[
             {"if": {"filter_query": '{Method} contains "LLM"'}, "backgroundColor": "#eef2ff"},
             {"if": {"filter_query": '{Method} contains "hold-prompt"'}, "backgroundColor": "#fdf4ff"},
+            {"if": {"filter_query": '{Method} contains "blind-synthesis"'}, "backgroundColor": "#fefce8"},
         ],
         **_TABLE_KW,
     ) if rows else html.Div("No per-method stats in this window yet.", style={"color": "#6b7280"})
@@ -1452,6 +1521,30 @@ def _methods_perf_section(window_days, session=None, direction=None):
         **_TABLE_KW,
     ) if macro_rows else html.Div("No macro-layer stats in this window yet.", style={"color": "#6b7280"})
 
+    # ── Decision funnel — per-stage evaluation (aggregator → synthesis → the
+    # four actionable gates), each stage's survivors AND each gate's drops
+    # scored on the same pseudo-trade basis so every step's marginal value
+    # (filtered losers vs discarded winners) is directly visible.
+    stage_rows = [
+        {
+            "Stage": r["label"],
+            "Trades": r.get("trades"),
+            "Win rate %": round(r["win_rate"], 1) if r.get("win_rate") is not None else None,
+            "Avg return %": round(r["avg_return"], 2) if r.get("avg_return") is not None else None,
+        }
+        for r in (perf.get("stage_eval") or [])
+    ]
+    stage_table = dash_table.DataTable(
+        data=stage_rows,
+        columns=[{"name": c, "id": c} for c in ["Stage", "Trades", "Win rate %", "Avg return %"]],
+        tooltip_header=_STAGE_HEADER_TIPS,
+        style_data_conditional=[
+            {"if": {"filter_query": '{Stage} contains "✂"'}, "backgroundColor": "#fef2f2"},
+            {"if": {"filter_query": '{Stage} contains "ACTIONABLE"'}, "backgroundColor": "#ecfdf5"},
+        ],
+        **_TABLE_KW,
+    ) if stage_rows else html.Div("No stage-funnel stats in this window yet.", style={"color": "#6b7280"})
+
     return html.Div([
         dcc.Graph(figure=figures.method_winrate_fig(perf)),
         _h3("Return vs entry confidence",
@@ -1471,6 +1564,18 @@ def _methods_perf_section(window_days, session=None, direction=None):
             "direct test of whether the LLM's confidence or the aggregator's confidence is the more reliable predictor. "
             "Respects the window + session toggles above."),
         macro_table,
+        _h3("Decision funnel — per-stage performance (aggregator → LLM → gates 1-4)",
+            "Every step of the decision pipeline evaluated on the SAME pseudo-trade basis: the mechanical "
+            "aggregator's directional calls, the LLM synthesis stream, then the four actionable gates in "
+            "execution order — Gate 1 regime confidence threshold, Gate 2 PANIC/RISK_OFF BUY-block, Gate 3 "
+            "earnings blackout, Gate 4 tradeable-liquidity floor. Each '→ past Gate k' row is the surviving "
+            "stream after that gate; the '✂' row under it is exactly what the gate discarded (gate outcomes "
+            "are reconstructed exactly from each run's persisted threshold/allow_buys/actionable flags, plus "
+            "the per-ticker gate_outcomes stamp on new runs). Read each gate by comparing its two rows: "
+            "drops worse than survivors = the gate filters losers; drops better = it discards winners. "
+            "The final green row is the actionable set the sizing layer actually received. "
+            "Respects the window + session toggles above."),
+        stage_table,
         _h3("Model evaluation — signal methods (solo simulation) & LLM engines",
             "Method rows: how each signal method would have performed deciding alone (each closed trade re-simulated as if only that method set the direction). "
             "Highlighted LLM rows: every BUY/SELL the engine recommended — executed or simulated — entered at the recommendation-time price, marked at the latest close, "
@@ -1981,17 +2086,20 @@ def _returns_tab():
         _window_toggle("returns-window"),
         _session_toggle("returns-session"),
         _direction_toggle("returns-direction"),
+        _asset_toggle("returns-asset"),
         dcc.Loading(html.Div(id="returns-body")),
     ])
 
 
 @app.callback(Output("returns-body", "children"),
               Input("returns-window", "value"), Input("returns-session", "value"),
-              Input("returns-direction", "value"), Input("returns-source", "value"))
-def _returns_body(window_value, session_value, direction_value, source_value):
+              Input("returns-direction", "value"), Input("returns-asset", "value"),
+              Input("returns-source", "value"))
+def _returns_body(window_value, session_value, direction_value, asset_value, source_value):
     if (source_value or "sim") == "broker":
-        return _safe(lambda: _broker_returns_section(window_value, session_value, direction_value))
-    return _safe(lambda: _returns_section(window_value, session_value, direction_value))
+        return _safe(lambda: _broker_returns_section(window_value, session_value, direction_value,
+                                                     asset_value))
+    return _safe(lambda: _returns_section(window_value, session_value, direction_value, asset_value))
 
 
 @app.callback(Output("returns-review-plot", "children"),
@@ -2018,7 +2126,8 @@ def _returns_review_plot(open_cell, closed_cell):
     return _safe(lambda: _review_timeline_section(ticker))
 
 
-def _broker_returns_section(window_value, session_value=None, direction_value=None):
+def _broker_returns_section(window_value, session_value=None, direction_value=None,
+                            asset_value=None):
     """The IBKR view: what actually executed, at actual prices and commissions.
     Dollar P&L leads — real fills have real notionals, so percentages alone
     hide sizing. No modeled costs anywhere in this view."""
@@ -2038,6 +2147,9 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
     if dirn:
         want = "BUY" if dirn == "long" else "SELL"
         trades = [t for t in trades if (t.get("action") or "").upper() == want]
+    atype = _asset_value(asset_value)
+    if atype:
+        trades = [t for t in trades if (t.get("type") or "STOCK").upper() == atype.upper()]
     if not trades:
         return html.Div(
             "No IBKR fills recorded in this window yet — either broker_mode is "
@@ -2178,9 +2290,10 @@ def _exit_quality_block(window_value, session_value, direction_value=None):
     ])
 
 
-def _returns_section(window_value, session_value=None, direction_value=None):
+def _returns_section(window_value, session_value=None, direction_value=None, asset_value=None):
     perf = data.performance(window_days=_window_days(window_value), session=_session_value(session_value),
-                            direction=_direction_value(direction_value))
+                            direction=_direction_value(direction_value),
+                            asset_type=_asset_value(asset_value))
     stats = perf.get("stats") or {}
     pm = perf.get("portfolio_metrics") or {}
     wlabel = _window_label(window_value)

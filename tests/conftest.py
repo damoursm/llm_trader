@@ -49,6 +49,46 @@ def _spread_only_costs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_gateway_auto_restart(monkeypatch):
+    """Disable the IB Gateway auto-restart for the whole suite.
+
+    gateway_recovery.maybe_restart_gateway runs REAL ``taskkill`` / ``schtasks``
+    commands — a reconcile/wedge test driving a connect failure must never kill
+    the developer's actual gateway. The recovery tests opt back in explicitly
+    (and monkeypatch subprocess)."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "broker_gateway_auto_restart", False)
+
+
+@pytest.fixture(autouse=True)
+def _default_llm_primary(monkeypatch):
+    """Pin the LLM routing/thinking settings to their code defaults for the whole
+    suite so engine-routing / hold-review-pinning / thinking tests don't inherit a
+    .env override (the developer's .env sets ``llm_primary_provider='qwen'`` and
+    ``llm_max_thinking=true``, which coerce pins to qwen and flip bulk sentiment/
+    macro-news to thinking). Tests that exercise those opt back in explicitly (their
+    per-test monkeypatch runs after this one)."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "llm_primary_provider", "deepseek")
+    monkeypatch.setattr(settings, "llm_max_thinking", False)
+    # DeepSeek-only sentiment for the legacy suites (the .env sets a 10% Qwen share);
+    # the sentiment-routing tests opt into a Qwen share explicitly.
+    monkeypatch.setattr(settings, "sentiment_qwen_share", 0.0)
+    # Deterministic prompts/exits for the legacy suites: no random blind-arm
+    # synthesis, single-review LLM exits. The A/B + confirmation tests opt in.
+    monkeypatch.setattr(settings, "blind_synthesis_share", 0.0)
+    monkeypatch.setattr(settings, "enable_llm_exit_confirmation", False)
+    # Pin the Qwen route to DashScope-direct defaults — the developer's .env
+    # points at OpenRouter (different model id + thinking dialect + explicit
+    # cache markers). OpenRouter-route tests monkeypatch these explicitly.
+    monkeypatch.setattr(settings, "qwen_base_url",
+                        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setattr(settings, "qwen_model", "qwen3.7-max")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_sentiment_cache(tmp_path, monkeypatch):
     """Point the sentiment LLM cache at a throwaway file + drop the in-memory
     copy for EVERY test. The cache is a process-global keyed by (ticker, engine,

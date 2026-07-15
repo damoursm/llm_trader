@@ -315,20 +315,34 @@ Headlines:
 _CATEGORIES_LIST = list(_CATEGORY_KEYWORDS.keys()) + ["other"]
 
 
+def _macro_llm_attempts() -> list:
+    """Ordered ``(provider, model, base_url, api_key, extra_body)`` classifier
+    attempts. Qwen first when ``llm_primary_provider=="qwen"`` (2026-07-11 — all
+    LLM calls on Qwen), DeepSeek as the error fallback; else DeepSeek only.
+    Thinking follows the maximum-thinking policy (``llm_max_thinking``): ON reasons
+    at each model's max budget, OFF stays cheap/deterministic. Keyless providers
+    are dropped so the loop skips straight to the next one."""
+    think = settings.llm_max_thinking
+    from src.analysis.qwen_api import thinking_body
+    qwen = ("qwen", settings.qwen_model, settings.qwen_base_url, settings.qwen_api_key,
+            thinking_body(think))                       # route dialect (qwen_api)
+    deepseek = ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com",
+                settings.deepseek_api_key,
+                {"thinking": {"type": "enabled" if think else "disabled"}})
+    ordered = [qwen, deepseek] if settings.llm_primary_provider == "qwen" else [deepseek]
+    return [a for a in ordered if a[3]]     # drop keyless providers
+
+
 def _deepseek_classify(
     articles: List[NewsArticle],
 ) -> Optional[Tuple[List[MacroNewsTheme], float, str, str, Dict[str, int]]]:
-    """Call DeepSeek to classify the macro headlines. Returns None on any failure.
+    """Classify the macro headlines via the primary LLM (Qwen, DeepSeek fallback).
+    Returns None on total failure.
 
     Returns ``(themes, score, composite_signal, summary, sector_tilts)``.
     """
-    if not settings.deepseek_api_key:
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=settings.deepseek_api_key, base_url="https://api.deepseek.com")
-    except Exception as e:
-        logger.warning(f"[macro_news] DeepSeek client init failed: {e}")
+    attempts = _macro_llm_attempts()
+    if not attempts:
         return None
 
     # Build prompt. Keep title-only to save tokens — summaries are noisy.
@@ -341,21 +355,43 @@ def _deepseek_classify(
         headlines="\n".join(lines),
     )
 
-    try:
-        # Determinism: temperature=0 + fixed seed so two runs on the same
-        # filtered headline set produce the same theme classification.
-        resp = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            seed=_MACRO_NEWS_SEED,
-            max_tokens=2400,
-            response_format={"type": "json_object"},
-            extra_body={"thinking": {"type": "disabled"}},  # non-thinking: cheap/fast/deterministic
-        )
-        raw = resp.choices[0].message.content or ""
-    except Exception as e:
-        logger.warning(f"[macro_news] DeepSeek call failed: {e}")
+    from openai import OpenAI
+    raw = None
+    for provider, model, base_url, api_key, extra_body in attempts:
+        try:
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            # Determinism: temperature=0 + fixed seed so two runs on the same
+            # filtered headline set produce the same theme classification.
+            # DeepSeek shares max_tokens with its thinking; give it room under the
+            # maximum-thinking policy (Qwen's reasoning is billed separately, so it
+            # ignores the slack). Answer (themes JSON) is small either way.
+            _mt = settings.llm_thinking_macro_max_tokens if settings.llm_max_thinking else 2400
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                seed=_MACRO_NEWS_SEED,
+                max_tokens=_mt,
+                response_format={"type": "json_object"},
+                extra_body=extra_body,
+            )
+            # Prefix-cache observability (fail-soft): Qwen implicit cache reports
+            # prompt_tokens_details.cached_tokens; DeepSeek prompt_cache_hit_tokens.
+            try:
+                u = getattr(resp, "usage", None)
+                det = getattr(u, "prompt_tokens_details", None)
+                cached = (getattr(det, "cached_tokens", None) if det is not None
+                          else None) or getattr(u, "prompt_cache_hit_tokens", None)
+                if cached:
+                    logger.info(f"[macro_news] {provider} prefix-cache hit: "
+                                f"{cached}/{getattr(u, 'prompt_tokens', '?')} input tok")
+            except Exception:
+                pass
+            raw = resp.choices[0].message.content or ""
+            break
+        except Exception as e:
+            logger.warning(f"[macro_news] {provider} classify failed ({type(e).__name__}: {e})")
+    if raw is None:
         return None
 
     # Parse — DeepSeek in JSON-mode returns clean JSON, but defensive strip

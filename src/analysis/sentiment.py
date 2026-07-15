@@ -30,14 +30,21 @@ from src.models import NewsArticle
 
 _deepseek_client = None
 _haiku_client = None
+_qwen_client = None
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"   # DeepSeek V4-Flash — cheapest/latest (replaces deprecated deepseek-chat)
-# v4-flash defaults to thinking ENABLED; force it OFF so bulk sentiment scoring stays
-# cheap, fast, and deterministic (no chain-of-thought output tokens). Passed via the
-# OpenAI SDK's extra_body since `thinking` is a DeepSeek-specific parameter.
+# DeepSeek reasoning mode (extra_body). OFF (default) keeps bulk sentiment cheap/
+# deterministic; ON is used under the maximum-thinking policy (llm_max_thinking).
 _DEEPSEEK_THINKING_OFF = {"thinking": {"type": "disabled"}}
+_DEEPSEEK_THINKING_ON = {"thinking": {"type": "enabled"}}
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+# Qwen (DashScope direct or OpenRouter — settings.qwen_base_url/qwen_model pick
+# the route; src/analysis/qwen_api.py picks the thinking dialect). 2026-07-13:
+# scores ~10% of runs (sentiment_qwen_share; DeepSeek-flash the rest) — the pricier
+# engine, kept to a minority for cost. Reasoning is billed separately from the
+# answer's max_tokens on both routes.
+QWEN_MODEL = settings.qwen_model      # resolved at import from the active route
 
 # Output ceiling for the sentiment call. The old 256 truncated a verbose DeepSeek
 # rationale mid-JSON (XBI) → invalid JSON → lost score. max_tokens is only a CEILING
@@ -53,10 +60,11 @@ _SENTIMENT_MAX_TOKENS = 4096
 _PROVIDER_COUNTS: dict = {}
 _PROVIDER_LOCK = threading.Lock()
 
-# Which engine scores first this run — re-flipped per run in
-# reset_sentiment_providers() per settings.llm_ab_anthropic_share, so both
-# providers accumulate comparable trade samples for the dashboard's per-LLM
-# evaluation rows. The other engine remains the error fallback.
+# Which engine scores this run — re-flipped per run in reset_sentiment_providers()
+# (2026-07-13: ~90% DeepSeek / ~10% Qwen via sentiment_qwen_share, cost tune), so
+# both providers accumulate whole-run samples for the dashboard's per-LLM evaluation
+# rows and the run's dominant sentiment model attributes cleanly. The other engine
+# remains the per-call error fallback.
 _PRIMARY_SENTIMENT_ENGINE = "deepseek"
 
 
@@ -64,34 +72,46 @@ def reset_sentiment_providers() -> None:
     global _PRIMARY_SENTIMENT_ENGINE
     with _PROVIDER_LOCK:
         _PROVIDER_COUNTS.clear()
-    # Sentiment is DeepSeek-only unless Claude sentiment is explicitly enabled
+    # Per-run sentiment engine flip (2026-07-13 cost tune). Qwen is pricier, so it
+    # scores only ``sentiment_qwen_share`` of runs (default 10%) and DeepSeek-flash
+    # the rest; the non-primary engine is the per-call error fallback. A per-RUN flip
+    # (not per-call) so each engine accrues whole-run samples for the dashboard's
+    # per-LLM eval and the run's dominant sentiment model attributes cleanly. Claude
+    # sentiment, when explicitly enabled, keeps its own A/B ahead of the Qwen split
     # (Claude is otherwise reserved for synthesis).
-    _PRIMARY_SENTIMENT_ENGINE = (
-        "anthropic"
-        if settings.enable_claude_sentiment and random.random() < settings.llm_ab_anthropic_share
-        else "deepseek"
-    )
-    if settings.enable_claude_sentiment:
+    if settings.enable_claude_sentiment and random.random() < settings.llm_ab_anthropic_share:
+        _PRIMARY_SENTIMENT_ENGINE = "anthropic"
         logger.info(
-            f"[sentiment] A/B routing this run: primary={_PRIMARY_SENTIMENT_ENGINE} "
+            f"[sentiment] A/B routing this run: primary=anthropic "
             f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
         )
+    elif settings.qwen_api_key and random.random() < settings.sentiment_qwen_share:
+        _PRIMARY_SENTIMENT_ENGINE = "qwen"
+        logger.info(f"[sentiment] Qwen-primary this run "
+                    f"(qwen share={settings.sentiment_qwen_share:.0%}; DeepSeek is the error fallback)")
     else:
-        logger.info("[sentiment] DeepSeek-only this run (Claude sentiment disabled)")
+        _PRIMARY_SENTIMENT_ENGINE = "deepseek"
+        logger.info("[sentiment] DeepSeek-primary this run"
+                    + ("" if settings.enable_claude_sentiment else " (Claude sentiment reserved for synthesis)"))
 
 
 def _sentiment_engine_order(force_engine: Optional[str]) -> list:
     """Engine try-order for one sentiment call (primary first, the other as fallback).
 
-    DeepSeek-only unless ``enable_claude_sentiment`` is set — when disabled, anthropic
-    is stripped entirely (even a ``force_engine='anthropic'`` hold-review pin coerces
-    to deepseek), so Claude is never called for sentiment."""
-    if force_engine in ("deepseek", "anthropic"):
+    2026-07-13 cost tune: DeepSeek-flash scores ~90% of runs and Qwen ~10%
+    (``sentiment_qwen_share``), each the other's error fallback. Hold-review pins are
+    HONORED — the opener engine re-judges its own position (Fix #2 same-engine
+    invariant). Claude is reserved for synthesis: unless ``enable_claude_sentiment``
+    is set, anthropic is stripped entirely (even a ``force_engine='anthropic'`` pin
+    coerces to deepseek), so Claude is never called for sentiment."""
+    if force_engine in ("deepseek", "anthropic", "qwen"):
         order = [force_engine]
-    elif _PRIMARY_SENTIMENT_ENGINE == "deepseek":
-        order = ["deepseek", "anthropic"]
-    else:
+    elif _PRIMARY_SENTIMENT_ENGINE == "qwen":
+        order = ["qwen", "deepseek"]
+    elif _PRIMARY_SENTIMENT_ENGINE == "anthropic":
         order = ["anthropic", "deepseek"]
+    else:                                    # deepseek primary → Qwen is the error fallback
+        order = ["deepseek", "qwen"]
     if not settings.enable_claude_sentiment:
         order = [e for e in order if e != "anthropic"] or ["deepseek"]
     return order
@@ -118,6 +138,7 @@ def get_sentiment_provider_summary() -> Optional[str]:
 SENTIMENT_PROVIDER_MODELS: dict = {
     "deepseek": DEEPSEEK_MODEL,
     "anthropic": HAIKU_MODEL,
+    "qwen": QWEN_MODEL,
 }
 
 
@@ -266,6 +287,43 @@ def _get_deepseek() -> OpenAI | None:
             base_url=DEEPSEEK_BASE_URL,
         )
     return _deepseek_client
+
+
+def _log_cache_hit(ticker: str, engine: str, response) -> None:
+    """DEBUG-log prefix-cache hits on a non-streaming sentiment call (Qwen
+    ``prompt_tokens_details.cached_tokens`` / DeepSeek ``prompt_cache_hit_tokens``)
+    so the provider-side automatic caching is verifiable without spamming INFO
+    (sentiment runs dozens of calls per tick). NOTE the shared sentiment prefix is
+    ~600 tokens — BELOW Qwen's ~1000-token implicit-cache minimum — so Qwen hits
+    here are expected to be rare/zero; the app-level article-digest verdict cache
+    is the layer that actually eliminates repeat sentiment cost. Fail-soft."""
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None) if details is not None else None
+        if cached is None:
+            cached = getattr(usage, "prompt_cache_hit_tokens", None)
+        if cached:
+            logger.debug(f"{ticker} sentiment {engine} prefix-cache hit: "
+                         f"{cached}/{getattr(usage, 'prompt_tokens', '?')} input tok")
+    except Exception:
+        pass
+
+
+def _get_qwen() -> OpenAI | None:
+    """OpenAI-compatible Qwen client (DashScope). None when no key → the caller
+    falls through to the next engine in the order (DeepSeek)."""
+    global _qwen_client
+    if not settings.qwen_api_key:
+        return None
+    if _qwen_client is None:
+        _qwen_client = OpenAI(
+            api_key=settings.qwen_api_key,
+            base_url=settings.qwen_base_url,
+        )
+    return _qwen_client
 
 
 def _get_haiku() -> anthropic.Anthropic:
@@ -530,20 +588,43 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
             f"({cached.get('engine')}, {len(to_score)} articles, cached)"
         )
     last_err: Exception | None = None
+    # Maximum-thinking policy: reason on every call. Qwen bills reasoning tokens
+    # separately, so its answer cap stays small; DeepSeek shares max_tokens with
+    # thinking, so give it headroom. thinking_budget is OMITTED → DashScope defaults
+    # it to the model's maximum chain-of-thought (true "maximum thinking").
+    _max_think = settings.llm_max_thinking
+    _think_mt = (settings.llm_thinking_sentiment_max_tokens
+                 if _max_think else _SENTIMENT_MAX_TOKENS)
     for engine in (order if raw_score is None else []):
         try:
-            if engine == "deepseek":
+            if engine == "qwen":
+                qwen = _get_qwen()
+                if qwen is None:            # no API key — try the next engine
+                    continue
+                from src.analysis.qwen_api import thinking_body
+                response = qwen.chat.completions.create(
+                    model=settings.qwen_model,
+                    max_tokens=_SENTIMENT_MAX_TOKENS,   # answer only (thinking billed separately)
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    seed=_LLM_SEED,
+                    extra_body=thinking_body(_max_think),   # route dialect (qwen_api)
+                )
+                _log_cache_hit(ticker, "qwen", response)
+                raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
+            elif engine == "deepseek":
                 deepseek = _get_deepseek()
                 if deepseek is None:        # no API key — try the other engine
                     continue
                 response = deepseek.chat.completions.create(
                     model=DEEPSEEK_MODEL,
-                    max_tokens=_SENTIMENT_MAX_TOKENS,
+                    max_tokens=_think_mt,   # DeepSeek thinking shares this budget
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                     seed=_LLM_SEED,
-                    extra_body=_DEEPSEEK_THINKING_OFF,
+                    extra_body=(_DEEPSEEK_THINKING_ON if _max_think else _DEEPSEEK_THINKING_OFF),
                 )
+                _log_cache_hit(ticker, "deepseek", response)
                 raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
             else:
                 client = _get_haiku()

@@ -14,6 +14,14 @@ from src.data.insider_trades import build_insider_summary
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _DEEPSEEK_ANALYST_MODEL = "deepseek-v4-flash"   # DeepSeek V4-Flash — cheapest/latest (replaces deprecated deepseek-chat)
+# Qwen3.7-Max (May 2026: 1M ctx, ~66K out). 2026-07-11: THE primary engine for
+# every LLM call (user directive) — the synthesis pool is <qwen_model>-thinking,
+# sentiment/macro-news run qwen-first, and legacy anthropic/deepseek hold-review
+# pins coerce to qwen when llm_primary_provider=="qwen". Reached via DashScope
+# direct OR OpenRouter — model id + request dialect come from settings.qwen_model
+# / qwen_base_url through src/analysis/qwen_api.py (2026-07-12).
+def _qwen_default_model() -> str:
+    return settings.qwen_model
 # DeepSeek v4 defaults to thinking ENABLED. OFF = cheaper/faster/deterministic (no
 # chain-of-thought tokens) — used for the cheap fallback. ON = better multi-step
 # reasoning for the BUY/SELL synthesis (the bake-off's *-thinking arms), at the cost
@@ -24,24 +32,39 @@ _DEEPSEEK_THINKING_ON  = {"thinking": {"type": "enabled"}}
 # Fixed seed for the DeepSeek analyst fallback; combined with temperature=0
 # this gets us near-deterministic synthesis across identical-prompt runs.
 _DEEPSEEK_ANALYST_SEED = 4242
-_DEEPSEEK_THINKING_SUFFIX = "-thinking"
+_THINKING_SUFFIX = "-thinking"
+_DEEPSEEK_THINKING_SUFFIX = _THINKING_SUFFIX   # back-compat alias
+
+
+def _split_thinking(model_id: str) -> tuple[str, bool]:
+    """Strip a trailing ``-thinking`` logical suffix → (API model, thinking flag).
+
+    Thinking is a request parameter, not part of the API model id, so the bake-off
+    pool encodes it with a ``-thinking`` suffix on a logical id recorded verbatim
+    for provenance (so the dashboard shows e.g. ``deepseek-v4-pro-thinking`` and
+    ``qwen3.7-max-thinking`` as distinct rows). Shared by DeepSeek and Qwen (both
+    OpenAI-compatible, both take reasoning as a request flag)."""
+    mid = (model_id or "").strip()
+    thinking = mid.endswith(_THINKING_SUFFIX)
+    api_model = mid[: -len(_THINKING_SUFFIX)] if thinking else mid
+    return api_model, thinking
 
 
 def _deepseek_spec(model_id: Optional[str]) -> tuple[str, bool]:
-    """Decode a logical DeepSeek synthesis id → (API model, thinking flag).
+    """``_split_thinking`` with the DeepSeek default when the id is blank. E.g.
+    ``deepseek-v4-pro-thinking`` → (``deepseek-v4-pro``, True); ``None`` →
+    (``deepseek-v4-flash``, False)."""
+    return _split_thinking(model_id or _DEEPSEEK_ANALYST_MODEL)
 
-    Thinking is a request parameter, not part of the API model id, so the bake-off
-    pool encodes it with a ``-thinking`` suffix on a logical id that is recorded
-    verbatim for provenance (so the dashboard shows flash-thinking and pro-thinking
-    as distinct rows). E.g. ``deepseek-v4-pro-thinking`` → (``deepseek-v4-pro``,
-    True); ``deepseek-v4-flash`` → (``deepseek-v4-flash``, False)."""
-    mid = (model_id or _DEEPSEEK_ANALYST_MODEL).strip()
-    thinking = mid.endswith(_DEEPSEEK_THINKING_SUFFIX)
-    api_model = mid[: -len(_DEEPSEEK_THINKING_SUFFIX)] if thinking else mid
-    return api_model, thinking
+
+def _qwen_spec(model_id: Optional[str]) -> tuple[str, bool]:
+    """``_split_thinking`` with the Qwen default when the id is blank. E.g.
+    ``qwen3.7-max-thinking`` → (``qwen3.7-max``, True)."""
+    return _split_thinking(model_id or _qwen_default_model())
 
 _client = None
 _deepseek_analyst_client = None
+_qwen_analyst_client = None
 
 # Records which engine produced the most recent synthesis, for run metadata.
 # provider ∈ {"anthropic", "deepseek", "rule-based", None}; model is the exact id.
@@ -78,6 +101,22 @@ def _get_deepseek_analyst_client():
     return _deepseek_analyst_client
 
 
+def _get_qwen_analyst_client():
+    """OpenAI-compatible client for Qwen (DashScope compatible-mode). None when no
+    key — the caller then errors and the engine fallback (DeepSeek) takes over, so
+    the system keeps producing recommendations before the Qwen key is set."""
+    global _qwen_analyst_client
+    if not settings.qwen_api_key:
+        return None
+    if _qwen_analyst_client is None:
+        from openai import OpenAI
+        _qwen_analyst_client = OpenAI(
+            api_key=settings.qwen_api_key,
+            base_url=settings.qwen_base_url,
+        )
+    return _qwen_analyst_client
+
+
 def _anthropic_sampling_kwargs(model: str) -> dict:
     """``{"temperature": 0}`` for Anthropic models that still accept sampling
     params, ``{}`` for those that removed them.
@@ -107,37 +146,51 @@ def _anthropic_thinking_kwargs(model: str) -> dict:
     synthesis reasons before committing to BUY/SELL/HOLD; ``{}`` for models that
     don't (Haiku 4.5, Sonnet 4.5, older), which would 400 on the parameter.
 
-    Effort is left at its default (``high``). ``display`` stays ``"omitted"`` (the
-    default) — we accumulate only the answer via ``text_stream``, never surface
-    the reasoning, so a summary would just be wasted tokens. Per the Anthropic
-    model reference (2026-06). Note: thinking is non-deterministic, so on a
-    thinking model the hold-review re-judgments are inherently noisier than the
-    old temperature=0 path (a tradeoff for the better synthesis)."""
+    Effort defaults to ``high``; under the maximum-thinking policy
+    (``llm_max_thinking``) it is raised to ``output_config={"effort": "max"}`` —
+    the deepest reasoning setting — on the same thinking-capable models (all of
+    which accept ``effort``). ``display`` stays ``"omitted"`` (the default) — we
+    accumulate only the answer via ``text_stream``, never surface the reasoning,
+    so a summary would just be wasted tokens. Per the Anthropic model reference
+    (2026-06). Note: thinking is non-deterministic, so on a thinking model the
+    hold-review re-judgments are inherently noisier than the old temperature=0
+    path (a tradeoff for the better synthesis)."""
     m = (model or "").lower()
-    if "fable" in m or "mythos" in m:
-        return {"thinking": {"type": "adaptive"}}
     mt = re.search(r"(opus|sonnet)-(\d+)-(\d+)", m)
-    if mt and (int(mt.group(2)), int(mt.group(3))) >= (4, 6):
-        return {"thinking": {"type": "adaptive"}}
-    return {}
+    supports = ("fable" in m or "mythos" in m
+                or (mt is not None and (int(mt.group(2)), int(mt.group(3))) >= (4, 6)))
+    if not supports:
+        return {}                                  # Haiku 4.5 / older 400 on both params
+    kwargs: dict = {"thinking": {"type": "adaptive"}}
+    if settings.llm_max_thinking:
+        kwargs["output_config"] = {"effort": "max"}   # deepest reasoning budget
+    return kwargs
 
 
 def _engine_of(model: str) -> str:
     """Which provider a synthesis model id belongs to: 'deepseek' for DeepSeek
-    ids, 'anthropic' for Claude ids."""
-    return "deepseek" if "deepseek" in (model or "").lower() else "anthropic"
+    ids, 'qwen' for Qwen ids, 'anthropic' for Claude ids."""
+    m = (model or "").lower()
+    if "deepseek" in m:
+        return "deepseek"
+    if "qwen" in m:
+        return "qwen"
+    return "anthropic"
 
 
 def _synthesis_attempts_for(chosen_model: str, anthropic_fallback: str,
                             deepseek_fallback: str) -> list:
     """Ordered ``(engine, model)`` synthesis attempts for a chosen model: the
-    chosen model first, then the OTHER provider's default model as the error
+    chosen model first, then a DIFFERENT provider's default model as the error
     fallback, so a provider outage still yields a recommendation. Pure /
     deterministic — the random pool pick happens in the caller, so this is
-    unit-testable."""
+    unit-testable. Qwen (the 2026-07-11 primary) falls back to DeepSeek, the cheap
+    resilient OpenAI-compatible engine."""
     eng = _engine_of(chosen_model)
     if eng == "anthropic":
         return [("anthropic", chosen_model), ("deepseek", deepseek_fallback)]
+    if eng == "qwen":
+        return [("qwen", chosen_model), ("deepseek", deepseek_fallback)]
     return [("deepseek", chosen_model), ("anthropic", anthropic_fallback)]
 
 
@@ -169,6 +222,28 @@ def _analyst_content(prompt: str, model: str):
         # so gate on it: Haiku 4.5 = 4096 tok, Opus/Sonnet = 1024.
         min_tokens = _cache_min_tokens(model)
         if len(prefix) >= min_tokens * 4:   # ~4 chars/token — skip if too small to cache
+            return [
+                {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": suffix},
+            ]
+    return prompt.replace(_CACHE_SENTINEL, "")
+
+
+def _qwen_user_content(prompt: str):
+    """User-message content for a Qwen call, per the active route's cache model.
+
+    DashScope direct: implicit prefix caching is automatic — return the plain
+    prompt with the sentinel stripped. OpenRouter: NO implicit caching for
+    Alibaba, so mark the stable prefix with an EXPLICIT Anthropic-style
+    ``cache_control`` breakpoint (write 1.25x / read 0.1x, 5-min TTL — the
+    within-tick hold-review hit more than pays for the write premium vs paying
+    full price twice). Marker gated on Alibaba's ~1024-token explicit-cache
+    minimum (~4 chars/token) — below it the marker would be a silent no-op."""
+    from src.analysis.qwen_api import is_openrouter
+    if (is_openrouter() and settings.enable_prompt_caching
+            and _CACHE_SENTINEL in prompt):
+        prefix, suffix = prompt.split(_CACHE_SENTINEL, 1)
+        if len(prefix) >= 1024 * 4:
             return [
                 {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": suffix},
@@ -228,6 +303,31 @@ def _call_claude_analyst(prompt: str, model: Optional[str] = None) -> str:
     return "".join(raw_parts).strip()
 
 
+def _log_openai_cache_usage(tag: str, usage) -> None:
+    """Log prefix-cache hits for an OpenAI-compatible call (Qwen / DeepSeek), so
+    the automatic caching is MEASURABLE (the Anthropic path already logs its
+    cache_control reads/writes). Qwen (DashScope implicit cache — automatic,
+    ≥~1000-token prefix, hits billed at 20% of input) reports
+    ``prompt_tokens_details.cached_tokens``; DeepSeek (automatic disk cache, hits
+    ~10% of input) reports ``prompt_cache_hit_tokens``/``prompt_cache_miss_tokens``.
+    Fail-soft: a missing/odd usage shape never breaks the call."""
+    try:
+        if usage is None:
+            return
+        total = getattr(usage, "prompt_tokens", None)
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None) if details is not None else None
+        if cached is None:
+            cached = getattr(usage, "prompt_cache_hit_tokens", None)
+        if cached:
+            logger.info(f"[claude] {tag} prefix cache: hit={cached} of {total} input tok "
+                        f"(cached input bills at a fraction of full price)")
+        elif total:
+            logger.info(f"[claude] {tag} prefix cache: MISS ({total} input tok at full price)")
+    except Exception:
+        pass
+
+
 def _call_deepseek_analyst(prompt: str, model: Optional[str] = None,
                            thinking: bool = False) -> str:
     """Call a DeepSeek analyst model (streaming). Returns raw response text.
@@ -240,6 +340,9 @@ def _call_deepseek_analyst(prompt: str, model: Optional[str] = None,
     if client is None:
         raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
     api_model = model or _DEEPSEEK_ANALYST_MODEL
+    # Maximum-thinking policy: reason on every call, including the cross-engine
+    # fallback (its max_tokens=32000 leaves room for DeepSeek's thinking + answer).
+    thinking = thinking or settings.llm_max_thinking
     logger.info(f"[claude] DeepSeek analyst: {api_model} ({'thinking' if thinking else 'non-thinking'})")
     raw_parts: list[str] = []
     # DeepSeek ignores Anthropic cache_control and does its own automatic prefix
@@ -247,22 +350,124 @@ def _call_deepseek_analyst(prompt: str, model: Optional[str] = None,
     prompt = prompt.replace(_CACHE_SENTINEL, "")
     # Determinism: temperature=0 + fixed seed so two runs on the same prompt
     # produce near-identical synthesis (slight provider-side variance only).
+    usage = None
     with client.chat.completions.create(
         model=api_model,
         max_tokens=32000,
         messages=[{"role": "user", "content": prompt}],
         stream=True,
+        stream_options={"include_usage": True},   # final chunk carries usage → cache observability
         temperature=0,
         seed=_DEEPSEEK_ANALYST_SEED,
         extra_body=_DEEPSEEK_THINKING_ON if thinking else _DEEPSEEK_THINKING_OFF,
     ) as stream:
         for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage               # usage-only chunk has empty choices
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             if delta.content:
                 raw_parts.append(delta.content)
+    _log_openai_cache_usage(f"DeepSeek {api_model}", usage)
     return "".join(raw_parts).strip()
+
+
+def _call_qwen_analyst(prompt: str, model: Optional[str] = None,
+                       thinking: bool = True) -> str:
+    """Call Qwen (DashScope compatible-mode, streaming). Returns raw response text.
+
+    The 2026-07-11 primary synthesis engine (``qwen3.7-max``). Thinking is toggled
+    via ``extra_body={"enable_thinking": bool}`` — Qwen's own flag, NOT DeepSeek's
+    ``thinking:{type}``. Streaming is required for thinking-mode output on the
+    compatible endpoint; the loop consumes only ``delta.content`` (the answer), so
+    the ``reasoning_content`` is generated-but-billed and discarded — same shape as
+    the DeepSeek path. Raises on failure (no key, API error) so the caller's engine
+    fallback (DeepSeek) takes over."""
+    client = _get_qwen_analyst_client()
+    if client is None:
+        raise RuntimeError("QWEN_API_KEY not configured — cannot use Qwen synthesis")
+    from src.analysis.qwen_api import thinking_body
+    api_model = model or _qwen_default_model()
+    # Maximum-thinking policy: always reason (the synthesis/hold-review arms already
+    # pass thinking=True). No budget/effort is ever sent → the model reasons at its
+    # default = MAX chain-of-thought on both routes (DashScope enable_thinking /
+    # OpenRouter reasoning.enabled — dialect via qwen_api.thinking_body). Qwen bills
+    # reasoning separately from max_tokens, so the answer cap is untouched.
+    thinking = thinking or settings.llm_max_thinking
+    logger.info(f"[claude] Qwen analyst: {api_model} ({'thinking' if thinking else 'non-thinking'})")
+    # Route-aware prefix caching: DashScope direct caches implicitly (just strip
+    # the sentinel); OpenRouter has NO implicit cache for Alibaba, so the stable
+    # prefix gets an EXPLICIT cache_control marker (1.25x write / 0.1x read).
+    content = _qwen_user_content(prompt)
+
+    # ~66K output ceiling on qwen3.7-max; 48000 leaves room for reasoning + the JSON
+    # answer over ~40 tickers (truncation is salvaged by the object-repair parser).
+    def _run(json_mode: bool) -> tuple[str, object]:
+        parts: list[str] = []
+        usage = None
+        kwargs: dict = dict(
+            model=api_model,
+            max_tokens=48000,
+            messages=[{"role": "user", "content": content}],
+            stream=True,
+            stream_options={"include_usage": True},   # final chunk carries usage → cache observability
+            temperature=0,
+            seed=_DEEPSEEK_ANALYST_SEED,
+            extra_body=thinking_body(thinking),        # route dialect (qwen_api)
+        )
+        if json_mode:
+            # Guaranteed-parseable output: the prompt asks for {"recommendations":
+            # [...]}, so json_object mode can enforce it (an OBJECT is required —
+            # a bare array isn't representable in this mode).
+            kwargs["response_format"] = {"type": "json_object"}
+        with client.chat.completions.create(**kwargs) as stream:
+            for chunk in stream:
+                if getattr(chunk, "usage", None) is not None:
+                    usage = chunk.usage           # usage-only chunk has empty choices
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    parts.append(delta.content)
+        return "".join(parts).strip(), usage
+
+    json_mode = bool(settings.qwen_json_mode)
+    try:
+        raw, usage = _run(json_mode)
+    except Exception as e:
+        if not json_mode:
+            raise
+        # DashScope may reject response_format in some model/thinking combos —
+        # retry WITHOUT it so Qwen stays the engine (the free-text JSON is still
+        # handled by the fence-strip + truncation-repair parser). A genuine
+        # outage fails this second attempt too and the caller's engine fallback
+        # (DeepSeek) takes over as before.
+        logger.warning(f"[claude] Qwen json_object mode failed ({type(e).__name__}: {e}) — "
+                       "retrying once without response_format")
+        raw, usage = _run(False)
+    _log_openai_cache_usage(f"Qwen {api_model}", usage)
+    return raw
+
+
+def _extract_rec_list(data) -> list:
+    """Normalise the parsed synthesis payload to the recommendations LIST.
+
+    The output spec asks for ``{"recommendations": [...]}`` (an OBJECT — required
+    so Qwen's json_object mode can guarantee parseability); legacy transcripts and
+    fallback engines may still emit the bare array. Accept both — and, defensively,
+    any dict whose first list-valued entry looks like the payload. Any other shape
+    degrades to [] (the caller's rule-based backfill covers the tickers)."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        recs = data.get("recommendations")
+        if isinstance(recs, list):
+            return recs
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+    return []
 
 
 def _recommendations_from_data(data, analyst_source: str, now) -> List["Recommendation"]:
@@ -333,7 +538,8 @@ def generate_recommendations(
     corporate_actions_context=None, # Optional[CorporateActionsContext]
     open_positions=None,            # Optional[List[dict]] — held-position review block (A/B'd per run)
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
-    force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' — pin synthesis (hold-review)
+    force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' | 'qwen' — pin synthesis (hold-review)
+    blind_synthesis: bool = False,  # A/B arm: hide the aggregator's verdict (see settings.blind_synthesis_share)
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -378,11 +584,21 @@ def generate_recommendations(
     if skipped:
         logger.info(f"[claude] Sending {len(signals_for_claude)}/{len(signals)} signals (skipped {skipped} near-zero tickers)")
 
-    # Build the signals block
+    # Build the signals block. BLIND arm (blind_synthesis_share A/B): the
+    # aggregate verdict trio (direction / combined_confidence / sources_agreeing)
+    # and the aggregate-model OPINION lines (HORIZON MODEL pick, EXPECTED MOVE
+    # alignment — both derived from the combined view, and 'aligned WITH the
+    # regime' leaks the direction) are withheld, so the LLM must commit to its
+    # OWN direction+confidence from the raw per-method evidence that follows.
+    # The 2026-07-12 agreement eval found 96% of sighted calls simply echo the
+    # aggregator — this arm measures whether independent judgment beats the echo.
     signal_lines = []
     for s in signals_for_claude:
-        parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, sources_agreeing={s.sources_agreeing}"]
-        if settings.enable_horizon_synthesis and getattr(s, "target_horizon", ""):
+        if blind_synthesis:
+            parts = [f"- {s.ticker}:"]
+        else:
+            parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, sources_agreeing={s.sources_agreeing}"]
+        if not blind_synthesis and settings.enable_horizon_synthesis and getattr(s, "target_horizon", ""):
             _tradeable = "" if getattr(s, "horizon_tradeable", True) else " — NO horizon clears cost, prefer WATCH/HOLD"
             parts.append(
                 f"  HORIZON MODEL: per-method per-horizon IC favours a {s.target_horizon} "
@@ -516,6 +732,54 @@ def generate_recommendations(
     # Append a note so Claude knows the full universe size
     if skipped:
         signals_text += f"\n\n[{skipped} additional tickers omitted — all had near-zero signals]"
+
+    # ── Blind-vs-sighted instruction variants (blind_synthesis A/B) ──────────
+    # SIGHTED values are byte-identical to the pre-A/B prompt (baseline integrity
+    # + the cacheable prefix is unaffected — both blocks sit after the sentinel).
+    # BLIND removes every reference to the withheld aggregate verdict and swaps
+    # the "trust the pre-computed confidence" anchor for own-judgment calibration.
+    if blind_synthesis:
+        agreement_instruction = (
+            "   - Strongly prefer tickers where MULTIPLE independent method families in the "
+            "signal block agree: when news sentiment, technical momentum, AND smart money all "
+            "point the same direction, the probability of being right is substantially higher "
+            "than any single source alone.\n"
+        )
+        conviction_rules = (
+            "3. Conviction rules — NO pre-computed verdict is provided. Form your OWN direction "
+            "and confidence from the raw per-method evidence above:\n"
+            "   - confidence = your calibrated probability that the direction is right at the "
+            "stated horizon. 0.5 = coin flip. Distribute honestly across the list — do not "
+            "cluster everything at 0.7-0.9.\n"
+            "   - confidence ≥ 0.78 AND ≥ 2 independent method families agreeing → eligible for BUY / SELL.\n"
+            "   - confidence ≥ 0.78 but only one method family in support → HOLD maximum (single-source signals are noise).\n"
+            "   - confidence 0.55-0.77 → HOLD (monitor closely).\n"
+            "   - confidence < 0.55 → WATCH only.\n"
+            "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
+            "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
+        )
+    else:
+        agreement_instruction = (
+            "   - Strongly prefer tickers where sources_agreeing ≥ 2: when news sentiment, "
+            "technical momentum, AND smart money all point the same direction, the probability "
+            "of being right is substantially higher than any single source alone.\n"
+        )
+        conviction_rules = (
+            "3. Conviction rules:\n"
+            "   - confidence ≥ 0.78 AND sources_agreeing ≥ 2 → eligible for BUY / SELL.\n"
+            "   - confidence ≥ 0.78 but sources_agreeing = 1 → HOLD maximum (single-source signals are noise).\n"
+            "   - confidence 0.55-0.77 → HOLD (monitor closely).\n"
+            "   - confidence < 0.55 → WATCH only.\n"
+            "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
+            "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
+            "   - The pre-computed confidence already reflects: every enabled method score "
+            "combined by weight, cross-method coherence (how strongly the methods agree, "
+            "magnitude-weighted), movement potential (ATR + Bollinger-band width), volume "
+            "confirmation, cross-sectional rank vs the universe, and sector-ETF alignment. It "
+            "also bakes in recency-weighted sentiment, article count, and source diversity "
+            "inside the news score. Trust it — do not override upward without explicit "
+            "multi-source justification.\n"
+        )
 
     # Build the active-methods description for the prompt
     active_methods = []
@@ -3119,8 +3383,7 @@ YOUR TASK:
 1. Identify the BEST opportunities across the full list — both longs (BUY) and shorts (SELL).
    - Apply the same discipline that made your career: only act when multiple independent layers of evidence converge. A genuine BUY/SELL signal is rare and valuable — treat it as such.
    - If no ticker clears the bar today, output HOLD/WATCH for all. Markets offer high-probability setups infrequently. Patience is the highest-conviction trade.
-   - Strongly prefer tickers where sources_agreeing ≥ 2: when news sentiment, technical momentum, AND smart money all point the same direction, the probability of being right is substantially higher than any single source alone.
-   - A single strong news print or a single options sweep is NEVER sufficient for BUY/SELL. It may be positioning, it may be noise. Require corroboration.
+{agreement_instruction}   - A single strong news print or a single options sweep is NEVER sufficient for BUY/SELL. It may be positioning, it may be noise. Require corroboration.
    - Do NOT ignore trending/discovered tickers just because they are not mega-caps. Small caps with strong smart money conviction and technical breakouts are often your best risk/reward setups.
 
 2. Distinguish time horizons:
@@ -3128,15 +3391,7 @@ YOUR TASK:
    - "SHORT-TERM" (1-4 weeks): sector rotation, earnings run-up/fade, macro shift.
    - "POSITION" (1-3 months): structural change — regulatory, competitive, macro theme.
 {tech_instructions}
-3. Conviction rules:
-   - confidence ≥ 0.78 AND sources_agreeing ≥ 2 → eligible for BUY / SELL.
-   - confidence ≥ 0.78 but sources_agreeing = 1 → HOLD maximum (single-source signals are noise).
-   - confidence 0.55-0.77 → HOLD (monitor closely).
-   - confidence < 0.55 → WATCH only.
-   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.
-   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.
-   - The pre-computed confidence already reflects: every enabled method score combined by weight, cross-method coherence (how strongly the methods agree, magnitude-weighted), movement potential (ATR + Bollinger-band width), volume confirmation, cross-sectional rank vs the universe, and sector-ETF alignment. It also bakes in recency-weighted sentiment, article count, and source diversity inside the news score. Trust it — do not override upward without explicit multi-source justification.
-
+{conviction_rules}
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
@@ -3147,7 +3402,7 @@ Commodity tickers always present in the list: {commodity_tickers}
   - Industrial metals (CPER): driven by global growth expectations, China PMI, and supply disruptions.
   - Give each commodity a standalone BUY/HOLD/SELL view with a rationale grounded in the current macro environment as reflected in the news signals. Do not default to HOLD for commodities — they have directional macro drivers that are often identifiable even when equity signals are mixed.
 
-Output a JSON array where each element has:
+Output a JSON object of the form {{"recommendations": [ ... ]}} where each array element has:
 - "ticker": string
 - "type": "STOCK" | "ETF" | "COMMODITY"
 - "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
@@ -3174,12 +3429,25 @@ Return ALL tickers from the input. No markdown, JSON only."""
     # Each attempt is an (engine, model) pair; the non-chosen provider is the
     # error fallback, rule-based the last resort.
     pool = [m.strip() for m in (settings.llm_ab_synthesis_models or "").split(",") if m.strip()]
-    if force_engine in ("anthropic", "deepseek"):
+    if force_engine in ("anthropic", "deepseek", "qwen"):
         # Opener-pinned hold-review: this engine ONLY (its default model) — no
         # A/B, no cross-engine fallback, no rule-based fallback (see below).
-        forced_model = settings.analyst_model if force_engine == "anthropic" else _DEEPSEEK_ANALYST_MODEL
-        attempts = [(force_engine, forced_model)]
-        logger.info(f"[claude] FORCED synthesis engine={force_engine} (pinned hold-review)")
+        # Under llm_primary_provider=="deepseek" (2026-07-13) the pin is HONORED —
+        # the opener engine re-judges its own position (Fix #2 same-engine
+        # invariant), which the 50/50 DeepSeek/Qwen synthesis split relies on. The
+        # legacy "coerce every pin to qwen" behavior only re-arms if the provider
+        # is set back to "qwen".
+        eng = "qwen" if settings.llm_primary_provider == "qwen" else force_engine
+        # Qwen review uses the SAME thinking-on arm as the entry synthesis pool
+        # (qwen3.7-max-thinking) so the hold-review is a true apples-to-apples
+        # re-judgment of the exit decision. Deepseek/anthropic pins keep their
+        # existing cheap defaults.
+        forced_model = {"anthropic": settings.analyst_model,
+                        "deepseek": _DEEPSEEK_ANALYST_MODEL,
+                        "qwen": _qwen_default_model() + _THINKING_SUFFIX}[eng]
+        attempts = [(eng, forced_model)]
+        logger.info(f"[claude] FORCED synthesis engine={eng} (pinned hold-review"
+                    f"{', coerced from ' + force_engine if eng != force_engine else ''})")
     elif pool:
         chosen = random.choice(pool)               # uniform → equal split over the pool
         attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL)
@@ -3201,6 +3469,10 @@ Return ALL tickers from the input. No markdown, JSON only."""
             if engine == "anthropic":
                 raw = _call_claude_analyst(prompt, model=model)
                 analyst_source = model
+            elif engine == "qwen":
+                api_model, thinking = _qwen_spec(model)
+                raw = _call_qwen_analyst(prompt, model=api_model, thinking=thinking)
+                analyst_source = model       # LOGICAL id (e.g. qwen3.7-max-thinking) for provenance
             else:
                 api_model, thinking = _deepseek_spec(model)
                 raw = _call_deepseek_analyst(prompt, model=api_model, thinking=thinking)
@@ -3234,6 +3506,14 @@ Return ALL tickers from the input. No markdown, JSON only."""
     except json.JSONDecodeError:
         # Response was likely truncated at the output token limit.
         # Salvage every complete object by trimming to the last closing brace.
+        # A json_object response wraps the array ({"recommendations": [ … ) — a
+        # TRUNCATED wrapped payload must be repaired as the inner ARRAY, so strip
+        # the wrapper up to the first '[' when the payload opens as an object.
+        _stripped = raw.lstrip()
+        if _stripped.startswith("{"):
+            _arr = _stripped.find("[")
+            if _arr != -1:
+                raw = _stripped[_arr:]
         last_brace = raw.rfind("}")
         if last_brace == -1:
             logger.error(f"[claude] Could not parse {analyst_source} response")
@@ -3258,6 +3538,9 @@ Return ALL tickers from the input. No markdown, JSON only."""
             f"recovered {len(data)}/{len(signals)} tickers. "
             f"Consider switching to a model with higher output limits."
         )
+    # Accept both the object-wrapped spec ({"recommendations": [...]}) and the
+    # legacy bare array (fallback engines / old transcripts).
+    data = _extract_rec_list(data)
     recommendations = _recommendations_from_data(data, analyst_source, now_et())
 
     # An LLM response can repeat a ticker (DeepSeek, 2026-06-11 16:30 tick:
@@ -3278,9 +3561,16 @@ Return ALL tickers from the input. No markdown, JSON only."""
     if missing and not force_engine:
         fallback = _fallback_recommendations(missing)
         recommendations += fallback
-        logger.warning(
-            f"[claude] {len(missing)} ticker(s) absent from {analyst_source} response "
-            f"— filled with rule-based fallback: {', '.join(s.ticker for s in missing)}"
+        # By design the LLM rates the top candidates and returns BUY/SELL/HOLD/WATCH
+        # for those; the rest of a ~330-name universe are "absent" and get a neutral
+        # rule-based HOLD so open positions never fall silent. Log the COUNT (the
+        # signal) + a short sample, not all 330 tickers (which spammed one ~4KB line
+        # per run). The full set is recoverable from the persisted recommendations.
+        _names = ", ".join(s.ticker for s in missing[:15])
+        _more = f" …(+{len(missing) - 15} more)" if len(missing) > 15 else ""
+        logger.info(
+            f"[claude] {len(missing)}/{len(signals)} ticker(s) absent from "
+            f"{analyst_source} response — neutral rule-based HOLD fill: {_names}{_more}"
         )
 
     # Provenance: only the run's MAIN (unforced) synthesis owns the last-synthesis
