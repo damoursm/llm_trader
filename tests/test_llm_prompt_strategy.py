@@ -59,7 +59,10 @@ def test_sighted_prompt_carries_the_aggregate_verdict(monkeypatch):
     cap = _capture_prompt(monkeypatch)
     ca.generate_recommendations([_signal()], blind_synthesis=False)
     p = cap["prompt"]
-    assert "direction=BULLISH, combined_confidence=40%, sources_agreeing=1" in p
+    # 2026-07-22: the buy/sell split sides ride the sighted verdict line between
+    # confidence and sources_agreeing (a contested 0.55-vs-0.40 read is visible).
+    assert "direction=BULLISH, combined_confidence=40%, buy_score=" in p
+    assert "sell_score=" in p and "sources_agreeing=1" in p
     assert "sources_agreeing ≥ 2 → eligible" in p
     assert "The pre-computed confidence already reflects" in p
     assert "Trust it" in p

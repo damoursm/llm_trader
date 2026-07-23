@@ -754,7 +754,12 @@ _IC_TOOLTIP = (
     "way a standard error off the raw n would be (|ICIR| ≳ 0.5 is a stable edge, ≈ 0 is "
     "noise); both need several signal-days before they populate. A persistent NEGATIVE "
     "IC is sign-inverted (a logic bug); IC ≈ 0 at large n is dead weight. 'Views' = scored, non-zero "
-    "observations. Run/forward-return based (NOT affected by the window toggle); "
+    "observations. Shown as THREE always-visible blocks: the BUY side (each method restricted to "
+    "its positive/bullish scores), the SELL side (its negative/bearish scores), and All calls (both "
+    "combined). Both sides stay on screen regardless of the Direction toggle above — so you can see "
+    "directly that the buy metrics carry on a method's bullish calls and the sell metrics on its "
+    "bearish calls. A predictive sell side shows a POSITIVE IC too (a more-negative score ranking a "
+    "more-negative return). Run/forward-return based (NOT affected by the window/direction toggles); "
     "n grows every run — judge nothing on a thin panel.")
 
 _IC_HORIZONS = (1, 5, 10)
@@ -799,26 +804,10 @@ def _ic_category_table(subset, labels):
     return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
 
 
-def _ic_section():
-    """Per-method information coefficient over the signals panel, split into the
-    30-min / daily / weekly technical categories plus Other."""
-    from src.performance.tracker import METHOD_LABELS
+def _ic_category_tables(icdf, labels):
+    """The per-category DataTables for one IC view (all / buy-side / sell-side)."""
     from src.analysis.signal_panel import IC_CATEGORY_ORDER
-    res = data.signal_ic()
-    icdf = res.get("ic")
-    heading = _h3("Signal information coefficient (IC)", _IC_TOOLTIP)
-    if icdf is None or getattr(icdf, "empty", True):
-        return html.Div([
-            heading,
-            html.Div(
-                f"Signals panel has {res.get('panel_rows', 0)} row(s) across "
-                f"{res.get('tickers', 0)} ticker(s) — not enough forward-return history "
-                "for IC yet. It accrues automatically every run.",
-                style={"color": "#6b7280"}),
-        ])
-    labels = dict(METHOD_LABELS)
-    labels["combined_score"] = "All methods (combined)"
-    children = [heading]
+    children = []
     has_cat = "category" in icdf.columns
     for category in IC_CATEGORY_ORDER:
         subset = icdf[icdf["category"] == category] if has_cat else icdf
@@ -829,7 +818,70 @@ def _ic_section():
         children.append(_ic_category_table(subset, labels))
         if not has_cat:
             break
-    return html.Div(children)
+    return children
+
+
+def _ic_section():
+    """Per-method information coefficient over the signals panel, split into the
+    30-min / daily / weekly technical categories plus Other.
+
+    2026-07-23: the BUY side and SELL side are shown as TWO always-visible
+    stacked blocks (not exclusive tabs) — plus an All-calls reference block —
+    so buy-signal skill on a method's bullish calls and sell-signal skill on its
+    bearish calls sit on screen together. That is deliberately kept independent
+    of the Direction toggle above (which filters the TRADE-based tables by trade
+    entry direction): the point is to compare, at a glance, that the buy metrics
+    carry on the bullish calls and the sell metrics carry on the bearish ones,
+    without either hiding the other. Each side restricts to that sign of each
+    method's own score (compute_ic side= in data.signal_ic)."""
+    from src.performance.tracker import METHOD_LABELS
+    res = data.signal_ic()
+    icdf = res.get("ic")
+    heading = _h3("Signal information coefficient (IC) — buy side vs sell side", _IC_TOOLTIP)
+    if icdf is None or getattr(icdf, "empty", True):
+        return html.Div([
+            heading,
+            html.Div(
+                f"Signals panel has {res.get('panel_rows', 0)} row(s) across "
+                f"{res.get('tickers', 0)} ticker(s) — not enough forward-return history "
+                "for IC yet. It accrues automatically every run.",
+                style={"color": "#6b7280"}),
+        ])
+    labels = dict(METHOD_LABELS)
+    labels["combined_score"] = "All methods (combined = buy − sell)"
+    labels["cmb_buy"] = "Combined BUY side (bull-camp conviction)"
+    labels["cmb_sell"] = "Combined SELL side (bear-camp conviction)"
+
+    def _block(title, blurb, df, accent):
+        body = (_ic_category_tables(df, labels)
+                if df is not None and not getattr(df, "empty", True)
+                else [html.Div("No calls on this side yet — accrues every run.",
+                               style={"color": "#6b7280", "marginTop": 6})])
+        return html.Div(
+            [html.Div(title, style={"fontWeight": "bold", "fontSize": 15, "color": accent,
+                                    "marginTop": 20, "marginBottom": 2,
+                                    "borderTop": "1px solid #334155", "paddingTop": 12}),
+             html.Div(blurb, style={"color": "#6b7280", "fontSize": 12, "marginBottom": 4})]
+            + body)
+
+    return html.Div([
+        heading,
+        _block("▲ Buy side — each method's BULLISH calls",
+               "Restricted to each method's POSITIVE scores: IC = ranking skill within its "
+               "buy calls, Sim win % = share that rose, Sim ret % = long-only gross P&L. "
+               "The combined BUY-camp conviction (cmb_buy) row is the aggregate.",
+               res.get("ic_buy"), figures.POS),
+        _block("▼ Sell side — each method's BEARISH calls",
+               "Restricted to each method's NEGATIVE scores: Sim win % = share that fell, "
+               "Sim ret % = short-only gross P&L. A genuinely predictive sell side shows a "
+               "POSITIVE IC here too (a more-negative score ranking a more-negative return). "
+               "The combined SELL-camp conviction (cmb_sell) row is the aggregate.",
+               res.get("ic_sell"), figures.NEG),
+        _block("● All calls — both directions combined",
+               "Every non-zero score regardless of sign — the classic per-method IC and the "
+               "combined_score headline, for reference.",
+               icdf, "#cbd5e1"),
+    ])
 
 
 _SIM_PERF_TOOLTIP = (

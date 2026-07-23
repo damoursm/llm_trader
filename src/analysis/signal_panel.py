@@ -39,8 +39,16 @@ from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_TIMEFRAME_COLUMNS,
                            SIGNAL_FUNDAMENTAL_COLUMNS)
 
 # Scored columns the IC report covers: every per-method column plus the
-# aggregator's weighted combined score (the "all methods together" row).
-PANEL_SCORE_COLUMNS = list(SIGNAL_METHOD_COLUMNS) + ["combined_score"]
+# aggregator's weighted combined score (the "all methods together" row) and the
+# buy/sell split sides (2026-07-22). The sides are persisted as MAGNITUDES
+# (combined_buy_score / combined_sell_score, both >= 0); build_panel derives the
+# signed evaluation columns below so the standard sign-convention machinery
+# (hit = directional, simret = sign(score)×fwd) applies unchanged: cmb_buy is
+# the bullish camp's conviction as-is, cmb_sell is the bearish camp's conviction
+# NEGATED (a bearish view in the standard signed convention).
+PANEL_SIDE_EVAL_COLUMNS = ["cmb_buy", "cmb_sell"]
+PANEL_SCORE_COLUMNS = (list(SIGNAL_METHOD_COLUMNS) + ["combined_score"]
+                       + PANEL_SIDE_EVAL_COLUMNS)
 
 
 # ── IC categories (the dashboard's section grouping) ───────────────────────
@@ -139,6 +147,15 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
     if dedupe == "last" and "generated_at" in df.columns:
         df = (df.sort_values("generated_at")
                 .groupby(["signal_date", "ticker"], as_index=False).tail(1))
+
+    # Signed evaluation columns for the buy/sell split sides (see
+    # PANEL_SIDE_EVAL_COLUMNS): buy side as-is, sell side negated so its sign
+    # says "bearish view" in the standard convention. Rows persisted before the
+    # split (NaN columns) simply contribute no views.
+    if "combined_buy_score" in df.columns:
+        df["cmb_buy"] = pd.to_numeric(df["combined_buy_score"], errors="coerce")
+    if "combined_sell_score" in df.columns:
+        df["cmb_sell"] = -pd.to_numeric(df["combined_sell_score"], errors="coerce")
 
     df["_sig_date"] = df["signal_date"].map(date.fromisoformat)
 
@@ -247,7 +264,8 @@ def periodic_ic_stats(days: Sequence, scores: Sequence, fwd: Sequence,
 
 
 def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
-               min_n: int = 20, min_per_day: int = 5, min_days: int = 3) -> pd.DataFrame:
+               min_n: int = 20, min_per_day: int = 5, min_days: int = 3,
+               side: Optional[str] = None) -> pd.DataFrame:
     """Per-method IC table: for each score column × horizon, the observation
     count ``n_<h>d``, Spearman ``ic_<h>d``, directional ``hit_<h>d`` (the
     **simulated win rate** — % of non-zero scores whose sign matched the forward
@@ -259,13 +277,27 @@ def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
     — which populate only once ``min_days`` signal-days each carrying
     ``min_per_day`` names have accrued. Methods with fewer than ``min_n`` joint
     observations report NaN. Sorted by |IC| at the longest horizon. Each row is
-    also tagged with its ``category``."""
+    also tagged with its ``category``.
+
+    ``side`` (2026-07-22) restricts every metric to ONE side of each method's
+    calls: ``"buy"`` = positive scores only (the method's bullish calls — hit
+    becomes P(fwd>0), simret the long-only P&L, IC the ranking skill WITHIN its
+    bullish calls), ``"sell"`` = negative scores only (bearish calls — hit =
+    P(fwd<0), simret the short-only P&L; a PREDICTIVE sell side shows a
+    POSITIVE IC there too, since a more-negative score should rank a
+    more-negative return). None = both (the historical behavior). The BUY-vs-
+    SELL forensics found method skill is heavily side-dependent (e.g. news:
+    all edge on the negative side), so the dashboard renders all three views."""
     rows = []
     for method in PANEL_SCORE_COLUMNS:
         if method not in panel.columns:
             continue
         s_all = pd.to_numeric(panel[method], errors="coerce")
         has_view = s_all.notna() & (s_all.abs() > 1e-12)
+        if side == "buy":
+            has_view &= s_all > 0
+        elif side == "sell":
+            has_view &= s_all < 0
         row: dict = {"method": method, "category": category_for(method),
                      "views": int(has_view.sum())}
         for h in horizons:

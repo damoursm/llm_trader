@@ -400,6 +400,11 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "volume_factor": float(getattr(s, "volume_factor", 1.0)),
                 "family_conf_factor": float(getattr(s, "family_conf_factor", 1.0)),
                 "tape_conf_factor": float(getattr(s, "tape_conf_factor", 1.0)),
+                # Buy/sell split sides (2026-07-22): the two camp-conviction
+                # aggregates whose difference is combined_score — persisted so
+                # each side's forward IC is monitored (Signal IC → Buy/Sell side).
+                "combined_buy_score": float(getattr(s, "combined_buy_score", 0.0)),
+                "combined_sell_score": float(getattr(s, "combined_sell_score", 0.0)),
                 "scores": all_scores,
             })
         if sig_rows:

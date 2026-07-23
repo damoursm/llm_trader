@@ -250,20 +250,26 @@ def broker_account_pnl() -> Optional[dict]:
 # ── Diagnostics accessors (IC · calibration · exit quality · execution) ──────
 
 def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) -> dict:
-    """Per-method information-coefficient table over the persisted signals panel
-    joined with forward returns. Cached (the OHLCV join is heavy). Returns
-    ``{panel_rows, tickers, ic}`` where ``ic`` is a DataFrame (empty until the
-    panel has enough forward-return history)."""
+    """Per-method information-coefficient tables over the persisted signals panel
+    joined with forward returns. Cached (the OHLCV join is heavy — done ONCE; the
+    three compute_ic passes over it are cheap). Returns ``{panel_rows, tickers,
+    ic, ic_buy, ic_sell}`` — ``ic`` over every call, ``ic_buy``/``ic_sell``
+    restricted to each method's bullish / bearish calls (2026-07-22: the BUY-vs-
+    SELL forensics found method skill is heavily side-dependent, so each side is
+    evaluated on its own)."""
     from src.analysis.signal_panel import build_panel, compute_ic
 
     def _q():
         panel = build_panel(horizons=horizons, days=days)
-        ic = (compute_ic(panel, horizons=horizons, min_n=min_n)
-              if panel is not None and not panel.empty else pd.DataFrame())
+        empty = panel is None or panel.empty
         return {
-            "panel_rows": 0 if panel is None or panel.empty else int(len(panel)),
-            "tickers":    0 if panel is None or panel.empty else int(panel["ticker"].nunique()),
-            "ic":         ic,
+            "panel_rows": 0 if empty else int(len(panel)),
+            "tickers":    0 if empty else int(panel["ticker"].nunique()),
+            "ic":      pd.DataFrame() if empty else compute_ic(panel, horizons=horizons, min_n=min_n),
+            "ic_buy":  pd.DataFrame() if empty else compute_ic(panel, horizons=horizons,
+                                                               min_n=min_n, side="buy"),
+            "ic_sell": pd.DataFrame() if empty else compute_ic(panel, horizons=horizons,
+                                                               min_n=min_n, side="sell"),
         }
     key = ("signal_ic", days, tuple(horizons), int(min_n))
     return _cached(key, lambda: _retry(_q, "signal_ic"))

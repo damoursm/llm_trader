@@ -1170,9 +1170,19 @@ class TickerSignal(BaseModel):
     ticker: str
     direction: Direction
     confidence: float           # 0.0 – 1.0
-    combined_score: float = 0.0 # -1.0 to +1.0 weighted sum of method scores (pre-confidence factors).
-                                # Stored so monitor_open_positions can compare today's signal
-                                # against signal_at_entry to detect thesis decay.
+    combined_score: float = 0.0 # -1.0 to +1.0. Since 2026-07-22 this is the DIFFERENCE of the
+                                # two side scores below (buy − sell, + the additive overlays) —
+                                # before that, the single normalised weighted sum. Stored so
+                                # monitor_open_positions can compare today's signal against
+                                # signal_at_entry to detect thesis decay.
+    # Buy/sell split (2026-07-22): each weighted method's inversion-corrected view is
+    # decomposed into a buy component max(0, eff) and a sell component max(0, −eff);
+    # each side is weight-averaged over the methods HOLDING that view only (its own
+    # camp — abstainers and the opposite camp don't dilute it). Both ∈ [0, 1]:
+    # combined_buy_score = how convinced the bullish camp is, combined_sell_score =
+    # how convinced the bearish camp is. combined_score = their difference.
+    combined_buy_score: float = 0.0
+    combined_sell_score: float = 0.0
     # Horizon synthesis (term-structure of edge) — populated when enable_horizon_synthesis=true.
     # target_horizon is the mechanical argmax-net-edge holding horizon (one of the
     # simulated-trade horizons, e.g. "1w"); horizon_label maps it to the LLM bucket;

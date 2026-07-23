@@ -697,7 +697,14 @@ def generate_recommendations(
         if blind_synthesis:
             parts = [f"- {s.ticker}:"]
         else:
-            parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, sources_agreeing={s.sources_agreeing}"]
+            # buy_score/sell_score (2026-07-22): the bullish and bearish camps'
+            # separate convictions — direction fires on their DIFFERENCE, so the
+            # LLM sees a contested read (0.55 vs 0.40) vs a one-sided one
+            # (0.55 vs 0.05). Aggregate verdict info → withheld in the blind arm.
+            parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, "
+                     f"buy_score={getattr(s, 'combined_buy_score', 0.0):.2f}, "
+                     f"sell_score={getattr(s, 'combined_sell_score', 0.0):.2f}, "
+                     f"sources_agreeing={s.sources_agreeing}"]
         if not blind_synthesis and settings.enable_horizon_synthesis and getattr(s, "target_horizon", ""):
             _tradeable = "" if getattr(s, "horizon_tradeable", True) else " — NO horizon clears cost, prefer WATCH/HOLD"
             parts.append(

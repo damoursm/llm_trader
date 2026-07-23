@@ -234,6 +234,21 @@ class Settings(BaseSettings):
     # review-noise-driven). Off = the pre-2026-07-12 single-review behavior.
     enable_llm_exit_confirmation: bool = True
 
+    # BUY/SELL SPLIT COMBINE (2026-07-22 user directive). Each weighted method's
+    # inversion-corrected view is decomposed into a BUY component max(0, eff) and a
+    # SELL component max(0, −eff), each side is weight-averaged over the methods
+    # holding that view ONLY (its own camp — abstainers and the opposing camp no
+    # longer dilute it, unlike the old single normalised pool), and
+    # combined_score = combined_buy − combined_sell (+ the additive overlays,
+    # unchanged). Direction fires on the DIFFERENCE clearing this band:
+    # diff >= +band → BULLISH, <= −band → BEARISH, else NEUTRAL. 0.15 was the old
+    # single-pool band; recalibrated on the 11.3k-row panel it keeps a comparable —
+    # and notably MORE BALANCED — mix (old: 32% bullish / 15% bearish; split:
+    # 18% / 21%), directly countering the measured BUY-side output skew. The two
+    # side scores are persisted per ticker (signals.combined_buy_score /
+    # combined_sell_score) so each side's IC is monitored on the dashboard.
+    buy_sell_diff_threshold: float = 0.15
+
     # ANTI-CHASE / OVEREXTENSION GATE (Gate 5 of the actionable filter, 2026-07-22).
     # The BUY-vs-SELL forensics (signals panel, 8.3k ticker-days) found the BUY
     # side's failure is CHASING: 40% of BUY calls landed in the top quintile of

@@ -1629,32 +1629,66 @@ def build_signals(
         if use_massive and ticker in allow_massive_set:
             massive_score = _compute_massive(ticker)
 
-        # ── Weighted combination ──────────────────────────────────────────
+        # ── Per-method (active, score) map ────────────────────────────────
         # Technical methods use their multi-timeframe BLEND (*_eff); non-OHLCV
-        # methods use their single live score.
-        combined = (
-            weights["news"]       * sentiment_score +
-            weights["sent_velocity"] * sent_velocity_score +
-            weights["tech"]       * tech_eff +
-            weights["massive"]    * massive_score +
-            weights["insider"]    * insider_sc +
-            weights["put_call"]   * pc_score +
-            weights["max_pain"]   * mp_score +
-            weights["oi_skew"]    * oi_skew_score +
-            weights["vwap"]       * vwap_eff +
-            weights["pattern"]    * pattern_eff +
-            weights["momentum"]   * momentum_eff +
-            weights["sector_momentum"] * sector_momentum_eff +
-            weights["market_momentum"] * market_momentum_score +
-            weights["money_flow"] * money_flow_eff +
-            weights["trend_strength"] * trend_strength_eff +
-            weights["pead"]       * pead_score_v +
-            weights["iv_rank"]    * iv_rank_eff +
-            weights["iv_expr"]    * iv_expr_score_v +
-            weights["coint"]      * coint_score_v +
-            weights["ext_gap"]    * ext_gap_score_v +
-            weights["broker_advisor"] * broker_advisor_score_v
-        )
+        # methods use their single live score. This ONE map feeds the buy/sell
+        # split combine below AND (through the inversion-corrected eff map
+        # further down) coherence / sources_agreeing / family agreement.
+        method_score_map = {
+            "news":       (active_flags["news"],       sentiment_score),
+            "sent_velocity": (active_flags["sent_velocity"], sent_velocity_score),
+            "tech":       (active_flags["tech"],       tech_eff),
+            "massive":    (active_flags["massive"],    massive_score),
+            "insider":    (active_flags["insider"],    insider_sc),
+            "put_call":   (active_flags["put_call"],   pc_score),
+            "max_pain":   (active_flags["max_pain"],   mp_score),
+            "oi_skew":    (active_flags["oi_skew"],    oi_skew_score),
+            "vwap":       (active_flags["vwap"],       vwap_eff),
+            "pattern":    (active_flags["pattern"],    pattern_eff),
+            "momentum":   (active_flags["momentum"],   momentum_eff),
+            "sector_momentum": (active_flags["sector_momentum"], sector_momentum_eff),
+            "market_momentum": (active_flags["market_momentum"], market_momentum_score),
+            "money_flow": (active_flags["money_flow"], money_flow_eff),
+            "trend_strength": (active_flags["trend_strength"], trend_strength_eff),
+            "pead":       (active_flags["pead"],       pead_score_v),
+            "iv_rank":    (active_flags["iv_rank"],    iv_rank_eff),
+            "iv_expr":    (active_flags["iv_expr"],    iv_expr_score_v),
+            "coint":      (active_flags["coint"],      coint_score_v),
+            "ext_gap":    (active_flags["ext_gap"],    ext_gap_score_v),
+            "broker_advisor": (active_flags["broker_advisor"], broker_advisor_score_v),
+        }
+
+        # ── Buy/sell split combine (2026-07-22 user directive) ────────────
+        # Each method's inversion-corrected view (eff ∈ [-1, +1]; the weight's
+        # sign carries the inversion, so |w|·eff == w·score) is decomposed into
+        # a BUY component max(0, eff) and a SELL component max(0, −eff), both
+        # ∈ [0, 1]. Each side is then weight-averaged over the methods HOLDING
+        # that view only — its own camp — so abstainers and the opposing camp
+        # no longer dilute a side the way they diluted the old single
+        # normalised pool. combined_buy = the bullish camp's conviction,
+        # combined_sell = the bearish camp's, combined = their DIFFERENCE
+        # (recalibrated band check at the Direction step below; the additive
+        # overlays keep landing on the difference, exactly as they landed on
+        # the old pooled sum). NOTE the deliberate consequence: a lone loud
+        # bull against many bears reads as a strong buy CAMP — camp SIZE is
+        # judged by the machinery built for it (coherence factor, Gate 1b
+        # sources_agreeing, family agreement), not by re-diluting the score.
+        _buy_acc = _sell_acc = _buy_w = _sell_w = 0.0
+        for _m, (_on, _s) in method_score_map.items():
+            _w = weights[_m]
+            if not _on or not _w or not _s:
+                continue                        # inactive / zero-weight / no view
+            _eff = _s if _w > 0 else -_s        # inversion-corrected view
+            _wm = abs(_w)
+            if _eff > 0:
+                _buy_acc += _wm * min(1.0, _eff)
+                _buy_w += _wm
+            else:
+                _sell_acc += _wm * min(1.0, -_eff)
+                _sell_w += _wm
+        combined_buy = (_buy_acc / _buy_w) if _buy_w else 0.0
+        combined_sell = (_sell_acc / _sell_w) if _sell_w else 0.0
+        combined = combined_buy - combined_sell
 
         # ── Interaction adjustments ───────────────────────────────────────
         # Small additive corrections for setups where two methods together
@@ -1697,45 +1731,24 @@ def build_signals(
                 kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
 
         # ── Direction ─────────────────────────────────────────────────────
+        # The buy−sell DIFFERENCE clearing the configured band is the buy/sell
+        # decision (settings.buy_sell_diff_threshold; 0.15 default — the old
+        # single-pool band, revalidated on the panel where it yields a more
+        # BALANCED 18%/21% bullish/bearish mix vs the old pool's 32%/15%).
+        _band = settings.buy_sell_diff_threshold
         direction: Direction
-        if combined >= 0.15:
+        if combined >= _band:
             direction = "BULLISH"
-        elif combined <= -0.15:
+        elif combined <= -_band:
             direction = "BEARISH"
         else:
             direction = "NEUTRAL"
 
         # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
-        # Technical methods use the blended (*_eff) values so coherence reflects
-        # exactly what the combine consumed. The enabled flag reads from
-        # active_flags (not the raw use_* booleans) so a win-rate-FILTERED method
-        # is dropped from coherence + sources_agreeing exactly as it is from the
-        # weighted combine — active_flags == use_* whenever the filter is inactive.
-        # Named map (not a bare list) so the family rollup below can group the
-        # SAME effective values by information family.
-        method_score_map = {
-            "news":       (active_flags["news"],       sentiment_score),
-            "sent_velocity": (active_flags["sent_velocity"], sent_velocity_score),
-            "tech":       (active_flags["tech"],       tech_eff),
-            "massive":    (active_flags["massive"],    massive_score),
-            "insider":    (active_flags["insider"],    insider_sc),
-            "put_call":   (active_flags["put_call"],   pc_score),
-            "max_pain":   (active_flags["max_pain"],   mp_score),
-            "oi_skew":    (active_flags["oi_skew"],    oi_skew_score),
-            "vwap":       (active_flags["vwap"],       vwap_eff),
-            "pattern":    (active_flags["pattern"],    pattern_eff),
-            "momentum":   (active_flags["momentum"],   momentum_eff),
-            "sector_momentum": (active_flags["sector_momentum"], sector_momentum_eff),
-            "market_momentum": (active_flags["market_momentum"], market_momentum_score),
-            "money_flow": (active_flags["money_flow"], money_flow_eff),
-            "trend_strength": (active_flags["trend_strength"], trend_strength_eff),
-            "pead":       (active_flags["pead"],       pead_score_v),
-            "iv_rank":    (active_flags["iv_rank"],    iv_rank_eff),
-            "iv_expr":    (active_flags["iv_expr"],    iv_expr_score_v),
-            "coint":      (active_flags["coint"],      coint_score_v),
-            "ext_gap":    (active_flags["ext_gap"],    ext_gap_score_v),
-            "broker_advisor": (active_flags["broker_advisor"], broker_advisor_score_v),
-        }
+        # method_score_map is built ABOVE the buy/sell split combine (one map,
+        # shared): blended (*_eff) values + active_flags, so coherence reflects
+        # exactly what the combine consumed and a win-rate-FILTERED method is
+        # dropped from coherence + sources_agreeing exactly as from the combine.
         # Effective (inversion-corrected) scores — the SINGLE canonical transform
         # used by every "does this method agree with combined_score" computation
         # below (coherence, sources_agreeing, family agreement). 2026-07-20: this
@@ -1813,6 +1826,8 @@ def build_signals(
             direction=direction,
             confidence=confidence,
             combined_score=round(combined, 4),
+            combined_buy_score=round(combined_buy, 4),
+            combined_sell_score=round(combined_sell, 4),
             sentiment_score=round(sentiment_score, 3),
             sentiment_velocity_score=round(sent_velocity_score, 3),
             sentiment_recent=round(sent_recent, 3),
@@ -1993,10 +2008,17 @@ def build_signals(
                     continue
                 new_combined = sig.combined_score + cs_w * cs
                 new_combined = max(-2.0, min(2.0, new_combined))
-                # Re-derive direction + confidence on the adjusted combined
-                if new_combined >= 0.15:
+                # Re-derive direction + confidence on the adjusted combined.
+                # Uses the SAME configurable band as the first pass (buy/sell
+                # split, 2026-07-22) so a tuned threshold applies consistently
+                # to cross-sectional-adjusted names too. cross_sectional is an
+                # additive relative-value overlay on the TOTAL (like the corp/
+                # fundamental/trend overlays), so it lands on combined_score and
+                # deliberately does NOT touch the persisted buy/sell camp sides.
+                _cs_band = settings.buy_sell_diff_threshold
+                if new_combined >= _cs_band:
                     new_direction: Direction = "BULLISH"
-                elif new_combined <= -0.15:
+                elif new_combined <= -_cs_band:
                     new_direction = "BEARISH"
                 else:
                     new_direction = "NEUTRAL"

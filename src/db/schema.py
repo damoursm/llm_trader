@@ -114,6 +114,13 @@ SIGNAL_CONFIDENCE_COMPONENT_COLUMNS = (
     "volume_factor", "family_conf_factor", "tape_conf_factor",
 )
 
+# Buy/sell split combine sides (2026-07-22) — the two camp-conviction aggregates
+# whose DIFFERENCE is combined_score. NOT method scores (kept OUT of
+# SIGNAL_METHOD_COLUMNS / tracker._ALL_METHODS — they are aggregates OF the
+# methods, like combined_score itself); persisted per ticker so each side's
+# forward IC is monitored on the dashboard (Signal IC → Buy side / Sell side).
+SIGNAL_COMBINED_SIDE_COLUMNS = ("combined_buy_score", "combined_sell_score")
+
 SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS runs (
@@ -272,6 +279,7 @@ SCHEMA_STATEMENTS = [
         price               DOUBLE,
         {", ".join(f"{m} DOUBLE" for m in SIGNAL_METHOD_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_COMBINED_SIDE_COLUMNS)},
         scores              VARCHAR
     );
     """,
@@ -361,6 +369,8 @@ _ADD_COLUMNS = (
     ("signals", "universe_source", "VARCHAR"),
     # Confidence-formula component factors (2026-07-21) on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS),
+    # Buy/sell split combine sides (2026-07-22) on an existing signals table.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_COMBINED_SIDE_COLUMNS),
     # IBKR account P&L snapshot (reqPnL) on an existing broker_reconciles table.
     ("broker_reconciles", "pnl_daily", "DOUBLE"),
     ("broker_reconciles", "pnl_unrealized", "DOUBLE"),
