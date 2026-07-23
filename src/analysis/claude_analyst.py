@@ -2,8 +2,10 @@
 
 import anthropic
 import json
+import openai
 import random
 import re
+import time
 from loguru import logger
 from typing import List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
@@ -163,7 +165,15 @@ def _anthropic_thinking_kwargs(model: str) -> dict:
         return {}                                  # Haiku 4.5 / older 400 on both params
     kwargs: dict = {"thinking": {"type": "adaptive"}}
     if settings.llm_max_thinking:
-        kwargs["output_config"] = {"effort": "max"}   # deepest reasoning budget
+        # Effort (GA) lives in output_config. Route it through extra_body — a
+        # version-agnostic passthrough merged into the request JSON — instead of a
+        # top-level output_config= kwarg: the installed anthropic SDK (0.49.0)
+        # predates the native kwarg and raises `TypeError: stream() got an
+        # unexpected keyword argument 'output_config'`, which silently kicked EVERY
+        # Anthropic synthesis/hold-review call over to the DeepSeek fallback (and
+        # then rule-based when DeepSeek was also down). extra_body is identical on
+        # the wire to the native kwarg on newer SDKs, so this is forward-compatible.
+        kwargs["extra_body"] = {"output_config": {"effort": "max"}}   # deepest reasoning budget
     return kwargs
 
 
@@ -179,19 +189,99 @@ def _engine_of(model: str) -> str:
 
 
 def _synthesis_attempts_for(chosen_model: str, anthropic_fallback: str,
-                            deepseek_fallback: str) -> list:
+                            deepseek_fallback: str, qwen_fallback: str) -> list:
     """Ordered ``(engine, model)`` synthesis attempts for a chosen model: the
-    chosen model first, then a DIFFERENT provider's default model as the error
-    fallback, so a provider outage still yields a recommendation. Pure /
+    chosen model first, then the OTHER TWO providers' default models as
+    successive error fallbacks (fixed resilience order deepseek → qwen →
+    anthropic, skipping whichever was already chosen), so a single provider
+    outage — or a merely TRANSIENT failure on the chosen engine itself (a
+    timeout, a rate limit) — still has two more shots before rule-based. Pure /
     deterministic — the random pool pick happens in the caller, so this is
-    unit-testable. Qwen (the 2026-07-11 primary) falls back to DeepSeek, the cheap
-    resilient OpenAI-compatible engine."""
+    unit-testable.
+
+    2026-07-22: widened from exactly one fallback. The old fixed pairing
+    (deepseek chosen -> anthropic only, never qwen) meant that whenever
+    Anthropic credits were exhausted, ANY transient DeepSeek hiccup on the
+    ~2/3 of runs that chose a DeepSeek arm collapsed straight to rule-based —
+    even with DeepSeek itself fully funded and Qwen possibly available —
+    because the chain never reached a 3rd engine. Observed 2026-07-22: a
+    DeepSeek ReadTimeout fell to a broke Anthropic account and gave up, in the
+    same tick DeepSeek had already answered two dozen other calls."""
     eng = _engine_of(chosen_model)
-    if eng == "anthropic":
-        return [("anthropic", chosen_model), ("deepseek", deepseek_fallback)]
-    if eng == "qwen":
-        return [("qwen", chosen_model), ("deepseek", deepseek_fallback)]
-    return [("deepseek", chosen_model), ("anthropic", anthropic_fallback)]
+    fallback_model = {"anthropic": anthropic_fallback, "deepseek": deepseek_fallback, "qwen": qwen_fallback}
+    rest = [e for e in ("deepseek", "qwen", "anthropic") if e != eng]
+    return [(eng, chosen_model)] + [(e, fallback_model[e]) for e in rest]
+
+
+# Message/type markers for a TRANSIENT-looking LLM failure that a plain httpx
+# exception (no SDK status_code) can present under — a read-timeout mid-stream
+# leaks through un-translated because openai-python only wraps the request-
+# issuing call, not each chunk read of an already-open stream, so a stall
+# between chunks raises the raw httpx exception rather than an APITimeoutError.
+_TRANSIENT_ERROR_MARKERS = (
+    "timeout", "timed out", "connection", "reset by peer",
+    "temporarily unavailable", "overloaded", "network",
+)
+
+
+def _is_transient_llm_error(e: Exception) -> bool:
+    """True when an LLM call failure looks recoverable by retrying the SAME
+    engine — a timeout, dropped connection, rate limit (429), or server error
+    (5xx) — as opposed to a HARD failure (bad/missing key, bad request,
+    insufficient credits/balance) that will just fail again immediately.
+
+    openai and anthropic are both stainless-generated SDKs sharing one shape:
+    every ``APIStatusError`` (and its named subclasses — ``RateLimitError``,
+    ``InternalServerError``, …) carries the HTTP ``status_code``; a connection-
+    level failure (``APIConnectionError``/``APITimeoutError``) carries none and
+    is always transient. A raw httpx timeout that leaks through un-translated
+    (see module note above) has neither, so it falls through to the message/
+    type marker check."""
+    status = getattr(e, "status_code", None)
+    if status is not None:
+        return status == 429 or status >= 500
+    if isinstance(e, (openai.APIConnectionError, anthropic.APIConnectionError)):
+        return True
+    blob = f"{type(e).__name__} {e}".lower()
+    return any(m in blob for m in _TRANSIENT_ERROR_MARKERS)
+
+
+def _call_engine(engine: str, model: str, prompt: str) -> str:
+    """Dispatch one synthesis attempt to its provider. Raises on failure — the
+    caller's cross-engine fallback (or ``_call_with_retry`` below) takes over."""
+    if engine == "anthropic":
+        return _call_claude_analyst(prompt, model=model)
+    if engine == "qwen":
+        api_model, thinking = _qwen_spec(model)
+        return _call_qwen_analyst(prompt, model=api_model, thinking=thinking)
+    api_model, thinking = _deepseek_spec(model)
+    return _call_deepseek_analyst(prompt, model=api_model, thinking=thinking)
+
+
+def _call_with_retry(engine: str, model: str, prompt: str) -> str:
+    """``_call_engine`` with up to ``settings.llm_transient_retries`` same-engine
+    retries on a TRANSIENT failure before raising to the caller's cross-engine
+    fallback. A hard failure (credits/auth/bad request) raises immediately —
+    retrying it wastes a tick's worth of time for a guaranteed repeat failure.
+
+    2026-07-22: added because a DeepSeek ReadTimeout — purely transient,
+    DeepSeek answered ~25 other calls fine in the same tick — was previously
+    treated exactly like a hard failure: one shot, then straight to the next
+    provider in the attempt list (which may itself be out of credits)."""
+    retries = max(0, int(settings.llm_transient_retries))
+    for attempt_n in range(retries + 1):
+        try:
+            return _call_engine(engine, model, prompt)
+        except Exception as e:
+            if attempt_n < retries and _is_transient_llm_error(e):
+                logger.warning(
+                    f"[claude] {engine} ({model}) analyst failed "
+                    f"({type(e).__name__}: {e}) — transient, retrying same engine "
+                    f"({attempt_n + 1}/{retries})"
+                )
+                time.sleep(settings.llm_transient_retry_wait_seconds)
+                continue
+            raise
 
 
 # Marks the boundary between the CACHEABLE prefix (persona + signal-method
@@ -592,6 +682,16 @@ def generate_recommendations(
     # OWN direction+confidence from the raw per-method evidence that follows.
     # The 2026-07-12 agreement eval found 96% of sighted calls simply echo the
     # aggregator — this arm measures whether independent judgment beats the echo.
+    #
+    # Win-rate method filter: any method whose solo win rate is confidently sub-50%
+    # is already held out of the combined_score / confidence / sources_agreeing above
+    # (aggregator.build_signals); mirror that here by HIDING its per-ticker score line
+    # so the LLM never leans on a sub-coin-flip method. Same cached filter set the
+    # aggregator used, so the two stay consistent. Filtered methods are still scored +
+    # persisted to the panel — this only affects what synthesis SEES.
+    from src.signals.aggregator import winrate_filtered_methods
+    _filtered_methods = winrate_filtered_methods()
+    _kept = lambda method: method not in _filtered_methods  # noqa: E731
     signal_lines = []
     for s in signals_for_claude:
         if blind_synthesis:
@@ -617,65 +717,91 @@ def generate_recommendations(
                     f"(upside rank {s.upside_score:.3f}), {_alnote}. Prioritise the names with the "
                     f"largest expected favourable move in the market's direction."
                 )
-        if use_news:
+        # Cross-family agreement rollup — WHICH independent information families
+        # align, not just how many methods. Sighted arm gets the alignment framing
+        # (it references the combined direction); the blind arm gets the NEUTRAL
+        # rollup only (family scores are aggregates of the per-method evidence
+        # below — no aggregate verdict leak). Tape structure is raw market data,
+        # direction-neutral phrasing, shown in both arms.
+        _fam_detail = getattr(s, "family_detail", "")
+        if _fam_detail:
+            if blind_synthesis:
+                parts.append(
+                    f"  FAMILY ROLLUP (independent info families, magnitude-weighted): {_fam_detail}"
+                )
+            else:
+                _n_agree = getattr(s, "families_agreeing", 0)
+                _n_oppose = getattr(s, "families_opposing", 0)
+                parts.append(
+                    f"  FAMILY AGREEMENT: {_n_agree} independent famil{'y' if _n_agree == 1 else 'ies'} "
+                    f"aligned with the read, {_n_oppose} opposing — {_fam_detail}"
+                )
+        _tape_lbl = getattr(s, "tape_confirmation_label", "")
+        if _tape_lbl and _tape_lbl != "NO_DATA":
+            parts.append(
+                f"  TAPE STRUCTURE={s.tape_confirmation_score:+.2f} [{_tape_lbl}] "
+                f"({s.tape_confirmation_detail}) — score-independent raw price/volume state; "
+                f">0 = bullish structure"
+            )
+        if use_news and _kept("news"):
             parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
-        if getattr(s, "ext_gap_score", 0.0):
+        if _kept("ext_gap") and getattr(s, "ext_gap_score", 0.0):
             parts.append(
                 f"  EXTENDED-SESSION GAP={s.ext_gap_score:+.2f} "
                 f"(live off-hours move {s.ext_gap_pct:+.1f}% vs last completed close, ATR-normalised)"
             )
-        if getattr(s, "sentiment_velocity_score", 0.0):
+        if _kept("sent_velocity") and getattr(s, "sentiment_velocity_score", 0.0):
             parts.append(
                 f"  Sentiment VELOCITY={s.sentiment_velocity_score:+.2f} "
                 f"(Δ tone: recent {s.sentiment_recent:+.2f} vs prior {s.sentiment_prior:+.2f}; "
                 f"news mood {'accelerating up' if s.sentiment_velocity_score > 0 else 'deteriorating'} — short-horizon timing)"
             )
-        if use_tech:
+        if use_tech and _kept("tech"):
             parts.append(f"  Technical score={s.technical_score:+.2f}")
-        if use_insider and s.insider_cluster_detected:
+        if use_insider and _kept("insider") and s.insider_cluster_detected:
             parts.append(
                 f"  *** INSIDER CLUSTER: {s.insider_cluster_size} different insiders bought within 5 days "
                 f"(insider_score already amplified 1.75×) ***"
             )
-        if use_insider and getattr(s, "insider_persistence_detected", False):
+        if use_insider and _kept("insider") and getattr(s, "insider_persistence_detected", False):
             parts.append(
                 f"  *** INSIDER PERSISTENCE: {s.insider_persistence_buyer} bought {s.insider_persistence_count}× "
                 f"on separate days (insider_score amplified for repeated single-name conviction) ***"
             )
-        if use_insider and s.insider_summary:
+        if use_insider and _kept("insider") and s.insider_summary:
             parts.append(f"  Insider activity: {s.insider_summary}")
-        if use_put_call_signal and s.put_call_score:
+        if use_put_call_signal and _kept("put_call") and s.put_call_score:
             parts.append(f"  Put/call score={s.put_call_score:+.2f} (contrarian; >0=extreme puts=bullish bias, <0=extreme calls=bearish bias)")
-        if s.vwap_score:
+        if _kept("vwap") and s.vwap_score:
             dist = f" ({s.vwap_distance_pct:+.1f}% from VWAP)" if s.vwap_distance_pct else ""
             parts.append(f"  VWAP_score={s.vwap_score:+.2f}{dist}")
         if s.gex_signal:
             flip = f", gamma_flip=${s.gamma_flip:.2f}" if s.gamma_flip else ""
             em   = f", exp_move=±{s.expected_move_pct:.1f}%" if s.expected_move_pct else ""
-            mp   = f", max_pain_score={s.max_pain_score:+.2f}" if s.max_pain_score else ""
-            sk   = f", oi_skew={s.oi_skew_score:+.2f}" if s.oi_skew_score else ""
+            mp   = f", max_pain_score={s.max_pain_score:+.2f}" if (_kept("max_pain") and s.max_pain_score) else ""
+            sk   = f", oi_skew={s.oi_skew_score:+.2f}" if (_kept("oi_skew") and s.oi_skew_score) else ""
             parts.append(f"  GEX={s.gex_signal}{flip}, max_pain_bias={s.max_pain_bias}{mp}{sk}{em}")
         pat_score = getattr(s, "pattern_score", 0.0)
         pat_name  = getattr(s, "pattern_name", "")
-        if pat_score and pat_name:
+        if _kept("pattern") and pat_score and pat_name:
             parts.append(f"  Pattern_score={pat_score:+.2f} [{pat_name}]  (historical win-rate; >0=bullish pattern, <0=bearish)")
         mom_score = getattr(s, "momentum_score", 0.0)
         mom_1m    = getattr(s, "momentum_1m_pct", 0.0)
         mom_3m    = getattr(s, "momentum_3m_pct", 0.0)
-        if mom_score:
+        if _kept("momentum") and mom_score:
             mom_ret = f" (1m:{mom_1m:+.1f}%, 3m:{mom_3m:+.1f}%)" if mom_1m else ""
             parts.append(f"  Momentum_score={mom_score:+.2f}{mom_ret}  (perceived-value trend vs own history)")
         smom_score = getattr(s, "sector_momentum_score", 0.0)
         smom_bench = getattr(s, "sector_benchmark", "")
         smom_1m    = getattr(s, "sector_momentum_1m_pct", 0.0)
         smom_3m    = getattr(s, "sector_momentum_3m_pct", 0.0)
-        if smom_score and smom_bench:
+        if _kept("sector_momentum") and smom_score and smom_bench:
             smom_ret = f" (1m:{smom_1m:+.1f}pp, 3m:{smom_3m:+.1f}pp vs {smom_bench})" if smom_1m else f" vs {smom_bench}"
             parts.append(f"  SectorRelativeMomentum_score={smom_score:+.2f}{smom_ret}  (beta-stripped: ticker minus sector ETF; >0 = outperforming peers)")
         mmom_score = getattr(s, "market_momentum_score", 0.0)
         mmom_1m    = getattr(s, "market_momentum_1m_pct", 0.0)
         mmom_3m    = getattr(s, "market_momentum_3m_pct", 0.0)
-        if mmom_score:
+        if _kept("market_momentum") and mmom_score:
             # Spell out the divergence so the model has the interpretation
             # ready without having to reason about three numbers from scratch.
             mmom_ret = f" (1m:{mmom_1m:+.1f}pp, 3m:{mmom_3m:+.1f}pp vs SPY)" if mmom_1m else " vs SPY"
@@ -699,29 +825,29 @@ def generate_recommendations(
         mf_score = getattr(s, "money_flow_score", 0.0)
         mfi_val  = getattr(s, "mfi_value", 50.0)
         cmf_val  = getattr(s, "cmf_value", 0.0)
-        if mf_score:
+        if _kept("money_flow") and mf_score:
             parts.append(f"  MoneyFlow_score={mf_score:+.2f} (MFI={mfi_val:.0f}, CMF={cmf_val:+.2f})  (>0=accumulation, <0=distribution)")
         ts_score = getattr(s, "trend_strength_score", 0.0)
         ts_lbl   = getattr(s, "trend_strength_label", "")
-        if ts_score or (ts_lbl and ts_lbl not in ("NO_DATA", "NO_TREND")):
+        if _kept("trend_strength") and (ts_score or (ts_lbl and ts_lbl not in ("NO_DATA", "NO_TREND"))):
             adx_v = getattr(s, "adx_value", 0.0)
             parts.append(f"  TrendStrength_score={ts_score:+.2f} (ADX={adx_v:.0f}, {ts_lbl}; >0=confirmed uptrend, <0=downtrend, ADX<20=chop→dampened)")
         pead_sc = getattr(s, "pead_score", 0.0)
-        if pead_sc:
+        if _kept("pead") and pead_sc:
             psurp = getattr(s, "pead_surprise_pct", 0.0)
             pdays = getattr(s, "pead_days_since_report", 0)
             parts.append(f"  PEAD_score={pead_sc:+.2f} (EPS surprise {psurp:+.1f}%, {pdays}d since report; post-earnings drift, >0=beat→drift up)")
         ivr_sc  = getattr(s, "iv_rank_score", 0.0)
         ivr_lbl = getattr(s, "iv_rank_label", "NEUTRAL")
-        if ivr_sc or (ivr_lbl and ivr_lbl != "NEUTRAL"):
+        if _kept("iv_rank") and (ivr_sc or (ivr_lbl and ivr_lbl != "NEUTRAL")):
             ivr_val = getattr(s, "iv_rank", 50.0)
             parts.append(f"  IVRank_score={ivr_sc:+.2f} (IV-rank {ivr_val:.0f}, {ivr_lbl}; high-IV→contrarian/fade, low-IV→trend-confirm)")
         ivx_sc  = getattr(s, "iv_expr_score", 0.0)
         ivx_lbl = getattr(s, "iv_expr_label", "NEUTRAL")
-        if ivx_sc or (ivx_lbl and ivx_lbl not in ("NEUTRAL", "NO_OPTIONS_DATA")):
+        if _kept("iv_expr") and (ivx_sc or (ivx_lbl and ivx_lbl not in ("NEUTRAL", "NO_OPTIONS_DATA"))):
             parts.append(f"  IVExpr_score={ivx_sc:+.2f} ({ivx_lbl}; options-chain IV vs own history + OI skew)")
         coint_sc = getattr(s, "coint_score", 0.0)
-        if coint_sc:
+        if _kept("coint") and coint_sc:
             parts.append(f"  Coint_score={coint_sc:+.2f} (stat-arb pair lean; >0=cheap/long leg, <0=rich/short leg)")
         cs_sc = getattr(s, "cross_sectional_score", 0.0)
         if cs_sc:
@@ -744,6 +870,17 @@ def generate_recommendations(
             "signal block agree: when news sentiment, technical momentum, AND smart money all "
             "point the same direction, the probability of being right is substantially higher "
             "than any single source alone.\n"
+            "   - AGREEMENT QUALITY — the methods are grouped into independent information "
+            "FAMILIES (Sentiment, Price/Trend, Rel-Strength, Volume-Flow, Options, Smart-Money, "
+            "Event/Arb; see each ticker's FAMILY ROLLUP line). Several methods from the SAME "
+            "family agreeing is ONE independent confirmation, not many — the technical methods "
+            "all read the same price tape, so a technical pile-on is pseudo-replication. Weigh "
+            "agreement ACROSS families (e.g. news + options + smart money) far above same-family "
+            "pile-ons.\n"
+            "   - TAPE STRUCTURE is a score-independent check of the raw market data (range "
+            "position, whether volume concentrates on up or down days, last-bar relative "
+            "volume). Treat alignment between your directional read and the tape as market "
+            "confirmation; a read that the tape contradicts deserves a confidence haircut.\n"
         )
         conviction_rules = (
             "3. Conviction rules — NO pre-computed verdict is provided. Form your OWN direction "
@@ -751,9 +888,9 @@ def generate_recommendations(
             "   - confidence = your calibrated probability that the direction is right at the "
             "stated horizon. 0.5 = coin flip. Distribute honestly across the list — do not "
             "cluster everything at 0.7-0.9.\n"
-            "   - confidence ≥ 0.78 AND ≥ 2 independent method families agreeing → eligible for BUY / SELL.\n"
-            "   - confidence ≥ 0.78 but only one method family in support → HOLD maximum (single-source signals are noise).\n"
-            "   - confidence 0.55-0.77 → HOLD (monitor closely).\n"
+            "   - confidence ≥ 0.85 AND ≥ 2 independent method families agreeing → eligible for BUY / SELL.\n"
+            "   - confidence ≥ 0.85 but only one method family in support → HOLD maximum (single-source signals are noise).\n"
+            "   - confidence 0.55-0.84 → HOLD (monitor closely).\n"
             "   - confidence < 0.55 → WATCH only.\n"
             "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
@@ -763,22 +900,39 @@ def generate_recommendations(
             "   - Strongly prefer tickers where sources_agreeing ≥ 2: when news sentiment, "
             "technical momentum, AND smart money all point the same direction, the probability "
             "of being right is substantially higher than any single source alone.\n"
+            "   - AGREEMENT QUALITY — sources_agreeing counts METHODS, but many methods are "
+            "correlated (the technical methods all read the same price tape). Each ticker's "
+            "FAMILY AGREEMENT line rolls the methods up into independent information FAMILIES "
+            "(Sentiment, Price/Trend, Rel-Strength, Volume-Flow, Options, Smart-Money, "
+            "Event/Arb): several same-family methods agreeing is ONE independent confirmation, "
+            "not many. Weigh cross-FAMILY agreement above the raw sources_agreeing count — 3 "
+            "families aligned (e.g. news + options + smart money) is materially stronger "
+            "evidence than 5 technical methods agreeing, and an OPPOSING family is a genuine "
+            "red flag, not one dissenting vote among many.\n"
+            "   - TAPE STRUCTURE is a score-independent check of the raw market data (range "
+            "position, whether volume concentrates on up or down days, last-bar relative "
+            "volume). Alignment between the signal direction and the tape is confirmation from "
+            "the market itself; divergence (bullish signal, bearish tape) warrants a confidence "
+            "haircut even when method scores agree.\n"
         )
         conviction_rules = (
             "3. Conviction rules:\n"
-            "   - confidence ≥ 0.78 AND sources_agreeing ≥ 2 → eligible for BUY / SELL.\n"
-            "   - confidence ≥ 0.78 but sources_agreeing = 1 → HOLD maximum (single-source signals are noise).\n"
-            "   - confidence 0.55-0.77 → HOLD (monitor closely).\n"
+            "   - confidence ≥ 0.85 AND sources_agreeing ≥ 2 → eligible for BUY / SELL.\n"
+            "   - confidence ≥ 0.85 but sources_agreeing = 1 → HOLD maximum (single-source signals are noise).\n"
+            "   - confidence 0.55-0.84 → HOLD (monitor closely).\n"
             "   - confidence < 0.55 → WATCH only.\n"
             "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
             "   - The pre-computed confidence already reflects: every enabled method score "
-            "combined by weight, cross-method coherence (how strongly the methods agree, "
-            "magnitude-weighted), movement potential (ATR + Bollinger-band width), volume "
-            "confirmation, cross-sectional rank vs the universe, and sector-ETF alignment. It "
-            "also bakes in recency-weighted sentiment, article count, and source diversity "
-            "inside the news score. Trust it — do not override upward without explicit "
-            "multi-source justification.\n"
+            "combined by weight (methods with a confirmed sub-50% solo win rate are already "
+            "excluded from the combine entirely — you are not seeing their scores), "
+            "cross-method coherence (how strongly the methods agree, magnitude-weighted), "
+            "movement potential (ATR + Bollinger-band width), volume confirmation, "
+            "cross-FAMILY agreement breadth (see FAMILY AGREEMENT above), raw-tape confirmation "
+            "(see TAPE STRUCTURE above), cross-sectional rank vs the universe, and sector-ETF "
+            "alignment. It also bakes in recency-weighted sentiment, article count, and source "
+            "diversity inside the news score. Trust it — do not override upward without "
+            "explicit multi-source justification.\n"
         )
 
     # Build the active-methods description for the prompt
@@ -3450,14 +3604,15 @@ Return ALL tickers from the input. No markdown, JSON only."""
                     f"{', coerced from ' + force_engine if eng != force_engine else ''})")
     elif pool:
         chosen = random.choice(pool)               # uniform → equal split over the pool
-        attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL)
+        attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL,
+                                            _qwen_default_model())
         logger.info(f"[claude] A/B synthesis bake-off this run: model={chosen} "
                     f"(pool of {len(pool)}, equal split)")
     else:
         primary = "anthropic" if random.random() < settings.llm_ab_anthropic_share else "deepseek"
-        engines = ["anthropic", "deepseek"] if primary == "anthropic" else ["deepseek", "anthropic"]
-        attempts = [(e, settings.analyst_model if e == "anthropic" else _DEEPSEEK_ANALYST_MODEL)
-                    for e in engines]
+        chosen = settings.analyst_model if primary == "anthropic" else _DEEPSEEK_ANALYST_MODEL
+        attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL,
+                                            _qwen_default_model())
         logger.info(
             f"[claude] A/B routing this run: primary={primary} "
             f"(anthropic share={settings.llm_ab_anthropic_share:.0%})"
@@ -3466,17 +3621,8 @@ Return ALL tickers from the input. No markdown, JSON only."""
     analyst_source = settings.analyst_model
     for engine, model in attempts:
         try:
-            if engine == "anthropic":
-                raw = _call_claude_analyst(prompt, model=model)
-                analyst_source = model
-            elif engine == "qwen":
-                api_model, thinking = _qwen_spec(model)
-                raw = _call_qwen_analyst(prompt, model=api_model, thinking=thinking)
-                analyst_source = model       # LOGICAL id (e.g. qwen3.7-max-thinking) for provenance
-            else:
-                api_model, thinking = _deepseek_spec(model)
-                raw = _call_deepseek_analyst(prompt, model=api_model, thinking=thinking)
-                analyst_source = model       # the LOGICAL id (e.g. deepseek-v4-pro-thinking) for provenance
+            raw = _call_with_retry(engine, model, prompt)
+            analyst_source = model      # LOGICAL id (e.g. deepseek-v4-pro-thinking) for provenance
             break
         except Exception as e:
             logger.warning(
@@ -3560,6 +3706,13 @@ Return ALL tickers from the input. No markdown, JSON only."""
     missing = [s for s in signals if s.ticker not in covered]
     if missing and not force_engine:
         fallback = _fallback_recommendations(missing)
+        # Mark them: these are NOT the synthesis model's calls (it was never
+        # asked about these tickers), so _persist_run stamps them with the
+        # rule-based provider rather than the run's model id. Without this they
+        # inherit the model's name and contaminate every per-engine comparison
+        # — they were ~22% of all persisted rows before 2026-07-22.
+        for _r in fallback:
+            _r.rule_filled = True
         recommendations += fallback
         # By design the LLM rates the top candidates and returns BUY/SELL/HOLD/WATCH
         # for those; the rest of a ~330-name universe are "absent" and get a neutral

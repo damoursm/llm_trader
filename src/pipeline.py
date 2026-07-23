@@ -74,7 +74,7 @@ from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_prov
 from src.analysis.data_quality import EXPECTED_SPARSE_SOURCES, KNOWN_DEAD_SOURCES, is_context_populated
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES, RULE_FILL_MODEL as _RULE_FILL_MODEL
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -316,7 +316,10 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "dominant_method": _dominant_method(scores, r.direction),
                 "methods_agreeing": _methods_agreeing(scores, r.direction),
                 "contributing_scores": scores,
-                "llm_provider": rec_llm,
+                # A back-filled ticker is attributed to the rule-based engine,
+                # not to whichever model synthesised the rest of this run — it
+                # was never asked about this ticker (tracker.RULE_FILL_MODEL).
+                "llm_provider": _RULE_FILL_MODEL if getattr(r, "rule_filled", False) else rec_llm,
                 "target_horizon": getattr(_hsig, "target_horizon", "") if _hsig else "",
                 "horizon_net_edge_pct": float(getattr(_hsig, "horizon_net_edge_pct", 0.0) or 0.0) if _hsig else 0.0,
                 "shadow_target_horizon": getattr(_hsig, "shadow_target_horizon", "") if _hsig else "",
@@ -366,7 +369,17 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
             base_scores = _method_scores_from_signal(tk, s.direction, signals_by_ticker)
             tf_scores = getattr(s, "timeframe_scores", None) or {}
             fund_scores = getattr(s, "fundamental_scores", None) or {}
-            all_scores = {**base_scores, **tf_scores, **fund_scores}
+            # Agreement-quality pseudo-methods (2026-07-19): the cross-family net
+            # vote + the raw-tape structure score ride the panel's scores JSON
+            # (and the long-format sim reshape below) so their forward IC is
+            # monitored like any method — WITHOUT joining the attribution set
+            # (base_scores), the combine, or the exit consensus. Zero scores are
+            # dropped by the reshape's no-view guard automatically.
+            agree_scores = {
+                "fam_net": float(getattr(s, "family_net_score", 0.0) or 0.0),
+                "tape":    float(getattr(s, "tape_confirmation_score", 0.0) or 0.0),
+            }
+            all_scores = {**base_scores, **tf_scores, **fund_scores, **agree_scores}
             sig_rows.append({
                 "ticker": tk,
                 "type": str(getattr(s, "type", "STOCK") or "STOCK"),
@@ -377,6 +390,16 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "dominant_method": _dominant_method(base_scores, s.direction),
                 "price": price_by_ticker.get(tk),
                 "universe_source": (universe_sources or {}).get(str(tk).upper()),
+                # Confidence-formula components (2026-07-21) — verbatim factors from
+                # the SAME confidence = raw × coherence × movement × volume × family ×
+                # tape chain, so src/analysis/confidence_components.py can isolate
+                # each one's forward-return contribution. See models.TickerSignal.
+                "raw_confidence": float(getattr(s, "raw_confidence", 0.0)),
+                "coherence_factor": float(getattr(s, "coherence_factor", 1.0)),
+                "movement_factor": float(getattr(s, "movement_factor", 1.0)),
+                "volume_factor": float(getattr(s, "volume_factor", 1.0)),
+                "family_conf_factor": float(getattr(s, "family_conf_factor", 1.0)),
+                "tape_conf_factor": float(getattr(s, "tape_conf_factor", 1.0)),
                 "scores": all_scores,
             })
         if sig_rows:
@@ -705,6 +728,23 @@ def _hold_review_groups(open_trades, run_sent=None, run_synth=None):
     return dict(groups), legacy
 
 
+# Cross-engine order tried when an opener-PINNED hold-review engine can't answer.
+# DeepSeek leads: it is the cheap, funded workhorse the rest of the system falls
+# back to (synthesis `_synthesis_attempts_for`, sentiment `_sentiment_engine_order`).
+_HOLD_REVIEW_FALLBACK_ORDER = ("deepseek", "qwen", "anthropic")
+
+
+def hold_review_fallbacks(pinned: str) -> list:
+    """Engines to try, in order, when ``pinned`` produced no review this tick.
+
+    EVERY other provider is tried, not just one. Until 2026-07-22 this was a
+    single fixed alternate (``"anthropic" if pinned == "deepseek" else "deepseek"``),
+    so a DeepSeek pin dead-ended on an Anthropic account that was out of credits
+    and never reached Qwen — leaving the position with no exit gate for the tick.
+    """
+    return [e for e in _HOLD_REVIEW_FALLBACK_ORDER if e != pinned]
+
+
 def _run_hold_reviews(groups, legacy_tickers, sectors, build_kwargs, session,
                       synth_kwargs_wait, run_engines_wait):
     """The pinned hold-review machinery: fresh refetch + per-combo re-judgment.
@@ -784,23 +824,26 @@ def _run_hold_reviews(groups, legacy_tickers, sectors, build_kwargs, session,
             out = _attempt(sy)
         except Exception as e:
             logger.warning(f"[hold_review] combo (sent={se}, synth={sy}) failed: {e}")
-        # Pinned engine unavailable → the OTHER provider re-judges rather than
-        # leaving the position with no exit gate this tick.
+        # Pinned engine unavailable → EVERY other provider re-judges in turn
+        # rather than leaving the position with no exit gate this tick.
+        # 2026-07-22: this used to try exactly ONE alternate ("anthropic" for a
+        # deepseek pin, else "deepseek"), so a deepseek pin dead-ended on a broke
+        # Anthropic account and never reached Qwen. DeepSeek leads the order — it
+        # is the cheap, funded workhorse the rest of the system falls back to.
         if not out and settings.hold_review_engine_fallback:
-            # DeepSeek is the resilient cross-engine fallback for both qwen and
-            # anthropic pins; a deepseek pin falls back to anthropic.
-            other = "anthropic" if sy == "deepseek" else "deepseek"
-            try:
-                out = _attempt(other)
-            except Exception as e:
-                logger.warning(f"[hold_review] fallback engine {other} failed too: {e}")
-                out = {}
-            if out:
-                engine_used = other
-                logger.warning(
-                    f"[hold_review] pinned engine {sy} produced no review — "
-                    f"{len(out)} position(s) re-judged by {other} (fallback)"
-                )
+            for other in hold_review_fallbacks(sy):
+                try:
+                    out = _attempt(other)
+                except Exception as e:
+                    logger.warning(f"[hold_review] fallback engine {other} failed too: {e}")
+                    out = {}
+                if out:
+                    engine_used = other
+                    logger.warning(
+                        f"[hold_review] pinned engine {sy} produced no review — "
+                        f"{len(out)} position(s) re-judged by {other} (fallback)"
+                    )
+                    break
         for tk in out:
             review_engines[tk] = engine_used
         return out
@@ -1099,6 +1142,65 @@ def _is_tradeable(ticker: str, budget: dict) -> bool:
     from src.data.liquidity import is_liquid
     return is_liquid(ticker, budget, settings.trade_min_price,
                      settings.trade_min_dollar_volume)
+
+
+def _recent_runup_pct(ticker: str):
+    """Trailing close-to-close return (%) over the last
+    ``overextension_lookback_bars`` COMPLETED daily bars, from the same cached
+    OHLCV the scorers read (forming bar already dropped during RTH). ``None``
+    when it can't be computed (no cache, short history, bad closes) — the
+    overextension gate FAILS OPEN on None."""
+    try:
+        from src.data.cache import load_ohlcv
+        bars = load_ohlcv(ticker)
+        if bars is None or bars.empty or "Close" not in bars.columns:
+            return None
+        closes = bars["Close"].tolist()
+        n = max(1, int(settings.overextension_lookback_bars))
+        if len(closes) < n + 1:
+            return None
+        last, prev = float(closes[-1]), float(closes[-(n + 1)])
+        if not (last > 0 and prev > 0) or last != last or prev != prev:
+            return None
+        return (last - prev) / prev * 100.0
+    except Exception:
+        return None
+
+
+def _is_overextended(ticker: str) -> bool:
+    """Overextension / anti-chase gate (Gate 5 of the actionable filter,
+    2026-07-22): True when the ticker already ran more than
+    ``overextension_runup_pct`` over the trailing lookback window — the cohort
+    the BUY-vs-SELL forensics measured at a 32.5% hit rate / −4.1% median 5d
+    excess (chasing into short-term reversal; see settings for the full
+    evidence). Applied to BUYs ONLY at the call site — SELLs on extended or
+    crashed names are measured edge and must never be gated here. Fail-open:
+    unknown run-up → not overextended. Gate off → never blocks."""
+    if not getattr(settings, "enable_overextension_gate", False):
+        return False
+    runup = _recent_runup_pct(ticker)
+    return runup is not None and runup > settings.overextension_runup_pct
+
+
+def _passes_agreement_gate(direction: str, sig) -> bool:
+    """Agreement floor (Gate 1b of the actionable filter, 2026-07-20): True unless
+    ``sig`` exists, ``direction`` (the recommendation's own call) matches the
+    aggregator's own ``sig.direction``, AND ``sig.sources_agreeing`` is below
+    ``min_sources_agreeing_gate`` — mechanically enforcing the CLAUDE.md-documented
+    "a single strong signal source never produces a BUY/SELL" invariant, which
+    previously had NO code-level check (only a prompt instruction).
+
+    ``sig.sources_agreeing`` is the aggregator's own count of ACTIVE weighted
+    methods (post win-rate-filter, effective/inversion-corrected sign) agreeing
+    with ``sig.direction`` — only meaningful for THIS call when the LLM's own
+    direction matches it (the ~96% common "echo" case, 2026-07-12 agreement
+    study). A genuine LLM override (``direction != sig.direction``) or a missing
+    signal has no correctly-attributable count, so it PASSES this gate unchecked
+    (same as before this gate existed) — gate off (``enable_agreement_gate``)
+    always passes too."""
+    if not settings.enable_agreement_gate or sig is None or direction != sig.direction:
+        return True
+    return sig.sources_agreeing >= settings.min_sources_agreeing_gate
 
 
 # ---------------------------------------------------------------------------
@@ -2017,8 +2119,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         key=lambda r: (_ACTION_RANK.get(r.action, 3), -r.confidence),
     )[:10]
 
-    # Macro regime gate — adjust threshold and optionally block BUY entries
-    _confidence_threshold = 0.78
+    # Macro regime gate — adjust threshold and optionally block BUY entries.
+    # Baseline 0.85 (2026-07-21 user directive): the fallback when the regime
+    # filter is off / has no context; the filter otherwise REPLACES it with the
+    # regime-specific threshold (NEUTRAL is also 0.85 — see macro_regime._REGIME_THRESHOLD).
+    _confidence_threshold = 0.85
     _allow_buys = True
     if macro_regime_context and settings.enable_macro_regime_filter:
         _confidence_threshold = macro_regime_context.confidence_threshold
@@ -2030,7 +2135,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             )
         logger.info(
             f"[macro_regime] Actionable threshold: {_confidence_threshold:.0%} "
-            f"(default 78%) | allow_buys={_allow_buys}"
+            f"(default 85%) | allow_buys={_allow_buys}"
         )
 
     # Engine-relative translation: the regime threshold is an ABSOLUTE
@@ -2089,9 +2194,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "buy_sell_candidates":          0,
         "dropped_below_threshold":      0,
         "dropped_low_combined_score":   0,
+        "dropped_low_agreement":        0,
         "dropped_buy_blocked":          0,
         "dropped_earnings_blackout":    0,
         "dropped_untradeable":          0,
+        "dropped_overextended":         0,
         "actionable_survivors":         0,
         "confidence_threshold":         round(_confidence_threshold, 2),
         "threshold_calibration":        threshold_meta,   # engine-relative gate audit
@@ -2136,6 +2243,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             gate_diag["dropped_below_threshold"] += 1
             _gate_outcomes[r.ticker] = "below_threshold"
             continue
+        # Gate 1b — agreement floor: mechanically enforces the CLAUDE.md-documented
+        # "a single strong signal source never produces a BUY/SELL" invariant
+        # (previously only a prompt instruction — see _passes_agreement_gate).
+        if not _passes_agreement_gate(r.direction, signals_by_ticker.get(r.ticker)
+                                      if signals_by_ticker else None):
+            gate_diag["dropped_low_agreement"] += 1
+            _gate_outcomes[r.ticker] = "low_agreement"
+            continue
         # Gate 2 — BUY block (PANIC / RISK_OFF)
         if r.action == "BUY" and not _allow_buys:
             gate_diag["dropped_buy_blocked"] += 1
@@ -2155,10 +2270,28 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             gate_diag["dropped_untradeable"] += 1
             _gate_outcomes[r.ticker] = "untradeable"
             continue
+        # Gate 5 — overextension (anti-chase, BUY-only): a BUY whose ticker
+        # already ran > overextension_runup_pct over the trailing 5 completed
+        # bars is deferred — the 2026-07-22 forensics measured that cohort at a
+        # 32.5% 5d hit rate (median −4.1% vs SPY): the combined score peaks
+        # right after the run-up and short-term reversal eats the entry. The
+        # name re-qualifies at any later tick it has cooled below the bar.
+        # SELLs pass untouched (fading spikes / riding crashes is measured edge).
+        if r.action == "BUY" and _is_overextended(r.ticker):
+            gate_diag["dropped_overextended"] += 1
+            _gate_outcomes[r.ticker] = "overextended"
+            continue
         actionable.append(r)
         gate_diag["actionable_survivors"] += 1
         _gate_outcomes[r.ticker] = "pass"
     gate_diag["gate_outcomes"] = _gate_outcomes
+
+    if gate_diag["dropped_overextended"]:
+        logger.info(
+            f"[overextension] Gate 5 deferred {gate_diag['dropped_overextended']} "
+            f"BUY(s) that ran > {settings.overextension_runup_pct:.0f}% in the last "
+            f"{settings.overextension_lookback_bars} sessions (anti-chase)"
+        )
 
     if gate_diag["dropped_earnings_blackout"]:
         logger.warning(
@@ -2302,9 +2435,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f"actionable filter: {gate_diag['buy_sell_candidates']} BUY/SELL → "
         f"survived={gate_diag['actionable_survivors']} "
         f"(rejected by threshold={gate_diag['dropped_below_threshold']}, "
+        f"low-agreement={gate_diag['dropped_low_agreement']}, "
         f"BUY-block={gate_diag['dropped_buy_blocked']}, "
         f"earnings-blackout={gate_diag['dropped_earnings_blackout']}, "
-        f"untradeable={gate_diag['dropped_untradeable']}) | "
+        f"untradeable={gate_diag['dropped_untradeable']}, "
+        f"overextended={gate_diag['dropped_overextended']}) | "
         f"trade entry: {gate_diag['trade_considered']} considered → "
         f"opened={gate_diag['trade_opened']} "
         f"(already_open={gate_diag['trade_skipped_already_open']}, "

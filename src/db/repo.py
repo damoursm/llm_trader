@@ -15,7 +15,7 @@ from typing import List, Optional
 import pandas as pd
 
 from src.db.connection import connect
-from src.db.schema import SIGNAL_METHOD_COLUMNS
+from src.db.schema import SIGNAL_METHOD_COLUMNS, SIGNAL_CONFIDENCE_COMPONENT_COLUMNS
 
 
 # When True, read paths open read-only connections. The dashboard sets this so it
@@ -281,7 +281,8 @@ _SIGNAL_BASE_COLS = [
     "combined_score", "confidence", "n_methods_agreeing", "dominant_method", "price",
     "universe_source",
 ]
-_SIGNAL_COLS = _SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS) + ["scores"]
+_SIGNAL_COLS = (_SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS)
+               + list(SIGNAL_CONFIDENCE_COMPONENT_COLUMNS) + ["scores"])
 
 
 def insert_signals(run_id: str, generated_at: str, signal_date: str,
@@ -312,6 +313,7 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
              _f(r.get("price")),
              r.get("universe_source")]
             + [_f(scores.get(m)) for m in SIGNAL_METHOD_COLUMNS]
+            + [_f(r.get(c)) for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS]
             + [_json(scores)]
         ))
     placeholders = ", ".join(["?"] * len(_SIGNAL_COLS))

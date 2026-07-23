@@ -6,11 +6,11 @@ regime classification.
 
 Regime effects in the pipeline
 ────────────────────────────────
-  PANIC     → confidence threshold 0.88, BUY entries blocked
-  RISK_OFF  → confidence threshold 0.82, BUY entries blocked
-  CAUTION   → confidence threshold 0.80, BUY entries allowed
-  NEUTRAL   → confidence threshold 0.78 (baseline), BUY entries allowed
-  RISK_ON   → confidence threshold 0.72, BUY entries allowed
+  PANIC     → confidence threshold 0.95, BUY entries blocked
+  RISK_OFF  → confidence threshold 0.89, BUY entries blocked
+  CAUTION   → confidence threshold 0.87, BUY entries allowed
+  NEUTRAL   → confidence threshold 0.85 (baseline), BUY entries allowed
+  RISK_ON   → confidence threshold 0.79, BUY entries allowed
 """
 
 from loguru import logger
@@ -140,11 +140,16 @@ _WEIGHTS = {
 }
 
 _REGIME_THRESHOLD = {
-    "PANIC":    0.88,
-    "RISK_OFF": 0.82,
-    "CAUTION":  0.80,
-    "NEUTRAL":  0.78,
-    "RISK_ON":  0.72,
+    # Baseline raised from 0.78 → 0.85 (2026-07-21, user directive: "minimum
+    # confidence score 0.85"). The whole table is shifted UP a uniform +0.07 so
+    # the NEUTRAL baseline = 0.85 while the regime filter's relative dynamics are
+    # preserved (relax when calm, tighten when risky). NOT a hard floor — RISK_ON
+    # still sits below 0.85 by design.
+    "PANIC":    0.95,
+    "RISK_OFF": 0.89,
+    "CAUTION":  0.87,
+    "NEUTRAL":  0.85,
+    "RISK_ON":  0.79,
 }
 
 _REGIME_ALLOW_BUYS = {
@@ -249,7 +254,7 @@ def compute_macro_regime(
 
     # Fail-CAUTIOUS, not fail-open: when too few macro inputs survived, the
     # composite is untrustworthy — and its absence-of-signal default is a
-    # PERMISSIVE NEUTRAL (BUYs allowed at the 0.78 baseline). If all the macro
+    # PERMISSIVE NEUTRAL (BUYs allowed at the 0.85 baseline). If all the macro
     # feeds go dark we must not silently relax the gate; degrade a permissive
     # verdict to at least CAUTION (higher threshold, BUYs still allowed). A
     # genuinely protective verdict (CAUTION/RISK_OFF/PANIC — e.g. a lone VIX

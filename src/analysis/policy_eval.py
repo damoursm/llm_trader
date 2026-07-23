@@ -160,7 +160,9 @@ def evaluate_policy(panel: pd.DataFrame, policy: Policy,
 
 # Baseline actionable confidence threshold (the pre-regime default the pipeline
 # starts from). Kept as a module constant so all policies share one gate.
-GATE_CONFIDENCE = 0.78
+# Tracks the live 0.85 NEUTRAL baseline (raised from 0.78 on 2026-07-21) so the
+# counterfactual policy simulation gates on the same bar the pipeline uses.
+GATE_CONFIDENCE = 0.85
 
 
 def _passes_gate(ctx: dict) -> bool:

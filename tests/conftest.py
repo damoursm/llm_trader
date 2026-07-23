@@ -104,6 +104,22 @@ def _isolated_sentiment_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_winrate_filter_cache():
+    """Drop the aggregator's process-global win-rate filter cache before AND after
+    every test. winrate_filtered_methods() caches its computed drop-set for
+    ic_weight_cache_seconds (1800s) so build_signals' hold-review pool doesn't
+    recompute it each call; without this reset a test that mocks
+    compute_solo_method_performance to a non-empty ledger could leak its drop-set
+    into a later test (the autouse _isolated_db points every test at an EMPTY DB, so
+    the correct value is frozenset() unless a test explicitly mocks otherwise)."""
+    from src.signals.aggregator import reset_winrate_filter_cache
+
+    reset_winrate_filter_cache()
+    yield
+    reset_winrate_filter_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_cost_override():
     """Reset the process-global real-fill cost override (flat + per-session)
     and the calibration registry before AND after every test. They're

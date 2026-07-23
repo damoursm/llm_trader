@@ -1215,6 +1215,39 @@ class TickerSignal(BaseModel):
     rationale: str
     insider_summary: str = ""   # human-readable insider/politician trade context
     sources_agreeing: int = 0   # how many enabled signal layers agree with the direction
+    # Cross-family agreement (src/signals/agreement.py, enable_family_agreement) —
+    # the 21 weighted methods rolled up into 7 independent INFORMATION families;
+    # counts are FAMILY-level (correlated same-family methods = one voice), judged
+    # against the combined direction with a real vote threshold (no hairline 0.01
+    # "agreement"). family_net_score is the magnitude-weighted mean of family votes
+    # ∈ [-1,+1] — a directional metric persisted to the panel for IC monitoring.
+    families_agreeing: int = 0
+    families_opposing: int = 0
+    family_coherence: float = 0.0     # magnitude-weighted family agreement ratio ∈ [0,1]
+    family_net_score: float = 0.0     # ∈ [-1,+1]
+    family_detail: str = ""           # compact rollup "Sentiment:+0.42|Options:-0.12"
+    # Tape confirmation (enable_tape_confirmation) — SCORE-INDEPENDENT raw
+    # price/volume structure state (20d range position + signed 10d volume share +
+    # last-bar RVOL×direction), + = bullish structure. An agreement qualifier
+    # (confidence factor + prompt line + panel `tape` pseudo-method), NOT a
+    # weighted combine member.
+    tape_confirmation_score: float = 0.0   # ∈ [-1,+1]
+    tape_confirmation_label: str = ""      # BULLISH_TAPE | BEARISH_TAPE | MIXED_TAPE | NO_DATA
+    tape_confirmation_detail: str = ""     # human-readable component summary
+    # Confidence-formula components (2026-07-21) — the exact multiplicative chain
+    # `confidence = round(min(1, raw_confidence * coherence_factor * movement_factor
+    # * volume_factor * family_factor * tape_conf_factor), 2)` computed in
+    # aggregator._score_ticker, persisted verbatim (not re-derived) so the signals
+    # panel can isolate each component's contribution — see
+    # src/analysis/confidence_components.py. Defaults are each factor's NEUTRAL
+    # value (1.0 = no effect) so an unset/legacy row multiplies out to a no-op
+    # rather than zeroing a downstream product.
+    raw_confidence: float = 0.0        # min(1, |combined_score| / 0.5), pre-multiplier
+    coherence_factor: float = 1.0      # ∈ [0.45, 1.35] magnitude-weighted method agreement
+    movement_factor: float = 1.0       # ∈ [0.70, 1.30] ATR%/BB-width%/GEX movement potential
+    volume_factor: float = 1.0         # ∈ [0.92, 1.15] cross-method volume confirmation
+    family_conf_factor: float = 1.0    # ∈ [1∓family_agreement_factor_span] cross-family vote
+    tape_conf_factor: float = 1.0      # ∈ [1∓tape_confirmation_factor_span] raw tape alignment
     # GEX fields — populated when enable_gex=true
     gex_signal: str = ""           # PINNED | AMPLIFIED | NEUTRAL | ""
     gamma_flip: Optional[float] = None
@@ -1356,3 +1389,10 @@ class Recommendation(BaseModel):
     time_horizon: str = "N/A"  # "SWING", "SHORT-TERM", "POSITION", "N/A"
     rationale: str
     generated_at: datetime
+    # True when this row came from the rule-based BACK-FILL rather than the
+    # synthesis LLM: the model is only asked about the ~40 highest-confidence
+    # tickers, and the rest of the universe is filled in so open positions never
+    # fall silent. Persisted as a distinct llm_provider (tracker.RULE_FILL_MODEL)
+    # so a per-engine comparison never counts a shared rule-based call as the
+    # model's own. In-memory only — not part of the LLM's JSON contract.
+    rule_filled: bool = False

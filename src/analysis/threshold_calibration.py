@@ -1,7 +1,7 @@
 """Engine-relative actionable threshold — quantile-anchored confidence gates.
 
-The actionable gate compares LLM confidence to absolute thresholds (0.78
-baseline, the macro-regime ladder 0.72–0.88, session bumps). But confidence
+The actionable gate compares LLM confidence to absolute thresholds (0.85
+baseline, the macro-regime ladder 0.79–0.95, session bumps). But confidence
 DISTRIBUTIONS are engine-specific: DeepSeek hands out 1.00s where Claude tops
 out lower, so swapping ``ANALYST_MODEL`` (or the A/B flip landing on the other
 engine) silently changes what every threshold means — the same scale-invariance
@@ -54,11 +54,20 @@ def _confidence_samples(engine_model: Optional[str], days: int) -> Tuple[List[fl
     e: List[float] = []
     try:
         from src.db import repo
+        from src.performance.tracker import _is_rule_based_fill
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         df = repo.fetch_df(
-            "SELECT llm_provider, confidence FROM recommendations "
+            "SELECT llm_provider, confidence, rationale FROM recommendations "
             "WHERE action IN ('BUY','SELL') AND confidence IS NOT NULL "
             "AND generated_at >= ?", [cutoff])
+        if df is not None and not df.empty and "rationale" in df.columns:
+            # Drop rule-based BACK-FILLS: their confidence is the AGGREGATOR's,
+            # copied verbatim, not the engine's own. They were ~22% of rows and
+            # carried the run's model name before 2026-07-22, so leaving them in
+            # skews the engine's confidence ECDF — and this calibration converts
+            # the regime threshold into that scale, so it moves the live gate.
+            df = df[~df.apply(lambda r: _is_rule_based_fill(r["llm_provider"],
+                                                            r["rationale"]), axis=1)]
         if df is not None and not df.empty:
             g = sorted(float(c) for c in df["confidence"] if c == c)
             if engine_model:

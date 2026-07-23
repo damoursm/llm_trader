@@ -277,7 +277,7 @@ When `ENABLE_RELATED_DISCOVERY=true` (default), widens the universe with peers o
 
 ### Massive technical indicators (`src/signals/massive_tech.py`)
 
-When `ENABLE_MASSIVE_TECH=true` (default), computes a `massive` method score from **Massive/Polygon's server-side RSI + MACD** indicators (2 API calls/ticker, capped at `MASSIVE_TECH_MAX_TICKERS`, default 40) — each mapped to [-1, +1] and averaged. It runs **alongside** our own locally-computed `tech` method so the dashboard's **Method Performance** can compare them head-to-head (labelled *Massive Tech (RSI+MACD)*) and reveal whether the server-side path is worth keeping.
+When `ENABLE_MASSIVE_TECH=true` (default), computes a `massive` method score from **Massive/Polygon's server-side RSI + MACD** indicators (2 API calls/ticker, capped at `MASSIVE_TECH_MAX_TICKERS`, default 40) — each mapped to [-1, +1] and averaged. It runs **alongside** our own locally-computed `tech` method so the dashboard's **Entry Performance** can compare them head-to-head (labelled *Massive Tech (RSI+MACD)*) and reveal whether the server-side path is worth keeping.
 
 For now it is **tracked and compared only** — persisted to the signals panel + trade attribution, but **not** folded into the weighted `combined_score` (weighting a capped method would dampen every ticker through the aggregator's weight normalisation). Promote it to a live weight once the comparison validates it.
 
@@ -870,11 +870,11 @@ Reads VIX, MOVE, bond internals, global macro, FRED, breadth, and credit signals
 
 | Regime | Composite score | Confidence threshold | BUY entries |
 |---|---|---|---|
-| `PANIC` | ≤ −1.5 (or any PANIC source) | **88%** | **BLOCKED** |
-| `RISK_OFF` | −1.5 to −0.8 | **82%** | **BLOCKED** |
-| `CAUTION` | −0.8 to −0.3 | 80% | Allowed |
-| `NEUTRAL` | −0.3 to +0.3 | 78% (baseline) | Allowed |
-| `RISK_ON` | > +0.3 | **72%** | Allowed |
+| `PANIC` | ≤ −1.5 (or any PANIC source) | **95%** | **BLOCKED** |
+| `RISK_OFF` | −1.5 to −0.8 | **89%** | **BLOCKED** |
+| `CAUTION` | −0.8 to −0.3 | 87% | Allowed |
+| `NEUTRAL` | −0.3 to +0.3 | 85% (baseline) | Allowed |
+| `RISK_ON` | > +0.3 | **79%** | Allowed |
 
 **Effect on the pipeline:**
 
@@ -1849,13 +1849,16 @@ A read-only [Plotly Dash](https://dash.plotly.com/) app for inspecting the datab
 python main.py --dashboard      # http://127.0.0.1:8050 by default
 ```
 
-Three tabs:
+Six tabs:
 
 | Tab | Shows |
 |---|---|
-| Recommendations & Rationale | Per-run data sources used (✓/✗) and the run's recommendations with rationale |
-| Method Performance | Solo win-rate per signal method (bar chart + table), plus an *LLM models used* table — the exact synthesis & sentiment models that ran (including DeepSeek / rule-based fallbacks) |
-| Returns | KPI tiles (compound, win rate, best/worst), equity curve, and open/closed trades |
+| Recommendations & Rationale | Per-run data sources used (✓/✗) and the run's recommendations with rationale; click a row for a per-ticker hold-review confidence-over-time chart |
+| Entry Performance | Solo win-rate per signal method (bar chart + table), the Signal-IC table (per-method Spearman IC / Sim win% / Sim ret% across 30-min · daily · weekly · fundamentals), a Monte Carlo luck-vs-skill check, a confidence-formula component-isolation pair of tables (does each of the 6 confidence multipliers — coherence / movement / volume / family / tape — actually predict outcomes, isolated one at a time against raw), predictability-by-feature and price/dollar-volume breakdowns, discovery-source performance, and an *LLM models used* table — the exact synthesis & sentiment models that ran (including DeepSeek / rule-based fallbacks) |
+| Exit Performance | The exit-side mirror of Entry Performance — per-exit-method IC/win/ret (held ledger or simulated over all scored tickers), exit-reason outcomes, post-exit "what if we'd held longer", exit-timing-vs-random Monte Carlo, the same confidence-component isolation applied to held positions mid-hold, the edge-decay curve, and a close-rule counterfactual comparison |
+| Returns | KPI tiles (compound, win rate, best/worst), equity curve, open/closed trades, and a Simulated ⇄ IBKR (actual fills) toggle |
+| Execution | Price-provenance flags, broker fill/reject/slippage forensics, and sim-vs-broker tracking error |
+| Data Quality | Per-source reliability (success rate, latency) and per-method score coverage, so a feed going dark shows up before it silently degrades signals |
 
 Each tab's content is embedded directly in the tab, so switching is instant and handled client-side; the page is rebuilt with fresh data on each load (reload to refresh — the selected tab is remembered). Tables are sortable (click a column header, shift-click for multi-sort) and filterable (per-column search box), with human-readable headers and Eastern-time timestamps. Hover any column header, metric tile, or section heading for a plain-English explanation. It is served by **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows, where gunicorn doesn't run) — wrapped in an auto-restart supervisor loop so it stays alive for always-on use (it falls back to the Dash dev server only if waitress isn't installed). All database access is read-only with exponential-backoff retry around the brief daily write-lock window, and the heavy performance computation is cached for 60 seconds. Host and port are configurable via `DASHBOARD_HOST` / `DASHBOARD_PORT`.
 
@@ -2027,7 +2030,7 @@ llm_trader/
 ├── config/
 │   └── settings.py
 ├── dashboard/                       # Read-only Plotly Dash monitoring app (served via waitress)
-│   ├── app.py                       # 3 tabs: rationale · method performance · returns
+│   ├── app.py                       # 6 tabs: rationale · entry perf · exit perf · returns · execution · data quality
 │   ├── data.py                      # Read-only DuckDB access + retry + 60s perf cache
 │   └── figures.py                   # Plotly figures (win-rate bars, equity curve)
 └── src/

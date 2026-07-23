@@ -14,7 +14,15 @@ from config.settings import settings
 # ── #2: engine-relative actionable threshold ──────────────────────────────────
 
 def _rec_df(rows):
-    return pd.DataFrame(rows, columns=["llm_provider", "confidence"])
+    """Rows are (provider, confidence) or (provider, confidence, rationale).
+
+    The real query also selects ``rationale`` — the calibration drops rule-based
+    BACK-FILLS, whose confidence is the aggregator's rather than the engine's.
+    Default to authored prose so a plain 2-tuple row counts as a genuine call.
+    """
+    norm = [(r[0], r[1], r[2] if len(r) > 2 else "Authored rationale prose.")
+            for r in rows]
+    return pd.DataFrame(norm, columns=["llm_provider", "confidence", "rationale"])
 
 
 def _patch_recs(monkeypatch, rows):
@@ -198,3 +206,31 @@ def test_record_new_trades_applies_edge_blend(monkeypatch):
     assert t["edge_size_ratio"] > 1.0                      # broad profile sized up
     assert t["edge_model_weight"] == pytest.approx(60 / 90, abs=1e-4)
     assert t["position_size_multiplier"] > 1.0
+
+
+def test_threshold_ignores_rule_based_backfills(monkeypatch):
+    """Rule-based BACK-FILLS carry the run's model name but the AGGREGATOR's
+    confidence, so counting them warps the engine's confidence scale — and this
+    calibration turns the regime threshold into that scale, moving the live gate.
+
+    Engine B's genuine calls are inflated (0.85–1.00); the fills sit far lower.
+    With the fills excluded the translated bar must stay up in B's real range.
+    """
+    monkeypatch.setattr(settings, "threshold_engine_relative_enabled", True)
+    monkeypatch.setattr(settings, "threshold_min_global_recs", 100)
+    monkeypatch.setattr(settings, "threshold_engine_prior_n", 0)
+    monkeypatch.setattr(settings, "threshold_max_shift", 0.20)
+    genuine = ([("A", 0.70 + 0.001 * i) for i in range(190)]
+               + [("B", 0.85 + 0.00075 * i) for i in range(190)])
+    fills = [("B", 0.20 + 0.001 * i, "No recent news. | Technical score: +0.10")
+             for i in range(190)]
+
+    clean = _patch_recs(monkeypatch, genuine)
+    eff_clean, meta_clean = clean.engine_relative_threshold(0.78, "B")
+    polluted = _patch_recs(monkeypatch, genuine + fills)
+    eff_filtered, meta_filtered = polluted.engine_relative_threshold(0.78, "B")
+
+    assert meta_clean["applied"] and meta_filtered["applied"]
+    # Adding 190 low-confidence FILLS must not move the engine's bar.
+    assert eff_filtered == pytest.approx(eff_clean, abs=1e-9)
+    assert eff_filtered > 0.85

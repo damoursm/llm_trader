@@ -4,12 +4,15 @@ Opus 4.7+ and the Fable/Mythos 5 families removed temperature/top_p/top_k;
 sending temperature 400s and silently kicks synthesis to the DeepSeek fallback.
 """
 
+import anthropic
+import openai
 import pytest
 
 import src.analysis.claude_analyst as ca
 from src.analysis.claude_analyst import (
     _anthropic_sampling_kwargs, _anthropic_thinking_kwargs,
     _engine_of, _synthesis_attempts_for, _deepseek_spec, _qwen_spec,
+    _is_transient_llm_error, _call_with_retry,
 )
 
 
@@ -75,14 +78,18 @@ def test_engine_of_maps_provider():
 @pytest.mark.parametrize("chosen", ["claude-opus-4-8", "claude-haiku-4-5-20251001"])
 def test_attempts_anthropic_chosen_then_deepseek_fallback(chosen):
     # The chosen Claude model runs first (so it's the sampled+recorded engine);
-    # DeepSeek is the resilience fallback.
-    assert _synthesis_attempts_for(chosen, "claude-opus-4-8", "deepseek-v4-flash") == [
-        ("anthropic", chosen), ("deepseek", "deepseek-v4-flash")]
+    # DeepSeek then Qwen are the resilience fallbacks (all 3 providers, so a
+    # single-provider outage can never fully block synthesis).
+    assert _synthesis_attempts_for(chosen, "claude-opus-4-8", "deepseek-v4-flash", "qwen3.7-max") == [
+        ("anthropic", chosen), ("deepseek", "deepseek-v4-flash"), ("qwen", "qwen3.7-max")]
 
 
 def test_attempts_deepseek_chosen_then_anthropic_fallback():
-    assert _synthesis_attempts_for("deepseek-v4-flash", "claude-opus-4-8", "deepseek-v4-flash") == [
-        ("deepseek", "deepseek-v4-flash"), ("anthropic", "claude-opus-4-8")]
+    # DeepSeek chosen -> Qwen, THEN Anthropic (2026-07-22: widened from a single
+    # fixed fallback so a transient DeepSeek failure isn't stranded when
+    # Anthropic alone happens to be out of credits).
+    assert _synthesis_attempts_for("deepseek-v4-flash", "claude-opus-4-8", "deepseek-v4-flash", "qwen3.7-max") == [
+        ("deepseek", "deepseek-v4-flash"), ("qwen", "qwen3.7-max"), ("anthropic", "claude-opus-4-8")]
 
 
 # ── 4-way bake-off: DeepSeek flash-thinking / pro-thinking arms ───────────────
@@ -106,9 +113,9 @@ def test_thinking_ids_route_to_deepseek():
 
 def test_attempts_pro_thinking_chosen_then_anthropic_fallback():
     # The logical id is preserved as the chosen attempt (so provenance records the
-    # exact arm); the cross-engine fallback stays cheap flash non-thinking.
-    assert _synthesis_attempts_for("deepseek-v4-pro-thinking", "claude-opus-4-8", "deepseek-v4-flash") == [
-        ("deepseek", "deepseek-v4-pro-thinking"), ("anthropic", "claude-opus-4-8")]
+    # exact arm); the cross-engine fallbacks stay cheap/non-thinking defaults.
+    assert _synthesis_attempts_for("deepseek-v4-pro-thinking", "claude-opus-4-8", "deepseek-v4-flash", "qwen3.7-max") == [
+        ("deepseek", "deepseek-v4-pro-thinking"), ("qwen", "qwen3.7-max"), ("anthropic", "claude-opus-4-8")]
 
 
 def _capture_deepseek_create(monkeypatch):
@@ -156,9 +163,113 @@ def test_qwen_spec_decodes_thinking_suffix(logical, api, thinking):
 
 
 def test_attempts_qwen_chosen_then_deepseek_fallback():
-    # Qwen (the primary) runs first; DeepSeek is the resilient error fallback.
-    assert _synthesis_attempts_for("qwen3.7-max-thinking", "claude-opus-4-8", "deepseek-v4-flash") == [
-        ("qwen", "qwen3.7-max-thinking"), ("deepseek", "deepseek-v4-flash")]
+    # Qwen (the primary) runs first; DeepSeek then Anthropic are the fallbacks.
+    assert _synthesis_attempts_for("qwen3.7-max-thinking", "claude-opus-4-8", "deepseek-v4-flash", "qwen3.7-max") == [
+        ("qwen", "qwen3.7-max-thinking"), ("deepseek", "deepseek-v4-flash"), ("anthropic", "claude-opus-4-8")]
+
+
+# ── Same-engine transient retry (2026-07-22) ─────────────────────────────────
+
+class _FakeStatusError(Exception):
+    def __init__(self, status_code, message="boom"):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 529])
+def test_transient_status_codes_are_retried(status):
+    assert _is_transient_llm_error(_FakeStatusError(status)) is True
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
+def test_hard_status_codes_are_not_retried(status):
+    # 402 in particular is the exact "Insufficient credits/balance" shape seen
+    # from both DeepSeek and Qwen/OpenRouter — retrying it just fails again.
+    assert _is_transient_llm_error(_FakeStatusError(status)) is False
+
+
+def test_connection_errors_are_transient():
+    req = object()   # openai.APIConnectionError only touches .request for repr
+    assert _is_transient_llm_error(openai.APIConnectionError(request=req)) is True
+    assert _is_transient_llm_error(anthropic.APIConnectionError(request=req)) is True
+
+
+def test_raw_readtimeout_leak_is_recognized_by_message():
+    # 2026-07-22 case: a mid-stream read-timeout leaked through as a raw
+    # exception with no status_code — must still be caught by message/type,
+    # since this is precisely the failure that stranded a healthy DeepSeek.
+    class ReadTimeout(Exception):
+        pass
+    assert _is_transient_llm_error(ReadTimeout("The read operation timed out")) is True
+
+
+def test_unrelated_error_is_not_transient():
+    assert _is_transient_llm_error(ValueError("unexpected ticker shape")) is False
+
+
+def test_call_with_retry_recovers_after_one_transient_failure(monkeypatch):
+    monkeypatch.setattr(ca.settings, "llm_transient_retries", 1)
+    sleeps = []
+    monkeypatch.setattr(ca.time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+
+    def fake_engine(engine, model, prompt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _FakeStatusError(503, "server hiccup")
+        return "ok"
+
+    monkeypatch.setattr(ca, "_call_engine", fake_engine)
+    assert _call_with_retry("deepseek", "deepseek-v4-flash", "hi") == "ok"
+    assert calls["n"] == 2
+    assert len(sleeps) == 1
+
+
+def test_call_with_retry_raises_immediately_on_hard_failure(monkeypatch):
+    monkeypatch.setattr(ca.settings, "llm_transient_retries", 1)
+    sleeps = []
+    monkeypatch.setattr(ca.time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+
+    def fake_engine(engine, model, prompt):
+        calls["n"] += 1
+        raise _FakeStatusError(402, "Insufficient Balance")
+
+    monkeypatch.setattr(ca, "_call_engine", fake_engine)
+    with pytest.raises(_FakeStatusError):
+        _call_with_retry("deepseek", "deepseek-v4-flash", "hi")
+    assert calls["n"] == 1          # never retried — no point burning a hop on a hard fail
+    assert sleeps == []
+
+
+def test_call_with_retry_gives_up_after_exhausting_retries(monkeypatch):
+    monkeypatch.setattr(ca.settings, "llm_transient_retries", 2)
+    monkeypatch.setattr(ca.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def fake_engine(engine, model, prompt):
+        calls["n"] += 1
+        raise _FakeStatusError(429, "rate limited")
+
+    monkeypatch.setattr(ca, "_call_engine", fake_engine)
+    with pytest.raises(_FakeStatusError):
+        _call_with_retry("deepseek", "deepseek-v4-flash", "hi")
+    assert calls["n"] == 3          # initial + 2 retries, then give up
+
+
+def test_call_with_retry_zero_disables_retry(monkeypatch):
+    monkeypatch.setattr(ca.settings, "llm_transient_retries", 0)
+    monkeypatch.setattr(ca.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def fake_engine(engine, model, prompt):
+        calls["n"] += 1
+        raise _FakeStatusError(503, "server hiccup")
+
+    monkeypatch.setattr(ca, "_call_engine", fake_engine)
+    with pytest.raises(_FakeStatusError):
+        _call_with_retry("deepseek", "deepseek-v4-flash", "hi")
+    assert calls["n"] == 1
 
 
 def _capture_qwen_create(monkeypatch):
@@ -218,7 +329,11 @@ def test_max_thinking_forces_deepseek_fallback_thinking(monkeypatch):
 def test_max_thinking_anthropic_effort_max(monkeypatch):
     monkeypatch.setattr(ca.settings, "llm_max_thinking", True)
     kw = _anthropic_thinking_kwargs("claude-opus-4-8")
-    assert kw == {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}
+    # effort (output_config) is routed through extra_body so it reaches the API as a
+    # body field even on an anthropic SDK too old to accept a top-level output_config=
+    # kwarg (0.49.0 raised TypeError → silent fallback to DeepSeek/rule-based).
+    assert kw == {"thinking": {"type": "adaptive"},
+                  "extra_body": {"output_config": {"effort": "max"}}}
     # Haiku 4.5 supports neither thinking nor effort → still empty (would 400)
     assert _anthropic_thinking_kwargs("claude-haiku-4-5-20251001") == {}
 

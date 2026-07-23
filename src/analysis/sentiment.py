@@ -95,15 +95,35 @@ def reset_sentiment_providers() -> None:
                     + ("" if settings.enable_claude_sentiment else " (Claude sentiment reserved for synthesis)"))
 
 
+# Cross-engine resilience order appended after the preferred engine, so a single
+# provider outage can never leave a ticker unscored. DeepSeek first: it is the
+# cheap, funded workhorse and the engine the rest of the system falls back to.
+_SENTIMENT_FALLBACK_ORDER = ("deepseek", "qwen", "anthropic")
+
+
 def _sentiment_engine_order(force_engine: Optional[str]) -> list:
-    """Engine try-order for one sentiment call (primary first, the other as fallback).
+    """Engine try-order for one sentiment call — preferred engine first, then EVERY
+    remaining engine as successive fallbacks.
 
     2026-07-13 cost tune: DeepSeek-flash scores ~90% of runs and Qwen ~10%
-    (``sentiment_qwen_share``), each the other's error fallback. Hold-review pins are
-    HONORED — the opener engine re-judges its own position (Fix #2 same-engine
-    invariant). Claude is reserved for synthesis: unless ``enable_claude_sentiment``
-    is set, anthropic is stripped entirely (even a ``force_engine='anthropic'`` pin
-    coerces to deepseek), so Claude is never called for sentiment."""
+    (``sentiment_qwen_share``). Hold-review pins are HONORED — the opener engine
+    re-judges its own position first (Fix #2 same-engine invariant).
+
+    2026-07-22: a pin used to return that engine ALONE, so when the pinned engine
+    was down the call fell through to ``0.0`` + "Analysis error" — a NEUTRAL
+    sentiment silently fed into the hold review that decides whether to keep or
+    close the position. Observed with Qwen out of OpenRouter credits: WKC, MOH,
+    SEIC, GLD and AGEN (all held) scored 0.0 on a DeepSeek-primary run, having
+    never tried DeepSeek. A pin is a PREFERENCE, not a suicide pact: an honest
+    score from the other engine beats a fabricated neutral, and the provider
+    tally still records whichever engine actually answered, so attribution stays
+    truthful. This mirrors what the synthesis layer already does one level up
+    (``pipeline._review``: "pinned engine X produced no review — re-judged by Y").
+
+    Claude is reserved for synthesis: unless ``enable_claude_sentiment`` is set,
+    anthropic is stripped entirely (even a ``force_engine='anthropic'`` pin
+    coerces to deepseek), so Claude is never called for sentiment.
+    """
     if force_engine in ("deepseek", "anthropic", "qwen"):
         order = [force_engine]
     elif _PRIMARY_SENTIMENT_ENGINE == "qwen":
@@ -112,6 +132,7 @@ def _sentiment_engine_order(force_engine: Optional[str]) -> list:
         order = ["anthropic", "deepseek"]
     else:                                    # deepseek primary → Qwen is the error fallback
         order = ["deepseek", "qwen"]
+    order += [e for e in _SENTIMENT_FALLBACK_ORDER if e not in order]
     if not settings.enable_claude_sentiment:
         order = [e for e in order if e != "anthropic"] or ["deepseek"]
     return order

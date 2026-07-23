@@ -106,29 +106,67 @@ def test_funnel_counts_and_order(fake_env):
     rows = tr.compute_stage_eval()
     labels = [r["label"] for r in rows]
 
-    # All ten rows present, funnel order, each gate's drops right after its survivors.
+    # All fourteen rows present, funnel order, each gate's drops right after its
+    # survivors. No fixture call is stamped "low_agreement" or "overextended",
+    # so those stages drop nothing here — see the dedicated tests for the cases
+    # where they do.
     assert labels[0] == "Aggregator (combined signal)"
     assert labels[1] == "LLM Synthesis (all BUY/SELL)"
     assert [l for l in labels[2:] if l.startswith("→")] == [
         "→ past Gate 1 · regime confidence threshold",
+        "→ past Gate 1b · agreement floor (sources_agreeing)",
         "→ past Gate 2 · PANIC/RISK_OFF BUY-block",
         "→ past Gate 3 · earnings blackout",
-        "→ past Gate 4 · liquidity floor = ACTIONABLE",
+        "→ past Gate 4 · liquidity floor",
+        "→ past Gate 5 · overextension (anti-chase) = ACTIONABLE",
     ]
-    assert len([l for l in labels if l.startswith("✂")]) == 4
+    assert len([l for l in labels if l.startswith("✂")]) == 6
 
     by = _by_label(rows)
     assert by["Aggregator (combined signal)"]["trades"] == 1            # AGG
     assert by["LLM Synthesis (all BUY/SELL)"]["trades"] == 6
     # BBB out at gate 1; DDD at gate 2; FFF at gate 3; CCC at gate 4.
     assert by["→ past Gate 1 · regime confidence threshold"]["trades"] == 5
+    assert by["→ past Gate 1b · agreement floor (sources_agreeing)"]["trades"] == 5
     assert by["→ past Gate 2 · PANIC/RISK_OFF BUY-block"]["trades"] == 4
     assert by["→ past Gate 3 · earnings blackout"]["trades"] == 3
-    assert by["→ past Gate 4 · liquidity floor = ACTIONABLE"]["trades"] == 2   # AAA + EEE
+    assert by["→ past Gate 4 · liquidity floor"]["trades"] == 2         # AAA + EEE
+    assert by["→ past Gate 5 · overextension (anti-chase) = ACTIONABLE"]["trades"] == 2
     assert _one(rows, "Gate 1 drops")["trades"] == 1
+    assert _one(rows, "Gate 1b drops")["trades"] == 0
     assert _one(rows, "Gate 2 drops")["trades"] == 1
     assert _one(rows, "Gate 3 drops")["trades"] == 1
     assert _one(rows, "Gate 4 drops")["trades"] == 1
+    assert _one(rows, "Gate 5 drops")["trades"] == 0
+
+
+def test_gate1b_agreement_floor_classifies_and_scores(fake_env, monkeypatch):
+    """A ticker stamped "low_agreement" in gate_outcomes must be classified into
+    the Gate 1b drop row (not fall through to Gate 3/4 count-attribution) and
+    excluded from every downstream survivor row."""
+    runs = fake_env["runs"].copy()
+    r2_diag = json.loads(runs.loc[runs["run_id"] == "r2", "gate_diag"].iloc[0])
+    r2_diag["gate_outcomes"]["EEE"] = "low_agreement"    # was "pass" (actionable)
+    runs.loc[runs["run_id"] == "r2", "gate_diag"] = json.dumps(r2_diag)
+
+    def fetch(sql, params=None):
+        s = " ".join(sql.split())
+        if "FROM recommendations" in s:
+            return fake_env["recs"].copy()
+        if "FROM runs" in s:
+            return runs.copy()
+        return pd.DataFrame()
+
+    monkeypatch.setattr(tr.repo, "fetch_df", fetch)
+    rows = tr.compute_stage_eval()
+    by = _by_label(rows)
+
+    assert _one(rows, "Gate 1b drops")["trades"] == 1                 # EEE
+    # EEE no longer reaches Gate 2/3/4/5 survivors (was the only survivor
+    # besides AAA) — Gate 1b removes it upstream of every later stage.
+    assert by["→ past Gate 1b · agreement floor (sources_agreeing)"]["trades"] == 4
+    assert by["→ past Gate 4 · liquidity floor"]["trades"] == 1        # AAA only
+    assert by["→ past Gate 5 · overextension (anti-chase) = ACTIONABLE"]["trades"] == 1
 
 
 def test_gate2_only_blocks_buys(fake_env):
@@ -176,11 +214,13 @@ def test_empty_stage_reports_zero_row(fake_env, monkeypatch):
 
     monkeypatch.setattr(tr.repo, "fetch_df", fetch)
     rows = tr.compute_stage_eval()
-    for k in (1, 2, 3, 4):
+    for k in (1, 2, 3, 4, 5):
         drop = _one(rows, f"Gate {k} drops")
         assert drop["trades"] == 0
         assert drop["win_rate"] is None
-    assert _by_label(rows)["→ past Gate 4 · liquidity floor = ACTIONABLE"]["trades"] == 6
+    gate1b_drop = _one(rows, "Gate 1b drops")
+    assert gate1b_drop["trades"] == 0 and gate1b_drop["win_rate"] is None
+    assert _by_label(rows)["→ past Gate 5 · overextension (anti-chase) = ACTIONABLE"]["trades"] == 6
 
 
 def test_window_cutoff_filters_old_calls(fake_env):
@@ -214,7 +254,7 @@ def test_dedupe_keeps_last_call_per_ticker_day(fake_env, monkeypatch):
     assert by["LLM Synthesis (all BUY/SELL)"]["trades"] == 6           # still 6 deduped
     # AAA's LAST call (conf 0.10) is now a gate-1 drop: BBB + AAA = 2.
     assert _one(rows, "Gate 1 drops")["trades"] == 2
-    assert by["→ past Gate 4 · liquidity floor = ACTIONABLE"]["trades"] == 1   # EEE only
+    assert by["→ past Gate 5 · overextension (anti-chase) = ACTIONABLE"]["trades"] == 1   # EEE only
 
 
 def test_stats_shape_matches_macro_eval_rows(fake_env):

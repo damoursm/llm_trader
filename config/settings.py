@@ -44,10 +44,35 @@ class Settings(BaseSettings):
     # DeepSeek arms may carry a "-thinking" suffix (logical id → API model + reasoning
     # mode, decoded by claude_analyst._deepseek_spec). Sentiment is unaffected (stays
     # Haiku ⇄ DeepSeek flash non-thinking via llm_ab_anthropic_share). Example (2026-07-11 —
-    # DeepSeek's reasoning family is V4, not R1; deepseek-v4-flash-thinking beat
-    # deepseek-v4-pro-thinking on live win rate, so only the flash-thinking arm remains):
+    # DeepSeek's reasoning family is V4, not R1):
     #   LLM_AB_SYNTHESIS_MODELS=claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking
+    # Current pool (2026-07-22, flat 2-way — see .env): deepseek-v4-flash,
+    # qwen/qwen3.7-plus-thinking (~50% each). Consolidated onto ONE DeepSeek model
+    # after the bake-off found the arms statistically indistinguishable: eleven
+    # paired tests (same ticker, same day) returned no significant difference and
+    # the models disagreed on direction 0–6 times out of 25–170 shared calls, so
+    # the choice is cost/latency, not accuracy. Dropped deepseek-v4-pro-thinking
+    # (+233s per tick, ~3x tokens, repeated tickers in 26% of responses) and
+    # deepseek-v4-flash-thinking (see llm_max_thinking below). Qwen moved from
+    # qwen3.7-max to qwen3.7-plus — same capabilities on this route (reasoning,
+    # response_format, seed, 1M ctx, 65K out) at ~4.6x cheaper input / ~3.5x
+    # cheaper output.
     llm_ab_synthesis_models: str = ""
+
+    # Same-engine TRANSIENT retry before spending a fallback hop on a DIFFERENT
+    # provider (2026-07-22). A read-timeout or connection drop mid-stream is often
+    # just a blip — DeepSeek/Qwen/Anthropic all occasionally stall or reset a
+    # single request while otherwise fine (observed: a DeepSeek ReadTimeout in the
+    # same tick DeepSeek answered ~25 other calls) — so it's worth retrying the
+    # SAME engine once before moving to a different provider, which may itself be
+    # out of credits right now. A HARD failure (bad key, bad request, insufficient
+    # credits/balance) is never retried — it will just fail again immediately.
+    # Applies to every synthesis attempt, including the opener-pinned hold-review
+    # call (still the same engine either way, so Fix #2's same-engine invariant is
+    # untouched). 0 = off (fail straight to the next engine/attempt, pre-2026-07-22
+    # behavior).
+    llm_transient_retries: int = 1
+    llm_transient_retry_wait_seconds: float = 3.0
 
     # Anthropic prompt caching (cache_control) on the SYNTHESIS prompt. The large
     # persona + macro-context prefix is identical across the main call and the
@@ -169,6 +194,17 @@ class Settings(BaseSettings):
     # per-ticker sentiment and the macro-news classifier — to thinking too, so
     # reasoning is billed on every call (notably the high-volume sentiment path).
     # OFF → the prior cost-tuned mix (decisions think; bulk sentiment/macro don't).
+    #
+    # TURNED OFF 2026-07-22 (.env). The flag OVERRIDES the model id — it forced
+    # `thinking=True` even on an arm named `deepseek-v4-flash`, so the "cheap flash"
+    # arm silently billed reasoning tokens AND recorded provenance as plain
+    # `deepseek-v4-flash`, colliding with the 2,685 genuinely non-thinking rows in
+    # the history. Off restores a true non-thinking flash. Justified by the bake-off:
+    # flash vs flash-thinking agreed on direction 97.6% of the time with no
+    # significant accuracy difference at any horizon, so the reasoning tokens were
+    # buying agreement with the cheaper setting. An arm that should reason must now
+    # say so in its id (the `-thinking` suffix, e.g. qwen/qwen3.7-plus-thinking) —
+    # which is also what makes the dashboard's per-model rows honest.
     llm_max_thinking: bool = False
 
     # BLIND-SYNTHESIS A/B (2026-07-12). The agreement eval found 96% of LLM calls
@@ -197,6 +233,30 @@ class Settings(BaseSettings):
     # Mechanical/trailing/macro/horizon exits are NOT gated (they are not
     # review-noise-driven). Off = the pre-2026-07-12 single-review behavior.
     enable_llm_exit_confirmation: bool = True
+
+    # ANTI-CHASE / OVEREXTENSION GATE (Gate 5 of the actionable filter, 2026-07-22).
+    # The BUY-vs-SELL forensics (signals panel, 8.3k ticker-days) found the BUY
+    # side's failure is CHASING: 40% of BUY calls landed in the top quintile of
+    # trailing-5-day gainers (2x the universe share) and those hit 38% at 5d with
+    # a -2.4% median — recent big gainers mean-revert (universe Q5 P(up) 45%),
+    # while the combined score peaks exactly then (momentum+tech+news all read
+    # the same run-up; top score decile P(up) 38%, the worst cohort in the panel).
+    # Gate: a BUY whose ticker's trailing close-to-close return over the last
+    # `overextension_lookback_bars` COMPLETED daily bars exceeds
+    # `overextension_runup_pct` is dropped from the actionable set (observe-only
+    # this tick; it re-qualifies at the next tick it has cooled below the bar —
+    # entering on the pullback is the measured sweet spot, universe Q2 +0.64%).
+    # BUY-ONLY by design: SELLs on crashed names ride continuation (61.9% hit on
+    # t5<-8% names) and SELLs on spiked names fade correctly (64% hit) — gating
+    # them would destroy measured edge. Threshold from the 2026-07-22 sweep:
+    # blocked cohort at 12% hit 32.5% (median -4.1%) vs kept 43.4%; the 10-15%
+    # region is a plateau so 12 is not knife-edge (vol-normalized variants
+    # separated WORSE than the raw %). Fail-OPEN: a ticker with no/short cached
+    # history is NOT blocked (this is an opportunity filter on measured harm,
+    # not a risk guard — the liquidity gate already owns the thin-data case).
+    enable_overextension_gate: bool = True
+    overextension_runup_pct: float = 12.0
+    overextension_lookback_bars: int = 5
 
     # Qwen structured output: request response_format={"type":"json_object"} on the
     # synthesis call so the answer is guaranteed-parseable JSON (the prompt asks for
@@ -1045,6 +1105,87 @@ class Settings(BaseSettings):
     adaptive_weight_min_multiplier: float = 0.5    # floor: a bad method keeps at least half its baseline
     adaptive_weight_max_multiplier: float = 2.0    # cap:   a great method gets at most double
 
+    # ── Win-rate method filter (HARD exclusion; panel monitoring unaffected) ──
+    # A hard version of the adaptive-weight tilt above. Any method whose GROSS solo
+    # win rate (tracker.compute_solo_method_gross_winrate — "if this method alone had
+    # decided the trade, did it pick the right DIRECTION on the raw price move?",
+    # BEFORE fees and spread — costs are an execution concern, not a measure of signal
+    # quality) sits below winrate_filter_threshold, ONCE it has at least
+    # winrate_filter_min_trades attributed solo trades to judge it, is DROPPED from:
+    #   • combined_score — weight → 0; the surviving methods renormalise so the
+    #     score stays on the same scale (not just shrunk like the adaptive floor),
+    #   • coherence / sources_agreeing (and therefore the confidence it feeds),
+    #   • the synthesis prompt — the LLM never sees a sub-coin-flip method's
+    #     per-ticker score line, so it can't lean on it.
+    # The method is STILL scored and persisted to the `signals` panel + trade
+    # attribution every run, so IC / win-rate / simulation monitoring keeps
+    # accruing and a filtered method can re-earn its place (or be inverted) once
+    # the evidence turns. Composes with the soft adaptive/IC tilts (a filtered
+    # method is simply held out of the pool before they apply).
+    # Two guards keep it safe:
+    #   • min_trades — never drop a method on small-sample noise (a 1-loss method
+    #     is not a bad method); below the floor the method keeps its full weight.
+    #   • INVERTED methods (inverted_methods) are EXEMPT — their sign is already
+    #     corrected in the combine, so a sub-50% RAW win rate is exactly WHY they
+    #     are useful, not a reason to drop them.
+    # And build_signals never lets the filter zero out EVERY active method (it is
+    # suppressed for that run if it would, so the book can't go all-NEUTRAL).
+    enable_winrate_method_filter: bool = True
+    winrate_filter_threshold: float = 0.50   # drop a method whose solo win rate is below this…
+    winrate_filter_min_trades: int = 10      # …once it has at least this many attributed solo trades
+
+    # ── Cross-family agreement + tape confirmation (2026-07-19) ──────────────
+    # Upgrades to agreement quality (src/signals/agreement.py). The flat
+    # sources_agreeing count treats every method as an independent voter, but the
+    # OHLCV-derived technicals all read the same tape (pseudo-replication) —
+    # METHOD_FAMILIES groups the weighted pool into 7 independent INFORMATION
+    # families (Sentiment / Price-Trend / Rel-Strength / Volume-Flow / Options /
+    # Smart-Money / Event-Arb); per-family magnitude-weighted votes are counted at
+    # the FAMILY level (a family votes only when |family score| ≥
+    # family_vote_threshold — no more hairline-0.01 "agreement"), exposed to the
+    # synthesis prompt per ticker (which families align/oppose, with values), and
+    # folded into confidence via a modest breadth-of-independent-confirmation
+    # factor ∈ [1−span, 1+span] (1 family alone → 1.0 neutral; 4+ aligned → the
+    # +span cap; an opposing family drags 1.5× as hard as an aligned one helps).
+    # Filtered (win-rate) methods are excluded; inverted methods vote with their
+    # corrected sign (what the combine consumes).
+    enable_family_agreement: bool = True
+    family_vote_threshold: float = 0.05
+    family_agreement_factor_span: float = 0.12
+
+    # Tape confirmation — a SCORE-INDEPENDENT raw price/volume state check from
+    # the cached daily OHLCV (20d range position + up/down-day volume share 10d +
+    # last-bar RVOL signed by its direction → composite ∈ [-1,+1], + = bullish
+    # structure). Not an alpha method in the combine — an agreement QUALIFIER:
+    # multiplies confidence by 1 + span×(tape × direction) when it confirms /
+    # diverges from the combined direction, rides the synthesis prompt as a
+    # per-ticker TAPE STRUCTURE line, and is persisted to the signals panel as
+    # the `tape` pseudo-method so its forward IC is monitored like any method.
+    # Cache-only (never fetches; cold cache → NO_DATA → neutral 1.0).
+    enable_tape_confirmation: bool = True
+    tape_confirmation_factor_span: float = 0.08
+
+    # ── Agreement floor (MECHANICAL gate; 2026-07-20) ─────────────────────────
+    # CLAUDE.md documents "a single strong signal source never produces a BUY/SELL
+    # regardless of score" as a baseline invariant of the actionable filter — but a
+    # 2026-07-20 audit found NO pipeline gate actually enforced it: sources_agreeing
+    # ≥ 2 was only a PROMPT INSTRUCTION the LLM was trusted to self-apply, so a
+    # single-source call could reach the ledger if the model ever misjudged it. This
+    # makes the documented invariant mechanically true: pipeline.py's actionable
+    # filter gains "Gate 1b — agreement floor", dropping any BUY/SELL whose sig.
+    # sources_agreeing < min_sources_agreeing_gate WHENEVER the recommendation's own
+    # direction matches the aggregator's sig.direction (the ~96% common "echo" case
+    # per the 2026-07-12 agreement study — sources_agreeing is computed relative to
+    # sig.direction, so it isn't a meaningful count for a genuine LLM override; an
+    # override passes this gate unchecked and stays governed by the confidence
+    # threshold + prompt instructions alone, unchanged from before). Counted in
+    # gate_diag.dropped_low_agreement + the per-ticker gate_outcomes stamp
+    # ("low_agreement"), and evaluated end-to-end (pass vs drop, simulated
+    # performance) by tracker.compute_stage_eval's decision-funnel — visible on the
+    # dashboard's Entry Performance tab as "Gate 1b" rows, exactly like gates 1-4.
+    enable_agreement_gate: bool = True
+    min_sources_agreeing_gate: int = 2
+
     # ── IC-informed adaptive weights (panel-driven; ON, but CONFIDENCE-GATED) ──
     # A better-founded sibling of the win-rate layer above. Instead of solo win rate
     # from the gate-selected (thin, biased) trade ledger, it tilts each method's weight
@@ -1805,7 +1946,7 @@ class Settings(BaseSettings):
     # firms up as the decay confirms. Also emitted as the `edge_decay` exit signal
     # so its OWN exit-IC is measured before it earns real weight.
     enable_edge_decay_exit: bool = True
-    edge_decay_conf_min: float = 0.78          # confidence subset the edge curve is measured on (the traded population)
+    edge_decay_conf_min: float = 0.85          # confidence subset the edge curve is measured on (the traded population; tracks the 0.85 NEUTRAL gate, raised 2026-07-21)
     edge_decay_cal_days: int = 90              # panel window for the edge curve
     edge_decay_min_n: int = 20                 # min obs per horizon before it counts
     edge_decay_prior_obs: int = 250            # obs prior shrinking the evidence strength (gentle now)

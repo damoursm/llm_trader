@@ -102,6 +102,18 @@ SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squee
 # separate appended group — so it is NOT added again here (that would duplicate columns).
 SIGNAL_METHOD_COLUMNS = SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
 
+# Confidence-formula component columns (2026-07-21) — NOT method scores (so they are
+# deliberately kept OUT of SIGNAL_METHOD_COLUMNS / tracker._ALL_METHODS: they are
+# multiplicative confidence factors, not [-1,+1] directional views). Verbatim values
+# from aggregator._score_ticker's `confidence = raw_confidence * coherence_factor *
+# movement_factor * volume_factor * family_factor * tape_conf_factor` chain, persisted
+# so src/analysis/confidence_components.py can isolate each factor's forward-return
+# contribution without re-deriving it (and drifting from the live formula) later.
+SIGNAL_CONFIDENCE_COMPONENT_COLUMNS = (
+    "raw_confidence", "coherence_factor", "movement_factor",
+    "volume_factor", "family_conf_factor", "tape_conf_factor",
+)
+
 SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS runs (
@@ -259,6 +271,7 @@ SCHEMA_STATEMENTS = [
         dominant_method     VARCHAR,
         price               DOUBLE,
         {", ".join(f"{m} DOUBLE" for m in SIGNAL_METHOD_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)},
         scores              VARCHAR
     );
     """,
@@ -346,6 +359,8 @@ _ADD_COLUMNS = (
     # the measurement behind per-source hit rates and, later, an adaptive
     # discovery budget. Trades carry the same stamp in their JSON.
     ("signals", "universe_source", "VARCHAR"),
+    # Confidence-formula component factors (2026-07-21) on an existing signals table.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS),
     # IBKR account P&L snapshot (reqPnL) on an existing broker_reconciles table.
     ("broker_reconciles", "pnl_daily", "DOUBLE"),
     ("broker_reconciles", "pnl_unrealized", "DOUBLE"),

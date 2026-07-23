@@ -107,7 +107,7 @@ def test_compare_policies_ranks_by_cap_weighted(monkeypatch):
     monkeypatch.setattr(settings, "min_combined_score_for_entry", 0.15)
     panel = _panel([
         _mk("A", "2026-06-01", "BULLISH", 0.95, 0.4, +3.0, agree=10),
-        _mk("B", "2026-06-02", "BULLISH", 0.80, 0.4, -1.0, agree=3),
+        _mk("B", "2026-06-02", "BULLISH", 0.88, 0.4, -1.0, agree=3),   # ≥0.85 gate (GATE_CONFIDENCE)
     ])
     df = pe.compare_policies(signals_df=None, policies=pe.DEFAULT_POLICIES,
                              horizon=5) if False else None

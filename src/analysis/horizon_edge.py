@@ -8,7 +8,7 @@ then decay / reverse? — at THOUSANDS of observations, where the held-panel
 ``horizon`` IC can't validate it (only ~5 real positions have ever outlived their
 window, so that IC is stuck at n≈1).
 
-First result (actionable subset, confidence ≥ 0.78 — the traded population): the
+First result (actionable subset, confidence ≥ 0.85 — the traded population): the
 edge peaks at ~1–2 days (+1% at 2d), is gone by 3d, and turns NEGATIVE by 5–7d
 (win ~37%). So holding a gated position past ~2–3 days gives the edge back — a
 SHORTER window than the entry ``target_horizon``.
@@ -45,7 +45,7 @@ _INERT = {"edge_days": None, "strength": 0.0, "n_obs": 0, "peak_day": None}
 
 def compute_horizon_edge_curve(days: Optional[int] = None,
                                horizons: Sequence[int] = _DEFAULT_HORIZONS,
-                               conf_min: Optional[float] = 0.78, min_n: int = 20,
+                               conf_min: Optional[float] = 0.85, min_n: int = 20,
                                panel: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Realized edge of ``combined_score`` by holding horizon, over the signals
     panel (optionally restricted to ``confidence ≥ conf_min`` — the traded

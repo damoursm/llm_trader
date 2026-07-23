@@ -25,6 +25,31 @@ def test_signal_base_columns_match_tracker():
     )
 
 
+def test_method_categories_cover_every_attributed_method():
+    """Every _ALL_METHODS entry must appear in exactly one METHOD_CATEGORIES bucket.
+
+    2026-07-20 post-mortem: `massive` and `market_momentum` (promoted into the
+    weighted combine 2026-06-24) plus all 6 fundamental/corp-action factors and
+    all 4 trend-predictability methods were silently missing from
+    METHOD_CATEGORIES — a method not in ANY category contributes to NO bundle in
+    tracker.compute_macro_eval's "method bundle" rollup and NO category in
+    tracker._compute_category_stats, with no error or "(uncategorized)" fallback
+    to signal the gap. This guard makes that class of drift a test failure
+    instead of a silent dashboard/email undercount."""
+    from src.performance.tracker import _ALL_METHODS, METHOD_CATEGORIES
+    categorized = set()
+    for members in METHOD_CATEGORIES.values():
+        categorized.update(members)
+    missing = [m for m in _ALL_METHODS if m not in categorized]
+    assert not missing, (
+        f"{missing} in _ALL_METHODS but missing from every METHOD_CATEGORIES "
+        "bucket — add each to whichever category it belongs to."
+    )
+    dupes = [m for m in categorized
+            if sum(m in members for members in METHOD_CATEGORIES.values()) > 1]
+    assert not dupes, f"{dupes} appear in MORE THAN ONE METHOD_CATEGORIES bucket"
+
+
 def test_fundamentals_are_trade_attributed():
     # The 6 fundamental/corp-action factors are now in _ALL_METHODS and read from the
     # signal's fundamental_scores dict by _method_scores_from_signal → they show up in

@@ -159,6 +159,7 @@ def _fmt_et(iso_str) -> str:
 _INT = Format(precision=0, scheme=Scheme.fixed)
 _NUM1 = Format(precision=1, scheme=Scheme.fixed)
 _NUM2 = Format(precision=2, scheme=Scheme.fixed)
+_NUM3 = Format(precision=3, scheme=Scheme.fixed)
 _NUM4 = Format(precision=4, scheme=Scheme.fixed)
 
 
@@ -229,7 +230,7 @@ _TRADE_COL_SPEC = [
     ("broker_exit", "IBKR exit", None, "Same for the closing order. ⏳ pending = the ledger closed the trade and the exit goes out on the next sync. Blank while the position is open."),
 ]
 
-# Method Performance table — header explanations (table is built inline below).
+# Entry Performance table — header explanations (table is built inline below).
 _METHOD_HEADER_TIPS = {
     "Method": "The signal method (e.g. news sentiment, technical, momentum) — or an LLM engine row: 'Synthesis LLM' made the final BUY/SELL call, 'Sentiment LLM' scored the per-ticker news (run-dominant engine).",
     "Win rate %": "Method rows — solo simulation: for each closed trade, what if ONLY this method had decided the direction? LLM rows — share of the engine's recommended trades (executed or not) currently positive.",
@@ -239,7 +240,7 @@ _METHOD_HEADER_TIPS = {
 
 # Decision-funnel table — header explanations (pipeline stage evaluation).
 _STAGE_HEADER_TIPS = {
-    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each of the four actionable gates. '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners.",
+    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each actionable gate (confidence threshold, agreement floor, PANIC/RISK_OFF BUY-block, earnings blackout, liquidity floor). '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners. 'Gate 1b · agreement floor' is the newest gate (2026-07-20) — it mechanically enforces the ≥2-independent-sources rule that was previously only a prompt instruction.",
     "Trades": "Directional calls in that stage's stream, deduped to the last call per ticker per day. The shrink from row to row is each gate's real selectivity.",
     "Win rate %": "Share of the stage's calls currently positive, scored as pseudo-trades: snapshot price at call time → latest cached close, through the real cost model — every call counts, not just the ones that became ledger trades.",
     "Avg return %": "Average forward % return across the stage's calls on the same pseudo-trade basis. A gate earns its place when this rises from the pre-gate row to the post-gate row.",
@@ -254,7 +255,7 @@ _MACRO_HEADER_TIPS = {
 }
 
 
-# ── LLM model usage (Method Performance tab → "LLM models used" section) ──────
+# ── LLM model usage (Entry Performance tab → "LLM models used" section) ───────
 # Exact model ids per provider. Sources of truth in the code:
 #   synthesis Claude   → settings.analyst_model
 #   synthesis DeepSeek → claude_analyst._DEEPSEEK_ANALYST_MODEL  ("deepseek-v4-flash")
@@ -373,7 +374,7 @@ def serve_layout() -> html.Div:
                 children=[
                     dcc.Tab(label="Recommendations & Rationale", value="rationale",
                             children=dcc.Loading(html.Div(_safe(_rationale_tab), style=body))),
-                    dcc.Tab(label="Method Performance", value="methods",
+                    dcc.Tab(label="Entry Performance", value="methods",
                             children=dcc.Loading(html.Div(_safe(_methods_tab), style=body))),
                     dcc.Tab(label="Exit Performance", value="exit_perf",
                             children=dcc.Loading(html.Div(_safe(_exit_perf_tab), style=body))),
@@ -514,7 +515,7 @@ def _review_timeline_section(ticker: str):
     ])
 
 
-# ── Time-window toggle (shared by the Method Performance & Returns tabs) ─────
+# ── Time-window toggle (shared by the Entry Performance & Returns tabs) ──────
 _WINDOW_OPTIONS = [
     {"label": "1 Week", "value": "7"},
     {"label": "1 Month", "value": "30"},
@@ -733,7 +734,7 @@ def _usd(x, signed: bool = True) -> str:
         return str(x)
 
 
-# ── Tab 2: Method Performance ──────────────────────────────────────────────
+# ── Tab 2: Entry Performance ────────────────────────────────────────────────
 
 _IC_TOOLTIP = (
     "Spearman rank correlation between each method's score and the forward "
@@ -1332,6 +1333,204 @@ def _source_perf_section():
     return html.Div(children)
 
 
+_MC_METHODS_TOOLTIP = (
+    "Monte Carlo luck-vs-skill — is each method's track record statistically distinguishable "
+    "from a coin flip at its sample size? Judged on the GROSS solo win rate (sign(score) × raw "
+    "price move, pre-cost) — the exact number the win-rate method filter selects on, same train "
+    "split. Two resampling tests per method (2000 sims, fixed seed): BOOTSTRAP resamples the "
+    "method's own trades with replacement → the 5–95% CI on its win rate and mean oriented "
+    "return (how wide is the evidence); PERMUTATION NULL replaces every direction call with a "
+    "fair coin on the same |price moves| → p(luck) = probability a NO-SKILL method would post "
+    "at least this win rate by chance (p(ret) = same test on the mean return — a method right "
+    "on the BIG moves scores better here than raw hit rate shows). One-sided: p < 0.05 ⇒ "
+    "evidence of real skill; p > 0.95 ⇒ reliably WORSE than chance (inversion candidate); "
+    "anything between = the record is consistent with noise — a keep/drop decision based on it "
+    "is provisional. 'Filter state' shows what the live win-rate filter did with the method. "
+    "The selection-bias line above the table runs the WHOLE filter on synthetic coin-flip "
+    "methods at the real trade counts: if chance alone would keep about as many methods as the "
+    "filter kept, the current kept set is not yet evidence of skill (expect churn as trades "
+    "accrue). Small samples move these p-values a lot — re-read as the ledger grows.")
+
+
+def _mc_overfit_section():
+    """Monte Carlo overfitting check — per-method luck-vs-skill + the win-rate
+    filter's selection-bias null (src/analysis/monte_carlo.py)."""
+    rep = data.monte_carlo_methods()
+    rows = rep.get("rows") or []
+    heading = _h3("Overfitting check — Monte Carlo luck vs skill", _MC_METHODS_TOOLTIP)
+    if not rows:
+        return html.Div([heading, html.Div(
+            "No closed trades with method attribution yet — accrues with the ledger.",
+            style={"color": "#6b7280"})])
+
+    sel = rep.get("selection") or {}
+    sel_line = None
+    if sel.get("n_judgeable"):
+        sel_line = html.Div(
+            f"Win-rate filter selection-bias null: at the real per-method trade counts, pure "
+            f"chance would keep {sel['kept_null_mean']} ± {sel['kept_null_sd']} of "
+            f"{sel['n_judgeable']} judgeable methods (5–95%: {sel['kept_null_lo']}–"
+            f"{sel['kept_null_hi']}); the live filter kept {sel['kept_actual']} "
+            f"(p ≥ actual = {sel['p_ge_actual']}). → {sel.get('verdict', '')}",
+            style={"color": "#cbd5e1", "marginBottom": 8})
+    elif sel.get("verdict"):
+        sel_line = html.Div(sel["verdict"], style={"color": "#6b7280", "marginBottom": 8})
+
+    trows = [{
+        "method": r["method"], "state": r.get("filter_state", "—"), "n": r["n"],
+        "wr": r["win_rate"], "wr_ci": f"{r['wr_lo']:.0f} – {r['wr_hi']:.0f}",
+        "p_luck": r["p_luck"],
+        "ret": r["mean_ret"], "ret_ci": f"{r['ret_lo']:.2f} – {r['ret_hi']:.2f}",
+        "p_ret": r["p_ret"], "verdict": r["verdict"],
+    } for r in rows]
+    tcols = [
+        {"name": "Method", "id": "method"},
+        {"name": "Filter state", "id": "state"},
+        {"name": "Trades", "id": "n", "type": "numeric", "format": _INT},
+        {"name": "Gross WR %", "id": "wr", "type": "numeric", "format": _NUM1},
+        {"name": "WR CI 5–95%", "id": "wr_ci"},
+        {"name": "p (luck)", "id": "p_luck", "type": "numeric", "format": _NUM3},
+        {"name": "Mean ret %", "id": "ret", "type": "numeric", "format": _NUM2},
+        {"name": "Ret CI 5–95%", "id": "ret_ci"},
+        {"name": "p (ret)", "id": "p_ret", "type": "numeric", "format": _NUM3},
+        {"name": "Verdict", "id": "verdict"},
+    ]
+    cond = [
+        {"if": {"filter_query": "{p_luck} < 0.05", "column_id": "p_luck"}, "color": figures.POS},
+        {"if": {"filter_query": "{p_luck} > 0.95", "column_id": "p_luck"}, "color": figures.NEG},
+        {"if": {"filter_query": "{p_ret} < 0.05", "column_id": "p_ret"}, "color": figures.POS},
+        {"if": {"filter_query": "{p_ret} > 0.95", "column_id": "p_ret"}, "color": figures.NEG},
+        {"if": {"filter_query": '{verdict} contains "SKILL"', "column_id": "verdict"},
+         "color": figures.POS},
+        {"if": {"filter_query": '{verdict} contains "worse"', "column_id": "verdict"},
+         "color": figures.NEG},
+        {"if": {"filter_query": '{state} = "FILTERED"', "column_id": "state"},
+         "color": "#6b7280"},
+    ]
+    return html.Div([heading] + ([sel_line] if sel_line is not None else []) + [
+        dash_table.DataTable(data=trows, columns=tcols, style_data_conditional=cond,
+                             **_TABLE_KW),
+    ])
+
+
+_CONF_COMPONENTS_TOOLTIP = (
+    "Isolates each multiplier in the confidence formula (confidence = raw × coherence × "
+    "movement × volume × family × tape — src/signals/aggregator.py::_score_ticker) to see "
+    "which ones actually earn their keep. 'Raw score only' = min(1, |combined_score| / 0.5) "
+    "with no multiplier applied; each other row applies exactly ONE factor on top of raw "
+    "(capped at 1.0) — in ISOLATION, not stacked cumulatively. 'Live (all combined)' is the "
+    "actual confidence the system uses today, shown as the reference row. IC = Spearman rank "
+    "correlation between the variant's value and the DIRECTION-ORIENTED forward return "
+    "(sign(combined_score) × forward return) — positive means higher readings of that "
+    "variant genuinely predict better outcomes; ≈0 means it doesn't discriminate despite "
+    "moving the number (this top table deliberately omits win%/return — ungated, those "
+    "never depend on the variant's value, only IC does; they'd be redundant at best, "
+    "missingness noise at worst). The conviction-band table below splits each variant's OWN "
+    "value into Low (0.10–0.35) / Medium (0.35–0.65) / High "
+    "(0.65+) — the same cut points tracker._eval_stats uses for per-method calibration — so "
+    "you can see whether win rate / return actually RISES with that variant's own conviction "
+    "(a well-behaved component shows Low < Medium < High; flat or inverted means it isn't "
+    "separating good calls from bad ones). Forward-collected from 2026-07-21 when the factor "
+    "columns were added to the signals panel — 0 rows at first, fills in every run.")
+
+_CONF_COMPONENTS_EXIT_NOTE = (
+    "Exit-side: the SAME isolation, but over signals-panel rows re-scored on an ALREADY-OPEN "
+    "position mid-hold (oriented by the trade's own direction, not the ticker's possibly-"
+    "since-drifted current call; forward return measured from the re-read tick, not the "
+    "original entry) — does a component's reading, taken WHILE HOLDING, predict what happens "
+    "to the position from that point on. No separate capture path: held tickers stay in the "
+    "scored universe every tick, so this is a join against the trades ledger's open interval, "
+    "not a new signal.")
+
+
+_DEFAULT_CONF_HORIZONS = (1, 5, 10)
+
+
+def _conf_component_ic_table(icdf: pd.DataFrame) -> dash_table.DataTable:
+    rows = icdf.rename(columns={"label": "Variant"}).to_dict("records")
+    cols = [{"name": "Variant", "id": "Variant"}]
+    for h in _DEFAULT_CONF_HORIZONS:
+        cols += [
+            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
+            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM3},
+            {"name": f"ICIR@{h}d", "id": f"icir_{h}d", "type": "numeric", "format": _NUM2},
+        ]
+    cond = [{"if": {"filter_query": '{Variant} = "Live (all combined)"'},
+            "backgroundColor": "#1f2937"}]
+    for h in _DEFAULT_CONF_HORIZONS:
+        cond += [
+            {"if": {"filter_query": f"{{ic_{h}d}} > 0.03", "column_id": f"ic_{h}d"},
+             "color": figures.POS},
+            {"if": {"filter_query": f"{{ic_{h}d}} < -0.03", "column_id": f"ic_{h}d"},
+             "color": figures.NEG},
+        ]
+    return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
+
+
+def _conf_component_band_table(banddf: pd.DataFrame) -> dash_table.DataTable:
+    rows = banddf.rename(columns={"label": "Variant", "band_label": "Band"}).to_dict("records")
+    cols = [{"name": "Variant", "id": "Variant"}, {"name": "Band", "id": "Band"}]
+    for h in _DEFAULT_CONF_HORIZONS:
+        cols += [
+            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
+            {"name": f"Win@{h}d %", "id": f"win_{h}d", "type": "numeric", "format": _NUM1},
+            {"name": f"Ret@{h}d %", "id": f"ret_{h}d", "type": "numeric", "format": _NUM2},
+        ]
+    cond = [{"if": {"filter_query": '{Band} = "High (0.65+)"'}, "backgroundColor": "#1f2937"}]
+    return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
+
+
+def _confidence_components_section():
+    """Entry-side confidence-component isolation (src/analysis/confidence_components.py)."""
+    rep = data.confidence_components_entry()
+    heading = _h3("Confidence-formula component isolation", _CONF_COMPONENTS_TOOLTIP)
+    if not rep.get("has_factors"):
+        return html.Div([heading, html.Div(
+            "Forward-collecting — the per-factor columns (coherence / movement / volume / "
+            "family / tape) were just added to the signals panel; this fills in from the "
+            "next pipeline run onward.", style={"color": "#6b7280"})])
+    icdf, banddf = rep.get("ic"), rep.get("bands")
+    if icdf is None or icdf.empty:
+        return html.Div([heading, html.Div(
+            f"{rep.get('panel_rows', 0)} signal row(s) with factor data — not enough "
+            "forward-return history yet.", style={"color": "#6b7280"})])
+    return html.Div([
+        heading,
+        html.Div(f"{rep['panel_rows']} scored ticker-tick(s) with factor data",
+                 style={"color": "#cbd5e1", "marginBottom": 8}),
+        _conf_component_ic_table(icdf),
+        html.Div("By conviction band (does win rate / return rise with THIS variant's own "
+                 "conviction level?):",
+                 style={"marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+        _conf_component_band_table(banddf),
+    ])
+
+
+def _exit_confidence_components_block(session=None, direction=None):
+    """Exit-side confidence-component isolation — held-position mid-hold re-reads."""
+    rep = data.confidence_components_exit(session=session, direction=direction)
+    note = html.Div(_CONF_COMPONENTS_EXIT_NOTE, style={"color": "#6b7280", "marginBottom": 8})
+    if not rep.get("has_factors") or not rep.get("panel_rows"):
+        return html.Div([note, html.Div(
+            "No held-position re-reads with factor data yet — accrues once a position "
+            "opened after 2026-07-21 is held past its entry day.",
+            style={"color": "#6b7280"})])
+    icdf, banddf = rep.get("ic"), rep.get("bands")
+    if icdf is None or icdf.empty:
+        return html.Div([note, html.Div(
+            f"{rep.get('panel_rows', 0)} held re-read(s) — not enough forward-return "
+            "history yet.", style={"color": "#6b7280"})])
+    return html.Div([
+        note,
+        html.Div(f"{rep['panel_rows']} held-position re-read(s) with factor data",
+                 style={"color": "#cbd5e1", "marginBottom": 8}),
+        _conf_component_ic_table(icdf),
+        html.Div("By conviction band:",
+                 style={"marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+        _conf_component_band_table(banddf),
+    ])
+
+
 def _methods_tab():
     # The LLM-models-used table is run-based (not trade-windowed), so it lives
     # outside the windowed body. The per-method performance section (bar + table)
@@ -1354,6 +1553,8 @@ def _methods_tab():
         _sim_column_filters(),
         dcc.Loading(html.Div(id="methods-body")),
         _safe(_ic_section),
+        _safe(_mc_overfit_section),
+        _safe(_confidence_components_section),
         _safe(_policy_eval_section),
         _safe(_predictability_section),
         _safe(_price_volume_section),
@@ -1785,6 +1986,65 @@ _EXIT_SESSION_TITLE = (
     "the trade actually EXITED in.")
 
 
+_MC_EXITS_TOOLTIP = (
+    "Monte Carlo exit-timing test — does each exit rule TIME its exits better than random, or "
+    "is its realized outcome just what any exit in the same windows would have gotten? For every "
+    "CLOSED trade the feasible exit window is each session close from the first session after "
+    "entry through the actual hold + 10 more sessions; the RANDOM-EXIT NULL draws one uniform "
+    "random exit per trade per simulation (2000 sims, fixed seed) and records the group's mean "
+    "gross oriented return. Both arms anchor entry at the real entry fill and exit at SESSION "
+    "CLOSES (the actual arm at the actual exit date's close) so the comparison is apples-to-"
+    "apples; gross of costs (both arms pay the same one-way exit cost). 'Percentile' = where the "
+    "rule's actual mean lands inside its own random-exit distribution: ≥ 95 ⇒ the rule genuinely "
+    "times exits (green); ≤ 5 ⇒ RANDOM exits would have beaten the rule (red — the rule "
+    "destroys timing value); anything between ≈ the rule adds no measurable timing skill — its "
+    "realized P&L is explained by WHICH trades it closed, not WHEN. p(random ≥ actual) is the "
+    "one-sided probability. Trades without enough cached sessions are skipped, never guessed. "
+    "Small groups (n < ~10) are noise — judge only as trades accrue.")
+
+
+def _exit_mc_block(session=None, direction=None):
+    """Exit-timing-vs-random Monte Carlo per exit rule (src/analysis/monte_carlo.py)."""
+    rep = data.monte_carlo_exits(session=session, direction=direction)
+    if not rep.get("n"):
+        return html.Div(rep.get("verdict") or "No closed trades with cached exit windows yet.",
+                        style={"color": "#6b7280"})
+    rows = [{
+        "reason": r["reason"], "trades": r["trades"],
+        "actual": r["actual_mean"], "null": r["null_mean"],
+        "null_ci": f"{r['null_lo']:.2f} – {r['null_hi']:.2f}",
+        "pctile": r["percentile"], "p_rand": r["p_random_beats"],
+        "verdict": r["verdict"],
+    } for r in rep["rows"]]
+    cols = [
+        {"name": "Exit reason", "id": "reason"},
+        {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT},
+        {"name": "Actual mean %", "id": "actual", "type": "numeric", "format": _NUM2},
+        {"name": "Random-exit mean %", "id": "null", "type": "numeric", "format": _NUM2},
+        {"name": "Null CI 5–95%", "id": "null_ci"},
+        {"name": "Percentile", "id": "pctile", "type": "numeric", "format": _NUM1},
+        {"name": "p (random ≥ actual)", "id": "p_rand", "type": "numeric", "format": _NUM3},
+        {"name": "Verdict", "id": "verdict"},
+    ]
+    cond = [
+        {"if": {"filter_query": "{pctile} >= 95", "column_id": "pctile"}, "color": figures.POS},
+        {"if": {"filter_query": "{pctile} <= 5", "column_id": "pctile"}, "color": figures.NEG},
+        {"if": {"filter_query": '{verdict} contains "BETTER"', "column_id": "verdict"},
+         "color": figures.POS},
+        {"if": {"filter_query": '{verdict} contains "BEATEN"', "column_id": "verdict"},
+         "color": figures.NEG},
+        {"if": {"filter_query": '{reason} = "ALL exits"'}, "backgroundColor": "#1f2937"},
+    ]
+    skipped = (f" · {rep['n_skipped']} trade(s) skipped (no cached window)"
+               if rep.get("n_skipped") else "")
+    return html.Div([
+        html.Div(f"{rep['n']} closed trade(s) in the MC{skipped}",
+                 style={"color": "#cbd5e1", "marginBottom": 8}),
+        dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond,
+                             **_TABLE_KW),
+    ])
+
+
 def _exit_perf_tab():
     return html.Div([
         _window_toggle("exit-window"),
@@ -1831,6 +2091,11 @@ def _exit_body(window_value, session_value, direction_value, source_value,
             "Direction toggles; the Window toggle does not apply. Exits without forward bars yet "
             "(closed today / cache gap) are counted as pending, never guessed."),
         _safe(lambda: _exit_forward_block(session=session, direction=direction)),
+        _h3("Exit timing vs random exits — Monte Carlo (closed ledger trades)",
+            _MC_EXITS_TOOLTIP),
+        _safe(lambda: _exit_mc_block(session=session, direction=direction)),
+        _h3("Confidence-formula component isolation — held positions", _CONF_COMPONENTS_TOOLTIP),
+        _safe(lambda: _exit_confidence_components_block(session=session, direction=direction)),
         _safe(_horizon_edge_section),
         _safe(_exit_policy_eval_section),
     ])
@@ -1840,7 +2105,7 @@ _HORIZON_EDGE_TOOLTIP = (
     "The realized EDGE-DECAY of combined_score by holding horizon — measured tick-by-tick, "
     "ticker-by-ticker over the whole signals panel (every scored ticker at every tick is a "
     "hypothetical entry in its signal's direction), restricted to the ACTIONABLE subset "
-    "(confidence ≥ 0.78 — the traded population). This is the ground truth the horizon time-stop "
+    "(confidence ≥ 0.85 — the traded population). This is the ground truth the horizon time-stop "
     "rests on, at thousands of observations where the held-position `horizon` IC can't reach "
     "(only ~5 real positions have ever outlived their window). Per horizon: 'n' = observations, "
     "'IC' = Spearman(combined_score, forward return), 'win %' = directional hit, 'edge %' = mean "

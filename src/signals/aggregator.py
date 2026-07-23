@@ -37,25 +37,46 @@ scorer fix). See ``simulated_trades --directional`` for the per-side ICIR readou
 
 Methods
 ───────
-  1  News sentiment        (enable_news_sentiment)
-  2  Technical analysis    (enable_technical_analysis)
-  3  Smart money / insider (enable_insider_trades / options_flow / sec_filings)
-  4  Put/call ratio        (enable_put_call, per-ticker contrarian)
+The weighted pool (``_BASE_WEIGHTS`` — 21 methods spanning news/sentiment, technical,
+smart-money, options, momentum/trend, and event-driven signals) plus additive overlays
+(fundamentals, corporate actions, trend-predictability) and 8 panel-first methods at
+weight 0. See CLAUDE.md's "Weighting stack" section for the full, current catalogue and
+each method's ``enable_*`` flag — kept there, not duplicated here, so this docstring
+doesn't drift the way the confidence-formula numbers below did (2026-07-20 audit).
+
+A method is WEIGHTED ONLY IF: its ``enable_*`` flag is on AND its solo win rate isn't a
+confirmed sub-50% (``winrate_filtered_methods()`` — a HARD exclusion, weight → 0, the
+survivors renormalise so combined_score stays on scale; the filtered method is still
+scored + persisted to the panel, so its win rate keeps being tracked). An INVERTED
+method (``inverted_methods``) is exempt from that filter and contributes with its sign
+flipped instead.
 
 Confidence formula
 ──────────────────
   confidence = raw_conf × coherence_factor × movement_factor × volume_factor
+               × family_factor × tape_conf_factor
 
   raw_conf         — abs(combined_score) normalised to [0, 1].
   coherence_factor — continuous [0.45, 1.35]: how strongly do all methods agree?
                      Replaces the old binary 1.25×/0.60× toggle. Magnitude-weighted,
                      so a weak outlier costs less than a strong one pointing opposite.
-  movement_factor  — [0.80, 1.20]: is the stock actually likely to move?
-                     Derived from ATR% + BB-width%. Low-volatility stocks are
-                     unlikely to deliver on a signal; high-volatility ones are "in play".
-  volume_factor    — [0.90, 1.15]: does recent volume confirm the aggregate direction?
+                     Reads each method's EFFECTIVE (inversion-corrected) score — the
+                     same convention as family_factor below (unified 2026-07-20).
+  movement_factor  — effective range [0.70, 1.30]: is the stock actually likely to
+                     move? ``_movement_factor()`` (ATR% + BB-width%) itself returns
+                     [0.80, 1.20]; the GEX PINNED/AMPLIFIED modifier (×0.85 / ×1.15)
+                     is applied on top and the product re-clamped to [0.70, 1.30].
+  volume_factor    — [0.92, 1.15]: does recent volume confirm the aggregate direction?
                      Separate from the vol multiplier already baked into technical_score;
                      this operates at the cross-method level.
+  family_factor    — [1−span, 1+span] (``family_agreement_factor_span``, default 0.12):
+                     breadth of agreement ACROSS independent information families
+                     (``src/signals/agreement.py`` — correlated same-family methods
+                     collapse to one vote, unlike coherence_factor above; uses each
+                     method's EFFECTIVE/corrected sign). 1 family alone → neutral 1.0.
+  tape_conf_factor — [1−span, 1+span] (``tape_confirmation_factor_span``, default 0.08):
+                     does the SCORE-INDEPENDENT raw price/volume tape confirm the
+                     combined direction? NO_DATA / near-zero combined → neutral 1.0.
 
 Interaction adjustments (additive, applied before confidence, capped ±0.15)
 ────────────────────────────────────────────────────────────────────────────
@@ -66,10 +87,16 @@ Interaction adjustments (additive, applied before confidence, capped ±0.15)
   • News catalyst confirmed by volume — a strong sentiment signal backed by
     above-average volume is more likely to be a real market-moving event.
 
-Sector alignment (second pass, unchanged from before)
-──────────────────────────────────────────────────────
-  Individual stocks are cross-referenced against their sector ETF direction.
-  Alignment → mild boost (1.10×). Contradiction → meaningful penalty (0.75×).
+Post-combine passes (in order)
+───────────────────────────────
+  2nd — Cross-sectional ranking: nudges combined_score by how each method's score
+        deviates from the universe mean (``enable_cross_sectional``, ≥3 tickers).
+  3rd — Sector alignment: individual stocks are cross-referenced against their
+        sector ETF's OWN 0.40/0.30/0.30 sentiment/technical/insider proxy (a fixed,
+        simplified read — NOT the full weighting stack above, and only for the
+        ~20 large-caps in ``_SECTOR_MAP``). Alignment → mild confidence boost
+        (1.10×). Contradiction → meaningful penalty (0.75×). Names outside the map
+        get no adjustment (factor 1.0).
 """
 
 from datetime import date
@@ -97,6 +124,8 @@ from src.signals.iv_rank import compute_iv_rank_score
 from src.signals.iv_expr import compute_iv_expr_score
 from src.signals.extended_session import compute_extended_gap_score
 from src.signals.broker_advisor import compute_broker_advisor_score
+from src.signals.agreement import (compute_family_agreement,
+                                   compute_tape_confirmation, tape_factor)
 from src.signals.classic_anomalies import (compute_high_52w_score,
                                            compute_momentum_12_1_score,
                                            compute_st_reversal_score)
@@ -405,6 +434,76 @@ def _ic_weight_multipliers() -> dict:
 def reset_ic_weight_cache() -> None:
     """Drop the cached IC-weight multipliers (tests / forced refresh)."""
     _IC_WEIGHT_CACHE.clear()
+
+
+# ── Win-rate method filter (hard exclusion; panel monitoring unaffected) ─────
+
+_WINRATE_FILTER_CACHE: dict = {}
+
+
+def winrate_filtered_methods() -> frozenset:
+    """Methods DROPPED from the combine + synthesis because their GROSS solo win rate
+    is below the coin-flip threshold (``winrate_filter_threshold``, default 50%), given
+    at least ``winrate_filter_min_trades`` attributed solo trades to judge them.
+
+    The win rate is the PURE directional hit rate BEFORE fees and spread
+    (``tracker.compute_solo_method_gross_winrate`` — ``sign(score)·(exit−entry) > 0``),
+    so a method is judged on whether it picked the right DIRECTION, not on whether the
+    move cleared the round-trip cost (costs are an execution concern, not signal
+    quality). This is a HARD exclusion rather than a soft multiplier: a filtered method
+    contributes 0 to ``combined_score`` / coherence / ``sources_agreeing`` and is hidden
+    from the synthesis prompt — yet is STILL scored and persisted to the ``signals``
+    panel + trade attribution every run, so IC / win-rate / simulation monitoring is
+    unaffected and the method can re-earn its place.
+
+    Exemptions / guards:
+      • INVERTED methods (``inverted_methods``) are never filtered — their sign is
+        already corrected in the combine, so a sub-50% RAW win rate is precisely why
+        they're kept.
+      • A method below ``winrate_filter_min_trades`` attributed trades keeps its full
+        weight (small-sample noise is not evidence of a bad method).
+    Returns ``frozenset()`` when the flag is off, the tracker has no attribution yet,
+    or the lookup raises. (build_signals additionally suppresses the filter for a run
+    if it would remove every ACTIVE method — this helper doesn't know the active set.)
+
+    Cached for ``ic_weight_cache_seconds`` because ``build_signals`` runs many times per
+    tick (the hold-review pool); the ledger only advances once per tick."""
+    if not settings.enable_winrate_method_filter:
+        return frozenset()
+    import time
+    now = time.time()
+    hit = _WINRATE_FILTER_CACHE.get("v")
+    if hit and (now - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["set"]
+
+    result: frozenset = frozenset()
+    try:
+        from src.performance.tracker import compute_solo_method_gross_winrate
+        # Train-slice only when OOS validation is on, matching the adaptive layer so
+        # the holdout stays an honest evaluation set (None = full sample otherwise).
+        split = "train" if settings.enable_oos_validation else None
+        perf = compute_solo_method_gross_winrate(split=split)
+        thresh_pct = float(settings.winrate_filter_threshold) * 100.0
+        min_n = max(1, int(settings.winrate_filter_min_trades))
+        inverted = _inverted_methods()
+        dropped = {
+            m for m in _BASE_WEIGHTS
+            if m not in inverted
+            and int((perf.get(m, {}) or {}).get("trades", 0) or 0) >= min_n
+            and float((perf.get(m, {}) or {}).get("win_rate", 50.0) or 50.0) < thresh_pct
+        }
+        result = frozenset(dropped)
+    except Exception as e:
+        logger.debug(f"[aggregator] win-rate filter — gross solo win rate unavailable: {e}")
+        result = frozenset()
+
+    _WINRATE_FILTER_CACHE["v"] = {"ts": now, "set": result}
+    return result
+
+
+def reset_winrate_filter_cache() -> None:
+    """Drop the cached win-rate filter set (tests / forced refresh)."""
+    _WINRATE_FILTER_CACHE.clear()
 
 
 # ── Per-method score helpers ──────────────────────────────────────────────────
@@ -1114,7 +1213,7 @@ def build_signals(
             f"news/velocity/gap ×{settings.extended_news_weight_mult:g}"
         )
 
-    active_flags = {
+    _raw_active = {
         "news":       use_news,
         "sent_velocity": use_sent_velocity,
         "tech":       use_tech,
@@ -1137,12 +1236,33 @@ def build_signals(
         "ext_gap":    use_ext_gap,
         "broker_advisor": use_broker_advisor,
     }
+    # Win-rate filter — drop methods whose solo win rate is confidently sub-50%
+    # from the combine + coherence + agreement (and, via winrate_filtered_methods(),
+    # from the synthesis prompt). Their scores are still COMPUTED below and persisted
+    # to the panel, so simulation monitoring is unaffected. Never let the filter zero
+    # out the whole active book — suppress it this run if it would.
+    filtered_methods = winrate_filtered_methods()
+    if filtered_methods and all(
+            (m in filtered_methods) for m, on in _raw_active.items() if on):
+        logger.warning("[aggregator] win-rate filter would remove EVERY active method "
+                       "— suppressed this run (base weights kept)")
+        filtered_methods = frozenset()
+    if filtered_methods:
+        logger.info(
+            f"[aggregator] win-rate filter — dropping from combine + synthesis "
+            f"(<{settings.winrate_filter_threshold:.0%} solo WR over "
+            f"≥{settings.winrate_filter_min_trades} trades): {sorted(filtered_methods)}"
+        )
+    active_flags = {m: (on and m not in filtered_methods) for m, on in _raw_active.items()}
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     # Method INVERSION: a method whose raw signal is reliably anti-predictive across
     # horizons (net of beta) contributes with a FLIPPED sign — its backwards read
     # becomes a correct one. Config-driven (inverted_methods) + reversible; the panel
-    # keeps the RAW score so the inversion stays re-validatable. (Coherence / source
-    # agreement read the raw scores — a minor, accepted inconsistency.)
+    # keeps the RAW score so the inversion stays re-validatable. Coherence / source
+    # agreement / family agreement all read the EFFECTIVE (flipped) sign — what the
+    # combine actually consumed — so "does this method agree with combined_score" is
+    # judged consistently everywhere (unified 2026-07-20; previously coherence read
+    # the raw, pre-inversion sign, a documented inconsistency now removed).
     _inv = _inverted_methods()
     for _m in _inv:
         if _m in weights and weights[_m]:
@@ -1587,38 +1707,74 @@ def build_signals(
 
         # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
         # Technical methods use the blended (*_eff) values so coherence reflects
-        # exactly what the combine consumed.
-        method_scores = [
-            (use_news,       sentiment_score),
-            (use_sent_velocity, sent_velocity_score),
-            (use_tech,       tech_eff),
-            (use_massive,    massive_score),
-            (use_insider,    insider_sc),
-            (use_put_call,   pc_score),
-            (use_max_pain,   mp_score),
-            (use_oi_skew,    oi_skew_score),
-            (use_vwap,       vwap_eff),
-            (use_pattern,    pattern_eff),
-            (use_momentum,   momentum_eff),
-            (use_sector_momentum, sector_momentum_eff),
-            (use_market_momentum, market_momentum_score),
-            (use_money_flow, money_flow_eff),
-            (use_trend_strength, trend_strength_eff),
-            (use_pead,       pead_score_v),
-            (use_iv_rank,    iv_rank_eff),
-            (use_iv_expr,    iv_expr_score_v),
-            (use_coint,      coint_score_v),
-            (use_ext_gap,    ext_gap_score_v),
-            (use_broker_advisor, broker_advisor_score_v),
-        ]
-        coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores)
+        # exactly what the combine consumed. The enabled flag reads from
+        # active_flags (not the raw use_* booleans) so a win-rate-FILTERED method
+        # is dropped from coherence + sources_agreeing exactly as it is from the
+        # weighted combine — active_flags == use_* whenever the filter is inactive.
+        # Named map (not a bare list) so the family rollup below can group the
+        # SAME effective values by information family.
+        method_score_map = {
+            "news":       (active_flags["news"],       sentiment_score),
+            "sent_velocity": (active_flags["sent_velocity"], sent_velocity_score),
+            "tech":       (active_flags["tech"],       tech_eff),
+            "massive":    (active_flags["massive"],    massive_score),
+            "insider":    (active_flags["insider"],    insider_sc),
+            "put_call":   (active_flags["put_call"],   pc_score),
+            "max_pain":   (active_flags["max_pain"],   mp_score),
+            "oi_skew":    (active_flags["oi_skew"],    oi_skew_score),
+            "vwap":       (active_flags["vwap"],       vwap_eff),
+            "pattern":    (active_flags["pattern"],    pattern_eff),
+            "momentum":   (active_flags["momentum"],   momentum_eff),
+            "sector_momentum": (active_flags["sector_momentum"], sector_momentum_eff),
+            "market_momentum": (active_flags["market_momentum"], market_momentum_score),
+            "money_flow": (active_flags["money_flow"], money_flow_eff),
+            "trend_strength": (active_flags["trend_strength"], trend_strength_eff),
+            "pead":       (active_flags["pead"],       pead_score_v),
+            "iv_rank":    (active_flags["iv_rank"],    iv_rank_eff),
+            "iv_expr":    (active_flags["iv_expr"],    iv_expr_score_v),
+            "coint":      (active_flags["coint"],      coint_score_v),
+            "ext_gap":    (active_flags["ext_gap"],    ext_gap_score_v),
+            "broker_advisor": (active_flags["broker_advisor"], broker_advisor_score_v),
+        }
+        # Effective (inversion-corrected) scores — the SINGLE canonical transform
+        # used by every "does this method agree with combined_score" computation
+        # below (coherence, sources_agreeing, family agreement). 2026-07-20: this
+        # UNIFIES coherence_factor/sources_agreeing with family_factor, which
+        # previously read RAW (pre-inversion) scores — a method whose raw score is
+        # the OPPOSITE of what it actually contributes (an inverted method) could
+        # read as "disagreeing" in coherence while correctly "agreeing" in the
+        # family rollup. An inverted method's EFFECTIVE sign is what the weighted
+        # combine actually consumed, so agreement should be judged on that.
+        method_score_map_eff = {
+            m: (on, (-s if m in _inv else s)) for m, (on, s) in method_score_map.items()
+        }
+        method_scores_eff = list(method_score_map_eff.values())
+        coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores_eff)
 
         # sources_agreeing kept for backward-compat with Claude's prompt context
         sources_agreeing = sum(
-            1 for enabled, score in method_scores
+            1 for enabled, score in method_scores_eff
             if enabled and abs(score) >= _AGREE_THRESHOLD
             and ((combined > 0 and score > 0) or (combined < 0 and score < 0))
         )
+
+        # ── Cross-family agreement (independent-information confirmation) ──
+        # Family votes use the ACTIVE methods' EFFECTIVE scores (inversion sign
+        # applied — what the combine consumes; win-rate-filtered methods are
+        # already inactive here). Correlated same-family methods roll up into
+        # ONE family vote, so pseudo-replication (five technicals agreeing)
+        # no longer masquerades as broad confirmation.
+        fam_agreement = None
+        if settings.enable_family_agreement:
+            _eff_scores = {m: s for m, (on, s) in method_score_map_eff.items() if on and s != 0.0}
+            fam_agreement = compute_family_agreement(
+                _eff_scores, combined,
+                vote_threshold=settings.family_vote_threshold)
+
+        # ── Tape confirmation (score-independent raw price/volume state) ──
+        tape_check = None
+        if settings.enable_tape_confirmation:
+            tape_check = compute_tape_confirmation(ticker)
 
         # ── Movement potential (ATR + BB width + GEX) ────────────────────
         movement_factor = _movement_factor(atr_pct, bb_width_pct) * _gex_movement_modifier(gex_sig)
@@ -1628,9 +1784,17 @@ def build_signals(
         volume_factor = _volume_factor(vol_ratio, abs(combined), coherence_ratio)
 
         # ── Final confidence ──────────────────────────────────────────────
+        # family_factor rewards breadth of INDEPENDENT confirmation (1 family
+        # alone → neutral 1.0); tape_factor rewards raw-tape alignment with the
+        # combined direction. Both neutral when their flag is off / no data.
+        family_factor = (fam_agreement.factor(settings.family_agreement_factor_span)
+                         if fam_agreement is not None else 1.0)
+        tape_conf_factor = tape_factor(tape_check, combined,
+                                       settings.tape_confirmation_factor_span)
         raw_confidence = min(1.0, abs(combined) / 0.5)
         confidence = round(
-            min(1.0, raw_confidence * coherence_factor * movement_factor * volume_factor),
+            min(1.0, raw_confidence * coherence_factor * movement_factor * volume_factor
+                * family_factor * tape_conf_factor),
             2,
         )
 
@@ -1664,6 +1828,20 @@ def build_signals(
             rationale=rationale,
             insider_summary=insider_summary,
             sources_agreeing=sources_agreeing,
+            families_agreeing=(fam_agreement.agreeing if fam_agreement else 0),
+            families_opposing=(fam_agreement.opposing if fam_agreement else 0),
+            family_coherence=(fam_agreement.coherence if fam_agreement else 0.0),
+            family_net_score=(fam_agreement.net_score if fam_agreement else 0.0),
+            family_detail=(fam_agreement.detail if fam_agreement else ""),
+            tape_confirmation_score=(tape_check.score if tape_check else 0.0),
+            tape_confirmation_label=(tape_check.label if tape_check else ""),
+            tape_confirmation_detail=(tape_check.detail if tape_check else ""),
+            raw_confidence=round(raw_confidence, 4),
+            coherence_factor=round(coherence_factor, 4),
+            movement_factor=round(movement_factor, 4),
+            volume_factor=round(volume_factor, 4),
+            family_conf_factor=round(family_factor, 4),
+            tape_conf_factor=round(tape_conf_factor, 4),
             gex_signal=gex_sig,
             gamma_flip=gamma_flip,
             max_pain_bias=max_pain_bias,

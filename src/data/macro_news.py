@@ -317,11 +317,16 @@ _CATEGORIES_LIST = list(_CATEGORY_KEYWORDS.keys()) + ["other"]
 
 def _macro_llm_attempts() -> list:
     """Ordered ``(provider, model, base_url, api_key, extra_body)`` classifier
-    attempts. Qwen first when ``llm_primary_provider=="qwen"`` (2026-07-11 — all
-    LLM calls on Qwen), DeepSeek as the error fallback; else DeepSeek only.
+    attempts — the configured primary first, the OTHER provider as error fallback.
+    Qwen leads when ``llm_primary_provider=="qwen"``, else DeepSeek.
     Thinking follows the maximum-thinking policy (``llm_max_thinking``): ON reasons
     at each model's max budget, OFF stays cheap/deterministic. Keyless providers
-    are dropped so the loop skips straight to the next one."""
+    are dropped so the loop skips straight to the next one.
+
+    2026-07-22: a DeepSeek primary used to return DeepSeek ALONE, so a DeepSeek
+    outage left macro classification with no engine at all. Both providers are now
+    always in the chain (order set by the primary), matching the synthesis and
+    sentiment layers — a single provider being down never silences a whole layer."""
     think = settings.llm_max_thinking
     from src.analysis.qwen_api import thinking_body
     qwen = ("qwen", settings.qwen_model, settings.qwen_base_url, settings.qwen_api_key,
@@ -329,7 +334,8 @@ def _macro_llm_attempts() -> list:
     deepseek = ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com",
                 settings.deepseek_api_key,
                 {"thinking": {"type": "enabled" if think else "disabled"}})
-    ordered = [qwen, deepseek] if settings.llm_primary_provider == "qwen" else [deepseek]
+    ordered = ([qwen, deepseek] if settings.llm_primary_provider == "qwen"
+               else [deepseek, qwen])
     return [a for a in ordered if a[3]]     # drop keyless providers
 
 

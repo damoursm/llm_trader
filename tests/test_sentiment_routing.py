@@ -1,7 +1,14 @@
 """Sentiment engine routing (2026-07-13 cost tune): DeepSeek-flash scores ~90% of
 runs and Qwen ~10% (sentiment_qwen_share), each the other's error fallback.
-Hold-review pins are HONORED (Fix #2). Claude is reserved for synthesis unless
-enable_claude_sentiment."""
+Hold-review pins are HONORED FIRST (Fix #2). Claude is reserved for synthesis unless
+enable_claude_sentiment.
+
+2026-07-22: a pin no longer returns that engine ALONE. It leads the order — the
+Fix #2 invariant is about which engine judges FIRST — but the remaining engines
+follow as fallbacks, because the alternative when the pinned engine is down is a
+0.0 "Analysis error" score silently feeding the hold review that decides whether
+to close the position. See tests/test_llm_fallback_chains.py.
+"""
 
 import src.analysis.sentiment as sent
 
@@ -11,11 +18,13 @@ def test_order_deepseek_primary_qwen_fallback(monkeypatch):
     monkeypatch.setattr(sent.settings, "enable_claude_sentiment", False)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "deepseek")
     assert sent._sentiment_engine_order(None) == ["deepseek", "qwen"]
-    # pins honored (Fix #2 — the opener engine re-judges its own position)
-    assert sent._sentiment_engine_order("deepseek") == ["deepseek"]
-    assert sent._sentiment_engine_order("qwen") == ["qwen"]
+    # pins lead (Fix #2 — the opener engine re-judges its own position FIRST)…
+    assert sent._sentiment_engine_order("deepseek")[0] == "deepseek"
+    assert sent._sentiment_engine_order("qwen")[0] == "qwen"
+    # …but never strand the ticker when that engine is down
+    assert sent._sentiment_engine_order("qwen") == ["qwen", "deepseek"]
     # an anthropic pin coerces to deepseek — Claude never scores sentiment when disabled
-    assert sent._sentiment_engine_order("anthropic") == ["deepseek"]
+    assert sent._sentiment_engine_order("anthropic") == ["deepseek", "qwen"]
 
 
 def test_order_qwen_primary_run(monkeypatch):
@@ -23,18 +32,19 @@ def test_order_qwen_primary_run(monkeypatch):
     monkeypatch.setattr(sent.settings, "enable_claude_sentiment", False)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "qwen")
     assert sent._sentiment_engine_order(None) == ["qwen", "deepseek"]
-    # pins still honored — a deepseek-opened position is re-judged by deepseek
-    assert sent._sentiment_engine_order("deepseek") == ["deepseek"]
-    assert sent._sentiment_engine_order("qwen") == ["qwen"]
+    # pins still lead — a deepseek-opened position is re-judged by deepseek first
+    assert sent._sentiment_engine_order("deepseek") == ["deepseek", "qwen"]
+    assert sent._sentiment_engine_order("qwen") == ["qwen", "deepseek"]
 
 
 def test_order_ab_when_claude_enabled(monkeypatch):
     monkeypatch.setattr(sent.settings, "enable_claude_sentiment", True)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "anthropic")
-    assert sent._sentiment_engine_order(None) == ["anthropic", "deepseek"]
+    assert sent._sentiment_engine_order(None) == ["anthropic", "deepseek", "qwen"]
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "deepseek")
-    assert sent._sentiment_engine_order(None) == ["deepseek", "qwen"]
-    assert sent._sentiment_engine_order("anthropic") == ["anthropic"]   # pin honored when enabled
+    assert sent._sentiment_engine_order(None) == ["deepseek", "qwen", "anthropic"]
+    # pin leads when enabled, with the others behind it
+    assert sent._sentiment_engine_order("anthropic")[0] == "anthropic"
 
 
 def test_reset_deepseek_when_qwen_share_zero(monkeypatch):

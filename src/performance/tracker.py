@@ -387,13 +387,21 @@ _LLM_ENGINES = ("anthropic", "deepseek", "qwen")
 _ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
-# Category groupings: how methods map to higher-level signal families
+# Category groupings: how methods map to higher-level signal families. Every
+# _ALL_METHODS entry must appear in exactly one category — tests/test_tier3_methods.py
+# (and the drift check below) hold this invariant; a method left out silently drops
+# out of compute_macro_eval's bundle view and _compute_category_stats' rollup (it
+# contributes to NO category, not an "uncategorized" one).
 METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Sentiment":   ["news", "sent_velocity"],
-    "Technical":   ["tech", "vwap", "pattern", "momentum", "sector_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap", "hi52", "mom_12_1", "st_reversal", "squeeze", "avwap", "resid_mom", "vol_profile"],
+    "Technical":   ["tech", "massive", "vwap", "pattern", "momentum", "sector_momentum",
+                    "market_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap",
+                    "kaufman_long", "kaufman_short", "adx_long", "adx_short",
+                    "hi52", "mom_12_1", "st_reversal", "squeeze", "avwap", "resid_mom", "vol_profile"],
     "Smart Money": ["insider"],
     "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr", "iv_term"],
-    "Fundamental": ["pead"],
+    "Fundamental": ["pead", "f_value", "f_quality", "f_growth", "f_short_squeeze",
+                    "f_split", "f_dividend"],
     "Relative":    ["cross_sectional", "coint"],
     "Broker":      ["broker_advisor"],
 }
@@ -673,6 +681,50 @@ def _synthesis_model_for_rec(value: Optional[str]) -> Optional[str]:
     return _synthesis_model_for_provider(v) or v
 
 
+# Label for a recommendation the synthesis LLM never made: the model is asked
+# about only the ~40 highest-confidence tickers, and every OTHER ticker in the
+# universe is back-filled by claude_analyst._fallback_recommendations so open
+# positions never fall silent. Those fills are stamped with this at persist time
+# (pipeline._persist_run) instead of inheriting the run's model name.
+RULE_FILL_MODEL = "rule-based (fill)"
+
+# Aggregator-authored fragments that identify a LEGACY fill (rows written before
+# the persist-time stamping above). A fill reuses the SIGNAL's rationale, which
+# aggregator.build_signals assembles from these parts; the synthesis LLM writes
+# its own prose and never emits them (the prompt renders the same figure as
+# "Technical score=", with an equals sign, so even an echo doesn't collide).
+# Verified over 7.1k joined rows: every row matching these has a confidence
+# EXACTLY equal to its signal's and an action equal to the rule-based mapping —
+# 100% of the fill signature, 0 false positives — and adds nothing beyond the
+# first marker. Note the prose in a fill often READS authored: the news half of
+# a signal rationale is written by the SENTIMENT model, which is not the engine
+# being attributed here.
+_RULE_FILL_MARKERS = ("Technical score:", "Put/call signal:", "No rationale available.")
+
+
+def _is_rule_based_fill(provider: Optional[str], rationale: Optional[str]) -> bool:
+    """Whether a recommendation row was produced by the rule-based back-fill
+    rather than by the synthesis model named on it.
+
+    Attributing these to the model corrupts any per-engine comparison: they are
+    ~22% of all rows (up to 36% of one arm's BUY calls), they are IDENTICAL
+    across engines, and they drag every model toward a shared mean. New rows
+    carry ``RULE_FILL_MODEL`` explicitly; older rows are recognised by the
+    aggregator-authored rationale above.
+    """
+    if str(provider or "").strip() == RULE_FILL_MODEL:
+        return True
+    r = rationale or ""
+    return any(m in r for m in _RULE_FILL_MARKERS)
+
+
+# Multiplicative band within which a recommendation-time snapshot price is
+# trusted against the retroactively split-adjusted OHLCV cache (see the split
+# guard in _build_pseudo_trades). Outside it the two are on different price
+# scales and the snapshot is discarded.
+_SPLIT_GUARD_LO, _SPLIT_GUARD_HI = 0.5, 2.0
+
+
 def _match_direction(t: dict, direction: Optional[str]) -> bool:
     """Whether trade/call ``t`` matches a LONG/SHORT filter (None/'' = both).
     Long = BUY / BULLISH entry; Short = SELL / BEARISH."""
@@ -754,9 +806,30 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
             entry_price = None
         if entry_price is not None and not entry_price > 0:   # also catches NaN
             entry_price = None
+        closes = [(d.date().isoformat(), float(cl))
+                  for d, cl in zip(bars.index, bars["Close"])]
+        # SPLIT GUARD (2026-07-22). The snapshot was recorded LIVE and is on the
+        # price scale of its own day; the cached series it is marked against is
+        # adjusted RETROACTIVELY (Polygon adjusted=true / yfinance auto_adjust),
+        # so every split rescales all prior closes. Mixing the two bases invents
+        # a return of exactly the split ratio — leveraged inverse ETFs reverse-
+        # split constantly and produced a −1,239% ONE-DAY return on SNDQ (SOXS
+        # −1,106%, TZA −880%), enough to drag every engine's mean deeply negative.
+        # daily_nav solves this for real trades via _split_adjustment_factor over a
+        # reference close stored on the trade; a recommendation has no such anchor,
+        # so instead we VALIDATE the snapshot against the cached bar for its own
+        # day and discard it when the two bases disagree, falling through to the
+        # cached close below (same basis as the forward mark, so splits cancel).
+        # Threshold is multiplicative and deliberately wide: a snapshot-vs-close
+        # ratio is 0.92–1.06 at the 1st/99th percentile over 7.3k rows (it is the
+        # same session's intraday drift), while the smallest real split is 2×.
+        if entry_price is not None:
+            same_day = [cl for d, cl in closes if d == c["entry_date"] and cl > 0]
+            if same_day:
+                ratio = same_day[-1] / entry_price
+                if not (_SPLIT_GUARD_LO < ratio < _SPLIT_GUARD_HI):
+                    entry_price = None            # mixed basis — distrust the snapshot
         if entry_price is None:
-            closes = [(d.date().isoformat(), float(cl))
-                      for d, cl in zip(bars.index, bars["Close"])]
             if _generated_after_rth_close(c.get("entry_datetime")):
                 day = [cl for d, cl in closes if d == c["entry_date"]]
                 entry_price = day[-1] if day and day[-1] > 0 else None
@@ -825,7 +898,7 @@ def _compute_llm_perf(window_days: Optional[int] = None,
     try:
         df = repo.fetch_df(
             "SELECT r.run_id, r.generated_at, r.ticker, r.type, r.action, "
-            "       r.llm_provider, s.price AS snap_price "
+            "       r.llm_provider, r.rationale, s.price AS snap_price "
             "FROM recommendations r "
             "LEFT JOIN signals s ON s.run_id = r.run_id AND s.ticker = r.ticker "
             "WHERE r.action IN ('BUY', 'SELL') "
@@ -849,8 +922,14 @@ def _compute_llm_perf(window_days: Optional[int] = None,
         if not entry_date or (cutoff and entry_date < cutoff):
             continue
         run = run_map.get(str(rec.run_id or "")) or {}
-        synth = (_synthesis_model_for_rec(rec.llm_provider)
-                 or _synthesis_model_for_provider(run.get("synthesis_provider")))
+        # A back-filled ticker is NOT this model's call — re-attribute it to the
+        # rule-based engine so it forms its own baseline row instead of being
+        # averaged into whichever model happened to run that tick.
+        if _is_rule_based_fill(rec.llm_provider, rec.rationale):
+            synth = RULE_FILL_MODEL
+        else:
+            synth = (_synthesis_model_for_rec(rec.llm_provider)
+                     or _synthesis_model_for_provider(run.get("synthesis_provider")))
         sent = _sentiment_model_for_summary(run.get("sentiment_summary"))
         if not synth and not sent:
             continue
@@ -995,20 +1074,25 @@ def compute_macro_eval(window_days: Optional[int] = None,
 
 
 # ── Decision-funnel stage evaluation ─────────────────────────────────────────
-# Walks every deduped BUY/SELL recommendation through the SAME four gates the
-# pipeline applied (regime confidence threshold → PANIC/RISK_OFF BUY-block →
-# earnings blackout → tradeable-liquidity floor) and scores each stage's
-# surviving stream — plus each gate's DROPPED stream — as pseudo-trades, so
-# every stage of the decision pipeline is evaluated on the same basis:
+# Walks every deduped BUY/SELL recommendation through the SAME gates the
+# pipeline applied (regime confidence threshold → agreement floor →
+# PANIC/RISK_OFF BUY-block → earnings blackout → tradeable-liquidity floor) and
+# scores each stage's surviving stream — plus each gate's DROPPED stream — as
+# pseudo-trades, so every stage of the decision pipeline is evaluated on the
+# same basis:
 #   stage row improves on the previous one  ⇒ the gate filtered losers (helps);
 #   a gate's dropped row OUTPERFORMS its survivors ⇒ the gate discards winners.
 #
 # Gate outcomes per rec are reconstructed exactly for history:
 #   • Gate 1 — recommendations.confidence vs the run's persisted
 #     confidence_threshold (runs column, session/regime bump already baked in);
+#   • Gate 1b (2026-07-20 on) — the run's gate_diag.gate_outcomes stamp only;
+#     no legacy reconstruction exists (the gate didn't exist before, so it never
+#     fired in an older run — those runs simply have no "low_agreement" stamp
+#     and fall straight through this stage unaffected);
 #   • Gate 2 — runs.allow_buys (SELLs always pass);
 #   • Gate 4 survivors — recommendations.actionable is stamped by the pipeline
-#     as exactly "survived all four gates" (pre-sizing);
+#     as exactly "survived every gate" (pre-sizing);
 #   • Gate 3 vs 4 attribution of the remaining drops — the run's
 #     gate_diag.gate_outcomes per-ticker stamp when present (written from
 #     2026-07-11 on), else the run's dropped_earnings_blackout /
@@ -1018,9 +1102,11 @@ def compute_macro_eval(window_days: Optional[int] = None,
 
 _STAGE_OUTCOME_PASS = "pass"
 _STAGE_OUTCOME_G1 = "below_threshold"
+_STAGE_OUTCOME_G1B = "low_agreement"
 _STAGE_OUTCOME_G2 = "buy_blocked"
 _STAGE_OUTCOME_G3 = "earnings_blackout"
 _STAGE_OUTCOME_G4 = "untradeable"
+_STAGE_OUTCOME_G5 = "overextended"     # anti-chase gate (2026-07-22 on) — stamp-only, like Gate 1b
 
 _STAGE_EMPTY_STATS = {"trades": 0, "win_rate": None, "compound_return": None,
                       "avg_return": None, "wtd_avg_return": None,
@@ -1059,8 +1145,9 @@ def _classify_stage_outcome(call: dict, ctx: dict) -> str:
     """Which gate (if any) dropped this recommendation — the per-run stamp when
     present, else the exact reconstruction described above."""
     stamp = ctx.get("outcomes", {}).get(call["ticker"])
-    if stamp in (_STAGE_OUTCOME_PASS, _STAGE_OUTCOME_G1, _STAGE_OUTCOME_G2,
-                 _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4):
+    if stamp in (_STAGE_OUTCOME_PASS, _STAGE_OUTCOME_G1, _STAGE_OUTCOME_G1B,
+                 _STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4,
+                 _STAGE_OUTCOME_G5):
         return stamp
     if call["confidence"] < ctx["threshold"]:
         return _STAGE_OUTCOME_G1
@@ -1081,8 +1168,9 @@ def compute_stage_eval(window_days: Optional[int] = None,
                        bars_memo: Optional[Dict[str, object]] = None,
                        asset_type: Optional[str] = None) -> List[dict]:
     """Decision-funnel rows for the dashboard: the aggregator, the LLM synthesis
-    stream, and the four mechanical gates — each stage's survivors AND each
-    gate's drops scored as pseudo-trades (same model as ``compute_macro_eval``).
+    stream, and the mechanical gates (confidence threshold, agreement floor,
+    BUY-block, earnings blackout, liquidity floor) — each stage's survivors AND
+    each gate's drops scored as pseudo-trades (same model as ``compute_macro_eval``).
 
     Returns ``[{label, group ('stage'|'dropped'), trades, win_rate, ...}]`` in
     funnel order, each gate's dropped row directly under its survivor row.
@@ -1162,17 +1250,26 @@ def compute_stage_eval(window_days: Optional[int] = None,
         return [c for c in calls if c["_outcome"] in outcomes]
 
     _emit("LLM Synthesis (all BUY/SELL)", "stage", calls)
-    surviving = {_STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4, _STAGE_OUTCOME_PASS}
+    surviving = {_STAGE_OUTCOME_G1B, _STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3,
+                 _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G5, _STAGE_OUTCOME_PASS}
     _emit("→ past Gate 1 · regime confidence threshold", "stage", _sub(surviving))
     _emit("✂ Gate 1 drops (confidence below threshold)", "dropped", _sub({_STAGE_OUTCOME_G1}))
+    surviving -= {_STAGE_OUTCOME_G1B}
+    _emit("→ past Gate 1b · agreement floor (sources_agreeing)", "stage", _sub(surviving))
+    _emit("✂ Gate 1b drops (< min sources agreeing)", "dropped", _sub({_STAGE_OUTCOME_G1B}))
     surviving -= {_STAGE_OUTCOME_G2}
     _emit("→ past Gate 2 · PANIC/RISK_OFF BUY-block", "stage", _sub(surviving))
     _emit("✂ Gate 2 drops (BUY blocked by regime)", "dropped", _sub({_STAGE_OUTCOME_G2}))
     surviving -= {_STAGE_OUTCOME_G3}
     _emit("→ past Gate 3 · earnings blackout", "stage", _sub(surviving))
     _emit("✂ Gate 3 drops (earnings blackout)", "dropped", _sub({_STAGE_OUTCOME_G3}))
-    _emit("→ past Gate 4 · liquidity floor = ACTIONABLE", "stage", _sub({_STAGE_OUTCOME_PASS}))
+    surviving -= {_STAGE_OUTCOME_G4}
+    _emit("→ past Gate 4 · liquidity floor", "stage", _sub(surviving))
     _emit("✂ Gate 4 drops (untradeable / penny-thin)", "dropped", _sub({_STAGE_OUTCOME_G4}))
+    _emit("→ past Gate 5 · overextension (anti-chase) = ACTIONABLE", "stage",
+          _sub({_STAGE_OUTCOME_PASS}))
+    _emit("✂ Gate 5 drops (BUY chased a recent run-up)", "dropped",
+          _sub({_STAGE_OUTCOME_G5}))
     return rows
 
 
@@ -1987,6 +2084,16 @@ def record_new_trades(
             "extended_size_multiplier": ext_mult if entry_session != "rth" else 1.0,
             "breadth_size_multiplier": breadth_mult,      # agreement-breadth tilt (audit)
             "breadth_at_entry": breadth,                  # len(methods_agreeing) | None
+            # Cross-family agreement + tape state at entry (2026-07-19) — audit
+            # only for now; the evidence base for a future family-breadth sizing
+            # tilt (the refined successor to breadth_at_entry, which counts
+            # correlated methods as independent voters).
+            "families_at_entry": (int(getattr(_sig, "families_agreeing", 0))
+                                  if _sig is not None else None),
+            "families_opposing_at_entry": (int(getattr(_sig, "families_opposing", 0))
+                                           if _sig is not None else None),
+            "tape_at_entry": (float(getattr(_sig, "tape_confirmation_score", 0.0))
+                              if _sig is not None else None),
             "breadth_frac_at_entry": (round(breadth_frac, 4)
                                       if breadth_frac is not None else None),
             "breadth_center_at_entry": breadth_cal["center"],   # calibration audit trail
@@ -3601,6 +3708,55 @@ def compute_solo_method_performance(split: Optional[str] = None, window_days: Op
         }
 
     return results
+
+
+def compute_solo_method_gross_winrate(split: Optional[str] = None) -> dict:
+    """Per-method GROSS directional win rate — the fraction of a method's solo
+    directional calls that were right on the RAW price move, BEFORE fees and spread.
+
+    Distinct from ``compute_solo_method_performance`` (whose ``win_rate`` is on the
+    cost-adjusted ``return_pct`` — a right-direction move SMALLER than the round-trip
+    cost counts as a loss there). This judges pure SIGNAL QUALITY: for each closed
+    trade with stored ``method_scores`` the method's solo view (score > 0 → long,
+    score < 0 → short; ``|score| < threshold`` → no view → skipped) is a WIN iff the
+    stock's gross move matched it — ``sign(score) · (exit_price − entry_price) > 0``.
+    Costs are an execution concern, not a measure of whether the method picked the
+    right direction, so they're excluded here by design.
+
+    Same trade population / split / no-view skip as ``compute_solo_method_performance``,
+    so the trade COUNTS line up; only the win test differs (gross move vs net return).
+    A zero move (exit == entry) is counted as a trade but not a win.
+
+    Returns ``{method: {"trades": n, "win_rate": pct}}`` for every method with ≥ 1
+    view. Used by the win-rate method filter (``aggregator.winrate_filtered_methods``).
+    """
+    trades = _load_trades()
+    closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
+    closed = _filter_by_split(closed, split)
+    out: dict = {}
+    for method in _ALL_METHODS:
+        n = wins = 0
+        for trade in closed:
+            score = trade.get("method_scores", {}).get(method, 0.0)
+            # Same no-view guard as _hypothetical_trades_for_method (exact-zero +
+            # below-threshold), so a literal 0.0 isn't mis-read as a short view.
+            if score == 0.0 or abs(score) < _METHOD_AGREE_THRESHOLD:
+                continue
+            entry_px, exit_px = trade.get("entry_price"), trade.get("exit_price")
+            if entry_px is None or exit_px is None:
+                continue
+            try:
+                move = float(exit_px) - float(entry_px)
+            except (TypeError, ValueError):
+                continue
+            n += 1
+            # score > 0 = long view (win if stock rose); score < 0 = short view
+            # (win if stock fell). Gross move only — no cost applied.
+            if move != 0.0 and (score > 0) == (move > 0):
+                wins += 1
+        if n:
+            out[method] = {"trades": n, "win_rate": round(wins / n * 100, 1)}
+    return out
 
 
 def compute_method_eval_stats(split: Optional[str] = None) -> dict:

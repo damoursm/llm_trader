@@ -3,6 +3,8 @@ to the sequential path — same order, same scores — and the per-run caps that
 to be sequential counters (massive_tech_max_tickers / intraday_30m_max_tickers)
 must still pick the first-N tickers deterministically regardless of concurrency."""
 
+import pytest
+
 from config.settings import settings
 import src.signals.aggregator as agg
 
@@ -122,6 +124,65 @@ def test_inversion_flips_combined_score_but_keeps_panel_raw(monkeypatch):
     inv = agg.build_signals(list(tickers), [])
     assert inv and all(s.combined_score < 0 for s in inv)         # inverted → NEGATIVE
     assert all(s.massive_score == 0.8 for s in inv)               # panel keeps the RAW score
+
+
+def test_coherence_and_sources_agreeing_use_effective_sign(monkeypatch):
+    """coherence_factor / sources_agreeing must judge agreement on each method's
+    EFFECTIVE (inversion-corrected) sign, not its RAW sign — unified 2026-07-20
+    with family_factor's pre-existing convention. An inverted method's raw score
+    is typically the OPPOSITE of what it actually contributes to combined_score,
+    so reading raw misclassifies it as "disagreeing" even when it's the very
+    method driving combined_score's direction (exercised via `massive`, the only
+    active weighted method here so the agreement math is unambiguous)."""
+    _setup(monkeypatch, massive=True)
+    monkeypatch.setattr(agg, "analyse_sentiment", lambda t, a, force_engine=None: (0.0, "neutral"))
+    monkeypatch.setattr(settings, "enable_ic_weights", False)
+    monkeypatch.setattr(settings, "massive_tech_max_tickers", 0)
+    monkeypatch.setattr(settings, "signal_scoring_max_workers", 4)
+    monkeypatch.setattr(settings, "inverted_methods", "massive")
+    import src.signals.massive_tech as mt
+    monkeypatch.setattr(mt, "compute_massive_tech_score", lambda t: 0.8)   # raw bullish
+
+    sigs = agg.build_signals(["AAA"], [])
+    s = sigs[0]
+    assert s.combined_score < 0            # inverted massive is the sole driver → BEARISH
+    assert s.massive_score == 0.8          # panel still keeps the RAW (bullish) score
+    # massive's EFFECTIVE score (-0.8) agrees with the bearish combined → counted as
+    # agreeing. Pre-unification this read massive's RAW (+0.8) against a bearish
+    # combined → opposite signs → wrongly "disagreeing" (coherence_ratio 0.0, the
+    # 0.45x confidence-penalty floor) despite massive being the only contributor.
+    assert s.sources_agreeing == 1
+    from src.signals.aggregator import _coherence_factor
+    # Rebuild coherence directly to assert the exact ratio (not just >0): full
+    # agreement from the sole active method → ratio 1.0, not the 0.0 a raw-sign
+    # read would have produced.
+    ratio, factor = _coherence_factor(s.combined_score, [(True, -0.8)])
+    assert ratio == 1.0 and factor == 1.35
+
+
+def test_confidence_components_reproduce_stored_confidence(monkeypatch):
+    """The 5 persisted confidence-factor fields (+ raw_confidence) on
+    TickerSignal must multiply out to EXACTLY the stored `confidence` — the
+    invariant src/analysis/confidence_components.py depends on. If the formula
+    in aggregator._score_ticker ever changes without updating the corresponding
+    TickerSignal(...) field assignments, this catches the drift immediately
+    (the component-isolation dashboard tables would otherwise silently analyse
+    a formula that no longer matches production)."""
+    _setup(monkeypatch, massive=True)
+    monkeypatch.setattr(settings, "enable_ic_weights", False)
+    monkeypatch.setattr(settings, "massive_tech_max_tickers", 0)
+    monkeypatch.setattr(settings, "signal_scoring_max_workers", 4)
+    import src.signals.massive_tech as mt
+    monkeypatch.setattr(mt, "compute_massive_tech_score", lambda t: 0.6)
+
+    sigs = agg.build_signals(["AAA", "BBB", "CCC"], [])
+    assert sigs
+    for s in sigs:
+        product = (s.raw_confidence * s.coherence_factor * s.movement_factor
+                  * s.volume_factor * s.family_conf_factor * s.tape_conf_factor)
+        assert s.confidence == pytest.approx(round(min(1.0, product), 2), abs=1e-9)
+    # Sanity: the factors aren't all trivially 1.0 / the test isn't vacuous.
+    assert any(s.raw_confidence > 0 for s in sigs)
 
 
 def test_market_momentum_weighted_into_combined_score(monkeypatch):

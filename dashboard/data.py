@@ -356,6 +356,55 @@ def exit_forward(session: Optional[str] = None,
                   "exit_forward")
 
 
+def monte_carlo_methods() -> dict:
+    """Method luck-vs-skill Monte Carlo (bootstrap CIs + permutation p-values on
+    each method's gross solo win rate — the exact number the win-rate filter
+    selects on) + the filter's selection-bias null (how many methods pure chance
+    would keep at these sample sizes). Deterministic (fixed seed); cached — the
+    resampling over the ledger is ~instant but the trade extraction reads the DB."""
+    from src.analysis.monte_carlo import compute_method_overfit_report
+    return _cached("mc_methods", lambda: _retry(compute_method_overfit_report, "mc_methods"))
+
+
+def monte_carlo_exits(session: Optional[str] = None,
+                      direction: Optional[str] = None) -> dict:
+    """Exit-timing-vs-random Monte Carlo per exit rule (does the rule time exits
+    better than uniform-random exits over each trade's feasible window?). Same
+    session (exit session) / direction filter semantics as ``exit_forward``;
+    cached (loads OHLCV close series per closed trade)."""
+    from src.analysis.monte_carlo import compute_exit_timing_report
+    return _cached(("mc_exits", session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_exit_timing_report(session=session,
+                                                                     direction=direction),
+                                  "mc_exits"))
+
+
+def confidence_components_entry(days: Optional[int] = None, min_n: int = 10) -> dict:
+    """Confidence-formula component isolation (raw vs raw×each factor) over the
+    unbiased signals panel — entry-side, every scored ticker in its own
+    combined_score direction. Cached; forward-collected from 2026-07-21 (the
+    persisted factor columns are NULL on older rows, so ``has_factors`` is
+    False until fresh rows accrue)."""
+    from src.analysis.confidence_components import compute_entry_component_report
+    return _cached(("conf_components_entry", days or "all"),
+                   lambda: _retry(lambda: compute_entry_component_report(days=days, min_n=min_n),
+                                  "conf_components_entry"))
+
+
+def confidence_components_exit(days: Optional[int] = None, min_n: int = 10,
+                               session: Optional[str] = None,
+                               direction: Optional[str] = None) -> dict:
+    """Confidence-formula component isolation — exit-side: signals-panel rows
+    that fall inside an already-open position's holding window, oriented by
+    the trade's own direction. Same session (re-read generated-in) / direction
+    (held side) filter semantics as the other Exit-Performance blocks."""
+    from src.analysis.confidence_components import compute_exit_component_report
+    return _cached(("conf_components_exit", days or "all", session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_exit_component_report(
+                       days=days, min_n=min_n, session=session, direction=direction),
+                       "conf_components_exit"))
+
+
 def confidence_calibration(window_days: Optional[int] = None, session: Optional[str] = None,
                            direction: Optional[str] = None) -> dict:
     """Confidence-calibration report (buckets + slope) over the windowed/session/

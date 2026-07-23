@@ -35,8 +35,10 @@ def _panel():
     for i in range(60):
         # combined_score varies but stays positive (so oriented edge == fwd ret,
         # and Spearman is non-degenerate — no constant-input warnings).
+        # 0.90 clears both the explicit conf_min=0.78 in the direct-call tests AND
+        # the settings.edge_decay_conf_min=0.85 gate the calibration test reads.
         rows.append({"signal_date": "2026-01-02", "combined_score": 0.30 + 0.006 * i,
-                     "confidence": 0.80, "fwd_ret_1d": f[1][i], "fwd_ret_3d": f[3][i],
+                     "confidence": 0.90, "fwd_ret_1d": f[1][i], "fwd_ret_3d": f[3][i],
                      "fwd_ret_5d": f[5][i], "fwd_ret_7d": f[7][i]})
     return pd.DataFrame(rows)
 
