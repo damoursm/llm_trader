@@ -109,7 +109,11 @@ def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
         lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS})
     tickers = df["ticker"].unique()
     daily = {tk: _daily_series(tk) for tk in tickers}
-    intra: Dict[str, list] = {}
+    # ticker -> (series, times); the epoch-ns index is split out ONCE per
+    # ticker and the call timestamp parsed ONCE per distinct value, instead of
+    # both being rebuilt inside every _fwd_intraday call (69,900 of them here).
+    intra: Dict[str, tuple] = {}
+    ts_ns: Dict[str, Optional[int]] = {}
     daily_fwd: dict = {}
     intra_fwd: dict = {}
 
@@ -122,8 +126,17 @@ def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
                 key = (tk, ts, steps)
                 if key not in intra_fwd:
                     if tk not in intra:
-                        intra[tk] = _intraday_series(tk)
-                    intra_fwd[key] = _fwd_intraday(intra[tk], ts, steps)
+                        _s = _intraday_series(tk)
+                        intra[tk] = (_s, [t for t, _ in _s])
+                    if ts not in ts_ns:
+                        try:
+                            ts_ns[ts] = int(pd.Timestamp(ts).value)
+                        except Exception:
+                            ts_ns[ts] = None
+                    _ser, _times = intra[tk]
+                    intra_fwd[key] = (None if ts_ns[ts] is None else
+                                      _fwd_intraday(_ser, ts, steps, times=_times,
+                                                    entry_ns=ts_ns[ts]))
                 fwd = intra_fwd[key]
             else:
                 key = (tk, sigd, steps)

@@ -102,6 +102,47 @@ SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squee
 # separate appended group — so it is NOT added again here (that would duplicate columns).
 SIGNAL_METHOD_COLUMNS = SIGNAL_BASE_METHOD_COLUMNS + SIGNAL_TIMEFRAME_COLUMNS
 
+# Methods `src/analysis/replay.py` can regenerate for a PAST date from the cached
+# daily OHLCV alone — the columns of the `signals_replay` table. Membership is a
+# claim about *faithfulness*, verified by `replay.validate()`, not merely about
+# an OHLCV input:
+#   * a method here reproduces its stored value ~92% exactly (median error
+#     0.0000) whenever its scorer has not changed;
+#   * `pattern` is deliberately EXCLUDED despite being OHLCV-driven — it blends a
+#     live accuracy registry that grows with every trade, so replaying it today
+#     uses a registry the original run never saw (measured: 44% exact);
+#   * `sector_momentum` is excluded for the same class of reason: its second leg
+#     is a sector ETF fetched at CURRENT time, not truncated to the signal date.
+# Everything else (news, sentiment, the options family, insider, pead, massive…)
+# needs a point-in-time feed nobody stored and can never be replayed.
+REPLAYABLE_METHOD_COLUMNS = (
+    "tech", "vwap", "momentum", "money_flow", "trend_strength", "iv_rank",
+)
+
+# Market-condition values the replay can also recover, because they are computed
+# from the SAME cached OHLCV as the method scores above. `atr_pct`,
+# `bb_width_pct` and `vol_ratio` come off the very `compute_technical_score`
+# call that produces the `tech` score; `tape_score` is the cache-only tape
+# composite. All four were being computed inside the replay and discarded.
+#
+# `movement_factor` is the one CONFIDENCE component that does not depend on the
+# weights — it is `_movement_factor(atr_pct, bb_width_pct)` times a dealer-gamma
+# modifier — so it can be restored rather than merely masked. Measured 91.8%
+# exact (median error 0.0000). CAVEAT: GEX is options data and is NOT
+# replayable; it enters as a 0.85/1.15 multiplier when dealer gamma is
+# PINNED/AMPLIFIED and 1.0 otherwise, so a replayed value omits it. That is a
+# BOUNDED, one-sided approximation (never worse than ±15% on one of six
+# factors), which is why it is preferred over the alternative of NaN — but it is
+# an approximation, unlike the raw inputs beside it, which are exact.
+#
+# The other five components all take `combined_score` (hence the weights) as an
+# input, so recomputing them is a BACKTEST, not a recovery. They stay masked.
+REPLAYABLE_CONTEXT_COLUMNS = (
+    "movement_factor", "atr_pct", "bb_width_pct", "vol_ratio", "tape_score",
+)
+
+REPLAY_TABLE_COLUMNS = REPLAYABLE_METHOD_COLUMNS + REPLAYABLE_CONTEXT_COLUMNS
+
 # Confidence-formula component columns (2026-07-21) — NOT method scores (so they are
 # deliberately kept OUT of SIGNAL_METHOD_COLUMNS / tracker._ALL_METHODS: they are
 # multiplicative confidence factors, not [-1,+1] directional views). Verbatim values
@@ -300,6 +341,107 @@ SCHEMA_STATEMENTS = [
         return_pct        DOUBLE,
         synthesis_model   VARCHAR,
         sentiment_model   VARCHAR
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS arm_recommendations (
+        run_id        VARCHAR,
+        generated_at  VARCHAR,
+        signal_date   VARCHAR,
+        arm           VARCHAR,   -- dual | blind | sighted
+        live          BOOLEAN,   -- True = the arm that actually drove this run
+        ticker        VARCHAR,
+        action        VARCHAR,
+        direction     VARCHAR,
+        confidence    DOUBLE,
+        snap_price    DOUBLE
+    );
+    """,
+    f"""
+    -- Historical ticker-days rescored by the CURRENT scorers over the cached
+    -- OHLCV (src/analysis/replay.py). Lets a calibration fit values today's
+    -- code produced instead of discarding superseded rows via the epoch mask.
+    -- NEVER a substitute for `signals`, which records what actually happened;
+    -- only the OHLCV-derived methods are replayable and `replayed_at` says
+    -- which code version produced each row.
+    CREATE TABLE IF NOT EXISTS signals_replay (
+        signal_date   VARCHAR,
+        ticker        VARCHAR,
+        run_id        VARCHAR,
+        generated_at  VARCHAR,
+        replayed_at   VARCHAR,
+        {", ".join(f"{m} DOUBLE" for m in REPLAY_TABLE_COLUMNS)}
+    );
+    """,
+    """
+    -- Implementation fingerprints (src/analysis/code_version.py). Append-only:
+    -- one row per (name, fingerprint) the first time that fingerprint was seen.
+    -- Drives the AUTOMATIC refactor — a changed fingerprint means the stored
+    -- values for that method were produced by code that no longer exists, so
+    -- they are regenerated (replayable) or masked (not). `first_seen_at` is what
+    -- gives a non-replayable method its epoch without anyone hand-editing a
+    -- registry. NOT a partition key: no analysis reads it.
+    CREATE TABLE IF NOT EXISTS code_versions (
+        name          VARCHAR,
+        fingerprint   VARCHAR,
+        first_seen_at VARCHAR
+    );
+    """,
+    """
+    -- Audit trail of automatic refactor runs (src/analysis/refactor.py).
+    CREATE TABLE IF NOT EXISTS refactor_runs (
+        started_at    VARCHAR,
+        finished_at   VARCHAR,
+        trigger       VARCHAR,   -- JSON {name: old->new} that caused the run
+        steps         VARCHAR,   -- JSON [{step, status, detail}]
+        ok            BOOLEAN
+    );
+    """,
+    """
+    -- Walk-forward weight calibration (src/analysis/walkforward.py). One row per
+    -- calibration step: the weight state the system WOULD have had on that date,
+    -- computed with a point-in-time cutoff so only strictly-earlier data was
+    -- visible. This is what makes a backtest out-of-sample — weights at D cannot
+    -- encode D's outcome — and is therefore the one weight source a calibration
+    -- may legitimately consume, unlike the fixed-weight signals_backtest.
+    CREATE TABLE IF NOT EXISTS weight_history (
+        as_of         VARCHAR,
+        computed_at   VARCHAR,
+        n_active      INTEGER,
+        weights       VARCHAR,   -- JSON {method: effective weight, inversion signed}
+        inverted      VARCHAR,   -- JSON [method]
+        filtered      VARCHAR,   -- JSON [method] dropped by the hard filter
+        buy_filtered  VARCHAR,
+        sell_filtered VARCHAR,
+        buy_mults     VARCHAR,   -- JSON {method: per-side weight multiplier}
+        sell_mults    VARCHAR
+    );
+    """,
+    """
+    -- Tier 2 BACKTEST (src/analysis/backtest.py): combined_score + confidence
+    -- recomputed under a NAMED weight set. Deliberately a SEPARATE table from
+    -- signals_replay, because these values depend on the weights and the
+    -- weights are calibrated from the panel — feeding them back would fit the
+    -- weights on values derived from themselves. `weight_set` is a hash of the
+    -- weights used; rows under different hashes are not comparable.
+    -- READ to evaluate a configuration; NEVER to fit one.
+    CREATE TABLE IF NOT EXISTS signals_backtest (
+        signal_date         VARCHAR,
+        ticker              VARCHAR,
+        generated_at        VARCHAR,
+        weight_set          VARCHAR,
+        computed_at         VARCHAR,
+        combined_buy_score  DOUBLE,
+        combined_sell_score DOUBLE,
+        combined_score      DOUBLE,
+        raw_confidence      DOUBLE,
+        coherence_factor    DOUBLE,
+        movement_factor     DOUBLE,
+        volume_factor       DOUBLE,
+        family_conf_factor  DOUBLE,
+        tape_conf_factor    DOUBLE,
+        confidence          DOUBLE,
+        direction           VARCHAR
     );
     """,
     """

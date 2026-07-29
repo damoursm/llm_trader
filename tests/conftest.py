@@ -134,6 +134,29 @@ def _no_real_cost_override():
 
     def _reset_all():
         spread.set_real_cost_override(None)
+        spread.set_cost_attribution(None, None, None)   # per-trade cost lookups
+        # Parsed-OHLCV memo: keyed on (path, mtime, size), so a test that
+        # rewrites the same fixture file within one mtime tick at an identical
+        # size could otherwise read the previous test's frame.
+        try:
+            from src.data.cache import clear_ohlcv_parse_cache
+            clear_ohlcv_parse_cache()
+        except Exception:
+            pass
+        # Memoised signal panels — keyed on the latest run_id, which a test that
+        # writes its own DB would otherwise share with the previous test.
+        try:
+            from src.analysis.signal_panel import reset_panel_cache
+            reset_panel_cache()
+        except Exception:
+            pass
+        # Per-direction horizon ramp — measured from the ledger, so a test that
+        # writes its own trades must not inherit the previous one's multiplier.
+        try:
+            from src.performance.tracker import reset_horizon_ramp_cache
+            reset_horizon_ramp_cache()
+        except Exception:
+            pass
         reset_calibrations()
         _reset_exit_floor()
         _reset_threshold()

@@ -61,9 +61,18 @@ def calibrate_confidence_sizing(trades: Optional[List[dict]]) -> dict:
         return dict(_INERT)
     cal = dict(_INERT)
     try:
+        # CONFIDENCE-EPOCH gate (2026-07-27). This maps confidence BANDS to win
+        # rates, so a row whose confidence came from a superseded formula is
+        # filed under a band it never belonged to. Measured before the gate: 75%
+        # of eligible closes carried the pre-split scale (mean 0.873 vs 0.945),
+        # which is a whole band's width. The min-trades floor and the shrinkage
+        # below keep the layer inert until the clean sample is large enough.
+        from src.signals.method_epochs import confidence_is_comparable
         rows = []
         for t in trades or []:
             if t.get("status") != "CLOSED":
+                continue
+            if not confidence_is_comparable(t.get("entry_datetime") or t.get("entry_date")):
                 continue
             conf, ret = t.get("confidence"), t.get("return_pct")
             if conf is None or ret is None:

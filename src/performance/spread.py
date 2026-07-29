@@ -79,6 +79,230 @@ def get_real_cost_session_overrides() -> Optional[dict]:
     return dict(_REAL_COST_SESSION) if _REAL_COST_SESSION else None
 
 
+# ── per-trade cost attribution (2026-07-23) ─────────────────────────────────
+# The flat/session override above charges EVERY sim leg one calibrated number.
+# Per-trade attribution refines that WITHOUT breaking ledger purity (every sim
+# trade still assumes it fills): for a leg the broker actually filled, charge
+# that leg's OWN realized cost; for an unfilled leg, charge the average cost of
+# the trades that DID fill in the same tick (run); if that sample is too thin,
+# the average for the leg's time-of-day period (rth / premarket / afterhours /
+# overnight); and finally the modeled/global cost. Installed each tick by
+# tracker.calibrate_sim_costs from the SAME DB fills as the flat override, so
+# the daily-NAV compound stays deterministic (a per-run average can still drift
+# as later fills land — identical to how the flat override already behaves).
+_TICK_COST_FRAC: dict = {}       # run_id → mean one-way cost FRACTION of that run's filled legs
+_SESSION_COST_FRAC: dict = {}    # fine bucket (rth|premarket|afterhours|overnight) → mean fraction
+_LEG_REF_RUN: dict = {}          # client_ref → run_id (maps a leg to the tick it was decided in)
+
+
+def set_cost_attribution(tick_costs: Optional[dict], session_costs: Optional[dict],
+                         ref_to_run: Optional[dict]) -> None:
+    """Install the per-trade cost lookups (or clear them all with None). Values
+    are one-way FRACTIONS (e.g. 0.0018), already sanity-banded and min-sampled
+    by the builder in tracker."""
+    global _TICK_COST_FRAC, _SESSION_COST_FRAC, _LEG_REF_RUN
+    _TICK_COST_FRAC = {str(k): max(0.0, float(v)) for k, v in (tick_costs or {}).items()}
+    _SESSION_COST_FRAC = {str(k): max(0.0, float(v)) for k, v in (session_costs or {}).items()}
+    _LEG_REF_RUN = {str(k): str(v) for k, v in (ref_to_run or {}).items()}
+
+
+def session_bucket_fine(raw) -> str:
+    """Time-of-day period of an ISO timestamp: ``rth | premarket | afterhours
+    | overnight`` (ET). The single source of truth for the fine session split —
+    tracker._session_of_iso_fine delegates here. Date-only/missing → 'rth'
+    (every legacy record could only have traded in the regular session)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    if not raw or ("T" not in str(raw) and ":" not in str(raw)):
+        return "rth"
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        et = ZoneInfo("America/New_York")
+        dt = dt.astimezone(et) if dt.tzinfo is not None else dt.replace(tzinfo=et)
+        mins = dt.hour * 60 + dt.minute
+    except Exception:
+        return "rth"
+    if 9 * 60 + 30 <= mins < 16 * 60:
+        return "rth"
+    if 4 * 60 <= mins < 9 * 60 + 30:
+        return "premarket"
+    if 16 * 60 <= mins < 20 * 60:
+        return "afterhours"
+    return "overnight"
+
+
+def _coarse_of_fine(fine: str) -> str:
+    """Fine bucket → the coarse session the spread multipliers key on."""
+    if fine in ("premarket", "afterhours"):
+        return "extended"
+    return fine if fine in ("rth", "overnight") else "rth"
+
+
+def real_leg_cost_frac(side: str, filled_qty, model_price, fill_price,
+                       commission) -> Optional[float]:
+    """One-way cost FRACTION of a single REAL filled leg — commission as a
+    fraction of notional plus the cost-normalized execution-vs-decision
+    slippage (a BUY is adverse filling above model, a SELL below). None when
+    the leg is unusable OR when the measured cost is an implausible outlier
+    (|cost| beyond ``sim_real_fill_cost_sanity_pct`` — a stale decision price,
+    not real execution; the caller then falls through to an estimate). Mirrors
+    broker_view.leg_one_way_cost_pct, inlined here to keep spread import-free."""
+    try:
+        fq = int(filled_qty or 0)
+        fp = float(fill_price) if fill_price is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if fq <= 0 or fp <= 0:
+        return None
+    comm = 0.0
+    try:
+        comm = float(commission or 0.0)
+    except (TypeError, ValueError):
+        comm = 0.0
+    comm_pct = comm / (fq * fp) * 100.0
+    slip = 0.0
+    try:
+        mp = float(model_price) if model_price is not None else 0.0
+        if mp > 0:
+            is_buy = str(side or "").upper() == "BUY"
+            slip = ((fp - mp) if is_buy else (mp - fp)) / mp * 100.0
+    except (TypeError, ValueError):
+        slip = 0.0
+    pct = comm_pct + slip
+    band = abs(float(getattr(settings, "sim_real_fill_cost_sanity_pct", 2.0) or 0.0))
+    if band > 0 and abs(pct) > band:
+        return None
+    return max(0.0, pct) / 100.0
+
+
+def resolve_leg_cost(*, side: str, price: float, asset_type: str, session_fine: str,
+                     ref, filled_qty, model_price, fill_price, commission,
+                     coarse_session: Optional[str] = None, run=None) -> float:
+    """The per-trade one-way cost FRACTION for one leg, by the hierarchy:
+      1. the leg's OWN realized cost, if it filled at the broker;
+      2. else the average of the trades that filled in the SAME tick (run);
+      3. else the average for the leg's time-of-day period;
+      4. else the modeled / global-override cost.
+    Attribution is OFF (→ straight to the modeled/global cost, i.e. today's
+    behaviour) when the master switch is off or no lookups are installed.
+    Sub-``sim_real_fill_min_price`` legs always use the model — the fills the
+    averages are built from are liquid names, so charging that to a penny stock
+    understates its true spread (same guard as ``_one_side_cost``).
+
+    ``coarse_session`` is the leg's STORED session stamp; it drives the modeled
+    tier-4 fallback (the source of truth for the spread multiplier) so a trade
+    whose ``entry_session``/``exit_session`` is set still gets the right modeled
+    spread even when its timestamp — the fine-bucket source — is absent. Falls
+    back to the fine bucket's coarse mapping when the stamp is missing."""
+    coarse = coarse_session or _coarse_of_fine(session_fine)
+    if not settings.sim_per_trade_cost_attribution:
+        return _one_side_cost(price, asset_type, coarse)
+    try:
+        above_min = price is not None and float(price) >= float(settings.sim_real_fill_min_price)
+    except (TypeError, ValueError):
+        above_min = False
+    if above_min:
+        real = real_leg_cost_frac(side, filled_qty, model_price, fill_price, commission)
+        if real is not None:
+            return real
+        # Tick average: the run the leg was DECIDED in. The entry leg passes it
+        # directly (trade.run_id); otherwise fall back to the ref→run map (only
+        # populated for FILLED legs — so this second path only helps a filled
+        # leg whose own cost was banded out as an outlier).
+        rk = str(run) if run is not None else (_LEG_REF_RUN.get(str(ref)) if ref is not None else None)
+        if rk is not None and rk in _TICK_COST_FRAC:
+            return _TICK_COST_FRAC[rk]
+        if session_fine in _SESSION_COST_FRAC:
+            return _SESSION_COST_FRAC[session_fine]
+    return _one_side_cost(price, asset_type, coarse)
+
+
+# ── short borrow / carry (2026-07-25) ───────────────────────────────────────
+#
+# The one genuinely direction-ASYMMETRIC cost. A short pays a daily stock-loan
+# fee (and, on hard-to-borrow names, a locate cost) that a long simply does not;
+# every other cost in this module — half-spread, commission, session multiplier
+# — is symmetric. Until now nothing charged it anywhere in the spread, tracker
+# or NAV modules, so every short's simulated return read BETTER than reality by
+# roughly the borrow rate times the holding period.
+#
+# It is a HOLDING cost, not a per-leg one, so it does not go through
+# ``_one_side_cost``: it accrues per day held and is subtracted from the return.
+
+def borrow_annual_pct(trade: Optional[dict] = None) -> float:
+    """Annual borrow rate (%) to charge a short, preferring the REAL rate.
+
+    ``trade["borrow_fee_pct"]`` is used when present — the broker's own
+    stock-loan rate for that name (``Broker.get_short_borrow`` → ``fee_pct``),
+    stamped at entry. Falls back to ``settings.short_borrow_annual_pct``, a
+    blended assumption for a universe that mixes large caps (typically well
+    under 1%) with small caps and hard-to-borrow names (which can run far
+    higher). Same prefer-measured-over-modelled idiom as the real-fill costs.
+    """
+    if trade is not None:
+        raw = trade.get("borrow_fee_pct")
+        if raw is not None:
+            try:
+                v = float(raw)
+                if v >= 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+    try:
+        return max(0.0, float(settings.short_borrow_annual_pct))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def borrow_cost_fraction(action: str, days_held: Optional[float],
+                         trade: Optional[dict] = None) -> float:
+    """Borrow carry as a RETURN-REDUCING fraction for one position.
+
+    Zero for longs, for non-positive holding periods, and when the feature is
+    off. Uses a 365-day year: borrow accrues on calendar days (you pay over a
+    weekend), unlike the trading-day conventions elsewhere in the ledger.
+    """
+    if not getattr(settings, "enable_short_borrow_cost", False):
+        return 0.0
+    if str(action or "").upper() != "SELL":
+        return 0.0
+    try:
+        d = float(days_held or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if d <= 0:
+        return 0.0
+    return borrow_annual_pct(trade) / 100.0 * (d / 365.0)
+
+
+def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: str) -> float:
+    """One-way cost FRACTION for a real trade's entry or exit leg. Extracts the
+    broker leg fields from the trade UNIFORMLY so ``_pct_return`` (tracker) and
+    the daily-NAV anchors (daily_nav) resolve the SAME cost for the same leg —
+    the invariant that keeps the two return engines charging identical costs.
+    ``price`` is the price being priced (entry_price; exit_price for a closed
+    leg; the live mark for an open-trade M2M — which carries no exit fill, so it
+    correctly falls to the tick/session/model estimate)."""
+    action = str(trade.get("action") or "BUY").upper()
+    asset_type = trade.get("type", "STOCK")
+    if which == "entry":
+        side = "BUY" if action == "BUY" else "SELL"
+        return resolve_leg_cost(
+            side=side, price=price, asset_type=asset_type, session_fine=session_fine,
+            coarse_session=trade.get("entry_session"), run=trade.get("run_id"),
+            ref=trade.get("broker_client_ref") or trade.get("recommendation_id"),
+            filled_qty=trade.get("broker_fill_qty"), model_price=trade.get("entry_price"),
+            fill_price=trade.get("broker_fill_price"), commission=trade.get("broker_commission"))
+    # exit leg — the closing side is the opposite of the entry
+    side = "SELL" if action == "BUY" else "BUY"
+    return resolve_leg_cost(
+        side=side, price=price, asset_type=asset_type, session_fine=session_fine,
+        coarse_session=trade.get("exit_session"),
+        ref=trade.get("broker_exit_client_ref"),
+        filled_qty=trade.get("broker_exit_fill_qty"), model_price=trade.get("exit_price"),
+        fill_price=trade.get("broker_exit_fill_price"), commission=trade.get("broker_exit_commission"))
+
+
 def effective_cost_hurdle_pct() -> float:
     """The round-trip cost hurdle a horizon's net edge must clear — DERIVED
     from the calibrated real one-way cost when available:
@@ -248,7 +472,10 @@ def _one_side_cost(price: float, asset_type: str = "STOCK", session=None) -> flo
 
 
 def _pct_return(action: str, entry: float, current: float, asset_type: str = "STOCK",
-                entry_session=None, exit_session=None) -> float:
+                entry_session=None, exit_session=None,
+                entry_cost: Optional[float] = None,
+                exit_cost: Optional[float] = None,
+                borrow_cost: Optional[float] = None) -> float:
     """Percent return, sign-aware, with round-trip half-spread + commission.
 
     BUY  : paid the ask at entry (+cost), receive the bid at exit (−cost).
@@ -259,22 +486,35 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
     spread on each leg. Per-leg sessions widen the spread for a leg struck
     outside RTH (None = rth — every pre-extended-hours record).
 
+    ``entry_cost`` / ``exit_cost`` (fractions) override the modeled leg cost
+    when supplied — the per-trade attribution path (see ``resolve_leg_cost``)
+    passes each leg's REALIZED-or-estimated cost so a real trade is charged
+    what its own execution cost, not a portfolio-flat number. None → the
+    modeled/global cost, i.e. the original behaviour.
+
+    ``borrow_cost`` (a fraction) is the SHORT-only carry for the holding
+    period — see ``borrow_cost_fraction``. Ignored for longs, which never pay
+    it. None = no borrow charged (the pre-2026-07-25 behaviour).
+
     Returns ``0.0`` for non-positive prices — the round-trip is undefined
     there.  Callers refuse to trade at such prices; this guard exists to
     keep stats clean for any record that slipped through historically.
     """
     if entry is None or current is None or entry <= 0 or current <= 0:
         return 0.0
-    entry_cost = _one_side_cost(entry, asset_type, entry_session)
-    exit_cost  = _one_side_cost(current, asset_type, exit_session)
+    entry_cost = entry_cost if entry_cost is not None else _one_side_cost(entry, asset_type, entry_session)
+    exit_cost  = exit_cost  if exit_cost  is not None else _one_side_cost(current, asset_type, exit_session)
     if action == "BUY":
         effective_entry = entry   * (1 + entry_cost)
         effective_exit  = current * (1 - exit_cost)
         return (effective_exit - effective_entry) / effective_entry * 100
-    # SELL = short
+    # SELL = short. Borrow carry (a SHORT-only holding cost — see
+    # borrow_cost_fraction) reduces the realised return; it is not a price
+    # adjustment, so it is subtracted after the round trip.
     effective_entry = entry   * (1 - entry_cost)
     effective_exit  = current * (1 + exit_cost)
-    return (effective_entry - effective_exit) / effective_entry * 100
+    gross = (effective_entry - effective_exit) / effective_entry * 100
+    return gross - (borrow_cost or 0.0) * 100.0
 
 
 def fmt_price(p) -> str:

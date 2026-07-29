@@ -276,7 +276,7 @@ def _adaptive_weight_multipliers() -> dict:
     for method in _BASE_WEIGHTS:
         overall = perf.get(method, {}).get("overall", {})
         n = int(overall.get("trades", 0) or 0)
-        wr_pct = float(overall.get("win_rate", 50.0) or 50.0)
+        wr_pct = _win_rate_pct(overall)     # None-checked: a real 0.0% is not 50%
         wins = n * (wr_pct / 100.0)
         # Bayesian shrinkage toward the 50% prior
         shrunk_wr = (wins + 0.5 * prior_n) / (n + prior_n) if (n + prior_n) > 0 else 0.5
@@ -308,13 +308,136 @@ def _apply_adaptive_multipliers(weight_profile: dict) -> tuple[dict, dict]:
 _IC_WEIGHT_CACHE: dict = {}
 
 
-def _inverted_methods() -> frozenset:
-    """Methods (lower-cased) flagged for sign INVERSION in the combine — their raw
-    score is treated as reliably-backwards and contributes with a flipped sign
-    (config ``inverted_methods``, comma-separated; empty = none). The panel keeps the
-    RAW score, so the inversion stays re-validatable."""
+# Methods applied as ADDITIVE OVERLAYS that honour `_overlay_sign`, i.e. the
+# ones the inversion switch can actually reach outside `_BASE_WEIGHTS`. Adding a
+# new overlay here without wiring `_overlay_sign` into its application would make
+# its inversion a silent no-op — the exact bug fixed on 2026-07-25.
+INVERTIBLE_OVERLAYS = frozenset({"cross_sectional"})
+
+
+_INVERSION_NAME_WARNED: set = set()
+
+# Guards the auto-inversion cycle (see _inverted_methods). Module-level
+# rather than thread-local: build_signals' pool calls this, and a nested
+# call on a worker is the same logical computation as on the main thread.
+_INVERSION_IN_FLIGHT: dict = {"v": False}
+
+
+def _manual_inverted_methods() -> frozenset:
+    """Explicitly PINNED inversions from config (``inverted_methods``).
+
+    A manual pin always wins: it is how a human overrides the auto-detector in
+    either direction, and how the inversion behaved before auto-detection
+    existed.
+
+    Inversion is strictly PER-METHOD. A FAMILY (``agreement.METHOD_FAMILIES`` —
+    Sentiment, Price/Trend, Rel-Strength, …) is a grouping used for breadth
+    voting, not a signal with a sign, so it has no meaning here: a family name in
+    this config matches no weight and does nothing. Neither does a typo. Both
+    used to pass SILENTLY — the same "looks configured, does nothing" failure
+    mode as the pre-2026-07-25 overlay bug, and worse in one direction: a
+    misspelled name silently UN-inverts a live method. Unrecognised names are
+    now warned about once each (kept in the set, since they are inert anyway).
+    """
     raw = str(getattr(settings, "inverted_methods", "") or "")
-    return frozenset(m.strip().lower() for m in raw.split(",") if m.strip())
+    names = frozenset(m.strip().lower() for m in raw.split(",") if m.strip())
+    unknown = names - set(_BASE_WEIGHTS) - set(INVERTIBLE_OVERLAYS)
+    for u in sorted(unknown - _INVERSION_NAME_WARNED):
+        _INVERSION_NAME_WARNED.add(u)
+        hint = ""
+        try:
+            from src.signals.agreement import METHOD_FAMILIES
+            fams = {f.lower(): f for f in METHOD_FAMILIES}
+            if u in fams:
+                hint = (f" — '{fams[u]}' is a method FAMILY, not a method; "
+                        "inversion is per-method, so invert its members individually")
+        except Exception:
+            pass
+        logger.warning(
+            f"[aggregator] inverted_methods lists '{u}', which is not an "
+            f"invertible method{hint}. It will be IGNORED (invertible: "
+            f"_BASE_WEIGHTS + {sorted(INVERTIBLE_OVERLAYS)})."
+        )
+    return names
+
+
+def _inverted_methods() -> frozenset:
+    """Methods (lower-cased) whose raw score is sign-INVERTED in the combine.
+
+    The union of the manual ``inverted_methods`` pins and — when
+    ``enable_auto_inversion`` is on — the methods
+    ``tracker.calibrate_method_inversion`` has statistically established as
+    reliably anti-predictive AND better than chance once flipped. The panel keeps
+    the RAW score either way, so every inversion stays re-validatable.
+
+    Auto-detection is fail-soft: if it raises, the manual pins still apply."""
+    manual = _manual_inverted_methods()
+    if not getattr(settings, "enable_auto_inversion", False):
+        return manual
+    # RE-ENTRANCY GUARD. The auto-detector's bar 2 asks for the EFFECTIVE
+    # (inversion-corrected) win rate, which calls back in here — so computing
+    # the inverted set depends on already knowing it. Left unguarded that chain
+    # re-entered 22 times per filter evaluation, each time re-running the panel
+    # join, and blew the recursion limit inside `simulated_trades` once the
+    # market-relative filter added another entry point (2026-07-27).
+    #
+    # While a computation is in flight, callers see the MANUAL pins only. That
+    # is the semantically right answer as well as the terminating one: the
+    # detector cannot legitimately depend on its own output, and the pins are
+    # the part of the answer that is knowable without it.
+    if _INVERSION_IN_FLIGHT.get("v"):
+        return manual
+    _INVERSION_IN_FLIGHT["v"] = True
+    try:
+        from src.performance.tracker import calibrate_method_inversion
+        return manual | frozenset(calibrate_method_inversion().keys())
+    except Exception as e:
+        logger.debug(f"[aggregator] auto-inversion unavailable, manual pins only: {e}")
+        return manual
+    finally:
+        _INVERSION_IN_FLIGHT["v"] = False
+
+
+def _overlay_sign(method: str) -> float:
+    """``-1.0`` if ``method`` is inverted, else ``+1.0`` — the inversion hook for
+    ADDITIVE OVERLAYS (2026-07-25).
+
+    The pooled methods invert via ``weights[m] = -weights[m]``, which only reaches
+    entries of ``_BASE_WEIGHTS``. Overlays (``cross_sectional``, the ``f_*``
+    corp-action / fundamental factors, the ``kaufman_*``/``adx_*`` trend methods)
+    are added to ``combined_score`` OUTSIDE that pool, so they were structurally
+    un-invertible: naming one in ``inverted_methods`` was accepted by config and
+    then silently did nothing. Multiply an overlay's weight by this instead.
+
+    Why it mattered: ``cross_sectional`` measured the worst of ANY method
+    (40.8% gross win over 174 attributed trades, permutation p(luck)=0.996 — on
+    the largest sample in the system at 100% ticker coverage) while keeping its
+    full 0.20 additive weight, because the win-rate filter and the inversion
+    switch both iterate ``_BASE_WEIGHTS`` only. ``tech``, at a strictly better
+    41.6% / p=0.988, was dropped outright.
+
+    As with pooled inversion, the PANEL keeps the RAW score so the decision stays
+    re-validatable: if the raw IC turns positive the inversion should be removed.
+    """
+    return -1.0 if str(method).strip().lower() in _inverted_methods() else 1.0
+
+
+def _overlay_factor(method: str) -> float:
+    """Weight multiplier for an ADDITIVE OVERLAY: ``0.0`` if the win-rate filter
+    has dropped it, else ``-1.0``/``+1.0`` from ``_overlay_sign``.
+
+    The overlay counterpart of what the pooled path gets for free (a filtered
+    method is excluded from the combine, an inverted one has its weight
+    negated). Applied by multiplying the overlay's configured weight, so one
+    call carries both decisions and they cannot disagree.
+    """
+    m = str(method).strip().lower()
+    try:
+        if m in winrate_filtered_methods():
+            return 0.0
+    except Exception:                       # fail-soft: never silently zero a
+        pass                                # live weight because a lookup broke
+    return _overlay_sign(m)
 
 
 def _ic_mults_from_ic_table(ic, key: str) -> dict:
@@ -441,6 +564,91 @@ def reset_ic_weight_cache() -> None:
 _WINRATE_FILTER_CACHE: dict = {}
 
 
+def method_state_multipliers() -> dict:
+    """``{method: weight multiplier}`` from its measured horizon skill.
+
+    PROVEN (significantly >50% at some holding horizon) keeps full weight;
+    UNPROVEN is scaled by ``unproven_weight_multiplier``; DISPROVEN is handled by
+    the filter, not here. Empty dict when the calibration is unavailable, so the
+    weighting stack is unchanged.
+    """
+    if not getattr(settings, "enable_method_horizons", False):
+        return {}
+    try:
+        from src.analysis.method_horizons import compute_method_horizons, PROVEN, UNPROVEN
+        mult = float(settings.unproven_weight_multiplier)
+        return {m: (1.0 if d.get("state") == PROVEN else mult)
+                for m, d in compute_method_horizons().items()
+                if d.get("state") in (PROVEN, UNPROVEN)}
+    except Exception as e:
+        logger.debug(f"[aggregator] method-state multipliers unavailable: {e}")
+        return {}
+
+
+def _market_relative_filtered() -> frozenset:
+    """Methods whose MARKET-RELATIVE win rate is below the filter threshold.
+
+    The bar defaults to a literal ``winrate_filter_threshold`` (50%) rather than
+    the measured baseline (~48.1%): on this basis the median stock is
+    market-relative-negative, so 50% is the STRICTER of the two defensible bars.
+    Set ``market_relative_filter_baseline`` to use the measured one instead —
+    the two differ by only the methods sitting between them.
+
+    A method below ``market_relative_min_obs`` observations is EXEMPT (unproven
+    is not disproven), and a dropped method keeps being scored, persisted and
+    IC-tracked so it can re-earn its place. ``frozenset()`` on any failure, so
+    the caller falls back to the previous basis.
+    """
+    if not (getattr(settings, "enable_market_relative_weighting", False)
+            and getattr(settings, "enable_market_relative_filter", False)):
+        return frozenset()
+    try:
+        from src.analysis.market_relative import market_relative_skill, market_relative_baseline
+        rel = market_relative_skill(None)
+        if not rel:
+            return frozenset()
+        bar = (float(market_relative_baseline())
+               if getattr(settings, "market_relative_filter_baseline", False)
+               else float(settings.winrate_filter_threshold) * 100.0)
+        min_n = int(settings.market_relative_min_obs)
+        inverted = _inverted_methods()
+        out = {m for m, rec in rel.items()
+               if m in _BASE_WEIGHTS or m in INVERTIBLE_OVERLAYS}
+        out = {m for m in out
+               if m not in inverted
+               and int((rel[m] or {}).get("trades", 0) or 0) >= min_n
+               and float((rel[m] or {}).get("win_rate", 100.0)) < bar}
+        if out:
+            logger.info(
+                f"[aggregator] market-relative filter (<{bar:.1f}% net of benchmark, "
+                f">={min_n} obs): dropping {sorted(out)}"
+            )
+        return frozenset(out)
+    except Exception as e:
+        logger.debug(f"[aggregator] market-relative filter unavailable: {e}")
+        return frozenset()
+
+
+def horizon_disproven_methods() -> frozenset:
+    """Methods measured significantly BELOW 50% at EVERY horizon they can be
+    judged on, over the solo-method simulation.
+
+    Preferred over the trade-ledger filter when available: ~1,500-3,300 gated
+    observations per method versus 78-174 attributed trades. The ledger basis is
+    also selection-biased — it only contains calls that survived every gate,
+    which is how `vwap` measured 58% there and 50.2% here on 15x the data.
+    """
+    if not getattr(settings, "enable_method_horizons", False):
+        return frozenset()
+    try:
+        from src.analysis.method_horizons import compute_method_horizons, DISPROVEN
+        return frozenset(m for m, d in compute_method_horizons().items()
+                         if d.get("state") == DISPROVEN)
+    except Exception as e:
+        logger.debug(f"[aggregator] horizon states unavailable: {e}")
+        return frozenset()
+
+
 def winrate_filtered_methods() -> frozenset:
     """Methods DROPPED from the combine + synthesis because their GROSS solo win rate
     is below the coin-flip threshold (``winrate_filter_threshold``, default 50%), given
@@ -482,16 +690,59 @@ def winrate_filtered_methods() -> frozenset:
         # Train-slice only when OOS validation is on, matching the adaptive layer so
         # the holdout stays an honest evaluation set (None = full sample otherwise).
         split = "train" if settings.enable_oos_validation else None
-        perf = compute_solo_method_gross_winrate(split=split)
+        # EFFECTIVE win rate = the method as the combine actually uses it, so an
+        # INVERTED method is judged on its CORRECTED record rather than exempted
+        # (2026-07-25). The old blanket exemption meant nothing ever verified
+        # that flipping a method produced a >50% one — an inversion could sit at
+        # full weight forever on the strength of the raw record that justified
+        # flipping it. Ties count as losses on both sides, so `flipped` is not
+        # simply `100 - raw` and a mostly-tied method can fail both ways; it is
+        # noise, and this drops it.
+        perf = compute_solo_method_gross_winrate(split=split, effective=True)
         thresh_pct = float(settings.winrate_filter_threshold) * 100.0
         min_n = max(1, int(settings.winrate_filter_min_trades))
-        inverted = _inverted_methods()
-        dropped = {
-            m for m in _BASE_WEIGHTS
-            if m not in inverted
-            and int((perf.get(m, {}) or {}).get("trades", 0) or 0) >= min_n
-            and float((perf.get(m, {}) or {}).get("win_rate", 50.0) or 50.0) < thresh_pct
-        }
+        # Invertible OVERLAYS are judged too (2026-07-25). They are applied
+        # outside the normalised pool, so the filter used to skip them
+        # entirely — `cross_sectional` sat at its full 0.20 additive weight on
+        # a 40.8% win rate with nothing able to drop it. That gap only became
+        # load-bearing once the manual inversion pins were retired: without it,
+        # un-inverting the method would have promoted it from "backwards" to
+        # "full weight, unprotected", which is strictly worse than either.
+        # Prefer the SOLO-SIMULATION basis when it is available (2026-07-26):
+        # ~1,500-3,300 gated observations per method against the ledger's 78-174,
+        # and unbiased — the ledger only holds calls that survived every gate,
+        # which is how `vwap` measured 58% there and 50.2% here on 15x the data.
+        # A method is dropped only when it is SIGNIFICANTLY below 50% at EVERY
+        # horizon it can be judged on, so "unlucky" no longer means "removed";
+        # the merely-unproven get reduced weight via method_state_multipliers().
+        # MARKET-RELATIVE basis when enabled (2026-07-27): a method whose calls
+        # do not beat the benchmark in the direction called is not adding
+        # information, however well the absolute number reads in a rising
+        # market. Thousands of observations per method (246-9,362) versus the
+        # ledger's 78-174, so this is both the better basis AND the better
+        # sample. Methods below `market_relative_min_obs` are EXEMPT — unproven
+        # is not disproven — and every dropped method is still scored,
+        # persisted to the signals panel and IC-tracked, so it can re-earn its
+        # place (that is the "filtered but still observed" contract).
+        #
+        # NOTE the threshold is a literal 50%, not the measured ~48.1% baseline.
+        # On this basis the median stock is market-relative-NEGATIVE, so 50% is
+        # the STRICTER of the two defensible bars; it differs from the baseline
+        # rule by only 2 marginal methods (ext_gap 49.7%, insider 49.2%) and is
+        # the deliberate risk posture. `market_relative_filter_baseline` switches
+        # to the measured bar.
+        rel_bad = _market_relative_filtered()
+        horizon_bad = horizon_disproven_methods()
+        if rel_bad:
+            dropped = set(rel_bad) | set(horizon_bad)
+        elif horizon_bad:
+            dropped = set(horizon_bad)
+        else:
+            dropped = {
+                m for m in (set(_BASE_WEIGHTS) | set(INVERTIBLE_OVERLAYS))
+                if int((perf.get(m, {}) or {}).get("trades", 0) or 0) >= min_n
+                and _win_rate_pct(perf.get(m, {}) or {}) < thresh_pct
+            }
         result = frozenset(dropped)
     except Exception as e:
         logger.debug(f"[aggregator] win-rate filter — gross solo win rate unavailable: {e}")
@@ -504,6 +755,145 @@ def winrate_filtered_methods() -> frozenset:
 def reset_winrate_filter_cache() -> None:
     """Drop the cached win-rate filter set (tests / forced refresh)."""
     _WINRATE_FILTER_CACHE.clear()
+    _SIDE_SKILL_CACHE.clear()
+    _SIDE_LOG_STATE.clear()
+
+
+# ── Per-SIDE win-rate filter + weighting (2026-07-24) ────────────────────────
+#
+# A method's bullish and bearish calls are separate skills. Measured over 237
+# attributed trades, most methods hit ~40% on their BUY-side views and ~47-59%
+# on their SELL-side views. One blended win rate hides that, so with the
+# buy/sell split combine each camp is filtered and weighted on its OWN record.
+_SIDE_SKILL_CACHE: dict = {}
+_SIDES = ("buy", "sell")
+# Last per-side selection announced at INFO, so an unchanged one isn't re-logged
+# on every build_signals call (it runs many times per tick).
+_SIDE_LOG_STATE: dict = {}
+
+
+def _win_rate_pct(rec: dict, default: float = 50.0) -> float:
+    """Win rate (%) out of a ``{"trades": n, "win_rate": pct}`` record.
+
+    Explicitly None-checked rather than ``rec.get("win_rate", 50.0) or 50.0``:
+    a genuine **0.0%** win rate is falsy, so the ``or`` idiom silently rewrote
+    the worst possible method as a coin flip — which both exempted it from the
+    filter and handed it a neutral 1.0× weight (2026-07-24)."""
+    if not isinstance(rec, dict):
+        return default
+    val = rec.get("win_rate")
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _side_skill() -> dict:
+    """``{side: {method: {"trades": n, "win_rate": pct}}}`` — each method's GROSS
+    directional win rate on that side alone, from the trade ledger. Cached for
+    ``ic_weight_cache_seconds`` (build_signals runs many times per tick; the
+    ledger advances once). ``{}`` on any failure → callers fall back to
+    side-agnostic behaviour."""
+    import time
+    now = time.time()
+    hit = _SIDE_SKILL_CACHE.get("v")
+    if hit and (now - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["data"]
+    data: dict = {}
+    try:
+        # MARKET-RELATIVE basis when enabled (2026-07-27): an absolute win rate
+        # cannot separate "this signal works" from "the market went up" — a
+        # low-vol screen measured 53.5% absolute and 46.1% net of SPY on 296k
+        # ticker-days. Weighting is a SIGNAL-QUALITY decision, so beta is a
+        # confound here; sizing and P&L stay absolute, because the book is
+        # outright long/short and alpha you cannot capture must not size it.
+        # Falls back to the absolute ledger basis whenever the panel is
+        # unavailable, so this can only ever add information.
+        from src.analysis.market_relative import market_relative_skill
+        for side in _SIDES:
+            rel = market_relative_skill(side)
+            if rel:
+                data[side] = rel
+        if len(data) == len(_SIDES):
+            _SIDE_SKILL_CACHE["v"] = {"ts": now, "data": data}
+            return data
+        data = {}
+        from src.performance.tracker import compute_solo_method_gross_winrate
+        split = "train" if settings.enable_oos_validation else None
+        for side in _SIDES:
+            data[side] = compute_solo_method_gross_winrate(split=split, side=side) or {}
+    except Exception as e:
+        logger.debug(f"[aggregator] per-side skill unavailable: {e}")
+        data = {}
+    _SIDE_SKILL_CACHE["v"] = {"ts": now, "data": data}
+    return data
+
+
+def side_filtered_methods(side: str) -> frozenset:
+    """Methods dropped from ONE camp because their win rate ON THAT SIDE is below
+    ``winrate_filter_threshold``, given at least ``winrate_filter_min_trades``
+    views on that side.
+
+    Independent of the global filter (which judges both sides blended) and of
+    the other side — a method whose shorts work and whose longs don't is kept
+    for the bearish camp and dropped from the bullish one. Same exemptions:
+    INVERTED methods are never dropped (their sign is already corrected), and a
+    thin sample keeps full weight."""
+    if not settings.enable_side_winrate_filter or side not in _SIDES:
+        return frozenset()
+    skill = _side_skill().get(side) or {}
+    if not skill:
+        return frozenset()
+    thresh_pct = float(settings.winrate_filter_threshold) * 100.0
+    min_n = max(1, int(settings.winrate_filter_min_trades))
+    inverted = _inverted_methods()
+    return frozenset(
+        m for m in _BASE_WEIGHTS
+        if m not in inverted
+        and int((skill.get(m, {}) or {}).get("trades", 0) or 0) >= min_n
+        and _win_rate_pct(skill.get(m, {}) or {}) < thresh_pct
+    )
+
+
+def side_weight_multipliers(side: str) -> dict:
+    """``{method: multiplier}`` scaling each method's weight WITHIN one camp by
+    its demonstrated skill on that side.
+
+    Same shape as ``_adaptive_weight_multipliers`` (which uses the blended
+    record): Bayesian shrinkage toward a 50% prior by ``side_weight_prior_n``
+    virtual views, mapped to 1.0× at coin-flip and clamped to
+    ``side_weight_min/max_multiplier``. A method with no side record gets 1.0×,
+    so this is inert until a side has evidence."""
+    default = {m: 1.0 for m in _BASE_WEIGHTS}
+    if not settings.enable_side_adaptive_weights or side not in _SIDES:
+        return default
+    skill = _side_skill().get(side) or {}
+    if not skill:
+        return default
+    prior_n = max(0, int(settings.side_weight_prior_n))
+    min_m = float(settings.side_weight_min_multiplier)
+    max_m = float(settings.side_weight_max_multiplier)
+    # The neutral point is the BASELINE, not 50%. On the market-relative basis
+    # the median stock is ~48.6% (the cap-weighted index beats its typical
+    # constituent), so centring on 0.5 would hold every method to a bar ~1.4pp
+    # too high and read ordinary methods as weak. A half-migrated basis
+    # (relative numerator, 50% bar) is worse than either pure basis.
+    base = 0.5
+    for _rec in skill.values():
+        _b = (_rec or {}).get("baseline")
+        if _b:
+            base = float(_b) / 100.0
+            break
+    out = {}
+    for m in _BASE_WEIGHTS:
+        rec = skill.get(m, {}) or {}
+        n = int(rec.get("trades", 0) or 0)
+        wins = n * (_win_rate_pct(rec) / 100.0)
+        shrunk = (wins + base * prior_n) / (n + prior_n) if (n + prior_n) > 0 else base
+        out[m] = round(max(min_m, min(max_m, shrunk / base)), 3)
+    return out
 
 
 # ── Per-method score helpers ──────────────────────────────────────────────────
@@ -838,6 +1228,49 @@ def _volume_factor(vol_ratio: float, abs_combined: float, coherence_ratio: float
 
 
 # ── Interaction adjustments ───────────────────────────────────────────────────
+
+def combine_buy_sell(method_score_map: dict, weights: dict,
+                     buy_filtered=(), sell_filtered=(),
+                     buy_mults=None, sell_mults=None) -> tuple:
+    """The buy/sell split combine — ``(combined_buy, combined_sell)``.
+
+    Each method's inversion-corrected view (``eff`` ∈ [-1,+1]; the weight's SIGN
+    carries the inversion, so ``|w|·eff == w·score``) splits into a BUY
+    component ``max(0, eff)`` and a SELL component ``max(0, −eff)``. Each side
+    is weight-averaged over the methods HOLDING that view only — its own camp —
+    so abstainers and the opposing camp do not dilute a side the way they did
+    the old single normalised pool. ``combined = buy − sell`` at the call site.
+
+    Extracted from `_score_ticker` (2026-07-28), behaviour-preserving, for the
+    same reason `_apply_actionable_gates` was: it had no reachable entry point,
+    so anything needing to reproduce the combine — the tier-2 backtest — would
+    have had to DUPLICATE it, and a duplicate silently drifts from the live
+    path. One implementation, one drift test (`tests/test_backtest.py`).
+    """
+    buy_mults = buy_mults or {}
+    sell_mults = sell_mults or {}
+    _buy_acc = _sell_acc = _buy_w = _sell_w = 0.0
+    for _m, (_on, _s) in method_score_map.items():
+        _w = weights.get(_m, 0.0)
+        if not _on or not _w or not _s:
+            continue                        # inactive / zero-weight / no view
+        _eff = _s if _w > 0 else -_s        # inversion-corrected view
+        _wm = abs(_w)
+        if _eff > 0:
+            if _m in buy_filtered:
+                continue                    # sub-coin-flip on its long calls
+            _bw = _wm * buy_mults.get(_m, 1.0)
+            _buy_acc += _bw * min(1.0, _eff)
+            _buy_w += _bw
+        else:
+            if _m in sell_filtered:
+                continue                    # sub-coin-flip on its short calls
+            _sw = _wm * sell_mults.get(_m, 1.0)
+            _sell_acc += _sw * min(1.0, -_eff)
+            _sell_w += _sw
+    return ((_buy_acc / _buy_w) if _buy_w else 0.0,
+            (_sell_acc / _sell_w) if _sell_w else 0.0)
+
 
 def _interaction_adjustment(
     combined: float,
@@ -1254,6 +1687,17 @@ def build_signals(
             f"≥{settings.winrate_filter_min_trades} trades): {sorted(filtered_methods)}"
         )
     active_flags = {m: (on and m not in filtered_methods) for m, on in _raw_active.items()}
+    # THREE-STATE horizon skill (2026-07-26): a method that is neither proven nor
+    # disproven over the solo-method simulation keeps a REDUCED weight rather than
+    # a full or zero one. Absence of evidence is not evidence of absence — on a
+    # five-week sample most methods land in that middle, and zeroing them would
+    # collapse the ensemble that coherence, sources_agreeing, family agreement and
+    # Gate 1b all depend on. Applied BEFORE normalisation so the surviving pool
+    # still sums correctly.
+    _state_mults = method_state_multipliers()
+    if _state_mults:
+        weight_profile = {m: w * _state_mults.get(m, 1.0)
+                          for m, w in (weight_profile or _BASE_WEIGHTS).items()}
     weights      = _normalised_weights(active_flags, weight_profile=weight_profile)
     # Method INVERSION: a method whose raw signal is reliably anti-predictive across
     # horizons (net of beta) contributes with a FLIPPED sign — its backwards read
@@ -1271,6 +1715,55 @@ def build_signals(
         logger.debug(f"[aggregator] method inversion active: {sorted(_inv)} "
                      "(sign-flipped in the combine; raw kept in the panel)")
     active_count = sum(active_flags.values())
+
+    # ── Per-SIDE filter + weights (2026-07-24) ───────────────────────────────
+    # Resolved ONCE per run (each is cached anyway) and consumed by the buy/sell
+    # split combine below. A method excluded here is excluded from ONE camp
+    # only; it keeps contributing to the other, and it is still scored and
+    # persisted to the panel exactly as the global filter's drops are.
+    _buy_filtered  = side_filtered_methods("buy")
+    _sell_filtered = side_filtered_methods("sell")
+    _buy_mults     = side_weight_multipliers("buy")
+    _sell_mults    = side_weight_multipliers("sell")
+    if _buy_filtered or _sell_filtered:
+        _live = {m for m, on in active_flags.items() if on and weights.get(m)}
+        # Guard, mirroring the global filter's: never let the filter EMPTY a camp.
+        # An empty camp scores 0 on every ticker forever, so the difference can
+        # only ever fall one way — the system would become structurally
+        # single-direction, which is a far bigger bet than the filter is
+        # entitled to place. Suppress that camp's filter for the run instead,
+        # loudly, and let the evidence be read from the logs.
+        for _side, _drop in (("bullish", _buy_filtered), ("bearish", _sell_filtered)):
+            if _live and not (_live - _drop):
+                logger.warning(
+                    f"[aggregator] per-side win-rate filter would remove EVERY method "
+                    f"from the {_side} camp — suppressed for that camp this run "
+                    f"(it would force the book structurally single-direction). "
+                    f"Sub-threshold methods: {sorted(_drop & _live)}"
+                )
+                if _side == "bullish":
+                    _buy_filtered = frozenset()
+                else:
+                    _sell_filtered = frozenset()
+        _bl = sorted(_buy_filtered & _live)
+        _sl = sorted(_sell_filtered & _live)
+        if _bl or _sl:
+            # build_signals runs many times per tick (the hold-review pool fires
+            # it every few hundred ms), so announce the selection at INFO only
+            # when it actually CHANGES — otherwise the same three lines bury the
+            # log during an incident. Unchanged repeats drop to DEBUG.
+            _sel = (tuple(_bl), tuple(_sl))
+            _changed = _SIDE_LOG_STATE.get("sel") != _sel
+            _SIDE_LOG_STATE["sel"] = _sel
+            (logger.info if _changed else logger.debug)(
+                f"[aggregator] per-side win-rate filter "
+                f"(<{settings.winrate_filter_threshold:.0%} on that side over "
+                f"≥{settings.winrate_filter_min_trades} views) — "
+                f"bullish camp drops {len(_bl)}: {_bl} | bearish camp drops {len(_sl)}: {_sl}"
+            )
+            if _changed:
+                logger.debug(f"[aggregator] bullish camp: {sorted(_live - _buy_filtered)} | "
+                             f"bearish camp: {sorted(_live - _sell_filtered)}")
 
     mode_label = f" [{market_mode_context.mode}]" if market_mode_context else ""
     logger.info(
@@ -1673,21 +2166,16 @@ def build_signals(
         # bull against many bears reads as a strong buy CAMP — camp SIZE is
         # judged by the machinery built for it (coherence factor, Gate 1b
         # sources_agreeing, family agreement), not by re-diluting the score.
-        _buy_acc = _sell_acc = _buy_w = _sell_w = 0.0
-        for _m, (_on, _s) in method_score_map.items():
-            _w = weights[_m]
-            if not _on or not _w or not _s:
-                continue                        # inactive / zero-weight / no view
-            _eff = _s if _w > 0 else -_s        # inversion-corrected view
-            _wm = abs(_w)
-            if _eff > 0:
-                _buy_acc += _wm * min(1.0, _eff)
-                _buy_w += _wm
-            else:
-                _sell_acc += _wm * min(1.0, -_eff)
-                _sell_w += _wm
-        combined_buy = (_buy_acc / _buy_w) if _buy_w else 0.0
-        combined_sell = (_sell_acc / _sell_w) if _sell_w else 0.0
+        # Each camp is additionally filtered and weighted on ITS OWN record
+        # (2026-07-24): a method whose BUY-side gross win rate is below the
+        # coin-flip threshold is excluded from the bullish camp while still
+        # contributing to the bearish one, and within a camp its weight is
+        # scaled by its demonstrated skill on that side. Both layers are inert
+        # until a side has ≥winrate_filter_min_trades views, and both are
+        # computed once per tick (cached) outside this loop.
+        combined_buy, combined_sell = combine_buy_sell(
+            method_score_map, weights, _buy_filtered, _sell_filtered,
+            _buy_mults, _sell_mults)
         combined = combined_buy - combined_sell
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -1758,9 +2246,26 @@ def build_signals(
         # read as "disagreeing" in coherence while correctly "agreeing" in the
         # family rollup. An inverted method's EFFECTIVE sign is what the weighted
         # combine actually consumed, so agreement should be judged on that.
-        method_score_map_eff = {
-            m: (on, (-s if m in _inv else s)) for m, (on, s) in method_score_map.items()
-        }
+        # PER-SIDE filter applied here too (2026-07-25). The combine drops a
+        # method's BULLISH contribution when it is buy-filtered and its BEARISH
+        # contribution when it is sell-filtered; coherence / sources_agreeing /
+        # family agreement must see exactly the same book, or a method the system
+        # has judged sub-coin-flip on this side still inflates the agreement
+        # count (helping pass Gate 1b) and the confidence factor while
+        # contributing nothing to the score. Keyed on the METHOD's own effective
+        # sign — the same test the combine loop makes — not on the ticker's
+        # direction.
+        def _side_ok(method: str, eff_score: float) -> bool:
+            if eff_score > 0:
+                return method not in _buy_filtered
+            if eff_score < 0:
+                return method not in _sell_filtered
+            return True
+
+        method_score_map_eff = {}
+        for m, (on, s) in method_score_map.items():
+            _e = -s if m in _inv else s
+            method_score_map_eff[m] = (on and _side_ok(m, _e), _e)
         method_scores_eff = list(method_score_map_eff.values())
         coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores_eff)
 
@@ -1998,7 +2503,12 @@ def build_signals(
             signals, zcap=settings.cross_sectional_zcap,
         )
         if cs_scores:
-            cs_w = float(settings.cross_sectional_weight)
+            # An ADDITIVE overlay is applied outside the normalised pool, so the
+            # `weights[m] = -weights[m]` inversion in the combine above never
+            # reaches it — listing an overlay in `inverted_methods` used to be
+            # accepted by config and then silently do nothing. `_overlay_sign`
+            # is the inversion hook for that path (2026-07-25).
+            cs_w = float(settings.cross_sectional_weight) * _overlay_factor("cross_sectional")
             updated_signals = []
             for sig in signals:
                 cs = float(cs_scores.get(sig.ticker, 0.0))
@@ -2029,11 +2539,25 @@ def build_signals(
                 old_abs = max(abs(sig.combined_score), 0.05)
                 scale = abs(new_combined) / old_abs
                 new_conf = round(min(1.0, sig.confidence * scale), 2)
+                # Keep the PERSISTED components consistent with the confidence
+                # they are supposed to explain (2026-07-27). This overlay runs
+                # AFTER the components are captured and rescales confidence, so
+                # `raw_confidence` was left describing the pre-overlay combined
+                # score: multiplying the six stored components reproduced the
+                # stored confidence for only 24.7% of rows, versus 92.1% on the
+                # rows this overlay never touched. `confidence_components.py`
+                # was therefore isolating factors of a value that was not the
+                # final confidence. Scaling by |new|/|old| is algebraically the
+                # same as re-deriving raw from the new combined (the mapping is
+                # linear in |combined| below the cap), so recording that is both
+                # correct and faithful to what the code already computes.
+                new_raw = min(1.0, abs(new_combined) / 0.5)
                 updated_signals.append(sig.model_copy(update={
                     "combined_score":         round(new_combined, 4),
                     "cross_sectional_score":  round(cs, 4),
                     "direction":              new_direction,
                     "confidence":             new_conf,
+                    "raw_confidence":         round(new_raw, 6),
                 }))
                 combined_scores[sig.ticker] = new_combined
                 if abs(cs) >= 0.20:

@@ -58,13 +58,41 @@ def test_exactly_50_is_kept(monkeypatch):
     assert agg.winrate_filtered_methods() == frozenset()
 
 
-def test_inverted_method_is_exempt(monkeypatch):
+def test_inverted_method_is_kept_on_its_CORRECTED_record(monkeypatch):
+    """Superseded the old blanket exemption (2026-07-25).
+
+    An inverted method used to be skipped by the filter entirely, so nothing
+    ever verified that flipping it produced a better-than-chance method — an
+    inversion could hold full weight forever on the strength of the raw record
+    that justified flipping it. It is now judged on the CORRECTED record, and
+    passes on merit rather than by exemption."""
     _base(monkeypatch)
     monkeypatch.setattr(settings, "inverted_methods", "insider")
-    _patch_perf(monkeypatch, _perf(insider=(20, 25.0), news=(20, 40.0)))
-    # insider is anti-predictive RAW but INVERTED (sign already corrected) → exempt;
-    # news is genuinely sub-50% and not inverted → dropped.
+    monkeypatch.setattr(settings, "enable_auto_inversion", False)
+    raw = _perf(insider=(20, 25.0), news=(20, 40.0))
+    corrected = _perf(insider=(20, 75.0), news=(20, 40.0))   # flip: 25% → 75%
+    monkeypatch.setattr(
+        tracker, "compute_solo_method_gross_winrate",
+        lambda split=None, effective=False, **kw: corrected if effective else raw)
+    agg.reset_winrate_filter_cache()
+    # insider survives because CORRECTED it is 75%; news is genuinely sub-50%.
     assert agg.winrate_filtered_methods() == frozenset({"news"})
+
+
+def test_inverted_method_bad_BOTH_ways_is_dropped(monkeypatch):
+    """The teeth of the new rule: inversion is not a permanent exemption. Ties
+    count as losses whichever way the view points, so a method can be awful raw
+    AND still sub-50% flipped — that is noise, and it leaves the combine."""
+    _base(monkeypatch)
+    monkeypatch.setattr(settings, "inverted_methods", "insider")
+    monkeypatch.setattr(settings, "enable_auto_inversion", False)
+    raw = _perf(insider=(20, 25.0))
+    corrected = _perf(insider=(20, 30.0))    # heavy ties → still bad flipped
+    monkeypatch.setattr(
+        tracker, "compute_solo_method_gross_winrate",
+        lambda split=None, effective=False, **kw: corrected if effective else raw)
+    agg.reset_winrate_filter_cache()
+    assert agg.winrate_filtered_methods() == frozenset({"insider"})
 
 
 def test_flag_off_is_noop(monkeypatch):
@@ -74,11 +102,25 @@ def test_flag_off_is_noop(monkeypatch):
     assert agg.winrate_filtered_methods() == frozenset()
 
 
-def test_non_base_methods_never_filtered(monkeypatch):
-    # A panel-first / non-_BASE_WEIGHTS name in the perf dict is ignored by the filter.
+def test_panel_first_methods_are_never_filtered(monkeypatch):
+    """A PANEL-FIRST method (hi52 etc.) carries weight 0 — it is IC-measured and
+    trade-attributed but contributes nothing to the combine, so filtering it
+    would be meaningless. It must stay out of the filter's candidate set."""
     _base(monkeypatch)
-    _patch_perf(monkeypatch, _perf(hi52=(50, 5.0), cross_sectional=(50, 5.0)))
+    _patch_perf(monkeypatch, _perf(hi52=(50, 5.0)))
     assert agg.winrate_filtered_methods() == frozenset()
+
+
+def test_invertible_overlays_ARE_filtered(monkeypatch):
+    """Changed 2026-07-26. An invertible OVERLAY does carry real weight (0.20
+    for cross_sectional), it is simply applied outside the normalised pool — so
+    the filter previously skipped it and nothing could drop it however bad its
+    record. That gap only became load-bearing when the manual inversion pins
+    were retired: without it, un-inverting `cross_sectional` would have promoted
+    it from "backwards" to "full weight, unprotected"."""
+    _base(monkeypatch)
+    _patch_perf(monkeypatch, _perf(cross_sectional=(50, 5.0)))
+    assert agg.winrate_filtered_methods() == frozenset({"cross_sectional"})
 
 
 def test_gross_winrate_is_directional_and_cost_free(monkeypatch):

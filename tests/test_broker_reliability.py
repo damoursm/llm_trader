@@ -148,16 +148,47 @@ def test_duplicate_guard_adopts_order_already_at_broker(monkeypatch):
     the retry must adopt it, not resubmit (double-position protection)."""
     from src.broker import reconcile
     monkeypatch.setattr(settings, "broker_submit_retries", 2)
-    broker = _ScriptedBroker(
-        ["transient", "ok"],
-        open_orders=[OpenOrderInfo(client_ref="ref1", order_id="42",
-                                   status="Submitted", ticker="TEST", side="BUY")],
-    )
+    broker = _ScriptedBroker(["transient", "ok"])
+    # The order only becomes visible at the broker once it has been sent — the
+    # errored first attempt DID reach it. (Pre-populating this would instead
+    # exercise the pre-submit guard below.)
+    _orig_submit = broker.submit_order
+
+    def _submit(req):
+        res = _orig_submit(req)
+        broker._open_orders = [OpenOrderInfo(client_ref="ref1", order_id="42",
+                                             status="Submitted", ticker="TEST",
+                                             side="BUY")]
+        return res
+
+    broker.submit_order = _submit
     report = reconcile._new_report()
     res = reconcile._submit_with_retry(broker, _req(), 100.0, report, "ENTRY")
     assert res.ok and res.order_id == "42" and res.status == "Submitted"
     assert len(broker.requests) == 1          # never resubmitted
     # The adopted working order completes via the fill-refresh pass later.
+
+
+def test_presubmit_guard_never_stacks_a_second_order_on_one_ref(monkeypatch):
+    """A ref that ALREADY has a working order is adopted without submitting.
+
+    IBKR does not dedupe orderRef: every submission is an independent order
+    that fills independently. On 2026-07-23 a watchdog-killed reconcile lost
+    the record of orders it had placed, so later ticks resubmitted the same
+    ref — 8 live orders stacked on one HQY exit ref and filled together,
+    selling 112 shares against a 14-share long.
+    """
+    from src.broker import reconcile
+    broker = _ScriptedBroker(
+        ["ok"],
+        open_orders=[OpenOrderInfo(client_ref="ref1", order_id="42",
+                                   status="Submitted", ticker="TEST", side="BUY")],
+    )
+    report = reconcile._new_report()
+    res = reconcile._submit_with_retry(broker, _req(), 100.0, report, "ENTRY")
+    assert res.ok and res.order_id == "42"
+    assert broker.requests == []                          # nothing was sent
+    assert report["duplicate_submits_blocked"] == 1
 
 
 # ── stale-unfilled cancel + same-tick re-anchored resubmit ────────────────
@@ -264,3 +295,138 @@ def test_partial_fills_and_fresh_orders_left_alone(monkeypatch):
     monkeypatch.setattr(settings, "broker_unfilled_cancel_minutes", 0)
     stale = dict(fresh, broker_submitted_at=_stale_iso())
     assert reconcile._cancel_stale_unfilled(broker, [stale], report) is False
+
+
+# ── orphan-order sweep: no working order may outlive its ledger leg ────────
+#
+# The 2026-07-23 drift incident: the reconcile watchdog force-exits with
+# os._exit(1), so a kill between placing an order and persisting the ledger
+# left the order working with nothing pointing at it. Later ticks resubmitted
+# the same ref, the duplicates filled together, and the resulting position
+# read as "drifted from the ledger" every tick thereafter.
+
+def _owned_leg(**kw):
+    base = {"ticker": "OWNED", "action": "BUY", "status": "OPEN",
+            "broker_order_id": "1", "broker_client_ref": "owned-ref",
+            "broker_status": "Submitted"}
+    base.update(kw)
+    return base
+
+
+def test_orphan_sweep_cancels_only_unowned_refs(monkeypatch):
+    from src.broker import reconcile
+    monkeypatch.setattr(settings, "broker_orphan_order_sweep", True)
+    broker = _ScriptedBroker(
+        [],
+        open_orders=[
+            OpenOrderInfo(client_ref="owned-ref", order_id="1",
+                          status="Submitted", ticker="OWNED", side="BUY"),
+            OpenOrderInfo(client_ref="ghost-ref", order_id="2",
+                          status="Submitted", ticker="GHOST", side="SELL"),
+            OpenOrderInfo(client_ref="drift-XYZ-2026-07-23_120000", order_id="3",
+                          status="Submitted", ticker="XYZ", side="SELL"),
+        ],
+    )
+    report = reconcile._new_report()
+    reconcile._sweep_orphan_orders(broker, [_owned_leg()], report)
+    # The live leg is spared; the drift flatten is _flatten_orphan's business.
+    assert broker.cancelled == ["ghost-ref"]
+    assert report["orphan_orders_cancelled"] == 1
+
+
+def test_orphan_sweep_cancels_leg_whose_status_went_terminal(monkeypatch):
+    """A leg cleared/killed by an earlier pass no longer owns its order."""
+    from src.broker import reconcile
+    monkeypatch.setattr(settings, "broker_orphan_order_sweep", True)
+    broker = _ScriptedBroker(
+        [],
+        open_orders=[OpenOrderInfo(client_ref="owned-ref", order_id="1",
+                                   status="Submitted", ticker="OWNED", side="BUY")],
+    )
+    report = reconcile._new_report()
+    reconcile._sweep_orphan_orders(broker, [_owned_leg(broker_status="Cancelled")], report)
+    assert broker.cancelled == ["owned-ref"]
+
+
+def test_orphan_sweep_can_be_disabled(monkeypatch):
+    from src.broker import reconcile
+    monkeypatch.setattr(settings, "broker_orphan_order_sweep", False)
+    broker = _ScriptedBroker(
+        [],
+        open_orders=[OpenOrderInfo(client_ref="ghost-ref", order_id="2",
+                                   status="Submitted", ticker="GHOST", side="SELL")],
+    )
+    report = reconcile._new_report()
+    reconcile._sweep_orphan_orders(broker, [], report)
+    assert broker.cancelled == []
+
+
+def test_submission_persists_the_leg_immediately(monkeypatch):
+    """An order that is live at the broker must be in the ledger before the
+    next line runs — the watchdog can os._exit at any moment."""
+    from src.broker import reconcile
+    saved = []
+    monkeypatch.setattr(reconcile.repo, "save_trades",
+                        lambda trades: saved.append([dict(t) for t in trades]))
+    trades = [{"ticker": "T", "broker_order_id": None}]
+    reconcile._persist_legs(trades)
+    assert len(saved) == 1 and saved[0][0]["ticker"] == "T"
+
+
+def test_persist_legs_never_raises(monkeypatch):
+    """A DuckDB hiccup must not abort a reconcile mid-order-cycle."""
+    from src.broker import reconcile
+
+    def _boom(_trades):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(reconcile.repo, "save_trades", _boom)
+    reconcile._persist_legs([{"ticker": "T"}])   # must not propagate
+
+
+# ── settle pass: the budget is WALL-CLOCK, not a poll count ────────────────
+#
+# broker_settle_seconds was spent as `n_polls = budget // poll_seconds`, which
+# silently assumed the work inside a poll was free. Each poll actually cancels
+# and re-submits every unfilled leg (~13 s each against a real gateway), so on
+# 2026-07-23 a 30 s budget ran 10–20 min with ~9 legs. Every tick then blew the
+# 600 s reconcile watchdog, which force-exited mid-order-cycle and orphaned the
+# orders it had just placed — the root of the drift cascade.
+
+def test_settle_stops_at_the_wall_clock_budget(monkeypatch):
+    from src.broker import reconcile
+
+    monkeypatch.setattr(settings, "broker_settle_seconds", 30)
+    monkeypatch.setattr(settings, "broker_settle_poll_seconds", 3)
+    monkeypatch.setattr(settings, "broker_settle_reanchor_every", 2)
+    monkeypatch.setattr(reconcile, "_live_price", lambda _t: 100.0)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(reconcile.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(reconcile.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    broker = _ScriptedBroker([])
+    _orig_submit = broker.submit_order
+
+    def _slow_submit(req):                    # a re-anchor costs real seconds
+        clock["t"] += 15.0
+        return _orig_submit(req)
+
+    broker.submit_order = _slow_submit
+
+    sync_started = datetime.now(timezone.utc) - timedelta(minutes=5)
+    leg = {
+        "ticker": "T", "action": "BUY", "status": "OPEN",
+        "broker_order_id": "1", "broker_client_ref": "r0",
+        "broker_status": "Submitted", "broker_fill_qty": 0,
+        "broker_requested_qty": 10,
+        "broker_submitted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    report = reconcile._new_report()
+    reconcile._settle_unfilled_this_tick(broker, [leg], report, False, sync_started)
+
+    # 10 polls x 15 s of submit work would be minutes. The deadline caps it:
+    # only the re-anchors that start inside the 30 s budget are allowed.
+    assert clock["t"] <= 30 + 15          # at most one re-anchor may overrun
+    assert len(broker.requests) <= 2

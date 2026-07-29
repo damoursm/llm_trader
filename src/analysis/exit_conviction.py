@@ -54,7 +54,16 @@ _CONSENSUS_SKIP = frozenset({"llm_review", "aggregator", "horizon", "edge_decay"
 def exit_method_consensus(scores: Dict[str, float]) -> Optional[float]:
     """Mean of the underlying SIGNAL methods' position-oriented exit scores
     (+ = hold, − = exit) — the breadth-and-magnitude consensus. ``None`` when no
-    signal method scored (→ no adjustment). Bounded to [−1, +1] by construction."""
+    signal method scored (→ no adjustment). Bounded to [−1, +1] by construction.
+
+    ``method_horizon`` participates DELIBERATELY (2026-07-26), unlike the other
+    time-stops. ``horizon`` is skipped because it reflects the LLM's stated
+    target and ``edge_decay`` because it is one global window measured on
+    `combined_score` — neither is a statement by the signal methods. The
+    method-derived horizon IS: it is built from the measured best holding period
+    of the very methods that opened the position, weighted by their conviction
+    at entry, so "this position has outlived what its own methods are good for"
+    is a method view and belongs in their consensus."""
     vals: List[float] = [float(v) for m, v in (scores or {}).items()
                          if m not in _CONSENSUS_SKIP and v is not None]
     if not vals:

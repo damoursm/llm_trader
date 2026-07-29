@@ -127,6 +127,35 @@ def save_trades(trades: List[dict], allow_shrink: bool = False) -> None:
         conn.execute("COMMIT")
 
 
+def update_trade(trade: dict) -> bool:
+    """Rewrite ONE trade row in place, matched on its stable ``trade_id``.
+
+    ``save_trades`` full-replaces the table (~227 ms for 282 trades), which is
+    the right shape for a bulk ledger save but wasteful when a single broker leg
+    changed — and the reconciler persists after EVERY order submission so a
+    watchdog kill can't orphan a live order (see ``reconcile._persist_legs``), so
+    a 10-order tick paid ~2.3 s re-writing unchanged rows.
+
+    Returns False (caller should fall back to ``save_trades``) when the row
+    isn't found, or when the ``trade_id`` is NOT unique — that hash is
+    ticker+timestamp, so duplicate ledger rows are possible in principle and a
+    targeted DELETE would take out both.
+    """
+    tid = _trade_id(trade)
+    placeholders = ", ".join(["?"] * len(_TRADE_COLS))
+    with connect() as conn:
+        seqs = conn.execute("SELECT _seq FROM trades WHERE trade_id = ?", [tid]).fetchall()
+        if len(seqs) != 1:
+            return False                     # unknown or ambiguous — not our fast path
+        row = _trade_row(seqs[0][0], trade)  # keep the row's existing ordinal
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM trades WHERE trade_id = ?", [tid])
+        conn.execute(
+            f"INSERT INTO trades ({', '.join(_TRADE_COLS)}) VALUES ({placeholders})", row)
+        conn.execute("COMMIT")
+    return True
+
+
 # ── hypothetical trades (replaces cache/hypothetical_trades.json) ───────────
 
 _HYP_COLS = [
@@ -325,6 +354,49 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
         conn.execute("DELETE FROM signals WHERE run_id = ?", [run_id])
         conn.executemany(
             f"INSERT INTO signals ({', '.join(_SIGNAL_COLS)}) VALUES ({placeholders})",
+            out,
+        )
+        conn.execute("COMMIT")
+
+
+# ── per-arm synthesis recommendations (the prompt-arm bake-off panel) ──────
+
+_ARM_REC_COLS = [
+    "run_id", "generated_at", "signal_date", "arm", "live",
+    "ticker", "action", "direction", "confidence", "snap_price",
+]
+
+
+def insert_arm_recommendations(run_id: str, generated_at: str, signal_date: str,
+                               rows: List[dict]) -> None:
+    """Persist every synthesis ARM's call on every ticker for one run.
+
+    The live arm's row is the recommendation that actually drove the run; the
+    other arms' rows are SHADOW calls -- the same tickers, the same tick, the
+    same context, asked under a different prompt and acted on by nobody. That
+    pairing is the whole point: the 2026-07-22 bake-off established that
+    unpaired arm comparisons here are window artifacts (Qwen's apparent lead and
+    pro-thinking's apparent collapse were both pure calendar overlap), so an arm
+    is only judgeable against another arm's call on the SAME ticker-day.
+
+    Idempotent per ``run_id``. Each dict carries arm/live/ticker/action/
+    direction/confidence/snap_price.
+    """
+    if not rows:
+        return
+    out = [(
+        run_id, generated_at, signal_date,
+        r.get("arm"), bool(r.get("live")),
+        r.get("ticker"), r.get("action"), r.get("direction"),
+        _f(r.get("confidence")), _f(r.get("snap_price")),
+    ) for r in rows]
+    placeholders = ", ".join(["?"] * len(_ARM_REC_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM arm_recommendations WHERE run_id = ?", [run_id])
+        conn.executemany(
+            f"INSERT INTO arm_recommendations ({', '.join(_ARM_REC_COLS)}) "
+            f"VALUES ({placeholders})",
             out,
         )
         conn.execute("COMMIT")
@@ -544,7 +616,7 @@ def fetch_filled_lmt_legs() -> list:
     commission. Used to calibrate the sim cost (``tracker.calibrate_sim_costs``)
     and to show the IBKR one-way cost. ``[]`` when the table/file isn't there
     yet (fresh DB, tests). MKT fills never appear by construction."""
-    sql = ("SELECT client_ref, side, filled_qty, model_price, fill_price, commission, "
+    sql = ("SELECT client_ref, run_id, side, filled_qty, model_price, fill_price, commission, "
            "submitted_at "
            "FROM broker_orders "
            "WHERE upper(order_type) = 'LMT' AND filled_qty > 0 AND fill_price IS NOT NULL "

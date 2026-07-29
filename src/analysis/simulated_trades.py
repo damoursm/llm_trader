@@ -41,6 +41,7 @@ from datetime import date, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
+from loguru import logger
 
 from src.analysis.signal_panel import category_for, _spearman, periodic_ic_stats
 
@@ -62,20 +63,131 @@ HORIZON_LABELS = tuple(h[0] for h in HORIZONS)
 # ── data access ────────────────────────────────────────────────────────────
 
 def load_sim_trades(days: Optional[int] = None) -> pd.DataFrame:
-    """Load the simulated_trades rows (optionally only the last ``days``)."""
+    """Load the simulated_trades rows (optionally only the last ``days``).
+
+    The single read choke point for this table (mirrors ``signal_panel.
+    build_panel`` for the ``signals`` table) — scorer-epoch filtering is applied
+    HERE so every consumer (``compute_method_perf``, the dashboard's "All scored
+    tickers (simulated)" toggle, ``--backfill`` reports) is protected without
+    having to know the registry exists. Unlike the wide ``signals`` panel, a row
+    here IS one method's single observation, so a superseded row is DROPPED
+    rather than column-masked — there is nothing else on the row to keep.
+    """
     from src.db import repo
+    from src.analysis.asof import asof_sql_clause
+    _cut = asof_sql_clause("signal_date")     # walk-forward point-in-time cutoff
     try:
         if days:
             cutoff = (date.today() - timedelta(days=days)).isoformat()
-            return repo.fetch_df(
-                "SELECT * FROM simulated_trades WHERE signal_date >= ? ORDER BY generated_at",
-                [cutoff])
-        return repo.fetch_df("SELECT * FROM simulated_trades ORDER BY generated_at")
+            df = repo.fetch_df(
+                "SELECT * FROM simulated_trades WHERE signal_date >= ?"
+                + _cut + " ORDER BY generated_at", [cutoff])
+        else:
+            where = (" WHERE " + _cut[5:]) if _cut else ""
+            df = repo.fetch_df(
+                "SELECT * FROM simulated_trades" + where + " ORDER BY generated_at")
     except Exception as e:
         print(f"Could not read simulated_trades ({e}).\n"
               "It is populated every pipeline run; backfill the existing signals "
               "history with:  python -m src.analysis.simulated_trades --backfill")
         return pd.DataFrame()
+    return _drop_superseded_scorer_rows(df)
+
+
+def _epoch_sql_predicate() -> str:
+    """SQL fragment excluding rows a SUPERSEDED scorer produced, or ``""``.
+
+    The WHERE-clause twin of ``_drop_superseded_scorer_rows`` — applied inside
+    the DB so the epoch filter still runs BEFORE event extraction, exactly as it
+    does on the pandas path (dropping rows first is what makes "the previous
+    call" mean the previous COMPARABLE call)."""
+    from src.signals.method_epochs import METHOD_SCORER_EPOCH
+    if not METHOD_SCORER_EPOCH:
+        return ""
+    parts = []
+    for method, cutoff in METHOD_SCORER_EPOCH.items():
+        safe = str(method).replace("'", "''")
+        ts = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        parts.append(f"NOT (method = '{safe}' AND "
+                     f"CAST(generated_at AS TIMESTAMP) < TIMESTAMP '{ts}')")
+    return " AND ".join(parts)
+
+
+def load_sim_entry_events(days: Optional[int] = None) -> pd.DataFrame:
+    """Entry EVENTS straight from DuckDB — the SQL push-down of
+    ``load_sim_trades`` + ``extract_entry_events``.
+
+    Same definition as the pandas version (first call, sign flip, or re-emerged
+    after ``_MAX_EVENT_GAP_DAYS`` idle) expressed as a ``lag()`` window over
+    (ticker, method) ordered by ``generated_at``, so 97% of rows never leave the
+    database: 5.27M rows → 159k events, and DuckDB evaluates the window in
+    ~0.6s versus ~30s to pull everything into pandas and dedupe there.
+
+    Falls back to ``None`` on any failure so the caller can use the pandas path
+    — this is an optimisation, never a behaviour change.
+    """
+    from src.db import repo
+    where = ["1=1"]
+    params: list = []
+    if days:
+        where.append("signal_date >= ?")
+        params.append((date.today() - timedelta(days=days)).isoformat())
+    epoch = _epoch_sql_predicate()
+    if epoch:
+        where.append(epoch)
+    # Point-in-time cutoff BEFORE the lag() window, for the same reason the
+    # epoch filter goes here: dropping rows first is what makes "the previous
+    # call" mean the previous VISIBLE one. Applied after the window it would
+    # leak an event whose predecessor lies in the future.
+    from src.analysis.asof import current_asof
+    _asof = current_asof()
+    if _asof:
+        where.append(f"signal_date < '{_asof}'")
+    sql = f"""
+        WITH filtered AS (
+            SELECT * FROM simulated_trades WHERE {' AND '.join(where)}
+        ), marked AS (
+            SELECT *,
+                   lag(score)        OVER w AS _prev_score,
+                   lag(generated_at) OVER w AS _prev_gen
+            FROM filtered
+            WINDOW w AS (PARTITION BY ticker, method ORDER BY generated_at)
+        )
+        SELECT * EXCLUDE (_prev_score, _prev_gen) FROM marked
+        WHERE _prev_score IS NULL
+           OR sign(score) <> sign(_prev_score)
+           OR date_diff('second', CAST(_prev_gen AS TIMESTAMP),
+                        CAST(generated_at AS TIMESTAMP)) / 86400.0 > {_MAX_EVENT_GAP_DAYS}
+        ORDER BY generated_at
+    """
+    try:
+        return repo.fetch_df(sql, params)
+    except Exception as e:
+        logger.debug(f"[simulated_trades] SQL event extraction unavailable ({e}) — "
+                     "falling back to the pandas path")
+        return None
+
+
+def _drop_superseded_scorer_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows for a method whose scorer was CHANGED, dated before that
+    change (``signals/method_epochs.py``). A row before the change was produced
+    by a function that no longer exists — on 2026-07-24 this dropped 154,727 of
+    157,438 stored ``money_flow`` rows (98%), which is exactly why this table's
+    "unbiased" framing made the fix urgent: it is the dashboard's flagship
+    large-sample directional-skill view, and had no protection until this."""
+    if df is None or df.empty or "method" not in df.columns:
+        return df
+    from src.signals.method_epochs import METHOD_SCORER_EPOCH, score_is_comparable
+    changed = [m for m in METHOD_SCORER_EPOCH if m in set(df["method"])]
+    if not changed:
+        return df
+    ts_col = df["generated_at"] if "generated_at" in df.columns else df.get("signal_date")
+    keep = pd.Series(True, index=df.index)
+    for m in changed:
+        rows = df["method"] == m
+        stale = rows & ~ts_col[rows].map(lambda v: score_is_comparable(m, v))
+        keep &= ~stale
+    return df[keep]
 
 
 def _daily_series(ticker: str) -> Tuple[List[date], Dict[date, float]]:
@@ -86,19 +198,24 @@ def _daily_series(ticker: str) -> Tuple[List[date], Dict[date, float]]:
 
 
 def _intraday_series(ticker: str) -> List[Tuple[int, float]]:
-    """Sorted [(epoch_ns, close)] from the 30-min OHLCV cache (best effort)."""
+    """Sorted [(epoch_ns, close)] from the 30-min OHLCV cache (best effort).
+
+    Vectorised: the index → epoch-ns conversion and the positive-close filter
+    run in pandas/numpy rather than a per-ROW ``pd.Timestamp(ts).value``. Both
+    simulated-trade panels call this for ~1,760 tickers of several hundred bars
+    each, so the per-row form was millions of Timestamp constructions."""
     from src.data.cache import load_ohlcv
     df = load_ohlcv(ticker, interval="30m")
     if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
         return []
-    out: List[Tuple[int, float]] = []
-    for ts, close in zip(df.index, df["Close"].tolist()):
-        try:
-            c = float(close)
-            if c > 0:
-                out.append((int(pd.Timestamp(ts).value), c))
-        except Exception:
-            continue
+    try:
+        idx = pd.DatetimeIndex(df.index)
+        closes = pd.to_numeric(df["Close"], errors="coerce").to_numpy(dtype="float64")
+        ns = idx.asi8                                   # epoch ns, == Timestamp.value
+        keep = (closes > 0) & pd.notna(closes) & (ns != pd.NaT.value)
+        out = list(zip(ns[keep].tolist(), closes[keep].tolist()))
+    except Exception:                                   # malformed cache — same as before
+        return []
     out.sort(key=lambda x: x[0])
     return out
 
@@ -115,16 +232,35 @@ def _fwd_daily(dates: List[date], closes: Dict[date, float],
 
 
 def _fwd_intraday(series: List[Tuple[int, float]], generated_at: str,
-                  steps: int) -> Optional[float]:
+                  steps: int, times: Optional[List[int]] = None,
+                  entry_ns: Optional[int] = None) -> Optional[float]:
+    """Forward return ``steps`` intraday bars after *generated_at*.
+
+    ``times`` (the series' epoch-ns column) and ``entry_ns`` (the parsed
+    timestamp) are optional pre-computed inputs: both depend only on the
+    TICKER and the call time respectively, but were being rebuilt/re-parsed on
+    every invocation — 148,935 calls rebuilding a whole ticker's index list was
+    ~5.4s of the simulated-panel build. Omitting them keeps the original
+    behaviour for the less hot callers and the tests that stub this out."""
     if not series:
         return None
-    try:
-        entry_ns = int(pd.Timestamp(generated_at).value)
-    except Exception:
-        return None
-    times = [t for t, _ in series]
+    if entry_ns is None:
+        try:
+            entry_ns = int(pd.Timestamp(generated_at).value)
+        except Exception:
+            return None
+    if times is None:
+        times = [t for t, _ in series]
     i = bisect_left(times, entry_ns)
     if i >= len(series) or i + steps >= len(series):
+        return None
+    # Point-in-time horizon guard — the twin of signal_panel's. The as-of cutoff
+    # restricts which SIGNALS are visible, but a forward return reaching past it
+    # is an outcome that had not happened yet, and this path feeds the
+    # market-relative filter and the method-horizon states. Guarded here, at the
+    # single place the sim's forward returns are built.
+    _cut_ns = _asof_cutoff_ns()
+    if _cut_ns is not None and series[i + steps][0] >= _cut_ns:
         return None
     base = series[i][1]
     if not base or base <= 0:
@@ -132,9 +268,37 @@ def _fwd_intraday(series: List[Tuple[int, float]], generated_at: str,
     return (series[i + steps][1] / base - 1.0) * 100.0
 
 
+def _asof_cutoff_ns() -> Optional[int]:
+    """The walk-forward cutoff as epoch-ns, or None. Cheap enough to call per
+    row (module-global read + a cached parse); fail-soft so an import problem
+    can never silently restrict live analysis."""
+    try:
+        from src.analysis.asof import current_asof
+        cut = current_asof()
+    except Exception:
+        return None
+    if not cut:
+        return None
+    global _ASOF_NS_CACHE
+    if _ASOF_NS_CACHE and _ASOF_NS_CACHE[0] == cut:
+        return _ASOF_NS_CACHE[1]
+    try:
+        ns = int(pd.Timestamp(cut).value)
+    except Exception:
+        return None
+    _ASOF_NS_CACHE = (cut, ns)
+    return ns
+
+
+_ASOF_NS_CACHE: Optional[Tuple[str, int]] = None
+
+
 # ── core computation ───────────────────────────────────────────────────────
 
-def extract_entry_events(df: pd.DataFrame, max_gap_days: float = 3.0) -> pd.DataFrame:
+_MAX_EVENT_GAP_DAYS = 3.0   # shared by the pandas and SQL event extractors
+
+
+def extract_entry_events(df: pd.DataFrame, max_gap_days: float = _MAX_EVENT_GAP_DAYS) -> pd.DataFrame:
     """Reduce the per-run simulated rows to ENTRY EVENTS — the tick where a
     method NEWLY decided to enter (its first call, a sign flip, or a re-emerged
     call after ``max_gap_days`` without one). A method already in a position
@@ -187,12 +351,22 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
     long call). Both filters apply AFTER event extraction — filtering first
     would manufacture phantom transitions across excluded ticks. A window
     (``days``) edge can make a pre-existing call look new at the boundary."""
-    df = sim_df if sim_df is not None else load_sim_trades(days)
+    # Fast path: let DuckDB do the event extraction (a lag() window) so only the
+    # ~3% of rows that ARE events cross into pandas. Only when reading from the
+    # DB (an explicit sim_df must be honoured as given) and only for the events
+    # dedupe — the other modes have no SQL twin. Falls back transparently.
+    df = None
+    _events_done = False
+    if sim_df is None and dedupe == "events":
+        df = load_sim_entry_events(days)
+        _events_done = df is not None
+    if df is None:
+        df = sim_df if sim_df is not None else load_sim_trades(days)
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
 
-    if dedupe == "events":
+    if dedupe == "events" and not _events_done:
         df = extract_entry_events(df)
     elif dedupe == "last" and "generated_at" in df.columns:
         df = (df.sort_values("generated_at")
@@ -211,12 +385,14 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
 
     tickers = df["ticker"].unique()
     daily = {tk: _daily_series(tk) for tk in tickers}
-    intra: Dict[str, List[Tuple[int, float]]] = {}
+    # ticker -> (series, times) — the epoch-ns index split out once per ticker.
+    intra: Dict[str, Tuple[List[Tuple[int, float]], List[int]]] = {}
 
     # Forward returns depend only on (ticker, date/timestamp, steps) — not the
     # method — so memoise across the many method rows that share a ticker/run.
     daily_fwd: Dict[Tuple[str, date, int], Optional[float]] = {}
     intra_fwd: Dict[Tuple[str, str, int], Optional[float]] = {}
+    gen_ns: Dict[str, Optional[int]] = {}      # generated_at -> epoch ns, parsed once
 
     # Per (method, horizon): collect the (score, forward-return) pairs so n, win
     # rate, mean signed return AND the Spearman IC all come from one source.
@@ -232,8 +408,18 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
                 key = (tk, gen, steps)
                 if key not in intra_fwd:
                     if tk not in intra:
-                        intra[tk] = _intraday_series(tk)
-                    intra_fwd[key] = _fwd_intraday(intra[tk], gen, steps)
+                        s = _intraday_series(tk)
+                        # Split the index out ONCE per ticker, not per lookup.
+                        intra[tk] = (s, [t for t, _ in s])
+                    if gen not in gen_ns:
+                        try:
+                            gen_ns[gen] = int(pd.Timestamp(gen).value)
+                        except Exception:
+                            gen_ns[gen] = None
+                    _s, _t = intra[tk]
+                    intra_fwd[key] = (None if gen_ns[gen] is None else
+                                      _fwd_intraday(_s, gen, steps, times=_t,
+                                                    entry_ns=gen_ns[gen]))
                 fwd = intra_fwd[key]
             else:
                 key = (tk, sigd, steps)

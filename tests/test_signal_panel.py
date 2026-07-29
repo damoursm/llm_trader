@@ -192,3 +192,60 @@ def test_refresh_respects_max_and_is_fail_soft(monkeypatch):
     n = sp.refresh_panel_ohlcv(["A", "B", "C", "D"], max_tickers=3)
     assert calls == ["A", "B", "C"]                # capped at 3
     assert n == 2                                  # B failed, A+C warmed
+
+
+# ── SQL dedupe push-down + panel memo (2026-07-24) ──────────────────────────
+
+def test_sql_dedupe_matches_the_pandas_dedupe():
+    """_load_signals(dedupe="last") pushes last-row-per-(date,ticker) into
+    DuckDB. The panel keeps ~12k of 275k rows, so the other 96% never reach
+    pandas — but the surviving rows must be exactly the same ones."""
+    import pandas as pd
+    from src.analysis import signal_panel as sp
+    raw = pd.DataFrame({
+        "signal_date": ["2026-07-01"] * 3 + ["2026-07-02"],
+        "ticker": ["AAA", "AAA", "BBB", "AAA"],
+        "generated_at": ["2026-07-01T10:00:00", "2026-07-01T15:00:00",
+                         "2026-07-01T10:00:00", "2026-07-02T10:00:00"],
+        "price": [10.0, 11.0, 20.0, 12.0],
+        "tech": [0.1, 0.9, 0.3, 0.4],
+    })
+    # pandas reference: last row per (signal_date, ticker)
+    ref = (raw.sort_values("generated_at")
+              .groupby(["signal_date", "ticker"], as_index=False).tail(1))
+    panel = sp.build_panel(horizons=(1,), signals_df=raw)
+    assert len(panel) == len(ref) == 3
+    # the 15:00 AAA row wins over the 10:00 one
+    aaa = panel[(panel["ticker"] == "AAA") & (panel["signal_date"] == "2026-07-01")]
+    assert float(aaa.iloc[0]["tech"]) == 0.9
+
+
+def test_panel_memo_returns_independent_copies(monkeypatch):
+    """The memo hands out COPIES — a caller mutating its panel must not corrupt
+    the shared one (6 of 9 sweep calls hit this cache)."""
+    import pandas as pd
+    from src.analysis import signal_panel as sp
+    sp.reset_panel_cache()
+    calls = {"n": 0}
+    real = sp._load_signals
+
+    def counting(days, dedupe=None):
+        calls["n"] += 1
+        return pd.DataFrame({
+            "signal_date": ["2026-07-01"], "ticker": ["AAA"],
+            "generated_at": ["2026-07-01T10:00:00"], "price": [10.0], "tech": [0.5],
+        })
+
+    monkeypatch.setattr(sp, "_load_signals", counting)
+    monkeypatch.setattr(sp, "_panel_version", lambda: "run1")
+    p1 = sp.build_panel(horizons=(1,))
+    p2 = sp.build_panel(horizons=(1,))
+    assert calls["n"] == 1, "second identical call must hit the memo"
+    assert p1 is not p2 and p1.equals(p2)
+    p1.loc[0, "tech"] = 999.0
+    assert float(sp.build_panel(horizons=(1,)).loc[0, "tech"]) == 0.5
+    # A new pipeline run invalidates it.
+    monkeypatch.setattr(sp, "_panel_version", lambda: "run2")
+    sp.build_panel(horizons=(1,))
+    assert calls["n"] == 2
+    sp.reset_panel_cache()

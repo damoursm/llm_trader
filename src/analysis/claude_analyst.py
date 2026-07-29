@@ -630,6 +630,7 @@ def generate_recommendations(
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
     force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' | 'qwen' — pin synthesis (hold-review)
     blind_synthesis: bool = False,  # A/B arm: hide the aggregator's verdict (see settings.blind_synthesis_share)
+    dual_case: bool = False,        # A/B arm: BULL/BEAR cases side by side (see settings.dual_case_synthesis_share)
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -689,12 +690,45 @@ def generate_recommendations(
     # so the LLM never leans on a sub-coin-flip method. Same cached filter set the
     # aggregator used, so the two stay consistent. Filtered methods are still scored +
     # persisted to the panel — this only affects what synthesis SEES.
-    from src.signals.aggregator import winrate_filtered_methods
+    from src.signals.aggregator import (winrate_filtered_methods, side_filtered_methods,
+                                        _inverted_methods)
     _filtered_methods = winrate_filtered_methods()
-    _kept = lambda method: method not in _filtered_methods  # noqa: E731
+    # DUAL-CASE arm: also apply the PER-SIDE filter, gated on the side each
+    # method's own score points to — the same test the combine and coherence
+    # make. Without this the prompt showed a method the bullish camp had
+    # rejected while the model was considering a BUY.
+    _buy_drop = side_filtered_methods("buy") if dual_case else frozenset()
+    _sell_drop = side_filtered_methods("sell") if dual_case else frozenset()
+    _inv = _inverted_methods()
+
+    def _kept(method: str, score: float = None) -> bool:
+        if method in _filtered_methods:
+            return False
+        if score is None or not dual_case:
+            return True
+        eff = -score if method in _inv else score   # the sign the combine consumed
+        if eff > 0:
+            return method not in _buy_drop
+        if eff < 0:
+            return method not in _sell_drop
+        return True
+
     signal_lines = []
     for s in signals_for_claude:
-        if blind_synthesis:
+        if dual_case:
+            # Both cases, symmetrically, each with its own camp's conviction and
+            # NEITHER labelled as the aggregator's pick — the model weighs them.
+            _bull = getattr(s, "combined_buy_score", 0.0) or 0.0
+            _bear = getattr(s, "combined_sell_score", 0.0) or 0.0
+            parts = [
+                f"- {s.ticker}:",
+                f"  BULL CASE conviction={_bull:.2f} | BEAR CASE conviction={_bear:.2f}"
+                f"  — these are the two camps' SEPARATE convictions, each averaged over"
+                f" only the methods holding that view and vetted for that side."
+                f" Weigh them yourself; neither is a recommendation."
+                f" If both are weak, say HOLD/WATCH.",
+            ]
+        elif blind_synthesis:
             parts = [f"- {s.ticker}:"]
         else:
             # buy_score/sell_score (2026-07-22): the bullish and bearish camps'
@@ -750,65 +784,65 @@ def generate_recommendations(
                 f"({s.tape_confirmation_detail}) — score-independent raw price/volume state; "
                 f">0 = bullish structure"
             )
-        if use_news and _kept("news"):
+        if use_news and _kept("news", s.sentiment_score):
             parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
-        if _kept("ext_gap") and getattr(s, "ext_gap_score", 0.0):
+        if _kept("ext_gap", getattr(s, "ext_gap_score", 0.0)) and getattr(s, "ext_gap_score", 0.0):
             parts.append(
                 f"  EXTENDED-SESSION GAP={s.ext_gap_score:+.2f} "
                 f"(live off-hours move {s.ext_gap_pct:+.1f}% vs last completed close, ATR-normalised)"
             )
-        if _kept("sent_velocity") and getattr(s, "sentiment_velocity_score", 0.0):
+        if _kept("sent_velocity", getattr(s, "sentiment_velocity_score", 0.0)) and getattr(s, "sentiment_velocity_score", 0.0):
             parts.append(
                 f"  Sentiment VELOCITY={s.sentiment_velocity_score:+.2f} "
                 f"(Δ tone: recent {s.sentiment_recent:+.2f} vs prior {s.sentiment_prior:+.2f}; "
                 f"news mood {'accelerating up' if s.sentiment_velocity_score > 0 else 'deteriorating'} — short-horizon timing)"
             )
-        if use_tech and _kept("tech"):
+        if use_tech and _kept("tech", s.technical_score):
             parts.append(f"  Technical score={s.technical_score:+.2f}")
-        if use_insider and _kept("insider") and s.insider_cluster_detected:
+        if use_insider and _kept("insider", s.insider_score) and s.insider_cluster_detected:
             parts.append(
                 f"  *** INSIDER CLUSTER: {s.insider_cluster_size} different insiders bought within 5 days "
                 f"(insider_score already amplified 1.75×) ***"
             )
-        if use_insider and _kept("insider") and getattr(s, "insider_persistence_detected", False):
+        if use_insider and _kept("insider", s.insider_score) and getattr(s, "insider_persistence_detected", False):
             parts.append(
                 f"  *** INSIDER PERSISTENCE: {s.insider_persistence_buyer} bought {s.insider_persistence_count}× "
                 f"on separate days (insider_score amplified for repeated single-name conviction) ***"
             )
-        if use_insider and _kept("insider") and s.insider_summary:
+        if use_insider and _kept("insider", s.insider_score) and s.insider_summary:
             parts.append(f"  Insider activity: {s.insider_summary}")
-        if use_put_call_signal and _kept("put_call") and s.put_call_score:
+        if use_put_call_signal and _kept("put_call", s.put_call_score) and s.put_call_score:
             parts.append(f"  Put/call score={s.put_call_score:+.2f} (contrarian; >0=extreme puts=bullish bias, <0=extreme calls=bearish bias)")
-        if _kept("vwap") and s.vwap_score:
+        if _kept("vwap", s.vwap_score) and s.vwap_score:
             dist = f" ({s.vwap_distance_pct:+.1f}% from VWAP)" if s.vwap_distance_pct else ""
             parts.append(f"  VWAP_score={s.vwap_score:+.2f}{dist}")
         if s.gex_signal:
             flip = f", gamma_flip=${s.gamma_flip:.2f}" if s.gamma_flip else ""
             em   = f", exp_move=±{s.expected_move_pct:.1f}%" if s.expected_move_pct else ""
-            mp   = f", max_pain_score={s.max_pain_score:+.2f}" if (_kept("max_pain") and s.max_pain_score) else ""
-            sk   = f", oi_skew={s.oi_skew_score:+.2f}" if (_kept("oi_skew") and s.oi_skew_score) else ""
+            mp   = f", max_pain_score={s.max_pain_score:+.2f}" if (_kept("max_pain", s.max_pain_score) and s.max_pain_score) else ""
+            sk   = f", oi_skew={s.oi_skew_score:+.2f}" if (_kept("oi_skew", s.oi_skew_score) and s.oi_skew_score) else ""
             parts.append(f"  GEX={s.gex_signal}{flip}, max_pain_bias={s.max_pain_bias}{mp}{sk}{em}")
         pat_score = getattr(s, "pattern_score", 0.0)
         pat_name  = getattr(s, "pattern_name", "")
-        if _kept("pattern") and pat_score and pat_name:
+        if _kept("pattern", pat_score) and pat_score and pat_name:
             parts.append(f"  Pattern_score={pat_score:+.2f} [{pat_name}]  (historical win-rate; >0=bullish pattern, <0=bearish)")
         mom_score = getattr(s, "momentum_score", 0.0)
         mom_1m    = getattr(s, "momentum_1m_pct", 0.0)
         mom_3m    = getattr(s, "momentum_3m_pct", 0.0)
-        if _kept("momentum") and mom_score:
+        if _kept("momentum", mom_score) and mom_score:
             mom_ret = f" (1m:{mom_1m:+.1f}%, 3m:{mom_3m:+.1f}%)" if mom_1m else ""
             parts.append(f"  Momentum_score={mom_score:+.2f}{mom_ret}  (perceived-value trend vs own history)")
         smom_score = getattr(s, "sector_momentum_score", 0.0)
         smom_bench = getattr(s, "sector_benchmark", "")
         smom_1m    = getattr(s, "sector_momentum_1m_pct", 0.0)
         smom_3m    = getattr(s, "sector_momentum_3m_pct", 0.0)
-        if _kept("sector_momentum") and smom_score and smom_bench:
+        if _kept("sector_momentum", smom_score) and smom_score and smom_bench:
             smom_ret = f" (1m:{smom_1m:+.1f}pp, 3m:{smom_3m:+.1f}pp vs {smom_bench})" if smom_1m else f" vs {smom_bench}"
             parts.append(f"  SectorRelativeMomentum_score={smom_score:+.2f}{smom_ret}  (beta-stripped: ticker minus sector ETF; >0 = outperforming peers)")
         mmom_score = getattr(s, "market_momentum_score", 0.0)
         mmom_1m    = getattr(s, "market_momentum_1m_pct", 0.0)
         mmom_3m    = getattr(s, "market_momentum_3m_pct", 0.0)
-        if _kept("market_momentum") and mmom_score:
+        if _kept("market_momentum", mmom_score) and mmom_score:
             # Spell out the divergence so the model has the interpretation
             # ready without having to reason about three numbers from scratch.
             mmom_ret = f" (1m:{mmom_1m:+.1f}pp, 3m:{mmom_3m:+.1f}pp vs SPY)" if mmom_1m else " vs SPY"
@@ -832,7 +866,7 @@ def generate_recommendations(
         mf_score = getattr(s, "money_flow_score", 0.0)
         mfi_val  = getattr(s, "mfi_value", 50.0)
         cmf_val  = getattr(s, "cmf_value", 0.0)
-        if _kept("money_flow") and mf_score:
+        if _kept("money_flow", mf_score) and mf_score:
             parts.append(f"  MoneyFlow_score={mf_score:+.2f} (MFI={mfi_val:.0f}, CMF={cmf_val:+.2f})  (>0=accumulation, <0=distribution)")
         ts_score = getattr(s, "trend_strength_score", 0.0)
         ts_lbl   = getattr(s, "trend_strength_label", "")
@@ -840,13 +874,13 @@ def generate_recommendations(
             adx_v = getattr(s, "adx_value", 0.0)
             parts.append(f"  TrendStrength_score={ts_score:+.2f} (ADX={adx_v:.0f}, {ts_lbl}; >0=confirmed uptrend, <0=downtrend, ADX<20=chop→dampened)")
         pead_sc = getattr(s, "pead_score", 0.0)
-        if _kept("pead") and pead_sc:
+        if _kept("pead", pead_sc) and pead_sc:
             psurp = getattr(s, "pead_surprise_pct", 0.0)
             pdays = getattr(s, "pead_days_since_report", 0)
             parts.append(f"  PEAD_score={pead_sc:+.2f} (EPS surprise {psurp:+.1f}%, {pdays}d since report; post-earnings drift, >0=beat→drift up)")
         ivr_sc  = getattr(s, "iv_rank_score", 0.0)
         ivr_lbl = getattr(s, "iv_rank_label", "NEUTRAL")
-        if _kept("iv_rank") and (ivr_sc or (ivr_lbl and ivr_lbl != "NEUTRAL")):
+        if _kept("iv_rank", ivr_sc) and (ivr_sc or (ivr_lbl and ivr_lbl != "NEUTRAL")):
             ivr_val = getattr(s, "iv_rank", 50.0)
             parts.append(f"  IVRank_score={ivr_sc:+.2f} (IV-rank {ivr_val:.0f}, {ivr_lbl}; high-IV→contrarian/fade, low-IV→trend-confirm)")
         ivx_sc  = getattr(s, "iv_expr_score", 0.0)
@@ -854,7 +888,7 @@ def generate_recommendations(
         if _kept("iv_expr") and (ivx_sc or (ivx_lbl and ivx_lbl not in ("NEUTRAL", "NO_OPTIONS_DATA"))):
             parts.append(f"  IVExpr_score={ivx_sc:+.2f} ({ivx_lbl}; options-chain IV vs own history + OI skew)")
         coint_sc = getattr(s, "coint_score", 0.0)
-        if _kept("coint") and coint_sc:
+        if _kept("coint", coint_sc) and coint_sc:
             parts.append(f"  Coint_score={coint_sc:+.2f} (stat-arb pair lean; >0=cheap/long leg, <0=rich/short leg)")
         cs_sc = getattr(s, "cross_sectional_score", 0.0)
         if cs_sc:
@@ -871,7 +905,52 @@ def generate_recommendations(
     # + the cacheable prefix is unaffected — both blocks sit after the sentinel).
     # BLIND removes every reference to the withheld aggregate verdict and swaps
     # the "trust the pre-computed confidence" anchor for own-judgment calibration.
-    if blind_synthesis:
+    if dual_case:
+        # DUAL-CASE: both camps presented symmetrically, so the framing is
+        # "weigh the two cases" rather than "confirm the verdict". Like the
+        # blind arm there is no pre-computed direction to trust; unlike it, the
+        # model is told the two convictions come from DIFFERENT vetted method
+        # sets, so a case backed by few methods is not automatically the weaker
+        # one. HOLD is made explicitly available for the both-weak outcome —
+        # that is the state the old format could not express.
+        agreement_instruction = (
+            "   - Each ticker shows a BULL CASE and a BEAR CASE conviction. They are NOT two "
+            "halves of one number: each is averaged over only the methods holding that view, "
+            "and each side's methods are vetted separately for that side (a method whose "
+            "bullish calls are unreliable is excluded from the BULL CASE but may still inform "
+            "the BEAR CASE). So a case supported by FEWER methods is not automatically weaker "
+            "— judge the evidence beneath each case, not the count.\n"
+            "   - The right question is which case the evidence supports, and by how much. A "
+            "large gap between the two is a strong read; two similar convictions is a CONTESTED "
+            "read and should be HOLD/WATCH, not a coin flip; two weak convictions means the "
+            "methods have no view and you should say so rather than manufacture one.\n"
+            "   - AGREEMENT QUALITY — the methods are grouped into independent information "
+            "FAMILIES (Sentiment, Price/Trend, Rel-Strength, Volume-Flow, Options, Smart-Money, "
+            "Event/Arb; see each ticker's FAMILY ROLLUP line). Several methods from the SAME "
+            "family agreeing is ONE independent confirmation, not many — the technical methods "
+            "all read the same price tape, so a technical pile-on is pseudo-replication. Weigh "
+            "agreement ACROSS families far above same-family pile-ons.\n"
+            "   - TAPE STRUCTURE is a score-independent check of the raw market data (range "
+            "position, whether volume concentrates on up or down days, last-bar relative "
+            "volume). Treat alignment between your directional read and the tape as market "
+            "confirmation; a read that the tape contradicts deserves a confidence haircut.\n"
+        )
+        conviction_rules = (
+            "3. Conviction rules — you are given the two CASES, not a verdict. Decide the "
+            "direction yourself and state your own confidence:\n"
+            "   - confidence = your calibrated probability that YOUR chosen direction is right "
+            "at the stated horizon. 0.5 = coin flip. Distribute honestly across the list — do "
+            "not cluster everything at 0.7-0.9.\n"
+            "   - confidence ≥ 0.85 AND ≥ 2 independent method families agreeing → eligible for BUY / SELL.\n"
+            "   - confidence ≥ 0.85 but only one method family in support → HOLD maximum (single-source signals are noise).\n"
+            "   - confidence 0.55-0.84 → HOLD (monitor closely).\n"
+            "   - confidence < 0.55 → WATCH only.\n"
+            "   - Two similar case convictions, or two weak ones → HOLD/WATCH. Declining to "
+            "call a direction is a correct and expected output, not a failure.\n"
+            "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
+            "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
+        )
+    elif blind_synthesis:
         agreement_instruction = (
             "   - Strongly prefer tickers where MULTIPLE independent method families in the "
             "signal block agree: when news sentiment, technical momentum, AND smart money all "

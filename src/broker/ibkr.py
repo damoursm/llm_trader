@@ -173,6 +173,21 @@ class IBKRBroker(Broker):
                 self._expected_disconnect = False
             ib.connect(self.host, self.port, clientId=self.client_id,
                        timeout=settings.ibkr_connect_timeout, readonly=False)
+            # Bind orders placed by EARLIER sessions into this client's
+            # ``openTrades()`` view. Without this, a relaunched scheduler is
+            # blind to its own still-working orders: the duplicate-ref guard,
+            # cancel_order and the orphan sweep all read openTrades(), so every
+            # restart would resubmit refs that are already live at the broker
+            # (2026-07-23: 13 watchdog restarts stacked 8 live orders on one
+            # HQY exit ref, which then all filled at once → 112 shares sold
+            # against a 14-share long). Bounded by RequestTimeout; fail-soft.
+            try:
+                ib.reqAllOpenOrders()
+            except Exception as e:
+                logger.warning(
+                    f"[broker:ibkr] reqAllOpenOrders after connect failed — this "
+                    f"session may not see prior-session orders: {_exc_text(e)}"
+                )
             self._reconnect_block_until = 0.0
             self._ever_connected = True
             self._consecutive_timeouts = 0        # fresh session — clear the wedge counter
@@ -621,20 +636,39 @@ class IBKRBroker(Broker):
         if not client_ref or not self._ensure_connected():
             return False
         try:
-            for tr in self._ib.openTrades():
-                if (getattr(tr.order, "orderRef", "") or "").strip() != client_ref:
-                    continue
+            # EVERY order carrying this ref, not just the first. IBKR does not
+            # dedupe orderRef, so a ref can legitimately have several working
+            # orders behind it (a resubmit whose predecessor was never durably
+            # recorded). Returning after the first match cancelled one per tick
+            # while the resubmit loop added more — the stack then filled all at
+            # once (2026-07-23 HQY: 8 live orders on one ref → 112 shares sold
+            # against a 14-share long). Cancel them all, confirm them all.
+            matches = [tr for tr in self._ib.openTrades()
+                       if (getattr(tr.order, "orderRef", "") or "").strip() == client_ref]
+            if not matches:
+                return False
+            for tr in matches:
                 self._ib.cancelOrder(tr.order)
-                for _ in range(5):
-                    self._ib.sleep(1)
-                    if tr.orderStatus.status in ("Cancelled", "ApiCancelled", "Filled"):
-                        break
-                ok = tr.orderStatus.status in ("Cancelled", "ApiCancelled")
-                logger.info(
-                    f"[broker:ibkr] cancel {client_ref}: status={tr.orderStatus.status} "
-                    f"({'confirmed' if ok else 'not cancelled'})"
+            _done = ("Cancelled", "ApiCancelled", "Filled")
+            for _ in range(5):
+                self._ib.sleep(1)
+                if all(tr.orderStatus.status in _done for tr in matches):
+                    break
+            statuses = [tr.orderStatus.status for tr in matches]
+            # A fill anywhere in the stack means the caller must NOT treat this
+            # ref as cleanly cancelled — the fill-refresh pass owns it instead.
+            filled = any(s == "Filled" for s in statuses)
+            ok = not filled and all(s in ("Cancelled", "ApiCancelled") for s in statuses)
+            logger.info(
+                f"[broker:ibkr] cancel {client_ref}: {len(matches)} working order(s), "
+                f"status={statuses} ({'confirmed' if ok else 'not cancelled'})"
+            )
+            if len(matches) > 1:
+                logger.warning(
+                    f"[broker:ibkr] {len(matches)} DUPLICATE working orders shared ref "
+                    f"{client_ref} — each would have filled independently"
                 )
-                return ok
+            return ok
         except Exception as e:
             logger.warning(f"[broker:ibkr] cancel_order {client_ref} failed: {e}")
         return False

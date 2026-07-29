@@ -233,7 +233,10 @@ _TRADE_COL_SPEC = [
 # Entry Performance table — header explanations (table is built inline below).
 _METHOD_HEADER_TIPS = {
     "Method": "The signal method (e.g. news sentiment, technical, momentum) — or an LLM engine row: 'Synthesis LLM' made the final BUY/SELL call, 'Sentiment LLM' scored the per-ticker news (run-dominant engine).",
-    "Win rate %": "Method rows — solo simulation: for each closed trade, what if ONLY this method had decided the direction? LLM rows — share of the engine's recommended trades (executed or not) currently positive.",
+    "Win rate %": "ABSOLUTE. Method rows — solo simulation: for each closed trade, what if ONLY this method had decided the direction? LLM rows — share of the engine's recommended trades (executed or not) currently positive. Cannot separate 'the signal works' from 'the market went up' — compare against Rel win %.",
+    "Rel win %": "MARKET-RELATIVE: share of the method's calls where the stock beat SPY IN THE DIRECTION CALLED, over the whole simulated-trade panel (thousands of observations, not the ~150 attributed trades). This is the basis METHOD WEIGHTING now uses, because weighting is a signal-quality decision and beta is a confound there. Sizing and P&L stay absolute — the book is outright long/short, so alpha you cannot capture must not size it.",
+    "vs base": "Rel win % minus the MEASURED baseline. The bar is NOT 50%: the cap-weighted index beats its typical constituent, so the median stock is market-relative-negative (~48.6% at 1 week). Positive here means the method genuinely adds something; judging against 50% would hold every method to a bar ~1.4pp too high.",
+    "Rel n": "Observations behind Rel win % — the whole scored panel, so typically thousands versus the dozens or low hundreds behind the absolute Win rate %.",
     "Trades": "Method rows: closed trades this method had a view on (|score| ≥ 0.10). LLM rows: every BUY/SELL the engine recommended — actionable or not, executed or simulated — deduped to its last call per ticker per day.",
     "Avg return %": "Average % return across those trades.",
 }
@@ -1680,14 +1683,25 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
     labels = perf.get("method_labels") or {}
     order = perf.get("method_order_by_winrate") or list(solo.keys())
 
+    # Market-relative skill — the basis the WEIGHTING now uses. Shown beside the
+    # absolute win rate rather than replacing it: they answer different
+    # questions (does the signal carry information vs what did it earn), and the
+    # gap between them is exactly the beta the absolute number cannot see.
+    rel_skill, rel_base = data.market_relative_skill()
+
     rows = []
     for m in order:
         overall = (solo.get(m) or {}).get("overall") or {}
         if not overall:
             continue
+        r = rel_skill.get(m) or {}
+        rw = r.get("win_rate")
         rows.append({
             "Method": labels.get(m, m),
             "Win rate %": round(overall["win_rate"], 1) if overall.get("win_rate") is not None else None,
+            "Rel win %": rw,
+            "vs base": (round(rw - rel_base, 1) if rw is not None else None),
+            "Rel n": r.get("trades"),
             "Trades": overall.get("trades", overall.get("n")),
             "Avg return %": round(overall["avg_return"], 2) if overall.get("avg_return") is not None else None,
         })
@@ -1739,14 +1753,32 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
                 "Avg return %": st.get("avg_return"),
             })
 
+    # Three-arm prompt bake-off, ledger view. Separate from the boolean above
+    # because the dual arm also sets blind=False, so "OFF" merges dual+sighted.
+    # The unbiased per-ticker version is the shadow-arm block further down.
+    for key, label in (("dual", "Entry eval · prompt arm DUAL-CASE"),
+                       ("blind", "Entry eval · prompt arm BLIND"),
+                       ("sighted", "Entry eval · prompt arm SIGHTED")):
+        st = (perf.get("synth_arm_eval") or {}).get(key)
+        if st and st.get("trades"):
+            rows.append({
+                "Method": label,
+                "Win rate %": st.get("win_rate"),
+                "Trades": st.get("trades"),
+                "Avg return %": st.get("avg_return"),
+            })
+
     table = dash_table.DataTable(
         data=rows,
-        columns=[{"name": c, "id": c} for c in ["Method", "Win rate %", "Trades", "Avg return %"]],
+        columns=[{"name": c, "id": c} for c in
+                 ["Method", "Win rate %", "Rel win %", "vs base", "Rel n",
+                  "Trades", "Avg return %"]],
         tooltip_header=_METHOD_HEADER_TIPS,
         style_data_conditional=[
             {"if": {"filter_query": '{Method} contains "LLM"'}, "backgroundColor": "#eef2ff"},
             {"if": {"filter_query": '{Method} contains "hold-prompt"'}, "backgroundColor": "#fdf4ff"},
             {"if": {"filter_query": '{Method} contains "blind-synthesis"'}, "backgroundColor": "#fefce8"},
+            {"if": {"filter_query": '{Method} contains "prompt arm"'}, "backgroundColor": "#eff6ff"},
         ],
         **_TABLE_KW,
     ) if rows else html.Div("No per-method stats in this window yet.", style={"color": "#6b7280"})
@@ -1834,6 +1866,184 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
             "Highlighted LLM rows: every BUY/SELL the engine recommended — executed or simulated — entered at the recommendation-time price, marked at the latest close, "
             "deduped to the engine's last call per ticker per day. The 50/50 A/B routing flip gives each engine its own runs to be judged on. Hover the column headers for details."),
         table,
+        _ticker_perf_block(window_days),
+        _arm_eval_block(window_days),
+    ])
+
+
+# ── Per-ticker simulated performance (gate-independent) ────────────────────
+
+_TICKER_PERF_TIPS = {
+    "Ticker": "The scored name. Filter this column to find a specific ticker; filter Source to isolate a discovery channel (e.g. watchlist).",
+    "Source": "Which discovery source first surfaced the ticker. 'watchlist' = a name you pinned in STOCK_WATCHLIST — always in the universe, never dropped by the discovery liquidity gate.",
+    "Scored": "Ticker-days the name was scored at all. Pinned names accrue this every tick regardless of what the gates decide.",
+    "View": "Of those, days the combined score carried an actual direction (|score| ≥ 0.02). The rest are no-view days and are EXCLUDED from the returns, not counted as zero.",
+    "Avg score": "Mean combined_score. Positive = the system leans bullish on this name overall.",
+    "Avg conf": "Mean confidence. Compare against the ~0.85 actionable bar to see how far off being tradeable a name typically is.",
+    "Ret 1d %": "SIMULATED: mean return if the system had taken the signal's own direction each day and held 1 session. A bearish call on a stock that fell counts as a WIN.",
+    "Hit 1d %": "Share of 1-day observations where the signal's direction was right.",
+    "Ret 5d %": "Same, held 5 sessions — the swing horizon most of the calibration targets.",
+    "Hit 5d %": "Share of 5-day observations the signal's direction got right.",
+    "Ret 10d %": "Same, held 10 sessions.",
+    "Hit 10d %": "Share of 10-day observations the signal's direction got right.",
+    "Recs": "Times the LLM produced any recommendation for this ticker (including HOLD/WATCH).",
+    "Dir recs": "Of those, how many were directional BUY/SELL calls.",
+    "Actionable": "How many survived ALL the gates (confidence, agreement, BUY-block, earnings blackout, liquidity floor, overextension). A good simulated return with Actionable = 0 means the gates are consistently declining this name — that gap is the interesting part.",
+    "Trades": "Real trades opened on this ticker in the ledger (gate survivors only).",
+    "Open": "Currently open positions on this ticker.",
+    "Real ret %": "Mean realized return of those real trades, through the full cost model. Differs from the simulated columns because it only includes gate survivors and pays real costs.",
+}
+
+_TICKER_PERF_COLS = ["Ticker", "Source", "Scored", "View", "Avg score", "Avg conf",
+                     "Ret 1d %", "Hit 1d %", "Ret 5d %", "Hit 5d %",
+                     "Ret 10d %", "Hit 10d %",
+                     "Recs", "Dir recs", "Actionable", "Trades", "Open", "Real ret %"]
+
+
+def _ticker_perf_block(window_days):
+    """Every scored ticker's own record, whether or not the gates let it trade."""
+    df = data.ticker_perf(days=window_days)
+    if df is None or df.empty:
+        return html.Div([
+            _h3("Per-ticker simulated performance",
+                "Every scored ticker's own record, independent of the gates."),
+            html.Div("No scored tickers in this window yet.", style={"color": "#6b7280"}),
+        ])
+
+    rows = [{
+        "Ticker": r["ticker"], "Source": r.get("source"),
+        "Scored": r["signal_days"], "View": r["view_days"],
+        "Avg score": r["avg_score"], "Avg conf": r.get("avg_conf"),
+        "Ret 1d %": r.get("ret_1d"), "Hit 1d %": r.get("hit_1d"),
+        "Ret 5d %": r.get("ret_5d"), "Hit 5d %": r.get("hit_5d"),
+        "Ret 10d %": r.get("ret_10d"), "Hit 10d %": r.get("hit_10d"),
+        "Recs": r.get("recs"), "Dir recs": r.get("dir_recs"),
+        "Actionable": r.get("actionable"), "Trades": r.get("trades"),
+        "Open": r.get("open"), "Real ret %": r.get("real_ret"),
+    } for _, r in df.iterrows()]
+
+    return html.Div([
+        _h3("Per-ticker simulated performance — every scored name, gates or not",
+            "The plainest question about a name you deliberately pinned: how is the strategy doing on THIS ticker? "
+            "Every OTHER performance table aggregates — by method, by discovery source, by feature bucket, by realized "
+            "trade — so none of them answer it. The return columns are SIMULATED over every scored ticker-day (if the "
+            "system had taken the combined score's direction that day, what did it earn?), which is deliberately "
+            "gate-INDEPENDENT: the trade ledger only contains names that survived Gates 1-5, so a pinned ticker that "
+            "never clears the confidence bar would be invisible there while still being scored every tick. "
+            "The funnel columns on the right (Recs → Dir recs → Actionable → Trades) show where each name actually "
+            "stops. Sort by Ret 5d %, or filter Source to 'watchlist' to isolate your pinned names. "
+            "Respects the window toggle above."),
+        dash_table.DataTable(
+            data=rows,
+            columns=[{"name": c, "id": c} for c in _TICKER_PERF_COLS],
+            tooltip_header=_TICKER_PERF_TIPS,
+            style_data_conditional=[
+                {"if": {"filter_query": '{Source} = "watchlist"'},
+                 "backgroundColor": "#eef2ff", "fontWeight": "600"},
+                {"if": {"filter_query": "{Ret 5d %} < 0", "column_id": "Ret 5d %"},
+                 "color": "#b91c1c"},
+                {"if": {"filter_query": "{Ret 5d %} > 0", "column_id": "Ret 5d %"},
+                 "color": "#047857"},
+                {"if": {"filter_query": "{Actionable} = 0 && {Dir recs} > 0"},
+                 "borderLeft": "3px solid #f59e0b"},
+            ],
+            **_TABLE_KW,
+        ),
+    ])
+
+
+# ── Synthesis prompt-arm bake-off (dual-case vs blind vs sighted) ──────────
+
+_ARM_SUMMARY_TIPS = {
+    "Arm": "Which synthesis prompt produced the call. Dual-case = BULL and BEAR cases side by side, each from its own vetted method set. "
+           "Blind = the aggregator's verdict hidden. Sighted = the legacy prompt showing the verdict.",
+    "Calls": "Ticker-days this arm answered. Every arm is asked about every ticker each tick (one live, the rest shadow), so these should be near-identical — that is what makes the paired table below possible.",
+    "Buy %": "Share of its calls that were BUY.",
+    "Sell %": "Share of its calls that were SELL.",
+    "Flat %": "Share it declined to trade (HOLD/WATCH). Not a failure — the dual-case arm is explicitly told that declining is a valid output, and a decline earns 0 rather than a loss.",
+    "Strategy ret %": "Mean forward return treating a decline as 0 (no position, no P&L). This is the arm AS A STRATEGY: declining a loser genuinely beats taking it.",
+    "Dir ret %": "Mean forward return over only the calls it actually made directionally — how good its picks were, ignoring how often it picked.",
+    "Dir win %": "Share of its directional calls that moved its way.",
+    "Conf IC": "Spearman correlation between the arm's own stated confidence and its realized oriented return. Positive = its confidence ranks its own calls; ~0 = confidence carries no information (the established finding here).",
+}
+
+_ARM_PAIR_TIPS = {
+    "Pair": "The two arms compared head-to-head on ticker-days BOTH answered.",
+    "Common": "Ticker-days both arms were asked about — the paired sample.",
+    "Agree %": "How often the two arms took the same side (including both declining). A high number means the prompt rarely changes the decision.",
+    "Disagree": "Ticker-days the two arms took DIFFERENT sides. This is the real sample size of the experiment — the only rows where the prompt changed anything. Everything else is a shared call neither arm can take credit for.",
+    "A ret %": "First arm's mean return on the disagreement rows only.",
+    "B ret %": "Second arm's mean return on the same disagreement rows.",
+    "Edge %": "A minus B on the disagreement rows. Positive = the first arm was right where they differed. Read this as the arm's value; treat a small Disagree count as no answer yet.",
+}
+
+
+def _arm_eval_block(window_days):
+    """Per-ticker comparison of the three synthesis prompt arms.
+
+    Deliberately shows the PAIRED table alongside the per-arm one: the unpaired
+    view is the shape of comparison that produced the 2026-07-22 bake-off's
+    window artifacts, so it is presented as context rather than as the answer.
+    """
+    res = data.arm_eval(days=window_days) or {}
+    if not res.get("calls"):
+        return html.Div([
+            _h3("Synthesis prompt arms — dual-case vs blind vs sighted",
+                "Each tick every prompt arm is asked about every ticker: one arm drives the run, the others are "
+                "shadow calls nobody acts on. That makes the arms comparable on the SAME ticker-day."),
+            html.Div("No arm calls recorded yet — this fills in from the next tick onward "
+                     "(requires ENABLE_SHADOW_ARMS).", style={"color": "#6b7280"}),
+        ])
+
+    horizon = 5 if 5 in (res.get("horizons") or []) else (res.get("horizons") or [1])[0]
+
+    srows = [{
+        "Arm": r["label"], "Calls": r["calls"],
+        "Buy %": r["buy_pct"], "Sell %": r["sell_pct"], "Flat %": r["flat_pct"],
+        "Strategy ret %": r["mean_ret"], "Dir ret %": r["dir_ret"],
+        "Dir win %": r["dir_win"],
+        "Conf IC": round(r["conf_ic"], 3) if r.get("conf_ic") is not None else None,
+    } for r in res["summary"].get(horizon, [])]
+
+    prows = [{
+        "Pair": p["pair"], "Common": p["common"], "Agree %": p["agree_pct"],
+        "Disagree": p["disagree"], "A ret %": p["a_ret"], "B ret %": p["b_ret"],
+        "Edge %": p["edge"],
+    } for p in res["pairs"].get(horizon, [])]
+
+    return html.Div([
+        _h3(f"Synthesis prompt arms — dual-case vs blind vs sighted ({horizon}-day)",
+            "Each tick EVERY prompt arm is asked about EVERY ticker — one arm drives the run, the others are shadow "
+            "calls nobody acts on — so the arms are compared on the same ticker-days with the same engine and the same "
+            "context, with the prompt as the only difference. Without that pairing an arm is only observable on the runs "
+            "where its coin came up, which is exactly the design that made Qwen look best and pro-thinking look broken "
+            "in the 2026-07-22 model bake-off (both were pure calendar artifacts). "
+            f"{res['calls']:,} calls recorded, {res.get('shadow', 0):,} of them shadow."),
+        dash_table.DataTable(
+            data=srows,
+            columns=[{"name": c, "id": c} for c in
+                     ["Arm", "Calls", "Buy %", "Sell %", "Flat %",
+                      "Strategy ret %", "Dir ret %", "Dir win %", "Conf IC"]],
+            tooltip_header=_ARM_SUMMARY_TIPS,
+            style_data_conditional=[
+                {"if": {"filter_query": '{Arm} contains "Dual"'}, "backgroundColor": "#eef2ff"},
+            ],
+            **_TABLE_KW,
+        ) if srows else html.Div("No scored arm calls yet.", style={"color": "#6b7280"}),
+        _h3("Head-to-head — where the arms actually disagreed",
+            "The row that matters. Two arms agreeing on a ticker tells you nothing about either one, so the return "
+            "columns are computed ONLY over the ticker-days where they took different sides. A high Agree % means the "
+            "prompt rarely changes the decision — the blind A/B already showed the echo rate moves only 94.5% → 91.4%, "
+            "i.e. the model echoes because it reads the same method scores, not because it sees the verdict. "
+            "Treat a Disagree count in the low tens as 'no answer yet', not as a weak result."),
+        dash_table.DataTable(
+            data=prows,
+            columns=[{"name": c, "id": c} for c in
+                     ["Pair", "Common", "Agree %", "Disagree",
+                      "A ret %", "B ret %", "Edge %"]],
+            tooltip_header=_ARM_PAIR_TIPS,
+            **_TABLE_KW,
+        ) if prows else html.Div("No paired arm calls yet.", style={"color": "#6b7280"}),
     ])
 
 
@@ -3065,6 +3275,15 @@ def run() -> None:
             "  Bound to ALL interfaces — the (read-only) dashboard is reachable by "
             f"any device that can route to it. Windows Firewall must allow inbound TCP {port}."
         )
+
+    # Pre-warm the heavy caches off the request path: without this, the first
+    # page load after every pipeline run pays the full cold rebuild (~60s) while
+    # the browser waits. The warmer refills the same caches a request would have,
+    # so it can only ever make a load faster.
+    try:
+        data.start_cache_warmer()
+    except Exception as e:                      # optimisation only — never fatal
+        logger.warning(f"[dashboard] cache warmer not started: {e}")
 
     backoff = 2
     while True:

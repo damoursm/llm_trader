@@ -14,6 +14,7 @@ import json
 import statistics
 import time
 import yfinance as yf
+from bisect import bisect_left
 from statistics import median
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -99,6 +100,31 @@ def _sanitize_trades(trades: List[dict]) -> List[dict]:
     return valid
 
 
+def _current_asof():
+    """The walk-forward cutoff, or None. Fail-soft: an import problem must never
+    silently restrict the LIVE ledger."""
+    try:
+        from src.analysis.asof import current_asof
+        return current_asof()
+    except Exception:
+        return None
+
+
+def _closed_before(trade: dict, cutoff: str) -> bool:
+    """Was this trade's OUTCOME already known at ``cutoff``?
+
+    True only for a trade that had closed — an open position's return is not yet
+    determined, and a trade closing after the cutoff resolves in the future.
+    """
+    if str(trade.get("status", "")).upper() == "OPEN":
+        return False
+    exit_at = (trade.get("exit_datetime") or trade.get("exit_date")
+               or trade.get("exit_time"))
+    if not exit_at:
+        return False                    # closed but undated => cannot prove it
+    return str(exit_at)[:10] < cutoff
+
+
 def _load_trades() -> List[dict]:
     """Load the trade ledger from DuckDB (the single source of truth).
 
@@ -116,6 +142,20 @@ def _load_trades() -> List[dict]:
     # from a full wipe (observed lock race 2026-07-01 14:49; wipe class
     # 2026-06-11). repo.save_trades' shrink guard is the second line of defense.
     trades = _sanitize_trades(repo.load_trades())
+    # Point-in-time cutoff (walk-forward only; None in live operation).
+    #
+    # The filter is on the EXIT, not the entry, and that distinction is the
+    # whole point: a trade entered before the cutoff but closed after it carries
+    # a realised return that had not happened yet, so admitting it on its entry
+    # date would leak precisely the outcome a win-rate calibration is trying to
+    # predict. A trade still open at the cutoff has no outcome to contribute at
+    # all, so it is excluded too — its eventual result is future information and
+    # its M2M mark is struck at a price the cutoff date has not reached.
+    _asof = _current_asof()
+    if _asof and trades:
+        before = len(trades)
+        trades = [t for t in trades if _closed_before(t, _asof)]
+        logger.debug(f"[tracker] as-of {_asof}: {len(trades)}/{before} trades visible")
     if not trades and TRADES_FILE.exists():
         try:
             legacy = _sanitize_trades(json.loads(TRADES_FILE.read_text(encoding="utf-8")))
@@ -783,6 +823,25 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
                 bars_memo[ticker] = None
         return bars_memo[ticker]
 
+    def _index(ticker: str, bars):
+        """Per-TICKER date index for the anchor lookups below: ``(sorted ISO
+        dates, closes aligned to them, {date: close})``.
+
+        Derived once per ticker and memoised alongside the bars. It used to be
+        rebuilt for every CALL — ``[(d.date().isoformat(), float(cl)) for ...]``
+        over the ticker's whole history — which was the single largest cost in
+        the dashboard's cold load: 21.7M datetime conversions, ~20s of self time
+        in this function alone. The three anchor lookups then scanned that list
+        linearly; with the dates sorted they are now a dict hit and a bisect.
+        """
+        key = ("_idx", ticker)
+        if key not in bars_memo:
+            dates = [d.date().isoformat() for d in bars.index]
+            closes = [float(cl) for cl in bars["Close"]]
+            # Later duplicates win, matching the previous "last match" semantics.
+            bars_memo[key] = (dates, closes, dict(zip(dates, closes)))
+        return bars_memo[key]
+
     out: List[dict] = []
     for c in calls:
         row_session = _trade_session(c)
@@ -806,8 +865,7 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
             entry_price = None
         if entry_price is not None and not entry_price > 0:   # also catches NaN
             entry_price = None
-        closes = [(d.date().isoformat(), float(cl))
-                  for d, cl in zip(bars.index, bars["Close"])]
+        _dates, _closes, _by_date = _index(c["ticker"], bars)
         # SPLIT GUARD (2026-07-22). The snapshot was recorded LIVE and is on the
         # price scale of its own day; the cached series it is marked against is
         # adjusted RETROACTIVELY (Polygon adjusted=true / yfinance auto_adjust),
@@ -824,18 +882,19 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
         # ratio is 0.92–1.06 at the 1st/99th percentile over 7.3k rows (it is the
         # same session's intraday drift), while the smallest real split is 2×.
         if entry_price is not None:
-            same_day = [cl for d, cl in closes if d == c["entry_date"] and cl > 0]
-            if same_day:
-                ratio = same_day[-1] / entry_price
+            same_day = _by_date.get(c["entry_date"])
+            if same_day is not None and same_day > 0:
+                ratio = same_day / entry_price
                 if not (_SPLIT_GUARD_LO < ratio < _SPLIT_GUARD_HI):
                     entry_price = None            # mixed basis — distrust the snapshot
         if entry_price is None:
             if _generated_after_rth_close(c.get("entry_datetime")):
-                day = [cl for d, cl in closes if d == c["entry_date"]]
-                entry_price = day[-1] if day and day[-1] > 0 else None
+                day = _by_date.get(c["entry_date"])
+                entry_price = day if (day is not None and day > 0) else None
             if entry_price is None:
-                prior = [cl for d, cl in closes if d < c["entry_date"]]
-                entry_price = prior[-1] if prior and prior[-1] > 0 else None
+                # Last close strictly BEFORE the entry date (dates are sorted).
+                i = bisect_left(_dates, c["entry_date"])
+                entry_price = _closes[i - 1] if i > 0 and _closes[i - 1] > 0 else None
         if entry_price is None:
             continue
         # End anchor: latest cached close (skip when no bar exists at/after entry
@@ -862,8 +921,18 @@ def _build_pseudo_trades(calls: List[dict], session: Optional[str] = None,
             "current_price_datetime": last_date,
             "exit_date": None,
             "exit_price": None,
-            "return_pct": round(_pct_return(c["action"], entry_price, last_close, ctype,
-                                            entry_session=row_session), 3),
+            # A SELL call carried from its decision date to the latest close pays
+            # borrow for that whole window — and these streams run over ALL
+            # history, so the carry is far larger here than on a real 1.3-day
+            # short. Without it the daily-NAV walk (which reads action) charged
+            # borrow while this return did not, and short-heavy decision layers
+            # were flattered relative to the real book.
+            "return_pct": round(_pct_return(
+                c["action"], entry_price, last_close, ctype,
+                entry_session=row_session,
+                borrow_cost=_borrow_cost({"action": c["action"],
+                                          "entry_datetime": c["entry_datetime"]},
+                                         last_date)), 3),
             "position_size_multiplier": 1.0,
         }
         for k in ("llm_synthesis_model", "llm_sentiment_model"):
@@ -992,8 +1061,19 @@ def compute_macro_eval(window_days: Optional[int] = None,
         not), anchored at the recommendation-time snapshot (``signals.price``).
       • Aggregator — every ``signals`` row whose stored direction is BULLISH/BEARISH.
       • Bundle · <category> — direction = sign(Σ member method scores) from the
-        ``signals`` per-method columns, when |Σ| ≥ ``_BUNDLE_VIEW_FLOOR``.
+        ``signals`` per-method columns, when |Σ| ≥ ``_BUNDLE_VIEW_FLOOR``. A
+        member whose scorer has a registered epoch (method_epochs.py) is
+        excluded from the sum at rows dated before it went live, so a
+        superseded implementation's history doesn't bleed into its category's
+        total (diluted 1-of-N, unlike the isolated per-method paths, but not
+        zero — 2026-07-24).
     """
+    from src.signals.method_epochs import METHOD_SCORER_EPOCH, score_is_comparable
+    # Only these members can ever be excluded; empty for the common case, which
+    # lets the per-row loop below skip the check entirely.
+    _epoch_methods = frozenset(METHOD_SCORER_EPOCH) & {
+        m for members in METHOD_CATEGORIES.values() for m in members}
+    _NO_METHODS: frozenset = frozenset()
     cutoff = (date.today() - timedelta(days=window_days)).isoformat() if window_days is not None else None
     if bars_memo is None:
         bars_memo = {}                    # shared across every stream's NAV anchors
@@ -1053,9 +1133,17 @@ def compute_macro_eval(window_days: Optional[int] = None,
             direction = str(r.direction or "").upper()
             if direction in ("BULLISH", "BEARISH"):
                 agg_ded[(d, r.ticker)] = {**base, "action": "BUY" if direction == "BULLISH" else "SELL"}
+            # Which epoch-registered members are excluded is a function of the
+            # ROW's timestamp only, so resolve it once per row rather than once
+            # per (row × member) — the naive form cost 11.1M calls / ~4s on a
+            # cold dashboard load, since almost no method has an epoch at all.
+            excluded = {m for m in _epoch_methods if not score_is_comparable(m, gen)} \
+                if _epoch_methods else _NO_METHODS
             for cat, members in METHOD_CATEGORIES.items():
                 total = 0.0
                 for m in members:
+                    if m in excluded:
+                        continue   # superseded scorer — not this method's evidence
                     v = getattr(r, m, 0.0)
                     if v is not None and v == v:     # skip None / NaN
                         total += float(v)
@@ -1729,6 +1817,8 @@ def record_new_trades(
     llm_sentiment_model: Optional[str] = None,
     universe_sources: Optional[dict] = None,
     blind_synthesis: Optional[bool] = None,
+    synth_arm: Optional[str] = None,
+    macro_regime_context=None,
 ) -> dict:
     """Open a new trade for each BUY/SELL recommendation not already open today.
 
@@ -1922,6 +2012,21 @@ def record_new_trades(
                 f"[tracker] {rec.ticker}: {entry_session}-session entry — "
                 f"size ×{ext_mult:g} → {multiplier:.2f}×"
             )
+
+        # ── Step 3a: macro-regime sizing haircut ──────────────────────────
+        # RISK_OFF entries are sized down rather than banned (2026-07-27). See
+        # macro_regime.regime_size_multiplier for the measurement behind it.
+        _regime_name = getattr(macro_regime_context, "regime", None) if macro_regime_context else None
+        if _regime_name:
+            from src.data.macro_regime import regime_size_multiplier
+            _reg_mult = regime_size_multiplier(_regime_name)
+            if _reg_mult < 0.999:
+                multiplier = round(multiplier * _reg_mult, 3)
+                diag["regime_haircut_applied"] = diag.get("regime_haircut_applied", 0) + 1
+                logger.info(
+                    f"[tracker] {rec.ticker}: {_regime_name} regime — "
+                    f"size ×{_reg_mult:g} → {multiplier:.2f}×"
+                )
 
         # ── Step 3b: learned expected-edge blend (unified sizing) ─────────
         # The ratio hands conviction over from the tier product to the ridge
@@ -2144,6 +2249,12 @@ def record_new_trades(
             # verdict was hidden from the synthesis prompt) — the entry-side
             # analog of exit_hold_prompt, aggregated by compute_blind_synthesis_eval.
             "entry_blind_synthesis": blind_synthesis,
+            # Which of the THREE synthesis prompt arms produced this entry
+            # (dual | blind | sighted). Supersedes the boolean above, which
+            # cannot distinguish dual from sighted now that the dual arm also
+            # sets blind_synthesis=False — grouping by the boolean silently
+            # merges them. Aggregated by compute_synth_arm_eval.
+            "entry_synth_arm": synth_arm,
             # Which discovery source first surfaced the ticker this run —
             # the per-trade half of the provenance measurement (signals rows
             # carry the same stamp), for future per-source hit-rate analysis.
@@ -2239,6 +2350,35 @@ def compute_hold_prompt_eval(trades: Optional[List[dict]] = None) -> dict:
         }
 
     return {"on": _seg(True), "off": _seg(False)}
+
+
+def compute_synth_arm_eval(trades: Optional[List[dict]] = None) -> dict:
+    """Closed-trade outcomes grouped by the SYNTHESIS PROMPT ARM that opened them.
+
+    Supersedes ``compute_blind_synthesis_eval``: since 2026-07-25 the dual-case
+    arm also sets ``blind_synthesis=False``, so the boolean's OFF bucket silently
+    merges dual with sighted. Grouping by the arm name keeps the three separable.
+
+    This is the LEDGER view — only gate-surviving calls that became trades, so it
+    is small and selection-biased. The unbiased per-ticker comparison lives in
+    ``analysis/arm_eval.py`` over the shadow-arm panel, where every arm answers
+    every ticker. Pre-2026-07-25 entries carry no stamp and are excluded."""
+    trades = trades if trades is not None else _load_trades()
+
+    def _seg(arm: str) -> Optional[dict]:
+        seg = [t for t in trades
+               if t.get("status") == "CLOSED" and t.get("entry_synth_arm") == arm]
+        if not seg:
+            return None
+        rets = [float(t.get("return_pct") or 0.0) for t in seg]
+        wins = sum(1 for r in rets if r > 0)
+        return {
+            "trades": len(seg),
+            "win_rate": round(100.0 * wins / len(seg), 1),
+            "avg_return": round(sum(rets) / len(rets), 2),
+        }
+
+    return {arm: _seg(arm) for arm in ("dual", "blind", "sighted")}
 
 
 def compute_blind_synthesis_eval(trades: Optional[List[dict]] = None) -> dict:
@@ -2373,8 +2513,11 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
             continue
 
         exit_session = _session_of_iso(exit_executed_at)
+        e_cost, x_cost = _leg_costs(trade, exit_price, exit_executed_at)
         ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"),
-                          entry_session=trade.get("entry_session"), exit_session=exit_session)
+                          entry_session=trade.get("entry_session"), exit_session=exit_session,
+                          entry_cost=e_cost, exit_cost=x_cost,
+                          borrow_cost=_borrow_cost(trade, exit_executed_at))
         mul = trade.get("position_size_multiplier", 1.0)
         exit_ref = _reference_close(trade["ticker"])
         trade["status"]                 = "CLOSED"
@@ -2493,7 +2636,11 @@ def _horizon_expiry(trade: dict) -> Optional[dict]:
     ramp_windows = max(1e-9, float(settings.horizon_expiry_ramp_windows))
     ramp = min(1.0, max(0.0, overage / ramp_windows))
     base = _confidence_floor(trade.get("confidence"))
-    floor = min(0.99, base * (1.0 + (float(settings.horizon_expiry_floor_mult) - 1.0) * ramp))
+    # Per-DIRECTION time pressure: measured, shrunk, clamped (see
+    # calibrate_horizon_ramp). Longs whose time-outs bled get a tighter ramp;
+    # shorts whose time-outs paid get a looser one.
+    mult = calibrate_horizon_ramp(trade.get("action"))
+    floor = min(0.99, base * (1.0 + (float(mult) - 1.0) * ramp))
     return {"floor": floor, "ramp": ramp}
 
 
@@ -2543,11 +2690,19 @@ def _evaluate_decay(
     if action not in ("BUY", "SELL"):
         return None
 
-    # 1. Macro regime exit (only blocks long positions, matching entry-side logic)
+    # 1. Macro regime exit (only closes long positions, matching entry-side logic)
+    #    PANIC only since 2026-07-27. RISK_OFF used to close longs here because
+    #    it also blocked them on entry — but it no longer does (it measured as
+    #    the BEST-performing regime, +2.25% SPY at 21d over 337 days, and now
+    #    takes a size haircut instead). Leaving RISK_OFF in this list would have
+    #    opened a haircut long and closed it on the very next tick, which is
+    #    worse than either policy alone. The two sides must agree.
+    _regime_now = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
+    _exit_regimes = ("PANIC",) if getattr(settings, "enable_regime_size_haircut", False)         else ("PANIC", "RISK_OFF")
     if (settings.signal_decay_regime_exit
             and macro_regime_context is not None
             and action == "BUY"
-            and getattr(macro_regime_context, "regime", "") in ("PANIC", "RISK_OFF")):
+            and _regime_now in _exit_regimes):
         return "macro_regime_exit"
 
     # 2. LLM-driven hold/close — a fresh LLM re-judgment governs the exit.
@@ -2661,6 +2816,455 @@ def _trailing_exit_triggered(trade: dict) -> bool:
     return ret <= mfe * (1.0 - float(settings.trailing_give_back_frac))
 
 
+_SIDE_THRESHOLD_CACHE: dict = {}
+
+
+def _spearman_conf_return(rows: List[dict]) -> Optional[float]:
+    """Spearman rank correlation between entry confidence and realised return
+    for one side — i.e. does a higher-confidence call on this side actually do
+    better? None below 3 usable rows.
+
+    Uses ``signal_panel._spearman`` (pandas average-tie ranks) rather than a
+    hand-rolled ranker. A ranker that breaks ties by input order manufactures
+    correlation here: trades load chronologically and confidence has many ties,
+    so tied returns would receive ranks that track the load order and inflate
+    rho (an alternating ±5% series scored 0.571 instead of ~0)."""
+    pairs = []
+    for t in rows:
+        try:
+            pairs.append((float(t["confidence"]), float(t["return_pct"])))
+        except (TypeError, ValueError, KeyError):
+            continue
+    if len(pairs) < 3:
+        return None
+    import pandas as pd
+    from src.analysis.signal_panel import _spearman
+    return _spearman(pd.Series([p[0] for p in pairs]), pd.Series([p[1] for p in pairs]))
+
+
+_AUTO_INVERSION_CACHE: dict = {}
+
+
+def _binom_p_below_half(wins: int, n: int) -> float:
+    """One-sided exact binomial p-value for "this win rate is BELOW chance".
+
+    ``P(X <= wins | n, p=0.5)``. Exact rather than a normal approximation because
+    the decision it feeds (permanently sign-flipping a live signal) deserves the
+    exact tail, and n here is only a few hundred.
+    """
+    if n <= 0:
+        return 1.0
+    from math import comb
+    return sum(comb(n, i) for i in range(0, wins + 1)) / (2.0 ** n)
+
+
+_PANEL_INVERSION_CACHE: dict = {}
+
+
+def panel_inversion_evidence() -> dict:
+    """Per-method market-relative ICIR evidence for inversion, NET OF the
+    system's own edge decay.
+
+    The ledger arm (``calibrate_method_inversion``) is starved: 116-174
+    attributed trades. This arm reads the ``simulated_trades`` panel instead —
+    every scored ticker as a solo directional call, tens of thousands of
+    observations — via ``compute_directional_perf``, which is already the
+    documented inversion readout (market-relative, i.e. net of beta, so market
+    drift can't make a side look skilful).
+
+    **The shared-decay control is the whole design, not a refinement.** Measured
+    2026-07-25, the fraction of methods with negative ICIR rises 35% @30m → 61%
+    @1d → 76% @2w → 79% @1m, and ``combined_score`` ITSELF runs −0.227 @1d to
+    −2.187 @2w. That is the system's holding-period edge decay (the same effect
+    the edge-decay time-stop exists for), shared by every method. Testing a
+    method's ICIR against ZERO at a long horizon therefore flags almost the
+    whole book — it measures how long the position was held, not whether the
+    signal points backwards. So each method is scored on its EXCESS over
+    ``combined_score`` at the same horizon, and only at horizons matching the
+    real holding period (``inversion_panel_horizons``, default 1d + 3d — the
+    median hold is ~1.3 days and the measured edge peaks at 1-2d). Inverting a
+    method that merely shares the decay would not help: the decay is about
+    duration, not direction.
+
+    A candidate must be negative at EVERY configured horizon ("stays negative"
+    — the documented criterion) with |t| = |excess| · sqrt(signal-days) ≥
+    ``inversion_panel_min_t``, Bonferroni-corrected across the methods judged.
+
+    Cached separately and for much longer than the ledger arm
+    (``inversion_panel_cache_seconds``): the underlying join is expensive and
+    the panel moves over days, not ticks. Returns
+    ``{method: {excess: {h: v}, t: {h: v}, qualifies: bool}}``; fail-soft to {}.
+    """
+    if not getattr(settings, "enable_inversion_panel_arm", False):
+        return {}
+    import time
+    now = time.time()
+    hit = _PANEL_INVERSION_CACHE.get("v")
+    if hit and (now - hit["ts"]) < float(settings.inversion_panel_cache_seconds):
+        return hit["out"]
+
+    out: dict = {}
+    try:
+        import math
+        from src.analysis.simulated_trades import compute_directional_perf
+        from src.signals.aggregator import _BASE_WEIGHTS, INVERTIBLE_OVERLAYS
+
+        horizons = [h.strip() for h in
+                    str(settings.inversion_panel_horizons).split(",") if h.strip()]
+        df = compute_directional_perf(min_n=int(settings.inversion_panel_min_obs))
+        if df is None or df.empty or "side" not in df.columns:
+            raise ValueError("no directional panel yet")
+        b = df[df["side"] == "both"].set_index("method")
+        if "combined_score" not in b.index:
+            raise ValueError("combined_score row missing — no decay yardstick")
+
+        cands = sorted(set(_BASE_WEIGHTS) | set(INVERTIBLE_OVERLAYS))
+        staged = {}
+        for m in cands:
+            if m not in b.index:
+                continue
+            exc, tt, usable = {}, {}, True
+            for h in horizons:
+                mi, ci = b.at[m, f"icir_{h}"], b.at["combined_score", f"icir_{h}"]
+                days = b.at[m, f"icdays_{h}"]
+                if any(x is None or (isinstance(x, float) and math.isnan(x))
+                       for x in (mi, ci, days)):
+                    usable = False
+                    break
+                e = float(mi) - float(ci)
+                exc[h] = round(e, 4)
+                tt[h] = round(abs(e) * math.sqrt(max(float(days), 1.0)), 3)
+            if usable and exc:
+                staged[m] = (exc, tt)
+
+        # Plain threshold — no multiple-comparison bump. See
+        # settings.inversion_require_replication: the methods are ~0.72
+        # correlated, so a correction computed from the test COUNT is
+        # meaningless in both directions. Replication across the two arms is
+        # the safeguard instead.
+        min_t = float(settings.inversion_panel_min_t)
+        for m, (exc, tt) in staged.items():
+            qualifies = (all(v < 0 for v in exc.values())
+                         and all(v >= min_t for v in tt.values()))
+            out[m] = {"excess": exc, "t": tt, "min_t": round(min_t, 3),
+                      "qualifies": bool(qualifies)}
+    except Exception as e:
+        logger.debug(f"[inversion] panel arm unavailable: {e}")
+        out = {}
+
+    _PANEL_INVERSION_CACHE["v"] = {"ts": now, "out": out}
+    q = [m for m, d in out.items() if d.get("qualifies")]
+    if q:
+        logger.info(f"[inversion] panel arm qualifies: {sorted(q)}")
+    return out
+
+
+def calibrate_method_inversion() -> dict:
+    """Auto-detect methods whose RAW score is reliably anti-predictive, and that
+    actually BEAT chance once flipped.
+
+    Two independent bars, both of which must clear — the second is what stops a
+    merely-unlucky method from being sign-flipped into the combine:
+
+    1. **Significantly worse than chance, corrected for multiple comparisons.**
+       One-sided exact binomial on the method's gross solo win rate against
+       p=0.5, requiring ``p < inversion_alpha / n_tested`` (Bonferroni over the
+       methods judged this run, on by default). Without the correction, testing
+       ~20 methods at alpha=0.05 yields a false inversion about two-thirds of the
+       time by chance alone. This is the same standard that caused the 2026-07-25
+       long/short parameter split to be REJECTED (p=0.014 -> x8 = 0.111), so
+       applying it here keeps one bar across the project.
+    2. **The FLIPPED view must clear the win-rate filter's own threshold.**
+       Inverting a 45% method does not automatically give 55% — exact ties
+       (``exit == entry``) count as losses on BOTH sides, so the corrected rate
+       is ``100 - raw - tie_share``, and a method whose record is mostly ties can
+       be significantly bad raw AND still below 50% flipped. Such a method is
+       *noise*, not backwards information, and is left for the ordinary filter to
+       drop rather than inverted.
+
+    Evidence floor: ``inversion_min_trades`` (default 30) attributed solo calls —
+    deliberately higher than the filter's 10, because inverting is a stronger
+    claim than dropping. Fail-soft: any error returns no auto-inversions, so the
+    manual ``inverted_methods`` pins keep working.
+
+    Returns ``{method: {win_rate, effective_win_rate, trades, p, alpha}}``.
+    """
+    if not getattr(settings, "enable_auto_inversion", False):
+        return {}
+    import time
+    now = time.time()
+    hit = _AUTO_INVERSION_CACHE.get("v")
+    if hit and (now - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["out"]
+
+    out: dict = {}
+    try:
+        from src.signals.aggregator import (_BASE_WEIGHTS, INVERTIBLE_OVERLAYS,
+                                            _win_rate_pct)
+        split = "train" if settings.enable_oos_validation else None
+        raw = compute_solo_method_gross_winrate(split=split)
+        min_n = max(1, int(settings.inversion_min_trades))
+        candidates = (set(_BASE_WEIGHTS) | set(INVERTIBLE_OVERLAYS))
+        judgeable = [m for m in candidates
+                     if int((raw.get(m, {}) or {}).get("trades", 0) or 0) >= min_n]
+        alpha = float(settings.inversion_alpha)   # plain, uncorrected — see settings
+
+        thresh_pct = float(settings.winrate_filter_threshold) * 100.0
+        for m in judgeable:
+            rec = raw.get(m) or {}
+            n = int(rec.get("trades") or 0)
+            wr = _win_rate_pct(rec)
+            if wr is None:
+                continue
+            wins = int(round(wr / 100.0 * n))
+            p = _binom_p_below_half(wins, n)
+            if p >= alpha:
+                continue                        # bar 1: not reliably backwards
+            # bar 2: does flipping it actually produce a >50% method?
+            eff = _win_rate_pct(
+                (compute_solo_method_gross_winrate(split=split, effective=True)
+                 .get(m, {}) or {}))
+            # `effective` honours only ALREADY-inverted methods, so for a
+            # candidate not yet inverted we must model the flip ourselves.
+            eff_flipped = eff if m in _current_inverted() else (100.0 - wr - _tie_share(m, split))
+            if eff_flipped is None or eff_flipped < thresh_pct:
+                continue
+            out[m] = {"win_rate": wr, "effective_win_rate": round(eff_flipped, 1),
+                      "trades": n, "p": p, "alpha": alpha, "arm": "ledger"}
+
+        # ── Arm B: the signals PANEL, as REPLICATION ─────────────────────
+        # Not a union. A ledger finding must REPRODUCE on the panel — different
+        # data, ~1000x the observations, a different statistic, and its own
+        # shared-decay control — before anything is inverted. This is what
+        # replaces the (indefensible) multiple-comparison correction: six
+        # correlated ledger hits that fail to reproduce are ONE unconfirmed
+        # phenomenon, which is exactly the situation measured on 2026-07-26.
+        panel = panel_inversion_evidence() or {}
+        if settings.inversion_require_replication:
+            confirmed = {m for m, d in panel.items() if d.get("qualifies")}
+            for m in list(out):
+                if m not in confirmed:
+                    logger.debug(
+                        f"[inversion] {m} qualifies on the ledger (p={out[m]['p']:.4g}) "
+                        f"but does NOT reproduce on the panel — not inverted")
+                    out.pop(m)
+        for m, d in out.items():                       # annotate what confirmed it
+            d["arm"] = "ledger+panel" if settings.inversion_require_replication else "ledger"
+            if m in panel:
+                d["excess_icir"] = panel[m].get("excess")
+                d["panel_t"] = panel[m].get("t")
+    except Exception as e:                      # never let this break a run
+        logger.debug(f"[inversion] auto-detect unavailable: {e}")
+        out = {}
+
+    _AUTO_INVERSION_CACHE["v"] = {"ts": now, "out": out}
+    try:
+        from src.performance.calibration import report_calibration
+        report_calibration(
+            "auto_inversion", value=(",".join(sorted(out)) if out else "none"),
+            prior="none", n_evidence=sum(int(d["trades"]) for d in out.values()),
+            note=("methods auto-inverted: significantly worse than chance "
+                  "(Bonferroni-corrected) AND >50% once flipped"))
+    except Exception:
+        pass
+    if out:
+        logger.info("[inversion] auto-detected: " + ", ".join(
+            f"{m} raw={d['win_rate']}% -> {d['effective_win_rate']}% "
+            f"(n={d['trades']}, p={d['p']:.2g} < {d['alpha']:.2g})"
+            for m, d in sorted(out.items())))
+    return out
+
+
+def _current_inverted() -> frozenset:
+    try:
+        from src.signals.aggregator import _manual_inverted_methods
+        return _manual_inverted_methods()
+    except Exception:
+        return frozenset()
+
+
+def _tie_share(method: str, split: Optional[str]) -> float:
+    """% of a method's judged calls where the stock did not move at all.
+
+    A tie counts as a LOSS whichever way the view points, so it is the exact
+    amount by which `flipped != 100 - raw`. Computing it is what makes bar 2 of
+    ``calibrate_method_inversion`` honest instead of an assumption."""
+    from src.signals.method_epochs import score_is_comparable
+    closed = [t for t in _load_trades()
+              if t.get("status") == "CLOSED" and t.get("method_scores")]
+    closed = _filter_by_split(closed, split)
+    n = ties = 0
+    for t in closed:
+        if not score_is_comparable(method, t.get("entry_datetime") or t.get("entry_date")):
+            continue
+        sc = (t.get("method_scores") or {}).get(method, 0.0)
+        if sc == 0.0 or abs(sc) < _METHOD_AGREE_THRESHOLD:
+            continue
+        e, x = t.get("entry_price"), t.get("exit_price")
+        if e is None or x is None:
+            continue
+        try:
+            move = float(x) - float(e)
+        except (TypeError, ValueError):
+            continue
+        n += 1
+        if move == 0.0:
+            ties += 1
+    return (100.0 * ties / n) if n else 0.0
+
+
+def calibrate_side_threshold(direction: Optional[str]) -> float:
+    """Additive per-DIRECTION adjustment (confidence points) to the actionable
+    threshold. Always >= 0 — this can TIGHTEN a side, never loosen it.
+
+    Keyed on whether confidence DISCRIMINATES on that side, not on which side
+    wins more: raising a bar only helps if the bar sorts good calls from bad. A
+    side whose Spearman(confidence, return) is ~0 gets no adjustment, because
+    cutting its low-confidence calls would remove volume at random. Measured
+    2026-07-25: longs +0.008 (no adjustment), shorts +0.233 (raise).
+
+    Shrunk by ``side_threshold_prior_n`` so it is ~inert on thin evidence and
+    capped at ``side_threshold_max_adjust``. This gates the most consequential
+    parameter in the system, so both guards are deliberately tight. An explicit
+    ``actionable_threshold_adj_{long,short}`` pins a side and skips the
+    calibration entirely."""
+    from config.settings import directional
+    if not direction:
+        return 0.0
+    pinned = directional("actionable_threshold_adj", direction)
+    if pinned is not None:
+        return max(0.0, float(pinned))
+    if not settings.enable_side_threshold_calibration:
+        return 0.0
+    key = str(direction).upper()
+    hit = _SIDE_THRESHOLD_CACHE.get(key)
+    if hit and (time.time() - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["val"]
+
+    adj = 0.0
+    try:
+        side = "BUY" if key in ("BUY", "LONG", "BULLISH") else "SELL"
+        # CONFIDENCE-EPOCH gate (2026-07-27): this calibration fits a
+        # relationship BETWEEN confidence and return, so mixing rows produced by
+        # two different confidence formulas fits an artefact of the mixture.
+        # Measured before the gate: 75% of eligible closed trades carried the
+        # pre-split scale (mean 0.873 vs 0.945 after). The Bayesian shrinkage
+        # below is exactly what makes the smaller, honest sample safe — it goes
+        # inert on thin evidence rather than over-fitting it.
+        from src.signals.method_epochs import confidence_is_comparable
+        rows = [t for t in _load_trades()
+                if t.get("status") == "CLOSED" and t.get("action") == side
+                and t.get("return_pct") is not None and t.get("confidence") is not None
+                and confidence_is_comparable(t.get("entry_datetime") or t.get("entry_date"))]
+        rho = _spearman_conf_return(rows)
+        if rho is not None and rho > 0:
+            n = len(rows)
+            prior_n = max(0, int(settings.side_threshold_prior_n))
+            strength = n / (n + prior_n) if (n + prior_n) else 0.0
+            ref = max(1e-9, float(settings.side_threshold_rho_ref))
+            cap = abs(float(settings.side_threshold_max_adjust))
+            adj = min(1.0, rho / ref) * cap * strength
+            from src.performance.calibration import report_calibration
+            report_calibration(f"actionable_threshold_adj_{side.lower()}", value=adj,
+                               prior=0.0, n_evidence=n, unit="confidence pts",
+                               note=f"Spearman(conf, return) {rho:+.3f} — "
+                                    f"{'confidence discriminates, tighten' if rho > 0.05 else 'uninformative, no raise'}")
+    except Exception as e:
+        logger.debug(f"[tracker] side threshold calibration unavailable: {e}")
+        adj = 0.0
+    _SIDE_THRESHOLD_CACHE[key] = {"ts": time.time(), "val": adj}
+    return adj
+
+
+def reset_side_threshold_cache() -> None:
+    """Drop the cached per-side threshold adjustment (tests / forced refresh)."""
+    _SIDE_THRESHOLD_CACHE.clear()
+
+
+_HORIZON_RAMP_CACHE: dict = {}
+
+
+def calibrate_horizon_ramp(direction: Optional[str]) -> float:
+    """Per-DIRECTION horizon-expiry floor multiplier, measured not hand-set.
+
+    Evidence: for this side, how did trades closed by ``horizon_expired`` do
+    versus its other exits? A NEGATIVE gap means the time-stop let losers bleed
+    → tighten (raise the multiplier so conviction must be higher to keep
+    holding). POSITIVE means holding to the horizon paid → loosen. Measured
+    2026-07-25: longs −1.88 pp, shorts +2.54 pp — opposite signs, which is
+    precisely what one shared parameter cannot express.
+
+    Bayesian-shrunk by ``horizon_ramp_prior_n`` so it is ~inert until a side has
+    real evidence, clamped to ±``horizon_ramp_max_adjust`` of the base, and
+    reported to the calibration registry. Falls back to the static (or
+    per-side-overridden) value on any failure."""
+    from config.settings import directional
+    base = float(directional("horizon_expiry_floor_mult", direction) or
+                 settings.horizon_expiry_floor_mult)
+    if not settings.enable_horizon_ramp_calibration or not direction:
+        return base
+    key = str(direction).upper()
+    hit = _HORIZON_RAMP_CACHE.get(key)
+    if hit and (time.time() - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["val"]
+
+    val = base
+    try:
+        side = "BUY" if key in ("BUY", "LONG", "BULLISH") else "SELL"
+        closed = [t for t in _load_trades()
+                  if t.get("status") == "CLOSED" and t.get("action") == side
+                  and t.get("return_pct") is not None]
+        exp = [float(t["return_pct"]) for t in closed if t.get("exit_reason") == "horizon_expired"]
+        oth = [float(t["return_pct"]) for t in closed if t.get("exit_reason") != "horizon_expired"]
+        if exp and oth:
+            gap = statistics.mean(exp) - statistics.mean(oth)      # pp
+            n = len(exp)
+            prior_n = max(0, int(settings.horizon_ramp_prior_n))
+            strength = n / (n + prior_n) if (n + prior_n) else 0.0
+            ref = max(1e-9, float(settings.horizon_ramp_gap_ref_pp))
+            span = abs(float(settings.horizon_ramp_max_adjust))
+            # gap < 0 (time-outs did worse) → positive adjustment → tighter.
+            adj = max(-span, min(span, (-gap / ref) * span)) * strength
+            val = max(1.0, base * (1.0 + adj))
+            from src.performance.calibration import report_calibration
+            report_calibration(f"horizon_ramp_{side.lower()}", value=val, prior=base,
+                               n_evidence=n, unit="floor mult",
+                               note=f"horizon_expired vs other exits gap {gap:+.2f} pp "
+                                    f"({'tighten' if gap < 0 else 'loosen'})")
+    except Exception as e:
+        logger.debug(f"[tracker] horizon ramp calibration unavailable: {e}")
+        val = base
+    _HORIZON_RAMP_CACHE[key] = {"ts": time.time(), "val": val}
+    return val
+
+
+def reset_horizon_ramp_cache() -> None:
+    """Drop the cached per-side horizon ramp (tests / forced refresh)."""
+    _HORIZON_RAMP_CACHE.clear()
+
+
+def _adverse_stop_triggered(trade: dict) -> bool:
+    """Hard loss cap on a SINGLE position — the only exit here not conditioned on
+    conviction, so a position the engine keeps re-affirming can't bleed forever.
+
+    Threshold is direction-scoped (``config.settings.directional``): tighter for
+    shorts by default because a short's loss is unbounded while a long's caps at
+    −100%, and squeezes accelerate against the position. Reads the same
+    cost-adjusted ``return_pct`` the trailing stop does, so borrow carry and real
+    fill costs are already in it. A 0 / missing threshold disables that side."""
+    if not settings.enable_adverse_stop:
+        return False
+    from config.settings import directional
+    try:
+        pct = float(directional("adverse_stop_pct", trade.get("action")) or 0.0)
+        ret = float(trade.get("return_pct") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if pct <= 0:
+        return False
+    return ret <= -abs(pct)
+
+
 def monitor_open_positions(
     signals_by_ticker: Optional[dict] = None,
     macro_regime_context=None,
@@ -2749,6 +3353,13 @@ def monitor_open_positions(
         # off positive-exit-IC signals instead of waiting for the LATE LLM flip.
         if reason is None and _trailing_exit_triggered(trade):
             reason = "trailing_stop"
+        # (3) Hard adverse stop — the only cap on a SINGLE position's loss; every
+        # other exit here is conviction-based, so a position the engine keeps
+        # re-affirming could bleed indefinitely. Direction-split by default
+        # (tighter for shorts): a long's loss bounds at −100%, a short's does
+        # not, and squeezes accelerate against you.
+        if reason is None and _adverse_stop_triggered(trade):
+            reason = "adverse_stop"
         if reason is None and settings.enable_mechanical_exit and _escores is not None:
             _mc = exit_method_consensus(_escores)
             if _mc is not None and _mc <= -abs(float(settings.mechanical_exit_threshold)):
@@ -2780,8 +3391,11 @@ def monitor_open_positions(
 
         mul = trade.get("position_size_multiplier", 1.0)
         exit_session = _session_of_iso(executed_at)
+        e_cost, x_cost = _leg_costs(trade, exit_price, executed_at)
         ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"),
-                          entry_session=trade.get("entry_session"), exit_session=exit_session)
+                          entry_session=trade.get("entry_session"), exit_session=exit_session,
+                          entry_cost=e_cost, exit_cost=x_cost,
+                          borrow_cost=_borrow_cost(trade, executed_at))
         exit_ref = _reference_close(trade["ticker"])
 
         trade["status"]                 = "CLOSED"
@@ -2801,10 +3415,15 @@ def monitor_open_positions(
 
         # Logging — branch by which decision-maker fired so the line is legible.
         regime = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
-        if reason in ("trailing_stop", "mechanical_exit"):
+        if reason in ("trailing_stop", "mechanical_exit", "adverse_stop"):
             if reason == "trailing_stop":
                 extra = (f"MFE peaked {trade.get('max_favorable_excursion')}% → gave back to "
                          f"{ret:+.2f}% (≥{settings.trailing_give_back_frac:.0%} of the peak)")
+            elif reason == "adverse_stop":
+                from config.settings import directional as _dir
+                extra = (f"hard loss cap: {ret:+.2f}% breached the "
+                         f"{float(_dir('adverse_stop_pct', trade.get('action')) or 0):.1f}% "
+                         f"{'short' if trade.get('action') == 'SELL' else 'long'} stop")
             else:
                 extra = "mechanical signal consensus said EXIT (money_flow/max_pain/…)"
             logger.info(
@@ -2904,6 +3523,52 @@ def _confirm_llm_exit(trade: dict, reason: Optional[str], hold_review) -> tuple:
     return reason, False
 
 
+def _leg_costs(trade: dict, exit_price, exit_iso) -> tuple:
+    """(entry_cost, exit_cost) one-way FRACTIONS for a trade under per-trade
+    attribution — each leg charged its realized cost if it filled, else the
+    tick/period/model estimate (see spread.resolve_leg_cost). ``exit_price`` /
+    ``exit_iso`` are the price and instant the exit leg is priced at (the exit
+    fill for a closed trade; the live mark for an open-trade M2M). Returns
+    ``(None, None)`` when attribution is off → callers keep the modeled cost."""
+    if not settings.sim_per_trade_cost_attribution:
+        return None, None
+    from src.performance.spread import resolve_trade_leg_cost, session_bucket_fine
+    e_cost = resolve_trade_leg_cost(trade, "entry", trade.get("entry_price"),
+                                    session_bucket_fine(trade.get("entry_datetime")))
+    x_cost = resolve_trade_leg_cost(trade, "exit", exit_price,
+                                    session_bucket_fine(exit_iso))
+    return e_cost, x_cost
+
+
+def _calendar_days_held(trade: dict, end_iso=None) -> float:
+    """Calendar days from entry to *end_iso* (default: the trade's exit, else
+    now). Borrow accrues on CALENDAR days — you pay over a weekend — unlike the
+    trading-day conventions used elsewhere in the ledger."""
+    start = trade.get("entry_datetime") or trade.get("entry_date")
+    end = end_iso or trade.get("exit_datetime") or trade.get("exit_date")
+    if not start:
+        return 0.0
+    try:
+        a = datetime.fromisoformat(str(start).replace(" ", "T"))
+        b = (datetime.fromisoformat(str(end).replace(" ", "T"))
+             if end else datetime.now(timezone.utc))
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=timezone.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=timezone.utc)
+        return max(0.0, (b - a).total_seconds() / 86400.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _borrow_cost(trade: dict, end_iso=None) -> float:
+    """Short-only borrow carry for this trade's holding period (a fraction).
+    0.0 for longs and when the feature is off — see spread.borrow_cost_fraction."""
+    from src.performance.spread import borrow_cost_fraction
+    return borrow_cost_fraction(trade.get("action"),
+                                _calendar_days_held(trade, end_iso), trade)
+
+
 def _normalize_closed_returns(trades: List[dict]) -> int:
     """Re-derive ``return_pct`` for every closed trade from its stored
     entry/exit prices using the current spread model.
@@ -2923,9 +3588,12 @@ def _normalize_closed_returns(trades: List[dict]) -> int:
         x = t.get("exit_price")
         if e is None or x is None:
             continue
+        e_cost, x_cost = _leg_costs(t, float(x), t.get("exit_datetime"))
         ret = round(_pct_return(t.get("action", "BUY"), float(e), float(x), t.get("type", "STOCK"),
                                 entry_session=t.get("entry_session"),
-                                exit_session=t.get("exit_session")), 3)
+                                exit_session=t.get("exit_session"),
+                                entry_cost=e_cost, exit_cost=x_cost,
+                                borrow_cost=_borrow_cost(t)), 3)
         if abs(ret - t.get("return_pct", 0.0)) > 1e-3:
             t["return_pct"] = ret
             mul = t.get("position_size_multiplier", 1.0)
@@ -3014,8 +3682,16 @@ def update_open_trades() -> None:
             continue
 
         days = _trading_days_held(trade["entry_date"])
+        # Open-trade M2M: the entry leg charges its real fill cost; the exit
+        # leg has no fill, so it takes the current session's tick/period/model
+        # estimate at the live mark (decision_at is the mark instant).
+        e_cost, x_cost = _leg_costs(trade, price, decision_at)
+        # Borrow accrues while the position is OPEN, so the live M2M charges it
+        # to date — a short's unrealised return worsens each day it is held.
         ret = _pct_return(trade["action"], trade["entry_price"], price, trade.get("type", "STOCK"),
-                          entry_session=trade.get("entry_session"), exit_session=mark_session)
+                          entry_session=trade.get("entry_session"), exit_session=mark_session,
+                          entry_cost=e_cost, exit_cost=x_cost,
+                          borrow_cost=_borrow_cost(trade, decision_at))
 
         mul = trade.get("position_size_multiplier", 1.0)
         trade["current_price"] = float(price)
@@ -3549,17 +4225,24 @@ def _flip_trade(trade: dict) -> dict:
     asset_type = trade.get("type", "STOCK")
     e_sess     = trade.get("entry_session")
     if entry_px is not None:
+        # Borrow follows the FLIPPED direction — the hypothetical is "what if we
+        # had been short/long here", so a flip INTO a short pays carry and a flip
+        # OUT of one stops paying it. Without this the daily-NAV walk (which
+        # reads the flipped action) charged borrow while _pct_return did not, so
+        # the two engines disagreed on every flipped short.
+        _bc = _borrow_cost(flipped)
         if flipped["status"] == "CLOSED" and trade.get("exit_price") is not None:
             flipped["return_pct"] = round(
                 _pct_return(flipped["action"], float(entry_px), float(trade["exit_price"]), asset_type,
-                            entry_session=e_sess, exit_session=trade.get("exit_session")),
+                            entry_session=e_sess, exit_session=trade.get("exit_session"),
+                            borrow_cost=_bc),
                 3,
             )
         else:
             cp = trade.get("current_price") or entry_px
             flipped["return_pct"] = round(
                 _pct_return(flipped["action"], float(entry_px), float(cp), asset_type,
-                            entry_session=e_sess),
+                            entry_session=e_sess, borrow_cost=_bc),
                 3,
             )
     return flipped
@@ -3573,8 +4256,14 @@ def _hypothetical_trades_for_method(method: str, closed: List[dict]) -> List[dic
     include the flipped trade. Trades where the method has no view
     (|score| < threshold) are skipped entirely.
     """
+    from src.signals.method_epochs import score_is_comparable
     out: List[dict] = []
     for trade in closed:
+        # Scores stored before a scorer was CHANGED came from a function that no
+        # longer exists — they are not evidence about the current one.
+        if not score_is_comparable(
+                method, trade.get("entry_datetime") or trade.get("entry_date")):
+            continue
         score = trade.get("method_scores", {}).get(method, 0.0)
         # Skip methods with no view: either exactly zero (degenerate "no opinion")
         # or below the configured floor. The exact-zero guard is required because
@@ -3710,9 +4399,19 @@ def compute_solo_method_performance(split: Optional[str] = None, window_days: Op
     return results
 
 
-def compute_solo_method_gross_winrate(split: Optional[str] = None) -> dict:
+def compute_solo_method_gross_winrate(split: Optional[str] = None,
+                                      side: Optional[str] = None,
+                                      effective: bool = False) -> dict:
     """Per-method GROSS directional win rate — the fraction of a method's solo
     directional calls that were right on the RAW price move, BEFORE fees and spread.
+
+    ``side`` (2026-07-24) restricts the sample to ONE side of the method's calls:
+    ``"buy"`` counts only its BULLISH views (score > 0), ``"sell"`` only its
+    BEARISH ones; ``None`` keeps both (the original behaviour). A method's two
+    sides are separate skills — the 2026-07-24 audit measured most methods at
+    ~40% on their bullish calls and ~47-59% on their bearish ones — so the
+    combine filters and weights each camp on its OWN record rather than on a
+    blended number that hides the gap.
 
     Distinct from ``compute_solo_method_performance`` (whose ``win_rate`` is on the
     cost-adjusted ``return_pct`` — a right-direction move SMALLER than the round-trip
@@ -3730,18 +4429,37 @@ def compute_solo_method_gross_winrate(split: Optional[str] = None) -> dict:
     Returns ``{method: {"trades": n, "win_rate": pct}}`` for every method with ≥ 1
     view. Used by the win-rate method filter (``aggregator.winrate_filtered_methods``).
     """
+    from src.signals.method_epochs import score_is_comparable
     trades = _load_trades()
     closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("method_scores")]
     closed = _filter_by_split(closed, split)
+    # Resolved once: which methods the combine sign-flips. Only consulted when
+    # `effective` is set, but importing here keeps the hot loop clean.
+    _inv: frozenset = frozenset()
+    if effective:
+        try:
+            from src.signals.aggregator import _inverted_methods
+            _inv = _inverted_methods()
+        except Exception:
+            _inv = frozenset()          # fail-soft → raw behaviour
     out: dict = {}
     for method in _ALL_METHODS:
         n = wins = 0
         for trade in closed:
+            # Scores stored before a scorer was CHANGED came from a function
+            # that no longer exists — never charge them to the current one.
+            if not score_is_comparable(
+                    method, trade.get("entry_datetime") or trade.get("entry_date")):
+                continue
             score = trade.get("method_scores", {}).get(method, 0.0)
             # Same no-view guard as _hypothetical_trades_for_method (exact-zero +
             # below-threshold), so a literal 0.0 isn't mis-read as a short view.
             if score == 0.0 or abs(score) < _METHOD_AGREE_THRESHOLD:
                 continue
+            if side == "buy" and score < 0:
+                continue                        # bearish view — not this side's record
+            if side == "sell" and score > 0:
+                continue                        # bullish view — not this side's record
             entry_px, exit_px = trade.get("entry_price"), trade.get("exit_price")
             if entry_px is None or exit_px is None:
                 continue
@@ -3752,7 +4470,14 @@ def compute_solo_method_gross_winrate(split: Optional[str] = None) -> dict:
             n += 1
             # score > 0 = long view (win if stock rose); score < 0 = short view
             # (win if stock fell). Gross move only — no cost applied.
-            if move != 0.0 and (score > 0) == (move > 0):
+            # `effective` judges the method as the combine actually USES it: an
+            # INVERTED method's stored score is backwards on purpose, so its
+            # real contribution is the flipped view. Without this the filter can
+            # only ever see an inverted method's raw (bad) record, which is why
+            # inverted methods needed a blanket exemption — and why nothing
+            # verified that the correction actually clears 50%.
+            _view_up = (score > 0) if not (effective and method in _inv) else (score < 0)
+            if move != 0.0 and _view_up == (move > 0):
                 wins += 1
         if n:
             out[method] = {"trades": n, "win_rate": round(wins / n * 100, 1)}
@@ -3933,26 +4658,13 @@ def _session_of_iso_fine(raw) -> str:
     """Finer session split: ``rth | premarket | afterhours | overnight``.
 
     Splits the coarse ``extended`` session into its two halves — pre-market
-    (04:00–09:30 ET) and after-hours (16:00–20:00 ET). Used ONLY for the
-    dashboard's session filter/display; the stored ``entry_session`` /
-    ``exit_session`` stamps stay coarse because the cost/spread/size
-    multipliers key on ``extended``. Date-only/missing values default to
-    'rth' (matches every legacy record)."""
-    if not raw or ("T" not in str(raw) and ":" not in str(raw)):
-        return "rth"
-    try:
-        dt = datetime.fromisoformat(str(raw))
-        dt = dt.astimezone(ET) if dt.tzinfo is not None else dt.replace(tzinfo=ET)
-        mins = dt.hour * 60 + dt.minute
-    except Exception:
-        return "rth"
-    if 9 * 60 + 30 <= mins < 16 * 60:
-        return "rth"
-    if 4 * 60 <= mins < 9 * 60 + 30:
-        return "premarket"
-    if 16 * 60 <= mins < 20 * 60:
-        return "afterhours"
-    return "overnight"
+    (04:00–09:30 ET) and after-hours (16:00–20:00 ET). Used for the dashboard's
+    session filter/display AND as the per-trade cost-attribution period bucket.
+    Delegates to ``spread.session_bucket_fine`` (one implementation). The stored
+    ``entry_session`` / ``exit_session`` stamps stay coarse because the
+    spread/size multipliers key on ``extended``."""
+    from src.performance.spread import session_bucket_fine
+    return session_bucket_fine(raw)
 
 
 def _trade_session_fine(trade: dict) -> str:
@@ -4018,10 +4730,17 @@ def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
     # until measured, converging to reality as each session's fills accrue.
     by_session = None
     if frac is not None and settings.session_spread_calibration_enabled:
+        # Same sanity band as the flat fraction (real_one_way_cost_fraction):
+        # without it the 17 all-negative outlier legs (stale decision prices)
+        # drag each session mean below zero → clamped to 0 → _one_side_cost
+        # returns ZERO cost for every leg that hits the session path (it is
+        # checked before the flat override). That silently zeroed the sim's
+        # cost basis; band the outliers out here too. (2026-07-23)
+        _band = abs(float(getattr(settings, "sim_real_fill_cost_sanity_pct", 2.0) or 0.0))
         sess_costs: Dict[str, List[float]] = {"rth": [], "extended": [], "overnight": []}
         for leg in legs:
             pct = leg_one_way_cost_pct(leg)
-            if pct is None:
+            if pct is None or (_band > 0 and abs(pct) > _band):
                 continue
             sess_costs.setdefault(_session_of_iso(leg.get("submitted_at")), []).append(pct)
         min_legs = max(1, int(settings.session_cost_min_legs))
@@ -4047,6 +4766,41 @@ def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
                      f"{len(cs)} {sess} fill(s)")
 
     set_real_cost_override(frac, by_session)
+
+    # Per-trade cost attribution (2026-07-23): build the tick (run) and
+    # time-of-day averages the per-leg resolver falls back to for UNFILLED
+    # legs, plus the client_ref→run map that tells a leg which tick it belongs
+    # to. Built from the SAME sanity-banded fills as the flat override, so the
+    # daily-NAV compound stays deterministic from the DB. Cleared (→ the flat
+    # override for every leg) when the feature is off or there are no fills.
+    from src.performance.spread import (real_leg_cost_frac, session_bucket_fine,
+                                        set_cost_attribution)
+    if settings.sim_per_trade_cost_attribution and legs:
+        from collections import defaultdict
+        per_run: Dict[str, List[float]] = defaultdict(list)
+        per_bucket: Dict[str, List[float]] = defaultdict(list)
+        ref_to_run: Dict[str, str] = {}
+        for leg in legs:
+            f1 = real_leg_cost_frac(leg.get("side"), leg.get("filled_qty"),
+                                    leg.get("model_price"), leg.get("fill_price"),
+                                    leg.get("commission"))
+            if f1 is None:                     # unusable or sanity-band outlier
+                continue
+            run = str(leg.get("run_id") or "")
+            ref = str(leg.get("client_ref") or "")
+            if ref:
+                ref_to_run[ref] = run
+            if run:
+                per_run[run].append(f1)
+            per_bucket[session_bucket_fine(leg.get("submitted_at"))].append(f1)
+        tick_min = max(1, int(settings.sim_cost_tick_min_legs))
+        sess_min = max(1, int(settings.session_cost_min_legs))
+        tick_costs = {r: sum(v) / len(v) for r, v in per_run.items() if len(v) >= tick_min}
+        session_costs = {b: sum(v) / len(v) for b, v in per_bucket.items() if len(v) >= sess_min}
+        set_cost_attribution(tick_costs, session_costs, ref_to_run)
+    else:
+        set_cost_attribution(None, None, None)
+
     if frac is not None:
         report_calibration("sim_one_way_cost", value=frac * 100, prior=None,
                            n_evidence=len(legs), unit="%/leg",
@@ -4219,6 +4973,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "sim_cost_is_real":         real_cost_frac is not None,   # True = calibrated to real IBKR fills, False = modeled
         "hold_prompt_eval":         compute_hold_prompt_eval(trades),  # held-positions prompt A/B (exit outcomes ON vs OFF)
         "blind_synthesis_eval":     compute_blind_synthesis_eval(trades),  # blind-synthesis A/B (entry outcomes ON vs OFF)
+        "synth_arm_eval":           compute_synth_arm_eval(trades),        # 3-arm prompt bake-off (ledger view)
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration
         "oos_comparison":           oos_comparison,            # train vs holdout accuracy (honest OOS)
         "method_labels":            METHOD_LABELS,

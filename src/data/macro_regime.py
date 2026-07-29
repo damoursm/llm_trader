@@ -152,13 +152,98 @@ _REGIME_THRESHOLD = {
     "RISK_ON":  0.79,
 }
 
+# Smoothed-step threshold (2026-07-27). The step table is a CLIFF: composites of
+# -0.801 and -0.799 sit in different regimes, and the live composite has sd 0.146
+# — that boundary is well inside one standard deviation of ordinary daily
+# variation, so the same market sampled two ticks apart could jump the actionable
+# bar a full step.
+#
+# The fix deliberately SMOOTHS THE BOUNDARIES rather than interpolating across
+# whole bands. A full band-to-band interpolation was tried first and rejected on
+# measurement: it raised the bar on 100% of observed runs (mean +0.0089) and
+# would have dropped 7.9% of actionable trades — a systematic tightening, not
+# the removal of an instability. Here each band keeps its documented threshold
+# throughout its interior; only within `_THRESHOLD_SMOOTH_HALFWIDTH` of a
+# boundary does the value ramp linearly between the two neighbouring bands. So a
+# run sitting deep inside NEUTRAL is completely unaffected, and a run straddling
+# a boundary moves smoothly instead of jumping.
+_THRESHOLD_SMOOTH_HALFWIDTH = 0.05
+
+# (boundary norm, band BELOW it, band ABOVE it) — ordered, matching the bands in
+# compute_macro_regime.
+_THRESHOLD_BOUNDARIES = ((-1.5, "PANIC", "RISK_OFF"),
+                         (-0.8, "RISK_OFF", "CAUTION"),
+                         (-0.3, "CAUTION", "NEUTRAL"),
+                         (+0.3, "NEUTRAL", "RISK_ON"))
+
+
+def continuous_threshold(norm: float) -> float:
+    """Actionable-confidence threshold, continuous in the macro composite.
+
+    Equals the documented per-regime threshold everywhere except within
+    ``_THRESHOLD_SMOOTH_HALFWIDTH`` of a band boundary, where it ramps linearly
+    between the two bands. Monotonically non-increasing in ``norm`` (worse macro
+    ⇒ higher bar) and never below the band values it interpolates, so the
+    minimum-confidence directive holds wherever the step table held it.
+    """
+    w = float(_THRESHOLD_SMOOTH_HALFWIDTH)
+    for edge, below, above in _THRESHOLD_BOUNDARIES:
+        lo, hi = _REGIME_THRESHOLD[below], _REGIME_THRESHOLD[above]
+        # The ramp sits entirely on the LENIENT side of the boundary: the
+        # stricter band holds its value right up to the edge, and the easing
+        # happens inside the more permissive band. Straddling the edge
+        # symmetrically would have pushed NEUTRAL below 0.85 near the RISK_ON
+        # boundary, breaking the minimum-confidence directive (0.85 is a user
+        # directive, not a tunable; RISK_ON is its one documented exception).
+        if w > 0 and edge < norm < (edge + 2.0 * w):
+            frac = (norm - edge) / (2.0 * w)
+            return lo + (hi - lo) * frac
+    # Outside every transition zone: the plain step value.
+    if norm <= -1.5:
+        return _REGIME_THRESHOLD["PANIC"]
+    if norm <= -0.8:
+        return _REGIME_THRESHOLD["RISK_OFF"]
+    if norm <= -0.3:
+        return _REGIME_THRESHOLD["CAUTION"]
+    if norm <= 0.3:
+        return _REGIME_THRESHOLD["NEUTRAL"]
+    return _REGIME_THRESHOLD["RISK_ON"]
+
+
+# RISK_OFF no longer BLOCKS buys (2026-07-27) — it takes a size haircut instead.
+# The 7-input historical reconstruction over 2000-2026 measured RISK_OFF as the
+# regime with the BEST forward returns of any state (+2.25% SPY at 21d, 70.0%
+# up-rate over 337 days) — better than NEUTRAL (+0.37%) and RISK_ON (+0.84%) —
+# while PANIC is the only genuinely bad one (-0.69%, 45.5% up over 66 days).
+# The two had been lumped into one blocked bucket on no evidence they behave
+# alike, so the system was sitting out its best-performing regime.
+#
+# It is a HAIRCUT rather than full size deliberately: the measurement says
+# longs are fine in RISK_OFF, but RISK_OFF is by definition a stressed state
+# (wider spreads, fatter tails), the 337 days are concentrated in a handful of
+# episodes, and going from "banned" straight to "full size" is a bigger step
+# than the evidence carries. The ban stays for PANIC.
 _REGIME_ALLOW_BUYS = {
     "PANIC":    False,
-    "RISK_OFF": False,
+    "RISK_OFF": True,
     "CAUTION":  True,
     "NEUTRAL":  True,
     "RISK_ON":  True,
 }
+
+
+def regime_size_multiplier(regime: str) -> float:
+    """Position-size haircut for entries opened in ``regime`` (1.0 = no change).
+
+    Only RISK_OFF is haircut today; every other regime is either unrestricted
+    or (PANIC) blocked outright, and no other regime has evidence justifying a
+    size change. Returns 1.0 when the feature is disabled or the regime is
+    unknown, so the sizing chain is untouched by default."""
+    if not getattr(settings, "enable_regime_size_haircut", False):
+        return 1.0
+    if str(regime or "").upper() == "RISK_OFF":
+        return float(settings.risk_off_size_multiplier)
+    return 1.0
 
 # Last run's input coverage (available / total macro signals), so the pipeline can
 # surface it through ``_collect_sources`` → run_sources (Data Quality) + the health
@@ -270,7 +355,14 @@ def compute_macro_regime(
         regime = "CAUTION"
     _LAST_COVERAGE.update(available=inputs_available, total=inputs_total)
 
-    threshold  = _REGIME_THRESHOLD[regime]
+    # Threshold is continuous in the composite when enabled (default) — the step
+    # table is kept as the anchor set and as the fallback. The REGIME LABEL and
+    # the BUY block stay step-based: those are genuine state decisions, and a
+    # half-blocked BUY is not a meaningful thing.
+    if getattr(settings, "enable_continuous_regime_threshold", False):
+        threshold = round(continuous_threshold(norm), 4)
+    else:
+        threshold = _REGIME_THRESHOLD[regime]
     allow_buys = _REGIME_ALLOW_BUYS[regime]
 
     evidence_str = "  |  ".join(evidence) if evidence else "no macro inputs available"

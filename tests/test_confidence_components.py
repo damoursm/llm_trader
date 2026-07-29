@@ -13,6 +13,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _no_confidence_epoch(monkeypatch):
+    """These tests exercise the component REPORT, not the confidence epoch.
+
+    `build_panel` masks confidence + its components before the epoch
+    (`method_epochs.CONFIDENCE_EPOCH`, 2026-07-22), so any fixture dated earlier
+    would correctly yield `has_factors=False` and the test would be asserting
+    the masking rather than the report. Disabling it here keeps the fixture
+    dates arbitrary, which is what they are meant to be.
+    """
+    from config.settings import settings
+    monkeypatch.setattr(settings, "enable_confidence_epoch", False)
+
 import src.analysis.confidence_components as cc
 from config.settings import settings
 

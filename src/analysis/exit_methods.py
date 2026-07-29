@@ -133,6 +133,67 @@ def _horizon_pressure(trade: dict) -> float:
     return -min(1.0, held / window - 1.0)
 
 
+def method_horizon_days(trade: dict) -> Optional[float]:
+    """The position's target holding period in trading days, derived from the
+    MEASURED best horizon of the methods that actually drove the entry.
+
+    Each method's edge lives at a particular holding period (see
+    `analysis.method_horizons`): `sent_velocity` peaks at 1 day and decays,
+    `pattern` builds to 5-10 days, `oi_skew` is slowest. So a position opened
+    mostly on `sent_velocity` should be judged on a much shorter clock than one
+    opened on `pattern`, and a single global time-stop cannot express that.
+
+    Weighted by each method's CONVICTION AND IMPORTANCE at entry —
+    ``|method score| × |base weight|`` — so the horizon follows whichever methods
+    actually carried the decision. Only PROVEN methods have a measured horizon
+    and therefore contribute; a trade driven entirely by unproven methods returns
+    ``None`` (no view) rather than a fabricated deadline.
+    """
+    scores = trade.get("method_scores") or {}
+    if not scores:
+        return None
+    try:
+        from src.analysis.method_horizons import method_best_days
+        from src.signals.aggregator import _BASE_WEIGHTS
+    except Exception:
+        return None
+    num = den = 0.0
+    for m, sc in scores.items():
+        days = method_best_days(m)
+        if not days:
+            continue                       # unproven / disproven → no clock
+        try:
+            w = abs(float(sc or 0.0)) * abs(float(_BASE_WEIGHTS.get(m, 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if w <= 0:
+            continue
+        num += w * float(days)
+        den += w
+    return (num / den) if den > 0 else None
+
+
+def _method_horizon_pressure(trade: dict) -> float:
+    """One-sided hold-conviction from the METHOD-DERIVED horizon: ``0`` while the
+    position is inside the window its own methods say their edge lives in, then
+    increasingly negative once it has outlived it.
+
+    Distinct from the two time-stops already present, and deliberately kept
+    alongside them rather than replacing either: ``horizon`` uses the LLM's
+    stated target, ``edge_decay`` a single system-wide window measured on
+    `combined_score`. This one is per-position and derived from the METHODS that
+    opened it, so it is the only one that can say a `sent_velocity` trade is
+    stale after a day while a `pattern` trade still has a week to run.
+    """
+    days = method_horizon_days(trade)
+    if not days:
+        return 0.0
+    held = _held_trading_days(trade)
+    if held is None or held < days:
+        return 0.0
+    return -min(1.0, held / days - 1.0)
+
+
 def _held_trading_days(trade: dict) -> Optional[int]:
     """NYSE trading days a position has been held (entry → today), for the
     edge-decay window (measured in trading sessions, matching the panel's forward
@@ -204,6 +265,12 @@ def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_
 
     # 4. Horizon time-stop pressure (one-sided: 0 within window, negative past it).
     scores["horizon"] = _horizon_pressure(trade)
+
+    # 4-b. Method-derived horizon (2026-07-26): the holding window the position's
+    #      OWN methods say their edge lives in, weighted by their conviction at
+    #      entry. Complements rather than replaces `horizon` (LLM-stated) and
+    #      `edge_decay` (one global window) — only this one is per-position.
+    scores["method_horizon"] = _method_horizon_pressure(trade)
 
     # 4a. Edge-decay time-stop — exit pressure once held past the REALIZED
     #     edge-positive window (measured over the signals panel), distinct from the

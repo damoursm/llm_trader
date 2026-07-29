@@ -23,7 +23,7 @@ Safety posture:
 
 import subprocess
 import time
-from typing import Optional
+from typing import List, Optional
 
 from loguru import logger
 
@@ -58,6 +58,54 @@ def _pid_listening_on(port: int) -> Optional[int]:
     except Exception as e:
         logger.warning(f"[broker] gateway recovery: netstat probe failed ({e})")
     return None
+
+
+# Command-line markers that identify an IB Gateway java process. `ibcalpha.ibc.`
+# is IBC's launcher main class (IbcGateway / IbcTws) and `\ibgateway\` is the
+# IB install path on the classpath — both are specific enough that an unrelated
+# java application can never match. Verified against a live gateway 2026-07-26.
+_GATEWAY_CMDLINE_MARKERS = ("ibcalpha.ibc.", r"\ibgateway" + "\\", "/ibgateway/")
+
+_PS_LIST_JAVA = (
+    "Get-CimInstance Win32_Process -Filter \"Name='java.exe' OR Name='javaw.exe'\" | "
+    "ForEach-Object { $_.ProcessId.ToString() + '~~~' + [string]$_.CommandLine }"
+)
+
+
+def _gateway_pids_by_signature() -> List[int]:
+    """PIDs of IB Gateway java processes, identified by command-line signature.
+
+    The port probe (``_pid_listening_on``) finds nothing when the gateway never
+    BOUND its port — which is precisely the failure observed 2026-07-26: a
+    gateway wedged for ~23 hours, process alive, port 4002 never opened, so
+    recovery logged "pid not found", killed nothing, and fired the relaunch task
+    on top of a surviving corpse. IBC's own watchdog can't see it either (it
+    only checks the process is alive, and it was).
+
+    So when the port is unbound we identify the gateway by what it IS rather
+    than by what it is serving. Fail-soft: any error returns [] and recovery
+    proceeds to the relaunch step exactly as before.
+    """
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_LIST_JAVA],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
+        ).stdout or ""
+    except Exception as e:
+        logger.warning(f"[broker] gateway recovery: process scan failed ({e})")
+        return []
+    pids: List[int] = []
+    for line in out.splitlines():
+        pid_s, _, cmd = line.partition("~~~")
+        if not cmd:
+            continue
+        low = cmd.lower()
+        if any(mark.lower() in low for mark in _GATEWAY_CMDLINE_MARKERS):
+            try:
+                pids.append(int(pid_s.strip()))
+            except ValueError:
+                continue
+    return pids
 
 
 def maybe_restart_gateway(reason: str, wait: bool = True) -> bool:
@@ -95,14 +143,22 @@ def maybe_restart_gateway(reason: str, wait: bool = True) -> bool:
     port = int(settings.ibkr_port)
     task = settings.broker_gateway_task_name
     pid = _pid_listening_on(port)
+    # A gateway that never BOUND the port owns no listener, so the port probe
+    # returns nothing and the corpse would survive the relaunch (observed
+    # 2026-07-26: wedged ~23h). Fall back to identifying it by signature.
+    by_sig: List[int] = [] if pid else _gateway_pids_by_signature()
+    targets = [pid] if pid else by_sig
+    how = (f"pid {pid} on port {port}" if pid else
+           (f"pid(s) {by_sig} by signature — nothing was listening on {port}"
+            if by_sig else f"nothing found (no listener on {port}, no gateway process)"))
     logger.critical(
-        f"[broker] GATEWAY RECOVERY — {reason}. Killing gateway on port {port} "
-        f"(pid {pid if pid else 'not found'}) and triggering scheduled task '{task}' "
-        "(IBC relaunches + auto-logs-in; paper login needs no 2FA)."
+        f"[broker] GATEWAY RECOVERY — {reason}. Killing {how} and triggering "
+        f"scheduled task '{task}' (IBC relaunches + auto-logs-in; paper login "
+        "needs no 2FA)."
     )
     try:
-        if pid:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+        for _t in targets:
+            subprocess.run(["taskkill", "/PID", str(_t), "/F"],
                            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
         r = subprocess.run(["schtasks", "/Run", "/TN", task],
                            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)

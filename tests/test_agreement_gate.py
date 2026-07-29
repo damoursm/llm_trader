@@ -79,11 +79,40 @@ def test_sell_direction_matches_bearish_sig(monkeypatch):
 # ── wiring into the actionable-filter loop (gate_diag + gate_outcomes stamp) ──
 
 def test_gate_diag_has_dropped_low_agreement_key():
-    # gate_diag initializes the counter even when the gate never fires — the
-    # dashboard/log line reads gate_diag['dropped_low_agreement'] unconditionally.
+    """The counter must EXIST even when the gate never fires — the dashboard and
+    the log line read gate_diag['dropped_low_agreement'] unconditionally.
+
+    Rewritten 2026-07-25: this asserted on the SOURCE TEXT of run_pipeline, so
+    it broke the moment the filter was extracted into `_apply_actionable_gates`
+    even though behaviour was identical — and, worse, it would have passed on
+    code that contained the right string but never executed it (the block had
+    ZERO coverage at the time). Now it drives the real function.
+    """
     import inspect
     import src.pipeline as pipeline
-    src = inspect.getsource(pipeline.run_pipeline)
-    assert '"dropped_low_agreement":' in src
-    assert 'gate_diag["dropped_low_agreement"] += 1' in src
-    assert '_gate_outcomes[r.ticker] = "low_agreement"' in src
+
+    # The counter is initialised in run_pipeline's gate_diag literal…
+    assert '"dropped_low_agreement":' in inspect.getsource(pipeline.run_pipeline)
+
+    # …and the gate actually increments it and stamps the outcome.
+    class _R:
+        ticker, action, confidence, direction = "AAA", "BUY", 0.99, "BULLISH"
+
+    diag = {k: 0 for k in ("buy_sell_candidates", "dropped_below_threshold",
+                           "dropped_low_agreement", "dropped_buy_blocked",
+                           "dropped_earnings_blackout", "dropped_untradeable",
+                           "dropped_overextended", "actionable_survivors")}
+    outcomes: dict = {}
+    orig = pipeline._passes_agreement_gate
+    pipeline._passes_agreement_gate = lambda direction, sig: False
+    try:
+        out = pipeline._apply_actionable_gates(
+            [_R()], confidence_threshold=0.5,
+            side_threshold_adj={"BUY": 0.0, "SELL": 0.0}, signals_by_ticker={},
+            allow_buys=True, earnings_blackout=set(), trade_gate_budget={"n": 1},
+            gate_diag=diag, gate_outcomes=outcomes)
+    finally:
+        pipeline._passes_agreement_gate = orig
+    assert out == []
+    assert diag["dropped_low_agreement"] == 1
+    assert outcomes["AAA"] == "low_agreement"

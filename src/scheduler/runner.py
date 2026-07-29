@@ -259,6 +259,58 @@ def _run_eod_maintenance() -> None:
             logger.info(f"[scheduler] EOD retention: {res}")
     except Exception as exc:
         logger.warning(f"[scheduler] EOD retention failed: {exc}")
+    # Rescore history through the CURRENT scorers so the calibrations fit values
+    # today's code produced. Runs AFTER the cache warm above, which is what
+    # supplies the bars a replay reads. Fail-soft: a stale replay table only
+    # means the epoch mask blanks more, never that a wrong value is served.
+    if settings.enable_eod_replay_refresh:
+        try:
+            from src.analysis.replay import materialize
+            n = materialize(days=(int(settings.eod_replay_refresh_days) or None))
+            logger.info(f"[scheduler] EOD replay: {n:,} ticker-days rescored")
+        except Exception as exc:
+            logger.warning(f"[scheduler] EOD replay refresh failed: {exc}")
+    # Append TODAY's point-in-time calibration to `weight_history`. Incremental
+    # by design: each step is a fixed fact about a date once its data is in, so
+    # only the tail is recomputed (`walkforward_eod_days`) rather than rewalking
+    # the whole span, which costs ~60s PER STEP. Runs after the replay above,
+    # which supplies the panel the calibration reads.
+    if settings.enable_eod_walkforward:
+        try:
+            from datetime import date as _date, timedelta as _td
+            from src.analysis.walkforward import materialize as wf_materialize
+            _lookback = max(1, int(settings.walkforward_eod_days))
+            _start = (_date.today() - _td(days=_lookback)).isoformat()
+            n = wf_materialize(start=_start, step_days=1)
+            logger.info(f"[scheduler] EOD walk-forward: {n} calibration step(s) stored")
+        except Exception as exc:
+            logger.warning(f"[scheduler] EOD walk-forward failed: {exc}")
+    # Automatic refactor. Runs LAST because it re-runs the steps above in
+    # dependency order when — and only when — an implementation actually
+    # changed; on an unchanged day it detects nothing and costs one AST hash per
+    # method. This is what makes the stored history self-maintaining: a scorer
+    # edit repairs the database on the next EOD instead of waiting for someone
+    # to remember a registry.
+    if settings.enable_auto_refactor:
+        try:
+            from src.analysis.refactor import run_refactor
+            res = run_refactor(apply=True)
+            changed = res["plan"]["changed"]
+            if changed:
+                logger.info(f"[scheduler] EOD refactor repaired: {changed} "
+                            f"(ok={res['ok']})")
+                if not res["ok"]:
+                    _alert("Automatic refactor incomplete",
+                           f"Implementation change detected ({changed}) but a "
+                           f"repair step failed:\n{res['steps']}\n\n"
+                           "Stored history is STALE for those methods until this "
+                           "succeeds; fingerprints were deliberately not advanced "
+                           "so it retries next EOD.")
+            elif res["plan"]["mask_candidates"]:
+                logger.info(f"[scheduler] EOD refactor: unregenerable changes "
+                            f"{res['plan']['mask_candidates']}")
+        except Exception as exc:
+            logger.warning(f"[scheduler] EOD auto-refactor failed: {exc}")
 
 
 def _alert(subject: str, body: str) -> None:

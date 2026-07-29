@@ -2,7 +2,7 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
-from typing import List
+from typing import List, Optional
 
 # Absolute path to <project root>/.env so settings load no matter the current
 # working directory (e.g. when launched via Windows Task Scheduler from System32,
@@ -222,6 +222,44 @@ class Settings(BaseSettings):
     # open_positions_prompt_share). Hold-review calls are NEVER blinded (stable
     # exit governance; only the entry side is under test). 0.0 = off, 1.0 = always.
     blind_synthesis_share: float = 0.5
+
+    # ── Dual-case synthesis (2026-07-25) ─────────────────────────────────────
+    # Presents the BULL CASE and the BEAR CASE side by side, each built from its
+    # OWN camp, and lets the LLM weigh them. Fixes a real incoherence rather
+    # than chasing the echo rate: the per-side win-rate filter means the two
+    # camps hold DIFFERENT valid method sets (news and iv_rank are currently
+    # excluded from the bullish camp), but the prompt filtered methods GLOBALLY
+    # only — so the model saw `news` while considering a BUY, on a method the
+    # system had already decided must not inform buying. Here each per-method
+    # line is gated by the side its own score points to, exactly as the combine
+    # and coherence now gate it.
+    # Measured expectations, so this is not oversold: the blind A/B moved the
+    # echo rate only 94.5% -> 91.4%, i.e. the LLM echoes because it reads the
+    # same method scores, NOT because it sees the verdict — so do not expect
+    # this to change direction-picking much. What it protects is the cohort
+    # where the LLM demonstrably adds value: when the aggregator is NEUTRAL and
+    # the model supplies the direction, its BUY calls returned +0.21% / 66% win
+    # versus -3.19% / 33% when echoing a bullish aggregator (same side, so the
+    # long/short asymmetry is controlled for).
+    # SUPERSEDES the blind/sighted axis when active (a symmetric two-case
+    # presentation is inherently verdict-free), so the arms stay at three —
+    # dual / blind / sighted — instead of fragmenting into four cells.
+    dual_case_synthesis_share: float = 0.5
+
+    # ── Shadow synthesis arms (per-ticker arm bake-off, 2026-07-25) ────────
+    # Ask EVERY prompt arm about EVERY ticker each tick: the live arm drives the
+    # run, the other two are shadow calls nobody acts on. Without this an arm is
+    # only observable on the runs where its coin came up, so the arms are
+    # compared over different ticker-days -- exactly the unpaired design that
+    # made Qwen look best and pro-thinking look broken in the 2026-07-22
+    # bake-off (both pure window artifacts; every difference vanished paired).
+    # Cost: two extra SYNTHESIS calls per tick. Synthesis is one call for the
+    # whole top-N ticker set (unlike per-ticker sentiment, the real cost
+    # driver), and shadow calls run off the critical path, so orders never wait.
+    enable_shadow_arms: bool = True
+    # Hard bound on the join at persist time. A shadow arm that overruns is
+    # abandoned (live arm still persisted) rather than delaying the run.
+    shadow_arms_join_timeout_seconds: float = 300.0
 
     # Two-tick confirmation on the NOISY LLM exits (llm_signal_flipped /
     # llm_confidence_loss): with max thinking the hold-review is non-deterministic,
@@ -933,6 +971,15 @@ class Settings(BaseSettings):
     intraday_30m_max_tickers: int = 0
     # Re-fetch the 30-min OHLCV cache when its newest bar is older than this (minutes).
     intraday_30m_ttl_minutes: int = 25
+    # In-process memo of PARSED OHLCV frames (cache.load_ohlcv), bounded in MB.
+    # pd.read_json is the floor cost of every analytics sweep and the dashboard's
+    # panels re-read the same ~1,760 tickers in both timeframes (~111 MB: daily
+    # frames average ~8 KB, 30-min ~54 KB). Sized to hold that working set so one
+    # panel doesn't re-parse what the previous just evicted. Entries are keyed on
+    # (path, mtime, size) so a pipeline rewrite invalidates them automatically,
+    # and each caller gets a COPY, so this is safe in the writer process too.
+    # 0 disables the memo entirely (always re-parse).
+    ohlcv_parse_cache_mb: int = 160
     # Per-ticker scoring concurrency. The build_signals loop is I/O-bound (DeepSeek
     # sentiment ~7s/ticker + Massive/OHLCV reads), so a bounded thread pool collapses
     # the serial sum to ~max wall-time with IDENTICAL scores. 1 = sequential (legacy).
@@ -1149,6 +1196,33 @@ class Settings(BaseSettings):
     winrate_filter_threshold: float = 0.50   # drop a method whose solo win rate is below this…
     winrate_filter_min_trades: int = 10      # …once it has at least this many attributed solo trades
 
+    # ── Per-SIDE win-rate filter + weighting (2026-07-24) ────────────────────
+    # A method's bullish and bearish calls are separate skills, and the audit
+    # measured them far apart: on 237 attributed trades most methods hit ~40% on
+    # their BUY-side views and ~47-59% on their SELL-side views (e.g. insider
+    # 37.7/51.9, iv_rank 43.9/54.5, st_reversal 42.9/64.2). One blended win rate
+    # per method hides that, so the filter above either keeps a method whose long
+    # calls are a coin-flip-loser, or drops one whose short calls are genuinely
+    # good. With the buy/sell split combine these are separable: each camp is
+    # filtered and weighted on ITS OWN record.
+    #   • side filter — a method is dropped from the BUY camp when its buy-side
+    #     gross win rate is below winrate_filter_threshold (with at least
+    #     winrate_filter_min_trades buy-side views), and independently from the
+    #     SELL camp on its sell-side record. Same exemptions as the global
+    #     filter: inverted methods are never dropped, thin samples keep full
+    #     weight.
+    #   • side weights — within a camp, each surviving method's weight is scaled
+    #     by its demonstrated skill on THAT side, Bayesian-shrunk toward 50% by
+    #     side_weight_prior_n so a handful of views can't dominate.
+    # NOTE this can legitimately leave a side with NO qualifying methods, in
+    # which case that side's score is 0 and the system simply does not signal
+    # in that direction — the intended consequence of the evidence, not a bug.
+    enable_side_winrate_filter: bool = True
+    enable_side_adaptive_weights: bool = True
+    side_weight_prior_n: int = 10             # virtual views at 50% (Bayesian prior)
+    side_weight_min_multiplier: float = 0.5   # floor for a weak-but-surviving side
+    side_weight_max_multiplier: float = 2.0   # cap for a strong side
+
     # ── Cross-family agreement + tape confirmation (2026-07-19) ──────────────
     # Upgrades to agreement quality (src/signals/agreement.py). The flat
     # sources_agreeing count treats every method as an independent voter, but the
@@ -1248,6 +1322,176 @@ class Settings(BaseSettings):
     # INVERTED_METHODS in .env — a reversible ops call, not a baked-in regime bet.
     inverted_methods: str = ""
 
+    # ── Automatic method inversion (2026-07-25) ───────────────────────────
+    # Sign-flip a method whose RAW score is reliably anti-predictive, without a
+    # human editing INVERTED_METHODS. Two bars must BOTH clear:
+    #   1. one-sided exact binomial vs p=0.5 at `inversion_alpha`, Bonferroni-
+    #      corrected across the methods judged that run (testing ~20 methods at
+    #      0.05 uncorrected produces a false inversion ~2/3 of the time);
+    #   2. the FLIPPED view must itself clear `winrate_filter_threshold` — ties
+    #      count as losses BOTH ways, so flipped != 100-raw, and a mostly-tied
+    #      method is noise rather than backwards information.
+    # Manual `inverted_methods` pins are unioned in and always win.
+    enable_auto_inversion: bool = True
+    inversion_min_trades: int = 30      # evidence floor; higher than the filter's
+                                        # 10 — inverting claims more than dropping
+    inversion_alpha: float = 0.05       # plain per-method significance, no correction
+    # NO multiple-comparison correction, deliberately (2026-07-26). We do run one
+    # test per method per run, but a correction computed from the COUNT of tests
+    # is indefensible here: the methods are heavily correlated (measured +0.72
+    # mean pairwise Spearman over 246k scored ticker-days; momentum vs
+    # market_momentum is 0.98 — the same signal twice). Bonferroni assumes
+    # INDEPENDENCE and so over-corrects, dividing alpha by 13 when the effective
+    # number of independent tests is nearer 2-3 (it selected nothing at all);
+    # plain alpha has the mirror flaw, reporting 6 "findings" that are really one
+    # phenomenon counted six times. The count is simply not the right
+    # denominator, so no alpha setting fixes it.
+    #
+    # Replication replaces it: each method gets ONE plain test on its own full
+    # history, and the finding must reproduce on the INDEPENDENT panel arm
+    # (different data, ~1000x the observations, different statistic, its own
+    # shared-decay control) before anything is inverted. That handles correlated
+    # methods by construction — six correlated ledger hits that don't reproduce
+    # are one unconfirmed phenomenon — and it also dampens the multiplicity that
+    # alpha-correction never addressed at all: we re-evaluate every run (~28x a
+    # day), so a method parked near the boundary crosses it eventually by chance.
+    inversion_require_replication: bool = True
+
+    # ── Per-method horizon skill (2026-07-26) ─────────────────────────────
+    # Where each method's edge actually LIVES, measured over the solo-method
+    # simulation (`simulated_trades`) gated at buy_sell_diff_threshold — the gate
+    # a single method driving combined_score would really face. ~1,500-3,300
+    # observations per method versus 78-174 attributed trades, which is the
+    # difference between "cannot tell" and an answer.
+    #
+    # Judged at 1 DAY ONLY, exactly one method cleared p<0.05 and the book would
+    # have collapsed to a single signal. Across 1/3/5/10 days five methods clear,
+    # with coherent shapes: sent_velocity peaks at 1d and decays (it measures a
+    # RATE OF CHANGE, so that is its expected profile), pattern builds
+    # monotonically and clears at 5d AND 10d, oi_skew is slowest. A method is not
+    # good or bad — it is good over a particular holding period.
+    # Actionable threshold as a CONTINUOUS function of the macro composite
+    # rather than five discrete steps (2026-07-27). The step table is a cliff:
+    # composites of -0.801 and -0.799 sit in different regimes, and the live
+    # composite has sd 0.146 — so that boundary is well inside one standard
+    # deviation of ordinary daily variation and the same market, sampled two
+    # ticks apart, could jump the bar a full step. The curve reproduces the
+    # documented threshold EXACTLY at every band boundary and interpolates
+    # between, so only the discontinuity goes. The regime LABEL and the BUY
+    # block remain step-based — those are state decisions, and a half-blocked
+    # BUY is not a meaningful thing. false → the legacy step table.
+    # RISK_OFF takes a size HAIRCUT instead of the outright BUY ban it shared
+    # with PANIC (2026-07-27). The 7-input reconstruction over 2000-2026 found
+    # RISK_OFF to be the BEST-performing regime (+2.25% SPY at 21d, 70.0% up
+    # over 337 days) while PANIC is the only bad one (-0.69%, 45.5% over 66) —
+    # the system was sitting out its strongest state. A haircut rather than
+    # full size because RISK_OFF is a stressed regime by definition and its
+    # days are concentrated in a few episodes; the ban stays for PANIC.
+    # Method WEIGHTING uses market-relative win rates (2026-07-27). An absolute
+    # win rate cannot separate "this signal works" from "the market went up":
+    # measured on 296k ticker-days, a low-volatility screen won 53.5% at 5 days
+    # and only 46.1% net of SPY. Scoped to weighting only — the hard filter and
+    # all P&L/sizing stay absolute, because the book is outright long/short and
+    # alpha you cannot capture must not drive sizing.
+    #
+    # The neutral point is the MEASURED baseline (~48.6%), not 50%: the
+    # cap-weighted index beats its typical constituent, so the median stock is
+    # market-relative-negative. A half-migrated basis (relative numerator, 50%
+    # bar) is worse than either pure basis.
+    # Mask confidence values produced before the buy/sell split combine
+    # (2026-07-22) — see method_epochs.CONFIDENCE_EPOCH. The column mixes
+    # formulas across the panel's life; masking is the same remedy the scorer
+    # epochs use, and was chosen over a RETROFIT because 78% of rows predate the
+    # component capture, the OHLCV cache is retroactively split-adjusted, and
+    # today's weights are calibrated FROM this panel (rescoring the past with
+    # them would be look-ahead into the dataset that feeds live sizing).
+    enable_confidence_epoch: bool = True
+
+    # Restore-before-mask (src/analysis/replay.py). Where a method is faithfully
+    # replayable from the cached OHLCV, a superseded score is REGENERATED by the
+    # current scorer rather than blanked by the epoch mask — so a calibration
+    # fits values today's code produced without discarding the row. Serves the
+    # materialised `signals_replay` table; off => pure epoch masking (the
+    # pre-2026-07-27 behaviour). The mask remains the correctness backstop for
+    # everything replay cannot regenerate.
+    enable_panel_replay_restore: bool = True
+    # Populate `signals_replay` during EOD maintenance so a scorer change is
+    # reflected without a manual `python -m src.analysis.replay --write`.
+    enable_eod_replay_refresh: bool = True
+    eod_replay_refresh_days: int = 45       # 0/None => all history
+
+    # Walk-forward calibration (src/analysis/walkforward.py). Appends today's
+    # point-in-time weight state to `weight_history`, which is what lets a
+    # backtest use the weights the system WOULD have had on each date instead of
+    # applying today's to all history (measured: the book genuinely ran 18
+    # active methods in late June vs 10 now, so a fixed-weight backtest
+    # misstates that period wholesale). Incremental — a step is a fixed fact
+    # once its data is in, and each costs ~60s, so only the tail is rewalked.
+    enable_eod_walkforward: bool = True
+    walkforward_eod_days: int = 3           # tail rewalked each EOD
+
+    # Automatic database refactor (src/analysis/refactor.py). Detects that an
+    # implementation changed (AST fingerprint per method) and repairs the stored
+    # history in dependency order: data -> epochs -> weights -> derived.
+    enable_auto_refactor: bool = True
+    # Mask (epoch) a method whose code changed but which CANNOT be regenerated.
+    # OFF by default and deliberately so: masking withholds real history, and
+    # the detector cannot tell a cosmetic edit from a categorical one — a rename
+    # inside a sentiment module should not silently blank 78% of the panel.
+    # Replayable methods are regenerated regardless of this flag, since there a
+    # false positive costs only CPU.
+    refactor_auto_epoch: bool = False
+
+    enable_market_relative_weighting: bool = True
+    market_relative_horizon: str = "1w"     # column in compute_directional_perf
+    market_relative_min_obs: int = 200
+    # The HARD filter also uses the market-relative basis. Bar is a literal 50%
+    # (winrate_filter_threshold) — on this basis the median stock is
+    # market-relative-NEGATIVE (~48.1%), so 50% is the STRICTER of the two
+    # defensible bars and the deliberate risk posture. Set
+    # market_relative_filter_baseline=true to use the measured baseline instead;
+    # the two differ only by the methods sitting between them (currently
+    # ext_gap 49.7% and insider 49.2%).
+    # Filtered methods are STILL scored, persisted to the signals panel and
+    # IC-tracked, so a dropped method can re-earn its place.
+    enable_market_relative_filter: bool = True
+    market_relative_filter_baseline: bool = False
+
+    enable_regime_size_haircut: bool = True
+    risk_off_size_multiplier: float = 0.5
+
+    enable_continuous_regime_threshold: bool = True
+
+    enable_method_horizons: bool = True
+    method_horizon_alpha: float = 0.05
+    method_horizon_min_obs: int = 30
+    method_horizon_cache_seconds: float = 21600.0    # 6h — heavy join, slow-moving
+    # Weight multiplier for a method that is neither proven nor disproven.
+    # Absence of evidence is not evidence of absence: on a five-week sample most
+    # methods land here, and zeroing them would collapse the ensemble (coherence,
+    # sources_agreeing, family agreement and Gate 1b all need several methods).
+    unproven_weight_multiplier: float = 0.5
+
+    # ── Inversion arm B: the signals panel (2026-07-25) ───────────────────
+    # The ledger arm is starved (~150 attributed trades). This arm reads the
+    # simulated_trades panel — tens of thousands of solo directional calls —
+    # via compute_directional_perf (market-relative, net of beta).
+    #
+    # CRITICAL: each method is scored on its EXCESS ICIR over combined_score at
+    # the same horizon, not against zero. Measured 2026-07-25, the share of
+    # methods with negative ICIR runs 35% @30m → 61% @1d → 76% @2w → 79% @1m,
+    # and combined_score itself is −0.227 @1d to −2.187 @2w: that is the
+    # system's holding-period edge DECAY, shared by everything. Testing against
+    # zero at a long horizon would invert most of the book while measuring only
+    # how long positions are held. Horizons are therefore restricted to the real
+    # holding period (median hold ~1.3 days, measured edge peak 1–2d).
+    enable_inversion_panel_arm: bool = True
+    inversion_panel_horizons: str = "1d,3d"
+    inversion_panel_min_t: float = 2.0    # before the multiple-comparison bump
+    inversion_panel_min_obs: int = 200    # min observations per method/horizon
+    inversion_panel_cache_seconds: float = 21600.0   # 6h — the join is expensive
+                                                     # and the panel moves in days
+
     # ── Macro News Regime (geopolitics / oil / tariffs / policy) ────────────
     # Scans the day's news flow for macro-level themes (active wars and
     # geopolitical escalation, trade / tariff actions, oil/energy shocks,
@@ -1343,8 +1587,11 @@ class Settings(BaseSettings):
     enable_hypothetical_trades: bool = True
     hypothetical_trades: str = "GLD:BUY,SLV:BUY,GDX:BUY,NVDA:BUY"
 
-    # Scheduling — daily pre-market run (Mon-Fri, US/Eastern)
-    schedule_daily: str = "0 8 * * 1-5"
+    # Scheduling — LEGACY, INERT (audited 2026-07-25): read nowhere. The runner
+    # is driven by the RTH window + `extended_windows` + `overnight_windows`
+    # below, not by a cron string. Kept only to avoid breaking a .env that
+    # still sets SCHEDULE_DAILY; changing it has no effect.
+    schedule_daily: str = "0 8 * * 1-5"    # inert — see above
 
     # Intraday scheduling — the runner ticks every 30 min and only acts inside
     # the regular session window below (ET, Mon-Fri). Combined with live prices
@@ -1450,8 +1697,29 @@ class Settings(BaseSettings):
     # |combined_score| 0.20–0.46 in their direction (none have ever opposed), so the
     # default is a floor that catches future weak/contradicted calls without
     # blocking well-formed ones — raise it to demand stronger method agreement.
-    enable_combined_score_gate: bool = True
-    min_combined_score_for_entry: float = 0.15
+    # ⚠ NOT IMPLEMENTED IN THE LIVE PIPELINE, AND DELIBERATELY SO (audited
+    # 2026-07-25). `enable_combined_score_gate` is read NOWHERE, and
+    # `min_combined_score_for_entry` only by the OFFLINE counterfactual harness
+    # `analysis/policy_eval.py` — the live actionable filter has Gates 1, 1b,
+    # 2, 3, 4, 5 and no combined-score gate. The description above therefore
+    # describes behaviour that does not exist; it is kept only because
+    # policy_eval still measures the counterfactual.
+    #
+    # It was NOT wired up when the gap was found, because the ledger says the
+    # gate would BLOCK THE BEST TRADES. Over 241 closed trades joined to their
+    # entry-day signals row, the cohort this gate would have removed
+    # (|combined_score| < 0.15 or opposing the LLM's direction) returned
+    # +1.60% / 45% win, while the cohort it would have kept returned −1.46% /
+    # 34% win; the 7 trades that outright OPPOSED the aggregator returned
+    # +2.77%. That corroborates the much larger recommendation-stream finding
+    # behind the dual-case prompt (echo BUYs −3.19% / 33% at n=4,698 vs
+    # neutral-origin BUYs +0.21% / 66% at n=150, genuine overrides 67.6% win):
+    # the LLM adds value exactly where the aggregator is undecided or wrong, so
+    # forcing agreement with the weighted methods removes its best cohort.
+    # Two independent samples, same direction. Do not enable without new
+    # evidence that reverses both.
+    enable_combined_score_gate: bool = True     # inert — see above
+    min_combined_score_for_entry: float = 0.15  # offline (policy_eval) only
     # Position-size multiplier applied ON TOP of the confidence tier and the
     # correlation haircut for trades ENTERED outside RTH. Extended books are
     # thin and the modeled spread 4× wider, so pre-prod sizes off-hours
@@ -1801,6 +2069,133 @@ class Settings(BaseSettings):
     # cancelled and resubmitted re-anchored at the current mark. Partial
     # fills are left working. 0 = never (no age rule).
     broker_unfilled_cancel_minutes: int = 90
+    # Each sync, CANCEL any working broker order that no ledger leg points at.
+    # The invariant: an order may work the book only while a trade leg owns it.
+    # Orders outlive the ledger whenever the process dies between placing one
+    # and persisting it (the reconcile watchdog's os._exit) — the orphans then
+    # fill unattributed and read as "position drifted from the ledger" for ever
+    # (2026-07-23: 13 watchdog kills left 88 working orders, 18 refs duplicated,
+    # one HQY exit ref stacked 8 deep → 112 shares sold against a 14-share
+    # long). Drift-flatten refs are exempt (no leg by design; _flatten_orphan
+    # runs its own cycle). False = legacy behaviour, orphans rest for ever.
+    broker_orphan_order_sweep: bool = True
+    # Ceiling on how far an unfilled ENTRY may be chased away from the price the
+    # decision was made at. A resubmit whose current price is worse than the
+    # trade's entry_price by more than this many bps is HELD (never re-sent this
+    # tick), whether or not the signal still fires — the decision and its sizing
+    # were made at entry_price, so past this the modeled edge is gone and
+    # chasing only books a bad entry. Applies to entries only; an EXIT must get
+    # flat regardless of price. 0 = no ceiling (chase at any price).
+    broker_resubmit_max_adverse_bps: float = 100.0
+    # Sanity band (%) for the real-fill cost calibration: a filled LMT leg whose
+    # measured one-way cost is beyond ±this is DISCARDED as a bad record, not
+    # averaged in. A capped marketable LMT (20 bp RTH / 80 bp extended / 150 bp
+    # overnight) cannot legitimately fill percent-points away from its own
+    # anchor — such a leg means the recorded decision price was stale. Without
+    # this the plain mean has no defence: 17 corrupt legs (all negative) once
+    # pulled the measured cost to ~0, so the sim charged no transaction cost at
+    # all. 0 = no filtering (the old, unguarded behaviour).
+    sim_real_fill_cost_sanity_pct: float = 2.0
+    # Per-trade cost attribution (2026-07-23): charge each sim leg the cost that
+    # best fits it — its OWN realized cost if it filled at the broker; else the
+    # average of the trades that filled in the same tick; else the average for
+    # its time-of-day period (rth/premarket/afterhours/overnight); else the
+    # modeled/global cost. Refines the flat override WITHOUT breaking ledger
+    # purity (every sim trade still assumes it fills). False → the flat/session
+    # override for every leg, i.e. the pre-2026-07-23 behaviour.
+    # ── Direction-scoped overrides (2026-07-25) ──────────────────────────────
+    # Resolved by config.settings.directional(name, direction). Each is None by
+    # default, meaning "use the shared value" — so the split machinery is
+    # present and inert until a value is deliberately set. Only parameters with
+    # a STRUCTURAL reason to differ are exposed here; see `directional`.
+    horizon_expiry_floor_mult_long: Optional[float] = None
+    horizon_expiry_floor_mult_short: Optional[float] = None
+    # Self-calibrating per-side time pressure. Rather than freezing two numbers
+    # from a sample that fails multiple-comparison correction, the ramp
+    # multiplier is nudged per direction by MEASURED evidence: the gap between
+    # what horizon_expired trades returned and what that side's other exits
+    # returned. A NEGATIVE gap means the time-stop is firing too late (the
+    # position kept bleeding) → tighten; POSITIVE means patience paid → loosen.
+    # Measured 2026-07-25: longs −1.88 pp (time-outs do worse → tighten),
+    # shorts +2.54 pp (time-outs do better → loosen) — opposite directions,
+    # which is exactly the asymmetry a shared parameter cannot express.
+    # Shrunk by horizon_ramp_prior_n so it is ~inert on thin evidence, clamped
+    # to ±horizon_ramp_max_adjust, and reported to the calibration registry.
+    # ── Per-side actionable threshold (2026-07-25) ───────────────────────────
+    # Splitting Gate 1 — the single highest-leverage parameter in the system —
+    # so it is deliberately the most conservative split of the four: MEASURED,
+    # shrunk, small-capped, and it can only ever TIGHTEN a side (loosening a
+    # risk gate automatically is not something a calibration should do).
+    #
+    # The evidence is NOT "which side wins more" — it is whether confidence
+    # DISCRIMINATES on that side, because raising a bar only helps if the bar
+    # sorts good calls from bad. Measured 2026-07-25 over closed trades:
+    #   longs  Spearman(confidence, return) = +0.008  -> no information; the
+    #          >=0.90 cohort was the WORST (-2.11%). Raising the long bar would
+    #          cut volume without improving quality, so it stays put.
+    #   shorts Spearman = +0.233, monotonic bands, and >=0.90 is the only
+    #          profitable cohort (+1.91%, 43.6% win) -> a higher short bar
+    #          concentrates a real edge.
+    # Set an override to pin a side manually (in confidence points, added to the
+    # regime threshold); None = calibrate.
+    enable_side_threshold_calibration: bool = True
+    actionable_threshold_adj_long: Optional[float] = None
+    actionable_threshold_adj_short: Optional[float] = None
+    side_threshold_max_adjust: float = 0.04   # cap: at most +4 confidence points
+    side_threshold_prior_n: int = 40          # virtual trades at "no adjustment"
+    side_threshold_rho_ref: float = 0.30      # rho that maps to a full-strength raise
+
+    enable_horizon_ramp_calibration: bool = True
+    horizon_ramp_prior_n: int = 30        # virtual observations at "no adjustment"
+    horizon_ramp_max_adjust: float = 0.30  # ±30% of the base multiplier
+    horizon_ramp_gap_ref_pp: float = 4.0   # gap (pp) that maps to a full-strength adjustment
+    # Adverse stop, split by MEASUREMENT — and the split runs OPPOSITE to the
+    # structural prior. The reasoning "a short's loss is unbounded, so stop it
+    # tighter" is sound about tail risk but wrong about where the tail starts: a
+    # threshold sweep over the closed ledger (Δ = capped-at-stop − realised, via
+    # each trade's stored MAE) found a stop HELPS longs at every level from −5%
+    # to −12% (+2.13 pp/trade at −6%, +1.22 at −8%) and HURTS shorts at every
+    # level from −5% to −15% (−2.80 pp/trade at −5%, worsening to −20.87 at
+    # −15%). Shorts that go against this book tend to RECOVER — consistent with
+    # the earlier finding that SELLs on spiked names fade correctly — so cutting
+    # them at a normal stop locks in a loss that would have come back.
+    # Both readings are stable across a wide band rather than a single point,
+    # which is what makes them worth acting on at n=153/88.
+    adverse_stop_pct_long: Optional[float] = 8.0      # inside the helping plateau
+    # NOT disabled: the unbounded-loss tail is real even though a normal stop
+    # destroys value here. −20% is a pure runaway guard — the sweep shows no harm
+    # there (n=2) while still capping a genuine squeeze.
+    adverse_stop_pct_short: Optional[float] = 20.0
+
+    # ── Hard adverse stop (2026-07-25) ───────────────────────────────────────
+    # The system's exits are otherwise ALL conviction-based, so nothing caps a
+    # single position's loss: a position the engine keeps re-affirming can bleed
+    # indefinitely. Fires on the cost-adjusted M2M return, and only when the LLM
+    # review HELD (like trailing_stop / mechanical_exit), so it never overrides a
+    # macro or flip close. Per-side thresholds above; 0 disables a side.
+    enable_adverse_stop: bool = True
+    adverse_stop_pct: float = 10.0            # shared fallback if a side is unset
+
+    # ── Short borrow / carry (2026-07-25) ────────────────────────────────────
+    # The one genuinely direction-ASYMMETRIC cost: a short pays a daily
+    # stock-loan fee a long never does. Nothing charged it before, so every
+    # short's simulated return read BETTER than reality by roughly the rate ×
+    # holding period — a bias that grows the longer a short is held and is
+    # largest on exactly the squeeze-prone names the (currently disabled)
+    # broker_advisor method was built to flag. Charged per CALENDAR day (borrow
+    # accrues over weekends), on SELL legs only, in both return engines.
+    # The rate prefers the broker's REAL fee for that name when it was captured
+    # at entry (trade["borrow_fee_pct"], from Broker.get_short_borrow) and falls
+    # back to this blended assumption: liquid large caps typically borrow well
+    # under 1%/yr, small caps and hard-to-borrow names far more, and this
+    # universe mixes both. Deliberately a round, conservative placeholder —
+    # revisit once real borrow rates accrue. 0 = charge nothing.
+    enable_short_borrow_cost: bool = True
+    short_borrow_annual_pct: float = 3.0
+    sim_per_trade_cost_attribution: bool = True
+    # Min filled legs in a tick (run) before that tick's average is trusted for
+    # its unfilled trades; below it, fall through to the time-of-day average.
+    sim_cost_tick_min_legs: int = 3
     # Price-aware next-tick resubmit for a previously-unfilled ENTRY. Instead of
     # blindly chasing the current price on the next tick, decide per the fresh
     # signal + the price vs the original decision: (a) still actionable same
@@ -2172,3 +2567,37 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ── direction-scoped parameter resolution (2026-07-25) ──────────────────────
+
+_LONG_WORDS = frozenset({"BUY", "LONG", "BULLISH"})
+_SHORT_WORDS = frozenset({"SELL", "SHORT", "BEARISH"})
+
+
+def directional(name: str, direction, obj=None):
+    """Resolve a setting for ONE direction: ``{name}_long`` / ``{name}_short``
+    when that override is set, otherwise the shared ``{name}``.
+
+    The mechanism behind "a parameter set optimised for buying and another for
+    selling", built so that adding a split is a config change rather than a
+    refactor. **Every override defaults to None**, so with nothing configured
+    this returns exactly the shared value and behaviour is unchanged.
+
+    Deliberately NOT applied to every threshold. The 2026-07-25 analysis found
+    the long/short gap in the ledger does not survive multiple-comparison
+    correction (permutation p 0.014, Bonferroni ×8 → 0.111), so hand-setting two
+    values from that sample would be fitting noise. Splits are justified where
+    the asymmetry is STRUCTURAL — borrow cost, tail-loss geometry, the speed of
+    downside moves — not merely observed once. Prefer a shrunk per-side
+    calibration (see ``aggregator.side_weight_multipliers``) over a frozen pair
+    wherever the quantity can be measured.
+    """
+    s = obj if obj is not None else settings
+    d = str(direction or "").upper()
+    suffix = "_long" if d in _LONG_WORDS else "_short" if d in _SHORT_WORDS else None
+    if suffix is not None:
+        override = getattr(s, f"{name}{suffix}", None)
+        if override is not None:
+            return override
+    return getattr(s, name, None)

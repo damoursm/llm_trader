@@ -101,3 +101,38 @@ def test_calibrate_below_floor_falls_back_to_model(monkeypatch):
     monkeypatch.setattr(tracker.repo, "fetch_filled_lmt_legs", lambda: [_leg(), _leg()])
     assert tracker.calibrate_sim_costs() is None           # too few LMT legs
     assert spread.get_real_cost_override() is None          # model in effect
+
+
+# ── session-split outlier band (2026-07-23 regression) ─────────────────────
+#
+# The per-SESSION split (calibrate_sim_costs) averaged raw per-leg costs with
+# no outlier band, so a handful of corrupt all-negative legs (stale decision
+# prices) dragged each session mean below zero → clamped to 0 → _one_side_cost
+# returned ZERO cost for every leg that hit the session path (checked before
+# the flat override). That silently zeroed the sim's cost basis.
+
+def test_session_split_excludes_outlier_legs(monkeypatch, tmp_path):
+    import src.db.repo as repo
+    from src.performance import tracker
+
+    good = [_leg(fill_price=100.20, commission=0.0) for _ in range(12)]  # +0.20% one-way, RTH
+    bad = _leg(fill_price=93.0, commission=0.0)                          # -7% one-way, corrupt
+    for leg in good + [bad]:
+        leg["submitted_at"] = "2026-07-10T14:00:00+00:00"  # all RTH
+    monkeypatch.setattr(repo, "fetch_filled_lmt_legs", lambda: good + [bad])
+    monkeypatch.setattr(settings, "sim_use_real_fill_costs", True)
+    monkeypatch.setattr(settings, "sim_real_fill_costs_min_legs", 5)
+    monkeypatch.setattr(settings, "session_spread_calibration_enabled", True)
+    monkeypatch.setattr(settings, "session_cost_min_legs", 5)
+    monkeypatch.setattr(settings, "sim_real_fill_cost_sanity_pct", 2.0)
+
+    tracker.calibrate_sim_costs([])
+    try:
+        by_sess = spread.get_real_cost_session_overrides()
+        assert by_sess is not None
+        # RTH must be the ~0.20% of the good legs, NOT dragged to 0 by the -7% leg.
+        assert by_sess["rth"] == pytest.approx(0.0020, abs=3e-4)
+        assert _one_side_cost(100.0, "STOCK", "rth") > 0.001    # not zero
+    finally:
+        spread.set_real_cost_override(None)
+        spread.set_cost_attribution(None, None, None)

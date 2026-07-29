@@ -178,3 +178,46 @@ def test_no_legs_is_none():
                                              real_one_way_cost_fraction)
     assert avg_one_way_cost_pct_from_legs([]) is None
     assert real_one_way_cost_fraction([], min_legs=10) is None
+
+
+# ── real-fill cost calibration: outlier-corrupt legs must not set the basis ──
+#
+# 2026-07-23: 17 of 346 filled legs carried an implausible one-way cost (ALL
+# negative, -2.0% to -7.1% — a one-sided tail real execution noise never
+# produces; they were stale decision prices). The plain mean has no defence
+# against them, so the measured cost collapsed 0.185% -> 0.0006% and the sim
+# charged essentially ZERO transaction cost on every trade.
+
+def _costed_leg(cost_pct, price=100.0, qty=100):
+    """A filled BUY leg engineered to measure `cost_pct` one-way (no commission)."""
+    return {"side": "BUY", "filled_qty": qty, "fill_price": price,
+            "model_price": price / (1.0 + cost_pct / 100.0), "commission": 0.0}
+
+
+def test_real_cost_ignores_implausible_legs(monkeypatch):
+    from config.settings import settings
+    from src.performance.broker_view import real_one_way_cost_fraction
+    monkeypatch.setattr(settings, "sim_real_fill_cost_sanity_pct", 2.0)
+    legs = [_costed_leg(0.20) for _ in range(20)] + [_costed_leg(-7.0)]     # one corrupt leg
+    frac = real_one_way_cost_fraction(legs, min_legs=10)
+    assert frac == pytest.approx(0.0020, abs=2e-4)            # ~0.20%, not dragged to 0
+
+
+def test_real_cost_without_the_guard_is_corrupted(monkeypatch):
+    """Documents WHY the guard exists — one bad leg in 21 destroys the mean."""
+    from config.settings import settings
+    from src.performance.broker_view import real_one_way_cost_fraction
+    monkeypatch.setattr(settings, "sim_real_fill_cost_sanity_pct", 0.0)   # disabled
+    legs = [_costed_leg(0.20) for _ in range(20)] + [_costed_leg(-7.0)]
+    frac = real_one_way_cost_fraction(legs, min_legs=10)
+    assert frac < 0.0005                                       # collapses toward zero
+
+
+def test_real_cost_keeps_legitimate_spread_of_fills(monkeypatch):
+    """Ordinary good and bad fills inside the band all still count."""
+    from config.settings import settings
+    from src.performance.broker_view import real_one_way_cost_fraction
+    monkeypatch.setattr(settings, "sim_real_fill_cost_sanity_pct", 2.0)
+    legs = [_costed_leg(0.5) for _ in range(10)] + [_costed_leg(-0.1) for _ in range(10)]
+    frac = real_one_way_cost_fraction(legs, min_legs=10)
+    assert frac == pytest.approx(0.0020, abs=3e-4)             # mean of +0.5 and -0.1

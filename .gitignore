@@ -18,3 +18,8 @@ build/
 .env
 .env.backup
 logs/
+# Coverage artifacts (dev only)
+.coverage
+coverage.xml
+cov*.json
+htmlcov/

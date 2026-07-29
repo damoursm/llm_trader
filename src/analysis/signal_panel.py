@@ -34,9 +34,12 @@ from datetime import date, timedelta
 from typing import Iterable, Optional, Sequence, Tuple
 
 import pandas as pd
+from loguru import logger
 
+from config.settings import settings
 from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_TIMEFRAME_COLUMNS,
                            SIGNAL_FUNDAMENTAL_COLUMNS)
+from src.signals.method_epochs import epoch_for as _epoch_for
 
 # Scored columns the IC report covers: every per-method column plus the
 # aggregator's weighted combined score (the "all methods together" row) and the
@@ -116,15 +119,39 @@ def refresh_panel_ohlcv(tickers: Sequence[str], max_tickers: Optional[int] = Non
     return warmed
 
 
-def _load_signals(days: Optional[int]) -> pd.DataFrame:
+def _load_signals(days: Optional[int], dedupe: Optional[str] = None) -> pd.DataFrame:
+    """Rows from the ``signals`` table, optionally windowed by ``days``.
+
+    When ``dedupe == "last"`` the last-row-per-(signal_date, ticker) reduction is
+    pushed into DuckDB as a ``row_number()`` window instead of being done in
+    pandas afterwards. The panel keeps only ~12k of 275k rows (96% discarded), so
+    doing it in SQL means the other 263k never cross into Python. Falls back to
+    loading everything and letting ``build_panel`` dedupe if the window query
+    fails — an optimisation, never a behaviour change.
+    """
     from src.db import repo
-    try:
-        if days:
-            cutoff = (date.today() - timedelta(days=days)).isoformat()
+    from src.analysis.asof import current_asof
+    where, params = "", []
+    if days:
+        where = " WHERE signal_date >= ?"
+        params = [(date.today() - timedelta(days=days)).isoformat()]
+    # Point-in-time cutoff (walk-forward). Applied HERE, at the choke point, so
+    # every panel consumer is restricted without knowing the mechanism exists.
+    _asof = current_asof()
+    if _asof:
+        where += (" AND " if where else " WHERE ") + f"signal_date < '{_asof}'"
+    if dedupe == "last":
+        try:
             return repo.fetch_df(
-                "SELECT * FROM signals WHERE signal_date >= ? ORDER BY generated_at",
-                [cutoff])
-        return repo.fetch_df("SELECT * FROM signals ORDER BY generated_at")
+                "SELECT * EXCLUDE (_rn) FROM ("
+                "  SELECT *, row_number() OVER ("
+                "    PARTITION BY signal_date, ticker ORDER BY generated_at DESC"
+                "  ) AS _rn FROM signals" + where +
+                ") WHERE _rn = 1 ORDER BY generated_at", params)
+        except Exception as e:
+            logger.debug(f"[signal_panel] SQL dedupe unavailable ({e}) — loading all rows")
+    try:
+        return repo.fetch_df("SELECT * FROM signals" + where + " ORDER BY generated_at", params)
     except Exception as e:
         # DB missing or table not created yet (it appears on the first pipeline
         # run after the schema gained the signals table) — report, don't crash.
@@ -133,18 +160,68 @@ def _load_signals(days: Optional[int]) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ── panel memo ──────────────────────────────────────────────────────────────
+_PANEL_CACHE: dict = {}
+_PANEL_VER: dict = {"ts": 0.0, "val": None}
+_PANEL_VER_TTL = 15.0
+
+
+def _panel_version() -> Optional[str]:
+    """Latest run_id — the panel's data version. The panel derives from the
+    ``signals`` table, which only changes when a run persists."""
+    import time as _t
+    now = _t.time()
+    if (now - _PANEL_VER["ts"]) < _PANEL_VER_TTL:
+        return _PANEL_VER["val"]
+    try:
+        from src.db import repo
+        d = repo.fetch_df("SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1")
+        val = None if d is None or d.empty else str(d.iloc[0]["run_id"])
+    except Exception:
+        val = _PANEL_VER["val"]
+    _PANEL_VER.update(ts=now, val=val)
+    return val
+
+
+def reset_panel_cache() -> None:
+    """Drop the memoised panels (tests / forced refresh)."""
+    _PANEL_CACHE.clear()
+    _PANEL_VER.update(ts=0.0, val=None)
+
+
 def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None,
                 dedupe: str = "last", signals_df: Optional[pd.DataFrame] = None,
                 ) -> pd.DataFrame:
     """The signals table joined with forward returns: one row per
     (signal_date, ticker), plus a ``fwd_ret_<h>d`` column per horizon (in %,
-    NaN where the OHLCV cache doesn't yet reach signal_date + h sessions)."""
-    df = signals_df if signals_df is not None else _load_signals(days)
+    NaN where the OHLCV cache doesn't yet reach signal_date + h sessions).
+
+    Memoised per (horizons, days, dedupe) against the latest run_id: a dashboard
+    warm sweep asked for the IDENTICAL panel 6 times out of 9 calls (~19s of
+    rebuilds), and the analysis modules that share it — predictability,
+    price_volume_perf, horizon_edge, policy_eval, source_performance,
+    confidence_components — each built their own. Callers get a COPY (25.8 MB
+    panel, ~4.5ms to copy versus ~6.1s to rebuild — 1,355x), so nobody can
+    corrupt a shared frame. An explicit ``signals_df`` is never cached.
+    """
+    _key = None
+    if signals_df is None:
+        _key = (tuple(horizons), days, dedupe, _panel_version())
+        _hit = _PANEL_CACHE.get(_key)
+        if _hit is not None:
+            return _hit.copy()
+
+    _sql_deduped = False
+    if signals_df is not None:
+        df = signals_df
+    else:
+        df = _load_signals(days, dedupe=dedupe)
+        _sql_deduped = dedupe == "last"
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
 
-    if dedupe == "last" and "generated_at" in df.columns:
+    if dedupe == "last" and not _sql_deduped and "generated_at" in df.columns:
         df = (df.sort_values("generated_at")
                 .groupby(["signal_date", "ticker"], as_index=False).tail(1))
 
@@ -157,6 +234,79 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
     if "combined_sell_score" in df.columns:
         df["cmb_sell"] = -pd.to_numeric(df["combined_sell_score"], errors="coerce")
 
+    # ── Scorer-epoch masking (2026-07-24) ────────────────────────────────────
+    # Blank out stored values that a SUPERSEDED implementation produced, so no
+    # analysis can silently attribute them to the scorer that exists today.
+    # Applied HERE, at the single entry point every panel consumer goes
+    # through (predictability, horizon_edge, policy_eval, scorecard,
+    # source_performance, confidence_components, price_volume_perf, the
+    # IC table, …), rather than in each of them — a new analysis is then
+    # protected by default instead of having to remember the registry.
+    # Masked → NaN, which every consumer already treats as "no view".
+    # The rows themselves are KEPT: their forward returns, prices and every
+    # unchanged method column remain valid evidence.
+    # Restore-before-mask: where a method is faithfully replayable from the
+    # cached OHLCV, a superseded score is REGENERATED by the current scorer
+    # rather than blanked. The mask below then only blanks what could not be
+    # restored, so it keeps its correctness guarantee while discarding far less
+    # evidence (money_flow alone: 98% of its rows were being dropped).
+    # Fail-soft — an absent/stale `signals_replay` just leaves the mask to run.
+    _restored = {}
+    if getattr(settings, "enable_panel_replay_restore", True):
+        try:
+            from src.analysis.replay import restore_replayed
+            df, _restored = restore_replayed(df)
+        except Exception as _e:
+            logger.debug(f"[panel] replay restore unavailable: {_e}")
+    if _restored:
+        logger.info("[panel] replayed with current scorers: "
+                    + ", ".join(f"{k}({int(v.sum())})" for k, v in sorted(_restored.items())))
+
+    _masked = []
+    for _col in list(df.columns):
+        _ep = _epoch_for(_col.split("_30m")[0].split("_1w")[0])
+        if _ep is None or _col not in df.columns:
+            continue
+        _pre = df["signal_date"].astype(str) < _ep.isoformat()
+        # A replayed cell already holds the CURRENT scorer's value, so it is not
+        # superseded any more and must survive the mask — otherwise the restore
+        # above is undone and the panel is exactly where it started.
+        _rp = _restored.get(_col)
+        if _rp is not None:
+            _pre = _pre & ~_rp.reindex(_pre.index, fill_value=False).values
+        if _pre.any():
+            df.loc[_pre, _col] = float("nan")
+            _masked.append(f"{_col}({int(_pre.sum())})")
+    # Confidence epoch — same contract, different registry. The confidence
+    # column and its six components mix formulas across the panel's life, so
+    # pre-epoch values are blanked rather than compared with post-epoch ones.
+    try:
+        from src.signals.method_epochs import confidence_epoch, CONFIDENCE_EPOCH_COLUMNS
+        _cep = confidence_epoch()
+        if _cep is not None:
+            _pre = df["signal_date"].astype(str) < _cep.isoformat()
+            if _pre.any():
+                for _c in CONFIDENCE_EPOCH_COLUMNS:
+                    if _c not in df.columns:
+                        continue
+                    # movement_factor is the one component that does NOT depend
+                    # on the weights, so the replay can genuinely recover it.
+                    # A recovered cell carries the CURRENT formula and must
+                    # survive this mask, exactly as for the method columns —
+                    # otherwise the restore is silently undone.
+                    _cm = _pre
+                    _crp = _restored.get(_c)
+                    if _crp is not None:
+                        _cm = _pre & ~_crp.reindex(_pre.index, fill_value=False).values
+                    if _cm.any():
+                        df.loc[_cm, _c] = float("nan")
+                _masked.append(f"confidence+components({int(_pre.sum())})")
+    except Exception as _e:
+        logger.debug(f"[signal_panel] confidence epoch unavailable: {_e}")
+
+    if _masked:
+        logger.debug(f"[signal_panel] scorer-epoch masked: {', '.join(_masked)}")
+
     df["_sig_date"] = df["signal_date"].map(date.fromisoformat)
 
     # One cache read per ticker, shared across all its rows/horizons.
@@ -168,12 +318,25 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
             closes_by_ticker[tk] = {}
     dates_by_ticker = {tk: sorted(c.keys()) for tk, c in closes_by_ticker.items()}
 
+    # Point-in-time horizon guard (walk-forward). A forward return is only
+    # KNOWN once its end bar has printed: at cutoff D a row dated D-1 has no
+    # 5-day return, only rows dated <= D-5 do. Without this the cutoff filters
+    # signal_date but the forward return still reaches past it — the calibration
+    # would be fitted on outcomes that had not happened, which is exactly the
+    # look-ahead walk-forward exists to remove, and it is invisible because the
+    # ROW looks correctly dated.
+    from src.analysis.asof import current_asof as _cur_asof
+    _asof_s = _cur_asof()
+    _asof_d = date.fromisoformat(_asof_s) if _asof_s else None
+
     def fwd(row, h: int) -> Optional[float]:
         dates = dates_by_ticker.get(row["ticker"]) or []
         closes = closes_by_ticker[row["ticker"]]
         i = bisect_left(dates, row["_sig_date"])
         if i >= len(dates) or i + h >= len(dates):
             return None
+        if _asof_d is not None and dates[i + h] >= _asof_d:
+            return None                 # end bar has not printed by the cutoff
         base = closes[dates[i]]
         if not base or base <= 0:
             return None
@@ -181,7 +344,15 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
 
     for h in horizons:
         df[f"fwd_ret_{h}d"] = df.apply(lambda r: fwd(r, h), axis=1)
-    return df.drop(columns=["_sig_date"])
+    out = df.drop(columns=["_sig_date"])
+    if _key is not None:
+        # One panel per (args, run) — keep only the newest few so a long-lived
+        # dashboard can't accumulate a frame per pipeline run (~26 MB each).
+        _PANEL_CACHE[_key] = out
+        while len(_PANEL_CACHE) > 4:
+            _PANEL_CACHE.pop(next(iter(_PANEL_CACHE)))
+        return out.copy()
+    return out
 
 
 def _spearman(a: pd.Series, b: pd.Series) -> Optional[float]:
@@ -293,6 +464,9 @@ def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
         if method not in panel.columns:
             continue
         s_all = pd.to_numeric(panel[method], errors="coerce")
+        # Values from a superseded scorer are already NaN — build_panel masks
+        # them once, centrally (see the scorer-epoch block there), so they drop
+        # out of has_view here without a second check.
         has_view = s_all.notna() & (s_all.abs() > 1e-12)
         if side == "buy":
             has_view &= s_all > 0

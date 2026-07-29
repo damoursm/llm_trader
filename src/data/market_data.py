@@ -134,6 +134,19 @@ def _ts_to_utc(ts) -> Optional["pd.Timestamp"]:
         return None
 
 
+def _trim_trailing_nan_bars(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Delegates to ``cache.trim_trailing_nan_bars`` — ONE implementation.
+
+    Kept as a thin alias because `_drop_forming_bar` calls it on frames that did
+    not come from the cache (a fresh provider fetch), and because
+    `tests/test_scorer_contract.py` drives it by this name. The cache applies the
+    same trim at parse time, so cache-sourced frames are already clean and this
+    is a no-op scalar check for them.
+    """
+    from src.data.cache import trim_trailing_nan_bars
+    return trim_trailing_nan_bars(df)
+
+
 def _drop_forming_bar(df: Optional[pd.DataFrame], interval: str = "1d") -> Optional[pd.DataFrame]:
     """Remove the current period's still-forming bar (look-ahead guard).
 
@@ -149,6 +162,20 @@ def _drop_forming_bar(df: Optional[pd.DataFrame], interval: str = "1d") -> Optio
       * ``1w``  — drop the current ISO-week bar until that week's Friday close.
     """
     if df is None or getattr(df, "empty", True):
+        return df
+
+    # Trailing rows with no Close carry NO information, and an indicator that
+    # reads one does not fail — it produces a DIFFERENT number, silently
+    # (2026-07-25: a single trailing-NaN bar swung `tech`, weight 0.30, by
+    # +0.47 on identical price history — from mildly bearish to solidly
+    # bullish; `trend_strength` and `iv_rank` shifted 0.13 each). ~1% of cached
+    # daily frames carry one, so this is live, not hypothetical, and it is the
+    # same NaN-tail shape that once made `is_liquid` gate out liquid large caps.
+    # Interior NaNs are LEFT ALONE: they are a real gap in a real series, the
+    # indicators tolerate them (measured drift ≤0.04), and dropping them would
+    # silently change the spacing between bars.
+    df = _trim_trailing_nan_bars(df)
+    if df.empty:
         return df
 
     if interval == "1d":

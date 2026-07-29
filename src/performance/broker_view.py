@@ -32,6 +32,10 @@ from __future__ import annotations
 from statistics import median
 from typing import List, Optional
 
+from loguru import logger
+
+from config.settings import settings
+
 
 def _f(v) -> Optional[float]:
     try:
@@ -141,8 +145,32 @@ def real_one_way_cost_fraction(legs: List[dict], min_legs: int) -> Optional[floa
     """Average all-in one-way cost as a FRACTION (e.g. 0.0056) over real LMT
     fills, for calibrating the simulated cost model. None until at least
     ``min_legs`` LMT legs exist — a flat average over a handful of fills is
-    noise. Clamped ≥ 0 by the caller (``set_real_cost_override``)."""
+    noise. Clamped ≥ 0 by the caller (``set_real_cost_override``).
+
+    Legs whose measured cost falls outside ±``sim_real_fill_cost_sanity_pct``
+    are DISCARDED as bad records before averaging. A capped marketable LMT
+    cannot legitimately fill percent-points better than its own anchor (the
+    caps are 20 bp RTH / 80 bp extended / 150 bp overnight), so such a leg
+    means the recorded ``model_price`` was stale, not that execution was
+    brilliant. This matters because the mean has no defence against them:
+    on 2026-07-23, 17 corrupt legs (5% of 346, ALL negative, −2.0% to −7.1% —
+    a one-sided tail, which real execution noise never produces) dragged the
+    measured cost from ~0.185% to 0.0006%, and the sim charged essentially
+    ZERO transaction cost on every trade as a result. Same guard idiom as
+    ``tracker._SPLIT_GUARD_LO/HI``.
+    """
     pcts = one_way_cost_pcts_from_legs(legs)
+    band = abs(float(getattr(settings, "sim_real_fill_cost_sanity_pct", 2.0) or 0.0))
+    if band > 0:
+        kept = [p for p in pcts if abs(p) <= band]
+        dropped = len(pcts) - len(kept)
+        if dropped:
+            logger.warning(
+                f"[cost-calib] discarded {dropped}/{len(pcts)} filled leg(s) with an "
+                f"implausible one-way cost (|cost| > {band:g}%) — almost certainly a "
+                f"stale decision price, not real execution; see the price-provenance check"
+            )
+        pcts = kept
     if len(pcts) < max(1, int(min_legs)):
         return None
     return (sum(pcts) / len(pcts)) / 100.0

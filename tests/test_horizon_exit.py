@@ -20,6 +20,11 @@ def _floors(monkeypatch):
     monkeypatch.setattr(settings, "signal_decay_confidence_floor", 0.30)
     monkeypatch.setattr(settings, "signal_decay_confidence_floor_relative", 0.0)
     monkeypatch.setattr(settings, "horizon_expiry_floor_mult", 2.0)  # raised floor = 0.60
+    # These tests exercise the RAMP mechanics against a known multiplier, so pin
+    # the per-direction calibration off — otherwise the live ledger's measured
+    # long/short adjustment (2026-07-25) moves the multiplier under them.
+    monkeypatch.setattr(settings, "enable_horizon_ramp_calibration", False)
+    tracker.reset_horizon_ramp_cache()
 
 
 def _trade(hours_ago, **kw):

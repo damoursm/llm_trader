@@ -72,6 +72,7 @@ from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
 from src.analysis.data_quality import EXPECTED_SPARSE_SOURCES, KNOWN_DEAD_SOURCES, is_context_populated
+from src.analysis import arm_shadow
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
 from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES, RULE_FILL_MODEL as _RULE_FILL_MODEL
@@ -274,7 +275,7 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                  confidence_threshold, allow_buys, signals_by_ticker,
                  broker_report=None, snapshots=None,
                  synthesis_meta=None, sentiment_summary=None,
-                 universe_sources=None) -> None:
+                 universe_sources=None, shadow_arm_branch=None) -> None:
     """Write the run, its per-source 'APIs used' record, every recommendation
     (with method attribution + the LLM provider that synthesised it), the
     broker reconcile report (per-order slippage/commission rows), and the FULL
@@ -443,10 +444,26 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                     rows=sim_rows,
                 )
 
+        # Per-arm synthesis calls (live + shadow). Joined HERE, at the very end
+        # of the run, so the shadow arms had the whole pipeline to finish in and
+        # nothing on the order path ever blocked on them.
+        n_arm = 0
+        if shadow_arm_branch is not None:
+            try:
+                arm_rows = shadow_arm_branch.rows()
+                if arm_rows:
+                    repo.insert_arm_recommendations(
+                        run_id, generated_at=generated_at, signal_date=signal_date,
+                        rows=arm_rows,
+                    )
+                    n_arm = len(arm_rows)
+            except Exception as e:
+                logger.warning(f"[db] shadow-arm persist skipped: {e}")
+
         logger.info(
             f"[db] Persisted run {run_id}: {len(rec_rows)} recommendation(s), "
             f"{len(sources)} source(s), {n_orders} broker order event(s), "
-            f"{len(sig_rows)} signal row(s) → DuckDB"
+            f"{len(sig_rows)} signal row(s), {n_arm} arm call(s) → DuckDB"
         )
     except Exception as e:
         logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
@@ -1133,6 +1150,86 @@ def _email_decision(*, observe_only: bool, send_email: bool,
     if send_email or email_configured or health_problem:
         return "send"
     return "skip"
+
+
+def _apply_actionable_gates(recommendations, *, confidence_threshold,
+                            side_threshold_adj, signals_by_ticker, allow_buys,
+                            earnings_blackout, trade_gate_budget,
+                            gate_diag, gate_outcomes):
+    """Run the actionable filter (Gates 1, 1b, 2, 3, 4, 5) over ``recommendations``.
+
+    Extracted from ``run_pipeline`` on 2026-07-25 for ONE reason: coverage showed
+    this block -- the code that decides what actually trades -- had **zero** test
+    coverage (0 of 31 statements). The individual gate helpers were well tested,
+    but nothing exercised the loop that SEQUENCES them, so a wrong gate order, a
+    missing ``continue``, or a mis-attributed counter would have been invisible.
+
+    Behaviour is unchanged: same gates, same order, same counters, same
+    ``gate_outcomes`` stamps. ``gate_diag`` and ``gate_outcomes`` are mutated in
+    place exactly as before; the surviving recommendations are returned.
+
+    Gate order is load-bearing: each drop is attributed to the FIRST gate that
+    rejected it, and ``tracker.compute_stage_eval``'s funnel reads those stamps.
+    """
+    actionable: List = []
+    for r in recommendations:
+        if r.action not in ("BUY", "SELL"):
+            continue
+        gate_diag["buy_sell_candidates"] += 1
+        # Gate 1 — regime-tightened confidence threshold, plus a per-SIDE
+        # adjustment (2026-07-25). The adjustment is measured, shrunk and can
+        # only TIGHTEN: a side whose confidence genuinely sorts good calls from
+        # bad gets a higher bar; a side where confidence carries no information
+        # gets none, because cutting its low-confidence calls would only remove
+        # volume at random. See tracker.calibrate_side_threshold.
+        _side_thr = confidence_threshold + side_threshold_adj.get(r.action, 0.0)
+        if r.confidence < _side_thr:
+            gate_diag["dropped_below_threshold"] += 1
+            gate_outcomes[r.ticker] = "below_threshold"
+            continue
+        # Gate 1b — agreement floor: mechanically enforces the CLAUDE.md-documented
+        # "a single strong signal source never produces a BUY/SELL" invariant
+        # (previously only a prompt instruction — see _passes_agreement_gate).
+        if not _passes_agreement_gate(r.direction, signals_by_ticker.get(r.ticker)
+                                      if signals_by_ticker else None):
+            gate_diag["dropped_low_agreement"] += 1
+            gate_outcomes[r.ticker] = "low_agreement"
+            continue
+        # Gate 2 — BUY block (PANIC / RISK_OFF)
+        if r.action == "BUY" and not allow_buys:
+            gate_diag["dropped_buy_blocked"] += 1
+            gate_outcomes[r.ticker] = "buy_blocked"
+            continue
+        # Gate 3 — earnings blackout window
+        if r.ticker in earnings_blackout:
+            gate_diag["dropped_earnings_blackout"] += 1
+            gate_outcomes[r.ticker] = "earnings_blackout"
+            continue
+        # Gate 4 — tradeable liquidity floor: penny / thin names (< trade_min_price
+        # or < trade_min_dollar_volume 20d ADV) are OBSERVE-ONLY — still scored +
+        # persisted to the signals panel (penny-stock performance keeps accruing)
+        # but never actionable (no sim trade / broker order). Fail-closed via
+        # is_liquid; discovery admits them at the LOWER observation floor.
+        if not _is_tradeable(r.ticker, trade_gate_budget):
+            gate_diag["dropped_untradeable"] += 1
+            gate_outcomes[r.ticker] = "untradeable"
+            continue
+        # Gate 5 — overextension (anti-chase, BUY-only): a BUY whose ticker
+        # already ran > overextension_runup_pct over the trailing 5 completed
+        # bars is deferred — the 2026-07-22 forensics measured that cohort at a
+        # 32.5% 5d hit rate (median −4.1% vs SPY): the combined score peaks
+        # right after the run-up and short-term reversal eats the entry. The
+        # name re-qualifies at any later tick it has cooled below the bar.
+        # SELLs pass untouched (fading spikes / riding crashes is measured edge).
+        if r.action == "BUY" and _is_overextended(r.ticker):
+            gate_diag["dropped_overextended"] += 1
+            gate_outcomes[r.ticker] = "overextended"
+            continue
+        actionable.append(r)
+        gate_diag["actionable_survivors"] += 1
+        gate_outcomes[r.ticker] = "pass"
+    gate_diag["gate_outcomes"] = gate_outcomes
+    return actionable
 
 
 def _is_tradeable(ticker: str, budget: dict) -> bool:
@@ -2086,14 +2183,24 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # measurable (the agreement eval found 96% of sighted calls just echo the
     # aggregator). Stamped into gate_diag + entry_blind_synthesis on new trades →
     # the dashboard's "Entry eval · blind-synthesis ON/OFF" rows.
-    blind_synthesis = random.random() < float(settings.blind_synthesis_share)
-    logger.info(f"[blind_synth] {'BLIND' if blind_synthesis else 'SIGHTED'} this run "
-                f"(share={settings.blind_synthesis_share:g})")
+    # Dual-case synthesis A/B (2026-07-25): presents the BULL and BEAR cases
+    # side by side, each built from its OWN camp's vetted method set. It
+    # SUPERSEDES the blind/sighted axis when it fires — a symmetric two-case
+    # presentation is inherently verdict-free — so the experiment stays at three
+    # arms (dual / blind / sighted) rather than fragmenting into four cells.
+    dual_case = random.random() < float(settings.dual_case_synthesis_share)
+    blind_synthesis = (False if dual_case
+                       else random.random() < float(settings.blind_synthesis_share))
+    _arm = "DUAL-CASE" if dual_case else ("BLIND" if blind_synthesis else "SIGHTED")
+    logger.info(f"[synth_prompt] {_arm} this run "
+                f"(dual share={settings.dual_case_synthesis_share:g}, "
+                f"blind share={settings.blind_synthesis_share:g})")
     recommendations = generate_recommendations(
         signals,
         open_positions=open_position_summaries if hold_prompt_active else None,
         session=run_session,
         blind_synthesis=blind_synthesis,
+        dual_case=dual_case,
         **synth_kwargs,
     )
 
@@ -2116,13 +2223,42 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # stamps are reviewed with THIS run's engines, now known).
         hold_review_branch.supply_run_engines(run_sentiment_provider, run_synthesis_provider)
 
+    # ── Shadow arms: ask the OTHER prompt arms the same question ───────────
+    # Started here (after the provenance meta is captured, pinned to the engine
+    # the live arm used) so the ARM is the only thing that differs between the
+    # three answers, and joined at persist time so orders never wait on it.
+    # This is what makes the arms comparable per TICKER instead of per run —
+    # the unpaired design is exactly what produced the 2026-07-22 bake-off's
+    # window artifacts.
+    shadow_arm_branch = arm_shadow.maybe_start(
+        signals=signals,
+        live_arm=arm_shadow.live_arm_name(dual_case, blind_synthesis),
+        live_recs=_full_recs,
+        synth_kwargs=synth_kwargs,
+        generate=generate_recommendations,
+        force_engine=run_synthesis_provider,
+        open_positions=open_position_summaries if hold_prompt_active else None,
+        session=run_session,
+    )
+
     # Keep only the top 10 recommendations by conviction:
     # BUY/SELL first (sorted by confidence desc), then HOLD/WATCH to fill up to 10.
     _ACTION_RANK = {"BUY": 0, "SELL": 0, "HOLD": 1, "WATCH": 2}
-    recommendations = sorted(
-        recommendations,
-        key=lambda r: (_ACTION_RANK.get(r.action, 3), -r.confidence),
-    )[:10]
+    # LLM-authored recommendations OUTRANK rule-based back-fills (2026-07-27).
+    # A fill exists so open positions never fall silent when synthesis only
+    # covered the top ~40 tickers — it is not a conviction, and it carries the
+    # AGGREGATOR's confidence verbatim (`_fallback_recommendations`:
+    # `confidence=s.confidence`). That confidence saturates at 1.00 whenever
+    # coherence hits its 1.35x cap, so a fill sorted ABOVE every genuine call:
+    # measured over 2026-07-24..27, ALL 227 recommendations at 100% confidence
+    # were rule-based fills and NONE came from the model, and on the worst runs
+    # the entire top-10 email was fills — i.e. the report showed aggregator
+    # scores labelled as recommendations while hiding what the LLM actually
+    # said. Ranking the fills last fixes the report without discarding them.
+    def _rank(r):
+        is_fill = bool(getattr(r, "rule_filled", False))
+        return (_ACTION_RANK.get(r.action, 3), is_fill, -r.confidence)
+    recommendations = sorted(recommendations, key=_rank)[:10]
 
     # Macro regime gate — adjust threshold and optionally block BUY entries.
     # Baseline 0.85 (2026-07-21 user directive): the fallback when the regime
@@ -2227,6 +2363,10 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "hold_prompt_n_positions":      len(open_position_summaries),
         # Blind-synthesis A/B arm this run (entry-side prompt experiment).
         "blind_synthesis":              blind_synthesis,
+        # Which synthesis-prompt arm ran: dual / blind / sighted. Stamped so the
+        # outcome comparison can be built after the fact, same idiom as the
+        # blind flip and the hold-prompt flip.
+        "dual_case_synthesis":          dual_case,
     }
 
     # Fresh cold-fetch allowance for the trade gate (actionable tickers are almost
@@ -2238,58 +2378,37 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # vs 4 when both fire in one run. Recs are deduped per ticker upstream, so
     # one outcome per ticker per run.
     _gate_outcomes: dict = {}
-    actionable: List = []
-    for r in recommendations:
-        if r.action not in ("BUY", "SELL"):
-            continue
-        gate_diag["buy_sell_candidates"] += 1
-        # Gate 1 — regime-tightened confidence threshold
-        if r.confidence < _confidence_threshold:
-            gate_diag["dropped_below_threshold"] += 1
-            _gate_outcomes[r.ticker] = "below_threshold"
-            continue
-        # Gate 1b — agreement floor: mechanically enforces the CLAUDE.md-documented
-        # "a single strong signal source never produces a BUY/SELL" invariant
-        # (previously only a prompt instruction — see _passes_agreement_gate).
-        if not _passes_agreement_gate(r.direction, signals_by_ticker.get(r.ticker)
-                                      if signals_by_ticker else None):
-            gate_diag["dropped_low_agreement"] += 1
-            _gate_outcomes[r.ticker] = "low_agreement"
-            continue
-        # Gate 2 — BUY block (PANIC / RISK_OFF)
-        if r.action == "BUY" and not _allow_buys:
-            gate_diag["dropped_buy_blocked"] += 1
-            _gate_outcomes[r.ticker] = "buy_blocked"
-            continue
-        # Gate 3 — earnings blackout window
-        if r.ticker in earnings_blackout:
-            gate_diag["dropped_earnings_blackout"] += 1
-            _gate_outcomes[r.ticker] = "earnings_blackout"
-            continue
-        # Gate 4 — tradeable liquidity floor: penny / thin names (< trade_min_price
-        # or < trade_min_dollar_volume 20d ADV) are OBSERVE-ONLY — still scored +
-        # persisted to the signals panel (penny-stock performance keeps accruing)
-        # but never actionable (no sim trade / broker order). Fail-closed via
-        # is_liquid; discovery admits them at the LOWER observation floor.
-        if not _is_tradeable(r.ticker, _trade_gate_budget):
-            gate_diag["dropped_untradeable"] += 1
-            _gate_outcomes[r.ticker] = "untradeable"
-            continue
-        # Gate 5 — overextension (anti-chase, BUY-only): a BUY whose ticker
-        # already ran > overextension_runup_pct over the trailing 5 completed
-        # bars is deferred — the 2026-07-22 forensics measured that cohort at a
-        # 32.5% 5d hit rate (median −4.1% vs SPY): the combined score peaks
-        # right after the run-up and short-term reversal eats the entry. The
-        # name re-qualifies at any later tick it has cooled below the bar.
-        # SELLs pass untouched (fading spikes / riding crashes is measured edge).
-        if r.action == "BUY" and _is_overextended(r.ticker):
-            gate_diag["dropped_overextended"] += 1
-            _gate_outcomes[r.ticker] = "overextended"
-            continue
-        actionable.append(r)
-        gate_diag["actionable_survivors"] += 1
-        _gate_outcomes[r.ticker] = "pass"
-    gate_diag["gate_outcomes"] = _gate_outcomes
+    # Per-side actionable-threshold adjustment, resolved ONCE per run (it is
+    # cached anyway) and surfaced in gate_diag so a run's effective bar per side
+    # is auditable after the fact.
+    try:
+        from src.performance.tracker import calibrate_side_threshold
+        _side_threshold_adj = {"BUY": float(calibrate_side_threshold("BUY") or 0.0),
+                               "SELL": float(calibrate_side_threshold("SELL") or 0.0)}
+    except Exception as _e:                       # never let a calibration break the gate
+        logger.debug(f"[gate] per-side threshold unavailable: {_e}")
+        _side_threshold_adj = {"BUY": 0.0, "SELL": 0.0}
+    gate_diag["threshold_adj_buy"] = round(_side_threshold_adj["BUY"], 4)
+    gate_diag["threshold_adj_sell"] = round(_side_threshold_adj["SELL"], 4)
+    if any(_side_threshold_adj.values()):
+        logger.info(
+            f"[gate] per-side actionable threshold — "
+            f"BUY {_confidence_threshold + _side_threshold_adj['BUY']:.3f} "
+            f"(+{_side_threshold_adj['BUY']:.3f}) | "
+            f"SELL {_confidence_threshold + _side_threshold_adj['SELL']:.3f} "
+            f"(+{_side_threshold_adj['SELL']:.3f})"
+        )
+    actionable = _apply_actionable_gates(
+        recommendations,
+        confidence_threshold=_confidence_threshold,
+        side_threshold_adj=_side_threshold_adj,
+        signals_by_ticker=signals_by_ticker,
+        allow_buys=_allow_buys,
+        earnings_blackout=earnings_blackout,
+        trade_gate_budget=_trade_gate_budget,
+        gate_diag=gate_diag,
+        gate_outcomes=_gate_outcomes,
+    )
 
     if gate_diag["dropped_overextended"]:
         logger.info(
@@ -2372,6 +2491,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             llm_sentiment_model=_sent_model,   # snapshotted before the hold-reviews
             universe_sources=universe_source,
             blind_synthesis=blind_synthesis,   # A/B arm stamp (entry_blind_synthesis)
+            synth_arm=arm_shadow.live_arm_name(dual_case, blind_synthesis),
+            macro_regime_context=macro_regime_context,   # RISK_OFF sizing haircut
         ) or {}
 
         # Broker shadow execution (paper-first): once the internal ledger is final for
@@ -2501,6 +2622,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         broker_report=broker_report, snapshots=snapshots,
         synthesis_meta=_synth_meta, sentiment_summary=_sent_summary,
         universe_sources=universe_source,
+        shadow_arm_branch=shadow_arm_branch,
     )
 
     # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:

@@ -30,7 +30,9 @@ from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from src.performance.spread import _one_side_cost
+from config.settings import settings
+from src.performance.spread import (_one_side_cost, resolve_trade_leg_cost,
+                                     session_bucket_fine)
 
 
 # ---------------------------------------------------------------------------
@@ -144,22 +146,28 @@ def _load_close_series(ticker: str) -> Dict[date, float]:
 # Per-trade daily P&L walk
 # ---------------------------------------------------------------------------
 
-def _effective_entry(entry_price: float, action: str, asset_type: str, session=None) -> float:
+def _effective_entry(entry_price: float, action: str, asset_type: str, session=None,
+                     cost: Optional[float] = None) -> float:
     """Cash basis paid (BUY) or received (SELL) per share, after the one-way
     transaction cost (bid-ask half-spread + commission — same figure
     ``_pct_return`` charges, so both engines agree). ``session`` widens the
     spread for an anchor struck outside RTH (None = rth — every pre-extended
-    record)."""
-    cost = _one_side_cost(entry_price, asset_type, session)
+    record). ``cost`` (fraction) overrides the modeled cost with this leg's
+    per-trade attributed cost so both engines stay in lock-step."""
+    if cost is None:
+        cost = _one_side_cost(entry_price, asset_type, session)
     if action == "BUY":
         return entry_price * (1 + cost)
     return entry_price * (1 - cost)
 
 
-def _effective_exit(exit_price: float, action: str, asset_type: str, session=None) -> float:
+def _effective_exit(exit_price: float, action: str, asset_type: str, session=None,
+                    cost: Optional[float] = None) -> float:
     """Cash basis received (BUY exit) or paid (SELL cover) per share, after the
-    one-way transaction cost (half-spread + commission)."""
-    cost = _one_side_cost(exit_price, asset_type, session)
+    one-way transaction cost (half-spread + commission). ``cost`` overrides the
+    modeled cost with the leg's per-trade attributed cost."""
+    if cost is None:
+        cost = _one_side_cost(exit_price, asset_type, session)
     if action == "BUY":
         return exit_price * (1 - cost)
     return exit_price * (1 + cost)
@@ -326,8 +334,13 @@ def _build_marks(
         trade.get("entry_ref_close_date"),
         close_series,
     )
+    # Per-trade attributed entry cost (this leg's real fill cost if it filled,
+    # else the tick/period/model estimate) so the daily walk and _pct_return
+    # charge the SAME leg cost. None inside → the modeled cost, unchanged.
+    entry_cost = resolve_trade_leg_cost(
+        trade, "entry", float(entry_px), session_bucket_fine(trade.get("entry_datetime")))
     eff_entry = _effective_entry(float(entry_px), action, asset_type,
-                                 trade.get("entry_session")) * entry_adj
+                                 trade.get("entry_session"), cost=entry_cost) * entry_adj
 
     # Determine end anchor (date + effective price)
     if trade.get("status") == "CLOSED":
@@ -343,8 +356,10 @@ def _build_marks(
             trade.get("exit_ref_close_date"),
             close_series,
         )
+        exit_cost = resolve_trade_leg_cost(
+            trade, "exit", float(exit_px), session_bucket_fine(trade.get("exit_datetime")))
         end_mark = _effective_exit(float(exit_px), action, asset_type,
-                                   trade.get("exit_session")) * exit_adj
+                                   trade.get("exit_session"), cost=exit_cost) * exit_adj
     else:
         # OPEN: prefer the live current mark so the equity curve reflects the
         # latest intraday (30-min) price the pipeline marked the position at.
@@ -361,8 +376,12 @@ def _build_marks(
             # The live mark's hypothetical exit crosses whatever book the mark
             # was struck in — an extended-tick mark bears the extended spread,
             # matching update_open_trades' M2M return_pct.
-            end_mark = _effective_exit(float(cur_px), action, asset_type,
-                                       _session_of_mark(trade.get("current_price_datetime")))
+            end_mark = _effective_exit(
+                float(cur_px), action, asset_type,
+                _session_of_mark(trade.get("current_price_datetime")),
+                cost=resolve_trade_leg_cost(
+                    trade, "exit", float(cur_px),
+                    session_bucket_fine(trade.get("current_price_datetime"))))
         else:
             anchor = _open_trade_end_anchor(entry_d, today, close_series)
             if anchor is None:
@@ -432,16 +451,30 @@ def _daily_returns_for_trade(
     # subsequent r_d via the divide-by-zero guard — the trade's end-anchor
     # return was lost entirely.  Now we just skip the bad row and the next
     # valid mark compares against the last good price.
+    # Short borrow carry, charged per CALENDAR day between marks so the daily
+    # walk and _pct_return agree on the total (see spread.borrow_cost_fraction).
+    # Zero for longs and when the feature is off.
+    from src.performance.spread import borrow_annual_pct
+    borrow_daily = 0.0
+    if (sign < 0 and getattr(settings, "enable_short_borrow_cost", False)):
+        borrow_daily = borrow_annual_pct(trade) / 100.0 / 365.0
+
     results: List[Tuple[date, float, float]] = []
     prev_mark = marks[0][1] if marks[0][1] and marks[0][1] > 0 else None
+    prev_date = marks[0][0]
     for d, mark in marks[1:]:
         if mark is None or mark <= 0:
             continue
         if prev_mark is None or prev_mark <= 0:
             prev_mark = mark
+            prev_date = d
             continue
-        results.append((d, sign * (mark - prev_mark) / prev_mark, weight))
+        r = sign * (mark - prev_mark) / prev_mark
+        if borrow_daily:
+            r -= borrow_daily * max(0, (d - prev_date).days)
+        results.append((d, r, weight))
         prev_mark = mark
+        prev_date = d
     return results
 
 

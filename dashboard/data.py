@@ -275,6 +275,47 @@ def signal_ic(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 10) 
     return _cached(key, lambda: _retry(_q, "signal_ic"))
 
 
+def ticker_perf(days: Optional[int] = None, horizons=(1, 5, 10),
+                source: Optional[str] = None, min_days: int = 1) -> pd.DataFrame:
+    """Per-TICKER simulated performance + decision funnel over the signals panel.
+
+    Gate-independent by construction: every scored ticker-day counts, so a name
+    the gates never let through is still measured. Cached — shares the memoised
+    panel with the other analyses, so this is a groupby, not a rebuild."""
+    from src.analysis.ticker_performance import compute_ticker_perf
+    return _cached(("ticker_perf", days, tuple(horizons), source or "all", int(min_days)),
+                   lambda: _retry(lambda: compute_ticker_perf(
+                       days=days, horizons=horizons, source=source,
+                       min_days=min_days), "ticker_perf"))
+
+
+def market_relative_skill():
+    """``({method: {...}}, baseline_pct)`` — market-relative method skill and the
+    MEASURED bar it must beat. Cached; empty dict + fallback baseline on error so
+    the table degrades to absolute-only rather than showing wrong numbers."""
+    from src.analysis.market_relative import market_relative_skill as _mrs, market_relative_baseline
+    def _q():
+        return (_mrs(None) or {}), float(market_relative_baseline())
+    try:
+        return _cached(("market_relative_skill",), lambda: _retry(_q, "market_relative_skill"))
+    except Exception:
+        return {}, 48.6
+
+
+def arm_eval(days: Optional[int] = None, horizons=(1, 5, 10)) -> dict:
+    """Synthesis prompt-arm bake-off over the ``arm_recommendations`` panel.
+
+    Every arm's call on every ticker each tick (one live, the rest shadow), so
+    the arms are comparable PER TICKER-DAY rather than over whichever runs their
+    coin came up on. Cached — the forward-return join reads the OHLCV cache once
+    per ticker. Returns ``{summary, pairs, horizons, calls, shadow}``; empty
+    until shadow arms have run."""
+    from src.analysis.arm_eval import evaluate
+    return _cached(("arm_eval", days, tuple(horizons)),
+                   lambda: _retry(lambda: evaluate(days=days, horizons=horizons),
+                                  "arm_eval"))
+
+
 def simulated_method_perf(days: Optional[int] = None, min_n: int = 10,
                           session: Optional[str] = None,
                           direction: Optional[str] = None) -> pd.DataFrame:
@@ -575,3 +616,91 @@ def latest_gate_diag() -> dict:
         return json.loads(df.iloc[0]["gate_diag"])
     except Exception:
         return {}
+
+
+# ── background pre-warm ─────────────────────────────────────────────────────
+#
+# The version cache makes a WARM page load ~0.3s, but every new pipeline run
+# invalidates it, so whoever opens the dashboard next pays the full cold
+# rebuild (~60s: NAV walks over every decision stream, the 5M-row simulated
+# trades panel, the predictability/price-volume sweeps). Since the pipeline
+# ticks every ~30 min, that "next person" is almost always the user.
+#
+# Nothing about that work needs a browser waiting on it. This warms the same
+# accessors on a daemon thread as soon as a new run lands, so the cache is
+# already populated by the time anyone looks. Purely an optimisation: it only
+# ever fills the cache the request path would have filled itself, so a failure
+# here costs a slow page load, never a wrong one.
+
+_WARM_POLL_SECONDS = 20.0
+_warm_thread = None
+_warm_state: dict = {"ver": None, "running": False}
+
+
+def _warm_targets():
+    """The accessors a cold page load would otherwise force.
+
+    Ordered heaviest-first (measured cold, 2026-07-24: simulated_method_perf
+    ~30s, performance ~19s — it also drives compute_macro_eval/compute_stage_eval
+    internally — price_volume_perf ~18s, predictability ~17s, signal_ic ~6s), so
+    the biggest win lands earliest if a new run interrupts the sweep. Resolved
+    by NAME so a renamed/removed accessor degrades to "not warmed" instead of
+    raising on import."""
+    names = ("simulated_method_perf", "performance", "price_volume_perf",
+             "predictability", "signal_ic", "source_performance",
+             "exit_method_perf", "shadow_exit_method_perf", "exit_forward",
+             "confidence_components_entry", "confidence_components_exit",
+             "confidence_calibration", "monte_carlo_methods", "monte_carlo_exits",
+             "policy_comparison", "exit_policy_comparison", "horizon_edge_curve",
+             "exit_quality", "broker_forensics", "tracking_error",
+             "source_reliability", "method_coverage", "broker_trades",
+             # 2026-07-25: both share the memoised panel, so they are cheap —
+             # but an unwarmed accessor still costs the FIRST visitor after
+             # every run, which is nearly every visit at a 30-min tick.
+             "ticker_perf", "arm_eval", "market_relative_skill")
+    return [(n, globals().get(n)) for n in names]
+
+
+def warm_caches(reason: str = "") -> float:
+    """Populate every heavy cache for the CURRENT data version. Returns seconds
+    spent. Safe to call from any thread; individual failures are logged and
+    skipped."""
+    started = time.time()
+    ok = 0
+    for label, fn in _warm_targets():
+        if fn is None:
+            continue
+        try:
+            fn()
+            ok += 1
+        except Exception as e:
+            logger.debug(f"[dashboard] warm {label} failed: {e}")
+    took = time.time() - started
+    logger.info(f"[dashboard] cache warm{f' ({reason})' if reason else ''} — "
+                f"{ok} accessor(s) in {took:.1f}s; page loads served from cache")
+    return took
+
+
+def _warm_loop() -> None:
+    while True:
+        try:
+            ver = _data_version()
+            if ver is not None and ver != _warm_state["ver"]:
+                _warm_state["ver"] = ver
+                warm_caches(f"run {ver}")
+        except Exception as e:                      # never let the thread die
+            logger.debug(f"[dashboard] warm loop error: {e}")
+        time.sleep(_WARM_POLL_SECONDS)
+
+
+def start_cache_warmer() -> None:
+    """Start the background warmer (idempotent). Called once from ``app.run``."""
+    global _warm_thread
+    if _warm_state["running"]:
+        return
+    import threading
+    _warm_state["running"] = True
+    _warm_thread = threading.Thread(target=_warm_loop, name="dash-cache-warmer", daemon=True)
+    _warm_thread.start()
+    logger.info(f"[dashboard] background cache warmer started "
+                f"(polls every {_WARM_POLL_SECONDS:.0f}s; warms on each new pipeline run)")

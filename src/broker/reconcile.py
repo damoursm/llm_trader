@@ -129,6 +129,8 @@ def _new_report() -> dict:
         "overnight_deferred": 0,  # overnight-venue refusals — benign, resubmitted at the pre-market open
         "retries": 0, "stale_cancels": 0, "entry_cancels_on_close": 0, "drift_flattened": 0,
         "settled_fills": 0, "settle_reanchors": 0, "unfilled_killed": 0,
+        # duplicate live orders prevented / cleaned up (the 2026-07-23 drift cause)
+        "duplicate_submits_blocked": 0, "orphan_orders_cancelled": 0,
         "drift": [], "slippage": [], "orders": [], "errors": [], "account_equity": None,
         "pnl_daily": None, "pnl_unrealized": None, "pnl_realized": None,
     }
@@ -217,6 +219,34 @@ def _apply_fill(t: dict, prefix: str, fs: FillSummary) -> bool:
                                 else "PartiallyFilled")
         t[f"{prefix}fill_refreshed_at"] = _utcnow_iso()
     return changed
+
+
+def _persist_legs(trades: List[dict], changed: Optional[dict] = None) -> None:
+    """Flush the ledger the moment an order becomes live at the broker.
+
+    ``changed`` (the one trade whose broker leg just moved) takes the targeted
+    single-row path — ``save_trades`` full-replaces the table, so persisting
+    after every submission re-wrote every unchanged row too (~227 ms a time).
+    Falls back to the full save when the row can't be uniquely identified.
+
+    ``sync`` used to persist ONCE, at its very end. The 600 s reconcile
+    watchdog force-exits via ``os._exit(1)`` — no ``finally``, no flush — so a
+    kill mid-reconcile left orders WORKING at the broker that the ledger had no
+    record of. The next tick reloaded that stale ledger, saw an un-submitted
+    leg, and resubmitted the SAME client_ref; the stack then filled all at once
+    (2026-07-23: 13 watchdog kills stacked 8 live orders on one HQY exit ref →
+    112 shares sold against a 14-share long → permanent "drift").
+
+    Persisting at each submission shrinks that window from minutes to
+    milliseconds. Fail-soft: a DuckDB hiccup must never abort the reconcile —
+    the end-of-sync save is still the backstop.
+    """
+    try:
+        if changed is not None and repo.update_trade(changed):
+            return
+        repo.save_trades(trades)
+    except Exception as e:
+        logger.warning(f"[broker] leg persist failed (order state at risk): {e}")
 
 
 def _refresh_fills(broker: Broker, trades: List[dict], report: dict) -> bool:
@@ -368,6 +398,29 @@ def _known_order_result(broker: Broker, req: OrderRequest) -> Optional[OrderResu
     return None
 
 
+def _working_order_for_ref(broker: Broker, req: OrderRequest) -> Optional[OrderResult]:
+    """A working broker order ALREADY carrying ``req.client_ref``, if any.
+
+    The pre-submit half of the duplicate guard (``_known_order_result`` only
+    ran before a *retry*, so a first submission could always stack). IBKR does
+    not dedupe orderRef: every submission creates an independent order that
+    fills independently. Reads the local ``openTrades()`` view — no round trip,
+    so this is cheap enough to run before every submission.
+    """
+    try:
+        for o in broker.get_open_orders():
+            if o.client_ref == req.client_ref:
+                return OrderResult(
+                    ok=True, ticker=req.ticker, side=req.side,
+                    requested_qty=req.quantity, filled_qty=0,
+                    order_id=o.order_id, client_ref=req.client_ref,
+                    status=o.status or "Submitted",
+                )
+    except Exception as e:
+        logger.debug(f"[broker] working-order check failed for {req.client_ref}: {e}")
+    return None
+
+
 def _submit_with_retry(broker: Broker, req: OrderRequest, model_price: float,
                        report: dict, intent: str) -> OrderResult:
     """Submit and verify; retry TRANSIENT failures a few times, briefly.
@@ -381,6 +434,18 @@ def _submit_with_retry(broker: Broker, req: OrderRequest, model_price: float,
     a SUBMIT_FAILED event row so the paper phase accumulates a reliability
     record alongside slippage.
     """
+    # Never stack a second live order on a ref that already has one. This is
+    # the guard that turns a lost/duplicated resubmit into a no-op instead of
+    # extra shares (2026-07-23: 8 orders on one HQY exit ref all filled).
+    working = _working_order_for_ref(broker, req)
+    if working is not None:
+        report["duplicate_submits_blocked"] = report.get("duplicate_submits_blocked", 0) + 1
+        logger.warning(
+            f"[broker] {intent} {req.ticker}: ref {req.client_ref} ALREADY has a "
+            f"working order ({working.status}) at the broker — adopting it, NOT "
+            "submitting a duplicate"
+        )
+        return working
     res = broker.submit_order(req)
     retries = max(0, int(settings.broker_submit_retries))
     wait = max(1, int(settings.broker_retry_wait_seconds))
@@ -589,6 +654,59 @@ def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
                 "resubmitting re-anchored at the current mark"
             )
     return changed
+
+
+def _sweep_orphan_orders(broker: Broker, trades: List[dict], report: dict) -> None:
+    """Cancel working broker orders that NO ledger leg owns.
+
+    Enforces the invariant an order lifecycle depends on: an order may work the
+    book only while a trade leg points at it. Orders outlive the ledger
+    whenever the process dies between placing one and persisting it — the
+    reconcile watchdog force-exits with ``os._exit(1)``, so this is routine,
+    not hypothetical. The orphans then fill unattributed, and because several
+    can share a client_ref they fill *together*: the 2026-07-23 incident sold
+    112 HQY against a 14-share long and every later tick reported the result as
+    "position drifted from the ledger".
+
+    Drift-flatten refs (``drift-<TICKER>-``) are exempt: they carry no ledger
+    leg by design and ``_flatten_orphan`` runs its own stale-cancel/re-anchor
+    cycle over them. Orders placed by HAND in TWS are exempt too — they carry
+    no orderRef, and ``get_open_orders`` drops ref-less orders — so the sweep
+    can only ever cancel orders this system tagged.
+    """
+    if not settings.broker_orphan_order_sweep:
+        return
+    owned = set()
+    for t in trades:
+        for prefix in ("broker_", "broker_exit_"):
+            ref = t.get(f"{prefix}client_ref")
+            if not ref or not t.get(f"{prefix}order_id"):
+                continue
+            if (t.get(f"{prefix}status") or "") in _TERMINAL_STATUSES:
+                continue
+            owned.add(ref)
+    try:
+        working = broker.get_open_orders()
+    except Exception as e:
+        logger.warning(f"[broker] orphan sweep: could not read open orders: {e}")
+        return
+    orphans = sorted({o.client_ref for o in working
+                      if o.client_ref
+                      and o.client_ref not in owned
+                      and not o.client_ref.startswith("drift-")})
+    if not orphans:
+        return
+    shown = ", ".join(orphans[:10]) + (" …" if len(orphans) > 10 else "")
+    logger.warning(
+        f"[broker] orphan sweep: {len(orphans)} working ref(s) of {len(working)} "
+        f"order(s) have no ledger leg — cancelling: {shown}"
+    )
+    for ref in orphans:
+        try:
+            if broker.cancel_order(ref):
+                report["orphan_orders_cancelled"] += 1
+        except Exception as e:
+            logger.warning(f"[broker] orphan sweep: cancel {ref} raised: {e}")
 
 
 # ── drift auto-reconciliation: flatten orphan positions ─────────────────────
@@ -823,6 +941,12 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
         return False
     changed = False
     n_polls = max(1, budget // poll_seconds)
+    # ``budget`` is WALL-CLOCK, not a poll count. Each poll's work (a cancel
+    # ~1 s plus a re-anchor submit ~12 s, PER leg) is unbounded, so counting
+    # polls alone let a 30 s budget run 10–20 min with ~9 legs — every tick
+    # then blew the 600 s reconcile watchdog, which force-exited mid-flight and
+    # orphaned the orders it had just placed (see _persist_legs). Hard deadline.
+    deadline = time.monotonic() + budget
     logger.info(
         f"[broker] settle: {len(legs)} order(s) unfilled after submission — "
         f"watching ≤{budget}s, poll {poll_seconds}s, re-anchor every {reanchor_every} "
@@ -830,6 +954,12 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
     )
 
     for poll_i in range(n_polls):
+        if time.monotonic() >= deadline:
+            logger.info(
+                f"[broker] settle: {budget}s budget spent after {poll_i} poll(s) with "
+                f"{len(legs)} leg(s) still unfilled — killing survivors"
+            )
+            break
         time.sleep(poll_seconds)
         try:
             fills = {f.client_ref: f for f in broker.get_fills()}
@@ -871,6 +1001,8 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
             # Repeating this chases the spread in bounded steps so a mispriced
             # order fills within seconds instead of resting the whole budget.
             for (t, prefix, intent) in list(legs):
+                if time.monotonic() >= deadline:
+                    break      # out of budget mid-round — the kill pass takes over
                 if (t.get(f"{prefix}fill_qty") or 0) > 0:
                     continue   # partial — leave it working
                 ref = t.get(f"{prefix}client_ref")
@@ -907,6 +1039,7 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
                     _apply_entry_result(t, res)
                 else:
                     _apply_exit_result(t, res)
+                _persist_legs(trades, t)   # the order is live NOW — never lose that
                 changed = True
                 report["settle_reanchors"] += 1
                 _record_order(
@@ -1020,23 +1153,27 @@ def _resubmit_decision(t: dict, actionable_by_ticker: Optional[dict]) -> str:
 
     Returns 'submit' (re-send, re-anchored at the current mark) or 'skip' (hold —
     don't chase this tick; the next tick re-evaluates). Rule:
-      • still actionable this tick, SAME direction → submit (chase);
       • signal flipped to the OPPOSITE actionable side → skip (never buy into a
         bearish flip on a "better" price, and vice-versa);
+      • price drifted adverse of the decision by more than
+        ``broker_resubmit_max_adverse_bps`` → skip, EVEN IF the signal still
+        fires. The decision (and its sizing) was made at ``entry_price``; once
+        the fill would land materially worse, the modeled edge is gone and
+        chasing just books a bad entry. This ceiling used to apply only after
+        the signal decayed, so a still-actionable name was chased at ANY price;
+      • still actionable, SAME direction, inside the ceiling → submit (chase);
       • decayed to non-actionable, but the price is AS-GOOD-OR-BETTER than the
         original decision (≤ entry for a long / ≥ entry for a short) → submit at
         the better price;
-      • decayed AND the price drifted adverse → skip.
+      • decayed AND the price drifted adverse at all → skip.
     Only consulted when the caller supplies an actionable map (feature on); with
-    none, the caller keeps the legacy always-chase behavior. EXITS never use this.
+    none, the caller keeps the legacy always-chase behavior. EXITS never use this
+    — an exit must get flat regardless of price.
     """
     action = (t.get("action") or "").upper()          # BUY (long) / SELL (short)
     cur = ((actionable_by_ticker or {}).get(t.get("ticker")) or "").upper()
-    if cur == action:
-        return "submit"                               # still wants the trade
-    if cur in ("BUY", "SELL"):
+    if cur in ("BUY", "SELL") and cur != action:
         return "skip"                                 # flipped to the other side
-    # Non-actionable now: resubmit only at an equal-or-better price than decision.
     try:
         entry = float(t.get("entry_price") or 0.0)
         price = float(t.get("current_price") or 0.0)
@@ -1044,8 +1181,15 @@ def _resubmit_decision(t: dict, actionable_by_ticker: Optional[dict]) -> str:
         return "submit"
     if entry <= 0 or price <= 0:
         return "submit"                               # can't compare — don't strand
-    favorable = (price <= entry) if action == "BUY" else (price >= entry)
-    return "submit" if favorable else "skip"
+    # Adverse drift vs the decision price, in bps and sign-corrected for side.
+    adverse_bps = ((price - entry) if action == "BUY" else (entry - price)) / entry * 10_000.0
+    ceiling = float(settings.broker_resubmit_max_adverse_bps or 0.0)
+    if ceiling > 0 and adverse_bps > ceiling:
+        return "skip"                                 # ran away — let it go
+    if cur == action:
+        return "submit"                               # still wants it, price still sane
+    # Decayed to non-actionable: only worth re-sending at an equal-or-better price.
+    return "submit" if adverse_bps <= 0 else "skip"
 
 
 def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
@@ -1168,6 +1312,11 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         # ── FILL REFRESH: repair orders that completed after a previous tick ──
         changed = _refresh_fills(broker, trades, report) or changed
 
+        # ── ORPHAN SWEEP: working orders no ledger leg owns ───────────────
+        # Runs before any decision is made, so this tick reasons about a book
+        # that only contains orders the ledger actually placed.
+        _sweep_orphan_orders(broker, trades, report)
+
         # ── STALE-UNFILLED CANCEL: tick-scoped order lifetime ─────────────
         # Unfilled orders from a previous tick are cancelled (or recognized as
         # dead/expired) and re-decided below from THIS tick's data and price.
@@ -1221,20 +1370,28 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             price = float(t.get("entry_price") or t.get("current_price") or 0.0)
             resubmit_n = int(t.get("broker_resubmit_n") or 0)
             if resubmit_n and t.get("current_price"):
-                # Previously-unfilled entry being resubmitted. Price-aware gate
-                # (ask 2): chase only when the fresh signal still wants it OR the
-                # price is as-good-or-better than the decision; otherwise HOLD
-                # and let the next tick re-evaluate — never chase a decayed
-                # signal into an adverse price. Off / no map → legacy chase.
+                # Previously-unfilled entry being resubmitted. Price-aware gate:
+                # chase only when the price is still near the decision AND the
+                # signal hasn't flipped; otherwise HOLD and let the next tick
+                # re-evaluate. Off / no map → legacy chase.
                 if (settings.broker_price_aware_resubmit
                         and actionable_by_ticker is not None
                         and _resubmit_decision(t, actionable_by_ticker) == "skip"):
                     t["broker_status"] = "RESUBMIT_HELD_ADVERSE"
                     changed = True
+                    # Say WHICH rule held it: "signal decayed" is only one of
+                    # the three, and mislabelling the other two sends whoever
+                    # reads this log looking for the wrong thing.
+                    _cur = (actionable_by_ticker.get(t["ticker"]) or "").upper()
+                    _why = ("signal flipped to the opposite side"
+                            if _cur in ("BUY", "SELL") and _cur != (t.get("action") or "").upper()
+                            else "signal still actionable but price ran away"
+                            if _cur == (t.get("action") or "").upper()
+                            else "signal decayed and price adverse")
                     logger.info(
-                        f"[broker] entry {t['ticker']}: resubmit HELD — signal "
-                        f"decayed and price {t.get('current_price')} drifted "
-                        f"adverse of decision {t.get('entry_price')} (re-eval next tick)"
+                        f"[broker] entry {t['ticker']}: resubmit HELD — {_why}; "
+                        f"price {t.get('current_price')} vs "
+                        f"decision {t.get('entry_price')} (re-eval next tick)"
                     )
                     continue
                 # Re-anchor at the latest mark (refreshed by update_open_trades
@@ -1250,6 +1407,35 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 t["broker_status"] = "SKIPPED_ZERO_QTY"
                 changed = True
                 continue
+            # Order the GAP to target, never the full target again. If the
+            # broker already holds part (or all) of this position — a partial
+            # fill, or an earlier order that filled without being recorded —
+            # re-requesting the whole size MULTIPLIES the position instead of
+            # reaching it. Sizing against what is actually held makes a repeat
+            # submission self-limiting: the second one asks for 0 and stops.
+            # (This is the sizing half of the 2026-07-23 drift cascade, where
+            # repeated full-size exits sold 112 shares against a 14-share long.)
+            # Only same-direction holdings count; an opposite-sign position is
+            # the drift pass's business, not an offset to trade against.
+            held_now = positions.get(t["ticker"])
+            want_sign = 1 if t["action"] == "BUY" else -1
+            have = (int(abs(held_now.quantity))
+                    if held_now is not None and held_now.quantity * want_sign > 0 else 0)
+            if have:
+                target = qty
+                qty = max(0, qty - have)
+                if qty <= 0:
+                    t["broker_status"] = "POSITION_ALREADY_AT_TARGET"
+                    changed = True
+                    logger.info(
+                        f"[broker] entry {t['ticker']}: broker already holds {have} "
+                        f"vs target {target} — nothing to add, not submitting"
+                    )
+                    continue
+                logger.info(
+                    f"[broker] entry {t['ticker']}: broker already holds {have} of "
+                    f"target {target} — ordering the {qty}-share remainder only"
+                )
             ok, reason = within_caps(n_open, gross + qty * price, equity_usd)
             if not ok:
                 logger.info(f"[broker] entry {t['ticker']} skipped — {reason}")
@@ -1279,6 +1465,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             ), model_price=price, report=report, intent="ENTRY")
             submitted_refs.add(ref)
             _apply_entry_result(t, res)
+            _persist_legs(trades, t)   # the order is live NOW — never lose that
             changed = True
             _record_order(
                 report, event="SUBMIT", intent="ENTRY", ticker=t["ticker"], side=side,
@@ -1369,6 +1556,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             ), model_price=model, report=report, intent="EXIT")
             submitted_refs.add(ref)
             _apply_exit_result(t, res)
+            _persist_legs(trades, t)   # the order is live NOW — never lose that
             changed = True
             _record_order(
                 report, event="SUBMIT", intent="EXIT", ticker=t["ticker"], side=side,
@@ -1459,6 +1647,8 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         f"exits={report['exits_submitted']} fills_repaired={report['fills_repaired']} "
         f"rejects={report['rejects']} timeouts={report['broker_timeouts']} "
         f"overnight_deferred={report['overnight_deferred']} "
+        f"orphans_cancelled={report['orphan_orders_cancelled']} "
+        f"dup_blocked={report['duplicate_submits_blocked']} "
         f"drift={len(report['drift'])} equity={report['account_equity']:.0f}"
     )
     return report
