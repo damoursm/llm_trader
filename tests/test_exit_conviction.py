@@ -98,6 +98,10 @@ def _rev(action="BUY", confidence=0.85):
 @pytest.fixture(autouse=True)
 def _no_default_time_stop(monkeypatch):
     monkeypatch.setattr(settings, "horizon_default_window", "")   # isolate the floor test
+    # The exit-consensus nudge modulates the IN-WINDOW degradation floor, and that
+    # exit ships OFF (2026-08-03, measured to exit too early). Enable it here so the
+    # nudge MECHANISM stays covered; the nudge also feeds ml_exit's floor in live use.
+    monkeypatch.setattr(settings, "enable_llm_confidence_loss_exit", True)
     monkeypatch.setattr(settings, "enable_exit_floor_calibration", True) if hasattr(
         settings, "enable_exit_floor_calibration") else None
 

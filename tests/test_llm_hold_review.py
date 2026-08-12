@@ -30,6 +30,7 @@ _HEAVY_METHOD_FLAGS = [
     "enable_adaptive_weights", "enable_market_mode_switching", "enable_catalyst_timing",
     "enable_trend_predictability_methods", "enable_multi_timeframe_signals",
     "enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+    "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv",
     "enable_ttm_squeeze", "enable_iv_term_structure", "enable_anchored_vwap",
     "enable_residual_momentum", "enable_volume_profile",
 ]
@@ -103,7 +104,15 @@ def test_hold_keeps_position():
         ) is None
 
 
-def test_same_direction_conviction_collapse_closes():
+@pytest.fixture
+def _degradation_exit_on(monkeypatch):
+    """The in-window confidence-degradation exit is OFF by default since
+    2026-08-03 (measured to exit too early — see settings). The two tests below
+    exercise the MECHANISM, so they opt back in explicitly."""
+    monkeypatch.setattr(settings, "enable_llm_confidence_loss_exit", True)
+
+
+def test_same_direction_conviction_collapse_closes(_degradation_exit_on):
     # Still a BUY, but conviction fell below floor(0.85)=0.4675 → close.
     assert tracker._evaluate_decay(
         _claude_trade(entry_conf=0.85), today_signal=None, macro_regime_context=None,
@@ -111,7 +120,7 @@ def test_same_direction_conviction_collapse_closes():
     ) == "llm_confidence_loss"
 
 
-def test_confidence_floor_boundary():
+def test_confidence_floor_boundary(_degradation_exit_on):
     floor = max(0.45, 0.55 * 0.85)   # 0.4675 (2026-07-11 recalibration: 0.65→0.55)
     assert tracker._evaluate_decay(
         _claude_trade(entry_conf=0.85), today_signal=None, macro_regime_context=None,
@@ -119,6 +128,25 @@ def test_confidence_floor_boundary():
     assert tracker._evaluate_decay(
         _claude_trade(entry_conf=0.85), today_signal=None, macro_regime_context=None,
         hold_review=_rec(action="BUY", confidence=floor + 0.01)) is None
+
+
+def test_degradation_exit_is_off_by_default_and_horizon_still_catches_it():
+    # The rule is the ONLY one post-exit forward returns condemn (+1.50% @1d left
+    # behind, 62% of exits kept running), so it ships OFF. A collapsed conviction
+    # inside the window must now HOLD...
+    assert settings.enable_llm_confidence_loss_exit is False
+    assert tracker._evaluate_decay(
+        _claude_trade(entry_conf=0.85), today_signal=None, macro_regime_context=None,
+        hold_review=_rec(action="BUY", confidence=0.10)) is None
+    # ...but the PAST-WINDOW half of the same test (horizon_expired, measured
+    # CORRECT) must still close it, so a decayed position is never a zombie —
+    # it just closes at its horizon instead of before it.
+    old = _claude_trade(entry_conf=0.85)
+    old["entry_datetime"] = "2026-01-01T15:00:00+00:00"     # far past any window
+    old["target_horizon"] = "1d"
+    assert tracker._evaluate_decay(
+        old, today_signal=None, macro_regime_context=None,
+        hold_review=_rec(action="BUY", confidence=0.10)) == "horizon_expired"
 
 
 def test_no_review_holds():

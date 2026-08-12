@@ -124,7 +124,9 @@ def evaluate_policy(panel: pd.DataFrame, policy: Policy,
             continue
         net = ctx["fwd"] - _round_trip_cost_pct(ctx["price"], ctx["session"])
         n_dec += 1
-        wins += 1 if net > 0 else 0
+        # GROSS win (system convention): the direction-oriented forward return
+        # BEFORE the round trip. Every return column below stays net of cost.
+        wins += 1 if ctx["fwd"] > 0 else 0
         net_sum += net
         tot_w += size
         tot_wr += size * net                       # capital-weighted aggregate

@@ -46,6 +46,11 @@ def _base(monkeypatch):
     monkeypatch.setattr(settings, "side_weight_prior_n", 10)
     monkeypatch.setattr(settings, "inverted_methods", "")
     monkeypatch.setattr(settings, "enable_oos_validation", False)
+    # 2026-08-11 promotions score on the fixture caches and would pollute the
+    # hand-built method worlds these tests construct - off in this file's base.
+    for _f in ("enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+               "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv"):
+        monkeypatch.setattr(settings, _f, False)
     agg.reset_winrate_filter_cache()
 
 

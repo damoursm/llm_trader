@@ -28,7 +28,7 @@ from config import settings
 from src.data.market_data import get_history, is_valid_ticker
 
 # Day count → the nearest get_bars period token (descending).
-_PERIOD_TOKENS = (("5y", 1825), ("2y", 730), ("1y", 365),
+_PERIOD_TOKENS = (("20y", 7300), ("5y", 1825), ("2y", 730), ("1y", 365),
                   ("6mo", 180), ("3mo", 90), ("1mo", 30))
 
 

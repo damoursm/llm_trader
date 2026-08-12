@@ -154,9 +154,11 @@ def compute_source_trade_perf(trades: Iterable[dict]) -> list:
     of trade dicts (each carries ``universe_source`` + cost-adjusted
     ``return_pct``; open trades contribute their live M2M mark). Returns
     ``[{source, trades, win_rate, avg_return, median_return, best, worst}]``
-    sorted by trade count descending. Direction is already baked into
-    ``return_pct`` (a profitable short is a positive return), so a win is simply
-    ``return_pct > 0``."""
+    sorted by trade count descending. ``win_rate`` is GROSS per the system-wide
+    convention (``tracker.is_gross_win`` — direction only, before spread and
+    fees); the return columns stay on the cost-adjusted ``return_pct``."""
+    from src.performance.tracker import is_gross_win
+
     groups: dict = {}
     for t in trades or []:
         r = t.get("return_pct")
@@ -166,17 +168,19 @@ def compute_source_trade_perf(trades: Iterable[dict]) -> list:
             r = float(r)
         except (TypeError, ValueError):
             continue
-        groups.setdefault(_source_label(t.get("universe_source")), []).append(r)
+        groups.setdefault(_source_label(t.get("universe_source")), []).append(
+            (r, is_gross_win(t)))
 
     out = []
-    for source, rets in groups.items():
-        if not rets:
+    for source, entries in groups.items():
+        if not entries:
             continue
-        wins = sum(1 for r in rets if r > 0)
+        rets = [r for r, _ in entries]
+        wins = [w for _, w in entries if w is not None]
         out.append({
             "source":        source,
             "trades":        len(rets),
-            "win_rate":      round(100.0 * wins / len(rets), 1),
+            "win_rate":      round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return":    round(sum(rets) / len(rets), 3),
             "median_return": round(float(median(rets)), 3),
             "best":          round(max(rets), 2),

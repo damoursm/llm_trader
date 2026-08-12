@@ -99,6 +99,7 @@ Post-combine passes (in order)
         get no adjustment (factor 1.0).
 """
 
+import threading
 from datetime import date
 from loguru import logger
 from typing import List, Optional
@@ -126,8 +127,10 @@ from src.signals.extended_session import compute_extended_gap_score
 from src.signals.broker_advisor import compute_broker_advisor_score
 from src.signals.agreement import (compute_family_agreement,
                                    compute_tape_confirmation, tape_factor)
-from src.signals.classic_anomalies import (compute_high_52w_score,
+from src.signals.classic_anomalies import (compute_dloc_rev_score,
+                                           compute_high_52w_score,
                                            compute_momentum_12_1_score,
+                                           compute_rsi2_rev_score,
                                            compute_st_reversal_score)
 from src.signals.ttm_squeeze import compute_ttm_squeeze_score
 from src.signals.iv_term_structure import compute_iv_term_score
@@ -173,6 +176,19 @@ _BASE_WEIGHTS = {
     "coint":      0.12,   # Cointegration pairs: per-ticker lean from stat-arb spread z-scores
     "ext_gap":    0.15,   # Extended-session gap momentum: live off-hours print vs last close / ATR
     "broker_advisor": 0.10,  # IBKR short-borrow squeeze tilt (hard/expensive to short → bullish, fades a SELL)
+    # ── 2026-08-11 promotions (user-directed) — the methods validated at their
+    # best parameterisation by the 20y Gate-4 sweeps + forward-panel gates
+    # (memory/pivot-horizon-target-2026-08.md), weighted by the h2 (2017-26,
+    # selection-untouched) evidence ladder; massive's 0.15 entry weight is the
+    # cap precedent for new combine entrants. Tier-2/3 panel-first methods
+    # (squeeze/iv_term/avwap/resid_mom/vol_profile) carry no new evidence and
+    # stay at weight 0.
+    "mom_12_1":   0.15,   # 12-1 skip-month momentum — h2 pivot IC +0.0227 (t +5.8), the sweep's strongest
+    "hi52":       0.15,   # 52-week-high proximity — h2 +0.0224 (t +5.2)
+    "st_reversal": 0.12,  # weekly reversal v2 (fixed-scale) — battery IC +0.0150 (t +7.2 full-period)
+    "ml_ohlcv":   0.12,   # signed-pivot rank GBM v2 — forward-panel IC +0.0639 (t +2.31, survivorship-free)
+    "rsi2_rev":   0.10,   # Connors RSI(2) — h2 +0.0098 (t +3.7), most half-stable short-horizon MR
+    "dloc_rev":   0.10,   # candle-location reversal — pivot-target t +8.1 on tradeables
 }
 
 # Extended-session weight overlay (runs outside RTH). Options chains close at
@@ -182,6 +198,32 @@ _BASE_WEIGHTS = {
 # the extended gap are the genuinely live information off-hours → scaled up.
 _EXTENDED_STALE_METHODS = ("put_call", "max_pain", "oi_skew", "iv_expr")
 _EXTENDED_FRESH_METHODS = ("news", "sent_velocity", "ext_gap")
+
+
+# ── ML combine arm (2026-08-01; "long-horizon" name retired — the min-hold was
+# measured harmful and removed, and BOTH sides swap) ─────────────────────────
+# When active, combined_buy_score comes from the learned 5d buy stacker and
+# combined_sell_score from the sell stacker (ml_stacker.compute_*_conviction)
+# instead of the weighted camps — the learned 5d aggregator vs the hand-weighted
+# combine, A/B'd per run at ml_combine_arm_share.
+# The per-run override is set by the pipeline's A/B flip; absent an override it
+# falls back to the static `enable_ml_combine` setting. Kept as a cheap
+# module global + settings bool so the hot path never imports ml_stacker unless
+# the arm is actually on.
+_ML_ARM_OVERRIDE: Optional[bool] = None
+
+
+def set_ml_combine_arm(active: Optional[bool]) -> None:
+    """Pipeline hook — force the ML combine arm on/off for THIS run
+    (None restores the static setting)."""
+    global _ML_ARM_OVERRIDE
+    _ML_ARM_OVERRIDE = active
+
+
+def ml_combine_arm_active() -> bool:
+    if _ML_ARM_OVERRIDE is not None:
+        return _ML_ARM_OVERRIDE
+    return bool(getattr(settings, "enable_ml_combine", False))
 
 
 def _extended_session_weight_overlay(profile: dict) -> dict:
@@ -306,6 +348,7 @@ def _apply_adaptive_multipliers(weight_profile: dict) -> tuple[dict, dict]:
 # ── IC-informed adaptive weights (panel-driven; default off) ─────────────────
 
 _IC_WEIGHT_CACHE: dict = {}
+_IC_WEIGHT_LOCK = threading.Lock()
 
 
 # Methods applied as ADDITIVE OVERLAYS that honour `_overlay_sign`, i.e. the
@@ -519,6 +562,17 @@ def _ic_weight_multipliers() -> dict:
     if not settings.enable_ic_weights:
         return {}
     import time
+    hit = _IC_WEIGHT_CACHE.get("v")
+    if hit and (time.time() - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["mults"]                     # fast path — no lock when fresh
+    with _IC_WEIGHT_LOCK:                       # MISS → one computation, shared
+        return _ic_weight_compute()
+
+
+def _ic_weight_compute() -> dict:
+    """The heavy path, always under ``_IC_WEIGHT_LOCK``; re-checks the cache so a
+    queued caller reuses the first thread's result."""
+    import time
     now = time.time()
     hit = _IC_WEIGHT_CACHE.get("v")
     if hit and (now - hit["ts"]) < settings.ic_weight_cache_seconds:
@@ -562,6 +616,9 @@ def reset_ic_weight_cache() -> None:
 # ── Win-rate method filter (hard exclusion; panel monitoring unaffected) ─────
 
 _WINRATE_FILTER_CACHE: dict = {}
+# Serialises the MISS path only (the fresh-cache fast path never takes it), so
+# the concurrent build_signals callers share one computation. See utils.ttl_single_flight.
+_WINRATE_FILTER_LOCK = threading.Lock()
 
 
 def method_state_multipliers() -> dict:
@@ -586,46 +643,101 @@ def method_state_multipliers() -> dict:
 
 
 def _market_relative_filtered() -> frozenset:
-    """Methods whose MARKET-RELATIVE win rate is below the filter threshold.
+    """Methods DISPROVEN on the PROMOTION statistic: market-neutral per-day IC,
+    significantly negative at EVERY horizon it can be judged on.
 
-    The bar defaults to a literal ``winrate_filter_threshold`` (50%) rather than
-    the measured baseline (~48.1%): on this basis the median stock is
-    market-relative-negative, so 50% is the STRICTER of the two defensible bars.
-    Set ``market_relative_filter_baseline`` to use the measured one instead —
-    the two differ by only the methods sitting between them.
+    2026-08-12 rebasis (user-directed). The old rule dropped on a POINT
+    ESTIMATE — directional hit rate net of the benchmark below a literal 50%
+    over ≥200 observations, no significance test — which is a different
+    statistic than the one the 2026-08-11 promotions were justified by
+    (ranking IC with a t-stat) and a far weaker standard of evidence. On the
+    live window it zeroed 14 of 27 weighted methods including the two
+    strongest promotions (hi52, mom_12_1), leaving the running combine a
+    minority of the intended one. Filtering now mirrors promotion logic
+    symmetrically: a method earned weight on significant POSITIVE IC evidence
+    and loses it only on significant NEGATIVE IC evidence —
 
-    A method below ``market_relative_min_obs`` observations is EXEMPT (unproven
-    is not disproven), and a dropped method keeps being scored, persisted and
-    IC-tracked so it can re-earn its place. ``frozenset()`` on any failure, so
-    the caller falls back to the previous basis.
+        drop  ⇔  at least one judgeable horizon, and at EVERY judgeable
+                 horizon:  ICIR < 0  and  |ICIR|·sqrt(n_days) ≥ ic_weight_min_t
+
+    (the same t-bar the IC weight tilt trusts, on the same market-neutral
+    shadow basis: within-day IC of the method's score against ticker-minus-
+    benchmark forward returns from `compute_directional_perf`, ``both`` side —
+    net-of-market by construction, matching the promotion sweeps' within-day
+    ranking). A horizon is judgeable with ≥ ``market_relative_min_obs`` rows
+    and a positive day count; a method with NO judgeable horizon is EXEMPT
+    (unproven is not disproven — a freshly promoted or epoch-reset method runs
+    at full weight until real evidence accrues, exactly the promotion
+    posture). Merely-negative-but-insignificant stays IN the combine: on this
+    basis "unlucky on the live window" is no longer "removed".
+
+    Inverted methods are exempt (the inversion machinery owns them — it
+    already demands significance plus replication). A dropped method keeps
+    being scored, persisted and IC-tracked so it can re-earn its place.
+    ``frozenset()`` on any failure, so the caller falls back to the ledger
+    basis.
     """
     if not (getattr(settings, "enable_market_relative_weighting", False)
             and getattr(settings, "enable_market_relative_filter", False)):
         return frozenset()
     try:
-        from src.analysis.market_relative import market_relative_skill, market_relative_baseline
-        rel = market_relative_skill(None)
-        if not rel:
+        from math import sqrt
+
+        import pandas as pd
+
+        from src.analysis.simulated_trades import compute_directional_perf
+        # Same call signature as the IC weight tilt's shadow basis, so a
+        # memoised directional panel serves both consumers in one pass.
+        df = compute_directional_perf(days=settings.horizon_ic_days,
+                                      benchmark=settings.horizon_market_benchmark,
+                                      min_n=settings.horizon_ic_min_n,
+                                      min_per_day=settings.ic_weight_min_per_day,
+                                      min_days=settings.ic_weight_min_days)
+        if df is None or df.empty or "side" not in df.columns:
             return frozenset()
-        bar = (float(market_relative_baseline())
-               if getattr(settings, "market_relative_filter_baseline", False)
-               else float(settings.winrate_filter_threshold) * 100.0)
+        both = df[df["side"] == "both"]
+        if both.empty:
+            return frozenset()
+        horizons = [c[len("icir_"):] for c in both.columns if c.startswith("icir_")]
+        if not horizons:
+            return frozenset()
+        min_t = max(0.0, float(settings.ic_weight_min_t))
         min_n = int(settings.market_relative_min_obs)
         inverted = _inverted_methods()
-        out = {m for m, rec in rel.items()
-               if m in _BASE_WEIGHTS or m in INVERTIBLE_OVERLAYS}
-        out = {m for m in out
-               if m not in inverted
-               and int((rel[m] or {}).get("trades", 0) or 0) >= min_n
-               and float((rel[m] or {}).get("win_rate", 100.0)) < bar}
+        by_method = {str(r["method"]): r for _, r in both.iterrows()}
+
+        out = set()
+        for m in (set(_BASE_WEIGHTS) | set(INVERTIBLE_OVERLAYS)):
+            if m in inverted:
+                continue
+            r = by_method.get(m)
+            if r is None:
+                continue
+            judgeable = 0
+            all_bad = True
+            for h in horizons:
+                icir, days = r.get(f"icir_{h}"), r.get(f"icdays_{h}")
+                n = r.get(f"n_{h}")
+                if (icir is None or pd.isna(icir) or days is None
+                        or pd.isna(days) or int(days) <= 0
+                        or n is None or pd.isna(n) or int(n) < min_n):
+                    continue                    # not judgeable at this horizon
+                judgeable += 1
+                if not (float(icir) < 0.0
+                        and abs(float(icir)) * sqrt(int(days)) >= min_t):
+                    all_bad = False
+                    break
+            if judgeable > 0 and all_bad:
+                out.add(m)
         if out:
             logger.info(
-                f"[aggregator] market-relative filter (<{bar:.1f}% net of benchmark, "
-                f">={min_n} obs): dropping {sorted(out)}"
+                f"[aggregator] IC-disproof filter (market-neutral ICIR "
+                f"significantly negative, t>={min_t:g}, at every judgeable "
+                f"horizon of {sorted(horizons)}): dropping {sorted(out)}"
             )
         return frozenset(out)
     except Exception as e:
-        logger.debug(f"[aggregator] market-relative filter unavailable: {e}")
+        logger.debug(f"[aggregator] IC-disproof filter unavailable: {e}")
         return frozenset()
 
 
@@ -679,6 +791,22 @@ def winrate_filtered_methods() -> frozenset:
     if not settings.enable_winrate_method_filter:
         return frozenset()
     import time
+    hit = _WINRATE_FILTER_CACHE.get("v")
+    if hit and (time.time() - hit["ts"]) < settings.ic_weight_cache_seconds:
+        return hit["set"]                       # fast path — no lock when fresh
+    # MISS → serialise. build_signals runs CONCURRENTLY (main pass +
+    # _HoldReviewBranch, overlapped by design, + shadow arms), so without this
+    # every branch checks the SAME empty cache, all miss, and all recompute.
+    # Measured on a live tick: 4 computations, two logging in the same second.
+    with _WINRATE_FILTER_LOCK:
+        return _winrate_filter_compute()
+
+
+def _winrate_filter_compute() -> frozenset:
+    """The heavy path, always called under ``_WINRATE_FILTER_LOCK``. Re-checks the
+    cache first, so a caller that queued behind another thread's computation
+    reuses that result instead of repeating it."""
+    import time
     now = time.time()
     hit = _WINRATE_FILTER_CACHE.get("v")
     if hit and (now - hit["ts"]) < settings.ic_weight_cache_seconds:
@@ -715,22 +843,16 @@ def winrate_filtered_methods() -> frozenset:
         # A method is dropped only when it is SIGNIFICANTLY below 50% at EVERY
         # horizon it can be judged on, so "unlucky" no longer means "removed";
         # the merely-unproven get reduced weight via method_state_multipliers().
-        # MARKET-RELATIVE basis when enabled (2026-07-27): a method whose calls
-        # do not beat the benchmark in the direction called is not adding
-        # information, however well the absolute number reads in a rising
-        # market. Thousands of observations per method (246-9,362) versus the
-        # ledger's 78-174, so this is both the better basis AND the better
-        # sample. Methods below `market_relative_min_obs` are EXEMPT — unproven
-        # is not disproven — and every dropped method is still scored,
-        # persisted to the signals panel and IC-tracked, so it can re-earn its
-        # place (that is the "filtered but still observed" contract).
-        #
-        # NOTE the threshold is a literal 50%, not the measured ~48.1% baseline.
-        # On this basis the median stock is market-relative-NEGATIVE, so 50% is
-        # the STRICTER of the two defensible bars; it differs from the baseline
-        # rule by only 2 marginal methods (ext_gap 49.7%, insider 49.2%) and is
-        # the deliberate risk posture. `market_relative_filter_baseline` switches
-        # to the measured bar.
+        # PROMOTION-LOGIC basis when enabled (rebased 2026-08-12, user-directed;
+        # was a point-estimate market-relative hit-rate drop 2026-07-27→08-12
+        # that zeroed 14/27 weighted methods incl. hi52/mom_12_1): a method is
+        # dropped only when the promotion statistic itself — market-neutral
+        # per-day IC — is SIGNIFICANTLY negative (t ≥ ic_weight_min_t) at every
+        # horizon it can be judged on. Same evidence bar to lose weight as to
+        # earn it; "below the bar on the live window" is no longer "removed".
+        # Every dropped method is still scored, persisted to the signals panel
+        # and IC-tracked, so it can re-earn its place (the "filtered but still
+        # observed" contract).
         rel_bad = _market_relative_filtered()
         horizon_bad = horizon_disproven_methods()
         if rel_bad:
@@ -1668,6 +1790,13 @@ def build_signals(
         "coint":      use_coint,
         "ext_gap":    use_ext_gap,
         "broker_advisor": use_broker_advisor,
+        # 2026-08-11 promotions — flags gate the scorers directly (no fetch deps).
+        "mom_12_1":   settings.enable_momentum_12_1,
+        "hi52":       settings.enable_high_52w,
+        "st_reversal": settings.enable_st_reversal,
+        "ml_ohlcv":   settings.enable_ml_ohlcv,
+        "rsi2_rev":   settings.enable_rsi2_rev,
+        "dloc_rev":   settings.enable_dloc_rev,
     }
     # Win-rate filter — drop methods whose solo win rate is confidently sub-50%
     # from the combine + coherence + agreement (and, via winrate_filtered_methods(),
@@ -1778,7 +1907,10 @@ def build_signals(
         f"trend={weights['trend_strength']:.0%}  "
         f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
         f"coint={weights['coint']:.0%}  ext_gap={weights['ext_gap']:.0%}  "
-        f"broker_advisor={weights['broker_advisor']:.0%}"
+        f"broker_advisor={weights['broker_advisor']:.0%}  "
+        f"m12-1={weights['mom_12_1']:.0%}  hi52={weights['hi52']:.0%}  "
+        f"strev={weights['st_reversal']:.0%}  mlo={weights['ml_ohlcv']:.0%}  "
+        f"rsi2={weights['rsi2_rev']:.0%}  dloc={weights['dloc_rev']:.0%}"
     )
 
     signals        = []
@@ -1980,20 +2112,40 @@ def build_signals(
         # ── Method 10d: Classic anomalies (PANEL-FIRST, weight 0) ─────────
         # 52-week-high proximity + 12-1 skip-month momentum + short-term
         # reversal (signals/classic_anomalies.py). Scored on every ticker and
-        # persisted to the signals panel for IC accrual, but deliberately KEPT
-        # OUT of the weighted combine, the coherence pool, and sources_agreeing
-        # below — combined_score/confidence are bit-identical with these flags
-        # on or off. Promotion once the IC clears the confidence gate =
-        # a _BASE_WEIGHTS entry + a combine line + a method_scores row.
+        # persisted to the signals panel. hi52 / mom_12_1 / st_reversal (and the
+        # MR pair below) were PROMOTED into the weighted combine on 2026-08-11 —
+        # they enter method_score_map further down like any weighted method.
+        #
+        # ONE SHARED DAILY FRAME (2026-08-11 latency fix): these 9 OHLCV scorers
+        # each self-fetched per call — ~9 parse-memo copies of a ~5,000-bar frame
+        # per ticker per tick after the 20y backfill. Fetch once here and pass
+        # df= through. Guard: a None/short frame passes df=None instead, so each
+        # scorer's own get_history fallback still fires exactly as before.
+        _shared_df = None
+        try:
+            from src.data.cache import load_ohlcv as _load_daily
+            _cand = _load_daily(ticker)
+            if _cand is not None and len(_cand) >= 260:
+                _shared_df = _cand
+        except Exception:
+            _shared_df = None
         hi52_v = hi52_ratio_pct = 0.0
         if settings.enable_high_52w:
-            hi52_v, hi52_ratio_pct = compute_high_52w_score(ticker)
+            hi52_v, hi52_ratio_pct = compute_high_52w_score(ticker, df=_shared_df)
         mom_12_1_v = mom_12_1_pct = 0.0
         if settings.enable_momentum_12_1:
-            mom_12_1_v, mom_12_1_pct = compute_momentum_12_1_score(ticker)
+            mom_12_1_v, mom_12_1_pct = compute_momentum_12_1_score(ticker, df=_shared_df)
         st_reversal_v = st_rev_5d_pct = 0.0
         if settings.enable_st_reversal:
-            st_reversal_v, st_rev_5d_pct = compute_st_reversal_score(ticker)
+            st_reversal_v, st_rev_5d_pct = compute_st_reversal_score(ticker, df=_shared_df)
+        # Mean-reversion additions (2026-08-10, panel-first at weight 0 — the
+        # de-correlated winners of the 20y full-history MR battery).
+        rsi2_rev_v = rsi2_val_v = 0.0
+        if settings.enable_rsi2_rev:
+            rsi2_rev_v, rsi2_val_v = compute_rsi2_rev_score(ticker, df=_shared_df)
+        dloc_rev_v = dloc_loc_pct_v = 0.0
+        if settings.enable_dloc_rev:
+            dloc_rev_v, dloc_loc_pct_v = compute_dloc_rev_score(ticker, df=_shared_df)
 
         # ── Method 10e: Tier-2 panel-first methods (weight 0, same contract) ──
         # TTM squeeze (vol coil/release, momentum-signed), IV term-structure
@@ -2005,13 +2157,13 @@ def build_signals(
         # from the exit consensus (exit_conviction._CONSENSUS_SKIP).
         squeeze_v, squeeze_label_v, squeeze_bars_v = 0.0, "NONE", 0
         if settings.enable_ttm_squeeze:
-            squeeze_v, squeeze_label_v, squeeze_bars_v = compute_ttm_squeeze_score(ticker)
+            squeeze_v, squeeze_label_v, squeeze_bars_v = compute_ttm_squeeze_score(ticker, df=_shared_df)
         iv_term_v, iv_term_slope_v, iv_term_label_v = 0.0, 0.0, "NO_DATA"
         if settings.enable_iv_term_structure:
             iv_term_v, iv_term_slope_v, iv_term_label_v = compute_iv_term_score(ticker, gex_context)
         avwap_v = avwap_hi_pct = avwap_lo_pct = 0.0
         if settings.enable_anchored_vwap:
-            avwap_v, avwap_hi_pct, avwap_lo_pct = compute_anchored_vwap_score(ticker)
+            avwap_v, avwap_hi_pct, avwap_lo_pct = compute_anchored_vwap_score(ticker, df=_shared_df)
 
         # ── Method 10f: Tier-3 panel-first methods (weight 0, same contract) ──
         # Residual momentum (true-beta-adjusted 12-1 vs SPY — unlike
@@ -2021,10 +2173,19 @@ def build_signals(
         # sources_agreeing and the exit consensus (_CONSENSUS_SKIP).
         resid_mom_v = resid_mom_pct = resid_mom_beta_v = 0.0
         if settings.enable_residual_momentum:
-            resid_mom_v, resid_mom_pct, resid_mom_beta_v = compute_residual_momentum_score(ticker)
+            resid_mom_v, resid_mom_pct, resid_mom_beta_v = compute_residual_momentum_score(ticker, df=_shared_df)
         vol_profile_v, vol_profile_label_v, vol_profile_poc_pct = 0.0, "NO_DATA", 0.0
         if settings.enable_volume_profile:
-            vol_profile_v, vol_profile_label_v, vol_profile_poc_pct = compute_volume_profile_score(ticker)
+            vol_profile_v, vol_profile_label_v, vol_profile_poc_pct = compute_volume_profile_score(ticker, df=_shared_df)
+
+        # ML OHLCV model (panel-first, weight 0 — signals/ml_model.py). Emits a
+        # view only where the model was validated (clean-trend/liquid subset);
+        # fail-soft to 0.0 when the artifact/lightgbm/history is missing, so the
+        # method is simply inactive and never breaks a tick.
+        ml_ohlcv_v, ml_ohlcv_label_v = 0.0, "NO_MODEL"
+        if settings.enable_ml_ohlcv:
+            from src.signals.ml_model import compute_ml_score
+            ml_ohlcv_v, ml_ohlcv_label_v = compute_ml_score(ticker)
 
         # ── Method 11: Post-Earnings Announcement Drift (PEAD) ───────────
         # SUE × time-decay. Positive = bullish drift from recent earnings beat;
@@ -2149,6 +2310,14 @@ def build_signals(
             "coint":      (active_flags["coint"],      coint_score_v),
             "ext_gap":    (active_flags["ext_gap"],    ext_gap_score_v),
             "broker_advisor": (active_flags["broker_advisor"], broker_advisor_score_v),
+            # 2026-08-11 promotions: the validated best-version methods enter the
+            # combine (and thereby coherence / sources_agreeing / family votes).
+            "mom_12_1":   (active_flags["mom_12_1"],   mom_12_1_v),
+            "hi52":       (active_flags["hi52"],       hi52_v),
+            "st_reversal": (active_flags["st_reversal"], st_reversal_v),
+            "ml_ohlcv":   (active_flags["ml_ohlcv"],   ml_ohlcv_v),
+            "rsi2_rev":   (active_flags["rsi2_rev"],   rsi2_rev_v),
+            "dloc_rev":   (active_flags["dloc_rev"],   dloc_rev_v),
         }
 
         # ── Buy/sell split combine (2026-07-22 user directive) ────────────
@@ -2176,6 +2345,49 @@ def build_signals(
         combined_buy, combined_sell = combine_buy_sell(
             method_score_map, weights, _buy_filtered, _sell_filtered,
             _buy_mults, _sell_mults)
+
+        # Provenance default — overwritten inside the arm block below when the ML
+        # stackers actually produce a conviction (fail-soft is per SIDE).
+        combine_source = "weighted"
+        # ── ML combine arm: learned 5d stackers AS combined_buy/sell_score ──
+        # Replace the weighted buy camp with the stacker's buy conviction
+        # (validated to beat the weighted combine at 5d). The stacker trained on
+        # the panel's DAILY method scores, so the feature vector uses the *_score
+        # locals, NOT the multi-timeframe blend (*_eff) that combine_buy_sell
+        # consumes. Fail-soft: a None conviction (no artifact / lightgbm) keeps
+        # the weighted combine — the swap can never silently break the combine.
+        if ml_combine_arm_active():
+            from src.analysis.ml_stacker import compute_buy_conviction, compute_sell_conviction
+            _daily_scores = {
+                "news": sentiment_score, "sent_velocity": sent_velocity_score,
+                "tech": technical_score, "massive": massive_score, "insider": insider_sc,
+                "put_call": pc_score, "max_pain": mp_score, "oi_skew": oi_skew_score,
+                "vwap": vwap_score, "pattern": pattern_score, "momentum": momentum_score,
+                "sector_momentum": sector_momentum_score,
+                "market_momentum": market_momentum_score, "money_flow": money_flow_score,
+                "trend_strength": trend_strength_score, "pead": pead_score_v,
+                "iv_rank": iv_rank_score_v, "iv_expr": iv_expr_score_v,
+                "coint": coint_score_v, "ext_gap": ext_gap_score_v,
+                "broker_advisor": broker_advisor_score_v,
+            }
+            _conv = compute_buy_conviction(_daily_scores)
+            if _conv is not None:
+                combined_buy = float(_conv)
+            # Sell side is symmetric — the sell stacker replaces the weighted
+            # combined_sell_score (validated to beat it at 5d). Fail-soft to the
+            # weighted sell camp.
+            _sconv = compute_sell_conviction(_daily_scores)
+            if _sconv is not None:
+                combined_sell = float(_sconv)
+            # PROVENANCE (2026-08-02): record which combine actually produced this
+            # ticker's sides. The arm is per-RUN but the swap is fail-soft PER SIDE,
+            # so a missing artifact silently leaves that side weighted — recording
+            # the arm flag alone would mislabel it. Every panel analysis can then
+            # segment ML-combine vs weighted-combine performance.
+            combine_source = {(True, True): "ml", (True, False): "ml_buy",
+                              (False, True): "ml_sell", (False, False): "weighted"}[
+                (_conv is not None, _sconv is not None)]
+
         combined = combined_buy - combined_sell
 
         # ── Interaction adjustments ───────────────────────────────────────
@@ -2333,6 +2545,7 @@ def build_signals(
             combined_score=round(combined, 4),
             combined_buy_score=round(combined_buy, 4),
             combined_sell_score=round(combined_sell, 4),
+            combine_source=combine_source,
             sentiment_score=round(sentiment_score, 3),
             sentiment_velocity_score=round(sent_velocity_score, 3),
             sentiment_recent=round(sent_recent, 3),
@@ -2399,6 +2612,10 @@ def build_signals(
             momentum_12_1_pct=round(mom_12_1_pct, 2),
             st_reversal_score=round(st_reversal_v, 3),
             st_reversal_ret_5d_pct=round(st_rev_5d_pct, 2),
+            rsi2_rev_score=round(rsi2_rev_v, 3),
+            rsi2_rev_value=round(rsi2_val_v, 2),
+            dloc_rev_score=round(dloc_rev_v, 3),
+            dloc_rev_loc_pct=round(dloc_loc_pct_v, 2),
             squeeze_score=round(squeeze_v, 3),
             squeeze_label=squeeze_label_v,
             squeeze_bars=int(squeeze_bars_v),
@@ -2414,6 +2631,8 @@ def build_signals(
             vol_profile_score=round(vol_profile_v, 3),
             vol_profile_label=vol_profile_label_v,
             vol_profile_poc_dist_pct=round(vol_profile_poc_pct, 2),
+            ml_ohlcv_score=round(ml_ohlcv_v, 4),
+            ml_ohlcv_label=ml_ohlcv_label_v,
             pead_score=round(pead_score_v, 3),
             pead_surprise_pct=round(pead_surprise, 2),
             pead_days_since_report=int(pead_days),
@@ -2456,6 +2675,8 @@ def build_signals(
         hi52_str = f"  hi52={hi52_v:+.2f}({hi52_ratio_pct:.0f}%)" if hi52_v != 0.0 else ""
         m121_str = f"  m12-1={mom_12_1_v:+.2f}({mom_12_1_pct:+.0f}%)" if mom_12_1_v != 0.0 else ""
         srev_str = f"  strev={st_reversal_v:+.2f}({st_rev_5d_pct:+.1f}%/5d)" if st_reversal_v != 0.0 else ""
+        rsi2_str = f"  rsi2={rsi2_rev_v:+.2f}({rsi2_val_v:.0f})" if rsi2_rev_v != 0.0 else ""
+        dloc_str = f"  dloc={dloc_rev_v:+.2f}({dloc_loc_pct_v:.0f}%)" if dloc_rev_v != 0.0 else ""
         sq_str   = f"  sq={squeeze_v:+.2f}[{squeeze_label_v}:{squeeze_bars_v}]" if squeeze_v != 0.0 else ""
         ivt_str  = f"  ivt={iv_term_v:+.2f}({iv_term_slope_v:+.1f}pts,{iv_term_label_v})" if iv_term_v != 0.0 else ""
         avw_str  = f"  avwap={avwap_v:+.2f}(hi{avwap_hi_pct:+.1f}%/lo{avwap_lo_pct:+.1f}%)" if avwap_v != 0.0 else ""
@@ -2467,7 +2688,7 @@ def build_signals(
         logger.info(
             f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
             f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}{hi52_str}{m121_str}{srev_str}{sq_str}{ivt_str}{avw_str}{rmom_str}{vp_str}  combined={combined:+.2f} | "
+            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}{hi52_str}{m121_str}{srev_str}{rsi2_str}{dloc_str}{sq_str}{ivt_str}{avw_str}{rmom_str}{vp_str}  combined={combined:+.2f} | "
             f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
             f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
             f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"

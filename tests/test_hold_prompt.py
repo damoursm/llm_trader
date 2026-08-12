@@ -120,12 +120,19 @@ def test_monitor_close_stamps_the_coin_flip(tmp_path, monkeypatch):
 
 def test_hold_prompt_eval_groups_by_flag():
     from src.performance.tracker import compute_hold_prompt_eval
+    # win_rate is GROSS (system convention, 2026-08-06) so each row carries a
+    # price pair matching the sign of its return.
+    def _t(flag, ret, status="CLOSED"):
+        return {"status": status, "exit_hold_prompt": flag, "return_pct": ret,
+                "action": "BUY", "entry_price": 100.0,
+                "exit_price": 100.0 * (1 + ret / 100.0)}
+
     trades = [
-        {"status": "CLOSED", "exit_hold_prompt": True,  "return_pct": 2.0},
-        {"status": "CLOSED", "exit_hold_prompt": True,  "return_pct": -1.0},
-        {"status": "CLOSED", "exit_hold_prompt": False, "return_pct": 0.5},
-        {"status": "CLOSED", "exit_hold_prompt": None,  "return_pct": 9.9},  # pre-experiment
-        {"status": "OPEN",   "exit_hold_prompt": True,  "return_pct": 1.0},  # not closed
+        _t(True, 2.0),
+        _t(True, -1.0),
+        _t(False, 0.5),
+        _t(None, 9.9),                       # pre-experiment
+        _t(True, 1.0, status="OPEN"),        # not closed
     ]
     ev = compute_hold_prompt_eval(trades)
     assert ev["on"] == {"trades": 2, "win_rate": 50.0, "avg_return": 0.5}

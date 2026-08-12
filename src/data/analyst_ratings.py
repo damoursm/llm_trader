@@ -338,16 +338,40 @@ def discover_analyst_tickers(
     latest_by_sym: dict = {}
 
     try:
+        seen_rows = 0
         for page in range(max(1, pages)):
             resp = httpx.get(
-                "https://financialmodelingprep.com/api/v4/upgrades-downgrades-rss-feed",
+                # MIGRATED 2026-08-04: the v4 `upgrades-downgrades-rss-feed` now
+                # returns 403 "Legacy Endpoint" for EVERY caller — FMP retired the
+                # v3/v4 API, it is not a lapsed key (v3 quote/AAPL 403s too while
+                # `stable/*` answers 200). This had been failing 26x/day into an
+                # empty list since the cutover, silently costing the run a whole
+                # discovery source. Same response schema (symbol / publishedDate /
+                # action / gradingCompany), and the action vocabulary still uses
+                # upgrade|downgrade|hold, so the filtering below is unchanged.
+                "https://financialmodelingprep.com/stable/grades-latest-news",
+                # NOTE no `limit`: it is a PREMIUM query parameter on this plan
+                # (402), and sending one rejects the whole request.
                 params={"page": page, "apikey": settings.fmp_api_key},
                 timeout=15,
             )
-            resp.raise_for_status()
+            # Do NOT raise here. Paging past the free tier's first page returns
+            # 402, and raising would discard the rows already collected from
+            # page 0 — turning a working (if small) feed back into an empty one.
+            if resp.status_code != 200:
+                if seen_rows == 0:
+                    logger.warning(
+                        f"[analyst_disc] FMP grades feed unavailable "
+                        f"(HTTP {resp.status_code}): {resp.text[:120]}"
+                    )
+                else:
+                    logger.debug(f"[analyst_disc] page {page} unavailable "
+                                 f"(HTTP {resp.status_code}) — keeping {seen_rows} row(s)")
+                break
             rows = resp.json() or []
             if not rows:
                 break
+            seen_rows += len(rows)
             reached_old = False
             for row in rows:
                 pub = _parse_fmp_date(row.get("publishedDate"))
@@ -368,8 +392,19 @@ def discover_analyst_tickers(
             if reached_old:
                 break
     except Exception as e:
-        logger.warning(f"[analyst_disc] FMP upgrades-downgrades feed failed: {e}")
+        logger.warning(f"[analyst_disc] FMP grades feed failed: {e}")
         return []
+
+    # Loud when the feed ANSWERS but nothing survives the filter — that is the
+    # shape a silent vocabulary/schema change takes (rows arrive, every one is
+    # discarded, discovery returns [] and looks merely quiet). Cheap to check,
+    # and it is exactly how this endpoint's predecessor rotted unnoticed.
+    if seen_rows and not firms_by_sym:
+        logger.warning(
+            f"[analyst_disc] FMP grades feed returned {seen_rows} row(s) but NONE "
+            f"were upgrades/downgrades within {lookback_days}d for a valid ticker "
+            "— check the feed's action vocabulary if this persists"
+        )
 
     qualified = [(s, f) for s, f in firms_by_sym.items() if len(f) >= min_firms]
     qualified.sort(key=lambda kv: (-len(kv[1]), -latest_by_sym.get(kv[0], cutoff).timestamp()))

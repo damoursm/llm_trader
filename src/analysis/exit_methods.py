@@ -34,12 +34,15 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+from config.settings import settings
+
 # The exit-specific overlay methods (distinct from the entry signal methods,
 # which are ALSO re-scored as exit signals on a held position). ``mfe`` / ``mae``
-# are held-only path signals — they need a position's ratcheted excursions, so
-# (like horizon / llm_review) they never appear in the universe shadow book.
+# / ``ml_exit`` are held-only signals — they need a position's ratcheted
+# excursions / state, so (like horizon / llm_review) they never appear in the
+# universe shadow book.
 EXIT_DECISION_METHODS = ("llm_review", "aggregator", "macro_regime", "horizon",
-                         "edge_decay", "mfe", "mae")
+                         "edge_decay", "mfe", "mae", "ml_exit")
 
 # Dashboard Exit-IC table grouping (mirrors signal_panel.IC_CATEGORY_ORDER).
 EXIT_CATEGORY_DECISION = "Exit decision (synthesized review + overlays)"
@@ -56,6 +59,7 @@ EXIT_METHOD_LABELS: Dict[str, str] = {
     "edge_decay":   "Edge-decay time-stop (realized edge window)",
     "mfe":          "Favorable excursion / give-back (trailing)",
     "mae":          "Adverse excursion / drawdown (stop)",
+    "ml_exit":      "ML exit model (learned exit-timer)",
 }
 
 # Regime → hold-pressure for a LONG position (× the position's dir_sign). Only
@@ -280,6 +284,21 @@ def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_
     # 4b. MFE / MAE excursion signals from the position's own path (already
     #     position-oriented — P&L terms — so no dir_sign). Held-only.
     scores.update(_excursion_scores(trade))
+
+    # 4c. ML exit model (2026-08-02) — the learned exit-timer (position state +
+    #     the oriented method scores), a signed hold-conviction (+ = keep, − =
+    #     exit). Persisted for EVERY held position so its exit IC accrues live;
+    #     it only CLOSES trades stamped `ml_arm` (the entry-arm cohort —
+    #     tracker.monitor_open_positions gates the decision on that). Fail-soft:
+    #     None (no artifact / lightgbm) ⇒ omitted, no exit view.
+    if settings.enable_ml_exit_model:
+        try:
+            from src.analysis.ml_exit_dataset import compute_exit_model_score
+            mx = compute_exit_model_score(trade, signals_by_ticker, today_signal)
+            if mx is not None:
+                scores["ml_exit"] = mx
+        except Exception:
+            pass
 
     # 5. The entry signal methods, re-scored on the held ticker and oriented.
     if today_signal is not None:

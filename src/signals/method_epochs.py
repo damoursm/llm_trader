@@ -92,6 +92,42 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # falling tape as bullish). Before this instant the scorer returned the same
     # sign on a rising and a falling tape — tests/test_method_directionality.py.
     "money_flow": datetime(2026, 7, 24, 20, 1, tzinfo=timezone.utc),
+    # 2026-08-08 16:30 UTC (scheduler restart): ml_ohlcv v1 → v2 — a CATEGORICAL
+    # swap, not a retrain. v1 was P(up)−P(down) from a 10-day market-relative
+    # classifier, emitted only on the clean-trend+liquid subset (NO_VIEW
+    # elsewhere); v2 is 2× a predicted within-day RANK of the signed pivot
+    # return, 85 features (76 + 9 leg-state), full universe. Different target,
+    # different feature set, different score semantics — the two histories must
+    # never pool. Promotion gate: `python -m src.analysis.ml_validate --target
+    # pivot` (panel IC +0.0639, t +2.31, edge +2.58pp over 14,610 rows /
+    # 2026-08-08); record in memory/pivot-horizon-target-2026-08.md. Ordinary
+    # retrains within v2 stay the ml_models registry's job, per the module rule.
+    "ml_ohlcv": datetime(2026, 8, 8, 16, 30, tzinfo=timezone.utc),
+    # 2026-08-10 16:20 UTC (scheduler restart; the instant sits between the last
+    # v1 run 16:00:14 and the first v2 run 16:38:50 — the restarted scheduler's
+    # misfire-grace catch-up tick stamped 16:38:50, EARLIER than the restart
+    # command finished, which is why the boundary is placed by the RUNS, not by
+    # the wall clock of the restart): st_reversal v1 → v2. v1 scored
+    # −tanh(z/1.5) with z = ret_5d / the ticker's OWN weekly std — a
+    # self-normalised number whose magnitude meant "how unusual for this name".
+    # v2 scores −tanh(ret_5d / 0.05) — a FIXED scale, so magnitude now means
+    # "how big the week was" cross-sectionally. Same sign, different meaning →
+    # the two histories must not pool. Basis: the 20y Gate-4 MR battery
+    # (raw-return ranking IC +0.0150/t +7.2 vs z-version +0.0114/t +6.2; see
+    # memory/pivot-horizon-target-2026-08.md).
+    "st_reversal": datetime(2026, 8, 10, 16, 20, tzinfo=timezone.utc),
+    # 2026-08-11 02:05 UTC (scheduler restart; last v1 run 2026-08-10T20:00 UTC,
+    # first v2 run stamped 02:13 — the catch-up tick's generated_at leads the
+    # restart wall clock, so the boundary is placed by the RUNS, as always): vwap window 20 → 5 sessions.
+    # A 5-session VWAP anchor is a DIFFERENT reference frame than a 20-session
+    # one (weekly vs monthly cost basis), so the two score histories must not
+    # pool in ledger-based calibrations — and vwap is a WEIGHTED method (0.12),
+    # so the win-rate filter / adaptive tilt genuinely consume that history.
+    # Panel side: vwap is REPLAYABLE, so the nightly refactor regenerates its
+    # panel history under the new window and build_panel prefers the restored
+    # cells — the designed epoch+replay combo. Basis: the 62-variant parameter
+    # sweep (h2 IC +0.0082 vs +0.0036, paired t +2.16; pivot memory 2026-08-10).
+    "vwap": datetime(2026, 8, 11, 2, 5, tzinfo=timezone.utc),
 }
 
 

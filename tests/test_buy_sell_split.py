@@ -29,6 +29,7 @@ _OFF = [
     "enable_trend_predictability_methods", "enable_family_agreement",
     "enable_tape_confirmation",
     "enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+    "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv",
     "enable_ttm_squeeze", "enable_iv_term_structure", "enable_anchored_vwap",
     "enable_residual_momentum", "enable_volume_profile",
 ]

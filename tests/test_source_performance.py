@@ -132,12 +132,21 @@ def test_empty_or_unstamped_panel_returns_empty():
 # ── realized-trade view ──────────────────────────────────────────────────────
 
 def test_source_trade_perf_groups_and_scores():
+    # win_rate is GROSS (system convention, 2026-08-06) so each row carries a
+    # price pair matching the sign of its return; avg/best/worst stay net.
+    def _t(src, ret):
+        row = {"universe_source": src, "return_pct": ret}
+        if ret is not None:
+            row.update(action="BUY", entry_price=100.0,
+                       exit_price=100.0 * (1 + ret / 100.0))
+        return row
+
     trades = [
-        {"universe_source": "smart_money", "return_pct": -3.0},
-        {"universe_source": "smart_money", "return_pct": 2.0},
-        {"universe_source": "trending", "return_pct": 5.0},
-        {"universe_source": "trending", "return_pct": None},   # no return → skipped
-        {"universe_source": None, "return_pct": 1.0},
+        _t("smart_money", -3.0),
+        _t("smart_money", 2.0),
+        _t("trending", 5.0),
+        _t("trending", None),     # no return → skipped
+        _t(None, 1.0),
     ]
     out = spf.compute_source_trade_perf(trades)
     by = {r["source"]: r for r in out}

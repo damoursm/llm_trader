@@ -277,11 +277,12 @@ def _segment_stats(trades: List[dict]) -> Optional[dict]:
     """Equal-weighted summary stats over the supplied trade slice."""
     if not trades:
         return None
+    from src.performance.tracker import gross_win_rate
     returns = [float(t.get("return_pct", 0.0)) for t in trades]
-    wins = [r for r in returns if r > 0]
     return {
         "trades":          len(trades),
-        "win_rate":        round(len(wins) / len(returns) * 100, 1) if returns else 0.0,
+        # GROSS per the system-wide convention; returns below stay cost-adjusted.
+        "win_rate":        gross_win_rate(trades) or 0.0,
         "compound_return": compute_compound_return(trades) or 0.0,
         "avg_return":      round(sum(returns) / len(returns), 2),
         "best":            round(max(returns), 2),

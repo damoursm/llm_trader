@@ -52,8 +52,12 @@ def calibrate_confidence_sizing(trades: Optional[List[dict]]) -> dict:
     """Per-band empirical win rates from the closed ledger, shrunk toward the
     pooled win rate by ``confidence_recal_prior_n`` observations.
 
-    Eligible = CLOSED trades carrying a numeric entry ``confidence`` and
-    ``return_pct`` (win = return_pct > 0, the spread-adjusted convention).
+    Eligible = CLOSED trades carrying a numeric entry ``confidence`` and a usable
+    price pair. A win is GROSS (``tracker.is_gross_win`` — direction only, before
+    spread and fees), per the system-wide convention: this layer is asking
+    whether higher confidence picks the right DIRECTION more often, and charging
+    it the round trip would make the sizing curve move whenever the cost model is
+    recalibrated even though no signal changed.
     Below ``confidence_recal_min_trades`` eligible closes the calibration is
     inert — the layer starts neutral and only speaks once the ledger can.
     Registry-reported so the Data Quality tab shows the live band spread."""
@@ -68,17 +72,18 @@ def calibrate_confidence_sizing(trades: Optional[List[dict]]) -> dict:
         # which is a whole band's width. The min-trades floor and the shrinkage
         # below keep the layer inert until the clean sample is large enough.
         from src.signals.method_epochs import confidence_is_comparable
+        from src.performance.tracker import is_gross_win
         rows = []
         for t in trades or []:
             if t.get("status") != "CLOSED":
                 continue
             if not confidence_is_comparable(t.get("entry_datetime") or t.get("entry_date")):
                 continue
-            conf, ret = t.get("confidence"), t.get("return_pct")
-            if conf is None or ret is None:
+            conf, win = t.get("confidence"), is_gross_win(t)
+            if conf is None or win is None:
                 continue
             try:
-                rows.append((float(conf), float(ret) > 0.0))
+                rows.append((float(conf), bool(win)))
             except (TypeError, ValueError):
                 continue
         n = len(rows)

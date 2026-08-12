@@ -272,6 +272,35 @@ class Settings(BaseSettings):
     # review-noise-driven). Off = the pre-2026-07-12 single-review behavior.
     enable_llm_exit_confirmation: bool = True
 
+    # The IN-WINDOW confidence-degradation exit (`llm_confidence_loss`): while a
+    # position is still inside its target-horizon window, close it if the opener's
+    # same-direction conviction falls below the entry-relative floor.
+    #
+    # **OFF SINCE 2026-08-03 — it was MEASURED TO EXIT TOO EARLY.** Per-reason
+    # POST-EXIT forward returns (`src/analysis/exit_forward.py`, the "persistently
+    # positive mean ⇒ the rule exits too early" test) single this rule out as the
+    # only one the evidence condemns:
+    #     rule                  n    fwd+1d   fwd+5d
+    #     trailing_stop        93    -8.13   -15.68   (excellent — dodges crashes)
+    #     horizon_expired      98    -0.49    -0.93   (correct)
+    #     llm_signal_flipped   66    +0.28    +0.44   (~neutral)
+    #     llm_confidence_loss  45    +1.50    +2.24   ← money left on the table
+    # (+1.50% mean / +0.80% median next day, 62% of exits kept going our way.)
+    # It was already patched twice for the same fault — the two-tick confirmation
+    # above, and `signal_decay_confidence_floor_relative` 0.65→0.55 — which is the
+    # tell that the rule itself, not its tuning, is the problem: LLM confidence is
+    # measured ~uninformative about forward returns, so its DRIFT is not evidence.
+    #
+    # Turning it off does NOT create zombie positions. This is the IN-WINDOW half
+    # of a test whose PAST-WINDOW half (`horizon_expired`, same conviction test on
+    # a ramped floor) is measured correct and still fires — so a decayed position
+    # still closes, just at its horizon instead of before it, which is exactly what
+    # the forward returns say to do. `trailing_stop`, `llm_signal_flipped`,
+    # `macro_regime_exit` and `adverse_stop` are all untouched. Arm-cohort trades
+    # additionally get `ml_exit` (see _ARM_ML_OWNED_EXITS).
+    # Re-validate with `python -m src.analysis.exit_forward` before re-enabling.
+    enable_llm_confidence_loss_exit: bool = False
+
     # BUY/SELL SPLIT COMBINE (2026-07-22 user directive). Each weighted method's
     # inversion-corrected view is decomposed into a BUY component max(0, eff) and a
     # SELL component max(0, −eff), each side is weight-averaged over the methods
@@ -973,13 +1002,28 @@ class Settings(BaseSettings):
     intraday_30m_ttl_minutes: int = 25
     # In-process memo of PARSED OHLCV frames (cache.load_ohlcv), bounded in MB.
     # pd.read_json is the floor cost of every analytics sweep and the dashboard's
-    # panels re-read the same ~1,760 tickers in both timeframes (~111 MB: daily
-    # frames average ~8 KB, 30-min ~54 KB). Sized to hold that working set so one
-    # panel doesn't re-parse what the previous just evicted. Entries are keyed on
-    # (path, mtime, size) so a pipeline rewrite invalidates them automatically,
-    # and each caller gets a COPY, so this is safe in the writer process too.
-    # 0 disables the memo entirely (always re-parse).
-    ohlcv_parse_cache_mb: int = 160
+    # panels re-read the same tickers in both timeframes, so this is sized to hold
+    # the whole working set — otherwise one panel re-parses exactly what the
+    # previous one just evicted. Entries are keyed on (path, mtime, size) so a
+    # pipeline rewrite invalidates them automatically, and each caller gets a COPY,
+    # so this is safe in the writer process too. 0 disables the memo (always re-parse).
+    #
+    # RAISED 160 → 400 on 2026-08-04. The old value was sized when daily frames
+    # averaged ~8 KB; the 5-year OHLCV backfill (median 106 → 1,257 bars/ticker)
+    # made them ~37 KB, and the MEASURED working set is now:
+    #     daily   37 KB x 3,647 files = 134 MB
+    #     30-min  51 KB x 2,266 files = 116 MB   → 250 MB total
+    # At 160 MB the memo could hold barely half of that, so any full-universe
+    # sweep thrashed: evict, re-parse, evict again. That is a LIVE tick cost, not
+    # just an analysis one — the scorers sweep OHLCV ~7,500 times per tick.
+    # 400 MB leaves headroom for further backfill depth and is ~1.5% of this
+    # machine's RAM (66 GB, 27.6 GB free), even counting the dashboard's separate
+    # copy. Re-measure with cache.ohlcv_parse_cache_stats() if the cache grows again.
+    # 1200 MB since 2026-08-11: the 20y backfill made frames ~4x bigger and the
+    # 400 MB bound (~1,000 frames) thrashed against a ~3,400-ticker universe x
+    # multiple consumers — measured as 10-24 min ticks. ~1200 MB keeps the whole
+    # active universe's parsed frames resident.
+    ohlcv_parse_cache_mb: int = 1200
     # Per-ticker scoring concurrency. The build_signals loop is I/O-bound (DeepSeek
     # sentiment ~7s/ticker + Massive/OHLCV reads), so a bounded thread pool collapses
     # the serial sum to ~max wall-time with IDENTICAL scores. 1 = sequential (legacy).
@@ -1033,6 +1077,12 @@ class Settings(BaseSettings):
     # deliberately far ABOVE the $5M trade floor: below institutional size the
     # measured "reversal" is mostly bid-ask bounce, not a real snapback.
     st_reversal_min_dollar_volume: float = 50_000_000
+    # Mean-reversion additions (2026-08-10, panel-first at weight 0 — selected
+    # by the 20y full-history battery, de-correlated cluster winners on Gate-4
+    # names; see memory/pivot-horizon-target-2026-08.md). Both share the
+    # st_reversal liquidity floor (same bid-ask-bounce argument).
+    enable_rsi2_rev: bool = True        # Connors RSI(2) snapback
+    enable_dloc_rev: bool = True        # daily candle-location reversal
 
     # ── Tier-2 panel-first methods (2026-07-08, weight 0 — same contract) ───
     # TTM Squeeze: BB(20,2σ) coiling inside Keltner(20,1.5×ATR); the release
@@ -1309,7 +1359,17 @@ class Settings(BaseSettings):
     ic_weight_min_t: float = 2.0           # CONFIDENCE GATE: reweight only if |ICIR|·sqrt(n_days) ≥ this
     ic_weight_min_multiplier: float = 0.25 # floor for a confidently anti-predictive method
     ic_weight_max_multiplier: float = 3.0  # cap on a strongly-predictive method's boost
-    ic_weight_cache_seconds: int = 1800    # reuse the heavy panel IC across ticks / hold-review calls
+    # Reuse the heavy panel calibrations (IC weights, win-rate filter, per-side
+    # skill, market-relative skill) across ticks and hold-review calls.
+    # RAISED 1800 → 7200 on 2026-08-04: 1800 s was EXACTLY the RTH tick interval,
+    # so "reuse across ticks" landed on the expiry boundary and the heavy work was
+    # effectively redone every tick. These calibrations move far more slowly than
+    # that — one tick adds ~400 rows to a ~16,000-row panel (2.5%) and ~1 trade to
+    # ~356 (0.3%), and every one of them is Bayesian-shrunk over weeks — so a
+    # 30-minute versus 2-hour refresh is statistically indistinguishable while
+    # costing 4× less. EOD maintenance clears these caches explicitly, so a fresh
+    # panel/retrain is picked up at once rather than waiting out the TTL.
+    ic_weight_cache_seconds: int = 7200
     # Method INVERSION (manual, evidence-driven) — comma-separated method names whose
     # RAW score is reliably anti-predictive NET OF BETA across horizons (confirm via
     # `python -m src.analysis.scorecard` or `simulated_trades --directional`: a side
@@ -1430,10 +1490,112 @@ class Settings(BaseSettings):
     enable_eod_walkforward: bool = True
     walkforward_eod_days: int = 3           # tail rewalked each EOD
 
+    # ML OHLCV model (signals/ml_model.py) — a trained GBM wired as a PANEL-FIRST
+    # method (weight 0: scored + persisted + IC-tracked, zero combine impact) so
+    # its survivorship-free forward IC accrues before it can earn a weight.
+    # v2 (2026-08-08, current): signed-pivot within-day-rank LightGBM regressor,
+    # 85 features, full universe — cleared its pre-registered forward-panel gate
+    # (`ml_validate --target pivot`: IC +0.0639, t +2.31, edge +2.58pp). The v1
+    # rel-10d conditioned classifier (its gate: rel-10d IC +0.08, hit 55%) remains
+    # the fallback serving path for old artifacts. `enable_ml_ohlcv` gates the
+    # per-ticker scorer; fail-soft when the artifact or lightgbm is absent
+    # (method inactive). `enable_eod_ml_train` retrains the artifact at EOD.
+    # (ml_ohlcv PROMOTED to a 0.12 combine weight 2026-08-11 — user-directed.)
+    enable_ml_ohlcv: bool = True
+    enable_eod_ml_train: bool = True
+    # Which ml_ohlcv generation trains + serves (2026-08-08): "pivot_rank" = the
+    # v2 signed-pivot within-day-rank GBM (85 features incl. leg state, full
+    # universe, uniform day-equal weights — the measured winner; promotion gate
+    # `python -m src.analysis.ml_validate --target pivot`); "classic" reverts to
+    # the v1 rel-10d conditioned classifier. Serving dispatches on the ARTIFACT's
+    # own config, so flipping this changes what EOD trains, not how an existing
+    # pickle is read.
+    ml_ohlcv_target: str = "pivot_rank"
+    # v2 retrain throttle (days): the full-universe dataset rebuild is ~20-40 min
+    # and measured staleness of a few days costs ~nothing, so weekly by default.
+    ml_pivot_retrain_days: int = 7
+
+    # Long-horizon buy arm (2026-08-01, src/analysis/ml_stacker.py) — an A/B path
+    # that replaces the weighted combined_buy_score with the learned 5d stacker
+    # (measured to beat the weighted combine at 5d) AND holds those buys longer,
+    # to capture the 5d+ edge the short-hold book leaves on the table. Default
+    # OFF; `aggregator.ml_combine_arm_active` reads this (or the pipeline's per-run
+    # A/B override). Fail-soft: no artifact ⇒ the weighted combine is kept.
+    enable_ml_combine: bool = False
+    # Minimum HOLD for an arm trade (suppresses time/conviction exits until held
+    # this many trading days). **DEFAULT 0 = OFF, because it was MEASURED HARMFUL**
+    # (src/analysis/exit_policy_sim.py, 3,294 simulated positions): forcing the
+    # hold destroyed ~37% of the ML exit model's timing edge (excess over a
+    # hold-matched control +1.27 → +0.80) and cost ~1.8pp per position — it holds
+    # through exactly the deterioration the model detected. The horizon is now
+    # captured where it belongs (the exit model is trained at the 5d horizon the
+    # entry optimises), not by a clock. Kept as a knob for a future regime; safety
+    # exits always fire regardless. Re-measure with exit_policy_sim before raising.
+    ml_arm_min_hold_days: int = 0
+    # Per-run probability the ML combine arm is active (the A/B share). 0 =
+    # never via A/B (the default; the manual `enable_ml_combine` still forces
+    # it). Set e.g. 0.5 to paper-test the arm against the current short-hold book.
+    # LIVE production value is 0.5 via .env ML_COMBINE_ARM_SHARE (re-enabled
+    # 2026-08-11 for the stacker-vs-promoted-combine A/B); the code default
+    # stays 0 so a missing .env fails to the weighted combine, not to an arm.
+    ml_combine_arm_share: float = 0.0
+    # Retrain the buy stacker (ml_buy) at EOD on the freshly-materialised panel.
+    enable_eod_ml_buy_train: bool = True
+
+    # PROBABILITY CALIBRATION for the ML combine (2026-08-03). The combine reads
+    # the model's output AS a probability — `max(0, 2p−1)` is a conviction only if
+    # `p` means what it says — but gradient-boosted probabilities are known to be
+    # distorted (Niculescu-Mizil & Caruana, ICML 2005). MEASURED on ml_buy's
+    # walk-forward panel (n=10,248): raw P(up) spanned 0.087→0.929 while the
+    # realised up-rate stayed FLAT at ~0.47 in every bin — Brier skill −0.098,
+    # worse than always predicting the base rate — so conviction up to 0.86 was
+    # reaching Gate 1 and sizing on coin-flip names. An isotonic calibrator (PAVA,
+    # pure numpy) fitted on WALK-FORWARD OUT-OF-FOLD predictions is stored on the
+    # artifact and applied before the centering. **Expected effect while the model
+    # has no ranking power: conviction collapses toward 0, i.e. the model ABSTAINS
+    # rather than asserting — that is the intended safety property.** Fail-soft:
+    # no calibrator on the artifact (or this off) ⇒ the raw probability is used,
+    # exactly the pre-2026-08-03 behaviour.
+    enable_ml_probability_calibration: bool = True
+
+    # ML EXIT model (2026-08-02, src/analysis/ml_exit_dataset.py) — the learned
+    # exit-timer over position state (MFE/MAE/days-held/combine-degradation) + the
+    # oriented method scores. Its baseline (`exit_method_consensus`) is measured
+    # ANTI-PREDICTIVE at 3d and 5d, so this is the exit-side counterpart to the
+    # entry stacker swap. COUPLED to the entry arm: it DRIVES exits only for trades
+    # stamped `ml_arm` (opened while the ml_buy/ml_sell arm was active), so
+    # ML entry and ML exit ride the same A/B flip. For every other held position it
+    # is still scored + persisted to the exit_signals panel (IC-tracked live) but
+    # never closes it. Fail-soft: no artifact ⇒ the hand-built exit machinery is
+    # kept. A confident hold-conviction ≤ −ml_exit_threshold triggers the close.
+    enable_ml_exit_model: bool = True
+    ml_exit_threshold: float = 0.35            # oriented hold-conviction ≤ −this → ml_exit
+    ml_exit_horizon_days: int = 5              # label look-ahead the exit model optimises
+    # Retrain the exit model at EOD on the freshly-materialised panel.
+    enable_eod_ml_exit_train: bool = True
+
     # Automatic database refactor (src/analysis/refactor.py). Detects that an
     # implementation changed (AST fingerprint per method) and repairs the stored
     # history in dependency order: data -> epochs -> weights -> derived.
+    # A walk-forward step whose fail-soft layers returned EMPTY despite this
+    # many visible panel rows is treated as DEGRADED, not as a market fact.
+    # Observed once (2026-07-26 stored 21 active methods between neighbours at
+    # 10, non-reproducible) — a transient DB read lost to the live scheduler
+    # yields "nothing filtered", a materially more permissive calibration that
+    # looks entirely legitimate. Degraded steps are stored but skipped when
+    # resolving weights for a date, so the last GOOD calibration is used.
+    walkforward_min_rows_to_filter: int = 20000
+
     enable_auto_refactor: bool = True
+    # When the nightly rescore runs (ET). Its own slot rather than part of EOD
+    # maintenance: the rescore is ~40 minutes and the scheduler loop is
+    # single-threaded, so it runs in a BACKGROUND thread and must not be hosted
+    # inside an inline step. 02:00 ET sits inside the overnight session
+    # (ticks at 01:00/02:00/03:00/03:30), which is precisely why it cannot
+    # block — change detection is sub-second, so an unchanged night is free and
+    # the expensive path only starts when an implementation actually changed.
+    rescore_time: str = "02:00"
+
     # Mask (epoch) a method whose code changed but which CANNOT be regenerated.
     # OFF by default and deliberately so: masking withholds real history, and
     # the detector cannot tell a cosmetic edit from a categorical one — a rename
@@ -1445,17 +1607,18 @@ class Settings(BaseSettings):
     enable_market_relative_weighting: bool = True
     market_relative_horizon: str = "1w"     # column in compute_directional_perf
     market_relative_min_obs: int = 200
-    # The HARD filter also uses the market-relative basis. Bar is a literal 50%
-    # (winrate_filter_threshold) — on this basis the median stock is
-    # market-relative-NEGATIVE (~48.1%), so 50% is the STRICTER of the two
-    # defensible bars and the deliberate risk posture. Set
-    # market_relative_filter_baseline=true to use the measured baseline instead;
-    # the two differ only by the methods sitting between them (currently
-    # ext_gap 49.7% and insider 49.2%).
+    # The HARD filter judges on PROMOTION LOGIC (rebased 2026-08-12, user-
+    # directed): a weighted method is dropped only when the promotion statistic
+    # itself — market-neutral per-day IC over the directional panel — is
+    # SIGNIFICANTLY negative (t = |ICIR|·sqrt(n_days) ≥ ic_weight_min_t) at
+    # every horizon judgeable with ≥ market_relative_min_obs rows. Same
+    # evidence bar to lose weight as to earn it; unproven ≠ disproven. The
+    # 2026-07-27→08-12 rule (point-estimate hit rate net of benchmark < 50%,
+    # no significance test) zeroed 14/27 weighted methods on the live window,
+    # including the strongest 20y-validated promotions (hi52, mom_12_1).
     # Filtered methods are STILL scored, persisted to the signals panel and
     # IC-tracked, so a dropped method can re-earn its place.
     enable_market_relative_filter: bool = True
-    market_relative_filter_baseline: bool = False
 
     enable_regime_size_haircut: bool = True
     risk_off_size_multiplier: float = 0.5
@@ -2012,6 +2175,17 @@ class Settings(BaseSettings):
     # false-trip it, while a real wedge (EVERY request times out) trips within the
     # first few calls. 0 = disable wedge detection (legacy: trust isConnected()).
     broker_wedge_timeout_threshold: int = 5
+    # REPEATED-wedge escalation (2026-08-04). The wedge handling above force-
+    # recycles the CLIENT, and gateway recovery used to fire only when that forced
+    # redial FAILED. Observed live: a wedged gateway ACCEPTED every reconnect and
+    # then timed out every request, so the redial succeeded ~14 times in a row and
+    # recovery never fired — the loop ran 07:39→08:00 with auto-restart enabled and
+    # did nothing. A gateway needing this many force-recycles inside the window is
+    # therefore treated as the corpse REGARDLESS of whether it answers the dial.
+    # Any genuinely successful request clears the history (only a real response
+    # proves it is back). Keep the limit >2 so an ordinary blip can't escalate.
+    broker_wedge_recycle_limit: int = 3
+    broker_wedge_recycle_window_seconds: float = 900.0
     # ── GATEWAY auto-recovery (2026-07-13, the last manual ops step automated) ──
     # The app-side self-healing above (auto-reconnect, wedge detection + forced
     # client recycle) can only fix the APP's side of the session. When the GATEWAY
@@ -2031,9 +2205,15 @@ class Settings(BaseSettings):
     broker_gateway_task_name: str = "IBC Gateway"   # the IBC relaunch scheduled task
     broker_gateway_restart_cooldown_minutes: int = 30
     # sync-path restarts wait up to this long for the fresh gateway's port before
-    # the final in-tick dial (the IBC relaunch + auto-login takes ~60s); the
-    # wedge-path fires without waiting (next touchpoint redials).
-    broker_gateway_restart_wait_seconds: int = 90
+    # the final in-tick dial; the wedge-path fires without waiting (next touchpoint
+    # redials). RAISED 90 → 300 on 2026-08-04: the "~60s" estimate was optimistic —
+    # a MEASURED cold IBC relaunch + auto-login took **250s** to start listening, so
+    # at 90s the recovery logged "port not listening — will reconnect on a later
+    # touchpoint" and returned False while the gateway was in fact coming up fine.
+    # That turned a successful restart into a reported failure (and, on the sync
+    # path, skipped the final in-tick dial for no reason). The wait costs nothing
+    # when the port comes up sooner — the loop returns as soon as it is listening.
+    broker_gateway_restart_wait_seconds: int = 300
     # ── Settle pass: fill fast or kill ───────────────────────────────────
     # After this tick's orders are submitted, actively watch them for up to
     # this many seconds: fills are recorded the moment they land; a zero-fill
@@ -2379,9 +2559,28 @@ class Settings(BaseSettings):
     #      consensus (`exit_method_consensus`: money_flow / max_pain / …; − = exit,
     #      LLM + aggregator + time-overlays EXCLUDED) is confidently "exit"
     #      (≤ −mechanical_exit_threshold), independent of the LLM review (exit_reason
-    #      "mechanical_exit") — times the exit off positive-exit-IC signals rather
-    #      than waiting for the late LLM flip.
-    enable_mechanical_exit: bool = True
+    #      "mechanical_exit").
+    #
+    #      **OFF SINCE 2026-08-02 — DELIBERATELY, and do NOT "fix" the threshold.**
+    #      Two independent measurements condemn this rule:
+    #        (a) it is ANTI-PREDICTIVE — over the simulated held-position panel its
+    #            exit signal runs IC −0.066 / hit 46% at 3d AND 5d, i.e. it times
+    #            multi-day exits BACKWARDS (it averages ~21 mostly 1-day methods, the
+    #            same horizon mismatch that made the weighted entry combine fail at 5d);
+    #        (b) at the threshold below it CANNOT FIRE ANYWAY. The consensus is a MEAN
+    #            of ~21 near-zero scores, so its whole observed range is [−0.26, +0.32]
+    #            over 23,387 held-days — 0.35 is outside it (0.000% fire rate; the live
+    #            ledger shows 4 hits in 328 closes, all thin-method tickers).
+    #      So the rule was already inert BY ACCIDENT, which was quietly protecting the
+    #      book. Lowering the threshold to "make it work" (≤−0.10 fires ~5%) would wire
+    #      in a rule measured to exit wrong ~54% of the time. Turned off explicitly so
+    #      that protection is intentional and survives a future threshold tweak.
+    #      The learned replacement is `ml_exit` (enable_ml_exit_model), which DOES fire
+    #      and has measured skill. Re-validate with `python -m src.analysis.exit_policy_sim`
+    #      before ever re-enabling. Exits do NOT depend on this rule: horizon_expired,
+    #      trailing_stop, llm_signal_flipped, llm_confidence_loss and adverse_stop
+    #      account for ~99% of live closes.
+    enable_mechanical_exit: bool = False
     mechanical_exit_threshold: float = 0.35    # consensus ≤ −this → mechanical exit
 
     # ── End-of-day maintenance (2026-07-04) — scalability for the weeks ahead ──

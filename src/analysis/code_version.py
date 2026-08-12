@@ -83,10 +83,19 @@ METHOD_SOURCES: Dict[str, Tuple[str, ...]] = {
     "hi52": ("src.signals.classic_anomalies",),
     "mom_12_1": ("src.signals.classic_anomalies",),
     "st_reversal": ("src.signals.classic_anomalies",),
+    "rsi2_rev": ("src.signals.classic_anomalies",),
+    "dloc_rev": ("src.signals.classic_anomalies",),
     "squeeze": ("src.signals.ttm_squeeze",),
     "avwap": ("src.signals.anchored_vwap",),
     "resid_mom": ("src.signals.residual_momentum",),
     "vol_profile": ("src.signals.volume_profile",),
+    # ML OHLCV model — the scoring orchestration + the feature code. A CODE change
+    # to either is caught by the AST fingerprint (and, since ml_ohlcv is not
+    # replayable, REPORTED rather than auto-masked at weight 0). A RETRAIN changes
+    # the output without touching the code, so that comparability is the model
+    # registry's job (ml_models), deferred to promotion.
+    "ml_ohlcv": ("src.signals.ml_model", "src.analysis.ml_dataset",
+                 "src.analysis.pivot_target"),
     # Trend predictability (one module, four sides)
     "kaufman_long": ("src.signals.trend_predictability",),
     "kaufman_short": ("src.signals.trend_predictability",),

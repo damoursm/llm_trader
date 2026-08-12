@@ -18,7 +18,7 @@ from bisect import bisect_left
 from statistics import median
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 from loguru import logger
 
 from src.models import Recommendation
@@ -424,7 +424,7 @@ _LLM_ENGINES = ("anthropic", "deepseek", "qwen")
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile")
+_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families. Every
@@ -437,7 +437,9 @@ METHOD_CATEGORIES: Dict[str, List[str]] = {
     "Technical":   ["tech", "massive", "vwap", "pattern", "momentum", "sector_momentum",
                     "market_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap",
                     "kaufman_long", "kaufman_short", "adx_long", "adx_short",
-                    "hi52", "mom_12_1", "st_reversal", "squeeze", "avwap", "resid_mom", "vol_profile"],
+                    "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev",
+                    "squeeze", "avwap", "resid_mom", "vol_profile",
+                    "ml_ohlcv"],
     "Smart Money": ["insider"],
     "Options":     ["put_call", "max_pain", "oi_skew", "iv_expr", "iv_term"],
     "Fundamental": ["pead", "f_value", "f_quality", "f_growth", "f_short_squeeze",
@@ -503,6 +505,12 @@ METHOD_LABELS.update({
     "st_reversal": "Short-Term Reversal (1w, liquid)",
 })
 
+# Mean-reversion additions (2026-08-10, panel-first at weight 0).
+METHOD_LABELS.update({
+    "rsi2_rev": "RSI(2) Snapback (Connors)",
+    "dloc_rev": "Candle-Location Reversal (1d)",
+})
+
 # Tier-2 panel-first methods (2026-07-08, weight 0).
 METHOD_LABELS.update({
     "squeeze": "TTM Squeeze (BB/Keltner coil)",
@@ -514,6 +522,11 @@ METHOD_LABELS.update({
 METHOD_LABELS.update({
     "resid_mom":   "Residual Momentum (beta-adj 12-1)",
     "vol_profile": "Volume Profile (POC/Value Area)",
+})
+
+# ML model as a panel-first method (2026-07-30, weight 0 — signals/ml_model.py).
+METHOD_LABELS.update({
+    "ml_ohlcv": "ML OHLCV (GBM, panel-first)",
 })
 
 
@@ -557,6 +570,9 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         "hi52":        getattr(sig, "high_52w_score", 0.0),
         "mom_12_1":    getattr(sig, "momentum_12_1_score", 0.0),
         "st_reversal": getattr(sig, "st_reversal_score", 0.0),
+        # Mean-reversion additions (2026-08-10, panel-first at weight 0).
+        "rsi2_rev":    getattr(sig, "rsi2_rev_score", 0.0),
+        "dloc_rev":    getattr(sig, "dloc_rev_score", 0.0),
         # Tier-2 panel-first methods (2026-07-08, weight 0): TTM squeeze,
         # IV term-structure slope, anchored VWAP.
         "squeeze":     getattr(sig, "squeeze_score", 0.0),
@@ -566,6 +582,8 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         # volume profile (POC / value area).
         "resid_mom":   getattr(sig, "resid_mom_score", 0.0),
         "vol_profile": getattr(sig, "vol_profile_score", 0.0),
+        # ML OHLCV model (2026-07-30, panel-first at weight 0 — signals/ml_model.py).
+        "ml_ohlcv":    getattr(sig, "ml_ohlcv_score", 0.0),
         # Fundamental + corp-action factors live on the signal's fundamental_scores dict.
         **{m: float((getattr(sig, "fundamental_scores", None) or {}).get(m, 0.0))
            for m in ("f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend")},
@@ -606,12 +624,76 @@ def _compute_nav_compound(trades: list) -> Optional[float]:
     return compute_compound_return(trades or [])
 
 
+# ── The win-rate convention (standing directive, 2026-08-06) ─────────────────
+# EVERY win rate in this system is GROSS: it asks only whether the position moved
+# the way it was supposed to, on raw prices, before spread and commission. Costs
+# are judged by the RETURN metrics (avg / weighted / compound `return_pct`),
+# which stay fully cost-adjusted.
+#
+# Why split them. A win rate computed on a cost-adjusted return silently answers
+# two questions at once — "was the direction right?" and "was the move bigger
+# than the round trip?" — and the second is an execution property, not a signal
+# property. It moves with the spread model, the venue and the session, so the
+# same signal scores worse for being traded in wide markets, and every cost
+# recalibration rewrites the win rate of history that did not change. Separating
+# them means win rate measures the SIGNAL and returns measure the BUSINESS.
+#
+# ``compute_solo_method_gross_winrate`` already worked this way; these helpers
+# make the identical convention available to every other ledger consumer.
+
+def gross_return_pct(trade: dict) -> Optional[float]:
+    """Direction-aware GROSS % return of a trade — raw prices, no costs.
+
+    Uses the exit price for a closed trade and the live mark for an open one, so
+    open positions contribute on the same basis they already do to ``return_pct``.
+    ``None`` when the trade carries no usable price pair.
+    """
+    exit_px = trade.get("exit_price")
+    if exit_px is None:
+        exit_px = trade.get("current_price")
+    try:
+        entry_f = float(trade.get("entry_price"))
+        exit_f = float(exit_px)
+    except (TypeError, ValueError):
+        return None
+    if entry_f <= 0:
+        return None
+    sign = -1.0 if str(trade.get("action", "")).upper() == "SELL" else 1.0
+    return sign * (exit_f - entry_f) / entry_f * 100.0
+
+
+def is_gross_win(trade: dict) -> Optional[bool]:
+    """Did the position move the way it was supposed to? ``None`` = unknowable.
+
+    A flat round trip (exit == entry) is not a win — the direction did not pay —
+    but neither is it charged the spread, which is the whole difference from the
+    old cost-adjusted test.
+    """
+    g = gross_return_pct(trade)
+    return None if g is None else g > 0.0
+
+
+def gross_win_rate(trades: Sequence[dict]) -> Optional[float]:
+    """GROSS win rate (%) over a slice of trades; ``None`` when unmeasurable.
+
+    Trades whose prices cannot yield a gross outcome are dropped from BOTH the
+    numerator and the denominator — counting them as losses would let a data gap
+    masquerade as a bad signal.
+    """
+    outcomes = [w for w in (is_gross_win(t) for t in (trades or [])) if w is not None]
+    if not outcomes:
+        return None
+    return round(100.0 * sum(1 for w in outcomes if w) / len(outcomes), 1)
+
+
 def _compute_segment_stats(trades: List[dict]) -> Optional[dict]:
     """Compute all standard performance metrics for a slice of trades.
 
-    Compound return is computed from the actual daily price walk (no
-    interpolation) via ``_compute_nav_compound``, which accepts trade dicts
-    directly so the OHLCV cache can be consulted per ticker.
+    ``win_rate`` is GROSS (see the convention note above); every return metric
+    stays on the cost-adjusted ``return_pct``. Compound return is computed from
+    the actual daily price walk (no interpolation) via ``_compute_nav_compound``,
+    which accepts trade dicts directly so the OHLCV cache can be consulted per
+    ticker.
     """
     if not trades:
         return None
@@ -622,10 +704,9 @@ def _compute_segment_stats(trades: List[dict]) -> Optional[dict]:
         sum(r * m for r, m in zip(returns, multipliers)) / total_mul
         if total_mul else 0.0
     )
-    wins = [r for r in returns if r > 0]
     return {
         "trades":          len(trades),
-        "win_rate":        round(len(wins) / len(returns) * 100, 1),
+        "win_rate":        gross_win_rate(trades) or 0.0,
         "compound_return": _compute_nav_compound(trades) or 0.0,
         "avg_return":      round(sum(returns) / len(returns), 2),
         "median_return":   round(median(returns), 2),
@@ -1444,22 +1525,24 @@ def _compute_method_stats(closed_trades: List[dict]) -> dict:
         methods_agreed = t.get("methods_agreeing", [])
         ret = t.get("return_pct", 0.0)
         mul = t.get("position_size_multiplier", 1.0)
+        win = is_gross_win(t)          # carried alongside: the bucket drops the trade
         for m in methods_agreed:
             if m in buckets:
-                buckets[m].append((ret, mul))
+                buckets[m].append((ret, mul, win))
 
     result = {}
     for method, entries in buckets.items():
         if len(entries) < MIN_TRADES:
             continue
-        returns = [r for r, _ in entries]
-        muls    = [m for _, m in entries]
+        returns = [r for r, _, _ in entries]
+        muls    = [m for _, m, _ in entries]
         total_mul = sum(muls)
-        wins = [r for r in returns if r > 0]
+        wins = [w for _, _, w in entries if w is not None]
         weighted_avg = sum(r * m for r, m in zip(returns, muls)) / total_mul if total_mul else 0.0
         result[method] = {
             "trades":              len(entries),
-            "win_rate":            round(len(wins) / len(returns) * 100, 1),
+            # GROSS (convention) — the return columns below stay cost-adjusted.
+            "win_rate":            round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return":          round(sum(returns) / len(returns), 2),
             "weighted_avg_return": round(weighted_avg, 2),
         }
@@ -1482,24 +1565,25 @@ def _compute_category_stats(closed_trades: List[dict]) -> dict:
             continue
         ret = t.get("return_pct", 0.0)
         mul = t.get("position_size_multiplier", 1.0)
+        win = is_gross_win(t)
         seen_cats: set = set()
         for cat, members in METHOD_CATEGORIES.items():
             if any(m in methods_agreed for m in members) and cat not in seen_cats:
-                buckets[cat].append((ret, mul))
+                buckets[cat].append((ret, mul, win))
                 seen_cats.add(cat)
 
     result = {}
     for cat, entries in buckets.items():
         if len(entries) < MIN_TRADES:
             continue
-        returns  = [r for r, _ in entries]
-        muls     = [m for _, m in entries]
+        returns  = [r for r, _, _ in entries]
+        muls     = [m for _, m, _ in entries]
         total_m  = sum(muls)
-        wins     = [r for r in returns if r > 0]
+        wins     = [w for _, _, w in entries if w is not None]
         w_avg    = sum(r * m for r, m in zip(returns, muls)) / total_m if total_m else 0.0
         result[cat] = {
             "trades":              len(entries),
-            "win_rate":            round(len(wins) / len(returns) * 100, 1),
+            "win_rate":            round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return":          round(sum(returns) / len(returns), 2),
             "weighted_avg_return": round(w_avg, 2),
         }
@@ -1526,18 +1610,19 @@ def _compute_convergence_stats(closed_trades: List[dict]) -> dict:
         if not agreed:   # no attribution data (legacy trade)
             continue
         label = _bucket(len(agreed))
-        buckets.setdefault(label, []).append(t.get("return_pct", 0.0))
+        buckets.setdefault(label, []).append((t.get("return_pct", 0.0), is_gross_win(t)))
 
     order = ["4+ methods", "3 methods", "2 methods", "1 method"]
     result = {}
     for label in order:
-        returns = buckets.get(label, [])
-        if len(returns) < 2:
+        entries = buckets.get(label, [])
+        if len(entries) < 2:
             continue
-        wins = [r for r in returns if r > 0]
+        returns = [r for r, _ in entries]
+        wins = [w for _, w in entries if w is not None]
         result[label] = {
             "trades":     len(returns),
-            "win_rate":   round(len(wins) / len(returns) * 100, 1),
+            "win_rate":   round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return": round(sum(returns) / len(returns), 2),
         }
 
@@ -1557,16 +1642,17 @@ def _compute_dominant_stats(closed_trades: List[dict]) -> dict:
         dom = t.get("dominant_method", "none")
         if dom == "none":
             continue
-        buckets.setdefault(dom, []).append(t.get("return_pct", 0.0))
+        buckets.setdefault(dom, []).append((t.get("return_pct", 0.0), is_gross_win(t)))
 
     result = {}
-    for method, returns in buckets.items():
-        if len(returns) < MIN_TRADES:
+    for method, entries in buckets.items():
+        if len(entries) < MIN_TRADES:
             continue
-        wins = [r for r in returns if r > 0]
+        returns = [r for r, _ in entries]
+        wins = [w for _, w in entries if w is not None]
         result[method] = {
             "trades":     len(returns),
-            "win_rate":   round(len(wins) / len(returns) * 100, 1),
+            "win_rate":   round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return": round(sum(returns) / len(returns), 2),
         }
 
@@ -1590,7 +1676,7 @@ def _compute_confidence_ranked(closed_trades: List[dict]) -> List[dict]:
     for i, t in enumerate(sorted_trades, 1):
         ret = t.get("return_pct", 0.0)
         running_sum += ret
-        if ret > 0:
+        if is_gross_win(t):            # GROSS (convention); cumulative_avg stays net
             running_wins += 1
         rows.append({
             "rank":                 i,
@@ -1723,8 +1809,12 @@ def _breadth_calibration(trades: Optional[List[dict]] = None) -> dict:
         q = statistics.quantiles(fracs, n=4)
         half = max(float(settings.breadth_halfwidth_floor), q[2] - q[0])
 
-    closed = [(f, (t.get("return_pct") or 0.0) > 0)
-              for t, f in recent if t.get("status") == "CLOSED"]
+    # GROSS win (convention): whether breadth predicts DIRECTION, which is what
+    # the sizing tilt is claiming. Charging it the spread would make the tilt
+    # move with the cost model rather than with the signal.
+    closed = [(f, bool(is_gross_win(t)))
+              for t, f in recent if t.get("status") == "CLOSED"
+              and is_gross_win(t) is not None]
     n_closed = len(closed)
     d_prior = float(settings.breadth_edge_prior)
     prior_n = max(0, int(settings.breadth_edge_prior_n))
@@ -2124,9 +2214,14 @@ def record_new_trades(
         sig_at_entry = None
         pattern_at_entry: Optional[str] = None
         pattern_score_at_entry: Optional[float] = None
+        # Re-initialised per ticker: `sig` below is bound only inside the guard, so
+        # reading it later would either NameError or leak the PREVIOUS ticker's signal.
+        combine_source_at_entry = "weighted"
         if signals_by_ticker is not None:
             sig = signals_by_ticker.get(rec.ticker)
             if sig is not None:
+                combine_source_at_entry = str(getattr(sig, "combine_source", "weighted")
+                                              or "weighted")
                 sig_at_entry = {
                     "combined_score":  round(float(getattr(sig, "combined_score", 0.0)), 4),
                     "confidence":      round(float(sig.confidence), 4),
@@ -2186,6 +2281,21 @@ def record_new_trades(
             "entry_date": today,
             "entry_datetime": executed_at,
             "entry_session": entry_session,
+            # ML combine arm (2026-08-01; tightened 2026-08-11, user directive
+            # "stacker entry ⇔ ML exit"): stamped only when the stacker ACTUALLY
+            # DROVE THIS TRADE'S SIDE, not merely when the run's coin was heads.
+            # The swap is fail-soft PER SIDE (combine_source: weighted | ml |
+            # ml_buy | ml_sell), so under a partial swap a SELL entered while
+            # only the buy side swapped was decided by the WEIGHTED combine —
+            # coupling its exit to the ML model would break the invariant both
+            # ways. The stamp is what routes the exit: ml_exit closes and the
+            # llm_confidence_loss suppression apply to stamped trades only.
+            "ml_arm": _ml_arm_stamp(rec.action, combine_source_at_entry),
+            # Which combine actually produced this ticker's buy/sell sides at entry
+            # (2026-08-02): "weighted" | "ml" | "ml_buy" | "ml_sell". The arm flag
+            # above says the arm was ON; this says what the swap DID (fail-soft per
+            # side), so ML-vs-weighted entry outcomes are measurable exactly.
+            "combine_source": combine_source_at_entry,
             "extended_size_multiplier": ext_mult if entry_session != "rth" else 1.0,
             "breadth_size_multiplier": breadth_mult,      # agreement-breadth tilt (audit)
             "breadth_at_entry": breadth,                  # len(methods_agreeing) | None
@@ -2342,11 +2452,39 @@ def compute_hold_prompt_eval(trades: Optional[List[dict]] = None) -> dict:
         if not seg:
             return None
         rets = [float(t.get("return_pct") or 0.0) for t in seg]
-        wins = sum(1 for r in rets if r > 0)
+        wins = [w for w in (is_gross_win(t) for t in seg) if w is not None]
         return {
             "trades": len(seg),
-            "win_rate": round(100.0 * wins / len(seg), 1),
+            "win_rate": round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return": round(sum(rets) / len(rets), 2),
+        }
+
+    return {"on": _seg(True), "off": _seg(False)}
+
+
+def compute_ml_arm_eval(trades: Optional[List[dict]] = None) -> dict:
+    """A/B outcome comparison for the ML combine arm (stacker buy combine +
+    longer hold). Trades are stamped ``ml_arm`` at ENTRY by the per-run
+    flip; this groups CLOSED trades by that stamp so the arm's realized outcomes —
+    and, critically, its HOLDING PERIOD (the whole point) — can be compared
+    against the current short-hold book. ``is flag`` excludes pre-experiment
+    trades (no stamp). Same row shape as the other A/B eval rows, plus
+    ``avg_days_held``."""
+    trades = trades if trades is not None else _load_trades()
+
+    def _seg(flag: bool) -> Optional[dict]:
+        seg = [t for t in trades
+               if t.get("status") == "CLOSED" and t.get("ml_arm") is flag]
+        if not seg:
+            return None
+        rets = [float(t.get("return_pct") or 0.0) for t in seg]
+        held = [int(t.get("days_held") or 0) for t in seg]
+        wins = [w for w in (is_gross_win(t) for t in seg) if w is not None]
+        return {
+            "trades": len(seg),
+            "win_rate": round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
+            "avg_return": round(sum(rets) / len(rets), 2),
+            "avg_days_held": round(sum(held) / len(held), 1) if held else 0.0,
         }
 
     return {"on": _seg(True), "off": _seg(False)}
@@ -2371,10 +2509,10 @@ def compute_synth_arm_eval(trades: Optional[List[dict]] = None) -> dict:
         if not seg:
             return None
         rets = [float(t.get("return_pct") or 0.0) for t in seg]
-        wins = sum(1 for r in rets if r > 0)
+        wins = [w for w in (is_gross_win(t) for t in seg) if w is not None]
         return {
             "trades": len(seg),
-            "win_rate": round(100.0 * wins / len(seg), 1),
+            "win_rate": round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return": round(sum(rets) / len(rets), 2),
         }
 
@@ -2399,10 +2537,10 @@ def compute_blind_synthesis_eval(trades: Optional[List[dict]] = None) -> dict:
         if not seg:
             return None
         rets = [float(t.get("return_pct") or 0.0) for t in seg]
-        wins = sum(1 for r in rets if r > 0)
+        wins = [w for w in (is_gross_win(t) for t in seg) if w is not None]
         return {
             "trades": len(seg),
-            "win_rate": round(100.0 * wins / len(seg), 1),
+            "win_rate": round(100.0 * sum(wins) / len(wins), 1) if wins else 0.0,
             "avg_return": round(sum(rets) / len(rets), 2),
         }
 
@@ -2741,7 +2879,7 @@ def _evaluate_decay(
         # catalyst) — treating that as an exit would just reintroduce premature
         # closes through another door. Only an explicit reversal or a genuine
         # same-direction conviction collapse closes.
-        if rev_action == action:
+        if rev_action == action and settings.enable_llm_confidence_loss_exit:
             # Effective floor = the entry-relative calibrated floor, nudged by
             # the raw-method EXIT CONSENSUS (evidence-throttled, bounded; 0 with
             # no data → exactly the pre-2026-07-03 behavior). Consensus says
@@ -3265,6 +3403,79 @@ def _adverse_stop_triggered(trade: dict) -> bool:
     return ret <= -abs(pct)
 
 
+# ── ML combine arm (2026-08-01) ──────────────────────────────────────────────
+# The exit reasons that ALWAYS fire on an arm trade regardless of any hold
+# window: a genuine direction flip, a PANIC/RISK_OFF regime close, and the hard
+# adverse-loss stop. These are thesis-break / safety events, never "degradation".
+_ARM_ALWAYS_EXIT = frozenset({"llm_signal_flipped", "signal_flipped",
+                              "macro_regime_exit", "adverse_stop"})
+
+# Exit reasons the ML EXIT MODEL OWNS for an arm trade (2026-08-02) — permanently
+# suppressed, not merely delayed.
+#
+# `llm_confidence_loss` closes on the DEGRADATION of the LLM's confidence, and
+# that quantity is measured ~uninformative about forward returns (it is also
+# already patched with a two-tick confirmation because it was cutting winners).
+# For the arm cohort the learned exit-timer replaces it outright: conviction is
+# judged by a model trained on the oriented held return at the horizon the entry
+# actually optimises, instead of by the drift of a scalar that does not predict.
+# Measured (exit_policy_sim, 3,294 simulated positions, excess over a hold-matched
+# no-information control): ml_exit +1.27 vs a trailing stop +0.44, and the
+# hand-built consensus never even fires. Direction flips and safety exits are NOT
+# in here — a broken thesis is information, not degradation.
+_ARM_ML_OWNED_EXITS = frozenset({"llm_confidence_loss"})
+
+# Per-run flag set by the pipeline's A/B flip; stamped onto new trades so the
+# entry swap and the ML exit travel together on a per-trade basis.
+_ML_ARM = False
+
+
+def set_ml_arm(active: bool) -> None:
+    """Pipeline hook — mark THIS run's new trades as ML-combine-arm trades."""
+    global _ML_ARM
+    _ML_ARM = bool(active)
+
+
+def _ml_arm_stamp(action: str, combine_source: Optional[str]) -> bool:
+    """True iff the ML stacker ACTUALLY drove this trade's entry side.
+
+    The invariant (user directive 2026-08-11): stacker entry ⇔ ML exit. The
+    ``ml_arm`` stamp is what routes the exit (``ml_exit`` may close, and the
+    ``llm_confidence_loss`` suppression applies, ONLY on stamped trades), so it
+    must reflect actual use, not the run's coin: the swap is fail-soft PER SIDE
+    (``combine_source``: weighted | ml | ml_buy | ml_sell), and a missing/failed
+    artifact or a partial swap means the WEIGHTED combine decided this side.
+    No signal recorded → "weighted" → False: no proof of stacker use, no ML exit.
+    """
+    if not _ML_ARM:
+        return False
+    src = str(combine_source or "")
+    return src in (("ml", "ml_buy") if action == "BUY" else ("ml", "ml_sell"))
+
+
+def _arm_suppresses_exit(trade: dict, reason: Optional[str]) -> bool:
+    """True when the ML arm should HOLD THROUGH this exit reason.
+
+    Two cases, both arm-trades-only and neither touching ``_ARM_ALWAYS_EXIT``:
+
+    1. **Owned** (``_ARM_ML_OWNED_EXITS``) — the ML exit model has taken over this
+       decision permanently (the confidence-degradation exit).
+    2. **Min-hold** — a legacy time window. MEASURED HARMFUL and therefore default
+       0/inert: forcing the hold destroyed ~37% of the exit model's timing edge
+       (excess +1.27 → +0.80) and cost ~1.8pp of return per position, because it
+       holds through exactly the deterioration the model detected. Kept as a knob
+       (a future regime could differ) but off unless deliberately set.
+    """
+    if not reason or reason in _ARM_ALWAYS_EXIT or not trade.get("ml_arm"):
+        return False
+    if reason in _ARM_ML_OWNED_EXITS:
+        return True
+    try:
+        return _trading_days_held(trade["entry_date"]) < int(settings.ml_arm_min_hold_days)
+    except Exception:
+        return False
+
+
 def monitor_open_positions(
     signals_by_ticker: Optional[dict] = None,
     macro_regime_context=None,
@@ -3324,10 +3535,13 @@ def monitor_open_positions(
         hold_review = (hold_reviews or {}).get(trade["ticker"])
         exit_adj = 0.0
         _escores = None
-        # Exit scores drive BOTH the LLM floor nudge (needs a hold_review) and the
-        # mechanical-consensus exit (independent of the LLM) — compute once when
-        # either is wanted (build_exit_scores is hold_review-None-safe).
-        if _use_escores or settings.enable_mechanical_exit:
+        # Exit scores drive the LLM floor nudge (needs a hold_review), the
+        # mechanical-consensus exit, AND the ML exit model — compute once when ANY
+        # of them is wanted (build_exit_scores is hold_review-None-safe).
+        # `enable_ml_exit_model` is listed EXPLICITLY: ml_exit reads _escores, so
+        # without it here the ML exit would silently die the moment the other
+        # three flags happened to be off (mechanical_exit is now off by default).
+        if _use_escores or settings.enable_mechanical_exit or settings.enable_ml_exit_model:
             try:
                 _escores = build_exit_scores(trade, hold_review, signals_by_ticker,
                                              macro_regime_context)
@@ -3360,10 +3574,25 @@ def monitor_open_positions(
         # not, and squeezes accelerate against you.
         if reason is None and _adverse_stop_triggered(trade):
             reason = "adverse_stop"
-        if reason is None and settings.enable_mechanical_exit and _escores is not None:
+        # The hand-built consensus (money_flow/max_pain/…; − = exit) is measured
+        # ANTI-PREDICTIVE at 3d/5d, so for the ARM cohort the ML exit model
+        # supersedes it (next block) — restrict the consensus close to NON-arm trades.
+        if reason is None and settings.enable_mechanical_exit and _escores is not None \
+                and not trade.get("ml_arm"):
             _mc = exit_method_consensus(_escores)
             if _mc is not None and _mc <= -abs(float(settings.mechanical_exit_threshold)):
                 reason = "mechanical_exit"
+        # (3b) ML exit model — arm trades only. The learned exit-timer (position
+        # state + oriented methods) replaces the anti-predictive consensus for the
+        # long-horizon cohort, so the ML entry swap and the ML exit ride together.
+        # Persisted as _escores["ml_exit"] in build_exit_scores (+ = keep, − = exit);
+        # a confident exit closes. Suppressed inside the min-hold window by
+        # _arm_suppresses_exit below, so it can only fire once past it.
+        if reason is None and settings.enable_ml_exit_model and trade.get("ml_arm") \
+                and _escores is not None:
+            _mx = _escores.get("ml_exit")
+            if _mx is not None and _mx <= -abs(float(settings.ml_exit_threshold)):
+                reason = "ml_exit"
         # Opt-in intraday exit: close when the 30-min trend has reversed hard
         # against the position (Hybrid model — intraday only times the exit).
         if reason is None and settings.enable_intraday_exit:
@@ -3375,6 +3604,19 @@ def monitor_open_positions(
                     f"[monitor] intraday reversal on {trade['action']} {trade['ticker']} "
                     f"(30-min score {timing['score']:+.2f}) → closing"
                 )
+
+        # ── Long-horizon buy arm: hold to the target horizon ──────────────
+        # Suppress the TIME / CONVICTION exits until the arm trade has been held
+        # ml_arm_min_hold_days, so the 5d stacker edge can play out. The SAFETY exits
+        # (_ARM_ALWAYS_EXIT: direction flip, PANIC/RISK_OFF regime, hard adverse
+        # stop) are never suppressed, so a broken thesis / crash / runaway loss is
+        # never held hostage to the horizon.
+        if _arm_suppresses_exit(trade, reason):
+            logger.debug(f"[monitor] long-horizon hold: {trade['ticker']} "
+                         f"suppressing '{reason}' ({_trading_days_held(trade['entry_date'])}d "
+                         f"< {settings.ml_arm_min_hold_days}d)")
+            reason = None
+
         if reason is None:
             continue
 
@@ -3415,7 +3657,7 @@ def monitor_open_positions(
 
         # Logging — branch by which decision-maker fired so the line is legible.
         regime = getattr(macro_regime_context, "regime", "") if macro_regime_context else ""
-        if reason in ("trailing_stop", "mechanical_exit", "adverse_stop"):
+        if reason in ("trailing_stop", "mechanical_exit", "adverse_stop", "ml_exit"):
             if reason == "trailing_stop":
                 extra = (f"MFE peaked {trade.get('max_favorable_excursion')}% → gave back to "
                          f"{ret:+.2f}% (≥{settings.trailing_give_back_frac:.0%} of the peak)")
@@ -3424,6 +3666,11 @@ def monitor_open_positions(
                 extra = (f"hard loss cap: {ret:+.2f}% breached the "
                          f"{float(_dir('adverse_stop_pct', trade.get('action')) or 0):.1f}% "
                          f"{'short' if trade.get('action') == 'SELL' else 'long'} stop")
+            elif reason == "ml_exit":
+                _mxv = (_escores or {}).get("ml_exit")
+                extra = (f"ML exit model said EXIT (hold-conviction "
+                         f"{_mxv:+.2f} ≤ −{float(settings.ml_exit_threshold):.2f}) "
+                         f"[long-horizon arm]") if _mxv is not None else "ML exit model said EXIT"
             else:
                 extra = "mechanical signal consensus said EXIT (money_flow/max_pain/…)"
             logger.info(
@@ -3771,8 +4018,7 @@ def log_performance_summary() -> None:
     if closed_trades:
         returns = [t["return_pct"] for t in closed_trades]
         multipliers = [t.get("position_size_multiplier", 1.0) for t in closed_trades]
-        wins = [r for r in returns if r > 0]
-        win_rate = len(wins) / len(returns) * 100
+        win_rate = gross_win_rate(closed_trades) or 0.0
         avg_return = sum(returns) / len(returns)
         total_mul = sum(multipliers)
         weighted_avg = sum(r * m for r, m in zip(returns, multipliers)) / total_mul if total_mul else avg_return
@@ -4287,10 +4533,11 @@ def _solo_stats(trades: list) -> dict:
     if not trades:
         return {}
     hyp = [t["return_pct"] for t in trades]
-    wins = [r for r in hyp if r > 0]
     return {
         "trades":          len(trades),
-        "win_rate":        round(len(wins) / len(hyp) * 100, 1),
+        # GROSS (convention). `_flip_trade` rewrites action AND prices for a
+        # disagreeing method, so the gross test reads the flipped view correctly.
+        "win_rate":        gross_win_rate(trades) or 0.0,
         "avg_return":      round(sum(hyp) / len(hyp), 2),
         "compound_return": _compute_nav_compound(trades) or 0.0,
         "best":            round(max(hyp), 2),
@@ -4315,19 +4562,20 @@ def _eval_stats(entries: list) -> dict:
     """
     if not entries:
         return {}
-    correct = [t["return_pct"] for t, _ in entries if t["return_pct"] > 0]
-    wrong   = [t["return_pct"] for t, _ in entries if t["return_pct"] <= 0]
+    # "Correct" is a DIRECTIONAL claim, so it is judged gross (convention); the
+    # return columns alongside stay cost-adjusted.
+    correct = [t["return_pct"] for t, _ in entries if is_gross_win(t)]
+    wrong   = [t["return_pct"] for t, _ in entries if not is_gross_win(t)]
     conviction_bands = []
     for label, lo, hi in _EVAL_BANDS:
         band = [t for t, s in entries if lo <= s < hi]
         if not band:
             conviction_bands.append({"label": label, "trades": 0, "accuracy": 0.0, "avg_return": 0.0, "compound_return": 0.0})
             continue
-        band_correct = [t["return_pct"] for t in band if t["return_pct"] > 0]
         conviction_bands.append({
             "label":           label,
             "trades":          len(band),
-            "accuracy":        round(len(band_correct) / len(band) * 100, 1),
+            "accuracy":        gross_win_rate(band) or 0.0,
             "avg_return":      round(sum(t["return_pct"] for t in band) / len(band), 2),
             "compound_return": _compute_nav_compound(band) or 0.0,
         })
@@ -4916,7 +5164,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
             compound *= (1 + r / 100)
 
         stats.update({
-            "win_rate":            round(len([r for r in returns if r > 0]) / len(returns) * 100, 1),
+            "win_rate":            gross_win_rate(all_trades) or 0.0,
             "avg_return":          round(sum(returns) / len(returns), 2),
             "median_return":       round(median(returns), 2),
             "weighted_avg_return": round(weighted_avg, 2),
@@ -4972,6 +5220,7 @@ def get_performance_for_email(window_days: Optional[int] = None,
         "sim_one_way_cost_pct":     _displayed_one_way_cost_pct(all_trades, real_cost_frac),  # per-leg 1-way cost shown in Returns
         "sim_cost_is_real":         real_cost_frac is not None,   # True = calibrated to real IBKR fills, False = modeled
         "hold_prompt_eval":         compute_hold_prompt_eval(trades),  # held-positions prompt A/B (exit outcomes ON vs OFF)
+        "ml_arm_eval":    compute_ml_arm_eval(trades),  # ML combine arm A/B (stacker buy + longer hold; ON vs OFF, w/ avg hold days)
         "blind_synthesis_eval":     compute_blind_synthesis_eval(trades),  # blind-synthesis A/B (entry outcomes ON vs OFF)
         "synth_arm_eval":           compute_synth_arm_eval(trades),        # 3-arm prompt bake-off (ledger view)
         "method_eval_stats":        method_eval_stats,         # per-method accuracy + conviction calibration

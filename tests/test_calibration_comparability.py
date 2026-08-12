@@ -60,9 +60,12 @@ def test_disabling_the_epoch_makes_everything_comparable(monkeypatch):
 # ── the two ledger-side calibrations honour it ─────────────────────────────
 
 def _trade(day, conf, ret, action="BUY"):
+    # Win/loss is GROSS from the prices (system convention, 2026-08-06).
+    sign = 1.0 if action == "BUY" else -1.0
     return {"status": "CLOSED", "action": action, "ticker": "AAA",
             "entry_date": day, "entry_datetime": f"{day}T14:00:00+00:00",
-            "confidence": conf, "return_pct": ret}
+            "confidence": conf, "return_pct": ret,
+            "entry_price": 100.0, "exit_price": 100.0 * (1 + sign * ret / 100.0)}
 
 
 def test_confidence_sizing_excludes_pre_epoch_trades(monkeypatch):
@@ -114,4 +117,8 @@ def test_method_scores_have_the_same_guarantee():
     assert "money_flow" in METHOD_SCORER_EPOCH
     assert score_is_comparable("money_flow", "2026-07-01") is False
     assert score_is_comparable("money_flow", "2026-07-26") is True
-    assert score_is_comparable("vwap", "2020-01-01") is True
+    # vwap gained an epoch 2026-08-11 (window 20 -> 5): its old rows are now
+    # correctly NON-comparable, and a method with no epoch stays always-true.
+    assert score_is_comparable("vwap", "2020-01-01") is False
+    assert score_is_comparable("vwap", "2026-08-12") is True
+    assert score_is_comparable("tech", "2020-01-01") is True

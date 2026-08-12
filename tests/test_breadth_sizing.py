@@ -77,8 +77,12 @@ def test_breadth_ramp_is_continuous_monotone_and_bounded(monkeypatch):
 
 def _attr_trade(n_agree, n_set=28, status="CLOSED", ret=1.0, action="BUY"):
     ms = {f"m{i}": (0.5 if i < n_agree else 0.0) for i in range(n_set)}
+    # The breadth calibration reads a GROSS win (system convention, 2026-08-06),
+    # so the price pair must encode the same outcome as `ret`.
+    sign = 1.0 if action == "BUY" else -1.0
     return {"ticker": "T", "action": action, "status": status,
-            "return_pct": ret, "method_scores": ms}
+            "return_pct": ret, "method_scores": ms,
+            "entry_price": 100.0, "exit_price": 100.0 * (1 + sign * ret / 100.0)}
 
 
 def test_calibration_priors_hold_on_thin_ledger(monkeypatch):

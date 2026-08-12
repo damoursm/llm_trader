@@ -15,7 +15,7 @@ from src.data.news_fetcher import fetch_all_news, fetch_cached_news, fetch_rss_n
 from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
 from src.data.trending import get_trending_tickers
-from src.signals.aggregator import build_signals
+from src.signals.aggregator import build_signals, set_ml_combine_arm
 from src.analysis.claude_analyst import generate_recommendations, get_last_synthesis_meta
 from src.data.insider_trades import fetch_insider_trades, get_tickers_from_smart_money
 from src.data.eight_k import fetch_8k_articles
@@ -75,7 +75,7 @@ from src.analysis.data_quality import EXPECTED_SPARSE_SOURCES, KNOWN_DEAD_SOURCE
 from src.analysis import arm_shadow
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
-from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES, RULE_FILL_MODEL as _RULE_FILL_MODEL
+from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES, RULE_FILL_MODEL as _RULE_FILL_MODEL, set_ml_arm
 from src.db import repo
 from src.performance.hypothetical_tracker import update_hypothetical_trades, get_hypothetical_performance_for_email
 
@@ -391,6 +391,10 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "dominant_method": _dominant_method(base_scores, s.direction),
                 "price": price_by_ticker.get(tk),
                 "universe_source": (universe_sources or {}).get(str(tk).upper()),
+                # Which combine produced combined_buy/sell_score for THIS ticker:
+                # "weighted" or "ml"/"ml_buy"/"ml_sell" (per-side, since the ML swap
+                # is fail-soft per side). Segments ML-vs-weighted panel performance.
+                "combine_source": str(getattr(s, "combine_source", "weighted") or "weighted"),
                 # Confidence-formula components (2026-07-21) — verbatim factors from
                 # the SAME confidence = raw × coherence × movement × volume × family ×
                 # tape chain, so src/analysis/confidence_components.py can isolate
@@ -517,7 +521,30 @@ def _assess_llm_health() -> dict:
 # Drift actions that are self-resolving off-RTH convergence, not a failure —
 # see _assess_broker_health. Kept as a set so reconcile.py and here can't drift
 # apart on the label spelling.
-_PENDING_DRIFT_ACTIONS = {"flatten_pending_open", "flatten_pending_fill"}
+_PENDING_DRIFT_ACTIONS = {"flatten_pending_open", "flatten_pending_fill",
+                          # DELIBERATE stand-down, not a failure (2026-08-04) —
+                          # reconcile sets this when it CHOSE not to trade: no live
+                          # quote for the price cap, a fractional position, a cancel
+                          # race lost to a fill, or a same-side flatten that already
+                          # filled inside the guard window. Its own code comment says
+                          # "not an error", but the health verdict was counting it as
+                          # hard drift AND labelling it "auto-flatten FAILED".
+                          # Live case: ADIG — a 24.5-share fractional position with no
+                          # ledger record, no avg_cost and no quote from ANY source
+                          # (a corporate-action credit, not something we traded). It
+                          # can never be flattened, so it fired CRITICAL + a 🔔 email
+                          # banner on EVERY tick forever — pure alert fatigue that
+                          # would bury a real execution failure. It stays fully
+                          # visible in the drift list, count, broker order log and
+                          # dashboard; it just no longer scrapes the CRITICAL channel.
+                          "flatten_skipped",
+                          # Sub-1-share residue. IBKR rejects fractional orders
+                          # over the API (verified: "Error 10243: Fractional-sized
+                          # order cannot be placed via API"), so this can NEVER be
+                          # auto-closed — it needs one click in TWS. Alerting every
+                          # tick about something no code path can fix is noise; it
+                          # is surfaced in the drift list with its own action name.
+                          "flatten_manual_fractional"}
 
 
 def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
@@ -554,6 +581,10 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
             suffix = (f"; auto-flatten submitted for {flattened}" if flattened
                       else "; report-only" if all(
                           d.get("action") in (None, "report") for d in hard)
+                      # A stand-down is not a failure — say so, so the one message
+                      # that DOES mean "auto-flatten FAILED" keeps its meaning.
+                      else "; auto-flatten stood down (no quote / fractional / race)"
+                      if all(d.get("action") == "flatten_skipped" for d in hard)
                       else "; auto-flatten FAILED — check broker order log")
             problems.append(
                 f"{len(hard)} position(s) drifted from the ledger ({names}){suffix}"
@@ -1347,6 +1378,23 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # sees the same answer even when the run straddles a session boundary.
     run_session = current_session()
     logger.info(f"Pipeline started at {fmt_et(start)} (session: {run_session})")
+
+    # ── Long-horizon buy arm A/B (2026-08-01) ─────────────────────────────
+    # Per-run coin: replace combined_buy_score with the learned 5d stacker AND
+    # hold those buys to ml_arm_min_hold_days, to capture the 5d+ edge the short-hold
+    # book leaves on the table. Set HERE, before build_signals (aggregator) and
+    # record_new_trades (tracker), so the entry swap and the exit min-hold travel
+    # together per trade. Manual `enable_ml_combine` forces it on regardless
+    # of the share. Set EVERY run so the flag can never leak across ticks in the
+    # long-lived scheduler process.
+    ml_arm = (bool(settings.enable_ml_combine)
+                        or random.random() < float(settings.ml_combine_arm_share))
+    set_ml_combine_arm(ml_arm)
+    set_ml_arm(ml_arm)
+    if ml_arm:
+        logger.info(f"[ml_arm] ARM ACTIVE this run — stacker buy combine + "
+                    f"{settings.ml_arm_min_hold_days}d min hold "
+                    f"(share={settings.ml_combine_arm_share:g})")
     if run_session != "rth":
         logger.info(
             f"[extended] {run_session}-session run — extended signal profile active: "
@@ -2360,6 +2408,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "mode_coverage":                {"available": getattr(market_mode_context, "inputs_available", 0),
                                           "total":     getattr(market_mode_context, "inputs_total", 0)},
         "hold_prompt_active":           hold_prompt_active,
+        "ml_arm":         ml_arm,
         "hold_prompt_n_positions":      len(open_position_summaries),
         # Blind-synthesis A/B arm this run (entry-side prompt experiment).
         "blind_synthesis":              blind_synthesis,

@@ -36,6 +36,11 @@ def _base(monkeypatch):
     monkeypatch.setattr(settings, "winrate_filter_min_trades", 10)
     monkeypatch.setattr(settings, "inverted_methods", "")
     monkeypatch.setattr(settings, "enable_oos_validation", False)
+    # 2026-08-11 promotions score on the fixture caches and would pollute the
+    # hand-built method worlds these tests construct - off in this file's base.
+    for _f in ("enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+               "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv"):
+        monkeypatch.setattr(settings, _f, False)
     agg.reset_winrate_filter_cache()
 
 
@@ -103,12 +108,17 @@ def test_flag_off_is_noop(monkeypatch):
 
 
 def test_panel_first_methods_are_never_filtered(monkeypatch):
-    """A PANEL-FIRST method (hi52 etc.) carries weight 0 — it is IC-measured and
-    trade-attributed but contributes nothing to the combine, so filtering it
-    would be meaningless. It must stay out of the filter's candidate set."""
+    """A PANEL-FIRST method (squeeze etc. — the post-2026-08-11 weight-0 set)
+    contributes nothing to the combine, so filtering it would be meaningless.
+    It must stay out of the filter's candidate set. hi52, by contrast, was
+    PROMOTED on 2026-08-11 and is now a legitimate filter target like any
+    weighted method."""
     _base(monkeypatch)
-    _patch_perf(monkeypatch, _perf(hi52=(50, 5.0)))
+    _patch_perf(monkeypatch, _perf(squeeze=(50, 5.0)))
     assert agg.winrate_filtered_methods() == frozenset()
+    # the promoted method IS filterable on the same record:
+    _patch_perf(monkeypatch, _perf(hi52=(50, 5.0)))
+    assert agg.winrate_filtered_methods() == frozenset({"hi52"})
 
 
 def test_invertible_overlays_ARE_filtered(monkeypatch):

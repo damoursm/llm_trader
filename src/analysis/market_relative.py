@@ -32,6 +32,7 @@ is a confound there.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Dict, Optional
 
@@ -44,6 +45,7 @@ from loguru import logger  # project configures loguru sinks only
 _FALLBACK_BASELINE = 48.6
 
 _CACHE: dict = {}
+_SKILL_LOCK = threading.Lock()
 
 
 def _horizon_col() -> str:
@@ -68,6 +70,19 @@ def market_relative_skill(side: Optional[str] = None) -> Dict[str, dict]:
     if not getattr(settings, "enable_market_relative_weighting", False):
         return {}
     key = f"skill:{side or 'both'}"
+    hit = _CACHE.get(key)
+    if hit and (time.time() - hit["ts"]) < float(settings.ic_weight_cache_seconds):
+        return hit["data"]                      # fast path — no lock when fresh
+    # MISS → serialise, so the concurrent build_signals callers (main pass +
+    # _HoldReviewBranch + shadow arms) share ONE pass over the directional panel
+    # instead of each running their own (measured 2x per tick).
+    with _SKILL_LOCK:
+        return _market_relative_skill_compute(side, key)
+
+
+def _market_relative_skill_compute(side: Optional[str], key: str) -> Dict[str, dict]:
+    """The heavy path, always under ``_SKILL_LOCK``; re-checks the cache so a
+    caller that queued behind another thread reuses its result."""
     now = time.time()
     hit = _CACHE.get(key)
     if hit and (now - hit["ts"]) < float(settings.ic_weight_cache_seconds):

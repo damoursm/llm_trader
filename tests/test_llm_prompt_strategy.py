@@ -106,12 +106,18 @@ def test_blind_prompt_suppresses_horizon_and_expected_move(monkeypatch):
 # ── #1 stamping + eval ──────────────────────────────────────────────────────
 
 def test_blind_synthesis_eval_groups_by_entry_stamp():
+    # win_rate is GROSS (system convention, 2026-08-06) so each row carries a
+    # price pair matching the sign of its return.
+    def _t(ret, status="CLOSED", **kw):
+        return {"status": status, "return_pct": ret, "action": "BUY",
+                "entry_price": 100.0, "exit_price": 100.0 * (1 + ret / 100.0), **kw}
+
     trades = [
-        {"status": "CLOSED", "entry_blind_synthesis": True, "return_pct": 2.0},
-        {"status": "CLOSED", "entry_blind_synthesis": True, "return_pct": -1.0},
-        {"status": "CLOSED", "entry_blind_synthesis": False, "return_pct": -3.0},
-        {"status": "CLOSED", "return_pct": 9.9},              # pre-experiment: excluded
-        {"status": "OPEN", "entry_blind_synthesis": True, "return_pct": 5.0},  # open: excluded
+        _t(2.0, entry_blind_synthesis=True),
+        _t(-1.0, entry_blind_synthesis=True),
+        _t(-3.0, entry_blind_synthesis=False),
+        _t(9.9),                                          # pre-experiment: excluded
+        _t(5.0, status="OPEN", entry_blind_synthesis=True),  # open: excluded
     ]
     ev = tr.compute_blind_synthesis_eval(trades)
     assert ev["on"] == {"trades": 2, "win_rate": 50.0, "avg_return": 0.5}

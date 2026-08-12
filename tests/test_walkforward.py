@@ -272,3 +272,53 @@ def test_sim_forward_return_respects_the_cutoff():
     with analysis_asof("2026-07-10"):
         assert _fwd_intraday(series, gen, 2) is not None, \
             "end bar precedes the cutoff — must be available"
+
+
+# ── degraded steps: a fail-soft that fabricates a permissive calibration ──────
+
+def test_a_step_is_flagged_degraded_when_nothing_filters_despite_history(monkeypatch):
+    """The layers inside `weights_as_of` are fail-soft and several return EMPTY
+    rather than raising, so a transient DB read failure yields "nothing
+    filtered" — a materially more permissive calibration that looks completely
+    legitimate. Observed once for real: 2026-07-26 stored 21 active methods
+    between neighbours at 10, and recomputing the same cutoff gave 10.
+
+    An empty filter IS legitimate early on, so the discriminator is how much
+    history was VISIBLE, not the emptiness itself.
+    """
+    import src.analysis.walkforward as wf
+    import src.signals.aggregator as agg
+    from config.settings import settings
+
+    monkeypatch.setattr(agg, "winrate_filtered_methods", lambda: set())
+    monkeypatch.setattr(agg, "_inverted_methods", lambda: set())
+    monkeypatch.setattr(agg, "side_filtered_methods", lambda side: set())
+    monkeypatch.setattr(agg, "side_weight_multipliers", lambda side: {})
+    monkeypatch.setattr(settings, "walkforward_min_rows_to_filter", 100)
+
+    import src.analysis.signal_panel as sp
+    monkeypatch.setattr(sp, "_load_signals", lambda *a, **k: pd.DataFrame(
+        {"signal_date": ["2026-07-01"] * 500}))
+    assert wf.weights_as_of("2026-07-26")["degraded"] is True
+
+    # Sparse history => an empty filter is expected, NOT degraded.
+    monkeypatch.setattr(sp, "_load_signals", lambda *a, **k: pd.DataFrame(
+        {"signal_date": ["2026-07-01"] * 10}))
+    assert wf.weights_as_of("2026-06-20")["degraded"] is False
+
+
+def test_weights_for_date_skips_a_degraded_step():
+    """A degraded step is a fabricated permissive calibration; scoring a day
+    under it would be worse than using the previous good one."""
+    import json
+    from src.analysis.walkforward import weights_for_date
+
+    mk = lambda d, n, bad: {
+        "as_of": d, "computed_at": "x", "n_active": n, "degraded": bad,
+        "weights": json.dumps({"tech": 0.5}), "inverted": "[]", "filtered": "[]",
+        "buy_filtered": "[]", "sell_filtered": "[]",
+        "buy_mults": "{}", "sell_mults": "{}"}
+    h = pd.DataFrame([mk("2026-07-01", 10, False), mk("2026-07-05", 21, True)])
+
+    got = weights_for_date("2026-07-08", h)
+    assert got["as_of"] == "2026-07-01", "resolved to the DEGRADED step"

@@ -63,7 +63,20 @@ def run_supervised() -> None:
             started = time.time()
             try:
                 logger.info(f"[supervisor] launching: {' '.join(cmd)}")
-                child = subprocess.Popen(cmd, cwd=str(_ROOT))
+                # DEVNULL all three stdio handles — the 2026-08-08/09 freeze class.
+                # Inherited handles under Task Scheduler left the child's stderr on
+                # a pipe nothing drains; the nightly rescore's numpy-warning flood
+                # filled it (~64KB) and from then on every stderr write in the
+                # child blocked forever — numpy warnings, then loguru's console
+                # sink, then the main loop at its next log line: a whole-process
+                # wedge with zero CPU that neither this supervisor nor the broker
+                # watchdog can see (the process never exits and never hangs a
+                # broker call). The log FILE carries everything production needs;
+                # console output belongs to manual `--schedule` runs, not here.
+                child = subprocess.Popen(cmd, cwd=str(_ROOT),
+                                         stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
                 code = child.wait()                     # blocks until the scheduler exits
             except KeyboardInterrupt:
                 raise                                   # clean shutdown via the outer handler

@@ -12,6 +12,7 @@ IBKRBroker requires it.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -81,6 +82,22 @@ def _trade_log_reason(trade) -> Optional[str]:
     return None
 
 
+
+def _whole_shares(qty) -> int:
+    """Floor a share count to whole shares (0 when unusable).
+
+    IBKR's API rejects fractional equity orders outright (error 10243), so the
+    broker boundary normalises rather than trusting callers' type hints. Floors
+    toward zero for BOTH directions — the caller passes an unsigned magnitude and
+    the side carries the direction, so rounding up could overshoot a close and
+    FLIP a position.
+    """
+    try:
+        import math as _math
+        return max(0, int(_math.floor(float(qty))))
+    except (TypeError, ValueError):
+        return 0
+
 class IBKRBroker(Broker):
     name = "ibkr"
 
@@ -95,6 +112,7 @@ class IBKRBroker(Broker):
         self._ever_connected = False         # "reconnected" vs "connected" log wording
         self._expected_disconnect = False    # deliberate disconnects don't warn
         self._consecutive_timeouts = 0       # wedge detection: request timeouts since last success
+        self._wedge_recycle_times: list = []  # monotonic stamps of recent force-recycles
 
     # ── connection ────────────────────────────────────────────────────────
     def _get_ib(self):
@@ -138,6 +156,11 @@ class IBKRBroker(Broker):
         reject) leaves it unchanged (it is not evidence of a wedge)."""
         if exc is None:
             self._consecutive_timeouts = 0
+            # A request that actually SUCCEEDED is the only proof the gateway is
+            # really back, so it also clears the repeated-wedge history — otherwise
+            # recycles from an old, since-resolved episode would accumulate toward
+            # a spurious restart hours later.
+            self._wedge_recycle_times.clear()
         elif _is_timeout_exc(exc):
             self._consecutive_timeouts += 1
 
@@ -233,16 +256,36 @@ class IBKRBroker(Broker):
                 f"consecutive requests timed out — gateway WEDGED; force-recycling the client"
             )
         ok = self.connect(force=wedged)
+        recovery_reason = None
         if not ok and wedged:
             # The forced recycle dialed a DEAD gateway — the gateway itself is the
             # corpse (alive-but-wedged: process up, port open, API backend dead;
-            # IBC's watchdog can't see it). Fire the automated kill-and-relaunch,
-            # fire-and-forget: this path runs from every broker touchpoint, so the
-            # cooldown keeps it cheap and the next touchpoint redials the fresh
-            # gateway (paper-only + fail-soft inside).
+            # IBC's watchdog can't see it).
+            recovery_reason = "gateway wedged and forced redial failed"
+        elif wedged:
+            # …but a redial that SUCCEEDS does not mean the gateway is healthy.
+            # Observed 2026-08-04: a wedged gateway accepted every reconnect and
+            # then timed out every request, so `ok` was True on all ~14 cycles and
+            # the branch above NEVER fired — the loop ran 07:39→08:00 with
+            # auto-restart enabled and did nothing. A gateway that has to be
+            # force-recycled REPEATEDLY is the corpse regardless of whether it
+            # answers the dial, so count the recycles and act on the pattern.
+            now = time.monotonic()
+            window = max(60.0, float(settings.broker_wedge_recycle_window_seconds))
+            self._wedge_recycle_times = [t for t in self._wedge_recycle_times if now - t <= window]
+            self._wedge_recycle_times.append(now)
+            limit = max(2, int(settings.broker_wedge_recycle_limit))
+            if len(self._wedge_recycle_times) >= limit:
+                recovery_reason = (f"gateway force-recycled {len(self._wedge_recycle_times)}x in "
+                                   f"{int(window)}s despite successful redials — wedged-but-alive")
+                self._wedge_recycle_times.clear()   # don't re-fire on every later touchpoint
+        if recovery_reason:
+            # Fire-and-forget: this path runs from every broker touchpoint, so the
+            # recovery's own cooldown keeps it cheap and the next touchpoint
+            # redials the fresh gateway (paper-only + fail-soft inside).
             try:
                 from src.broker.gateway_recovery import maybe_restart_gateway
-                maybe_restart_gateway("gateway wedged and forced redial failed", wait=False)
+                maybe_restart_gateway(recovery_reason, wait=False)
             except Exception as e:
                 logger.warning(f"[broker:ibkr] gateway recovery hook failed: {e}")
         return ok
@@ -342,8 +385,65 @@ class IBKRBroker(Broker):
             logger.warning(f"[broker:ibkr] get_positions failed: {_exc_text(e)}")
         return out
 
+    def get_mark_price(self, ticker: str) -> Optional[float]:
+        """The BROKER's own mark for a position it holds, or None.
+
+        A last-resort price anchor for the drift flatten. ``tracker._fetch_price``
+        looks a ticker up by SYMBOL across IBKR/yfinance/Polygon, and that chain
+        can come back empty for an instrument that is delisted, illiquid or the
+        product of a corporate action — ADIG (2026-08-04) returned nothing from
+        ANY source, so the price-capped flatten stood down every tick and the
+        orphan could never converge. But IBKR is *holding* the position, so it
+        knows the contract and marks it: ``ib.portfolio()`` reported
+        marketPrice 23.14 for that same ticker. ``ib.positions()`` (what
+        ``get_positions`` reads) carries only avgCost, which is why this needs
+        the portfolio view.
+
+        Fail-soft: any error → None, and the caller keeps standing down.
+        """
+        if not self._ensure_connected():
+            return None
+        try:
+            want = to_ib_symbol(ticker)
+            for item in self._ib.portfolio():
+                if item.contract.symbol == want:
+                    px = float(item.marketPrice or 0.0)
+                    return px if px > 0 else None
+        except Exception as e:
+            logger.debug(f"[broker:ibkr] mark price for {ticker} unavailable: {_exc_text(e)}")
+        return None
+
     # ── orders ────────────────────────────────────────────────────────────
     def submit_order(self, req: OrderRequest) -> OrderResult:
+        # WHOLE SHARES ONLY. IBKR refuses fractional quantities over the API —
+        # "Error 10243: Fractional-sized order cannot be placed via API. Please
+        # use desktop version" (verified 2026-08-04 with a whatIfOrder dry run).
+        # `OrderRequest.quantity` is ANNOTATED int but OrderRequest is a plain
+        # dataclass, so the annotation is documentation, not a runtime check: a
+        # float would sail through to LimitOrder() and be rejected by IBKR. Every
+        # caller happens to floor today (sizing._round_shares; the reconciler's
+        # int(abs(...))) and 0 of 4,848 submitted orders have ever been
+        # fractional — but that is an EMERGENT invariant, and this is the single
+        # choke point where it can be an ENFORCED one.
+        qty = _whole_shares(req.quantity)
+        if qty <= 0:
+            logger.warning(
+                f"[broker:ibkr] {req.side} {req.ticker}: quantity {req.quantity!r} "
+                "is below one whole share — IBKR rejects fractional orders via the "
+                "API (10243), so there is nothing submittable here"
+            )
+            return OrderResult(ok=False, ticker=req.ticker, side=req.side,
+                               requested_qty=req.quantity, client_ref=req.client_ref,
+                               status="SUB_SHARE_QTY",
+                               error="fractional/zero quantity — not submittable via API")
+        if qty != req.quantity:
+            logger.warning(
+                f"[broker:ibkr] {req.side} {req.ticker}: fractional quantity "
+                f"{req.quantity!r} floored to {qty} whole share(s) — IBKR rejects "
+                "fractional orders via the API (10243). The remainder is NOT tradeable "
+                "here; check the caller's sizing."
+            )
+            req = replace(req, quantity=qty)
         if not self._ensure_connected():
             return OrderResult(ok=False, ticker=req.ticker, side=req.side,
                                requested_qty=req.quantity, client_ref=req.client_ref,

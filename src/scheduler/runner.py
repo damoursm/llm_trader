@@ -37,6 +37,7 @@ grace) as soon as the process wakes. Keep-awake is still requested (it helps on 
 """
 
 import sys
+import threading
 import time as _time_module
 from datetime import datetime, time as _time, timedelta
 
@@ -240,11 +241,137 @@ def _should_run_eod(now_naive: datetime, last_eod_date, eod_time: _time) -> bool
             and is_market_day(now_naive.date()))
 
 
+_RESCORE_THREAD = None
+
+
+def _should_run_nightly_rescore(now_naive: datetime, last_date, at: _time) -> bool:
+    """True on the first poll at/after ``at`` ET on a date it hasn't run for.
+
+    Deliberately NOT gated on `is_market_day`: the rescore repairs stored
+    history, which is just as stale on a Saturday, and a weekend night is the
+    quietest window it will ever get.
+    """
+    if not settings.enable_auto_refactor:
+        return False
+    return last_date != now_naive.date() and now_naive.time() >= at
+
+
+def _maybe_start_nightly_rescore() -> bool:
+    """Detect implementation changes and, if any, rescore in the BACKGROUND.
+
+    Two properties matter here and both are deliberate:
+
+    * **Detection first, cheaply.** Hashing 42 module ASTs takes well under a
+      second, so an unchanged night costs essentially nothing and starts no
+      thread. The expensive path only runs when something actually changed.
+    * **Background, because the scheduler loop is single-threaded.** A rescore
+      is ~40 minutes; running it inline at 02:00 ET would block the 02:00,
+      03:00 and 03:30 OVERNIGHT ticks outright — real missed trading, to repair
+      history that is in no hurry. The heavy phases hold no DB lock (they
+      compute, then write briefly), and both sides retry on the write lock, so
+      the overlap window is small. A read that loses the race still fails soft,
+      which is why walk-forward steps carry a `degraded` flag.
+
+    Returns True when a rescore was started.
+    """
+    global _RESCORE_THREAD
+    if _RESCORE_THREAD is not None and _RESCORE_THREAD.is_alive():
+        logger.warning("[scheduler] nightly rescore still running from a previous "
+                       "night — not starting another")
+        return False
+    try:
+        from src.analysis.refactor import plan
+        p = plan()
+    except Exception as exc:
+        logger.warning(f"[scheduler] rescore change-detection failed: {exc}")
+        return False
+
+    if not p["changed"]:
+        if p["first_seen"]:
+            # Baseline only — record fingerprints so the next real change is
+            # detectable. Cheap and synchronous.
+            try:
+                from src.analysis.code_version import record
+                logger.info(f"[scheduler] nightly rescore: recorded "
+                            f"{record(p['first_seen'])} baseline fingerprint(s)")
+            except Exception as exc:
+                logger.warning(f"[scheduler] baseline record failed: {exc}")
+        else:
+            logger.info("[scheduler] nightly rescore: no implementation changes")
+        return False
+
+    logger.info(f"[scheduler] nightly rescore STARTING in background — changed: "
+                f"{p['changed']}")
+
+    def _work():
+        try:
+            from src.analysis.refactor import run_refactor
+            res = run_refactor(apply=True)
+            if res["ok"]:
+                logger.info(f"[scheduler] nightly rescore complete: "
+                            f"{[(s['step'], s['status']) for s in res['steps']]}")
+            else:
+                logger.warning("[scheduler] nightly rescore INCOMPLETE")
+                _alert("Automatic rescore incomplete",
+                       f"An implementation change was detected "
+                       f"({res['plan']['changed']}) but a repair step failed:\n\n"
+                       f"{res['steps']}\n\n"
+                       "Stored history is STALE for those methods. Fingerprints "
+                       "were deliberately not advanced, so this retries "
+                       "tomorrow night rather than silently marking the "
+                       "database up to date.")
+        except Exception as exc:
+            logger.exception(f"[scheduler] nightly rescore raised: {exc}")
+            _alert_crash("nightly rescore", exc)
+
+    _RESCORE_THREAD = threading.Thread(target=_work, name="nightly-rescore",
+                                       daemon=True)
+    _RESCORE_THREAD.start()
+    return True
+
+
+_EOD_THREAD = None
+
+
 def _run_eod_maintenance() -> None:
-    """Warm the forward-return cache (fuel for every learning surface) then run
-    table retention. Heavy but off the time-critical path (after the close
-    tick). Each half is fail-soft so one failure never blocks the other."""
+    """Launch the EOD maintenance in a BACKGROUND thread (2026-08-11).
+
+    It ran inline in the scheduler loop until the 20y cache made it a >5.5h job
+    (measured 2026-08-10) that starved the entire extended + overnight sessions
+    — "off the time-critical path" was only true while it was short. Same
+    pattern as the nightly rescore: single-flight guard, daemon thread, the
+    loop keeps ticking. The heavy phases hold no DB lock (compute, then write
+    briefly) and both sides retry on the write lock. `last_eod_date` is marked
+    by the caller at LAUNCH, so a >24h EOD cannot re-trigger itself; a still-
+    running thread at the next day's slot is warned about and skipped."""
+    global _EOD_THREAD
+    if _EOD_THREAD is not None and _EOD_THREAD.is_alive():
+        logger.warning("[scheduler] EOD maintenance still running from a previous "
+                       "day — not starting another")
+        return
+    import threading as _threading
+    _EOD_THREAD = _threading.Thread(target=_eod_work, name="eod-maintenance",
+                                    daemon=True)
+    _EOD_THREAD.start()
+    logger.info("[scheduler] EOD maintenance STARTING in background thread")
+
+
+def _eod_work() -> None:
+    """The EOD body: cache warm → retention → replay, then walk-forward ∥ ML
+    retrains in parallel (the trains need the replay-refreshed panel; the
+    walk-forward does not feed them). Every stage fail-soft."""
     logger.info("[scheduler] EOD maintenance: warming forward-return cache + retention…")
+    # Drop the slow-moving panel calibrations so the fresh panel / replay /
+    # walk-forward / retrained models produced below are picked up on the NEXT
+    # tick rather than waiting out ic_weight_cache_seconds (2 h). The TTL is long
+    # precisely because these move slowly WITHIN a day; EOD is when they change.
+    try:
+        from src.analysis.market_relative import reset_cache as _reset_market_relative
+        from src.signals.aggregator import reset_winrate_filter_cache
+        reset_winrate_filter_cache()
+        _reset_market_relative()
+    except Exception as exc:
+        logger.debug(f"[scheduler] EOD calibration-cache reset skipped: {exc}")
     try:
         from src.data.cache_warm import warm_forward_return_cache
         warm_forward_return_cache(
@@ -275,7 +402,9 @@ def _run_eod_maintenance() -> None:
     # only the tail is recomputed (`walkforward_eod_days`) rather than rewalking
     # the whole span, which costs ~60s PER STEP. Runs after the replay above,
     # which supplies the panel the calibration reads.
-    if settings.enable_eod_walkforward:
+    def _wf_step() -> None:
+        if not settings.enable_eod_walkforward:
+            return
         try:
             from datetime import date as _date, timedelta as _td
             from src.analysis.walkforward import materialize as wf_materialize
@@ -285,32 +414,64 @@ def _run_eod_maintenance() -> None:
             logger.info(f"[scheduler] EOD walk-forward: {n} calibration step(s) stored")
         except Exception as exc:
             logger.warning(f"[scheduler] EOD walk-forward failed: {exc}")
-    # Automatic refactor. Runs LAST because it re-runs the steps above in
-    # dependency order when — and only when — an implementation actually
-    # changed; on an unchanged day it detects nothing and costs one AST hash per
-    # method. This is what makes the stored history self-maintaining: a scorer
-    # edit repairs the database on the next EOD instead of waiting for someone
-    # to remember a registry.
-    if settings.enable_auto_refactor:
-        try:
-            from src.analysis.refactor import run_refactor
-            res = run_refactor(apply=True)
-            changed = res["plan"]["changed"]
-            if changed:
-                logger.info(f"[scheduler] EOD refactor repaired: {changed} "
-                            f"(ok={res['ok']})")
-                if not res["ok"]:
-                    _alert("Automatic refactor incomplete",
-                           f"Implementation change detected ({changed}) but a "
-                           f"repair step failed:\n{res['steps']}\n\n"
-                           "Stored history is STALE for those methods until this "
-                           "succeeds; fingerprints were deliberately not advanced "
-                           "so it retries next EOD.")
-            elif res["plan"]["mask_candidates"]:
-                logger.info(f"[scheduler] EOD refactor: unregenerable changes "
-                            f"{res['plan']['mask_candidates']}")
-        except Exception as exc:
-            logger.warning(f"[scheduler] EOD auto-refactor failed: {exc}")
+
+    def _ml_step() -> None:
+        # Retrain the ml_ohlcv model (signals/ml_model.py; weighted 0.12 since
+        # 2026-08-11, throttled weekly in pivot mode). A stale/failed artifact
+        # means the method abstains (score 0) — degraded, never a broken tick.
+        if settings.enable_eod_ml_train:
+            try:
+                from src.signals.ml_model import eod_train
+                art = eod_train()
+                if art:
+                    logger.info(f"[scheduler] EOD ml_ohlcv train: {art['n_train']:,} rows "
+                                f"(<= {art['train_max_date']})")
+            except Exception as exc:
+                logger.warning(f"[scheduler] EOD ml_ohlcv train failed: {exc}")
+        # Retrain both stackers on the freshly-materialised panel (the ML combine
+        # arm is LIVE at 50% since 2026-08-11, STACKER_GBM_PARAMS config). A
+        # stale/failed artifact only means the arm falls back to the weighted
+        # combine (combine_source records it). Fail-soft.
+        if settings.enable_eod_ml_buy_train:
+            try:
+                from src.analysis.ml_stacker import eod_train_buy, eod_train_sell
+                for _name, _fn in (("ml_buy", eod_train_buy), ("ml_sell", eod_train_sell)):
+                    art = _fn()
+                    if art:
+                        logger.info(f"[scheduler] EOD {_name} train: {art['n_train']:,} rows "
+                                    f"(<= {art['train_max_date']})")
+            except Exception as exc:
+                logger.warning(f"[scheduler] EOD ml_buy/ml_sell train failed: {exc}")
+        # Retrain the ML EXIT model on the freshly-materialised panel. It only closes
+        # arm-cohort trades and is otherwise panel-first (IC-tracked), so a stale/
+        # failed artifact only means the hand-built exit machinery is kept. Fail-soft.
+        if settings.enable_eod_ml_exit_train:
+            try:
+                from src.analysis.ml_exit_dataset import eod_train_exit
+                art = eod_train_exit()
+                if art:
+                    logger.info(f"[scheduler] EOD ml_exit train: {art['n_train']:,} rows "
+                                f"(<= {art['train_max_date']})")
+            except Exception as exc:
+                logger.warning(f"[scheduler] EOD ml_exit train failed: {exc}")
+
+    # Walk-forward and the ML retrains are independent of each other (both need
+    # the replay-refreshed panel above; neither feeds the other) — run them in
+    # parallel. Two workers, join before returning so the thread's lifetime
+    # brackets the whole job for the single-flight guard.
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=2, thread_name_prefix="eod") as _ex:
+        for _f in (_ex.submit(_wf_step), _ex.submit(_ml_step)):
+            try:
+                _f.result()
+            except Exception as exc:
+                logger.warning(f"[scheduler] EOD parallel stage raised: {exc}")
+
+    # NOTE the automatic refactor is deliberately NOT here — it runs on its own
+    # nightly slot (`_maybe_start_nightly_rescore`, 02:00 ET by default) in a
+    # background thread. It is a ~40-minute job, and this function runs INLINE
+    # in the scheduler loop, so hosting it here would block every tick for its
+    # duration.
 
 
 def _alert(subject: str, body: str) -> None:
@@ -481,6 +642,8 @@ def start_scheduler() -> None:
     prev_poll: datetime | None = None
     last_eod_date = None
     eod_time = _parse_hhmm(settings.eod_maintenance_time, _time(16, 20)) or _time(16, 20)
+    rescore_time = _parse_hhmm(settings.rescore_time, _time(2, 0)) or _time(2, 0)
+    last_rescore_date = None
     if settings.enable_eod_maintenance:
         logger.info(f"EOD maintenance at/after {eod_time.strftime('%H:%M')} ET: "
                     "forward-return cache warm + table retention (market days).")
@@ -592,6 +755,17 @@ def start_scheduler() -> None:
 
             # End-of-day maintenance — once per market day past the trigger,
             # off the time-critical path (runs between ticks, after the close).
+            # Nightly rescore — its own slot, NOT inside EOD maintenance: it is
+            # a ~40-minute job and this loop is single-threaded, so running it
+            # inline would block the overnight ticks it overlaps. Change
+            # detection is sub-second, so an unchanged night is free.
+            if _should_run_nightly_rescore(now_naive, last_rescore_date, rescore_time):
+                last_rescore_date = now_naive.date()
+                try:
+                    _maybe_start_nightly_rescore()
+                except Exception as exc:
+                    logger.exception(f"[scheduler] nightly rescore trigger raised: {exc}")
+
             if _should_run_eod(now_naive, last_eod_date, eod_time):
                 last_eod_date = now_naive.date()
                 try:

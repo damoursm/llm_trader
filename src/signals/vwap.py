@@ -37,7 +37,16 @@ from loguru import logger
 from src.data.market_data import get_history
 from src.data.cache import load_ohlcv
 
-_VWAP_WINDOW = 20   # rolling sessions for VWAP
+# v2 (2026-08-10, epoch-registered): window 20 → 5. The 62-variant parameter
+# sweep vs the signed pivot target (tuned on 2007-16, confirmed on 2017-26,
+# Gate-4 names only — memory/pivot-horizon-target-2026-08.md) has the 5-session
+# VWAP at h2 daily-IC +0.0082 (t +3.0) vs the 20-session's +0.0036 (t +1.2);
+# paired per-day diff +0.0046 (t +2.16), rel-5d cross-check consistent
+# (+0.0091 vs +0.0039). A weekly VWAP anchor mean-reverts harder than a
+# monthly one at the 1-5d horizons this book trades. The constant is shared by
+# the 30m/weekly variants per the multi-timeframe one-formula convention;
+# their panel columns (vwap_30m / vwap_1w) track the change live.
+_VWAP_WINDOW = 5    # rolling sessions for VWAP
 _STD_WINDOW  = 60   # sessions for normalising the distance
 _MIN_ROWS    = 25   # minimum rows needed to produce a score
 

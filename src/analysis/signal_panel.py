@@ -33,6 +33,7 @@ from bisect import bisect_left
 from datetime import date, timedelta
 from typing import Iterable, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -356,10 +357,23 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
 
 
 def _spearman(a: pd.Series, b: pd.Series) -> Optional[float]:
-    """Spearman rank correlation = Pearson on average-tie ranks (no scipy)."""
+    """Spearman rank correlation = Pearson on average-tie ranks (no scipy).
+
+    ``np.errstate`` silences the divide/invalid FloatingPointError machinery for
+    the degenerate case (a constant vector → corrcoef divides by a zero std).
+    That is not cosmetic: every such call otherwise emits a RuntimeWarning to
+    STDERR, and the 2026-08-08/09 scheduler freezes were exactly this — the
+    nightly rescore's walk-forward re-calibration ran thousands of per-day
+    Spearmans, the warning flood filled an undrained stderr pipe (~64KB), and
+    from then on EVERY thread that touched stderr (numpy warnings, loguru's
+    console sink) blocked forever: whole-process wedge, zero CPU, silent log.
+    The NaN result for a degenerate day is already the documented contract
+    ("no verdict"), so nothing is lost by not announcing it per call.
+    """
     if len(a) < 2:
         return None
-    ic = a.rank().corr(b.rank())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ic = a.rank().corr(b.rank())
     return None if pd.isna(ic) else float(ic)
 
 

@@ -128,113 +128,85 @@ def test_baseline_is_observation_weighted(monkeypatch):
     assert mrel._measure_baseline(df, "1w") == pytest.approx(45.0)
 
 
-# ── the HARD filter on the market-relative basis ───────────────────────────
+# ── the HARD filter: promotion logic (IC significance), 2026-08-12 rebasis ───
 
-def _rel(monkeypatch, table, baseline=48.1):
-    data = {m: {"win_rate": w, "trades": n, "baseline": baseline}
-            for m, (w, n) in table.items()}
-    monkeypatch.setattr("src.analysis.market_relative.market_relative_skill",
-                        lambda side=None: data)
-    monkeypatch.setattr("src.analysis.market_relative.market_relative_baseline",
-                        lambda: baseline)
+def _dirpanel(monkeypatch, rows):
+    """Install a fake directional panel. ``rows`` = {method: {horizon: (icir,
+    icdays, n)}}; every method lands on the ``both`` side the filter reads."""
+    import pandas as pd
+    recs = []
+    for m, hs in rows.items():
+        r = {"method": m, "side": "both"}
+        for h, (icir, days, n) in hs.items():
+            r[f"icir_{h}"], r[f"icdays_{h}"], r[f"n_{h}"] = icir, days, n
+        recs.append(r)
+    df = pd.DataFrame(recs)
+    monkeypatch.setattr("src.analysis.simulated_trades.compute_directional_perf",
+                        lambda **kw: df)
     agg.reset_winrate_filter_cache()
 
 
 @pytest.fixture
 def _filter_on(monkeypatch):
     monkeypatch.setattr(settings, "enable_market_relative_filter", True)
-    monkeypatch.setattr(settings, "market_relative_filter_baseline", False)
-    monkeypatch.setattr(settings, "winrate_filter_threshold", 0.50)
+    monkeypatch.setattr(settings, "ic_weight_min_t", 2.0)
     monkeypatch.setattr(settings, "market_relative_min_obs", 200)
     monkeypatch.setattr(settings, "inverted_methods", "")
     monkeypatch.setattr(settings, "enable_auto_inversion", False)
 
 
-def test_below_fifty_is_filtered(monkeypatch, _filter_on):
-    _rel(monkeypatch, {"tech": (46.6, 9000), "vwap": (51.7, 9000)})
+def test_significantly_negative_ic_is_filtered(monkeypatch, _filter_on):
+    """ICIR −0.30 over 100 days → t = 3.0: confidently anti-predictive at every
+    judgeable horizon → dropped. A healthy method is untouched."""
+    _dirpanel(monkeypatch, {
+        "tech": {"1w": (-0.30, 100, 5000)},
+        "vwap": {"1w": (+0.20, 100, 5000)},
+    })
     out = agg._market_relative_filtered()
     assert "tech" in out and "vwap" not in out
 
 
+def test_insignificant_negative_ic_is_KEPT(monkeypatch, _filter_on):
+    """THE POINT of the rebasis: below-par on the live window is not evidence.
+    ICIR −0.05 over 60 days → t ≈ 0.39 — the old point-estimate rule would
+    have dropped a method reading like this; promotion logic keeps it."""
+    _dirpanel(monkeypatch, {"hi52": {"1w": (-0.05, 60, 5000)}})
+    assert agg._market_relative_filtered() == frozenset()
+
+
+def test_one_healthy_horizon_saves_the_method(monkeypatch, _filter_on):
+    """DISPROVEN requires significantly negative at EVERY judgeable horizon
+    (the method_horizons rule). Bad at 1d but fine at 1w → kept."""
+    _dirpanel(monkeypatch, {
+        "momentum": {"1d": (-0.40, 100, 5000), "1w": (+0.05, 100, 5000)},
+    })
+    assert agg._market_relative_filtered() == frozenset()
+
+
 def test_thin_evidence_is_exempt(monkeypatch, _filter_on):
-    """Unproven is not disproven — a method below the observation floor keeps
-    full weight however bad the point estimate looks."""
-    _rel(monkeypatch, {"pead": (20.0, 50)})
+    """Unproven is not disproven — rows below the observation floor (or a
+    missing ICIR) leave a horizon unjudgeable; no judgeable horizon → kept at
+    full weight, the promotion posture for a fresh method."""
+    _dirpanel(monkeypatch, {"pead": {"1w": (-0.90, 30, 50)}})       # n < 200
     assert agg._market_relative_filtered() == frozenset()
 
 
 def test_inverted_methods_are_exempt(monkeypatch, _filter_on):
-    """Their sign is already corrected, so a low RAW rate is the reason they're
-    kept — the same exemption the absolute filter has always had."""
+    """Their sign is already corrected — a confidently negative RAW IC is the
+    reason they are kept, and the inversion machinery owns that verdict."""
     monkeypatch.setattr(settings, "inverted_methods", "tech")
-    _rel(monkeypatch, {"tech": (30.0, 9000)})
+    _dirpanel(monkeypatch, {"tech": {"1w": (-0.50, 100, 9000)}})
     assert "tech" not in agg._market_relative_filtered()
-
-
-def test_baseline_mode_keeps_the_between_methods(monkeypatch, _filter_on):
-    """The two bars differ only for methods sitting between them — ext_gap at
-    49.7% and insider at 49.2% are below 50% but above the ~48.1% baseline."""
-    _rel(monkeypatch, {"ext_gap": (49.7, 2275), "insider": (49.2, 7845)})
-    assert agg._market_relative_filtered() == frozenset({"ext_gap", "insider"})
-    monkeypatch.setattr(settings, "market_relative_filter_baseline", True)
-    agg.reset_winrate_filter_cache()
-    assert agg._market_relative_filtered() == frozenset()
 
 
 def test_disabled_filter_drops_nothing(monkeypatch, _filter_on):
     monkeypatch.setattr(settings, "enable_market_relative_filter", False)
-    _rel(monkeypatch, {"tech": (10.0, 9000)})
+    _dirpanel(monkeypatch, {"tech": {"1w": (-0.90, 200, 9000)}})
     assert agg._market_relative_filtered() == frozenset()
 
 
 def test_filter_failure_is_fail_soft(monkeypatch, _filter_on):
-    def boom(side=None): raise RuntimeError("panel gone")
-    monkeypatch.setattr("src.analysis.market_relative.market_relative_skill", boom)
+    def boom(**kw): raise RuntimeError("panel gone")
+    monkeypatch.setattr("src.analysis.simulated_trades.compute_directional_perf", boom)
     agg.reset_winrate_filter_cache()
     assert agg._market_relative_filtered() == frozenset()
-
-
-# ── the re-entrancy guard ──────────────────────────────────────────────────
-
-def test_inverted_methods_is_reentrancy_safe(monkeypatch):
-    """The auto-detector's bar 2 asks for the EFFECTIVE win rate, which calls
-    back into `_inverted_methods` — so computing the inverted set depends on
-    already knowing it. Unguarded that chain re-entered 22 times per filter
-    evaluation and blew the recursion limit inside `simulated_trades`.
-
-    While a computation is in flight the caller must see the MANUAL pins only:
-    terminating, and semantically right — the detector cannot depend on its own
-    output."""
-    monkeypatch.setattr(settings, "enable_auto_inversion", True)
-    monkeypatch.setattr(settings, "inverted_methods", "insider")
-    depth = {"n": 0, "max": 0}
-
-    def recursive_detector():
-        depth["n"] += 1
-        depth["max"] = max(depth["max"], depth["n"])
-        try:
-            inner = agg._inverted_methods()          # the re-entrant call
-            assert inner == frozenset({"insider"}), "in-flight must yield pins only"
-            return {}
-        finally:
-            depth["n"] -= 1
-
-    monkeypatch.setattr("src.performance.tracker.calibrate_method_inversion",
-                        recursive_detector)
-    agg._INVERSION_IN_FLIGHT["v"] = False
-    out = agg._inverted_methods()
-    assert out == frozenset({"insider"})
-    assert depth["max"] == 1, "the detector must not be re-entered"
-
-
-def test_guard_is_released_after_an_exception(monkeypatch):
-    """A failing detector must not leave the guard stuck on, or every later
-    call would silently degrade to manual pins forever."""
-    monkeypatch.setattr(settings, "enable_auto_inversion", True)
-    monkeypatch.setattr(settings, "inverted_methods", "")
-    def boom():
-        raise RuntimeError("detector broke")
-    monkeypatch.setattr("src.performance.tracker.calibrate_method_inversion", boom)
-    agg._INVERSION_IN_FLIGHT["v"] = False
-    agg._inverted_methods()
-    assert agg._INVERSION_IN_FLIGHT["v"] is False

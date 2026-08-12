@@ -257,6 +257,7 @@ def regime_realized(days: Optional[int] = None) -> pd.DataFrame:
     """
     try:
         from src.performance.tracker import _load_trades
+        from src.performance.tracker import gross_win_rate as _gross_win_rate
         trades = _load_trades()
     except Exception:
         return pd.DataFrame()
@@ -281,8 +282,8 @@ def regime_realized(days: Optional[int] = None) -> pd.DataFrame:
             "open": sum(1 for t in ts if t.get("status") == "OPEN"),
             "buys": sum(1 for t in ts if (t.get("action") or "").upper() == "BUY"),
             "sells": sum(1 for t in ts if (t.get("action") or "").upper() == "SELL"),
-            "win_rate": (round(100.0 * sum(1 for r in rets if r > 0) / len(rets), 1)
-                         if rets else None),
+            # GROSS per the system-wide convention (tracker.gross_win_rate).
+            "win_rate": _gross_win_rate(closed),
             "avg_return": round(sum(rets) / len(rets), 2) if rets else None,
         })
     return pd.DataFrame(out)

@@ -534,3 +534,33 @@ def test_duplicate_closed_twins_exit_once_not_double(monkeypatch):
     assert not t2.get("broker_exit_order_id")
     assert t2["broker_exit_status"] == "DUPLICATE_REF_NOT_SUBMITTED"
     assert report["drift"] == []   # position fully explained — nothing flipped
+
+
+# ── broker mark-price fallback for the flatten anchor (2026-08-04) ───────────
+
+def test_broker_mark_is_used_when_no_external_quote(monkeypatch):
+    """ADIG returned NO price from IBKR/yfinance/Polygon by symbol, so the
+    price-capped flatten stood down every tick and the orphan never converged —
+    yet IBKR was HOLDING it and marked it at 23.14. The flatten now falls back to
+    the broker's own mark."""
+    from src.broker import reconcile as rc
+
+    class _B:
+        def get_mark_price(self, ticker):
+            return 23.14
+    monkeypatch.setattr(rc, "_live_price", lambda t: None)     # external chain dead
+    assert rc._broker_mark(_B(), "ADIG") == 23.14
+
+
+def test_broker_mark_fallback_is_fail_soft():
+    from src.broker import reconcile as rc
+
+    class _NoSupport:                       # dry-run broker / stub / older impl
+        pass
+
+    class _Raises:
+        def get_mark_price(self, ticker):
+            raise RuntimeError("gateway wedged")
+    assert rc._broker_mark(_NoSupport(), "X") is None
+    assert rc._broker_mark(_Raises(), "X") is None
+    assert rc._broker_mark(type("Z", (), {"get_mark_price": lambda s, t: 0.0})(), "X") is None

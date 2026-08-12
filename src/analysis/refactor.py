@@ -50,16 +50,30 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def plan(changes: Optional[Dict[str, dict]] = None) -> Dict[str, object]:
+def plan(changes: Optional[Dict[str, dict]] = None,
+         force: bool = False) -> Dict[str, object]:
     """What a refactor would do, without doing it.
 
     Splits the changed set by whether it can be regenerated, because the two
     halves have completely different costs and remedies.
+
+    ``force`` treats EVERY mapped name as changed. Detection is an optimisation
+    — it exists so an unchanged day is cheap — but it is not the source of
+    truth, and there are times you want the rebuild regardless: after restoring
+    a database, after editing something the fingerprints do not cover (a
+    setting, a threshold, the cost model), or simply to prove the pipeline end
+    to end. Without it the only way to force a rebuild is to corrupt a
+    fingerprint, which is a bad thing to have to do.
     """
-    from src.analysis.code_version import detect_changes, unmapped_methods
+    from src.analysis.code_version import (all_fingerprints, detect_changes,
+                                           unmapped_methods)
     from src.db.schema import REPLAYABLE_METHOD_COLUMNS
 
-    ch = detect_changes() if changes is None else changes
+    if force:
+        ch = {n: {"old": None, "new": fp, "is_new": False}
+              for n, fp in all_fingerprints().items()}
+    else:
+        ch = detect_changes() if changes is None else changes
     moved = {n: d for n, d in ch.items() if not d["is_new"]}
     first_seen = {n: d for n, d in ch.items() if d["is_new"]}
 
@@ -83,7 +97,8 @@ def plan(changes: Optional[Dict[str, dict]] = None) -> Dict[str, object]:
 
 
 def run_refactor(apply: bool = False,
-                 changes: Optional[Dict[str, dict]] = None) -> Dict[str, object]:
+                 changes: Optional[Dict[str, dict]] = None,
+                 force: bool = False) -> Dict[str, object]:
     """Detect implementation changes and repair the database.
 
     ``apply=False`` reports the plan and writes nothing. Each step is fail-soft
@@ -92,8 +107,11 @@ def run_refactor(apply: bool = False,
     overall ``ok`` is the AND of them.
     """
     started = _now()
-    p = plan(changes)
+    p = plan(changes, force=force)
     steps: List[dict] = []
+    if force:
+        logger.info("[refactor] FORCE: rebuilding everything regardless of "
+                    "detected changes")
 
     if p["unmapped"]:
         logger.warning(f"[refactor] {len(p['unmapped'])} method(s) have no source "
@@ -229,9 +247,11 @@ if __name__ == "__main__":  # pragma: no cover
     ap = argparse.ArgumentParser(description="Automatic database refactor")
     ap.add_argument("--apply", action="store_true", help="perform the refactor")
     ap.add_argument("--check", action="store_true", help="report only (default)")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild everything, ignoring change detection")
     a = ap.parse_args()
 
-    res = run_refactor(apply=a.apply and not a.check)
+    res = run_refactor(apply=a.apply and not a.check, force=a.force)
     p = res["plan"]
     print(f"\nchanged            : {p['changed'] or '(none)'}")
     print(f"  regenerate       : {p['regenerate'] or '(none)'}")

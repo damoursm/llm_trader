@@ -16,6 +16,7 @@ cache/
 dist/
 build/
 .env
+.env.bak.*
 .env.backup
 logs/
 # Coverage artifacts (dev only)

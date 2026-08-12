@@ -172,9 +172,11 @@ def record_outcome(trade: dict, reg: Optional[dict] = None) -> bool:
     open). Caller is responsible for persisting via ``save_registry`` after a
     batch of updates.
 
-    A trade is considered "won" when ``return_pct > 0`` — the spread-adjusted
-    figure stored by the tracker. Strictly positive matches the existing
-    win_rate convention in the rest of the system.
+    A trade is "won" on the GROSS move (``tracker.is_gross_win`` — direction
+    only, before spread and fees), matching the system-wide win-rate convention.
+    ``avg_return`` alongside it stays on the cost-adjusted ``return_pct``, so the
+    registry records whether the pattern pointed the right way separately from
+    what the round trip cost to trade it.
     """
     if reg is None:
         # If called solo, load-modify-save in one go
@@ -211,7 +213,11 @@ def record_outcome(trade: dict, reg: Optional[dict] = None) -> bool:
     if any(_trade_key(t) == key for t in p_entry.get("trades", [])):
         return False
 
-    won = float(ret) > 0.0
+    from src.performance.tracker import is_gross_win
+    _w = is_gross_win(trade)
+    if _w is None:                       # no usable price pair — don't guess
+        return False
+    won = bool(_w)
     pattern_correct = _pattern_was_correct(pattern, action, float(ret))
 
     # Global pattern aggregates

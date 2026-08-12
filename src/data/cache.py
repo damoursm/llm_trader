@@ -7,6 +7,8 @@ Cache files are stored in cache/ and keyed by YYYY-MM-DD_HH so:
 """
 
 import json
+import os
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -258,6 +260,13 @@ def load_ohlcv(ticker: str, interval: str = "1d") -> Optional["pd.DataFrame"]:
         return None
 
 
+# Atomic-replace retry (Windows): a reader holding the destination open makes
+# os.replace raise, so back off briefly rather than leaving the cache stale.
+# ~0.7 s total worst case — short enough to stay off the tick's critical path.
+_REPLACE_RETRIES = 5
+_REPLACE_BASE_DELAY = 0.05
+
+
 def save_ohlcv(ticker: str, df: "pd.DataFrame", interval: str = "1d") -> None:
     """Persist OHLCV DataFrame to disk, overwriting any previous version.
 
@@ -269,17 +278,40 @@ def save_ohlcv(ticker: str, df: "pd.DataFrame", interval: str = "1d") -> None:
     can't collide on the temp file; last replace wins, and readers always see a
     complete document either way.
     """
-    import os
     import threading
     _ohlcv_dir(interval).mkdir(parents=True, exist_ok=True)
     path = _ohlcv_path(ticker, interval)
     tmp = path.with_name(f"{path.name}.tmp{threading.get_ident()}")
     try:
         tmp.write_text(df.to_json(orient="split", date_format="iso"), encoding="utf-8")
-        os.replace(tmp, path)
+        # On WINDOWS os.replace fails with [WinError 5] Access is denied whenever
+        # ANY process has the destination open — and unlike POSIX rename there is
+        # no atomic-overwrite-through-open-handle. Measured 2026-08-04: 22 failed
+        # saves in one day, and every one was SPY / XLK / XLV / XLY — the
+        # market-relative benchmark and the sector ETFs, i.e. the most-READ files,
+        # so the collision rate is highest exactly where staleness hurts most (a
+        # stale SPY quietly skews every market-relative number). The old code
+        # logged a warning and moved on, leaving the cache silently stale.
+        # The blocking reader is always transient (a dashboard accessor or another
+        # scorer thread parsing the same file), so a short backoff clears it.
+        last: Exception | None = None
+        for attempt in range(_REPLACE_RETRIES):
+            try:
+                os.replace(tmp, path)
+                last = None
+                break
+            except OSError as e:                       # WinError 5/32 = still open
+                last = e
+                if attempt < _REPLACE_RETRIES - 1:
+                    time.sleep(_REPLACE_BASE_DELAY * (2 ** attempt))
+        if last is not None:
+            raise last
         logger.debug(f"[cache] Saved OHLCV[{interval}] for {ticker} → {path.name}")
     except Exception as e:
-        logger.warning(f"[cache] Failed to save OHLCV[{interval}] for {ticker}: {e}")
+        logger.warning(
+            f"[cache] Failed to save OHLCV[{interval}] for {ticker} after "
+            f"{_REPLACE_RETRIES} attempts: {e} — CACHE IS NOW STALE for this ticker"
+        )
         try:
             tmp.unlink(missing_ok=True)
         except Exception:

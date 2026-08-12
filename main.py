@@ -56,9 +56,38 @@ def main() -> None:
                         help="Backfill OHLCV caches for the whole universe via Massive/Polygon, then exit")
     parser.add_argument("--backfill-30m", action="store_true",
                         help="With --backfill, also warm the 30-min cache (heavier)")
+    parser.add_argument("--rescore", action="store_true",
+                        help="Rescore stored history with the CURRENT code: replay "
+                             "method scores + market conditions, re-walk the "
+                             "point-in-time weights, recompute combined_score/"
+                             "confidence. Detects what changed and repairs only "
+                             "that unless --force")
+    parser.add_argument("--force", action="store_true",
+                        help="With --rescore, rebuild everything regardless of "
+                             "detected changes")
+    parser.add_argument("--check", action="store_true",
+                        help="With --rescore, report what WOULD be done and exit")
     args = parser.parse_args()
 
-    if args.backfill:
+    if args.rescore:
+        from src.analysis.refactor import run_refactor
+        res = run_refactor(apply=not args.check, force=args.force)
+        p = res["plan"]
+        print(f"\nchanged           : {p['changed'] or '(none)'}")
+        print(f"  regenerate      : {p['regenerate'] or '(none)'}")
+        print(f"  mask candidates : {p['mask_candidates'] or '(none)'}")
+        print(f"  derived changed : {p['derived_changed'] or '(none)'}")
+        if p["unmapped"]:
+            print(f"  UNMAPPED (blind): {p['unmapped']}")
+        for s in res["steps"]:
+            print(f"  {s['step']:<12}{s['status']:<9}{s['detail']}")
+        if args.check:
+            print("\n(check only — rerun without --check to apply)")
+        elif not res["ok"]:
+            print("\nA step FAILED — fingerprints were not advanced, so this "
+                  "retries rather than silently marking the DB up to date.")
+            raise SystemExit(1)
+    elif args.backfill:
         from src.data.backfill import backfill
         backfill(with_30m=args.backfill_30m)
     elif args.dashboard:

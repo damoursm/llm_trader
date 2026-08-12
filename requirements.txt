@@ -17,6 +17,11 @@ openai==1.77.0
 # Technical analysis
 ta==0.11.0
 
+# ML methods (signals/ml_model.py — the panel-first ml_ohlcv GBM). Pulls scipy +
+# numpy transitively. REQUIRED in the production .venv or ml_ohlcv fails soft to
+# inactive (weight 0, so no crash, but it silently collects no panel data).
+lightgbm==4.6.0
+
 # Charts
 plotly==5.24.1
 kaleido==0.2.1

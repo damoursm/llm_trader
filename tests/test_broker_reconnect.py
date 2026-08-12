@@ -136,3 +136,74 @@ def test_deliberate_disconnect_stays_silent_and_reconnects_cleanly():
     assert not b.is_connected()
     assert b.get_open_orders() == []          # next touchpoint revives
     assert b.is_connected()
+
+
+# ── repeated-wedge escalation (2026-08-04) ───────────────────────────────────
+# Live failure this reproduces: a wedged gateway ACCEPTED every reconnect and
+# then timed out every request, so the forced redial SUCCEEDED ~14 times in a row
+# and the `if not ok and wedged` recovery branch never fired. The loop ran
+# 07:39→08:00 with auto-restart enabled and did nothing.
+
+def _wedge(b, fake):
+    """Put the broker in the alive-but-wedged state: socket reads connected, but
+    the request timeout counter is over the threshold."""
+    fake.connected = True
+    b._consecutive_timeouts = int(settings.broker_wedge_timeout_threshold) + 1
+
+
+def test_repeated_wedge_fires_recovery_even_when_the_redial_SUCCEEDS(monkeypatch):
+    import src.broker.gateway_recovery as gr
+    calls = []
+    monkeypatch.setattr(gr, "maybe_restart_gateway",
+                        lambda reason, wait=True: calls.append(reason) or True)
+    monkeypatch.setattr(settings, "broker_wedge_recycle_limit", 3)
+    monkeypatch.setattr(settings, "broker_wedge_recycle_window_seconds", 900.0)
+    monkeypatch.setattr(settings, "broker_reconnect_cooldown_seconds", 0.0)
+    fake = FakeIB()
+    b = _broker(fake)
+    for i in range(2):                       # below the limit → no escalation yet
+        _wedge(b, fake)
+        assert b._ensure_connected() is True  # the dial SUCCEEDS every time
+        assert calls == [], f"escalated too early on recycle {i + 1}"
+    _wedge(b, fake)                          # third force-recycle inside the window
+    assert b._ensure_connected() is True
+    assert len(calls) == 1
+    assert "wedged-but-alive" in calls[0]
+
+
+def test_successful_request_clears_the_wedge_history(monkeypatch):
+    # Only a real response proves the gateway is back, so it resets the counter —
+    # otherwise recycles from a since-resolved episode accumulate toward a
+    # spurious restart hours later.
+    import src.broker.gateway_recovery as gr
+    calls = []
+    monkeypatch.setattr(gr, "maybe_restart_gateway",
+                        lambda reason, wait=True: calls.append(reason) or True)
+    monkeypatch.setattr(settings, "broker_wedge_recycle_limit", 3)
+    monkeypatch.setattr(settings, "broker_reconnect_cooldown_seconds", 0.0)
+    fake = FakeIB()
+    b = _broker(fake)
+    for _ in range(2):
+        _wedge(b, fake)
+        b._ensure_connected()
+    b._note_request(None)                    # a request actually SUCCEEDED
+    assert b._wedge_recycle_times == []
+    _wedge(b, fake)                          # would have been the 3rd without the reset
+    b._ensure_connected()
+    assert calls == []
+
+
+def test_failed_redial_still_fires_recovery_immediately(monkeypatch):
+    # The original path must keep working: a wedge whose forced redial FAILS is a
+    # dead gateway and escalates on the first occurrence, with no counting.
+    import src.broker.gateway_recovery as gr
+    calls = []
+    monkeypatch.setattr(gr, "maybe_restart_gateway",
+                        lambda reason, wait=True: calls.append(reason) or True)
+    monkeypatch.setattr(settings, "broker_reconnect_cooldown_seconds", 0.0)
+    fake = FakeIB()
+    b = _broker(fake)
+    _wedge(b, fake)
+    fake.refuse = True
+    assert b._ensure_connected() is False
+    assert len(calls) == 1 and "forced redial failed" in calls[0]

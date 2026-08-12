@@ -37,20 +37,40 @@ anything that changes the visible data has the same problem.
 from __future__ import annotations
 
 import contextlib
+import threading
 from typing import Optional
 
 from loguru import logger
 
-# Module-level rather than thread-local: the walk-forward driver is
-# single-threaded by design (each step depends on the previous one's data), and a
-# thread-local would silently fail to reach a worker pool — which would look like
-# a subtle calibration drift rather than an error.
-_ASOF: Optional[str] = None
+# THREAD-LOCAL since 2026-08-04. It was a module global, with the reasoning that
+# the walk-forward driver is single-threaded so a thread-local "would silently
+# fail to reach a worker pool". That trade was backwards: there is no worker pool
+# under this read path (asserted mechanically by
+# tests/test_asof_thread_isolation.py), while the global DID leak — the nightly
+# refactor runs its walk-forward in a BACKGROUND THREAD
+# (`runner._maybe_start_nightly_rescore`), so a concurrent live tick read the
+# same cutoff and saw a TRUNCATED ledger. Observed twice:
+#
+#   2026-08-02 22:41:39 nightly rescore STARTING in background
+#   2026-08-02 22:44:19 tick raised: save_trades refused ... shrink 356 -> ...
+#   2026-08-04 13:51:36 nightly rescore STARTING (triggered by that day's edits)
+#
+# The save_trades shrink-guard caught the WRITE, which is the only reason history
+# survived. The silent half is worse: for the ~40 minutes a rescore runs, every
+# overlapping tick calibrates, sizes and monitors positions against a ledger cut
+# off weeks in the past, with nothing to notice it.
+#
+# Thread-local means the walk-forward's cutoff binds ONLY the thread that
+# installed it; live ticks on other threads stay unrestricted, which is correct
+# for both. If a worker pool is ever added beneath a calibration, the cutoff must
+# be propagated into the workers EXPLICITLY — the test above fails to force that
+# decision rather than letting look-ahead leak in quietly.
+_ASOF_LOCAL = threading.local()
 
 
 def current_asof() -> Optional[str]:
     """The active cutoff as ``YYYY-MM-DD``, or None when unrestricted."""
-    return _ASOF
+    return getattr(_ASOF_LOCAL, "value", None)
 
 
 def asof_sql_clause(column: str = "signal_date") -> str:
@@ -60,16 +80,18 @@ def asof_sql_clause(column: str = "signal_date") -> str:
     it into queries whose parameter lists they do not control. The value is a
     validated ISO date (see `analysis_asof`), never user input.
     """
-    return f" AND {column} < '{_ASOF}'" if _ASOF else ""
+    _a = current_asof()
+    return f" AND {column} < '{_a}'" if _a else ""
 
 
 def before_cutoff(value) -> bool:
     """True when ``value`` (a date/ISO string) is visible under the cutoff."""
-    if _ASOF is None:
+    _a = current_asof()
+    if _a is None:
         return True
     if value is None:
         return False                    # unknown date cannot be proven visible
-    return str(value)[:10] < _ASOF
+    return str(value)[:10] < _a
 
 
 def reset_all_calibration_caches() -> None:
@@ -122,7 +144,6 @@ def analysis_asof(cutoff: Optional[str]):
     on entry AND exit — on exit because the calibrations computed inside are
     point-in-time and must never leak into live decisions afterwards.
     """
-    global _ASOF
     if cutoff is not None:
         cutoff = str(cutoff)[:10]
         # A malformed cutoff would be spliced into SQL and silently match
@@ -130,11 +151,11 @@ def analysis_asof(cutoff: Optional[str]):
         import datetime as _dt
         _dt.date.fromisoformat(cutoff)
 
-    prev = _ASOF
-    _ASOF = cutoff
+    prev = current_asof()
+    _ASOF_LOCAL.value = cutoff
     reset_all_calibration_caches()
     try:
         yield cutoff
     finally:
-        _ASOF = prev
+        _ASOF_LOCAL.value = prev
         reset_all_calibration_caches()

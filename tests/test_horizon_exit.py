@@ -24,6 +24,10 @@ def _floors(monkeypatch):
     # the per-direction calibration off — otherwise the live ledger's measured
     # long/short adjustment (2026-07-25) moves the multiplier under them.
     monkeypatch.setattr(settings, "enable_horizon_ramp_calibration", False)
+    # The IN-WINDOW confidence-degradation exit ships OFF (2026-08-03, measured to
+    # exit too early). These tests contrast the within-window floor against the
+    # ramped past-window one, so the in-window half must be enabled to be visible.
+    monkeypatch.setattr(settings, "enable_llm_confidence_loss_exit", True)
     tracker.reset_horizon_ramp_cache()
 
 

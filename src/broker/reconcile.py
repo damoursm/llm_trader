@@ -510,6 +510,21 @@ def _live_price(ticker: str) -> Optional[float]:
         return None
 
 
+def _broker_mark(broker, ticker: str) -> Optional[float]:
+    """The broker's own mark for a held position (None when unsupported/absent).
+    ``getattr`` so a broker without ``get_mark_price`` (dry-run, stubs, tests)
+    degrades to the existing behaviour instead of raising."""
+    try:
+        fn = getattr(broker, "get_mark_price", None)
+        if fn is None:
+            return None
+        px = fn(ticker)
+        return float(px) if px and px > 0 else None
+    except Exception as e:
+        logger.debug(f"[broker] mark-price fallback failed for {ticker}: {e}")
+        return None
+
+
 def _predates(iso_ts, boundary: datetime) -> bool:
     """True when *iso_ts* parses and is strictly before *boundary* (tz-aware)."""
     try:
@@ -767,9 +782,17 @@ def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
     """
     qty = int(abs(broker_qty))
     if qty <= 0:
-        logger.warning(
-            f"[broker] drift {ticker}: fractional position ({broker_qty}) — "
-            "cannot be closed via the API; flatten it manually in TWS"
+        # IBKR REFUSES fractional orders over the API outright — verified with a
+        # whatIfOrder dry run on 2026-08-04: "Error 10243: Fractional-sized order
+        # cannot be placed via API. Please use desktop version to place this
+        # order." So a sub-1-share residue is NOT a transient skip that will
+        # resolve on a later tick; it is permanently un-closable by this system
+        # and needs one click in TWS. Logged at INFO (not WARNING) and marked
+        # MANUAL by the caller so it stops screaming every tick.
+        logger.info(
+            f"[broker] drift {ticker}: fractional residue ({broker_qty}) — IBKR "
+            "rejects fractional orders via the API (err 10243); close it in TWS. "
+            "Not retryable; reported only."
         )
         return None
 
@@ -823,9 +846,21 @@ def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
 
     live = _live_price(ticker)
     if not live:
+        # Fall back to the BROKER's own mark. The symbol-keyed quote chain comes
+        # back empty for delisted / illiquid / corporate-action instruments, but
+        # IBKR is HOLDING this position, so it prices it (ADIG 2026-08-04: every
+        # external source failed while ib.portfolio() marked it at 23.14). Without
+        # this the flatten stood down forever and the orphan never converged.
+        live = _broker_mark(broker, ticker)
+        if live:
+            logger.info(
+                f"[broker] drift {ticker}: no external quote — using the broker's "
+                f"own mark {live:.4f} to price-cap the flatten"
+            )
+    if not live:
         logger.warning(
-            f"[broker] drift {ticker}: no live quote for a price-capped flatten — "
-            "skipping this tick (reported only)"
+            f"[broker] drift {ticker}: no live quote and no broker mark for a "
+            "price-capped flatten — skipping this tick (reported only)"
         )
         return None
 
@@ -1607,8 +1642,12 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                                   report, run_id)
             if res is None:
                 # deliberate stand-down this tick (no quote, cancel race lost
-                # to a fill, or a same-side flatten already filled) — not an error
-                entry["action"] = "flatten_skipped"
+                # to a fill, or a same-side flatten already filled) — not an error.
+                # A sub-1-share residue is its OWN state: IBKR rejects fractional
+                # orders via the API (err 10243), so it is not "skipped this tick"
+                # but permanently un-closable here and needs a manual TWS close.
+                entry["action"] = ("flatten_manual_fractional"
+                                   if int(abs(p.quantity)) <= 0 else "flatten_skipped")
             elif res.ok:
                 report["drift_flattened"] += 1
                 # Accepted-but-not-yet-filled off-RTH is the SAME self-resolving

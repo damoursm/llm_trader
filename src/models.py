@@ -1183,6 +1183,12 @@ class TickerSignal(BaseModel):
     # how convinced the bearish camp is. combined_score = their difference.
     combined_buy_score: float = 0.0
     combined_sell_score: float = 0.0
+    # Which combine produced the two sides above (2026-08-02): "weighted" (the
+    # hand-weighted camps) or "ml"/"ml_buy"/"ml_sell" when the ML-combine A/B arm
+    # supplied that side. Recorded PER SIDE because the swap is fail-soft per side
+    # — a missing artifact leaves that side weighted even with the arm on. Rides
+    # the signals panel so ML-vs-weighted performance is measurable directly.
+    combine_source: str = "weighted"
     # Horizon synthesis (term-structure of edge) — populated when enable_horizon_synthesis=true.
     # target_horizon is the mechanical argmax-net-edge holding horizon (one of the
     # simulated-trade horizons, e.g. "1w"); horizon_label maps it to the LLM bucket;
@@ -1311,14 +1317,20 @@ class TickerSignal(BaseModel):
     kaufman_short_score: float = 0.0    # [-1, 0] efficient DOWNtrend (bearish); 0 = not a downtrend
     adx_long_score: float = 0.0         # [0, +1] strong UPtrend via ADX·DMI (bullish); 0 = not an uptrend
     adx_short_score: float = 0.0        # [-1, 0] strong DOWNtrend via ADX·DMI (bearish); 0 = not a downtrend
-    # Classic cross-sectional anomalies (2026-07-08, panel-first at weight 0 —
-    # see signals/classic_anomalies.py): IC-measured, NOT in combined_score yet.
+    # Classic cross-sectional anomalies (2026-07-08; PROMOTED into the combine
+    # 2026-08-11 along with rsi2_rev/dloc_rev/ml_ohlcv — see
+    # signals/classic_anomalies.py and aggregator._BASE_WEIGHTS).
     high_52w_score: float = 0.0         # [-1, +1] 52-week-high proximity (George-Hwang continuation)
     high_52w_ratio_pct: float = 0.0     # close / 52-week high, in % (100 = at the high)
     momentum_12_1_score: float = 0.0    # [-1, +1] vol-normalised 12-1 (skip-month) momentum
     momentum_12_1_pct: float = 0.0      # raw 12-1 return %
     st_reversal_score: float = 0.0      # [-1, +1] prior-week return SIGN-FLIPPED (liquid names only)
     st_reversal_ret_5d_pct: float = 0.0 # raw prior-5-day return %
+    # Mean-reversion additions (2026-08-10, panel-first at weight 0 — same contract):
+    rsi2_rev_score: float = 0.0         # [-1, +1] (50 − RSI(2))/50 — Connors snapback
+    rsi2_rev_value: float = 0.0         # raw RSI(2) 0..100
+    dloc_rev_score: float = 0.0         # [-1, +1] 2·(0.5 − close-location in day range)
+    dloc_rev_loc_pct: float = 0.0       # close location in the day's H-L range, %
     # Tier-2 panel-first methods (2026-07-08, weight 0 — same contract):
     squeeze_score: float = 0.0          # [-1, +1] TTM squeeze: momentum-signed coil/release (ttm_squeeze.py)
     squeeze_label: str = "NONE"         # NONE | SQUEEZE_ON | FIRED_UP | FIRED_DOWN
@@ -1336,6 +1348,10 @@ class TickerSignal(BaseModel):
     vol_profile_score: float = 0.0      # [-1, +1] acceptance outside the value area / POC gravity inside
     vol_profile_label: str = "NO_DATA"  # ABOVE_VALUE | BELOW_VALUE | IN_VALUE | NO_DATA
     vol_profile_poc_dist_pct: float = 0.0  # close vs Point of Control, % (+ = above POC)
+    # ML OHLCV model (2026-07-30, panel-first weight 0 — signals/ml_model.py):
+    # net = P(up) − P(down) ∈ [-1, 1]; 0 outside the validated clean-trend/liquid subset.
+    ml_ohlcv_score: float = 0.0
+    ml_ohlcv_label: str = "NO_MODEL"    # OK | NO_VIEW | NO_DATA | NO_MODEL | ERROR
     # PEAD (Post-Earnings Announcement Drift) — populated when enable_pead=true
     pead_score: float = 0.0          # [-1, +1] SUE × time-decay
     pead_surprise_pct: float = 0.0   # most recent EPS surprise %

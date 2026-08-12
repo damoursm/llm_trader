@@ -12,7 +12,10 @@ from src.performance.confidence_sizing import (
 
 
 def _trade(conf, ret, status="CLOSED"):
-    return {"status": status, "confidence": conf, "return_pct": ret}
+    # Win/loss is read GROSS from the prices (system convention, 2026-08-06), so
+    # the fixture carries a price pair consistent with the intended `ret` sign.
+    return {"status": status, "confidence": conf, "return_pct": ret,
+            "action": "BUY", "entry_price": 100.0, "exit_price": 100.0 * (1 + ret / 100.0)}
 
 
 def _ledger(band_specs):

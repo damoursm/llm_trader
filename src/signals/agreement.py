@@ -48,7 +48,13 @@ from loguru import logger
 METHOD_FAMILIES: Dict[str, Tuple[str, ...]] = {
     "Sentiment":    ("news", "sent_velocity"),                    # article flow (level + Δ)
     "Price/Trend":  ("tech", "massive", "momentum",               # the ticker's own OHLCV tape
-                     "trend_strength", "pattern", "vwap", "ext_gap"),
+                     "trend_strength", "pattern", "vwap", "ext_gap",
+                     # 2026-08-11 promotions — all six read the ticker's own
+                     # OHLCV, so they JOIN the tape family rather than adding
+                     # fake independent voters (the family design's whole point:
+                     # 13 price methods agreeing is one family vote, not 13).
+                     "mom_12_1", "hi52", "st_reversal",
+                     "rsi2_rev", "dloc_rev", "ml_ohlcv"),
     "Rel-Strength": ("sector_momentum", "market_momentum"),       # ticker vs benchmark tape
     "Volume-Flow":  ("money_flow",),                              # volume-weighted accumulation
     "Options":      ("put_call", "max_pain", "oi_skew",           # options-chain positioning

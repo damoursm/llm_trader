@@ -37,6 +37,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 from loguru import logger
 
+from config.settings import settings
 from src.analysis.asof import analysis_asof
 
 
@@ -80,7 +81,33 @@ def weights_as_of(cutoff: str) -> Dict[str, object]:
         eff = {m: (-w if m in inv else w) for m, w in _BASE_WEIGHTS.items()
                if m not in set(filtered)}
 
+        # Degradation check. Every layer above is fail-soft and several return
+        # an EMPTY result rather than raising — so a transient DB read failure
+        # (a lock lost to the live scheduler) yields "nothing filtered", which
+        # is a materially more permissive calibration that looks completely
+        # legitimate. Observed exactly once: 2026-07-26 stored 21 active methods
+        # between neighbours at 10, and recomputing the same cutoff afterwards
+        # gave 10 — non-reproducible, i.e. not a real market fact.
+        #
+        # An empty filter IS legitimate early on, when no method has enough
+        # observations to judge. The discriminator is therefore whether enough
+        # history was VISIBLE, not the emptiness itself.
+        degraded = False
+        try:
+            from src.analysis.signal_panel import _load_signals
+            visible = len(_load_signals(None))
+            if not filtered and visible >= int(settings.walkforward_min_rows_to_filter):
+                degraded = True
+                logger.warning(
+                    f"[walkforward] {cutoff}: no methods filtered despite "
+                    f"{visible:,} visible rows — treating this step as DEGRADED "
+                    f"(likely a transient read failure inside a fail-soft layer)")
+        except Exception as e:
+            degraded = True
+            logger.warning(f"[walkforward] {cutoff}: degradation check failed ({e})")
+
     state.update({
+        "degraded": degraded,
         "weights": {k: round(float(v), 6) for k, v in sorted(eff.items())},
         "inverted": inverted,
         "filtered": filtered,
@@ -154,6 +181,7 @@ def materialize(start: Optional[str] = None, end: Optional[str] = None,
         "as_of": s["as_of"],
         "computed_at": stamped,
         "n_active": int(s["n_active"]),
+        "degraded": bool(s.get("degraded", False)),
         "weights": json.dumps(s["weights"], sort_keys=True),
         "inverted": json.dumps(s["inverted"]),
         "filtered": json.dumps(s["filtered"]),
@@ -198,6 +226,12 @@ def weights_for_date(signal_date: str,
         return None
     d = str(signal_date)[:10]
     prior = h[h["as_of"].astype(str) < d]
+    # A degraded step is a fabricated permissive calibration, not a market
+    # fact — fall back to the last GOOD one rather than score a day under it.
+    if "degraded" in prior.columns:
+        good = prior[~prior["degraded"].fillna(False).astype(bool)]
+        if not good.empty:
+            prior = good
     if prior.empty:
         return None
     row = prior.iloc[-1]

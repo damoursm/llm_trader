@@ -225,3 +225,58 @@ def test_reconcile_overnight_accepted_flatten_is_also_pending(monkeypatch):
 
     assert report["drift"][0]["action"] == "flatten_pending_fill"
     assert _assess_broker_health(report)["down"] is False
+
+
+# ── deliberate stand-down is not a failure (2026-08-04, ADIG) ────────────────
+# reconcile sets action="flatten_skipped" when it CHOSE not to trade (no live
+# quote for the price cap, fractional position, cancel race lost to a fill, or a
+# same-side flatten already filled) — its own comment says "not an error". The
+# health verdict counted it as HARD drift and labelled it "auto-flatten FAILED",
+# so ADIG (24.5 fractional shares, no ledger record, no quote from any source —
+# a corporate-action credit) fired CRITICAL + a mail banner on EVERY tick with no
+# possible resolution: pure alert fatigue that would bury a real failure.
+
+def test_flatten_skipped_is_not_a_health_problem():
+    v = _assess_broker_health(_report([{"ticker": "ADIG", "action": "flatten_skipped"}]))
+    assert v["down"] is False                       # no CRITICAL, no forced email
+    assert v["message"] == ""
+    assert v["drift_pending"] == ["ADIG"]           # still fully surfaced
+
+
+def test_flatten_skipped_never_reads_as_FAILED():
+    # The one message that means "auto-flatten FAILED" must keep that meaning, so
+    # a stand-down mixed with a real failure reports the failure, not the skip.
+    v = _assess_broker_health(_report([
+        {"ticker": "ADIG", "action": "flatten_skipped"},
+        {"ticker": "V", "action": "flatten_failed"}]))
+    assert v["down"] is True
+    assert "auto-flatten FAILED" in v["message"]
+    assert "V" in v["message"] and "1 position" in v["message"]
+    assert v["drift_pending"] == ["ADIG"]
+
+
+def test_a_real_flatten_failure_is_still_hard():
+    # Guard against over-suppression: the fix must not silence genuine failures.
+    v = _assess_broker_health(_report([{"ticker": "V", "action": "flatten_failed"}]))
+    assert v["down"] is True and "auto-flatten FAILED" in v["message"]
+
+
+# ── fractional residue: un-closable by API, not a failure (2026-08-04) ───────
+# IBKR rejects fractional orders over the API — verified with a whatIfOrder dry
+# run: "Error 10243: Fractional-sized order cannot be placed via API. Please use
+# desktop version." ADIG sat at 0.5 shares ($11.57) alerting CRITICAL every tick
+# about something NO code path can fix. Note the residue was MANUFACTURED by the
+# flatten's own int() truncation (24.5 -> close 24 -> 0.5 left behind).
+
+def test_fractional_residue_is_not_a_health_problem():
+    v = _assess_broker_health(_report([
+        {"ticker": "ADIG", "action": "flatten_manual_fractional"}]))
+    assert v["down"] is False
+    assert v["drift_pending"] == ["ADIG"]        # surfaced, not escalated
+
+
+def test_fractional_residue_does_not_mask_a_real_failure():
+    v = _assess_broker_health(_report([
+        {"ticker": "ADIG", "action": "flatten_manual_fractional"},
+        {"ticker": "V", "action": "flatten_failed"}]))
+    assert v["down"] is True and "V" in v["message"]

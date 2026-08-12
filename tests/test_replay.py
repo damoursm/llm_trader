@@ -308,6 +308,88 @@ def test_restore_matches_the_RUN_not_just_the_day(monkeypatch):
     assert restored["money_flow"].all()
 
 
+def test_restore_survives_duplicate_replay_rows(monkeypatch):
+    """THE 2026-08-05..11 production bug: a double-materialise left the same
+    run-exact key in `signals_replay` twice, the left-merge fanned out, and the
+    index re-assignment raised "Length mismatch" — silently degrading EVERY
+    panel build to the epoch mask. Duplicates must be deduped (newest
+    replayed_at wins), never allowed to kill the restore."""
+    import src.db.repo as repo
+    monkeypatch.setattr(repo, "fetch_df", lambda *a, **k: pd.DataFrame({
+        "signal_date": ["2026-06-22", "2026-06-22"],
+        "ticker": ["AAA", "AAA"],
+        "generated_at": ["2026-06-22T14:00:00", "2026-06-22T14:00:00"],
+        "replayed_at": ["2026-08-06T05:41:11", "2026-08-05T09:46:53"],
+        "money_flow": [0.90, 0.10],
+    }))
+    df = pd.DataFrame({"signal_date": ["2026-06-22"], "ticker": ["AAA"],
+                       "generated_at": ["2026-06-22T14:00:00"],
+                       "money_flow": [0.0]})
+    out, restored = replay.restore_replayed(df, methods=("money_flow",))
+    assert len(out) == 1, "duplicate replay keys must not fan the panel out"
+    assert out.loc[0, "money_flow"] == pytest.approx(0.90),         "the NEWEST materialisation's value must win"
+    assert restored and restored["money_flow"].all()
+
+
+def test_restore_dedupe_keeps_last_run_primary_over_replayed_at(monkeypatch):
+    """In the no-generated_at fallback the panel's last-RUN rule stays primary:
+    an older run must not win the dedupe just because it was re-materialised
+    more recently."""
+    import src.db.repo as repo
+    monkeypatch.setattr(repo, "fetch_df", lambda *a, **k: pd.DataFrame({
+        "signal_date": ["2026-07-01", "2026-07-01"],
+        "ticker": ["AAA", "AAA"],
+        "generated_at": ["2026-07-01T20:00:00", "2026-07-01T14:00:00"],
+        "replayed_at": ["2026-08-05T00:00:00", "2026-08-06T00:00:00"],
+        "money_flow": [0.90, 0.10],
+    }))
+    df = pd.DataFrame({"signal_date": ["2026-07-01"], "ticker": ["AAA"],
+                       "money_flow": [0.0]})
+    out, _ = replay.restore_replayed(df, methods=("money_flow",))
+    assert out.loc[0, "money_flow"] == pytest.approx(0.90),         "the LAST run wins; replayed_at is only the within-key tiebreak"
+
+
+def test_materialize_delete_boundary_comes_from_the_staged_frame(monkeypatch):
+    """The DELETE window must be derived from the frame being inserted, not from
+    a fresh CURRENT_DATE: the SELECT ran hours earlier and a midnight crossing
+    between the two clocks shifted the DELETE one day past the INSERT, leaving
+    a stale day duplicated underneath the fresh copy (the 2026-06-22 twins).
+    Seeding a stale row on the frame's own min day and materialising must yield
+    UNIQUE run-exact keys."""
+    from src.db.connection import connect
+
+    staged = pd.DataFrame({
+        "signal_date": ["2026-06-22", "2026-06-23"],
+        "ticker": ["AAA", "AAA"],
+        "run_id": ["r2", "r2"],
+        "generated_at": ["2026-06-22T14:00:00", "2026-06-23T14:00:00"],
+        "money_flow": [0.5, 0.6],
+    })
+    monkeypatch.setattr(replay, "replay_panel", lambda *a, **k: staged.copy())
+    with connect() as con:
+        con.execute("DELETE FROM signals_replay")
+        con.execute(
+            "INSERT INTO signals_replay (signal_date, ticker, run_id, "
+            "generated_at, replayed_at, money_flow) VALUES "
+            "('2026-06-22', 'AAA', 'r1', '2026-06-22T14:00:00', "
+            "'2026-08-05T09:46:53', 0.1)")
+
+    # days=1: the old CURRENT_DATE arithmetic puts the DELETE boundary at
+    # ~yesterday, far past the staged June days, so the stale June row SURVIVES
+    # under the fresh insert (the exact production scenario). The fix derives
+    # the boundary from the staged frame's own min day instead.
+    n = replay.materialize(days=1)
+    assert n == 2
+
+    from src.db import repo
+    dup = repo.fetch_df(
+        "SELECT signal_date, ticker, generated_at, COUNT(*) AS n "
+        "FROM signals_replay GROUP BY 1,2,3 HAVING COUNT(*) > 1")
+    assert dup.empty, "materialize must never leave duplicate run-exact keys"
+    rows = repo.fetch_df("SELECT COUNT(*) AS n FROM signals_replay")
+    assert int(rows["n"].iloc[0]) == 2
+
+
 def test_restore_without_run_column_takes_the_panels_last_run(monkeypatch):
     """Fallback when the frame carries no `generated_at`: pick the LAST run, the
     same rule `build_panel` dedupes by — never arbitrary row order."""

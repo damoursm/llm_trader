@@ -313,7 +313,7 @@ _SIGNAL_BASE_COLS = [
 ]
 _SIGNAL_COLS = (_SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS)
                + list(SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)
-               + list(SIGNAL_COMBINED_SIDE_COLUMNS) + ["scores"])
+               + list(SIGNAL_COMBINED_SIDE_COLUMNS) + ["combine_source", "scores"])
 
 
 def insert_signals(run_id: str, generated_at: str, signal_date: str,
@@ -346,6 +346,7 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             + [_f(scores.get(m)) for m in SIGNAL_METHOD_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_COMBINED_SIDE_COLUMNS]
+            + [r.get("combine_source")]
             + [_json(scores)]
         ))
     placeholders = ", ".join(["?"] * len(_SIGNAL_COLS))
@@ -599,9 +600,28 @@ def insert_broker_report(run_id: str, report: dict) -> None:
 
 # ── generic read path (used by the dashboard) ──────────────────────────────
 
-def fetch_df(sql: str, params: Optional[list] = None, read_only: bool = True) -> pd.DataFrame:
-    """Run a query and return a pandas DataFrame. Read-only by default."""
-    with connect(read_only=read_only) as conn:
+def fetch_df(sql: str, params: Optional[list] = None,
+             read_only: Optional[bool] = None) -> pd.DataFrame:
+    """Run a query and return a pandas DataFrame.
+
+    ``read_only`` defaults to this PROCESS's role (``set_read_only``), not to a
+    hardcoded True. DuckDB keeps one database instance per path per process and
+    refuses a second handle with a different configuration, so a writer process
+    that opened read-only here raced its own writes:
+
+        ConnectionException: Can't open a connection to same database file with
+        a different configuration than existing connections
+
+    The pipeline is threaded (hold-review branch, shadow arms, EOD maintenance),
+    so a read overlapping a write is routine — this fired intermittently, and the
+    error is not a lock error, so it used to bypass the retry entirely. Reading
+    through the writer's own read-write config removes the clash at the source; a
+    read-write handle serves reads identically, and the connect-time schema check
+    is memoised per process so it costs ~0.5 ms, not the 14.1 ms it once did. The
+    dashboard (``set_read_only(True)``) is unaffected and stays read-only
+    throughout. Pass the flag explicitly only to override the process role.
+    """
+    with connect(read_only=_READ_ONLY if read_only is None else read_only) as conn:
         return conn.execute(sql, params or []).df()
 
 

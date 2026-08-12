@@ -189,3 +189,104 @@ def test_auto_epoch_never_masks_a_regenerated_method(monkeypatch):
     got = rf.auto_epochs()
     assert "money_flow" not in got, "a regenerated method must not be masked"
     assert "news" in got
+
+
+# ── nightly scheduling ────────────────────────────────────────────────────────
+
+def test_nightly_rescore_fires_once_per_date_at_the_configured_time():
+    from datetime import datetime, time
+    import src.scheduler.runner as runner
+
+    at = time(2, 0)
+    assert not runner._should_run_nightly_rescore(datetime(2026, 7, 29, 1, 59), None, at)
+    assert runner._should_run_nightly_rescore(datetime(2026, 7, 29, 2, 0), None, at)
+    assert runner._should_run_nightly_rescore(datetime(2026, 7, 29, 5, 0), None, at)
+    # Already ran for this date.
+    assert not runner._should_run_nightly_rescore(
+        datetime(2026, 7, 29, 3, 30), datetime(2026, 7, 29).date(), at)
+
+
+def test_nightly_rescore_runs_on_non_market_days():
+    """It repairs stored history, which is just as stale on a Saturday — and a
+    weekend night is the quietest window it will ever get."""
+    from datetime import datetime, time
+    import src.scheduler.runner as runner
+    saturday = datetime(2026, 8, 1, 2, 0)
+    assert runner._should_run_nightly_rescore(saturday, None, time(2, 0))
+
+
+def test_nightly_rescore_respects_the_master_flag(monkeypatch):
+    from datetime import datetime, time
+    from config.settings import settings
+    import src.scheduler.runner as runner
+    monkeypatch.setattr(settings, "enable_auto_refactor", False)
+    assert not runner._should_run_nightly_rescore(datetime(2026, 7, 29, 2, 0),
+                                                  None, time(2, 0))
+
+
+def test_no_change_means_no_thread_is_started(monkeypatch):
+    """Detection is sub-second; the ~40-minute path must only start when an
+    implementation actually changed."""
+    import src.scheduler.runner as runner
+    monkeypatch.setattr("src.analysis.refactor.plan",
+                        lambda: {"changed": [], "first_seen": [],
+                                 "mask_candidates": [], "regenerate": [],
+                                 "derived_changed": [], "unmapped": [],
+                                 "rewalk_weights": False, "rerun_backtest": False})
+    started = runner._maybe_start_nightly_rescore()
+    assert started is False
+
+
+def test_a_detected_change_starts_a_BACKGROUND_thread(monkeypatch):
+    """The scheduler loop is single-threaded and 02:00 ET is a live overnight
+    tick slot, so an inline rescore would block the 02:00/03:00/03:30 ticks —
+    real missed trading to repair history that is in no hurry."""
+    import threading
+    import src.scheduler.runner as runner
+
+    monkeypatch.setattr("src.analysis.refactor.plan",
+                        lambda: {"changed": ["money_flow"], "first_seen": [],
+                                 "mask_candidates": [], "regenerate": ["money_flow"],
+                                 "derived_changed": [], "unmapped": [],
+                                 "rewalk_weights": True, "rerun_backtest": True})
+    done = threading.Event()
+    monkeypatch.setattr("src.analysis.refactor.run_refactor",
+                        lambda **k: (done.set(), {"ok": True, "steps": [],
+                                                  "plan": {"changed": ["money_flow"]}})[1])
+    caller = threading.current_thread()
+    assert runner._maybe_start_nightly_rescore() is True
+    assert runner._RESCORE_THREAD is not caller
+    assert done.wait(timeout=10), "background rescore never ran"
+    runner._RESCORE_THREAD.join(timeout=10)
+
+
+def test_a_second_rescore_does_not_start_while_one_is_running(monkeypatch):
+    """A ~40-minute job overlapping itself would double every DB write."""
+    import threading
+    import src.scheduler.runner as runner
+
+    release = threading.Event()
+    monkeypatch.setattr("src.analysis.refactor.plan",
+                        lambda: {"changed": ["money_flow"], "first_seen": [],
+                                 "mask_candidates": [], "regenerate": ["money_flow"],
+                                 "derived_changed": [], "unmapped": [],
+                                 "rewalk_weights": True, "rerun_backtest": True})
+    monkeypatch.setattr("src.analysis.refactor.run_refactor",
+                        lambda **k: (release.wait(timeout=10),
+                                     {"ok": True, "steps": [],
+                                      "plan": {"changed": []}})[1])
+    try:
+        assert runner._maybe_start_nightly_rescore() is True
+        assert runner._maybe_start_nightly_rescore() is False, "started a second run"
+    finally:
+        release.set()
+        if runner._RESCORE_THREAD:
+            runner._RESCORE_THREAD.join(timeout=10)
+
+
+def test_eod_maintenance_no_longer_hosts_the_refactor():
+    """It must not move back inline — that is what would block the ticks."""
+    import inspect
+    import src.scheduler.runner as runner
+    src = inspect.getsource(runner._run_eod_maintenance)
+    assert "run_refactor" not in src

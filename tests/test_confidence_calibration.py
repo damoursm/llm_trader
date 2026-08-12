@@ -4,7 +4,11 @@ from src.analysis.confidence_calibration import compute_calibration
 
 
 def _t(conf, ret, mul=1.0):
-    return {"confidence": conf, "return_pct": ret, "position_size_multiplier": mul}
+    # Win/loss is GROSS from the prices (system convention, 2026-08-06); the
+    # price pair is kept consistent with the intended `ret` sign.
+    return {"confidence": conf, "return_pct": ret, "position_size_multiplier": mul,
+            "action": "BUY", "entry_price": 100.0,
+            "exit_price": 100.0 * (1 + ret / 100.0)}
 
 
 def test_empty():

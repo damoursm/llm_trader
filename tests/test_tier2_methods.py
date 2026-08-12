@@ -167,6 +167,7 @@ _OFF = [
     "enable_multi_timeframe_signals", "enable_extended_gap", "enable_massive_tech",
     "enable_trend_predictability_methods",
     "enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
+    "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv",
     "enable_residual_momentum", "enable_volume_profile",
 ]
 

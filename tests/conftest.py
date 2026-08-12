@@ -80,6 +80,15 @@ def _default_llm_primary(monkeypatch):
     # synthesis, single-review LLM exits. The A/B + confirmation tests opt in.
     monkeypatch.setattr(settings, "blind_synthesis_share", 0.0)
     monkeypatch.setattr(settings, "enable_llm_exit_confirmation", False)
+    # Long-horizon buy arm OFF for the legacy suites: the .env now A/B-tests it at
+    # 0.5, which would randomly swap combined_buy_score for the ml_buy stacker and
+    # make aggregator/pipeline tests non-deterministic. The arm tests opt in.
+    monkeypatch.setattr(settings, "ml_combine_arm_share", 0.0)
+    monkeypatch.setattr(settings, "enable_ml_combine", False)
+    # ML exit model OFF for the legacy suites: it only closes arm trades (pinned
+    # off above) and fail-softs without an artifact, but pinning it keeps
+    # build_exit_scores from trying to load a model during unrelated exit tests.
+    monkeypatch.setattr(settings, "enable_ml_exit_model", False)
     # Pin the Qwen route to DashScope-direct defaults — the developer's .env
     # points at OpenRouter (different model id + thinking dialect + explicit
     # cache markers). OpenRouter-route tests monkeypatch these explicitly.

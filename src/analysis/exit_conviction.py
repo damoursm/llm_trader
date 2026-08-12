@@ -40,15 +40,18 @@ from config.settings import settings
 # Method scores that are NOT part of the raw-method breadth consensus: the LLM
 # review (that IS the conviction the floor tests), the aggregator combined score
 # (Fix #2 distrusts it for exits), the non-signal decision/excursion layers, and
-# the PANEL-FIRST classic anomalies (hi52 / 12-1 momentum / short-term reversal,
-# 2026-07-08) — measured in the entry AND exit panels but acting on neither
-# until their IC earns it (st_reversal in particular scores every winner's
-# up-week as exit pressure, which is exactly the hypothesis to TEST, not assume).
+# the classic anomalies + 2026-08-10 MR additions. Since the 2026-08-11 combine
+# promotion (hi52/mom_12_1/st_reversal/rsi2_rev/dloc_rev/ml_ohlcv) these ACT on
+# ENTRY — but the EXIT consensus still deliberately excludes them: entry weight
+# and exit trust are separate decisions, their exit-side IC is measured in the
+# exit panel first (st_reversal in particular scores every winner's up-week as
+# exit pressure, which is exactly the hypothesis to TEST, not assume).
 _CONSENSUS_SKIP = frozenset({"llm_review", "aggregator", "horizon", "edge_decay",
                              "macro_regime", "mfe", "mae",
                              "hi52", "mom_12_1", "st_reversal",
+                             "rsi2_rev", "dloc_rev",
                              "squeeze", "iv_term", "avwap",
-                             "resid_mom", "vol_profile"})
+                             "resid_mom", "vol_profile", "ml_ohlcv", "ml_exit"})
 
 
 def exit_method_consensus(scores: Dict[str, float]) -> Optional[float]:

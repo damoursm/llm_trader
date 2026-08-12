@@ -63,6 +63,10 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     # IC-measured + trade-attributed but NOT in combined_score/coherence yet
     # (signals/classic_anomalies.py).
     "hi52", "mom_12_1", "st_reversal",
+    # Mean-reversion additions (2026-08-10, panel-first at weight 0): Connors
+    # RSI(2) + daily candle-location reversal (signals/classic_anomalies.py) —
+    # the de-correlated winners of the 20y full-history MR battery.
+    "rsi2_rev", "dloc_rev",
     # Tier-2 panel-first methods (2026-07-08, weight 0): TTM squeeze
     # (ttm_squeeze.py), IV term-structure slope (iv_term_structure.py, from the
     # GEX chains), anchored VWAP (anchored_vwap.py, 52w high/low anchors).
@@ -71,6 +75,9 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     # (residual_momentum.py, beta-adjusted 12-1 vs SPY) and volume profile
     # (volume_profile.py, POC / 70% value area).
     "resid_mom", "vol_profile",
+    # ML OHLCV model (2026-07-30, panel-first at weight 0 — signals/ml_model.py):
+    # GBM on clean-trend/liquid names, 10-day market-relative. net = P(up)-P(down).
+    "ml_ohlcv",
 )
 
 # Multi-timeframe technical columns — the 30-min + weekly variants of the 8
@@ -321,6 +328,7 @@ SCHEMA_STATEMENTS = [
         {", ".join(f"{m} DOUBLE" for m in SIGNAL_METHOD_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_COMBINED_SIDE_COLUMNS)},
+        combine_source      VARCHAR,
         scores              VARCHAR
     );
     """,
@@ -408,6 +416,7 @@ SCHEMA_STATEMENTS = [
         as_of         VARCHAR,
         computed_at   VARCHAR,
         n_active      INTEGER,
+        degraded      BOOLEAN,   -- a fail-soft layer returned empty; not a market fact
         weights       VARCHAR,   -- JSON {method: effective weight, inversion signed}
         inverted      VARCHAR,   -- JSON [method]
         filtered      VARCHAR,   -- JSON [method] dropped by the hard filter
@@ -442,6 +451,24 @@ SCHEMA_STATEMENTS = [
         tape_conf_factor    DOUBLE,
         confidence          DOUBLE,
         direction           VARCHAR
+    );
+    """,
+    """
+    -- ML model registry (2026-07-30, signals/ml_model.py). One row per training
+    -- of a trained-model method (e.g. ml_ohlcv). The artifact's OUTPUT changes on
+    -- every retrain, so `train_max_date` is the as-of anchor for interpreting that
+    -- model version's panel scores — the model-registry epoch the plan defers to
+    -- promotion time. Audit trail + provenance; never read into a live decision.
+    CREATE TABLE IF NOT EXISTS ml_models (
+        trained_at      VARCHAR,
+        method          VARCHAR,
+        model_type      VARCHAR,
+        horizon         INTEGER,
+        basis           VARCHAR,
+        n_train         INTEGER,
+        train_max_date  VARCHAR,
+        features        VARCHAR,   -- JSON [feature]
+        config          VARCHAR    -- JSON training config
     );
     """,
     """
@@ -497,6 +524,9 @@ _ADD_COLUMNS = (
     ("signals", "hi52", "DOUBLE"),
     ("signals", "mom_12_1", "DOUBLE"),
     ("signals", "st_reversal", "DOUBLE"),
+    # Mean-reversion additions (2026-08-10) on an existing DB.
+    ("signals", "rsi2_rev", "DOUBLE"),
+    ("signals", "dloc_rev", "DOUBLE"),
     # Tier-2 panel-first methods (squeeze / iv_term / avwap) on an existing DB.
     ("signals", "squeeze", "DOUBLE"),
     ("signals", "iv_term", "DOUBLE"),
@@ -504,6 +534,8 @@ _ADD_COLUMNS = (
     # Tier-3 panel-first methods (resid_mom / vol_profile) on an existing DB.
     ("signals", "resid_mom", "DOUBLE"),
     ("signals", "vol_profile", "DOUBLE"),
+    # ML OHLCV model (2026-07-30, panel-first at weight 0) on an existing DB.
+    ("signals", "ml_ohlcv", "DOUBLE"),
     # Universe provenance (2026-07-03): which discovery source first surfaced
     # the ticker this run (watchlist / trending / screener / smart_money / …) —
     # the measurement behind per-source hit rates and, later, an adaptive
@@ -513,6 +545,12 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS),
     # Buy/sell split combine sides (2026-07-22) on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_COMBINED_SIDE_COLUMNS),
+    # Which combine produced this row's buy/sell scores (2026-08-02): the ML
+    # stackers or the hand-weighted camps. The A/B arm is per-RUN but the swap is
+    # fail-soft PER SIDE (a missing artifact keeps that side weighted), so the
+    # source is recorded per ticker per side: weighted | ml | ml_buy | ml_sell.
+    # Lets every panel analysis segment ML-combine vs weighted-combine performance.
+    ("signals", "combine_source", "VARCHAR"),
     # IBKR account P&L snapshot (reqPnL) on an existing broker_reconciles table.
     ("broker_reconciles", "pnl_daily", "DOUBLE"),
     ("broker_reconciles", "pnl_unrealized", "DOUBLE"),

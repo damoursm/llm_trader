@@ -1738,6 +1738,22 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
                 "Avg return %": st.get("avg_return"),
             })
 
+    # Long-horizon buy arm A/B — outcomes grouped by the per-run coin that
+    # replaced combined_buy_score with the learned 5d stacker AND held those buys
+    # longer (ml_arm_min_hold_days). The avg hold days rides the label so the
+    # hold-lengthening — the whole point — is visible next to the return. ON should
+    # show a longer hold; the bet is that captures the 5d+ edge the short book misses.
+    lha = perf.get("ml_arm_eval") or {}
+    for key, tag in (("on", "ON"), ("off", "OFF")):
+        st = lha.get(key)
+        if st and st.get("trades"):
+            rows.append({
+                "Method": f"ML-arm eval · ML combine {tag} ({st.get('avg_days_held', 0)}d hold)",
+                "Win rate %": st.get("win_rate"),
+                "Trades": st.get("trades"),
+                "Avg return %": st.get("avg_return"),
+            })
+
     # Blind-synthesis A/B — entry outcomes grouped by whether the entry run hid
     # the aggregator's verdict from the synthesis prompt (ON = the LLM's own
     # independent judgment; OFF = the legacy echo-prone sighted prompt).
@@ -1777,6 +1793,7 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
         style_data_conditional=[
             {"if": {"filter_query": '{Method} contains "LLM"'}, "backgroundColor": "#eef2ff"},
             {"if": {"filter_query": '{Method} contains "hold-prompt"'}, "backgroundColor": "#fdf4ff"},
+            {"if": {"filter_query": '{Method} contains "ML combine"'}, "backgroundColor": "#ecfdf5"},
             {"if": {"filter_query": '{Method} contains "blind-synthesis"'}, "backgroundColor": "#fefce8"},
             {"if": {"filter_query": '{Method} contains "prompt arm"'}, "backgroundColor": "#eff6ff"},
         ],

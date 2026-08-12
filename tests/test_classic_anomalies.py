@@ -157,14 +157,16 @@ def _minimal_build(monkeypatch):
     return agg
 
 
-def test_zero_impact_on_combine_confidence_and_agreement(monkeypatch):
-    """The load-bearing panel-first guarantee: strong anomaly scores must leave
-    combined_score / confidence / sources_agreeing bit-identical, while the
-    scores themselves land on the signal for the panel."""
+def test_promoted_anomalies_now_move_the_combine(monkeypatch):
+    """POST-PROMOTION contract (2026-08-11, user-directed): hi52 / mom_12_1 /
+    st_reversal carry _BASE_WEIGHTS entries, so strong scores MUST move
+    combined_score and count in the agreement machinery — the exact inverse of
+    the weight-0 guarantee this test pinned before promotion. The panel payload
+    behaviour is unchanged (scores land on the signal either way)."""
     agg = _minimal_build(monkeypatch)
     monkeypatch.setattr(agg, "compute_high_52w_score", lambda t, df=None: (0.9, 99.0))
-    monkeypatch.setattr(agg, "compute_momentum_12_1_score", lambda t, df=None: (-0.8, -35.0))
-    monkeypatch.setattr(agg, "compute_st_reversal_score", lambda t, df=None: (-0.7, 12.0))
+    monkeypatch.setattr(agg, "compute_momentum_12_1_score", lambda t, df=None: (0.8, 35.0))
+    monkeypatch.setattr(agg, "compute_st_reversal_score", lambda t, df=None: (0.7, -12.0))
 
     for flag in ("enable_high_52w", "enable_momentum_12_1", "enable_st_reversal"):
         monkeypatch.setattr(settings, flag, False)
@@ -174,12 +176,13 @@ def test_zero_impact_on_combine_confidence_and_agreement(monkeypatch):
         monkeypatch.setattr(settings, flag, True)
     on = agg.build_signals(["AAPL"], [])[0]
 
-    assert on.combined_score == off.combined_score
-    assert on.confidence == off.confidence
-    assert on.sources_agreeing == off.sources_agreeing
-    assert on.direction == off.direction
-    # ...and the panel payload is populated only on the ON run.
-    assert (on.high_52w_score, on.momentum_12_1_score, on.st_reversal_score) == (0.9, -0.8, -0.7)
+    # Three aligned bullish views must lift the combine (they carry weight now)
+    # and register as agreeing sources.
+    assert on.combined_score != off.combined_score
+    assert on.combined_score > off.combined_score
+    assert on.sources_agreeing >= off.sources_agreeing
+    # ...and the panel payload is populated only on the ON run, as before.
+    assert (on.high_52w_score, on.momentum_12_1_score, on.st_reversal_score) == (0.9, 0.8, 0.7)
     assert (off.high_52w_score, off.momentum_12_1_score, off.st_reversal_score) == (0.0, 0.0, 0.0)
 
 
@@ -214,3 +217,98 @@ def test_labels_and_categories_registered():
     for m in ("hi52", "mom_12_1", "st_reversal"):
         assert m in METHOD_LABELS
         assert m in METHOD_CATEGORIES["Technical"]
+
+
+# ── rsi2_rev + dloc_rev: 2026-08-10 mean-reversion additions ─────────────────
+# Selected by the 20y full-history battery (memory/pivot-horizon-target-2026-08
+# .md): de-correlated cluster winners on Gate-4 names. Same panel-first contract
+# and the same liquidity floor as st_reversal (bid-ask-bounce protection).
+
+from src.signals.classic_anomalies import (compute_dloc_rev_score,  # noqa: E402
+                                           compute_rsi2_rev_score)
+
+
+def _mr_frame(closes, volume=2_000_000.0, highs=None, lows=None):
+    n = len(closes)
+    idx = pd.bdate_range(end="2026-08-07", periods=n)
+    c = pd.Series(closes, dtype=float)
+    return pd.DataFrame({
+        "Open":   c.values,
+        "High":   (pd.Series(highs, dtype=float) if highs is not None else c * 1.01).values,
+        "Low":    (pd.Series(lows, dtype=float) if lows is not None else c * 0.99).values,
+        "Close":  c.values,
+        "Volume": np.full(n, float(volume)),
+    }, index=idx)
+
+
+def test_rsi2_deep_selloff_is_bullish_snapback():
+    closes = np.concatenate([np.full(60, 100.0), [97.0, 94.0, 91.0]])  # 3 hard down days
+    score, rsi2 = compute_rsi2_rev_score("SOLD", df=_mr_frame(closes))
+    assert rsi2 < 10.0
+    assert score > 0.8                                    # deeply oversold → strong bounce view
+
+
+def test_rsi2_melt_up_is_bearish():
+    closes = np.concatenate([np.full(60, 100.0), [103.0, 106.0, 109.0]])
+    score, rsi2 = compute_rsi2_rev_score("HOT", df=_mr_frame(closes))
+    assert rsi2 > 90.0
+    assert score < -0.8
+
+
+def test_rsi2_below_liquidity_floor_is_no_view(monkeypatch):
+    monkeypatch.setattr(settings, "st_reversal_min_dollar_volume", 50_000_000)
+    closes = np.concatenate([np.full(60, 100.0), [97.0, 94.0, 91.0]])
+    score, _ = compute_rsi2_rev_score("THIN", df=_mr_frame(closes, volume=1_000.0))
+    assert score == 0.0
+
+
+def test_rsi2_missing_volume_fails_closed():
+    closes = np.concatenate([np.full(60, 100.0), [97.0, 94.0, 91.0]])
+    df = _mr_frame(closes).drop(columns=["Volume"])
+    assert compute_rsi2_rev_score("NOVOL", df=df)[0] == 0.0
+
+
+def test_dloc_close_at_the_low_is_bullish():
+    closes = np.full(40, 100.0)
+    highs = np.full(40, 101.0)
+    lows = np.full(40, 99.0)
+    closes[-1], highs[-1], lows[-1] = 95.05, 100.0, 95.0   # closed pinned to the low
+    score, loc_pct = compute_dloc_rev_score("LOWCLOSE", df=_mr_frame(closes, highs=highs, lows=lows))
+    assert loc_pct < 5.0
+    assert score > 0.9
+
+
+def test_dloc_close_at_the_high_is_bearish():
+    closes = np.full(40, 100.0)
+    highs = np.full(40, 101.0)
+    lows = np.full(40, 99.0)
+    closes[-1], highs[-1], lows[-1] = 104.95, 105.0, 100.0
+    score, loc_pct = compute_dloc_rev_score("HICLOSE", df=_mr_frame(closes, highs=highs, lows=lows))
+    assert loc_pct > 95.0
+    assert score < -0.9
+
+
+def test_dloc_midrange_close_is_inside_the_deadband():
+    closes = np.full(40, 100.0)
+    highs = np.full(40, 102.0)
+    lows = np.full(40, 98.0)                               # close exactly mid-range
+    score, _ = compute_dloc_rev_score("MID", df=_mr_frame(closes, highs=highs, lows=lows))
+    assert score == 0.0
+
+
+def test_dloc_zero_range_bar_is_no_view():
+    closes = np.full(40, 100.0)
+    highs = np.full(40, 100.0)
+    lows = np.full(40, 100.0)                              # h == l
+    assert compute_dloc_rev_score("FLAT", df=_mr_frame(closes, highs=highs, lows=lows))[0] == 0.0
+
+
+def test_dloc_below_liquidity_floor_is_no_view(monkeypatch):
+    monkeypatch.setattr(settings, "st_reversal_min_dollar_volume", 50_000_000)
+    closes = np.full(40, 100.0)
+    highs = np.full(40, 101.0)
+    lows = np.full(40, 99.0)
+    closes[-1] = 99.05
+    score, _ = compute_dloc_rev_score("THIN2", df=_mr_frame(closes, highs=highs, lows=lows,
+                                                            volume=1_000.0))
+    assert score == 0.0

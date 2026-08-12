@@ -46,6 +46,10 @@ def _endpoint_family(path: str) -> str:
 _PERIOD_DAYS: Dict[str, int] = {
     "5d": 10, "1mo": 35, "3mo": 95, "6mo": 185,
     "1y": 370, "2y": 740, "5y": 1830,
+    # 20y (2026-08-11): Polygon aggs serve 2006+ in one 50k-limit call; the
+    # cache is full-depth since the 2026-08-08 deep backfill and the maintenance
+    # path must be able to sustain that depth.
+    "20y": 7300,
 }
 
 

@@ -40,32 +40,39 @@ _BUCKETS: Tuple[Tuple[float, float, str], ...] = (
 )
 
 
-def _pairs(trades: List[dict]) -> List[Tuple[float, float, float]]:
-    """``(confidence, return_pct, weight)`` for every trade with both values."""
-    out: List[Tuple[float, float, float]] = []
+def _pairs(trades: List[dict]) -> List[Tuple[float, float, float, Optional[bool]]]:
+    """``(confidence, return_pct, weight, gross_win)`` for every usable trade.
+
+    The gross-win flag is carried alongside the cost-adjusted return because the
+    win rate is GROSS by system convention while every return metric stays net —
+    and once the trade dict is discarded the flag can no longer be recovered.
+    """
+    from src.performance.tracker import is_gross_win
+    out: List[Tuple[float, float, float, Optional[bool]]] = []
     for t in trades or []:
         c, r = t.get("confidence"), t.get("return_pct")
         if c is None or r is None:
             continue
         try:
-            out.append((float(c), float(r), float(t.get("position_size_multiplier", 1.0))))
+            out.append((float(c), float(r),
+                        float(t.get("position_size_multiplier", 1.0)), is_gross_win(t)))
         except (TypeError, ValueError):
             continue
     return out
 
 
-def _bucket_stats(rows: List[Tuple[float, float, float]]) -> dict:
+def _bucket_stats(rows: List[Tuple[float, float, float, Optional[bool]]]) -> dict:
     """Summary metrics for one confidence bucket (returns are already %)."""
-    rets = [r for _, r, _ in rows]
-    wts = [w for _, _, w in rows]
+    rets = [r for _, r, _, _ in rows]
+    wts = [w for _, _, w, _ in rows]
     total_w = sum(wts)
-    wins = [r for r in rets if r > 0]
+    wins = [w for *_, w in rows if w is not None]
     return {
         "trades":         len(rows),
-        "win_rate":       round(100.0 * len(wins) / len(rets), 1) if rets else None,
+        "win_rate":       round(100.0 * sum(wins) / len(wins), 1) if wins else None,
         "avg_return":     round(sum(rets) / len(rets), 2) if rets else None,
         "median_return":  round(median(rets), 2) if rets else None,
-        "wtd_avg_return": round(sum(r * w for _, r, w in rows) / total_w, 2) if total_w else None,
+        "wtd_avg_return": round(sum(r * w for _, r, w, _ in rows) / total_w, 2) if total_w else None,
         "best":           round(max(rets), 2) if rets else None,
         "worst":          round(min(rets), 2) if rets else None,
     }
@@ -83,14 +90,14 @@ def _spearman(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
     return None if pd.isna(ic) else round(float(ic), 3)
 
 
-def _slope_and_corr(rows: List[Tuple[float, float, float]]) -> dict:
+def _slope_and_corr(rows: List[Tuple[float, float, float, Optional[bool]]]) -> dict:
     """Least-squares slope (% return per 1 pp of confidence) + Pearson/Spearman.
 
     Slope x-units are confidence *percentage points* (confidence × 100) so the
     number reads as "each extra point of confidence is worth N% of return".
     Needs ≥2 trades at ≥2 distinct confidences."""
-    xs = [c * 100.0 for c, _, _ in rows]
-    ys = [r for _, r, _ in rows]
+    xs = [c * 100.0 for c, _, _, _ in rows]
+    ys = [r for _, r, _, _ in rows]
     if len(xs) < 2 or len(set(xs)) < 2:
         return {"slope": None, "pearson": None, "spearman": None}
     import numpy as np

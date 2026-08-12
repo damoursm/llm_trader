@@ -474,19 +474,32 @@ def materialize(days: Optional[int] = None, methods=REPLAYABLE) -> int:
     import time
     deadline = time.monotonic() + 300.0
     delay = 2.0
+    # The DELETE boundary comes from the STAGED FRAME, not a fresh CURRENT_DATE:
+    # the SELECT window was computed hours earlier (scoring is slow) and a date
+    # rollover between the two clocks shifts the DELETE one day past the INSERT,
+    # leaving a stale day duplicated underneath the fresh copy (the 2026-06-22
+    # twins that broke restore_replayed from 08-05 to 08-11). One boundary, one
+    # source of truth, and DELETE+INSERT in one explicit transaction so a retry
+    # or a concurrent writer can never observe (or leave) a half-applied window.
+    lo = str(df["signal_date"].astype(str).min())
     while True:
         try:
             with connect() as con:
-                if days:
-                    con.execute(
-                        "DELETE FROM signals_replay WHERE signal_date >= "
-                        "(CURRENT_DATE - INTERVAL (?) DAY)::VARCHAR", [int(days)])
-                else:
-                    con.execute("DELETE FROM signals_replay")
-                con.register("_replay_df", df)
-                con.execute(f"INSERT INTO signals_replay ({', '.join(cols)}) "
-                            f"SELECT {', '.join(cols)} FROM _replay_df")
-                con.unregister("_replay_df")
+                con.execute("BEGIN TRANSACTION")
+                try:
+                    if days:
+                        con.execute("DELETE FROM signals_replay "
+                                    "WHERE signal_date >= ?", [lo])
+                    else:
+                        con.execute("DELETE FROM signals_replay")
+                    con.register("_replay_df", df)
+                    con.execute(f"INSERT INTO signals_replay ({', '.join(cols)}) "
+                                f"SELECT {', '.join(cols)} FROM _replay_df")
+                    con.unregister("_replay_df")
+                    con.execute("COMMIT")
+                except BaseException:
+                    con.execute("ROLLBACK")
+                    raise
             break
         except Exception as e:
             if time.monotonic() >= deadline:
@@ -533,7 +546,7 @@ def restore_replayed(df: pd.DataFrame, methods=None) -> tuple:
         if not cols:
             return df, {}
         rep = repo.fetch_df(
-            "SELECT signal_date, ticker, generated_at, "
+            "SELECT signal_date, ticker, generated_at, replayed_at, "
             f"{', '.join(cols)} FROM signals_replay")
         if rep is None or rep.empty:
             return df, {}
@@ -552,12 +565,19 @@ def restore_replayed(df: pd.DataFrame, methods=None) -> tuple:
         if has_run and "generated_at" in df.columns:
             key = ["signal_date", "ticker", "generated_at"]
             rep["generated_at"] = rep["generated_at"].astype(str)
-        elif has_run:
-            rep = (rep.sort_values("generated_at")
-                      .drop_duplicates(subset=key, keep="last"))
-        else:
-            rep = rep.drop_duplicates(subset=key, keep="last")
-        rep = rep.drop(columns=[c for c in ("generated_at",)
+        # The exact key SHOULD be unique, but a historical double-materialise
+        # (two window clocks — see materialize) proved it isn't guaranteed, and
+        # one duplicate fans the left-merge out and kills the whole restore.
+        # Dedupe unconditionally: newest replayed_at wins within a key (latest-
+        # code values, matching materialize's replace semantics); in the 2-key
+        # fallback the panel's own last-run rule stays primary (generated_at
+        # sorted LAST so it decides keep="last", replayed_at the tiebreak).
+        if "replayed_at" in rep.columns:
+            rep = rep.sort_values("replayed_at", kind="stable")
+        if has_run and "generated_at" not in key:
+            rep = rep.sort_values("generated_at", kind="stable")
+        rep = rep.drop_duplicates(subset=key, keep="last")
+        rep = rep.drop(columns=[c for c in ("generated_at", "replayed_at")
                                 if c in rep.columns and c not in key])
 
         orig_index = df.index
@@ -566,6 +586,14 @@ def restore_replayed(df: pd.DataFrame, methods=None) -> tuple:
         if "generated_at" in key:
             left["generated_at"] = left["generated_at"].astype(str)
         merged = left.merge(rep, on=key, how="left", suffixes=("", "_rp"))
+        if len(merged) != len(left):
+            # A left-merge only grows on duplicate right-side keys; the dedupe
+            # above makes that impossible, so this is a real invariant, not a
+            # tolerance. Raising lands in the fallback below with a message
+            # naming the cause instead of pandas' opaque index error.
+            raise AssertionError(
+                f"replay join fanned out ({len(left)} -> {len(merged)} rows): "
+                f"signals_replay holds duplicate {key} keys")
         merged.index = orig_index
 
         restored = {}

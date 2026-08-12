@@ -540,7 +540,9 @@ def build_equity_curve(closed_trades: list) -> Optional["go.Figure"]:
         textfont=dict(size=10),
     ), row=2, col=1)
 
-    win_rate = sum(1 for r in returns if r > 0) / len(returns) * 100 if returns else 0
+    # GROSS win rate (system convention); the Avg alongside it stays cost-adjusted.
+    from src.performance.tracker import gross_win_rate as _gwr
+    win_rate = _gwr(sorted_trades) or 0.0
     avg_ret  = sum(returns) / len(returns) if returns else 0
 
     fig.update_layout(

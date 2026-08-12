@@ -212,7 +212,11 @@ def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[fl
     closed = [b for b in btrades if b["status"] == "CLOSED"]
     open_ = [b for b in btrades if b["status"] == "OPEN"]
     all_rets = [float(b["return_pct"]) for b in btrades if b.get("return_pct") is not None]
-    wins = [r for r in all_rets if r > 0]
+    # GROSS win rate (system convention): these dicts carry the REAL fill prices
+    # as entry_price/exit_price, so the gross test reads actual execution while
+    # excluding the commissions — which the dollar-P&L and return figures below
+    # already account for in full.
+    from src.performance.tracker import gross_win_rate as _gross_win_rate
     # Exit commissions only count once the exit actually filled — a stale
     # field on a cancelled/unfilled exit is not money spent.
     commissions = sum(
@@ -245,7 +249,7 @@ def summarize_broker_trades(btrades: List[dict], account_equity_usd: Optional[fl
         "trades": len(btrades),
         "closed": len(closed),
         "open": len(open_),
-        "win_rate": round(100.0 * len(wins) / len(all_rets), 1) if all_rets else None,
+        "win_rate": _gross_win_rate(btrades),
         "avg_return": round(sum(all_rets) / len(all_rets), 2) if all_rets else None,
         "median_return": round(median(all_rets), 2) if all_rets else None,
         "weighted_return": weighted_return,
