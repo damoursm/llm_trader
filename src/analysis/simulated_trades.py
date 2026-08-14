@@ -35,7 +35,7 @@ Usage:  python -m src.analysis.simulated_trades [--days 90] [--backfill] [--refr
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -225,6 +225,15 @@ def _fwd_daily(dates: List[date], closes: Dict[date, float],
     i = bisect_left(dates, sig_date)
     if i >= len(dates) or i + steps >= len(dates):
         return None
+    # Point-in-time horizon guard — the daily twin of `_fwd_intraday`'s
+    # (2026-08-12; the intraday path was guarded on 2026-08-04, this one was
+    # not — daily outcomes were reaching past the walk-forward cutoff into the
+    # filter / weighting / method-horizon calibrations). Same rule as
+    # `signal_panel.fwd`: the end bar must have PRINTED strictly before the
+    # cutoff date.
+    cut = _asof_cutoff_date()
+    if cut is not None and dates[i + steps] >= cut:
+        return None
     base = closes[dates[i]]
     if not base or base <= 0:
         return None
@@ -291,6 +300,110 @@ def _asof_cutoff_ns() -> Optional[int]:
 
 
 _ASOF_NS_CACHE: Optional[Tuple[str, int]] = None
+
+
+def _asof_cutoff_date() -> Optional[date]:
+    """The walk-forward cutoff as a DATE, or None — the daily-granular twin of
+    `_asof_cutoff_ns` (same fail-soft contract)."""
+    try:
+        from src.analysis.asof import current_asof
+        cut = current_asof()
+    except Exception:
+        return None
+    if not cut:
+        return None
+    global _ASOF_DATE_CACHE
+    if _ASOF_DATE_CACHE and _ASOF_DATE_CACHE[0] == cut:
+        return _ASOF_DATE_CACHE[1]
+    try:
+        d = date.fromisoformat(str(cut)[:10])
+    except Exception:
+        return None
+    _ASOF_DATE_CACHE = (cut, d)
+    return d
+
+
+_ASOF_DATE_CACHE: Optional[Tuple[str, date]] = None
+
+
+_DIRPERF_CACHE: dict = {}
+_DIRPERF_LOCK = __import__("threading").Lock()
+
+
+def reset_cache() -> None:
+    """Drop the directional-perf memo (asof flush / tests)."""
+    _DIRPERF_CACHE.clear()
+
+
+# ── the PIVOT pseudo-horizon (2026-08-12, user directive) ────────────────────
+#
+# The signed pivot target (return to the next pivot, peak or trough whichever
+# first — `pivot_target.next_pivot_targets`, the ml_ohlcv-v2 training target)
+# joins the fixed grid as label "pv". It is the DECISION basis: the IC weight
+# tilt, the hard filter, the per-side weights and the inversion arm read pv;
+# the fixed horizons stay for monitoring, holding-period estimation and exits.
+PIVOT_LABEL = "pv"
+
+
+def _pivot_targets(dates: List[date], closes: Dict[date, float],
+                   ticker: Optional[str] = None):
+    """Per-ticker pivot labels: ``(dates_kept, sp, end_idx)`` — settled rows
+    only carry a finite ``sp`` / non-negative ``end_idx``.
+
+    H/L basis (2026-08-12): the marks live on each bar's HIGH/LOW, so the
+    high/low series are loaded from the OHLCV cache (aligned to the close
+    dates; a missing frame falls back to closes-as-extremes, which degrades
+    the label rather than dropping it). Point-in-time by TRUNCATION: under an
+    as-of cutoff the series end strictly before the cutoff date, so a pivot
+    can settle only if its CONFIRMING bar is inside the visible window."""
+    cut = _asof_cutoff_date()
+    if cut is not None:
+        dates = dates[:bisect_left(dates, cut)]
+    n = len(dates)
+    if n < 50:
+        return [], None, None
+    import numpy as np
+    c = np.asarray([closes[d] for d in dates], dtype=float)
+    h = lo = c
+    if ticker:
+        try:
+            from src.data.cache import load_ohlcv
+            df = load_ohlcv(ticker)
+            if df is not None and not df.empty and "High" in df.columns:
+                hi_m, lo_m = {}, {}
+                import pandas as _pd
+                idx = _pd.DatetimeIndex(df.index)
+                hv = _pd.to_numeric(df["High"], errors="coerce").to_numpy(dtype=float)
+                lv = _pd.to_numeric(df["Low"], errors="coerce").to_numpy(dtype=float)
+                for t, hh, ll in zip(idx, hv, lv):
+                    dd = t.date()
+                    if hh == hh:
+                        hi_m[dd] = hh
+                    if ll == ll:
+                        lo_m[dd] = ll
+                h = np.asarray([hi_m.get(d, closes[d]) for d in dates], dtype=float)
+                lo = np.asarray([lo_m.get(d, closes[d]) for d in dates], dtype=float)
+        except Exception:
+            h = lo = c
+    from src.analysis.pivot_target import next_pivot_targets
+    sp, end = next_pivot_targets(c, h, lo)
+    return dates, sp, end
+
+
+def _window_ret(b_dates: List[date], b_closes: Dict[date, float],
+                d0: date, d1: date) -> Optional[float]:
+    """Benchmark return over the CALENDAR window [d0, d1] — the market leg of a
+    variable-horizon (pivot) return. Entry anchors at the benchmark bar
+    at-or-after d0 (mirroring `_fwd_daily`'s bisect_left convention), the exit
+    at the bar at-or-before d1; None when either leg is missing."""
+    i = bisect_left(b_dates, d0)
+    j = bisect_right(b_dates, d1) - 1
+    if i >= len(b_dates) or j < 0 or j <= i:
+        return None
+    base = b_closes[b_dates[i]]
+    if not base or base <= 0:
+        return None
+    return (b_closes[b_dates[j]] / base - 1.0) * 100.0
 
 
 # ── core computation ───────────────────────────────────────────────────────
@@ -396,13 +509,34 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
 
     # Per (method, horizon): collect the (score, forward-return) pairs so n, win
     # rate, mean signed return AND the Spearman IC all come from one source.
+    mp_labels = HORIZON_LABELS + (PIVOT_LABEL,)
     acc: Dict[str, Dict[str, Dict[str, list]]] = defaultdict(
-        lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS})
+        lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in mp_labels})
+    pv_by_tk: dict = {}
+    pv_fwd: Dict[Tuple[str, date], Optional[float]] = {}
 
     for row in df.itertuples(index=False):
         tk, sc, method, sigd, gen = (row.ticker, row.score, row.method,
                                      row.sigd, row.generated_at)
         dates, closes = daily.get(tk, ([], {}))
+        # The pivot pseudo-horizon (absolute basis here, matching the fixed
+        # columns): the signed return to the ticker's next pivot.
+        pk = (tk, sigd)
+        if pk not in pv_fwd:
+            if tk not in pv_by_tk:
+                pv_by_tk[tk] = _pivot_targets(dates, closes, ticker=tk)
+            pdts, sp, endx = pv_by_tk[tk]
+            out_pv = None
+            if pdts:
+                pi = bisect_left(pdts, sigd)
+                if pi < len(pdts) and endx[pi] >= 0:
+                    out_pv = float(sp[pi])
+            pv_fwd[pk] = out_pv
+        if pv_fwd[pk] is not None:
+            cell = acc[method][PIVOT_LABEL]
+            cell["s"].append(sc)
+            cell["f"].append(pv_fwd[pk])
+            cell["d"].append(sigd)
         for lbl, interval, steps in HORIZONS:
             if interval == "30m":
                 key = (tk, gen, steps)
@@ -440,10 +574,10 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
     # (views > 0, every n = 0), so a session/direction filter isolating such an
     # event can't silently drop the row and break All = Σ sessions.
     for method in dict.fromkeys(list(views) + list(acc)):
-        by_h = acc.get(method) or {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS}
+        by_h = acc.get(method) or {lbl: {"s": [], "f": [], "d": []} for lbl in mp_labels}
         rec: dict = {"method": method, "category": category_for(method),
                      "views": int(views.get(method, 0))}
-        for lbl in HORIZON_LABELS:
+        for lbl in mp_labels:
             s_list, f_list, d_list = by_h[lbl]["s"], by_h[lbl]["f"], by_h[lbl]["d"]
             n = len(f_list)
             rec[f"n_{lbl}"] = n
@@ -494,6 +628,35 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
     ``icir_H`` is confidently negative (and stays negative across horizons) is
     reliably anti-predictive net of the benchmark. Below ``min_n`` a cell reports
     NaN; ``icstd``/``icir`` need ``min_days`` signal-days of ``min_per_day`` names."""
+    # Memoised (2026-08-12): FIVE cache-keyed consumers call this with two
+    # argument signatures — the IC weight tilt, the IC-disproof filter, and
+    # market_relative_skill's three side keys — each behind its OWN TTL at a
+    # different phase, so a full directional-panel pass was landing on most
+    # ticks (the ~1,000-1,200s tick class of 2026-08-12). One shared memo per
+    # argument tuple, single-flight, TTL = ic_weight_cache_seconds; flushed by
+    # `asof.reset_all_calibration_caches` like every calibration memo. A caller
+    # supplying its own ``sim_df`` bypasses the memo (its frame, its result),
+    # and callers get a COPY so nobody can mutate the shared frame.
+    if sim_df is not None:
+        return _directional_perf_impl(days=days, min_n=min_n, benchmark=benchmark,
+                                      dedupe=dedupe, sim_df=sim_df,
+                                      min_per_day=min_per_day, min_days=min_days)
+    from config.settings import settings as _s
+    from src.utils import ttl_single_flight
+    key = f"{days}|{min_n}|{benchmark}|{dedupe}|{min_per_day}|{min_days}"
+    out = ttl_single_flight(
+        _DIRPERF_LOCK, _DIRPERF_CACHE, key,
+        float(getattr(_s, "ic_weight_cache_seconds", 900)),
+        lambda: _directional_perf_impl(days=days, min_n=min_n,
+                                       benchmark=benchmark, dedupe=dedupe,
+                                       sim_df=None, min_per_day=min_per_day,
+                                       min_days=min_days))
+    return out.copy() if out is not None else out
+
+
+def _directional_perf_impl(days: Optional[int], min_n: int, benchmark: str,
+                           dedupe: str, sim_df: Optional[pd.DataFrame],
+                           min_per_day: int, min_days: int) -> pd.DataFrame:
     df = sim_df if sim_df is not None else load_sim_trades(days)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -514,13 +677,42 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
     b_intra = _intraday_series(benchmark)
 
     d_fwd: dict = {}; i_fwd: dict = {}; bd_fwd: dict = {}; bi_fwd: dict = {}
+    pv_by_tk: dict = {}; pv_fwd: dict = {}; b_win: dict = {}
+    all_labels = HORIZON_LABELS + (PIVOT_LABEL,)
     acc: Dict[tuple, Dict[str, Dict[str, list]]] = defaultdict(
-        lambda: {lbl: {"s": [], "m": [], "d": []} for lbl in HORIZON_LABELS})
+        lambda: {lbl: {"s": [], "m": [], "d": []} for lbl in all_labels})
 
     for row in df.itertuples(index=False):
         tk, sc, method, sigd, gen = (row.ticker, row.score, row.method, row.sigd, row.generated_at)
         side = "bull" if sc > 0 else "bear"
         dts, cls = daily.get(tk, ([], {}))
+        # The pivot pseudo-horizon: ticker leg to ITS next pivot; benchmark leg
+        # over the SAME calendar window, so market drift is netted per-row even
+        # though every row's horizon differs.
+        pk = (tk, sigd)
+        if pk not in pv_fwd:
+            if tk not in pv_by_tk:
+                pv_by_tk[tk] = _pivot_targets(dts, cls, ticker=tk)
+            pdts, sp, endx = pv_by_tk[tk]
+            out = None
+            if pdts:
+                pi = bisect_left(pdts, sigd)
+                if pi < len(pdts) and endx[pi] >= 0:
+                    out = (float(sp[pi]), pdts[int(endx[pi])])
+            pv_fwd[pk] = out
+        pv = pv_fwd[pk]
+        if pv is not None:
+            fwd_pv, end_d = pv
+            bk = (sigd, end_d)
+            if bk not in b_win:
+                b_win[bk] = _window_ret(b_dates, b_closes, sigd, end_d)
+            if b_win[bk] is not None:
+                mktrel = fwd_pv - b_win[bk]
+                for s in (side, "both"):
+                    cell = acc[(method, s)][PIVOT_LABEL]
+                    cell["s"].append(sc)
+                    cell["m"].append(mktrel)
+                    cell["d"].append(sigd)
         for lbl, interval, steps in HORIZONS:
             if interval == "30m":
                 k = (tk, gen, steps)
@@ -554,7 +746,7 @@ def compute_directional_perf(days: Optional[int] = None, min_n: int = 10,
     rows = []
     for (method, side), by_h in acc.items():
         rec: dict = {"method": method, "side": side}
-        for lbl in HORIZON_LABELS:
+        for lbl in all_labels:
             s_list, m_list, d_list = by_h[lbl]["s"], by_h[lbl]["m"], by_h[lbl]["d"]
             n = len(m_list)
             rec[f"n_{lbl}"] = n

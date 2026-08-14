@@ -1183,6 +1183,11 @@ class TickerSignal(BaseModel):
     # how convinced the bearish camp is. combined_score = their difference.
     combined_buy_score: float = 0.0
     combined_sell_score: float = 0.0
+    # Absolute-basis SHADOW combine (2026-08-14): the weighted combine over
+    # the RAW scores, persisted beside the live (ranked) one for the basis A/B.
+    combined_score_abs: Optional[float] = None
+    combined_buy_score_abs: Optional[float] = None
+    combined_sell_score_abs: Optional[float] = None
     # Which combine produced the two sides above (2026-08-02): "weighted" (the
     # hand-weighted camps) or "ml"/"ml_buy"/"ml_sell" when the ML-combine A/B arm
     # supplied that side. Recorded PER SIDE because the swap is fail-soft per side

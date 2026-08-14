@@ -36,12 +36,15 @@ def _epoch_on(monkeypatch):
 
 def test_pre_epoch_confidence_is_not_comparable():
     assert me.confidence_is_comparable("2026-07-21") is False
-    assert me.confidence_is_comparable("2026-07-21T23:59:00+00:00") is False
+    assert me.confidence_is_comparable("2026-08-13T23:59:00+00:00") is False
 
 
 def test_epoch_day_onward_is_comparable():
-    assert me.confidence_is_comparable("2026-07-22") is True
-    assert me.confidence_is_comparable("2026-07-25T10:00:00+00:00") is True
+    # epoch = 2026-08-14 02:00 UTC (the method RANK basis switch). Mid-day
+    # convention: the WHOLE partial day is excluded, comparability starts 08-15.
+    assert me.confidence_is_comparable("2026-08-14T03:00:00+00:00") is False
+    assert me.confidence_is_comparable("2026-08-15") is True
+    assert me.confidence_is_comparable("2026-08-20T10:00:00+00:00") is True
 
 
 def test_it_fails_OPEN_on_bad_input():
@@ -73,7 +76,7 @@ def test_confidence_sizing_excludes_pre_epoch_trades(monkeypatch):
     monkeypatch.setattr(settings, "enable_confidence_recal_sizing", True)
     monkeypatch.setattr(settings, "confidence_recal_min_trades", 1)
     old = [_trade("2026-07-01", 0.90, 5.0) for _ in range(50)]
-    new = [_trade("2026-07-25", 0.90, -5.0) for _ in range(3)]
+    new = [_trade("2026-08-20", 0.90, -5.0) for _ in range(3)]
     cal = cs.calibrate_confidence_sizing(old + new)
     assert cal.get("n", 0) == 3, (
         f"expected only the 3 post-epoch trades, got n={cal.get('n')}")
@@ -89,7 +92,7 @@ def test_side_threshold_excludes_pre_epoch_trades(monkeypatch):
     monkeypatch.setattr(tk, "_spearman_conf_return", spy)
     monkeypatch.setattr(tk, "_load_trades", lambda: (
         [_trade("2026-07-01", 0.9, 1.0) for _ in range(40)]
-        + [_trade("2026-07-25", 0.9, 1.0) for _ in range(7)]))
+        + [_trade("2026-08-20", 0.9, 1.0) for _ in range(7)]))
     tk._SIDE_THRESHOLD_CACHE.clear()
     tk.calibrate_side_threshold("BUY")
     assert seen["n"] == 7, f"expected 7 post-epoch rows, got {seen['n']}"

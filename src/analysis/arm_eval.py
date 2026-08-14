@@ -23,7 +23,7 @@ because the dual-case arm is explicitly instructed that declining is a valid
 output — scoring only its directional calls would hide exactly what it was
 built to do.
 
-CLI:  python -m src.analysis.arm_eval [--horizons 1,5,10] [--days 60]
+CLI:  python -m src.analysis.arm_eval [--horizons pv,1,5,10] [--days 60]
 """
 
 from __future__ import annotations
@@ -114,16 +114,45 @@ def attach_forward_returns(df: pd.DataFrame,
         df[f"fwd_ret_{h}d"] = df.apply(lambda r: fwd(r, h), axis=1)
         # Oriented as a STRATEGY return: a declined call earns 0, not NaN.
         df[f"ret_{h}d"] = df["_side"] * df[f"fwd_ret_{h}d"]
+    # The pivot pseudo-horizon (2026-08-13 standardization): the signed move to
+    # the next H/L pivot from the call's session close — the decision basis,
+    # comparable across every eval surface. Settled rows only (None otherwise).
+    try:
+        from bisect import bisect_left as _bl
+        from src.analysis.simulated_trades import _pivot_targets
+        pv_cache: Dict[str, tuple] = {}
+
+        def fwd_pv(row) -> Optional[float]:
+            tk = row["ticker"]
+            if tk not in pv_cache:
+                pv_cache[tk] = _pivot_targets(dates_by_ticker.get(tk) or [],
+                                              closes_by_ticker.get(tk) or {}, ticker=tk)
+            pdts, sp, endx = pv_cache[tk]
+            if not pdts:
+                return None
+            i = _bl(pdts, row["_sig_date"])
+            if i < len(pdts) and endx[i] >= 0:
+                return float(sp[i])
+            return None
+
+        df["fwd_ret_pv"] = df.apply(fwd_pv, axis=1)
+        df["ret_pv"] = df["_side"] * df["fwd_ret_pv"]
+    except Exception:
+        df["fwd_ret_pv"] = None
+        df["ret_pv"] = None
     return df.drop(columns=["_sig_date"])
 
 
 # ── unpaired: each arm on its own calls ────────────────────────────────────
 
-def arm_summary(df: pd.DataFrame, horizon: int = 5) -> List[dict]:
-    """Per-arm action mix and realized outcome. Weak evidence — see module doc."""
+def arm_summary(df: pd.DataFrame, horizon="pv") -> List[dict]:
+    """Per-arm action mix and realized outcome. Weak evidence — see module doc.
+    ``horizon="pv"`` (default, 2026-08-13) judges on the signed pivot target;
+    an int keeps the fixed-horizon view."""
     if df is None or df.empty:
         return []
-    col, fwd_col = f"ret_{horizon}d", f"fwd_ret_{horizon}d"
+    sfx = "pv" if horizon == "pv" else f"{horizon}d"
+    col, fwd_col = f"ret_{sfx}", f"fwd_ret_{sfx}"
     if col not in df.columns:
         return []
     rows: List[dict] = []
@@ -160,7 +189,7 @@ def arm_summary(df: pd.DataFrame, horizon: int = 5) -> List[dict]:
 
 # ── paired: arm vs arm on the same ticker-day ──────────────────────────────
 
-def arm_pairs(df: pd.DataFrame, horizon: int = 5) -> List[dict]:
+def arm_pairs(df: pd.DataFrame, horizon="pv") -> List[dict]:
     """Head-to-head on ticker-days both arms answered.
 
     The ``disagree`` subset is where the prompt actually changed a decision —
@@ -169,7 +198,8 @@ def arm_pairs(df: pd.DataFrame, horizon: int = 5) -> List[dict]:
     """
     if df is None or df.empty:
         return []
-    col, fwd_col = f"ret_{horizon}d", f"fwd_ret_{horizon}d"
+    sfx = "pv" if horizon == "pv" else f"{horizon}d"
+    col, fwd_col = f"ret_{sfx}", f"fwd_ret_{sfx}"
     if col not in df.columns:
         return []
     rows: List[dict] = []
@@ -205,12 +235,14 @@ def arm_pairs(df: pd.DataFrame, horizon: int = 5) -> List[dict]:
 
 
 def evaluate(days: Optional[int] = None,
-             horizons: Sequence[int] = (1, 5, 10)) -> dict:
-    """Everything the dashboard needs, in one pass over the arm table."""
+             horizons: Sequence = ("pv", 1, 5, 10)) -> dict:
+    """Everything the dashboard needs, in one pass over the arm table.
+    ``"pv"`` (the pivot pseudo-horizon, first = the decision basis) rides the
+    same summary/pairs machinery as the fixed horizons."""
     df = load_arm_calls(days)
     if df.empty:
         return {"summary": {}, "pairs": {}, "horizons": list(horizons), "calls": 0}
-    df = attach_forward_returns(df, horizons)
+    df = attach_forward_returns(df, [h for h in horizons if h != "pv"] or [5])
     return {
         "summary": {h: arm_summary(df, h) for h in horizons},
         "pairs": {h: arm_pairs(df, h) for h in horizons},
@@ -224,10 +256,11 @@ if __name__ == "__main__":  # pragma: no cover
     import argparse
 
     ap = argparse.ArgumentParser(description="Synthesis prompt-arm bake-off")
-    ap.add_argument("--horizons", default="1,5,10")
+    ap.add_argument("--horizons", default="pv,1,5,10")
     ap.add_argument("--days", type=int, default=None)
     a = ap.parse_args()
-    hs = [int(x) for x in a.horizons.split(",") if x.strip()]
+    hs = [(x.strip() if x.strip() == "pv" else int(x))
+          for x in a.horizons.split(",") if x.strip()]
 
     res = evaluate(days=a.days, horizons=hs)
     if not res["calls"]:

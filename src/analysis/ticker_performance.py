@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from src.analysis.signal_panel import build_panel
+from src.analysis.signal_panel import build_panel, fwd_col, int_horizons
 from src.db import repo
 
 from loguru import logger  # project configures loguru sinks only
@@ -85,7 +85,7 @@ def _trade_counts() -> Dict[str, dict]:
 
 
 def compute_ticker_perf(days: Optional[int] = None,
-                        horizons: Sequence[int] = (1, 5, 10),
+                        horizons: Sequence = ("pv", 1, 5, 10),
                         source: Optional[str] = None,
                         min_days: int = 1,
                         panel: Optional[pd.DataFrame] = None) -> pd.DataFrame:
@@ -94,7 +94,7 @@ def compute_ticker_perf(days: Optional[int] = None,
     ``source`` filters to one ``universe_source`` (e.g. ``"watchlist"``).
     ``min_days`` drops names with too few scored days to read.
     """
-    p = panel if panel is not None else build_panel(horizons=horizons, days=days)
+    p = panel if panel is not None else build_panel(horizons=int_horizons(horizons), days=days)
     if p is None or p.empty:
         return pd.DataFrame()
     p = p.copy()
@@ -107,10 +107,11 @@ def compute_ticker_perf(days: Optional[int] = None,
     p["_view"] = p["combined_score"].abs() >= _NO_VIEW
     p["_sign"] = p["combined_score"].apply(lambda v: 1.0 if v > 0 else (-1.0 if v < 0 else 0.0))
     for h in horizons:
-        fwd = pd.to_numeric(p.get(f"fwd_ret_{h}d"), errors="coerce")
+        _col, _sfx = fwd_col(h)
+        fwd = pd.to_numeric(p.get(_col), errors="coerce")
         # Oriented: what the signal's own direction earned. NaN where there is
         # no view or no forward bar — both are "no observation", not a zero.
-        p[f"_ret_{h}"] = (p["_sign"] * fwd).where(p["_view"])
+        p[f"_ret_{_sfx}"] = (p["_sign"] * fwd).where(p["_view"])
 
     rows: List[dict] = []
     for tk, g in p.groupby("ticker"):
@@ -131,10 +132,11 @@ def compute_ticker_perf(days: Optional[int] = None,
             "sell_days": int((views["_sign"] < 0).sum()),
         }
         for h in horizons:
-            col = views[f"_ret_{h}"].dropna()
-            row[f"ret_{h}d"] = round(float(col.mean()), 3) if len(col) else None
-            row[f"hit_{h}d"] = round(100.0 * float((col > 0).mean()), 1) if len(col) else None
-            row[f"n_{h}d"] = int(len(col))
+            _sfx = fwd_col(h)[1]
+            col = views[f"_ret_{_sfx}"].dropna()
+            row[f"ret_{_sfx}"] = round(float(col.mean()), 3) if len(col) else None
+            row[f"hit_{_sfx}"] = round(100.0 * float((col > 0).mean()), 1) if len(col) else None
+            row[f"n_{_sfx}"] = int(len(col))
         rows.append(row)
 
     out = pd.DataFrame(rows)
@@ -155,8 +157,9 @@ def compute_ticker_perf(days: Optional[int] = None,
         lambda t: (round(sum(tc[t]["rets"]) / len(tc[t]["rets"]), 2)
                    if tc.get(t, {}).get("rets") else None))
 
-    sort_h = 5 if 5 in horizons else list(horizons)[0]
-    return out.sort_values(f"ret_{sort_h}d", ascending=False, na_position="last")
+    sort_sfx = ("pv" if "pv" in list(horizons)
+                else (f"5d" if 5 in horizons else fwd_col(list(horizons)[0])[1]))
+    return out.sort_values(f"ret_{sort_sfx}", ascending=False, na_position="last")
 
 
 if __name__ == "__main__":  # pragma: no cover

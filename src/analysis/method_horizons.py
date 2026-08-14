@@ -32,6 +32,11 @@ builds monotonically or clears at two adjacent horizons is credible; a lone
 spike surrounded by noise is not, and is flagged as such.
 
 Three states, consumed by two different callers:
+  Since 2026-08-12 the STATE is judged on the SIGNED PIVOT TARGET (``win_pv``,
+  one binomial test at each name's own natural horizon — the promotion basis),
+  with the fixed-horizon rule as fallback; the fixed 1/3/5/10d curve still
+  decides ``best_horizon``/``best_days`` (the HOLDING period the exits use).
+
   * PROVEN     — significantly >50% at some horizon. Full weight; its best
                  horizon feeds the `method_horizon` exit signal.
   * DISPROVEN  — significantly <50% at EVERY horizon it has data for. Dropped.
@@ -139,14 +144,47 @@ def compute_method_horizons(days: Optional[int] = None,
                     best_p, best = pa, label
                 below.append(pb is not None and pb < alpha)
 
-            if not profile:
+            # STATE — PIVOT basis when judgeable (2026-08-12, user directive):
+            # proven/disproven is decided by the method's win rate on the
+            # SIGNED PIVOT TARGET (one target, one binomial test — the same
+            # statistic the promotions were justified by, at each name's own
+            # natural horizon). The fixed-horizon rule below remains the
+            # fallback for a perf frame predating the pivot column.
+            n_pv = int(row.get("n_pv") or 0)
+            w_pv = row.get("win_pv")
+            pv_ok = n_pv > 0 and w_pv is not None and not pd.isna(w_pv)
+            if pv_ok:
+                w_pv = float(w_pv)
+                pa_pv, pb_pv = _p_above_half(w_pv, n_pv), _p_below_half(w_pv, n_pv)
+                profile["pv"] = {"win": round(w_pv, 2), "n": n_pv,
+                                 "p_above": pa_pv, "p_below": pb_pv}
+                if pa_pv is not None and w_pv > 50.0 and pa_pv < alpha:
+                    state = PROVEN
+                elif pb_pv is not None and pb_pv < alpha:
+                    state = DISPROVEN      # loses on the pivot target
+                else:
+                    state = UNPROVEN
+            elif not profile:
                 continue
-            if best is not None and best_p < alpha:
+            elif best is not None and best_p < alpha:
                 state = PROVEN
             elif below and all(below):
                 state = DISPROVEN          # loses at EVERY horizon it can be judged on
             else:
                 state = UNPROVEN
+
+            # HOLDING PERIOD — always from the FIXED-horizon curve (the user
+            # directive keeps calendar horizons for "how long", pivot for
+            # "how good"): the winner is the significant fixed horizon when one
+            # exists, else the best GUESS (lowest p_above) for a pivot-proven
+            # method whose fixed curve is merely suggestive.
+            has_fixed = any(k in HORIZON_DAYS for k in profile)
+            if state == PROVEN and best is None and has_fixed:
+                cands = [(v.get("p_above"), k) for k, v in profile.items()
+                         if k in HORIZON_DAYS and v.get("p_above") is not None
+                         and v.get("win", 0) > 50.0]
+                if cands:
+                    best_p, best = min(cands)
 
             out[m] = {
                 "state": state,

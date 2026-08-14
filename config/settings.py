@@ -315,6 +315,53 @@ class Settings(BaseSettings):
     # side scores are persisted per ticker (signals.combined_buy_score /
     # combined_sell_score) so each side's IC is monitored on the dashboard.
     buy_sell_diff_threshold: float = 0.15
+    # ── Method score basis (2026-08-13 user directive) ─────────────────────────
+    # "rank": the combine (and coherence / sources_agreeing / family votes)
+    # consumes each method's CENTERED WITHIN-RUN RANK (+1 = the run's strongest
+    # view, −1 = weakest, median ≈ 0 — the ML models' convention); zeros abstain,
+    # and a method with < method_rank_min_views views this run gets WEIGHT 0
+    # (raw scores stay visible; excluded from coherence/agreement/votes like a
+    # win-rate-filtered method — no absolute fallback, 2026-08-13 directive).
+    # Consumption-time only: every persisted score stays RAW (inversion
+    # architecture). "absolute" reverts to the pre-directive combine.
+    # CONFIDENCE_EPOCH 2026-08-14 marks the switch (|combined| scale changes).
+    method_score_basis: str = "rank"
+    method_rank_min_views: int = 5
+    # Payoff-shaped rank mapping (2026-08-14 directive): each method's rank is
+    # mapped through its own SHRUNK measured rank->pivot-payoff decile curve
+    # (demeaned + normalized; src/signals/rank_shaping.py) instead of the
+    # linear grid — an anti-predictive extreme (momentum's top decile) becomes
+    # reversal signal. Identity fail-soft per method (thin evidence or a flat
+    # curve keeps the plain centered rank).
+    # Go-live thresholds for the rank basis (2026-08-14 quantile match over the
+    # reconstructed ranked+shaped combine vs the absolute era, 21,411 rows /
+    # 46 days, base-weight pool): the ranked |combined| runs hotter (mean 0.204
+    # vs 0.151), so the direction band and the raw-confidence divisor are
+    # re-anchored to PRESERVE the absolute era's pass rates (42.9% directional;
+    # raw_conf scale stable 0.619-0.644 across p75/90/95, tradeable-ranked config). Consumed ONLY when
+    # method_score_basis="rank"; the absolute basis keeps buy_sell_diff_threshold
+    # and the hardcoded 0.5. Directional pins (_long/_short) resolve via
+    # settings.directional() if the asymmetric-cutoff finding is adopted later.
+    # 2026-08-14 directive: the rank POOL is the Gate-4-eligible (tradeable)
+    # subset — the non-tradeable segment has negative drift + different reversal
+    # dynamics, so it is INTERPOLATED against the tradeable distribution rather
+    # than voting in it. False -> full-universe ranking.
+    rank_tradeable_only: bool = True
+    rank_diff_threshold: float = 0.182
+    # ADOPTED asymmetric bands (2026-08-14 directive #4, calibrated on the
+    # TRADEABLE ranked+shaped combine, 16,926 rows): bullish ≈ the day's top
+    # 10% (P(c>=0.324)=10.0%), bearish ≈ the bottom 5% (P(c<=-0.346)=5.0%) —
+    # the 10/5 asymmetric cutoff beat symmetric 15/15 at t +2.56 (bear-state
+    # windows strongest; every sell-heavy grid lost). Resolved per side via
+    # settings.directional("rank_diff_threshold", ...); set both to None to
+    # fall back to the symmetric rank_diff_threshold above.
+    rank_diff_threshold_long: Optional[float] = 0.324
+    rank_diff_threshold_short: Optional[float] = 0.346
+    rank_raw_confidence_scale: float = 0.642
+    enable_rank_shaping: bool = True
+    rank_shape_prior_n: int = 200        # per-decile shrink prior (observations)
+    rank_shape_min_rows: int = 500       # settled rows before a method is shaped
+    rank_shape_ttl_seconds: int = 21600  # calibration cache TTL (6h)
 
     # ANTI-CHASE / OVEREXTENSION GATE (Gate 5 of the actionable filter, 2026-07-22).
     # The BUY-vs-SELL forensics (signals panel, 8.3k ticker-days) found the BUY
@@ -1353,7 +1400,11 @@ class Settings(BaseSettings):
     enable_ic_weights: bool = True
     ic_weight_basis: str = "shadow"        # "shadow" = market-neutral IC (alpha, regime-robust) | "edge" = absolute-return IC
     ic_weight_horizon_days: int = 5        # EDGE-basis forward horizon in sessions (≈ a typical hold)
-    ic_weight_shadow_horizon: str = "1w"   # SHADOW-basis horizon LABEL (30m|3h|6h|1d|3d|1w|2w|1m); "1w" = 5 sessions = the 5d edge horizon
+    # "pv" = the signed PIVOT target (return to the next pivot — the promotion
+    # basis) since 2026-08-12 (user directive: pivot metrics for every DECISION
+    # evaluation; fixed horizons stay for monitoring/holding/exits). Any fixed
+    # label (30m|3h|6h|1d|3d|1w|2w|1m) restores the old basis.
+    ic_weight_shadow_horizon: str = "pv"
     ic_weight_min_days: int = 5            # min distinct signal-days before an ICIR is even computed
     ic_weight_min_per_day: int = 5         # min cross-section per day for that day's IC to count toward ICIR
     ic_weight_min_t: float = 2.0           # CONFIDENCE GATE: reweight only if |ICIR|·sqrt(n_days) ≥ this
@@ -1605,7 +1656,9 @@ class Settings(BaseSettings):
     refactor_auto_epoch: bool = False
 
     enable_market_relative_weighting: bool = True
-    market_relative_horizon: str = "1w"     # column in compute_directional_perf
+    # "pv" = pivot basis for the per-side weighting/baseline (2026-08-12
+    # directive); a fixed label ("1w") restores the calendar-horizon basis.
+    market_relative_horizon: str = "pv"
     market_relative_min_obs: int = 200
     # The HARD filter judges on PROMOTION LOGIC (rebased 2026-08-12, user-
     # directed): a weighted method is dropped only when the promotion statistic
@@ -1649,7 +1702,26 @@ class Settings(BaseSettings):
     # how long positions are held. Horizons are therefore restricted to the real
     # holding period (median hold ~1.3 days, measured edge peak 1–2d).
     enable_inversion_panel_arm: bool = True
-    inversion_panel_horizons: str = "1d,3d"
+    # Weekly ML retrain slot (2026-08-12, user directive: retrain models ONCE
+    # A WEEK, Saturday morning — nightly EOD retraining removed). weekday is
+    # Python convention (Mon=0 … Sat=5, Sun=6). The enable_eod_ml_* flags gate
+    # WHICH models the weekly job trains (names kept for .env compatibility).
+    ml_retrain_weekday: int = 5
+    ml_retrain_time: str = "08:00"
+    # Minimum pivot swing (2026-08-12, user directive): a reversal only
+    # CONFIRMS once price retraces this % from the running extreme, so legs
+    # smaller than the round-trip cost never become pivots ("not worth buying
+    # and selling weak price runs"). Changing it changes what every pivot
+    # label MEANS — the ml_ohlcv artifact basis string encodes it, so a
+    # threshold change makes stale artifacts abstain until retrained.
+    pivot_min_move_pct: float = 1.0
+    # Stacker training label (2026-08-12): "pivot_rank" = within-day rank of
+    # the signed pivot target (fails soft to the fixed rank_5d label while the
+    # panel's settled-pivot rows are thin); "rank_5d" pins the legacy label.
+    stacker_label_basis: str = "pivot_rank"
+    # "pv" since 2026-08-12 (pivot basis; "1d,3d" restores the fixed pair — the
+    # arm requires negativity at EVERY listed label, so one pivot label = one test).
+    inversion_panel_horizons: str = "pv"
     inversion_panel_min_t: float = 2.0    # before the multiple-comparison bump
     inversion_panel_min_obs: int = 200    # min observations per method/horizon
     inversion_panel_cache_seconds: float = 21600.0   # 6h — the join is expensive
@@ -2019,6 +2091,20 @@ class Settings(BaseSettings):
     # ── Dashboard (Plotly Dash monitoring app: rationale · methods · returns) ──
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8050
+
+    # HTTP Basic-Auth gate in front of the WHOLE dashboard (every route, including
+    # the Dash callback XHRs). One shared credential pair handed out with the link
+    # — the "sharable password" model, not per-person identity.
+    #
+    # Empty password = NO gate (the default: a loopback-only dashboard needs none).
+    # The gate is what makes public exposure safe, so the tunnel launcher
+    # (scripts/run_public_dashboard.ps1) PROBES it — an unauthenticated request
+    # must come back 401 — and refuses to open the tunnel otherwise. That check is
+    # mechanical on purpose: "middleware silently not applied" and "gate working"
+    # are indistinguishable from the config alone, and the cost of being wrong is
+    # publishing live P&L.
+    dashboard_auth_username: str = "viewer"
+    dashboard_auth_password: str = ""
 
     # ── Broker / live execution (paper-first; OFF by default → no broker calls) ──
     # Pre-production: drive a real broker's PAPER account in parallel with the
@@ -2643,7 +2729,17 @@ class Settings(BaseSettings):
     predictability_adx_cap: float = 40.0        # ADX value that maps to a full 1.0 score component
     predictability_er_window: int = 20          # efficiency-ratio lookback (sessions)
     predictability_adx_period: int = 14         # Wilder ADX period
-    predictability_horizon: int = 5             # swing horizon the edge is measured at (sessions)
+    predictability_horizon: int = 5             # swing horizon the edge is measured at (sessions; fallback + panel build)
+    # 2026-08-13 standardization: the sizing edge is measured on the H/L PIVOT
+    # target ("pv") like every other decision surface; "fixed" pins the
+    # pre-directive fwd_ret_{predictability_horizon}d basis.
+    predictability_label_basis: str = "pv"
+    # Same directive, exit side: ml_exit trains on the ORIENTED remaining move
+    # to the next H/L pivot ("pv" — the rank-degradation exit thesis: + = the
+    # leg still runs our way, − = the next turn is against us), failing soft to
+    # the fixed held-return label below 500 settled rows; "fixed" pins the old
+    # fwd_ret_pos_{ml_exit_horizon_days}d label.
+    ml_exit_label_basis: str = "pv"
     predictability_halfwidth_floor: float = 0.10   # min ramp half-width (guards a degenerate spread)
     predictability_edge_prior: float = 0.02     # documented prior hit-gap (heavily shrunk early)
     predictability_edge_prior_n: int = 40       # signal-DAYS for the prior to fade (≈2 months)

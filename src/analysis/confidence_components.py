@@ -78,7 +78,23 @@ import pandas as pd
 
 from src.analysis.signal_panel import _spearman, periodic_ic_stats, session_filter_mask
 
-_DEFAULT_HORIZONS = (1, 5, 10)
+# "pv" (the H/L signed-pivot pseudo-horizon) leads — the 2026-08-13
+# standardization directive: every evaluation judges on the pivot target, the
+# fixed horizons stay as monitoring companions. Column/key resolution via
+# `_fwd_col`, mirroring `signal_panel.compute_ic`.
+_DEFAULT_HORIZONS = ("pv", 1, 5, 10)
+
+
+def _fwd_col(h) -> tuple:
+    """Horizon token -> (panel forward-return column, metric-key suffix)."""
+    return (("fwd_ret_pivot", "pv") if h == "pv" else (f"fwd_ret_{h}d", f"{h}d"))
+
+
+def _int_horizons(horizons: Sequence) -> list:
+    """The fixed-day subset (what `build_panel(horizons=...)` accepts — the
+    pivot label rides every panel unconditionally)."""
+    ints = [h for h in horizons if h != "pv"]
+    return ints or [5]
 MIN_N = 10
 
 # (key, label, factor_column). factor_column=None means "raw" (no multiplier) for
@@ -160,24 +176,25 @@ def compute_component_ic(df: pd.DataFrame, dir_sign: pd.Series,
         v = values[key]
         row: dict = {"variant": key, "label": label}
         for h in horizons:
-            fwd = pd.to_numeric(df.get(f"fwd_ret_{h}d"), errors="coerce")
+            col, sfx = _fwd_col(h)
+            fwd = pd.to_numeric(df.get(col), errors="coerce")
             oriented = fwd * dir_sign
             valid = v.notna() & oriented.notna() & dir_sign.notna()
             n = int(valid.sum())
-            row[f"n_{h}d"] = n
+            row[f"n_{sfx}"] = n
             if n < min_n:
-                row[f"ic_{h}d"] = None
-                row[f"icir_{h}d"] = None
+                row[f"ic_{sfx}"] = None
+                row[f"icir_{sfx}"] = None
                 continue
             vv, oo = v[valid], oriented[valid]
             ic = _spearman(vv, oo)
-            row[f"ic_{h}d"] = round(ic, 4) if ic is not None else None
+            row[f"ic_{sfx}"] = round(ic, 4) if ic is not None else None
             if "signal_date" in df.columns:
                 _, _, icir, _ = periodic_ic_stats(df.loc[valid, "signal_date"], vv, oo,
                                                   min_per_day, min_days)
-                row[f"icir_{h}d"] = round(icir, 3) if icir is not None else None
+                row[f"icir_{sfx}"] = round(icir, 3) if icir is not None else None
             else:
-                row[f"icir_{h}d"] = None
+                row[f"icir_{sfx}"] = None
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -198,18 +215,19 @@ def compute_component_bands(df: pd.DataFrame, dir_sign: pd.Series,
             mask_band = v.notna() & (v >= lo) & (v < hi if hi is not None else True)
             row: dict = {"variant": key, "label": label, "band": bkey, "band_label": blabel}
             for h in horizons:
-                fwd = pd.to_numeric(df.get(f"fwd_ret_{h}d"), errors="coerce")
+                col, sfx = _fwd_col(h)
+                fwd = pd.to_numeric(df.get(col), errors="coerce")
                 oriented = fwd * dir_sign
                 valid = mask_band & oriented.notna() & dir_sign.notna()
                 n = int(valid.sum())
-                row[f"n_{h}d"] = n
+                row[f"n_{sfx}"] = n
                 if n < min_n:
-                    row[f"win_{h}d"] = None
-                    row[f"ret_{h}d"] = None
+                    row[f"win_{sfx}"] = None
+                    row[f"ret_{sfx}"] = None
                     continue
                 oo = oriented[valid]
-                row[f"win_{h}d"] = round(float((oo > 0).mean() * 100.0), 2)
-                row[f"ret_{h}d"] = round(float(oo.mean()), 4)
+                row[f"win_{sfx}"] = round(float((oo > 0).mean() * 100.0), 2)
+                row[f"ret_{sfx}"] = round(float(oo.mean()), 4)
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -223,7 +241,7 @@ def compute_entry_component_report(days: Optional[int] = None,
     """``{panel_rows, has_factors, ic, bands}`` — every scored ticker treated
     as a hypothetical entry in its own ``combined_score`` direction."""
     from src.analysis.signal_panel import build_panel
-    panel = build_panel(horizons=horizons, days=days, signals_df=signals_df)
+    panel = build_panel(horizons=_int_horizons(horizons), days=days, signals_df=signals_df)
     if panel is None or panel.empty:
         return {"panel_rows": 0, "has_factors": False,
                 "ic": pd.DataFrame(), "bands": pd.DataFrame()}
@@ -300,7 +318,7 @@ def compute_exit_component_report(days: Optional[int] = None,
     (``rth|premarket|afterhours|overnight|extended``); ``direction``
     (``long|short``) to the held position's side."""
     from src.analysis.signal_panel import build_panel
-    panel = build_panel(horizons=horizons, days=days, signals_df=signals_df)
+    panel = build_panel(horizons=_int_horizons(horizons), days=days, signals_df=signals_df)
     if panel is None or panel.empty or not has_component_data(panel):
         return {"panel_rows": 0, "has_factors": has_component_data(panel),
                 "ic": pd.DataFrame(), "bands": pd.DataFrame()}
@@ -363,10 +381,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
     print(f"\n{args.source.upper()} — {rep['panel_rows']} row(s)\n")
     print("Overall (ungated) — does the variant's value discriminate?")
-    _print_table(ic, ["label"] + [f"{m}_{h}d" for h in _DEFAULT_HORIZONS
+    _print_table(ic, ["label"] + [f"{m}_{_fwd_col(h)[1]}" for h in _DEFAULT_HORIZONS
                                   for m in ("n", "ic", "icir")])
     print("\nBy conviction band:")
-    _print_table(bands, ["label", "band_label"] + [f"{m}_{h}d" for h in _DEFAULT_HORIZONS
+    _print_table(bands, ["label", "band_label"] + [f"{m}_{_fwd_col(h)[1]}" for h in _DEFAULT_HORIZONS
                                                     for m in ("n", "win", "ret")])
 
 

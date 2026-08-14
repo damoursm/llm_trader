@@ -383,8 +383,15 @@ def walk_forward_predict(df: pd.DataFrame, horizon: int, basis: str,
     yet, the exact leak walk-forward removes. Predict rows dated in the next
     ``step_days`` block. Returns columns: signal_date, ticker, bull, bear, net, fwd.
     """
-    ycol = f"fwd_ret_{basis}_{horizon}d"
-    ecol = f"end_date_{horizon}d"
+    # The PIVOT label (2026-08-12) rides the same plumbing under basis
+    # "rank_pv" / "sellinv_pv": its columns are horizon-free (each row settles
+    # at its OWN pivot; `end_date_pv` carries that), so the nominal ``horizon``
+    # argument is ignored for column resolution.
+    if str(basis).endswith("_pv"):
+        ycol, ecol = f"fwd_ret_{str(basis)[:-3]}_pv", "end_date_pv"
+    else:
+        ycol = f"fwd_ret_{basis}_{horizon}d"
+        ecol = f"end_date_{horizon}d"
     if ycol not in df.columns or ecol not in df.columns:
         return pd.DataFrame()
     feats = [f for f in features if f in df.columns]

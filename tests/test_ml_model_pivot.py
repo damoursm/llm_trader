@@ -30,8 +30,11 @@ def pivot_artifact(tmp_path, monkeypatch):
     y = (0.8 * X[:, 2] + 0.2 * rng.normal(size=400)).astype(float)  # leg_dir drives it
     model = LightGBMRankRegressor(n_estimators=20, min_child_samples=5,
                                   num_threads=1).fit(X, y)
+    from src.analysis.pivot_target import pivot_basis
+    cfg = dict(ml_model.TRAIN_CONFIG_PIVOT)
+    cfg["pivot_basis"] = pivot_basis()        # a CURRENT-basis artifact
     art = {"model": model, "features": feats,
-           "config": dict(ml_model.TRAIN_CONFIG_PIVOT),
+           "config": cfg,
            "trained_at": "2026-08-08T00:00:00+00:00", "n_train": 400,
            "train_max_date": "2026-08-07"}
     path = tmp_path / "ml_ohlcv_model.pkl"
@@ -93,3 +96,25 @@ def test_v2_direction_tracks_the_planted_signal(pivot_artifact, monkeypatch):
                         lambda tk: {"leg_dir": -1.0, "leg_age": 3.0})
     dn, _ = ml_model.compute_ml_score("DOWN")
     assert up > 0 > dn
+
+
+def test_v2_stale_pivot_basis_abstains(pivot_artifact, monkeypatch):
+    """An artifact trained on the RETIRED close basis (no/old pivot_basis in
+    its config) must ABSTAIN — its leg features no longer mean what it learned.
+    The 2026-08-12 H/L refactor guard: degraded, never wrong."""
+    import pickle
+
+    from src.signals import ml_model
+
+    art = dict(pivot_artifact["art"])
+    cfg = dict(art["config"])
+    cfg.pop("pivot_basis", None)              # close-era artifact
+    art["config"] = cfg
+    with open(pivot_artifact["path"], "wb") as fh:
+        pickle.dump(art, fh)
+    ml_model._ART_CACHE.update(mtime=None, art=None)
+    ml_model._SCORE_CACHE.clear()
+    ml_model._BASIS_WARNED = False
+    score, status = ml_model.compute_ml_score("AAPL")
+    assert score == 0.0
+    assert status == "BASIS_STALE"

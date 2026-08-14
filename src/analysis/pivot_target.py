@@ -4,8 +4,12 @@ Ported verbatim from the 2026-08 scratchpad harness that measured it (see
 ``memory/pivot-horizon-target-2026-08.md`` for the full experimental record).
 The quantities:
 
-**The SIGNED pivot target** (``sp_buy``): at day *i*, the % return to the NEXT
-pivot — peak or trough, whichever comes first. One pivot, not two: the earlier
+**The SIGNED pivot target** (``sp_buy``): at day *i*, the % return from
+close(*i*) to the NEXT pivot's EXTREME — the peak bar's HIGH or the trough
+bar's LOW, whichever pivot comes first (H/L basis + the
+``pivot_min_move_pct`` threshold zigzag since 2026-08-12, user directives; the
+construction previously ran zero-threshold on closes — those changes are why
+``pivot_basis()`` exists and why the ml_ohlcv artifact is basis-stamped). One pivot, not two: the earlier
 two-pivot variant (buy→next peak, sell→next trough) made both sides ~75%
 positive by construction and turned the model into a volatility ranker; the
 signed redefinition drops the base rate to ~50.4% and kills that artifact
@@ -17,10 +21,11 @@ trading day, mean ~2, p90 4. Rows whose next pivot is further than
 **The 9 LEG FEATURES** (``LEG_FEATURES``): where the stock sits within its own
 swing — the state the 76 generic features never encode, and measured to be
 pivot-SPECIFIC (they add +0.0011 IC here and NOTHING on a static 5d target).
-A pivot at bar *j* is CONFIRMED only once bar *j+1* prints, so every leg
-feature at bar *i* uses pivots at *j ≤ i−1* — the one-bar confirmation lag is
-the entire causality story, because sign(target) = sign(tomorrow's move) makes
-any leak at this seam a perfect answer key. ``tests/test_pivot_target.py``
+A pivot is CONFIRMED only once its ``pivot_min_move_pct`` reversal has
+PRINTED (variable lag — `_resolved_pivots` returns each pivot's confirmation
+bar), so every leg feature at bar *i* uses pivots with ``conf ≤ i`` — that
+confirmation seam is the entire causality story, because any leak across it
+hands the model a still-revisable extreme as if it were settled. ``tests/test_pivot_target.py``
 probes exactly that seam.
 
 **The training label** (``within_day_rank``): the within-day centred percentile
@@ -52,6 +57,141 @@ LEG_FEATURES: List[str] = [
 ]
 
 
+def _min_move_pct() -> float:
+    """The minimum swing threshold (%). Lazy settings read, fail-soft to 1.0 —
+    the value the 2026-08-12 directive named ("not worth buying and selling
+    weak price runs" against the spread)."""
+    try:
+        from config.settings import settings
+        return max(0.0, float(settings.pivot_min_move_pct))
+    except Exception:
+        return 1.0
+
+
+def pivot_basis() -> str:
+    """The pivot-definition fingerprint the ml_ohlcv artifact is stamped with:
+    ``hl`` (highs/lows, extremes) + the confirmation threshold. Any change to
+    either is a CATEGORICAL change — a stale-basis artifact must abstain, so
+    the threshold is part of the string rather than a silent setting."""
+    return f"hl{_min_move_pct():g}"
+
+
+def _resolved_pivots(c: np.ndarray, h: np.ndarray, lo: np.ndarray):
+    """The single causal pivot SEQUENCE as a THRESHOLD zigzag on highs/lows:
+    ``(indices, prices, is_peak_flags, confirm_indices)``.
+
+    A swing high is the running maximum of the HIGH series; it becomes a PEAK
+    pivot only once some later bar's LOW prints ``pivot_min_move_pct`` percent
+    below it (the mirror on lows for troughs) — so every leg moved at least
+    the threshold and sub-threshold wiggles never become pivots (2026-08-12
+    user directive: weak runs aren't worth the spread). ``confirm_indices[k]``
+    is the bar at which pivot ``k`` became knowable — the VARIABLE-lag
+    confirmation seam that replaced the fixed one-bar lag: leg features at bar
+    *i* may only use pivots with ``conf <= i``, and a truncated series simply
+    never emits an unconfirmed pivot, which is the whole point-in-time story.
+
+    Per bar the machine does exactly ONE of extend or reverse, and the
+    reversal always tests against the extreme as of the PRIOR bar: a bar whose
+    own range spans the threshold must not confirm a reversal against the
+    extreme it itself just set (with typical daily ranges above 1% that
+    self-trigger degenerates into a pivot on almost every bar — caught by the
+    monotone-series probe). Extension wins an outside bar (continuation-
+    favoring, deterministic; intra-bar order is unknowable from daily data),
+    so its reversal, if real, confirms on a later bar against the updated
+    extreme. Ties keep the FIRST extreme bar."""
+    n = len(c)
+    empty = (np.asarray([], dtype=int), np.asarray([], dtype=float),
+             np.asarray([], dtype=bool), np.asarray([], dtype=int))
+    if n == 0:
+        return empty
+    thr = _min_move_pct() / 100.0
+    idxs: List[int] = []
+    prices: List[float] = []
+    flags: List[bool] = []
+    confs: List[int] = []
+
+    up: Optional[bool] = None
+    hi_i, hi_px = 0, float(h[0])
+    lo_i, lo_px = 0, float(lo[0])
+    ext_i, ext_px = 0, float(h[0])
+
+    for i in range(1, n):
+        if up is None:
+            # Direction unknown: triggers test against the extremes as of the
+            # PRIOR bar; only afterwards does bar i update the running extremes.
+            down_trig = hi_px > 0 and lo[i] <= hi_px * (1.0 - thr)
+            up_trig = lo_px > 0 and h[i] >= lo_px * (1.0 + thr)
+            if down_trig and up_trig:
+                # one bar resolves both ways — take the larger relative move
+                down_mag = (hi_px - lo[i]) / hi_px
+                up_mag = (h[i] - lo_px) / lo_px
+                if down_mag >= up_mag:
+                    up_trig = False
+                else:
+                    down_trig = False
+            if down_trig:
+                idxs.append(hi_i); prices.append(hi_px); flags.append(True); confs.append(i)
+                up = False
+                ext_i, ext_px = i, float(lo[i])
+            elif up_trig:
+                idxs.append(lo_i); prices.append(lo_px); flags.append(False); confs.append(i)
+                up = True
+                ext_i, ext_px = i, float(h[i])
+            else:
+                if h[i] > hi_px:
+                    hi_i, hi_px = i, float(h[i])
+                if lo[i] < lo_px:
+                    lo_i, lo_px = i, float(lo[i])
+        elif up:
+            if h[i] > ext_px:
+                ext_i, ext_px = i, float(h[i])          # extend — no reversal test this bar
+            elif ext_px > 0 and lo[i] <= ext_px * (1.0 - thr):
+                idxs.append(ext_i); prices.append(ext_px); flags.append(True); confs.append(i)
+                up = False
+                ext_i, ext_px = i, float(lo[i])
+        else:
+            if lo[i] < ext_px:
+                ext_i, ext_px = i, float(lo[i])         # extend — no reversal test this bar
+            elif ext_px > 0 and h[i] >= ext_px * (1.0 + thr):
+                idxs.append(ext_i); prices.append(ext_px); flags.append(False); confs.append(i)
+                up = True
+                ext_i, ext_px = i, float(h[i])
+
+    return (np.asarray(idxs, dtype=int), np.asarray(prices, dtype=float),
+            np.asarray(flags, dtype=bool), np.asarray(confs, dtype=int))
+
+
+def next_pivot_targets(c: np.ndarray, h: np.ndarray, lo: np.ndarray):
+    """Evaluation-side labels: ``(sp, end_idx)`` per bar — ``sp[i]`` = the
+    signed % return from close(i) to the next resolved pivot's EXTREME (the
+    peak bar's high / the trough bar's low; NaN unsettled), ``end_idx[i]`` =
+    that pivot's bar index (−1 unsettled). EXACTLY the training target: same
+    resolved sequence (`_resolved_pivots`), same settle rule (next pivot
+    printed AND within ``MAX_PIVOT_DAYS``), same 50-bar minimum — a parity
+    test pins ``sp`` against ``pivot_frame``'s ``sp_buy``. The caller owns
+    point-in-time discipline by truncating all three series at its visible-
+    history cutoff: a pivot then settles only if its CONFIRMING bar is inside
+    the window."""
+    n = len(c)
+    sp = np.full(n, np.nan)
+    end = np.full(n, -1, dtype=int)
+    if n < 50:
+        return sp, end
+    P, PP, _fl, _cf = _resolved_pivots(c, h, lo)
+    if len(P) == 0:
+        return sp, end
+    pos = np.searchsorted(P, np.arange(n), side="right")   # first pivot > i
+    for i in range(n):
+        k = pos[i]
+        if k >= len(P):
+            continue
+        j = int(P[k])
+        if j > 0 and (j - i) <= MAX_PIVOT_DAYS and c[i] > 0:
+            sp[i] = (PP[k] / c[i] - 1.0) * 100.0
+            end[i] = j
+    return sp, end
+
+
 def _leg_target_rows(c: np.ndarray, h: np.ndarray, lo: np.ndarray,
                      dates: Sequence, only_last: bool = False,
                      require_target: bool = True) -> List[dict]:
@@ -65,24 +205,13 @@ def _leg_target_rows(c: np.ndarray, h: np.ndarray, lo: np.ndarray,
     if n < 50:
         return []
     d = np.diff(c)
-    is_peak = np.zeros(n, dtype=bool)
-    is_trough = np.zeros(n, dtype=bool)
-    is_peak[1:-1] = (d[:-1] >= 0) & (d[1:] < 0)
-    is_trough[1:-1] = (d[:-1] <= 0) & (d[1:] > 0)
+    P, PP, P_is_peak, P_conf = _resolved_pivots(c, h, lo)
 
-    # next pivot at/after i+1 (the target end), -1 when none has printed
-    nxt = np.full(n, -1, dtype=int)
-    j = -1
-    for i in range(n - 1, -1, -1):
-        nxt[i] = j
-        if is_peak[i] or is_trough[i]:
-            j = i
-
-    P = np.where(is_peak | is_trough)[0]
-    P_is_peak = is_peak[P]
     if len(P) >= 2:
         s_len = (P[1:] - P[:-1]).astype(float)
-        s_amp = np.abs(c[P[1:]] / c[P[:-1]] - 1.0) * 100.0
+        # Swing amplitude between the RESOLVED EXTREMES (H/L basis) — the real
+        # size of each completed swing, not its close-to-close shadow.
+        s_amp = np.abs(PP[1:] / PP[:-1] - 1.0) * 100.0
         med_len = pd.Series(s_len).rolling(10, min_periods=3).median().to_numpy()
         med_amp = pd.Series(s_amp).rolling(10, min_periods=3).median().to_numpy()
     else:
@@ -97,26 +226,33 @@ def _leg_target_rows(c: np.ndarray, h: np.ndarray, lo: np.ndarray,
         else:
             run[i] = 0
 
-    n_prior = np.searchsorted(P, np.arange(n), side="left")   # pivots strictly < i
+    # A pivot is USABLE at bar i only once CONFIRMED (its threshold reversal
+    # printed): the variable-lag seam. `n_prior[i]` counts pivots with
+    # conf <= i — NOT extreme-index < i, which would leak pre-confirmation
+    # knowledge of a still-revisable extreme.
+    n_prior = np.searchsorted(P_conf, np.arange(n), side="right")
+    n_next = np.searchsorted(P, np.arange(n), side="right")   # first pivot > i
     rows: List[dict] = []
     idxs = [n - 1] if only_last else range(n)
     for i in idxs:
         if c[i] <= 0:
             continue
-        jn = nxt[i]
+        k_next = n_next[i]
+        jn = int(P[k_next]) if k_next < len(P) else -1
         settled = jn > 0 and (jn - i) <= MAX_PIVOT_DAYS
         if require_target and not settled:
             continue
         rec: dict = {"signal_date": dates[i].isoformat()}
         if settled:
-            rec["sp_buy"] = (c[jn] / c[i] - 1.0) * 100.0
+            rec["sp_buy"] = (PP[k_next] / c[i] - 1.0) * 100.0
             rec["sp_end"] = dates[jn].isoformat()
         pos = n_prior[i] - 1                    # last pivot < i (confirmed by bar i)
         if pos >= 0:
-            jp = P[pos]
+            jp = int(P[pos])
             rec["leg_dir"] = -1.0 if P_is_peak[pos] else 1.0
             rec["leg_age"] = float(i - jp)
-            rec["leg_ret"] = (c[i] / c[jp] - 1.0) * 100.0
+            # Position in the current leg vs the pivot's EXTREME (H/L basis).
+            rec["leg_ret"] = (c[i] / PP[pos] - 1.0) * 100.0
             k = pos                              # swings 1..pos are complete
             if k >= 1 and len(med_len) >= k and np.isfinite(med_len[k - 1]):
                 ml, ma = med_len[k - 1], med_amp[k - 1]

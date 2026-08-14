@@ -410,6 +410,10 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 # each side's forward IC is monitored (Signal IC → Buy/Sell side).
                 "combined_buy_score": float(getattr(s, "combined_buy_score", 0.0)),
                 "combined_sell_score": float(getattr(s, "combined_sell_score", 0.0)),
+                # Absolute-basis shadow combine (2026-08-14): rank-vs-absolute A/B.
+                "combined_score_abs": getattr(s, "combined_score_abs", None),
+                "combined_buy_score_abs": getattr(s, "combined_buy_score_abs", None),
+                "combined_sell_score_abs": getattr(s, "combined_sell_score_abs", None),
                 "scores": all_scores,
             })
         if sig_rows:

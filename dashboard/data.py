@@ -302,7 +302,7 @@ def market_relative_skill():
         return {}, 48.6
 
 
-def arm_eval(days: Optional[int] = None, horizons=(1, 5, 10)) -> dict:
+def arm_eval(days: Optional[int] = None, horizons=("pv", 1, 5, 10)) -> dict:
     """Synthesis prompt-arm bake-off over the ``arm_recommendations`` panel.
 
     Every arm's call on every ticker each tick (one live, the rest shadow), so
@@ -534,7 +534,7 @@ def exit_policy_comparison(days: Optional[int] = 90, horizon: int = 5) -> pd.Dat
                                   "exit_policy_comparison"))
 
 
-def source_performance(days: Optional[int] = None, horizons=(1, 5, 10),
+def source_performance(days: Optional[int] = None, horizons=("pv", 1, 5, 10),
                        min_n: int = 10) -> pd.DataFrame:
     """Per-discovery-source forward-return performance over the signals panel
     (funnel share + mean forward return + up-share win % + combined_score IC per
@@ -547,7 +547,7 @@ def source_performance(days: Optional[int] = None, horizons=(1, 5, 10),
                        horizons=horizons, days=days, min_n=min_n), "source_performance"))
 
 
-def predictability(days: Optional[int] = None, horizons=(1, 5, 10), min_n: int = 30,
+def predictability(days: Optional[int] = None, horizons=("pv", 1, 5, 10), min_n: int = 30,
                    n_buckets: int = 3) -> dict:
     """Predictability-feature IC panel — does ``combined_score`` predict forward
     returns better inside high-trend / moderate-vol / high-breadth buckets of the
@@ -637,6 +637,61 @@ _warm_thread = None
 _warm_state: dict = {"ver": None, "running": False}
 
 
+def method_decile_curves(days: Optional[int] = None) -> dict:
+    """Per-method DECILE curves on the pivot basis (2026-08-13 rank directive's
+    dashboard companion): for every method column with data, each panel row's
+    score is ranked WITHIN ITS DAY among that method's non-zero scores, bucketed
+    into deciles, and each decile reports n / win% / mean winsorized oriented
+    pivot return. Long-oriented: the outcome is the SIGNED pivot move (not
+    direction-adjusted), so an upward-sloping curve = higher score -> more
+    upside — the exact consumption the rank basis feeds the combine.
+
+    Returns ``{"methods": {m: {"ret": [...10], "win": [...10], "n": [...10]}},
+    "meta": {...}}``. One computation covers every method; the dropdown slices.
+    """
+    def _q():
+        import numpy as np
+        from src.analysis.signal_panel import build_panel
+        from src.db.schema import SIGNAL_BASE_METHOD_COLUMNS
+        panel = build_panel(horizons=(5,), days=days)
+        if panel is None or panel.empty or "fwd_ret_pivot" not in panel.columns:
+            return {"methods": {}, "meta": {}}
+        fp = panel.copy()
+        fp["fwd_ret_pivot"] = pd.to_numeric(fp["fwd_ret_pivot"], errors="coerce")
+        fp = fp[fp["fwd_ret_pivot"].notna()]
+        if fp.empty:
+            return {"methods": {}, "meta": {}}
+        fp["day"] = fp["signal_date"].astype(str).str[:10]
+        lo, hi = np.percentile(fp["fwd_ret_pivot"], [1, 99])
+        fp["retw"] = fp["fwd_ret_pivot"].clip(lo, hi)
+        out: dict = {}
+        for m in SIGNAL_BASE_METHOD_COLUMNS:
+            if m not in fp.columns:
+                continue
+            sc = pd.to_numeric(fp[m], errors="coerce")
+            sub = fp[sc.notna() & (sc != 0)].copy()
+            if len(sub) < 200 or sub["day"].nunique() < 5:
+                continue
+            sub["score"] = pd.to_numeric(sub[m], errors="coerce")
+            pct = sub.groupby("day")["score"].rank(pct=True)
+            b = np.clip((pct * 10).astype(int), 0, 9)
+            g = sub.groupby(b).agg(
+                n=("retw", "size"), ret=("retw", "mean"),
+                win=("retw", lambda s: 100.0 * (s > 0).mean()))
+            g = g.reindex(range(10))
+            out[m] = {
+                "ret": [None if v != v else round(float(v), 3) for v in g["ret"]],
+                "win": [None if v != v else round(float(v), 1) for v in g["win"]],
+                "n": [0 if v != v else int(v) for v in g["n"]],
+            }
+        meta = {"rows": int(len(fp)), "days": int(fp["day"].nunique()),
+                "d0": str(fp["day"].min()), "d1": str(fp["day"].max()),
+                "winsor": [round(float(lo), 2), round(float(hi), 2)]}
+        return {"methods": out, "meta": meta}
+    return _cached(("method_decile_curves", days or "all"),
+                   lambda: _retry(_q, "method_decile_curves"))
+
+
 def _warm_targets():
     """The accessors a cold page load would otherwise force.
 
@@ -657,7 +712,8 @@ def _warm_targets():
              # 2026-07-25: both share the memoised panel, so they are cheap —
              # but an unwarmed accessor still costs the FIRST visitor after
              # every run, which is nearly every visit at a 30-min tick.
-             "ticker_perf", "arm_eval", "market_relative_skill")
+             "ticker_perf", "arm_eval", "market_relative_skill",
+             "method_decile_curves")
     return [(n, globals().get(n)) for n in names]
 
 

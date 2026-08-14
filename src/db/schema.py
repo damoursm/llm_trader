@@ -169,6 +169,15 @@ SIGNAL_CONFIDENCE_COMPONENT_COLUMNS = (
 # forward IC is monitored on the dashboard (Signal IC → Buy side / Sell side).
 SIGNAL_COMBINED_SIDE_COLUMNS = ("combined_buy_score", "combined_sell_score")
 
+# Absolute-basis SHADOW combine (2026-08-14, rank directive follow-up): with
+# `method_score_basis="rank"` live, the weighted combine over the RAW absolute
+# scores is computed anyway (phase-2 arithmetic is free) and persisted per row,
+# so rank-vs-absolute is settled by the live A/B rather than a 43-day offline
+# experiment. When the basis is "absolute" these equal the live weighted combine
+# (pre-ML-arm). NULL on rows written before the columns existed.
+SIGNAL_ABS_SHADOW_COLUMNS = ("combined_score_abs", "combined_buy_score_abs",
+                             "combined_sell_score_abs")
+
 SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS runs (
@@ -441,6 +450,9 @@ SCHEMA_STATEMENTS = [
         weight_set          VARCHAR,
         computed_at         VARCHAR,
         combined_buy_score  DOUBLE,
+        combined_score_abs  DOUBLE,
+        combined_buy_score_abs DOUBLE,
+        combined_sell_score_abs DOUBLE,
         combined_sell_score DOUBLE,
         combined_score      DOUBLE,
         raw_confidence      DOUBLE,
@@ -545,6 +557,7 @@ _ADD_COLUMNS = (
     *(("signals", col, "DOUBLE") for col in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS),
     # Buy/sell split combine sides (2026-07-22) on an existing signals table.
     *(("signals", col, "DOUBLE") for col in SIGNAL_COMBINED_SIDE_COLUMNS),
+    *(("signals", col, "DOUBLE") for col in SIGNAL_ABS_SHADOW_COLUMNS),
     # Which combine produced this row's buy/sell scores (2026-08-02): the ML
     # stackers or the hand-weighted camps. The A/B arm is per-RUN but the swap is
     # fail-soft PER SIDE (a missing artifact keeps that side weighted), so the

@@ -129,8 +129,16 @@ def score_by_price_volume(days: Optional[int] = None,
     fp["dvol_band"] = dvol.map(lambda v: _band(v, DVOL_BANDS))
     fpp = fp.dropna(subset=["price_band"])
     fpv = fp.dropna(subset=["dvol_band"])
-    fwd_col = "fwd_ret_5d" if "fwd_ret_5d" in fp.columns else next(
-        (c for c in fp.columns if c.startswith("fwd_ret_")), None)
+    # Pivot-first (2026-08-13 standardization): the H/L pivot target is the
+    # headline outcome; 5d is the fallback when the pivot column is absent/empty.
+    fwd_col = None
+    if "fwd_ret_pivot" in fp.columns and pd.to_numeric(
+            fp["fwd_ret_pivot"], errors="coerce").notna().any():
+        fwd_col = "fwd_ret_pivot"
+    elif "fwd_ret_5d" in fp.columns:
+        fwd_col = "fwd_ret_5d"
+    else:
+        fwd_col = next((c for c in fp.columns if c.startswith("fwd_ret_")), None)
     res = {
         "by_price": _bucket_stats(fpp, "combined_score", "price_band", PRICE_BANDS),
         "by_dvol": _bucket_stats(fpv, "combined_score", "dvol_band", DVOL_BANDS),

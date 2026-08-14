@@ -62,6 +62,23 @@ def _no_gateway_auto_restart(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _absolute_score_basis(monkeypatch):
+    """Pin ``method_score_basis="absolute"`` for the whole suite.
+
+    The long-standing build_signals integration tests assert the combine's
+    ARITHMETIC (camp averages, inversion swaps, filter exclusion) on known
+    absolute inputs over 1-3-ticker fixtures. Under the live "rank" default a
+    cross-section that thin makes every method ABSTAIN (score 0 — the
+    2026-08-13 no-fallback rule), which is correct in production and useless
+    as a test fixture. The two-phase continuation path runs either way, so the
+    refactor stays covered; the rank transform itself is pinned by
+    tests/test_method_rank_basis.py, which opts back in explicitly."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "method_score_basis", "absolute")
+
+
+@pytest.fixture(autouse=True)
 def _default_llm_primary(monkeypatch):
     """Pin the LLM routing/thinking settings to their code defaults for the whole
     suite so engine-routing / hold-review-pinning / thinking tests don't inherit a

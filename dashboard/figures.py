@@ -429,3 +429,34 @@ def tracking_error_fig(rep: dict) -> go.Figure:
         plot_bgcolor="white", paper_bgcolor="white",
     )
     return fig
+
+
+def method_decile_fig(curve: dict, method: str, label: str = "") -> "go.Figure":
+    """Decile bars for ONE method on the pivot basis (the rank-directive plot):
+    x = within-day score decile (D1 weakest .. D10 strongest), bars = mean
+    winsorized signed pivot return, line = decile win rate on a secondary...
+    NO — one axis (house rule): win% and n ride the hover, return is the bar."""
+    import plotly.graph_objects as go
+    rets = curve.get("ret") or [None] * 10
+    wins = curve.get("win") or [None] * 10
+    ns = curve.get("n") or [0] * 10
+    colors = [POS if (v or 0) >= 0 else NEG for v in rets]
+    fig = go.Figure(go.Bar(
+        x=[f"D{i+1}" for i in range(10)],
+        y=[v if v is not None else 0 for v in rets],
+        marker_color=colors,
+        customdata=[[w if w is not None else float("nan"), n]
+                    for w, n in zip(wins, ns)],
+        hovertemplate=("%{x}: mean ret %{y:+.2f}%<br>win %{customdata[0]:.1f}%"
+                       "<br>n=%{customdata[1]:,}<extra></extra>"),
+    ))
+    fig.update_layout(
+        title=(f"{label or method} — mean signed pivot return by within-day "
+               f"score decile"),
+        yaxis_title="mean ret to next pivot (%)",
+        xaxis_title="within-day score decile (D10 = the day's strongest scores)",
+        margin=dict(l=10, r=10, t=48, b=10), height=360,
+        plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
+    )
+    fig.add_hline(y=0, line_width=1, line_color="#9ca3af")
+    return fig

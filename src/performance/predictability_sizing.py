@@ -152,9 +152,20 @@ def calibrate_predictability(feature_panel: Optional[pd.DataFrame] = None) -> di
             half = max(float(settings.predictability_halfwidth_floor), 0.1)
 
         # Measured edge — the directional-hit gap between high- and low-score
-        # names for combined_score at the swing horizon, shrunk toward the prior
-        # by SIGNAL-DAYS (correlated same-day names count once).
+        # names for combined_score, shrunk toward the prior by SIGNAL-DAYS
+        # (correlated same-day names count once).
+        #
+        # Label basis (2026-08-13 standardization directive): the H/L PIVOT
+        # target when the panel carries it — the same basis every other
+        # decision surface judges on — falling back to the fixed swing horizon
+        # on a thin/absent pivot column. `predictability_label_basis="fixed"`
+        # pins the old behaviour.
         col = f"fwd_ret_{horizon}d"
+        if (str(getattr(settings, "predictability_label_basis", "pv")).lower() == "pv"
+                and "fwd_ret_pivot" in fp.columns
+                and int(pd.to_numeric(fp["fwd_ret_pivot"], errors="coerce").notna().sum())
+                >= int(settings.predictability_cal_min_rows)):
+            col = "fwd_ret_pivot"
         cs = pd.to_numeric(fp.get("combined_score"), errors="coerce")
         fwd = pd.to_numeric(fp.get(col), errors="coerce")
         used = fp.assign(_score=scores, _cs=cs, _fwd=fwd)

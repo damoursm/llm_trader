@@ -2224,6 +2224,12 @@ def record_new_trades(
                                               or "weighted")
                 sig_at_entry = {
                     "combined_score":  round(float(getattr(sig, "combined_score", 0.0)), 4),
+                    # Absolute-basis twin (2026-08-14): ml_exit's ex_combine
+                    # features standardize on the ABSOLUTE combine so the rank
+                    # basis (and any future basis/shape drift) never shifts a
+                    # trained exit model's feature distribution mid-hold.
+                    "combined_score_abs": (round(float(v), 4) if (
+                        v := getattr(sig, "combined_score_abs", None)) is not None else None),
                     "confidence":      round(float(sig.confidence), 4),
                     "direction":       sig.direction,
                     "methods_agreeing": list(agreed),

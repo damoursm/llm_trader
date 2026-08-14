@@ -32,13 +32,15 @@ import src.signals.method_epochs as me
 
 # ── the epoch ──────────────────────────────────────────────────────────────
 
-def test_epoch_is_the_buy_sell_split(monkeypatch):
-    """Registered because the SPLIT changed what combined_score MEANS — a
-    difference of two camp averages, not one pooled average — and
-    raw_confidence derives straight from |combined|. Level shifts alone would
-    be a refinement; a change of meaning is categorical."""
+def test_epoch_is_the_method_rank_basis(monkeypatch):
+    """The epoch tracks the LATEST categorical change to what |combined| (and
+    hence confidence) MEANS. History: 2026-07-22 the buy/sell split (difference
+    of camp averages replaced one pooled average); 2026-08-14 the method RANK
+    basis (the combine consumes centered within-run ranks, so mean |eff score|
+    jumps from ~0.1-0.2 to ~0.5 by construction — same categorical test).
+    02:00 UTC mid-day change -> the day-after convention yields 08-15."""
     monkeypatch.setattr(settings, "enable_confidence_epoch", True)
-    assert me.confidence_epoch() == date(2026, 7, 22)
+    assert me.confidence_epoch() == date(2026, 8, 15)
 
 
 def test_epoch_can_be_disabled(monkeypatch):
@@ -62,10 +64,10 @@ def test_masking_blanks_confidence_but_KEEPS_the_row(monkeypatch):
     monkeypatch.setattr(settings, "enable_confidence_epoch", True)
     from src.analysis.signal_panel import build_panel
     df = pd.DataFrame({
-        "signal_date": ["2026-07-20", "2026-07-25"],
+        "signal_date": ["2026-08-10", "2026-08-20"],
         "ticker": ["AAA", "BBB"],
         "run_id": ["r1", "r2"],
-        "generated_at": ["2026-07-20T12:00:00", "2026-07-25T12:00:00"],
+        "generated_at": ["2026-08-10T12:00:00", "2026-08-20T12:00:00"],
         "confidence": [0.90, 0.80],
         "raw_confidence": [0.5, 0.5],
         "combined_score": [0.4, 0.4],
@@ -73,8 +75,8 @@ def test_masking_blanks_confidence_but_KEEPS_the_row(monkeypatch):
         "price": [10.0, 10.0],
     })
     out = build_panel(horizons=(1,), signals_df=df, dedupe="all")
-    pre = out[out["signal_date"] == "2026-07-20"].iloc[0]
-    post = out[out["signal_date"] == "2026-07-25"].iloc[0]
+    pre = out[out["signal_date"] == "2026-08-10"].iloc[0]
+    post = out[out["signal_date"] == "2026-08-20"].iloc[0]
     assert pd.isna(pre["confidence"]), "pre-epoch confidence must be masked"
     assert pd.isna(pre["raw_confidence"]), "its components too"
     assert post["confidence"] == 0.80, "post-epoch is untouched"
@@ -105,13 +107,23 @@ def test_components_reconstruct_confidence_after_the_overlay():
     import src.signals.aggregator as agg
     sigs = agg.build_signals(["AAPL", "MSFT", "GLD"], [])
     assert sigs, "need signals to check"
+    checked = 0
     for s in sigs:
+        if s.confidence == 0.0:
+            # Gate-zeroed (neutral direction): the stored components describe
+            # the pre-gate FORMULA by design — a gate decision is not a factor
+            # and reconstruction is undefined here. (Surfaced 2026-08-12 when
+            # the ml_ohlcv basis guard shifted a fixture ticker into the
+            # neutral branch; any method abstaining can do this.)
+            continue
         prod = (s.raw_confidence * s.coherence_factor * s.movement_factor
                 * s.volume_factor * s.family_conf_factor * s.tape_conf_factor)
         recon = round(min(1.0, prod), 2)
         assert abs(recon - s.confidence) <= 0.011, (
             f"{s.ticker}: components give {recon} but confidence is {s.confidence} "
             f"(cross_sectional={s.cross_sectional_score})")
+        checked += 1
+    assert checked >= 1, "every fixture row was gate-zeroed — test lost its subject"
 
 
 def test_raw_confidence_tracks_the_POST_overlay_combined_score():

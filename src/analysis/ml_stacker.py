@@ -103,6 +103,10 @@ def build_stacker_dataset(horizons: Sequence[int] = (1, 5, 10), days: Optional[i
     # validation can form combined_score = swapped_buy - combined_sell_score.
     extra = [c for c in ("combined_sell_score",) if c in panel.columns]
     fwd_cols = [f"fwd_ret_{h}d" for h in horizons if f"fwd_ret_{h}d" in panel.columns]
+    # The pivot label + its per-row settle date ride along whenever the panel
+    # carries them (2026-08-12) — the rank block below turns them into
+    # `fwd_ret_rank_pv`/`end_date_pv`, the stackers' default training label.
+    fwd_cols += [c for c in ("fwd_ret_pivot", "end_date_pivot") if c in panel.columns]
     # dict.fromkeys dedupes while preserving order — a column that is both a
     # feature and a baseline must not be selected twice (a duplicate column makes
     # df[col] 2-D and breaks the downstream metrics).
@@ -154,6 +158,18 @@ def build_stacker_dataset(horizons: Sequence[int] = (1, 5, 10), days: Optional[i
             df[f"fwd_ret_rank_{h}d"] = (df.groupby("signal_date")[raw_c]
                                           .rank(pct=True, method="average") - 0.5)
 
+    # PIVOT label (2026-08-12, user directive): the within-day centred rank of
+    # the SIGNED PIVOT TARGET — the ml_ohlcv-v2 objective, now the stackers'
+    # default label (``stacker_label_basis``). Settled rows only (an unsettled
+    # pivot is NaN and drops out of both the rank and the training set);
+    # ``end_date_pv`` carries each row's OWN settle date so the walk-forward
+    # trains strictly on printed labels.
+    if "fwd_ret_pivot" in df.columns:
+        df["fwd_ret_rank_pv"] = (df.groupby("signal_date")["fwd_ret_pivot"]
+                                   .rank(pct=True, method="average") - 0.5)
+        if "end_date_pivot" in df.columns:
+            df["end_date_pv"] = df["end_date_pivot"]
+
     logger.info(f"[ml_stacker] {len(df):,} rows over {df['ticker'].nunique()} tickers "
                 f"({df['signal_date'].min()} .. {df['signal_date'].max()}), "
                 f"{len(feats)} method features")
@@ -184,7 +200,8 @@ def buy_conviction_from_proba(p_up: float) -> float:
 
 
 # ── live inference: the buy stacker AS combined_buy_score ─────────────────────
-# The 5d-market-relative buy aggregator, trained on the 21 live method features
+# The buy aggregator on the within-day PIVOT-rank label (rank_5d fallback —
+# `_label_cfg`), trained on the 21 live method features
 # and served at the aggregator's combine point. Native Booster (no sklearn), so
 # the artifact loads in the production .venv. Fail-soft everywhere: a missing
 # artifact / lightgbm returns None and the caller keeps the weighted combine.
@@ -283,16 +300,38 @@ def _calibrate(art: dict, p: float) -> float:
         return p
 
 
+def _label_cfg(df: pd.DataFrame, cfg: dict, tag: str):
+    """Resolve the training label per ``stacker_label_basis`` (2026-08-12):
+    ``pivot_rank`` uses the within-day rank of the signed pivot target whenever
+    the panel carries enough settled rows; anything else (or a thin pivot
+    column) keeps the legacy fixed-horizon rank label. Returns ``(cfg, ycol)``
+    with ``cfg["basis"]`` switched to ``rank_pv`` when the pivot label won."""
+    want_pivot = str(getattr(settings, "stacker_label_basis", "pivot_rank")).lower() == "pivot_rank"
+    if want_pivot and "fwd_ret_rank_pv" in df.columns:
+        n = int(pd.to_numeric(df["fwd_ret_rank_pv"], errors="coerce").notna().sum())
+        if n >= 500:
+            out = dict(cfg)
+            out["basis"] = "rank_pv"
+            logger.info(f"[{tag}] label: PIVOT rank ({n:,} settled rows)")
+            return out, "fwd_ret_rank_pv"
+        logger.info(f"[{tag}] pivot label too thin ({n} rows) — falling back to "
+                    f"{cfg['basis']}_{cfg['horizon']}d")
+    return dict(cfg), f"fwd_ret_{cfg['basis']}_{cfg['horizon']}d"
+
+
 def train_and_persist_buy(days: Optional[int] = None, path=_BUY_MODEL_PATH) -> Optional[dict]:
     """Train the buy stacker on the panel (5d market-relative) over the 21 live
     method features; pickle it. Returns the artifact or None."""
     import numpy as _np
     from src.analysis.ml_train import LightGBMModel, label_from_return
-    cfg = BUY_TRAIN_CONFIG
-    h, basis = cfg["horizon"], cfg["basis"]
+    h = BUY_TRAIN_CONFIG["horizon"]
     df = build_stacker_dataset(horizons=[h], days=days)
-    ycol = f"fwd_ret_{basis}_{h}d"
-    if df.empty or ycol not in df.columns:
+    if df.empty:
+        logger.warning("[ml_buy] no panel data to train on")
+        return None
+    cfg, ycol = _label_cfg(df, BUY_TRAIN_CONFIG, "ml_buy")
+    basis = cfg["basis"]
+    if ycol not in df.columns:
         logger.warning("[ml_buy] no panel data to train on")
         return None
     feats = [f for f in STACKER_LIVE_FEATURES if f in df.columns]
@@ -306,7 +345,7 @@ def train_and_persist_buy(days: Optional[int] = None, path=_BUY_MODEL_PATH) -> O
     model = LightGBMModel(**STACKER_GBM_PARAMS).fit(X, y)
     # Calibrate on OUT-OF-FOLD predictions BEFORE the final all-data fit is used
     # live, so the probability the combine consumes means what it says.
-    cal, cal_diag = (_fit_calibrator(df, h, basis, feats, cfg["deadband"])
+    cal, cal_diag = (_fit_calibrator(df, h, cfg["basis"], feats, cfg["deadband"])
                      if settings.enable_ml_probability_calibration else (None, {}))
     art = {"model": model, "features": feats, "config": dict(cfg),
            "calibrator": cal, "calibration": cal_diag,
@@ -403,11 +442,14 @@ def train_and_persist_sell(days: Optional[int] = None, path=_SELL_MODEL_PATH) ->
     'up' = the short worked) over the 21 live method features; pickle it."""
     import numpy as _np
     from src.analysis.ml_train import LightGBMModel, label_from_return
-    cfg = SELL_TRAIN_CONFIG
-    h, basis = cfg["horizon"], cfg["basis"]
+    h = SELL_TRAIN_CONFIG["horizon"]
     df = build_stacker_dataset(horizons=[h], days=days)
-    ycol = f"fwd_ret_{basis}_{h}d"
-    if df.empty or ycol not in df.columns:
+    if df.empty:
+        logger.warning("[ml_sell] no panel data to train on")
+        return None
+    cfg, ycol = _label_cfg(df, SELL_TRAIN_CONFIG, "ml_sell")
+    basis = cfg["basis"]
+    if ycol not in df.columns:
         logger.warning("[ml_sell] no panel data to train on")
         return None
     feats = [f for f in STACKER_LIVE_FEATURES if f in df.columns]
@@ -427,9 +469,13 @@ def train_and_persist_sell(days: Optional[int] = None, path=_SELL_MODEL_PATH) ->
     if settings.enable_ml_probability_calibration:
         # The SHORT's outcome is the NEGATED basis (below the day's median on the
         # rank label = the short worked), matching this model's own label.
-        scol = f"fwd_ret_sellinv_{h}d"
-        df[scol] = -pd.to_numeric(df[f"fwd_ret_{basis}_{h}d"], errors="coerce")
-        cal, cal_diag = _fit_calibrator(df, h, "sellinv", feats, cfg["deadband"])
+        if basis == "rank_pv":
+            df["fwd_ret_sellinv_pv"] = -pd.to_numeric(df[ycol], errors="coerce")
+            cal, cal_diag = _fit_calibrator(df, h, "sellinv_pv", feats, cfg["deadband"])
+        else:
+            scol = f"fwd_ret_sellinv_{h}d"
+            df[scol] = -pd.to_numeric(df[ycol], errors="coerce")
+            cal, cal_diag = _fit_calibrator(df, h, "sellinv", feats, cfg["deadband"])
     art = {"model": model, "features": feats, "config": dict(cfg),
            "calibrator": cal, "calibration": cal_diag,
            "trained_at": _dt.now(_tz.utc).isoformat(timespec="seconds"),
@@ -698,10 +744,23 @@ def main(argv=None) -> None:
     p.add_argument("--validate-swap", action="store_true",
                    help="measure the DECISION impact of replacing combined_buy_score with the stacker")
     p.add_argument("--swap-horizon", type=int, default=5, help="horizon the buy aggregator optimizes (default 5)")
+    p.add_argument("--train", action="store_true",
+                   help="retrain + persist BOTH live artifacts (ml_buy, ml_sell) instead of measuring")
     a = p.parse_args(argv)
     horizons = tuple(int(h) for h in str(a.horizons).split(",") if h.strip())
     bases = tuple(b for b in str(a.bases).split(",") if b.strip())
     from src.db import repo
+    if a.train:
+        # Deliberately BEFORE set_read_only: training appends to the `ml_models`
+        # registry, so this branch needs the write path. Both sides are trained
+        # together — they are one decision surface (buy/sell camps of the same
+        # combine) and shipping a mismatched pair is never what you want.
+        for _name, _fn in (("ml_buy", eod_train_buy), ("ml_sell", eod_train_sell)):
+            art = _fn()
+            print(f"{_name}: " + (f"{art['n_train']:,} rows (<= {art['train_max_date']}), "
+                                  f"label basis={art['config']['basis']}"
+                                  if art else "NO ARTIFACT (see log)"))
+        return
     repo.set_read_only(True)
     if a.validate_swap:
         r = validate_swap(horizon=a.swap_horizon, basis="rel", deadband=a.deadband,

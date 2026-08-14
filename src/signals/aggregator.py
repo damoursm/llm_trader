@@ -664,7 +664,9 @@ def _market_relative_filtered() -> frozenset:
     shadow basis: within-day IC of the method's score against ticker-minus-
     benchmark forward returns from `compute_directional_perf`, ``both`` side —
     net-of-market by construction, matching the promotion sweeps' within-day
-    ranking). A horizon is judgeable with ≥ ``market_relative_min_obs`` rows
+    ranking). Since 2026-08-12 the judged horizon is the PIVOT pseudo-horizon
+    (``icir_pv`` — the promotion target itself) whenever the panel carries it;
+    the fixed grid is the fallback for panels predating the pivot column. A horizon is judgeable with ≥ ``market_relative_min_obs`` rows
     and a positive day count; a method with NO judgeable horizon is EXEMPT
     (unproven is not disproven — a freshly promoted or epoch-reset method runs
     at full weight until real evidence accrues, exactly the promotion
@@ -701,6 +703,13 @@ def _market_relative_filtered() -> frozenset:
         horizons = [c[len("icir_"):] for c in both.columns if c.startswith("icir_")]
         if not horizons:
             return frozenset()
+        # PIVOT basis (2026-08-12 directive): when the directional panel carries
+        # the pivot pseudo-horizon, the filter judges on IT ALONE — the same
+        # statistic the promotions were justified by, at the method's own
+        # natural horizon. The fixed grid remains the fallback for a panel
+        # predating the pivot column (fail-soft, never a behavior gap).
+        if "icir_pv" in both.columns:
+            horizons = ["pv"]
         min_t = max(0.0, float(settings.ic_weight_min_t))
         min_n = int(settings.market_relative_min_obs)
         inverted = _inverted_methods()
@@ -1347,6 +1356,114 @@ def _volume_factor(vol_ratio: float, abs_combined: float, coherence_ratio: float
     quality  = signal_q * coh_q                            # multiplicative AND
     boost    = (base - 1.00) * quality
     return round(1.00 + boost, 3)
+
+
+# ── Within-run rank transform (2026-08-13 user directive) ────────────────────
+
+def _rank_transform_run(raw_maps: dict, tradeable=None) -> tuple:
+    """Replace every method's scores with their CENTERED WITHIN-RUN rank.
+
+    ``raw_maps`` is ``{ticker: {method: (active, score)}}`` — the full run's
+    cross-section. For each method, the tickers holding an ACTIVE, non-zero,
+    finite view are ranked (average ranks on ties) and mapped onto
+    ``2·(rank−1)/(n−1) − 1`` ∈ [−1, +1]: the run's strongest view becomes +1,
+    the weakest −1, the median ≈ 0 — the same centered-rank convention the ML
+    models train on. Everything else is untouched:
+
+    * a ZERO score is an abstention and stays 0.0 (never assigned a rank);
+    * an INACTIVE method keeps its raw score (it doesn't join the combine);
+    * a method with fewer than ``method_rank_min_views`` views this run gets
+      **WEIGHT 0** (2026-08-13 directive, clarified same day: not a faked
+      zero SCORE — the raw scores stay visible in the map; the method is
+      returned in the ``abstained`` set and the combine treats it exactly
+      like a win-rate-filtered method: weight 0, excluded from coherence /
+      sources_agreeing / family votes. No absolute fallback);
+    * the transform happens at CONSUMPTION only — every persisted surface
+      (TickerSignal fields, the signals panel, trade attribution, the stacker
+      and ml_exit feature vectors) keeps the RAW score, exactly the inversion
+      architecture, so no scorer epoch fires and history stays re-validatable.
+
+    Returns ``(maps, abstained)`` — the transformed maps plus the frozenset of
+    methods whose cross-section was too thin to rank this run.
+
+    ``tradeable`` (2026-08-14 directive) restricts the RANK POOL to the
+    Gate-4-eligible names: ranks are computed over tradeable views only (the
+    distribution decisions actually trade against — the non-tradeable segment
+    has negative drift, harder momentum reversal and ~2x pivot payoffs, so one
+    pooled rank blends two different regimes), and every OBSERVE-ONLY view is
+    INTERPOLATED against that same tradeable distribution (scored consistently,
+    never distorting it). Thinness is judged on the tradeable count. ``None``
+    ranks over the full universe (the pre-directive behaviour).
+
+    Measured before adoption (2026-08-13 rank experiment, 43 days, Gate-4):
+    median-rank direction ≈ absolute (no |t| ≥ 2.1 of 22); decile extremes
+    helped ext_gap (+3.5t) and hurt the momentum family (−2..−3.3t). Adopted
+    by user directive; ``method_score_basis="absolute"`` reverts.
+    """
+    try:
+        min_views = max(2, int(getattr(settings, "method_rank_min_views", 5)))
+    except Exception:
+        min_views = 5
+    _shapes = None
+    if bool(getattr(settings, "enable_rank_shaping", True)):
+        try:
+            from src.signals.rank_shaping import get_rank_shapes
+            _shapes = get_rank_shapes()
+        except Exception:
+            _shapes = {}
+    out = {tk: dict(m) for tk, m in raw_maps.items()}
+    abstained: set = set()
+    methods = set()
+    for m in raw_maps.values():
+        methods.update(m.keys())
+    for method in methods:
+        all_views = [(tk, float(s)) for tk, m in raw_maps.items()
+                     for on, s in (m.get(method, (False, 0.0)),)
+                     if on and s == s and s != 0.0]
+        if tradeable is not None:
+            views = [(tk, s) for tk, s in all_views if tk in tradeable]
+            observe = [(tk, s) for tk, s in all_views if tk not in tradeable]
+        else:
+            views, observe = all_views, []
+        n = len(views)
+        if n < min_views:
+            # Too thin to rank -> WEIGHT 0 this run (scores left untouched;
+            # the caller zeroes the weight and excludes the method from
+            # coherence / agreement / family votes, the win-rate-filter idiom).
+            if all_views:
+                abstained.add(method)
+            continue
+        views.sort(key=lambda t: t[1])
+        # average ranks over tie groups (1-based)
+        ranks: dict = {}
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and views[j + 1][1] == views[i][1]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                ranks[views[k][0]] = avg
+            i = j + 1
+        # Observe-only views: the equivalent average-rank each score WOULD take
+        # inside the tradeable distribution (k below + ties/2), same pct scale.
+        _tvals = [v for _t, v in views]
+        from bisect import bisect_left as _bl, bisect_right as _br
+        for tk, _s in observe:
+            r_avg = (_bl(_tvals, _s) + _br(_tvals, _s)) / 2.0 + 0.5
+            ranks[tk] = min(max(r_avg, 1.0), float(n))
+        for tk, _s in views + observe:
+            pct = (ranks[tk] - 1.0) / (n - 1.0) if n > 1 else 0.5
+            if _shapes is not None:
+                # Payoff-shaped mapping (2026-08-14): the method's own measured
+                # rank->payoff curve replaces the linear grid (identity when the
+                # method has no shaped curve). See src/signals/rank_shaping.py.
+                from src.signals.rank_shaping import shape_score
+                val = shape_score(method, pct, _shapes)
+            else:
+                val = 2.0 * pct - 1.0
+            out[tk][method] = (True, round(float(val), 4))
+    return out, frozenset(abstained)
 
 
 # ── Interaction adjustments ───────────────────────────────────────────────────
@@ -2320,393 +2437,486 @@ def build_signals(
             "dloc_rev":   (active_flags["dloc_rev"],   dloc_rev_v),
         }
 
-        # ── Buy/sell split combine (2026-07-22 user directive) ────────────
-        # Each method's inversion-corrected view (eff ∈ [-1, +1]; the weight's
-        # sign carries the inversion, so |w|·eff == w·score) is decomposed into
-        # a BUY component max(0, eff) and a SELL component max(0, −eff), both
-        # ∈ [0, 1]. Each side is then weight-averaged over the methods HOLDING
-        # that view only — its own camp — so abstainers and the opposing camp
-        # no longer dilute a side the way they diluted the old single
-        # normalised pool. combined_buy = the bullish camp's conviction,
-        # combined_sell = the bearish camp's, combined = their DIFFERENCE
-        # (recalibrated band check at the Direction step below; the additive
-        # overlays keep landing on the difference, exactly as they landed on
-        # the old pooled sum). NOTE the deliberate consequence: a lone loud
-        # bull against many bears reads as a strong buy CAMP — camp SIZE is
-        # judged by the machinery built for it (coherence factor, Gate 1b
-        # sources_agreeing, family agreement), not by re-diluting the score.
-        # Each camp is additionally filtered and weighted on ITS OWN record
-        # (2026-07-24): a method whose BUY-side gross win rate is below the
-        # coin-flip threshold is excluded from the bullish camp while still
-        # contributing to the bearish one, and within a camp its weight is
-        # scaled by its demonstrated skill on that side. Both layers are inert
-        # until a side has ≥winrate_filter_min_trades views, and both are
-        # computed once per tick (cached) outside this loop.
-        combined_buy, combined_sell = combine_buy_sell(
-            method_score_map, weights, _buy_filtered, _sell_filtered,
-            _buy_mults, _sell_mults)
+        # ── PHASE 2 (continuation): combine + downstream ─────────────────
+        # Everything from here reads `method_score_map` — deferred into a
+        # closure so build_signals can RANK-TRANSFORM each method's full-run
+        # cross-section first (2026-08-13 user directive, method_score_basis).
+        # All other locals (raw *_score values, stacker feature dict, the
+        # TickerSignal fields) resolve through this closure and stay RAW —
+        # ranking is a consumption-time transform exactly like inversion.
+        def _finish(method_score_map, _rank_abstained=frozenset(), _raw_map=None):
+            # ABSOLUTE-basis SHADOW combine (2026-08-14): the weighted combine
+            # over the RAW scores with the UNMODIFIED weights (no thin-rank
+            # abstention — that concept belongs to the rank basis). Persisted
+            # per row so rank-vs-absolute accrues as a live A/B. Independent of
+            # the ML-arm swap below (the shadow is the pure weighted basis).
+            _abs_map = _raw_map if _raw_map is not None else method_score_map
+            _abs_buy, _abs_sell = combine_buy_sell(
+                _abs_map, weights, _buy_filtered, _sell_filtered,
+                _buy_mults, _sell_mults)
+            # Thin-cross-section methods (rank basis): WEIGHT 0 this run —
+            # the win-rate-filter idiom. Their raw scores stay in the map
+            # (truthful, persisted elsewhere anyway); the combine ignores
+            # them and the eff map below drops them from coherence /
+            # sources_agreeing / family votes.
+            if _rank_abstained:
+                weights_local = {m: (0.0 if m in _rank_abstained else w)
+                                 for m, w in weights.items()}
+            else:
+                weights_local = weights
+            # ── Buy/sell split combine (2026-07-22 user directive) ────────────
+            # Each method's inversion-corrected view (eff ∈ [-1, +1]; the weight's
+            # sign carries the inversion, so |w|·eff == w·score) is decomposed into
+            # a BUY component max(0, eff) and a SELL component max(0, −eff), both
+            # ∈ [0, 1]. Each side is then weight-averaged over the methods HOLDING
+            # that view only — its own camp — so abstainers and the opposing camp
+            # no longer dilute a side the way they diluted the old single
+            # normalised pool. combined_buy = the bullish camp's conviction,
+            # combined_sell = the bearish camp's, combined = their DIFFERENCE
+            # (recalibrated band check at the Direction step below; the additive
+            # overlays keep landing on the difference, exactly as they landed on
+            # the old pooled sum). NOTE the deliberate consequence: a lone loud
+            # bull against many bears reads as a strong buy CAMP — camp SIZE is
+            # judged by the machinery built for it (coherence factor, Gate 1b
+            # sources_agreeing, family agreement), not by re-diluting the score.
+            # Each camp is additionally filtered and weighted on ITS OWN record
+            # (2026-07-24): a method whose BUY-side gross win rate is below the
+            # coin-flip threshold is excluded from the bullish camp while still
+            # contributing to the bearish one, and within a camp its weight is
+            # scaled by its demonstrated skill on that side. Both layers are inert
+            # until a side has ≥winrate_filter_min_trades views, and both are
+            # computed once per tick (cached) outside this loop.
+            combined_buy, combined_sell = combine_buy_sell(
+                method_score_map, weights_local, _buy_filtered, _sell_filtered,
+                _buy_mults, _sell_mults)
 
-        # Provenance default — overwritten inside the arm block below when the ML
-        # stackers actually produce a conviction (fail-soft is per SIDE).
-        combine_source = "weighted"
-        # ── ML combine arm: learned 5d stackers AS combined_buy/sell_score ──
-        # Replace the weighted buy camp with the stacker's buy conviction
-        # (validated to beat the weighted combine at 5d). The stacker trained on
-        # the panel's DAILY method scores, so the feature vector uses the *_score
-        # locals, NOT the multi-timeframe blend (*_eff) that combine_buy_sell
-        # consumes. Fail-soft: a None conviction (no artifact / lightgbm) keeps
-        # the weighted combine — the swap can never silently break the combine.
-        if ml_combine_arm_active():
-            from src.analysis.ml_stacker import compute_buy_conviction, compute_sell_conviction
-            _daily_scores = {
-                "news": sentiment_score, "sent_velocity": sent_velocity_score,
-                "tech": technical_score, "massive": massive_score, "insider": insider_sc,
-                "put_call": pc_score, "max_pain": mp_score, "oi_skew": oi_skew_score,
-                "vwap": vwap_score, "pattern": pattern_score, "momentum": momentum_score,
-                "sector_momentum": sector_momentum_score,
-                "market_momentum": market_momentum_score, "money_flow": money_flow_score,
-                "trend_strength": trend_strength_score, "pead": pead_score_v,
-                "iv_rank": iv_rank_score_v, "iv_expr": iv_expr_score_v,
-                "coint": coint_score_v, "ext_gap": ext_gap_score_v,
-                "broker_advisor": broker_advisor_score_v,
-            }
-            _conv = compute_buy_conviction(_daily_scores)
-            if _conv is not None:
-                combined_buy = float(_conv)
-            # Sell side is symmetric — the sell stacker replaces the weighted
-            # combined_sell_score (validated to beat it at 5d). Fail-soft to the
-            # weighted sell camp.
-            _sconv = compute_sell_conviction(_daily_scores)
-            if _sconv is not None:
-                combined_sell = float(_sconv)
-            # PROVENANCE (2026-08-02): record which combine actually produced this
-            # ticker's sides. The arm is per-RUN but the swap is fail-soft PER SIDE,
-            # so a missing artifact silently leaves that side weighted — recording
-            # the arm flag alone would mislabel it. Every panel analysis can then
-            # segment ML-combine vs weighted-combine performance.
-            combine_source = {(True, True): "ml", (True, False): "ml_buy",
-                              (False, True): "ml_sell", (False, False): "weighted"}[
-                (_conv is not None, _sconv is not None)]
+            # Provenance default — overwritten inside the arm block below when the ML
+            # stackers actually produce a conviction (fail-soft is per SIDE).
+            combine_source = "weighted"
+            # ── ML combine arm: learned 5d stackers AS combined_buy/sell_score ──
+            # Replace the weighted buy camp with the stacker's buy conviction
+            # (validated to beat the weighted combine at 5d). The stacker trained on
+            # the panel's DAILY method scores, so the feature vector uses the *_score
+            # locals, NOT the multi-timeframe blend (*_eff) that combine_buy_sell
+            # consumes. Fail-soft: a None conviction (no artifact / lightgbm) keeps
+            # the weighted combine — the swap can never silently break the combine.
+            if ml_combine_arm_active():
+                from src.analysis.ml_stacker import compute_buy_conviction, compute_sell_conviction
+                _daily_scores = {
+                    "news": sentiment_score, "sent_velocity": sent_velocity_score,
+                    "tech": technical_score, "massive": massive_score, "insider": insider_sc,
+                    "put_call": pc_score, "max_pain": mp_score, "oi_skew": oi_skew_score,
+                    "vwap": vwap_score, "pattern": pattern_score, "momentum": momentum_score,
+                    "sector_momentum": sector_momentum_score,
+                    "market_momentum": market_momentum_score, "money_flow": money_flow_score,
+                    "trend_strength": trend_strength_score, "pead": pead_score_v,
+                    "iv_rank": iv_rank_score_v, "iv_expr": iv_expr_score_v,
+                    "coint": coint_score_v, "ext_gap": ext_gap_score_v,
+                    "broker_advisor": broker_advisor_score_v,
+                }
+                _conv = compute_buy_conviction(_daily_scores)
+                if _conv is not None:
+                    combined_buy = float(_conv)
+                # Sell side is symmetric — the sell stacker replaces the weighted
+                # combined_sell_score (validated to beat it at 5d). Fail-soft to the
+                # weighted sell camp.
+                _sconv = compute_sell_conviction(_daily_scores)
+                if _sconv is not None:
+                    combined_sell = float(_sconv)
+                # PROVENANCE (2026-08-02): record which combine actually produced this
+                # ticker's sides. The arm is per-RUN but the swap is fail-soft PER SIDE,
+                # so a missing artifact silently leaves that side weighted — recording
+                # the arm flag alone would mislabel it. Every panel analysis can then
+                # segment ML-combine vs weighted-combine performance.
+                combine_source = {(True, True): "ml", (True, False): "ml_buy",
+                                  (False, True): "ml_sell", (False, False): "weighted"}[
+                    (_conv is not None, _sconv is not None)]
 
-        combined = combined_buy - combined_sell
+            combined = combined_buy - combined_sell
 
-        # ── Interaction adjustments ───────────────────────────────────────
-        # Small additive corrections for setups where two methods together
-        # are more informative than their linear contributions suggest.
-        if active_count >= 2:
-            combined += _interaction_adjustment(
-                combined, sentiment_score, technical_score,
-                insider_sc, pc_score, vol_ratio,
+            # ── Interaction adjustments ───────────────────────────────────────
+            # Small additive corrections for setups where two methods together
+            # are more informative than their linear contributions suggest.
+            if active_count >= 2:
+                combined += _interaction_adjustment(
+                    combined, sentiment_score, technical_score,
+                    insider_sc, pc_score, vol_ratio,
+                )
+
+            # ── Corporate-action directional overlay (additive, event-driven) ──
+            # f_split (forward-drift / reverse-distress) + f_dividend (increase / cut),
+            # added OUTSIDE the normalised weight pool so a corporate action nudges the
+            # handful of event tickers without dampening everyone else. Weight is a
+            # placeholder — review once the f_split/f_dividend IC accrues.
+            if corp_factors:
+                _cf = corp_factors.get(ticker) or corp_factors.get(ticker.upper())
+                if _cf:
+                    combined += settings.corp_action_factor_weight * (
+                        float(_cf.get("f_split", 0.0)) + float(_cf.get("f_dividend", 0.0)))
+
+            # ── Massive fundamental factors directional overlay (additive) ─────
+            # value/quality/growth/short-squeeze, added OUTSIDE the normalised pool
+            # (same idiom as corp_factors) so the capped/sparse fundamentals nudge the
+            # event tickers without dampening the rest. Already IC-monitored in the panel.
+            if fundamental_factors:
+                _ff = fundamental_factors.get(ticker) or fundamental_factors.get(ticker.upper())
+                if _ff:
+                    combined += settings.fundamental_factor_weight * (
+                        float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
+                        + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
+
+            # ── Trend-predictability directional overlay (additive) ────────────
+            # The four scores are already oriented (continuation OR reversal, learned
+            # per method + scaled by trend strength/confidence), so a single symmetric
+            # weight suffices — the orientation, not the weight, encodes each context's
+            # direction quality. Added outside the normalised pool (sparse per context).
+            if settings.enable_trend_predictability_methods:
+                combined += settings.trend_method_weight * (
+                    kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
+
+            # ── Direction ─────────────────────────────────────────────────────
+            # The buy−sell DIFFERENCE clearing the configured band is the buy/sell
+            # decision (settings.buy_sell_diff_threshold; 0.15 default — the old
+            # single-pool band, revalidated on the panel where it yields a more
+            # BALANCED 18%/21% bullish/bearish mix vs the old pool's 32%/15%).
+            # Rank basis runs on its own quantile-matched bands (2026-08-14):
+            # the ranked+shaped |combined| distribution is hotter than the
+            # absolute era's, so the OLD band would fire far more often. The
+            # bands are PER-SIDE (directive #4 adoption — bullish ≈ the top
+            # 10%, bearish ≈ the bottom 5% of the tradeable distribution; the
+            # asymmetric 10/5 cutoff beat symmetric at t +2.56, sell-heavy
+            # grids always lost). `directional()` falls back to the symmetric
+            # rank_diff_threshold when a side override is unset.
+            if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
+                from config.settings import directional as _directional
+                _sym = float(getattr(settings, "rank_diff_threshold", 0.182))
+                _band_long = float(_directional("rank_diff_threshold", "long") or _sym)
+                _band_short = float(_directional("rank_diff_threshold", "short") or _sym)
+            else:
+                _band_long = _band_short = settings.buy_sell_diff_threshold
+            direction: Direction
+            if combined >= _band_long:
+                direction = "BULLISH"
+            elif combined <= -_band_short:
+                direction = "BEARISH"
+            else:
+                direction = "NEUTRAL"
+
+            # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
+            # method_score_map is built ABOVE the buy/sell split combine (one map,
+            # shared): blended (*_eff) values + active_flags, so coherence reflects
+            # exactly what the combine consumed and a win-rate-FILTERED method is
+            # dropped from coherence + sources_agreeing exactly as from the combine.
+            # Effective (inversion-corrected) scores — the SINGLE canonical transform
+            # used by every "does this method agree with combined_score" computation
+            # below (coherence, sources_agreeing, family agreement). 2026-07-20: this
+            # UNIFIES coherence_factor/sources_agreeing with family_factor, which
+            # previously read RAW (pre-inversion) scores — a method whose raw score is
+            # the OPPOSITE of what it actually contributes (an inverted method) could
+            # read as "disagreeing" in coherence while correctly "agreeing" in the
+            # family rollup. An inverted method's EFFECTIVE sign is what the weighted
+            # combine actually consumed, so agreement should be judged on that.
+            # PER-SIDE filter applied here too (2026-07-25). The combine drops a
+            # method's BULLISH contribution when it is buy-filtered and its BEARISH
+            # contribution when it is sell-filtered; coherence / sources_agreeing /
+            # family agreement must see exactly the same book, or a method the system
+            # has judged sub-coin-flip on this side still inflates the agreement
+            # count (helping pass Gate 1b) and the confidence factor while
+            # contributing nothing to the score. Keyed on the METHOD's own effective
+            # sign — the same test the combine loop makes — not on the ticker's
+            # direction.
+            def _side_ok(method: str, eff_score: float) -> bool:
+                if eff_score > 0:
+                    return method not in _buy_filtered
+                if eff_score < 0:
+                    return method not in _sell_filtered
+                return True
+
+            method_score_map_eff = {}
+            for m, (on, s) in method_score_map.items():
+                _e = -s if m in _inv else s
+                method_score_map_eff[m] = (
+                    on and _side_ok(m, _e) and m not in _rank_abstained, _e)
+            method_scores_eff = list(method_score_map_eff.values())
+            coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores_eff)
+
+            # sources_agreeing kept for backward-compat with Claude's prompt context
+            sources_agreeing = sum(
+                1 for enabled, score in method_scores_eff
+                if enabled and abs(score) >= _AGREE_THRESHOLD
+                and ((combined > 0 and score > 0) or (combined < 0 and score < 0))
             )
 
-        # ── Corporate-action directional overlay (additive, event-driven) ──
-        # f_split (forward-drift / reverse-distress) + f_dividend (increase / cut),
-        # added OUTSIDE the normalised weight pool so a corporate action nudges the
-        # handful of event tickers without dampening everyone else. Weight is a
-        # placeholder — review once the f_split/f_dividend IC accrues.
-        if corp_factors:
-            _cf = corp_factors.get(ticker) or corp_factors.get(ticker.upper())
-            if _cf:
-                combined += settings.corp_action_factor_weight * (
-                    float(_cf.get("f_split", 0.0)) + float(_cf.get("f_dividend", 0.0)))
+            # ── Cross-family agreement (independent-information confirmation) ──
+            # Family votes use the ACTIVE methods' EFFECTIVE scores (inversion sign
+            # applied — what the combine consumes; win-rate-filtered methods are
+            # already inactive here). Correlated same-family methods roll up into
+            # ONE family vote, so pseudo-replication (five technicals agreeing)
+            # no longer masquerades as broad confirmation.
+            fam_agreement = None
+            if settings.enable_family_agreement:
+                _eff_scores = {m: s for m, (on, s) in method_score_map_eff.items() if on and s != 0.0}
+                fam_agreement = compute_family_agreement(
+                    _eff_scores, combined,
+                    vote_threshold=settings.family_vote_threshold)
 
-        # ── Massive fundamental factors directional overlay (additive) ─────
-        # value/quality/growth/short-squeeze, added OUTSIDE the normalised pool
-        # (same idiom as corp_factors) so the capped/sparse fundamentals nudge the
-        # event tickers without dampening the rest. Already IC-monitored in the panel.
-        if fundamental_factors:
-            _ff = fundamental_factors.get(ticker) or fundamental_factors.get(ticker.upper())
-            if _ff:
-                combined += settings.fundamental_factor_weight * (
-                    float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
-                    + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
+            # ── Tape confirmation (score-independent raw price/volume state) ──
+            tape_check = None
+            if settings.enable_tape_confirmation:
+                tape_check = compute_tape_confirmation(ticker)
 
-        # ── Trend-predictability directional overlay (additive) ────────────
-        # The four scores are already oriented (continuation OR reversal, learned
-        # per method + scaled by trend strength/confidence), so a single symmetric
-        # weight suffices — the orientation, not the weight, encodes each context's
-        # direction quality. Added outside the normalised pool (sparse per context).
-        if settings.enable_trend_predictability_methods:
-            combined += settings.trend_method_weight * (
-                kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
+            # ── Movement potential (ATR + BB width + GEX) ────────────────────
+            movement_factor = _movement_factor(atr_pct, bb_width_pct) * _gex_movement_modifier(gex_sig)
+            movement_factor = round(max(0.70, min(1.30, movement_factor)), 3)
 
-        # ── Direction ─────────────────────────────────────────────────────
-        # The buy−sell DIFFERENCE clearing the configured band is the buy/sell
-        # decision (settings.buy_sell_diff_threshold; 0.15 default — the old
-        # single-pool band, revalidated on the panel where it yields a more
-        # BALANCED 18%/21% bullish/bearish mix vs the old pool's 32%/15%).
-        _band = settings.buy_sell_diff_threshold
-        direction: Direction
-        if combined >= _band:
-            direction = "BULLISH"
-        elif combined <= -_band:
-            direction = "BEARISH"
-        else:
-            direction = "NEUTRAL"
+            # ── Cross-method volume confirmation ──────────────────────────────
+            volume_factor = _volume_factor(vol_ratio, abs(combined), coherence_ratio)
 
-        # ── Coherence factor (continuous, replaces binary 1.25×/0.60×) ───
-        # method_score_map is built ABOVE the buy/sell split combine (one map,
-        # shared): blended (*_eff) values + active_flags, so coherence reflects
-        # exactly what the combine consumed and a win-rate-FILTERED method is
-        # dropped from coherence + sources_agreeing exactly as from the combine.
-        # Effective (inversion-corrected) scores — the SINGLE canonical transform
-        # used by every "does this method agree with combined_score" computation
-        # below (coherence, sources_agreeing, family agreement). 2026-07-20: this
-        # UNIFIES coherence_factor/sources_agreeing with family_factor, which
-        # previously read RAW (pre-inversion) scores — a method whose raw score is
-        # the OPPOSITE of what it actually contributes (an inverted method) could
-        # read as "disagreeing" in coherence while correctly "agreeing" in the
-        # family rollup. An inverted method's EFFECTIVE sign is what the weighted
-        # combine actually consumed, so agreement should be judged on that.
-        # PER-SIDE filter applied here too (2026-07-25). The combine drops a
-        # method's BULLISH contribution when it is buy-filtered and its BEARISH
-        # contribution when it is sell-filtered; coherence / sources_agreeing /
-        # family agreement must see exactly the same book, or a method the system
-        # has judged sub-coin-flip on this side still inflates the agreement
-        # count (helping pass Gate 1b) and the confidence factor while
-        # contributing nothing to the score. Keyed on the METHOD's own effective
-        # sign — the same test the combine loop makes — not on the ticker's
-        # direction.
-        def _side_ok(method: str, eff_score: float) -> bool:
-            if eff_score > 0:
-                return method not in _buy_filtered
-            if eff_score < 0:
-                return method not in _sell_filtered
-            return True
+            # ── Final confidence ──────────────────────────────────────────────
+            # family_factor rewards breadth of INDEPENDENT confirmation (1 family
+            # alone → neutral 1.0); tape_factor rewards raw-tape alignment with the
+            # combined direction. Both neutral when their flag is off / no data.
+            family_factor = (fam_agreement.factor(settings.family_agreement_factor_span)
+                             if fam_agreement is not None else 1.0)
+            tape_conf_factor = tape_factor(tape_check, combined,
+                                           settings.tape_confirmation_factor_span)
+            # Same quantile match for the confidence scale: /0.703 under rank
+            # keeps raw_confidence's distribution (and Gate 1 / the regime
+            # table / sizing tiers built on it) meaning what it meant.
+            _rc_scale = (float(getattr(settings, "rank_raw_confidence_scale", 0.703))
+                         if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank"
+                         else 0.5)
+            raw_confidence = min(1.0, abs(combined) / _rc_scale)
+            confidence = round(
+                min(1.0, raw_confidence * coherence_factor * movement_factor * volume_factor
+                    * family_factor * tape_conf_factor),
+                2,
+            )
 
-        method_score_map_eff = {}
-        for m, (on, s) in method_score_map.items():
-            _e = -s if m in _inv else s
-            method_score_map_eff[m] = (on and _side_ok(m, _e), _e)
-        method_scores_eff = list(method_score_map_eff.values())
-        coherence_ratio, coherence_factor = _coherence_factor(combined, method_scores_eff)
+            # ── Rationale ─────────────────────────────────────────────────────
+            rationale_parts = []
+            if use_news:
+                rationale_parts.append(news_rationale)
+            if use_tech and technical_score != 0:
+                rationale_parts.append(f"Technical score: {technical_score:+.2f}")
+            if use_put_call and pc_score != 0:
+                rationale_parts.append(f"Put/call signal: {pc_score:+.2f}")
+            rationale = " | ".join(rationale_parts) if rationale_parts else "No rationale available."
 
-        # sources_agreeing kept for backward-compat with Claude's prompt context
-        sources_agreeing = sum(
-            1 for enabled, score in method_scores_eff
-            if enabled and abs(score) >= _AGREE_THRESHOLD
-            and ((combined > 0 and score > 0) or (combined < 0 and score < 0))
-        )
+            _sig = TickerSignal(
+                ticker=ticker,
+                direction=direction,
+                confidence=confidence,
+                combined_score=round(combined, 4),
+                combined_buy_score=round(combined_buy, 4),
+                combined_sell_score=round(combined_sell, 4),
+                combine_source=combine_source,
+                sentiment_score=round(sentiment_score, 3),
+                sentiment_velocity_score=round(sent_velocity_score, 3),
+                sentiment_recent=round(sent_recent, 3),
+                sentiment_prior=round(sent_prior, 3),
+                technical_score=round(technical_score, 3),
+                massive_score=round(massive_score, 3),
+                insider_score=round(insider_sc, 3),
+                put_call_score=round(pc_score, 3),
+                max_pain_score=round(mp_score, 3),
+                oi_skew_score=round(oi_skew_score, 3),
+                vwap_score=round(vwap_score, 3),
+                vwap_distance_pct=round(vwap_dist_pct, 2),
+                rationale=rationale,
+                insider_summary=insider_summary,
+                sources_agreeing=sources_agreeing,
+                families_agreeing=(fam_agreement.agreeing if fam_agreement else 0),
+                families_opposing=(fam_agreement.opposing if fam_agreement else 0),
+                family_coherence=(fam_agreement.coherence if fam_agreement else 0.0),
+                family_net_score=(fam_agreement.net_score if fam_agreement else 0.0),
+                family_detail=(fam_agreement.detail if fam_agreement else ""),
+                tape_confirmation_score=(tape_check.score if tape_check else 0.0),
+                tape_confirmation_label=(tape_check.label if tape_check else ""),
+                tape_confirmation_detail=(tape_check.detail if tape_check else ""),
+                raw_confidence=round(raw_confidence, 4),
+                coherence_factor=round(coherence_factor, 4),
+                movement_factor=round(movement_factor, 4),
+                volume_factor=round(volume_factor, 4),
+                family_conf_factor=round(family_factor, 4),
+                tape_conf_factor=round(tape_conf_factor, 4),
+                gex_signal=gex_sig,
+                gamma_flip=gamma_flip,
+                max_pain_bias=max_pain_bias,
+                expected_move_pct=expected_move_pct,
+                insider_cluster_detected=cluster_detected,
+                insider_cluster_size=cluster_size,
+                insider_persistence_detected=persist_detected,
+                insider_persistence_count=persist_count,
+                insider_persistence_buyer=persist_buyer,
+                pattern_score=round(pattern_score, 3),
+                pattern_name=pattern_name,
+                momentum_score=round(momentum_score, 3),
+                momentum_1m_pct=round(momentum_1m_pct, 2),
+                momentum_3m_pct=round(momentum_3m_pct, 2),
+                sector_momentum_score=round(sector_momentum_score, 3),
+                sector_benchmark=sector_benchmark_used,
+                sector_momentum_1m_pct=round(sector_momentum_1m_pct, 2),
+                sector_momentum_3m_pct=round(sector_momentum_3m_pct, 2),
+                market_momentum_score=round(market_momentum_score, 3),
+                market_momentum_1m_pct=round(market_momentum_1m_pct, 2),
+                market_momentum_3m_pct=round(market_momentum_3m_pct, 2),
+                money_flow_score=round(money_flow_score, 3),
+                mfi_value=round(mfi_value, 2),
+                cmf_value=round(cmf_value, 4),
+                trend_strength_score=round(trend_strength_score, 3),
+                adx_value=round(adx_value, 2),
+                trend_strength_label=trend_label,
+                kaufman_long_score=round(kaufman_long_v, 3),
+                kaufman_short_score=round(kaufman_short_v, 3),
+                adx_long_score=round(adx_long_v, 3),
+                adx_short_score=round(adx_short_v, 3),
+                high_52w_score=round(hi52_v, 3),
+                high_52w_ratio_pct=round(hi52_ratio_pct, 2),
+                momentum_12_1_score=round(mom_12_1_v, 3),
+                momentum_12_1_pct=round(mom_12_1_pct, 2),
+                st_reversal_score=round(st_reversal_v, 3),
+                st_reversal_ret_5d_pct=round(st_rev_5d_pct, 2),
+                rsi2_rev_score=round(rsi2_rev_v, 3),
+                rsi2_rev_value=round(rsi2_val_v, 2),
+                dloc_rev_score=round(dloc_rev_v, 3),
+                dloc_rev_loc_pct=round(dloc_loc_pct_v, 2),
+                squeeze_score=round(squeeze_v, 3),
+                squeeze_label=squeeze_label_v,
+                squeeze_bars=int(squeeze_bars_v),
+                iv_term_score=round(iv_term_v, 3),
+                iv_term_slope_pts=round(iv_term_slope_v, 2),
+                iv_term_label=iv_term_label_v,
+                avwap_score=round(avwap_v, 3),
+                avwap_hi_dist_pct=round(avwap_hi_pct, 2),
+                avwap_lo_dist_pct=round(avwap_lo_pct, 2),
+                resid_mom_score=round(resid_mom_v, 3),
+                resid_mom_12_1_pct=round(resid_mom_pct, 2),
+                resid_mom_beta=round(resid_mom_beta_v, 3),
+                vol_profile_score=round(vol_profile_v, 3),
+                vol_profile_label=vol_profile_label_v,
+                vol_profile_poc_dist_pct=round(vol_profile_poc_pct, 2),
+                ml_ohlcv_score=round(ml_ohlcv_v, 4),
+                ml_ohlcv_label=ml_ohlcv_label_v,
+                pead_score=round(pead_score_v, 3),
+                pead_surprise_pct=round(pead_surprise, 2),
+                pead_days_since_report=int(pead_days),
+                iv_rank_score=round(iv_rank_score_v, 3),
+                iv_rank=round(iv_rank_v, 1),
+                iv_rank_ret_5d_pct=round(iv_rank_ret5d, 2),
+                iv_rank_label=iv_rank_label_v,
+                iv_expr_score=round(iv_expr_score_v, 3),
+                iv_expr_rank=round(iv_expr_rank_v, 1),
+                iv_expr_oi_skew=round(iv_expr_skew_v, 3),
+                iv_expr_label=iv_expr_label_v,
+                coint_score=round(coint_score_v, 3),
+                ext_gap_score=round(ext_gap_score_v, 3),
+                ext_gap_pct=round(ext_gap_pct_v, 2),
+                broker_advisor_score=round(broker_advisor_score_v, 3),
+                timeframe_scores=tf_scores,
+            )
 
-        # ── Cross-family agreement (independent-information confirmation) ──
-        # Family votes use the ACTIVE methods' EFFECTIVE scores (inversion sign
-        # applied — what the combine consumes; win-rate-filtered methods are
-        # already inactive here). Correlated same-family methods roll up into
-        # ONE family vote, so pseudo-replication (five technicals agreeing)
-        # no longer masquerades as broad confirmation.
-        fam_agreement = None
-        if settings.enable_family_agreement:
-            _eff_scores = {m: s for m, (on, s) in method_score_map_eff.items() if on and s != 0.0}
-            fam_agreement = compute_family_agreement(
-                _eff_scores, combined,
-                vote_threshold=settings.family_vote_threshold)
+            gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
+            mp_str      = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
+            skew_str    = f"  skew={oi_skew_score:+.2f}" if oi_skew_score != 0.0 else ""
+            vwap_str    = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
+            pat_str  = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
+            mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
+            sm_str   = (
+                f"  smom={sector_momentum_score:+.2f}(vs {sector_benchmark_used} {sector_momentum_1m_pct:+.1f}pp/1m)"
+                if sector_momentum_score != 0.0 else ""
+            )
+            mm_str   = (
+                f"  mmom={market_momentum_score:+.2f}(vs SPY {market_momentum_1m_pct:+.1f}pp/1m)"
+                if market_momentum_score != 0.0 else ""
+            )
+            mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
+            ts_str   = f"  trend={trend_strength_score:+.2f}(adx={adx_value:.0f},{trend_label})" if trend_strength_score != 0.0 else ""
+            pead_str = f"  pead={pead_score_v:+.2f}({pead_surprise:+.1f}%/{pead_days}d)" if pead_score_v != 0.0 else ""
+            ivr_str  = f"  ivr={iv_rank_score_v:+.2f}(ir={iv_rank_v:.0f},{iv_rank_label_v})" if iv_rank_score_v != 0.0 else ""
+            ivx_str  = f"  ivx={iv_expr_score_v:+.2f}(ir={iv_expr_rank_v:.0f},{iv_expr_label_v})" if iv_expr_score_v != 0.0 else ""
+            coint_str = f"  coint={coint_score_v:+.2f}" if coint_score_v != 0.0 else ""
+            gap_str  = f"  gap={ext_gap_score_v:+.2f}({ext_gap_pct_v:+.1f}%)" if ext_gap_score_v != 0.0 else ""
+            hi52_str = f"  hi52={hi52_v:+.2f}({hi52_ratio_pct:.0f}%)" if hi52_v != 0.0 else ""
+            m121_str = f"  m12-1={mom_12_1_v:+.2f}({mom_12_1_pct:+.0f}%)" if mom_12_1_v != 0.0 else ""
+            srev_str = f"  strev={st_reversal_v:+.2f}({st_rev_5d_pct:+.1f}%/5d)" if st_reversal_v != 0.0 else ""
+            rsi2_str = f"  rsi2={rsi2_rev_v:+.2f}({rsi2_val_v:.0f})" if rsi2_rev_v != 0.0 else ""
+            dloc_str = f"  dloc={dloc_rev_v:+.2f}({dloc_loc_pct_v:.0f}%)" if dloc_rev_v != 0.0 else ""
+            sq_str   = f"  sq={squeeze_v:+.2f}[{squeeze_label_v}:{squeeze_bars_v}]" if squeeze_v != 0.0 else ""
+            ivt_str  = f"  ivt={iv_term_v:+.2f}({iv_term_slope_v:+.1f}pts,{iv_term_label_v})" if iv_term_v != 0.0 else ""
+            avw_str  = f"  avwap={avwap_v:+.2f}(hi{avwap_hi_pct:+.1f}%/lo{avwap_lo_pct:+.1f}%)" if avwap_v != 0.0 else ""
+            rmom_str = f"  rmom={resid_mom_v:+.2f}({resid_mom_pct:+.0f}%,β{resid_mom_beta_v:.1f})" if resid_mom_v != 0.0 else ""
+            vp_str   = f"  vp={vol_profile_v:+.2f}[{vol_profile_label_v}]" if vol_profile_v != 0.0 else ""
+            cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
+            persist_str = f"  PERSIST({persist_count}×)" if persist_detected else ""
+            sv_str      = f"  sv={sent_velocity_score:+.2f}" if sent_velocity_score != 0.0 else ""
+            logger.info(
+                f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
+                f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
+                f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}{hi52_str}{m121_str}{srev_str}{rsi2_str}{dloc_str}{sq_str}{ivt_str}{avw_str}{rmom_str}{vp_str}  combined={combined:+.2f} | "
+                f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
+                f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
+                f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"
+            )
+            return ticker, combined, _sig
 
-        # ── Tape confirmation (score-independent raw price/volume state) ──
-        tape_check = None
-        if settings.enable_tape_confirmation:
-            tape_check = compute_tape_confirmation(ticker)
-
-        # ── Movement potential (ATR + BB width + GEX) ────────────────────
-        movement_factor = _movement_factor(atr_pct, bb_width_pct) * _gex_movement_modifier(gex_sig)
-        movement_factor = round(max(0.70, min(1.30, movement_factor)), 3)
-
-        # ── Cross-method volume confirmation ──────────────────────────────
-        volume_factor = _volume_factor(vol_ratio, abs(combined), coherence_ratio)
-
-        # ── Final confidence ──────────────────────────────────────────────
-        # family_factor rewards breadth of INDEPENDENT confirmation (1 family
-        # alone → neutral 1.0); tape_factor rewards raw-tape alignment with the
-        # combined direction. Both neutral when their flag is off / no data.
-        family_factor = (fam_agreement.factor(settings.family_agreement_factor_span)
-                         if fam_agreement is not None else 1.0)
-        tape_conf_factor = tape_factor(tape_check, combined,
-                                       settings.tape_confirmation_factor_span)
-        raw_confidence = min(1.0, abs(combined) / 0.5)
-        confidence = round(
-            min(1.0, raw_confidence * coherence_factor * movement_factor * volume_factor
-                * family_factor * tape_conf_factor),
-            2,
-        )
-
-        # ── Rationale ─────────────────────────────────────────────────────
-        rationale_parts = []
-        if use_news:
-            rationale_parts.append(news_rationale)
-        if use_tech and technical_score != 0:
-            rationale_parts.append(f"Technical score: {technical_score:+.2f}")
-        if use_put_call and pc_score != 0:
-            rationale_parts.append(f"Put/call signal: {pc_score:+.2f}")
-        rationale = " | ".join(rationale_parts) if rationale_parts else "No rationale available."
-
-        _sig = TickerSignal(
-            ticker=ticker,
-            direction=direction,
-            confidence=confidence,
-            combined_score=round(combined, 4),
-            combined_buy_score=round(combined_buy, 4),
-            combined_sell_score=round(combined_sell, 4),
-            combine_source=combine_source,
-            sentiment_score=round(sentiment_score, 3),
-            sentiment_velocity_score=round(sent_velocity_score, 3),
-            sentiment_recent=round(sent_recent, 3),
-            sentiment_prior=round(sent_prior, 3),
-            technical_score=round(technical_score, 3),
-            massive_score=round(massive_score, 3),
-            insider_score=round(insider_sc, 3),
-            put_call_score=round(pc_score, 3),
-            max_pain_score=round(mp_score, 3),
-            oi_skew_score=round(oi_skew_score, 3),
-            vwap_score=round(vwap_score, 3),
-            vwap_distance_pct=round(vwap_dist_pct, 2),
-            rationale=rationale,
-            insider_summary=insider_summary,
-            sources_agreeing=sources_agreeing,
-            families_agreeing=(fam_agreement.agreeing if fam_agreement else 0),
-            families_opposing=(fam_agreement.opposing if fam_agreement else 0),
-            family_coherence=(fam_agreement.coherence if fam_agreement else 0.0),
-            family_net_score=(fam_agreement.net_score if fam_agreement else 0.0),
-            family_detail=(fam_agreement.detail if fam_agreement else ""),
-            tape_confirmation_score=(tape_check.score if tape_check else 0.0),
-            tape_confirmation_label=(tape_check.label if tape_check else ""),
-            tape_confirmation_detail=(tape_check.detail if tape_check else ""),
-            raw_confidence=round(raw_confidence, 4),
-            coherence_factor=round(coherence_factor, 4),
-            movement_factor=round(movement_factor, 4),
-            volume_factor=round(volume_factor, 4),
-            family_conf_factor=round(family_factor, 4),
-            tape_conf_factor=round(tape_conf_factor, 4),
-            gex_signal=gex_sig,
-            gamma_flip=gamma_flip,
-            max_pain_bias=max_pain_bias,
-            expected_move_pct=expected_move_pct,
-            insider_cluster_detected=cluster_detected,
-            insider_cluster_size=cluster_size,
-            insider_persistence_detected=persist_detected,
-            insider_persistence_count=persist_count,
-            insider_persistence_buyer=persist_buyer,
-            pattern_score=round(pattern_score, 3),
-            pattern_name=pattern_name,
-            momentum_score=round(momentum_score, 3),
-            momentum_1m_pct=round(momentum_1m_pct, 2),
-            momentum_3m_pct=round(momentum_3m_pct, 2),
-            sector_momentum_score=round(sector_momentum_score, 3),
-            sector_benchmark=sector_benchmark_used,
-            sector_momentum_1m_pct=round(sector_momentum_1m_pct, 2),
-            sector_momentum_3m_pct=round(sector_momentum_3m_pct, 2),
-            market_momentum_score=round(market_momentum_score, 3),
-            market_momentum_1m_pct=round(market_momentum_1m_pct, 2),
-            market_momentum_3m_pct=round(market_momentum_3m_pct, 2),
-            money_flow_score=round(money_flow_score, 3),
-            mfi_value=round(mfi_value, 2),
-            cmf_value=round(cmf_value, 4),
-            trend_strength_score=round(trend_strength_score, 3),
-            adx_value=round(adx_value, 2),
-            trend_strength_label=trend_label,
-            kaufman_long_score=round(kaufman_long_v, 3),
-            kaufman_short_score=round(kaufman_short_v, 3),
-            adx_long_score=round(adx_long_v, 3),
-            adx_short_score=round(adx_short_v, 3),
-            high_52w_score=round(hi52_v, 3),
-            high_52w_ratio_pct=round(hi52_ratio_pct, 2),
-            momentum_12_1_score=round(mom_12_1_v, 3),
-            momentum_12_1_pct=round(mom_12_1_pct, 2),
-            st_reversal_score=round(st_reversal_v, 3),
-            st_reversal_ret_5d_pct=round(st_rev_5d_pct, 2),
-            rsi2_rev_score=round(rsi2_rev_v, 3),
-            rsi2_rev_value=round(rsi2_val_v, 2),
-            dloc_rev_score=round(dloc_rev_v, 3),
-            dloc_rev_loc_pct=round(dloc_loc_pct_v, 2),
-            squeeze_score=round(squeeze_v, 3),
-            squeeze_label=squeeze_label_v,
-            squeeze_bars=int(squeeze_bars_v),
-            iv_term_score=round(iv_term_v, 3),
-            iv_term_slope_pts=round(iv_term_slope_v, 2),
-            iv_term_label=iv_term_label_v,
-            avwap_score=round(avwap_v, 3),
-            avwap_hi_dist_pct=round(avwap_hi_pct, 2),
-            avwap_lo_dist_pct=round(avwap_lo_pct, 2),
-            resid_mom_score=round(resid_mom_v, 3),
-            resid_mom_12_1_pct=round(resid_mom_pct, 2),
-            resid_mom_beta=round(resid_mom_beta_v, 3),
-            vol_profile_score=round(vol_profile_v, 3),
-            vol_profile_label=vol_profile_label_v,
-            vol_profile_poc_dist_pct=round(vol_profile_poc_pct, 2),
-            ml_ohlcv_score=round(ml_ohlcv_v, 4),
-            ml_ohlcv_label=ml_ohlcv_label_v,
-            pead_score=round(pead_score_v, 3),
-            pead_surprise_pct=round(pead_surprise, 2),
-            pead_days_since_report=int(pead_days),
-            iv_rank_score=round(iv_rank_score_v, 3),
-            iv_rank=round(iv_rank_v, 1),
-            iv_rank_ret_5d_pct=round(iv_rank_ret5d, 2),
-            iv_rank_label=iv_rank_label_v,
-            iv_expr_score=round(iv_expr_score_v, 3),
-            iv_expr_rank=round(iv_expr_rank_v, 1),
-            iv_expr_oi_skew=round(iv_expr_skew_v, 3),
-            iv_expr_label=iv_expr_label_v,
-            coint_score=round(coint_score_v, 3),
-            ext_gap_score=round(ext_gap_score_v, 3),
-            ext_gap_pct=round(ext_gap_pct_v, 2),
-            broker_advisor_score=round(broker_advisor_score_v, 3),
-            timeframe_scores=tf_scores,
-        )
-
-        gex_str     = f"  gex={gex_sig}({gamma_flip})" if gex_sig else ""
-        mp_str      = f"  mp={mp_score:+.2f}" if mp_score != 0.0 else ""
-        skew_str    = f"  skew={oi_skew_score:+.2f}" if oi_skew_score != 0.0 else ""
-        vwap_str    = f"  vwap={vwap_score:+.2f}({vwap_dist_pct:+.1f}%)" if vwap_score != 0.0 else ""
-        pat_str  = f"  pat={pattern_score:+.2f}[{pattern_name}]" if pattern_name else ""
-        mom_str2 = f"  mom={momentum_score:+.2f}({momentum_1m_pct:+.1f}%/1m)" if momentum_score != 0.0 else ""
-        sm_str   = (
-            f"  smom={sector_momentum_score:+.2f}(vs {sector_benchmark_used} {sector_momentum_1m_pct:+.1f}pp/1m)"
-            if sector_momentum_score != 0.0 else ""
-        )
-        mm_str   = (
-            f"  mmom={market_momentum_score:+.2f}(vs SPY {market_momentum_1m_pct:+.1f}pp/1m)"
-            if market_momentum_score != 0.0 else ""
-        )
-        mf_str   = f"  mf={money_flow_score:+.2f}(mfi={mfi_value:.0f},cmf={cmf_value:+.2f})" if money_flow_score != 0.0 else ""
-        ts_str   = f"  trend={trend_strength_score:+.2f}(adx={adx_value:.0f},{trend_label})" if trend_strength_score != 0.0 else ""
-        pead_str = f"  pead={pead_score_v:+.2f}({pead_surprise:+.1f}%/{pead_days}d)" if pead_score_v != 0.0 else ""
-        ivr_str  = f"  ivr={iv_rank_score_v:+.2f}(ir={iv_rank_v:.0f},{iv_rank_label_v})" if iv_rank_score_v != 0.0 else ""
-        ivx_str  = f"  ivx={iv_expr_score_v:+.2f}(ir={iv_expr_rank_v:.0f},{iv_expr_label_v})" if iv_expr_score_v != 0.0 else ""
-        coint_str = f"  coint={coint_score_v:+.2f}" if coint_score_v != 0.0 else ""
-        gap_str  = f"  gap={ext_gap_score_v:+.2f}({ext_gap_pct_v:+.1f}%)" if ext_gap_score_v != 0.0 else ""
-        hi52_str = f"  hi52={hi52_v:+.2f}({hi52_ratio_pct:.0f}%)" if hi52_v != 0.0 else ""
-        m121_str = f"  m12-1={mom_12_1_v:+.2f}({mom_12_1_pct:+.0f}%)" if mom_12_1_v != 0.0 else ""
-        srev_str = f"  strev={st_reversal_v:+.2f}({st_rev_5d_pct:+.1f}%/5d)" if st_reversal_v != 0.0 else ""
-        rsi2_str = f"  rsi2={rsi2_rev_v:+.2f}({rsi2_val_v:.0f})" if rsi2_rev_v != 0.0 else ""
-        dloc_str = f"  dloc={dloc_rev_v:+.2f}({dloc_loc_pct_v:.0f}%)" if dloc_rev_v != 0.0 else ""
-        sq_str   = f"  sq={squeeze_v:+.2f}[{squeeze_label_v}:{squeeze_bars_v}]" if squeeze_v != 0.0 else ""
-        ivt_str  = f"  ivt={iv_term_v:+.2f}({iv_term_slope_v:+.1f}pts,{iv_term_label_v})" if iv_term_v != 0.0 else ""
-        avw_str  = f"  avwap={avwap_v:+.2f}(hi{avwap_hi_pct:+.1f}%/lo{avwap_lo_pct:+.1f}%)" if avwap_v != 0.0 else ""
-        rmom_str = f"  rmom={resid_mom_v:+.2f}({resid_mom_pct:+.0f}%,β{resid_mom_beta_v:.1f})" if resid_mom_v != 0.0 else ""
-        vp_str   = f"  vp={vol_profile_v:+.2f}[{vol_profile_label_v}]" if vol_profile_v != 0.0 else ""
-        cluster_str = f"  CLUSTER({cluster_size})" if cluster_detected else ""
-        persist_str = f"  PERSIST({persist_count}×)" if persist_detected else ""
-        sv_str      = f"  sv={sent_velocity_score:+.2f}" if sent_velocity_score != 0.0 else ""
-        logger.info(
-            f"{ticker}: {direction} (conf={confidence:.0%}, {sources_agreeing}/{active_count} agree) | "
-            f"news={sentiment_score:+.2f}{sv_str}  tech={technical_score:+.2f}  "
-            f"insider={insider_sc:+.2f}{cluster_str}{persist_str}  pc={pc_score:+.2f}{mp_str}{skew_str}{vwap_str}{pat_str}{mom_str2}{sm_str}{mm_str}{mf_str}{ts_str}{pead_str}{ivr_str}{ivx_str}{coint_str}{gap_str}{hi52_str}{m121_str}{srev_str}{rsi2_str}{dloc_str}{sq_str}{ivt_str}{avw_str}{rmom_str}{vp_str}  combined={combined:+.2f} | "
-            f"coherence={coherence_ratio:.2f}({coherence_factor:.2f}x)  "
-            f"movement={movement_factor:.2f}x  volume={volume_factor:.2f}x  "
-            f"atr={atr_pct:.3f}  vol_ratio={vol_ratio:.2f}x{gex_str}"
-        )
-        return ticker, combined, _sig
+        return ticker, method_score_map, _finish
 
     # Run the per-ticker scoring concurrently (bounded) — identical scores, ~max
     # wall time instead of the serial sum (DeepSeek sentiment was the long pole).
     # ex.map preserves input order, so `signals` is assembled in `tickers` order,
     # exactly as the sequential loop produced it. workers<=1 keeps the legacy path.
+    #
+    # TWO PHASES since 2026-08-13 (method_score_basis="rank", user directive):
+    # the pool computes every ticker's RAW method map + a continuation; between
+    # the phases each method's FULL-RUN cross-section is replaced by its centered
+    # within-run rank (`_rank_transform_run`), and the serial continuation loop
+    # (pure arithmetic, ~µs/ticker) runs the combine on the transformed maps.
+    # "absolute" bypasses the transform — byte-identical to the old single pass.
     _workers = max(1, int(getattr(settings, "signal_scoring_max_workers", 8) or 1))
     if _workers > 1 and len(tickers) > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(_workers, len(tickers)),
                                 thread_name_prefix="score") as _ex:
-            _results = list(_ex.map(_score_ticker, tickers))
+            _phase1 = list(_ex.map(_score_ticker, tickers))
     else:
-        _results = [_score_ticker(t) for t in tickers]
+        _phase1 = [_score_ticker(t) for t in tickers]
+    _raw_maps = {_tk: _msm for _tk, _msm, _fin in _phase1}
+    if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
+        # Tradeable rank pool (2026-08-14 directive): Gate-4 floors, CACHE-ONLY
+        # (budget n=0 — never spends API calls; an uncached name fails closed
+        # into the observe pool and is interpolated, which cannot distort the
+        # tradeable distribution). Fail-soft to the full universe when the gate
+        # is off or the pool is implausibly thin (a liquidity-data outage must
+        # never zero the whole book).
+        _tradeable = None
+        if (bool(getattr(settings, "rank_tradeable_only", True))
+                and getattr(settings, "enable_trade_liquidity_gate", False)):
+            try:
+                from src.data.liquidity import is_liquid
+                _budget = {"n": 0}
+                _t = {tk for tk in _raw_maps
+                      if is_liquid(tk, _budget, settings.trade_min_price,
+                                   settings.trade_min_dollar_volume)}
+                if len(_t) >= 30:
+                    _tradeable = _t
+                    logger.info(f"[aggregator] rank pool: {len(_t)}/{len(_raw_maps)} "
+                                f"tradeable names (observe-only interpolated)")
+                else:
+                    logger.warning(f"[aggregator] tradeable rank pool too thin "
+                                   f"({len(_t)}) — full-universe ranking this run")
+            except Exception as e:
+                logger.warning(f"[aggregator] tradeable-pool build failed ({e}) — "
+                               f"full-universe ranking this run")
+        _maps, _rank_abstained = _rank_transform_run(_raw_maps, tradeable=_tradeable)
+        if _rank_abstained:
+            logger.info(f"[aggregator] rank basis: {len(_rank_abstained)} method(s) "
+                        f"below {getattr(settings, 'method_rank_min_views', 5)} views "
+                        f"-> weight 0 this run: {sorted(_rank_abstained)}")
+    else:
+        _maps, _rank_abstained = _raw_maps, frozenset()
+    _results = [_fin(_maps[_tk], _rank_abstained, _raw_maps[_tk])
+                for _tk, _msm, _fin in _phase1]
     for _tk, _combined, _sig in _results:
         combined_scores[_tk] = _combined
         signals.append(_sig)
@@ -2740,16 +2950,24 @@ def build_signals(
                 new_combined = sig.combined_score + cs_w * cs
                 new_combined = max(-2.0, min(2.0, new_combined))
                 # Re-derive direction + confidence on the adjusted combined.
-                # Uses the SAME configurable band as the first pass (buy/sell
-                # split, 2026-07-22) so a tuned threshold applies consistently
-                # to cross-sectional-adjusted names too. cross_sectional is an
+                # Uses the SAME per-side bands as the first pass (rank basis:
+                # the quantile-matched asymmetric rank_diff_threshold_long/
+                # _short, 2026-08-14; absolute basis: buy_sell_diff_threshold)
+                # so a tuned threshold applies consistently to
+                # cross-sectional-adjusted names too. cross_sectional is an
                 # additive relative-value overlay on the TOTAL (like the corp/
                 # fundamental/trend overlays), so it lands on combined_score and
                 # deliberately does NOT touch the persisted buy/sell camp sides.
-                _cs_band = settings.buy_sell_diff_threshold
-                if new_combined >= _cs_band:
+                if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
+                    from config.settings import directional as _cs_directional
+                    _cs_sym = float(getattr(settings, "rank_diff_threshold", 0.182))
+                    _cs_band_long = float(_cs_directional("rank_diff_threshold", "long") or _cs_sym)
+                    _cs_band_short = float(_cs_directional("rank_diff_threshold", "short") or _cs_sym)
+                else:
+                    _cs_band_long = _cs_band_short = settings.buy_sell_diff_threshold
+                if new_combined >= _cs_band_long:
                     new_direction: Direction = "BULLISH"
-                elif new_combined <= -_cs_band:
+                elif new_combined <= -_cs_band_short:
                     new_direction = "BEARISH"
                 else:
                     new_direction = "NEUTRAL"

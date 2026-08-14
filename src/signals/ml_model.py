@@ -187,6 +187,8 @@ def train_and_persist_pivot(deep_parquet: str = _PIVOT_PARQUET,
     X = df[feats].to_numpy(dtype=np.float32)
 
     cfg = dict(TRAIN_CONFIG_PIVOT)
+    from src.analysis.pivot_target import pivot_basis
+    cfg["pivot_basis"] = pivot_basis()    # hl+threshold since 2026-08-12; serving refuses a mismatch
     model = LightGBMRankRegressor(num_threads=cfg["num_threads"]).fit(X, yr, w)
     art = {"model": model, "features": feats, "config": cfg,
            "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -202,7 +204,8 @@ def train_and_persist_pivot(deep_parquet: str = _PIVOT_PARQUET,
     return art
 
 
-def eod_train(limit_tickers: int = 1500, date_stride: int = 2) -> Optional[dict]:
+def eod_train(limit_tickers: int = 1500, date_stride: int = 2,
+              force: bool = False) -> Optional[dict]:
     """EOD entry point, dispatching on ``settings.ml_ohlcv_target``.
 
     Pivot mode is THROTTLED by ``ml_pivot_retrain_days`` — the full-universe
@@ -214,6 +217,8 @@ def eod_train(limit_tickers: int = 1500, date_stride: int = 2) -> Optional[dict]
 
     if settings.ml_ohlcv_target == "pivot_rank":
         art = _load_artifact()
+        if force:
+            art = None                      # weekly caller: throttle bypassed
         if art is not None and art.get("config", {}).get("target") == "pivot_rank":
             try:
                 trained = datetime.fromisoformat(str(art.get("trained_at")))
@@ -273,6 +278,9 @@ def _load_artifact() -> Optional[dict]:
         return None
 
 
+_BASIS_WARNED = False
+
+
 def compute_ml_score(ticker: str) -> Tuple[float, str]:
     """``(net_score, label)`` for one ticker — ``net = P(up) - P(down)`` ∈ [-1, 1].
 
@@ -306,7 +314,20 @@ def compute_ml_score(ticker: str) -> Tuple[float, str]:
             # a centred within-day rank in [-0.5, 0.5]; x2 maps onto the method-
             # score convention. Leg features come from the same completed-bar
             # series as the frame — None means <50 bars, i.e. genuinely no data.
-            from src.analysis.pivot_target import latest_leg_features
+            #
+            # BASIS GUARD (2026-08-12): the pivot definition moved to the H/L
+            # basis; an artifact trained on the close basis would be fed leg
+            # features it never saw. Abstain (a method with no view) until the
+            # retrain writes a matching artifact — degraded, never wrong.
+            from src.analysis.pivot_target import latest_leg_features, pivot_basis
+            if cfg.get("pivot_basis") != pivot_basis():
+                global _BASIS_WARNED
+                if not _BASIS_WARNED:
+                    logger.warning(
+                        f"[ml_ohlcv] artifact pivot_basis={cfg.get('pivot_basis')!r} != "
+                        f"current {pivot_basis()!r} — abstaining until the retrain lands")
+                    _BASIS_WARNED = True
+                return _memo(ck, 0.0, "BASIS_STALE")
             leg = latest_leg_features(ticker)
             if leg is None:
                 return _memo(ck, 0.0, "NO_DATA")
@@ -350,7 +371,20 @@ def reset_caches() -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    from src.db import repo
-    art = train_and_persist()
-    print("trained" if art else "no artifact", art and {k: art[k] for k in
-          ("trained_at", "n_train", "train_max_date")})
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="ml_ohlcv ad-hoc retrain (see CLAUDE.md — Ad-hoc ML retrains)")
+    p.add_argument("--throttled", action="store_true",
+                   help="honour ml_pivot_retrain_days instead of forcing the retrain")
+    a = p.parse_args()
+    # Dispatch through `eod_train` so the CONFIGURED generation trains. This
+    # block used to call `train_and_persist()` directly, which always trained the
+    # v1 CLASSIC model regardless of `ml_ohlcv_target` — and since serving
+    # dispatches on the artifact's OWN config, an ad-hoc retrain silently
+    # DOWNGRADED a weighted method from v2 pivot to v1 with no error anywhere.
+    # Forced by default: the throttle exists to pace the automated weekly caller,
+    # and someone typing this command has already decided to pay for it.
+    art = eod_train(force=not a.throttled)
+    print("trained" if art else "no artifact (throttled or failed)",
+          art and {k: art[k] for k in ("trained_at", "n_train", "train_max_date")})

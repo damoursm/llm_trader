@@ -36,6 +36,9 @@ from datetime import date
 from statistics import mean, median
 from typing import Dict, List, Optional, Sequence, Tuple
 
+# Every row also carries ``fwd_pv`` — the oriented move from the exit-day close
+# to the NEXT H/L pivot (the decision basis; the remaining leg the exit walked
+# away from) — aggregated as ``n_pv/mean_pv/median_pv/pct_pos_pv``.
 # Sessions-after-exit horizons. 1/3/5/10 brackets the system's swing horizon
 # (the measured combined_score edge peaks ~1–2d and is gone by ~3–5d, so a
 # systematic positive fwd at these horizons is a real early-exit signal).
@@ -86,7 +89,22 @@ def _per_trade(t: dict, horizons: Sequence[int]) -> Optional[dict]:
             fwd[h] = round(sign * (closes[dates[j]] / exit_price - 1.0) * 100.0, 3)
         else:
             fwd[h] = None
+    # The pivot pseudo-horizon (2026-08-13 standardization): the oriented move
+    # from the exit-day close to the NEXT H/L pivot extreme — the remaining leg
+    # the exit walked away from, on the decision basis. None until it settles.
+    fwd_pv = None
+    try:
+        from src.analysis.simulated_trades import _pivot_targets
+        from bisect import bisect_left as _bl
+        pdts, sp, endx = _pivot_targets(dates, closes, ticker=str(t.get("ticker") or ""))
+        if pdts:
+            pi = _bl(pdts, exit_d)
+            if pi < len(pdts) and endx[pi] >= 0:
+                fwd_pv = round(sign * float(sp[pi]), 3)
+    except Exception:
+        fwd_pv = None
     return {
+        "fwd_pv": fwd_pv,
         "ticker":      t.get("ticker"),
         "exit_date":   str(t.get("exit_date") or "")[:10],
         "exit_reason": t.get("exit_reason") or "(unspecified)",
@@ -100,6 +118,12 @@ def _aggregate(rows: List[dict], horizons: Sequence[int]) -> dict:
     ``pct_pos`` = share of exits whose forward return is POSITIVE, i.e. the
     position kept going our way — the '% exited too early' at that horizon."""
     out: dict = {"trades": len(rows)}
+    vals_pv = [r["fwd_pv"] for r in rows if r.get("fwd_pv") is not None]
+    out["n_pv"] = len(vals_pv)
+    out["mean_pv"] = round(mean(vals_pv), 3) if vals_pv else None
+    out["median_pv"] = round(median(vals_pv), 3) if vals_pv else None
+    out["pct_pos_pv"] = (round(100.0 * sum(1 for v in vals_pv if v > 0) / len(vals_pv), 1)
+                         if vals_pv else None)
     for h in horizons:
         vals = [r[f"fwd_{h}d"] for r in rows if r.get(f"fwd_{h}d") is not None]
         out[f"n_{h}d"] = len(vals)

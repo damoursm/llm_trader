@@ -31,7 +31,7 @@ Features (all cheap, causal, cache-only):
                      known strongest entry discriminator (Spearman +0.48) — the
                      built-in sanity check that the machinery measures correctly.
 
-Usage:  python -m src.analysis.predictability [--horizons 1,5,10] [--days 90]
+Usage:  python -m src.analysis.predictability [--horizons pv,1,5,10] [--days 90]
                                               [--buckets 3] [--min-n 30]
 """
 
@@ -45,7 +45,9 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from src.analysis.signal_panel import _spearman, build_panel
+from src.analysis.signal_panel import (_spearman, build_panel,
+                                       fwd_col as _fwd_col,
+                                       int_horizons as _int_horizons)
 
 _EPS = 1e-12
 # ADX value that normalises a signed-ADX signal to ~±1 (rank-preserving for IC —
@@ -245,7 +247,7 @@ def _side_mask(scores: pd.Series, side: str) -> pd.Series:
     return scores.abs() > _EPS
 
 
-def compute_directional_feature_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
+def compute_directional_feature_ic(panel: pd.DataFrame, horizons: Sequence = ("pv", 1, 5, 10),
                                    min_n: int = 20,
                                    features: Sequence[str] = FEATURE_SIGNAL_COLUMNS) -> pd.DataFrame:
     """Per signed-trend-feature × side (all / buy / sell) × horizon: the
@@ -272,29 +274,30 @@ def compute_directional_feature_ic(panel: pd.DataFrame, horizons: Sequence[int] 
             row = {"feature": col, "label": FEATURE_SIGNAL_LABELS.get(col, col),
                    "side": side, "side_label": _SIDE_LABELS[side]}
             for h in horizons:
-                f_all = pd.to_numeric(panel.get(f"fwd_ret_{h}d"), errors="coerce")
+                _c, _sfx = _fwd_col(h)
+                f_all = pd.to_numeric(panel.get(_c), errors="coerce")
                 valid = base & f_all.notna()
                 n = int(valid.sum())
-                row[f"n_{h}d"] = n
+                row[f"n_{_sfx}"] = n
                 if n < min_n:
-                    row[f"ic_{h}d"] = row[f"win_{h}d"] = row[f"sim_{h}d"] = None
+                    row[f"ic_{_sfx}"] = row[f"win_{_sfx}"] = row[f"sim_{_sfx}"] = None
                     continue
                 s, f = s_all[valid], f_all[valid]
                 ic = _spearman(s, f)
-                row[f"ic_{h}d"] = round(ic, 4) if ic is not None else None
+                row[f"ic_{_sfx}"] = round(ic, 4) if ic is not None else None
                 moved = f != 0
-                row[f"win_{h}d"] = (round(float(((s > 0) == (f > 0))[moved].mean() * 100.0), 2)
+                row[f"win_{_sfx}"] = (round(float(((s > 0) == (f > 0))[moved].mean() * 100.0), 2)
                                     if bool(moved.any()) else None)
-                row[f"sim_{h}d"] = round(float(f.where(s > 0, -f).mean()), 4)
+                row[f"sim_{_sfx}"] = round(float(f.where(s > 0, -f).mean()), 4)
             rows.append(row)
     return pd.DataFrame(rows)
 
 
-def load_directional_feature_ic(horizons: Sequence[int] = (1, 5, 10),
+def load_directional_feature_ic(horizons: Sequence = ("pv", 1, 5, 10),
                                 days: Optional[int] = None, min_n: int = 20) -> pd.DataFrame:
     """Build the signals panel, enrich it with the signed trend signals, and
     compute their by-direction IC. Empty when there's no forward-return history."""
-    panel = build_panel(horizons=horizons, days=days)
+    panel = build_panel(horizons=_int_horizons(horizons), days=days)
     if panel is None or panel.empty:
         return pd.DataFrame()
     return compute_directional_feature_ic(attach_feature_signals(panel),
@@ -303,7 +306,7 @@ def load_directional_feature_ic(horizons: Sequence[int] = (1, 5, 10),
 
 # ── bucketed conditional IC of combined_score ────────────────────────────────
 
-def _score_stats(sub: pd.DataFrame, horizons: Sequence[int], min_n: int) -> dict:
+def _score_stats(sub: pd.DataFrame, horizons: Sequence, min_n: int) -> dict:
     """For a subset of rows: per horizon, how well ``combined_score`` predicted
     the forward return — ``n``, Spearman ``ic``, directional ``hit`` %, and signed
     ``simret`` % (mean sign(score)×fwd_ret). Zero scores ("no view") excluded."""
@@ -311,20 +314,21 @@ def _score_stats(sub: pd.DataFrame, horizons: Sequence[int], min_n: int) -> dict
     has_view = score.notna() & (score.abs() > _EPS)
     out: dict = {}
     for h in horizons:
-        fwd = pd.to_numeric(sub.get(f"fwd_ret_{h}d"), errors="coerce")
+        _c, _sfx = _fwd_col(h)
+        fwd = pd.to_numeric(sub.get(_c), errors="coerce")
         valid = has_view & fwd.notna()
         n = int(valid.sum())
-        out[f"n_{h}d"] = n
+        out[f"n_{_sfx}"] = n
         if n < min_n:
-            out[f"ic_{h}d"] = out[f"hit_{h}d"] = out[f"simret_{h}d"] = None
+            out[f"ic_{_sfx}"] = out[f"hit_{_sfx}"] = out[f"simret_{_sfx}"] = None
             continue
         s, f = score[valid], fwd[valid]
         ic = _spearman(s, f)
-        out[f"ic_{h}d"] = round(ic, 4) if ic is not None else None
+        out[f"ic_{_sfx}"] = round(ic, 4) if ic is not None else None
         moved = f != 0
-        out[f"hit_{h}d"] = (round(float(((s > 0) == (f > 0))[moved].mean() * 100.0), 2)
+        out[f"hit_{_sfx}"] = (round(float(((s > 0) == (f > 0))[moved].mean() * 100.0), 2)
                             if bool(moved.any()) else None)
-        out[f"simret_{h}d"] = round(float(f.where(s > 0, -f).mean()), 4)
+        out[f"simret_{_sfx}"] = round(float(f.where(s > 0, -f).mean()), 4)
     return out
 
 
@@ -336,7 +340,7 @@ def _bucket_names(k: int) -> List[str]:
     return [f"Q{i + 1}" for i in range(k)]
 
 
-def compute_predictability_ic(feature_panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
+def compute_predictability_ic(feature_panel: pd.DataFrame, horizons: Sequence = ("pv", 1, 5, 10),
                               min_n: int = 30, n_buckets: int = 3,
                               features: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """Bucket the feature panel by each feature (into ``n_buckets`` quantiles) and
@@ -388,28 +392,29 @@ def summarize_feature_edges(bucket_df: pd.DataFrame,
     for feat, g in body.groupby("feature", sort=False):
         row = {"feature": feat, "label": g.iloc[0]["label"], "buckets": int(len(g))}
         for h in horizons:
+            _sfx = _fwd_col(h)[1]
             for m in ("hit", "simret"):
-                vals = [(r["bucket"], r.get(f"{m}_{h}d")) for _, r in g.iterrows()
-                        if pd.notna(r.get(f"{m}_{h}d"))]
+                vals = [(r["bucket"], r.get(f"{m}_{_sfx}")) for _, r in g.iterrows()
+                        if pd.notna(r.get(f"{m}_{_sfx}"))]
                 if len(vals) >= 2:
                     best = max(vals, key=lambda x: x[1])
                     worst = min(vals, key=lambda x: x[1])
-                    row[f"{m}_spread_{h}d"] = round(best[1] - worst[1], 3)
-                    row[f"{m}_best_{h}d"] = best[0]
+                    row[f"{m}_spread_{_sfx}"] = round(best[1] - worst[1], 3)
+                    row[f"{m}_best_{_sfx}"] = best[0]
                 else:
-                    row[f"{m}_spread_{h}d"] = None
-                    row[f"{m}_best_{h}d"] = None
+                    row[f"{m}_spread_{_sfx}"] = None
+                    row[f"{m}_best_{_sfx}"] = None
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 # ── live-DB convenience layer ────────────────────────────────────────────────
 
-def load_predictability(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None,
+def load_predictability(horizons: Sequence = ("pv", 1, 5, 10), days: Optional[int] = None,
                         min_n: int = 30, n_buckets: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """``(bucket_table, edge_summary)`` over the signals panel. Empty frames when
     there's no forward-return history yet."""
-    panel = build_panel(horizons=horizons, days=days)
+    panel = build_panel(horizons=_int_horizons(horizons), days=days)
     if panel is None or panel.empty:
         return pd.DataFrame(), pd.DataFrame()
     fp = build_feature_panel(panel)
@@ -450,8 +455,9 @@ def _print_report(horizons: Sequence[int], days: Optional[int], min_n: int, n_bu
         name = ("BASELINE" if r["feature"] == BASELINE_KEY else f"  {r['bucket']}{rng}")
         line = f"{name:<40}{int(r['n_rows']):>8}"
         for h in horizons:
-            n, ic_v, hit, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
-                                 r.get(f"hit_{h}d"), r.get(f"simret_{h}d"))
+            _sfx = _fwd_col(h)[1]
+            n, ic_v, hit, sim = (r.get(f"n_{_sfx}"), r.get(f"ic_{_sfx}"),
+                                 r.get(f"hit_{_sfx}"), r.get(f"simret_{_sfx}"))
             line += f"{int(n) if pd.notna(n) else 0:>6}"
             line += f"{ic_v:>+8.3f}" if pd.notna(ic_v) else f"{'—':>8}"
             line += f"{hit:>7.1f}%" if pd.notna(hit) else f"{'—':>8}"
@@ -468,8 +474,9 @@ def _print_report(horizons: Sequence[int], days: Optional[int], min_n: int, n_bu
         for _, r in edges.iterrows():
             line = f"{r['label']:<40}"
             for h in horizons:
-                hd, hb, sd = (r.get(f"hit_spread_{h}d"), r.get(f"hit_best_{h}d"),
-                              r.get(f"simret_spread_{h}d"))
+                _sfx = _fwd_col(h)[1]
+                hd, hb, sd = (r.get(f"hit_spread_{_sfx}"), r.get(f"hit_best_{_sfx}"),
+                              r.get(f"simret_spread_{_sfx}"))
                 line += f"{hd:>9.2f}" if pd.notna(hd) else f"{'—':>9}"
                 line += f"{str(hb):>8}" if hb is not None and pd.notna(hb) else f"{'—':>8}"
                 line += f"{sd:>9.3f}" if pd.notna(sd) else f"{'—':>9}"
@@ -490,8 +497,9 @@ def _print_report(horizons: Sequence[int], days: Optional[int], min_n: int, n_bu
                 print(head)
             line = f"  {_SIDE_LABELS[r['side']]:<38}"
             for h in horizons:
-                n, ic_v, win, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
-                                     r.get(f"win_{h}d"), r.get(f"sim_{h}d"))
+                _sfx = _fwd_col(h)[1]
+                n, ic_v, win, sim = (r.get(f"n_{_sfx}"), r.get(f"ic_{_sfx}"),
+                                     r.get(f"win_{_sfx}"), r.get(f"sim_{_sfx}"))
                 line += f"{int(n) if pd.notna(n) else 0:>7}"
                 line += f"{ic_v:>+8.3f}" if pd.notna(ic_v) else f"{'—':>8}"
                 line += f"{win:>7.1f}%" if pd.notna(win) else f"{'—':>8}"

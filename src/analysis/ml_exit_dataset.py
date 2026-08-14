@@ -5,15 +5,18 @@ question — for a position ALREADY held, should we close it now? An exit model 
 arguably a better fit for ML than entry (see memory/ml-methods-plan-2026-07.md):
 its features are richer and exit-specific (MFE / MAE / days held / the combine's
 conviction DEGRADATION since entry / the method-horizon elapsed ratio), and its
-label is a clean counterfactual — the oriented return the position earns if held
-N more sessions (``+`` = holding was right, ``−`` = should have exited).
+label is a clean counterfactual — since 2026-08-13 the ORIENTED REMAINING MOVE
+to the next H/L pivot from the held day (``+`` = the leg still runs our way,
+``−`` = the next turn is against us; ``ml_exit_label_basis``, fail-soft to the
+fixed held-return label ``fwd_ret_pos_<h>d`` below 500 settled rows).
 
 **The dataset is SIMULATED held positions over the signals panel.** For every
 scored ticker-day with a directional view, a hypothetical position is opened in
 that direction and walked forward day by day; at each held day it emits the
 exit-state features + the method scores re-scored on that day (oriented to the
-position) + the label (the panel's own forward return from that held day,
-oriented). So it needs nothing the panel + build_panel forward-return join don't
+position) + the labels (the panel's own settled pivot target — the training
+label — and the fixed forward return, both oriented; each with its own
+point-in-time settle date). So it needs nothing the panel + build_panel forward-return join don't
 already provide, and it is causal by construction (state uses prices ≤ held day;
 label uses days > held day; the walk-forward's ``end_date`` guard removes the
 rest).
@@ -26,7 +29,7 @@ entry harness (``ml_train.walk_forward_predict``/``evaluate``) unchanged — an 
 model predicting the sign of the oriented held return is structurally identical
 to an entry model predicting the sign of the forward return.
 
-CLI:  python -m src.analysis.ml_exit_dataset [--horizon 3] [--max-hold 12]
+CLI:  python -m src.analysis.ml_exit_dataset [--basis pv|fixed] [--horizon 3] [--max-hold 12] [--train]
 """
 
 from __future__ import annotations
@@ -94,8 +97,24 @@ def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
         dates = g["signal_date"].astype(str).tolist()
         px = pd.to_numeric(g.get("price"), errors="coerce").tolist()
         dirs = g["direction"].tolist()
-        comb = pd.to_numeric(g.get("combined_score"), errors="coerce").tolist()
+        # ex_combine standardizes on the ABSOLUTE combine (2026-08-14): the
+        # shadow column where present (rank-era rows), else combined_score
+        # (pre-shadow rows, which ARE absolute-basis) — so the feature series
+        # is basis-invariant across the 2026-08-14 rank switch and any future
+        # shape/TTL drift. The live twin in `live_exit_features` mirrors this.
+        _abs = (pd.to_numeric(g.get("combined_score_abs"), errors="coerce")
+                if "combined_score_abs" in g else None)
+        _liv = pd.to_numeric(g.get("combined_score"), errors="coerce")
+        comb = (_abs.where(_abs.notna(), _liv) if _abs is not None else _liv).tolist()
         fwd = pd.to_numeric(g.get(fwdcol), errors="coerce").tolist() if fwdcol in g else [np.nan] * n
+        # The pivot label (2026-08-13 standardization): the panel's own settled
+        # H/L pivot target per held day + its per-row settle date — oriented
+        # below, it reads "the remaining move to the next turn": the user's
+        # rank-degradation exit thesis as a label.
+        pv = (pd.to_numeric(g.get("fwd_ret_pivot"), errors="coerce").tolist()
+              if "fwd_ret_pivot" in g else [np.nan] * n)
+        pv_end = (g["end_date_pivot"].astype(str).tolist()
+                  if "end_date_pivot" in g else [None] * n)
         ms = {m: pd.to_numeric(g[m], errors="coerce").tolist() for m in mcols}
 
         for ei in range(0, n - 1, entry_stride):
@@ -144,6 +163,12 @@ def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
                 # was right). Absolute (P&L-relevant for an exit), oriented by dir.
                 f = fwd[hi]
                 rec[f"fwd_ret_pos_{horizon}d"] = (ds * f if f == f else np.nan)
+                # PIVOT label twin: the oriented remaining move to the next H/L
+                # pivot from this held day (+ = the leg still runs our way,
+                # − = the next turn is against us) with ITS OWN settle date.
+                pvv = pv[hi]
+                rec["fwd_ret_pos_pv"] = (ds * pvv if pvv == pvv else np.nan)
+                rec["end_date_pv"] = (pv_end[hi] if pvv == pvv else None)
                 # end date = held_day + horizon SESSIONS on the benchmark grid.
                 hd = _date.fromisoformat(dates[hi])
                 bi = bisect_left(b_dates, hd) if b_dates else 0
@@ -165,7 +190,7 @@ def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
 def measure_exit(horizon: int = 3, days: Optional[int] = None, deadband: float = 0.0,
                  max_hold: int = 12, model_name: str = "gbm",
                  min_train_days: int = 8, step_days: int = 2,
-                 min_train_rows: int = 500) -> pd.DataFrame:
+                 min_train_rows: int = 500, basis: str = "fixed") -> pd.DataFrame:
     """Walk-forward the ML exit model vs the hand-built ``exit_method_consensus``
     on the oriented held return. The go/no-go: does the learned 'keep-holding'
     score predict the held outcome (IC/ICIR/hit) better than the consensus?
@@ -179,13 +204,23 @@ def measure_exit(horizon: int = 3, days: Optional[int] = None, deadband: float =
     df = build_exit_dataset(horizon=horizon, days=days, max_hold=max_hold)
     if df.empty:
         return pd.DataFrame()
-    ycol, ecol = f"fwd_ret_pos_{horizon}d", f"end_date_{horizon}d"
+    # ``basis="pv"`` measures on the oriented pivot label + its own settle
+    # date (what the production trainer now prefers); "fixed" keeps the
+    # held-return label at ``horizon``. Metrics/IC read the SAME ycol either
+    # way, so the two runs are directly comparable.
+    if basis == "pv" and "fwd_ret_pos_pv" in df.columns:
+        ycol, ecol = "fwd_ret_pos_pv", "end_date_pv"
+    else:
+        ycol, ecol = f"fwd_ret_pos_{horizon}d", f"end_date_{horizon}d"
     feats = [f for f in EXIT_FEATURE_COLUMNS if f in df.columns]
     work = df[["signal_date", "ex_consensus", ycol, ecol] + feats].copy()
     work[ycol] = pd.to_numeric(work[ycol], errors="coerce")
     work = work[work[ycol].notna()].reset_index(drop=True)
     work["_y"] = work[ycol].map(lambda r: label_from_return(r, deadband))
     work = work[work["_y"].notna()].reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame()
+    work = work[work[ecol].notna()].reset_index(drop=True)
     if work.empty:
         return pd.DataFrame()
     work["_sig"] = work["signal_date"].map(lambda s: _d.fromisoformat(str(s)[:10]))
@@ -259,6 +294,23 @@ def train_and_persist_exit(days: Optional[int] = None, path=_EXIT_MODEL_PATH) ->
     if df.empty or ycol not in df.columns:
         logger.warning("[ml_exit] no exit data to train on")
         return None
+    # Label basis (2026-08-13 standardization directive, mirroring the
+    # stackers' `_label_cfg`): the oriented remaining-move-to-the-next-pivot
+    # label when enough rows have SETTLED, else the fixed held-return label.
+    # `ml_exit_label_basis="fixed"` pins the old behaviour. The basis is
+    # stamped in the artifact config either way.
+    cfg["combine_basis"] = "absolute"      # ex_combine reads the abs shadow (2026-08-14)
+    want_pv = str(getattr(settings, "ml_exit_label_basis", "pv")).lower() == "pv"
+    if want_pv and "fwd_ret_pos_pv" in df.columns:
+        n_pv = int(pd.to_numeric(df["fwd_ret_pos_pv"], errors="coerce").notna().sum())
+        if n_pv >= 500:
+            ycol, cfg["label_basis"] = "fwd_ret_pos_pv", "pv"
+            logger.info(f"[ml_exit] label: oriented PIVOT target ({n_pv:,} settled rows)")
+        else:
+            cfg["label_basis"] = f"pos_{h}d"
+            logger.info(f"[ml_exit] pivot label too thin ({n_pv}) — keeping pos_{h}d")
+    else:
+        cfg["label_basis"] = f"pos_{h}d"
     feats = [f for f in EXIT_FEATURE_COLUMNS if f in df.columns]
     y_raw = pd.to_numeric(df[ycol], errors="coerce").map(lambda r: label_from_return(r, cfg["deadband"]))
     keep = y_raw.notna()
@@ -364,8 +416,17 @@ def live_exit_features(trade: dict, signals_by_ticker: Optional[dict], today_sig
         days_held = float(_trading_days_held(trade["entry_date"]))
     except Exception:
         days_held = float(len(path))
-    today_comb = float(getattr(today_signal, "combined_score", 0.0) or 0.0)
-    entry_comb = (trade.get("signal_at_entry") or {}).get("combined_score")
+    # Basis-invariant ex_combine (2026-08-14): prefer the ABSOLUTE twin —
+    # matches the dataset build above, so the trained model's two combine
+    # features never shift scale when the live combine basis (or a shaped
+    # curve under its 6h TTL) moves.
+    _abs_v = getattr(today_signal, "combined_score_abs", None)
+    today_comb = (float(_abs_v) if _abs_v is not None
+                  else float(getattr(today_signal, "combined_score", 0.0) or 0.0))
+    _sae = trade.get("signal_at_entry") or {}
+    entry_comb = _sae.get("combined_score_abs")
+    if entry_comb is None:
+        entry_comb = _sae.get("combined_score")
     try:
         ex_combine_delta = ds * (today_comb - float(entry_comb)) if entry_comb is not None else np.nan
     except (TypeError, ValueError):
@@ -453,11 +514,22 @@ def main(argv=None) -> None:
     p.add_argument("--min-train-days", type=int, default=8)
     p.add_argument("--step-days", type=int, default=2)
     p.add_argument("--model", default="gbm", choices=("logistic", "gbm"))
+    p.add_argument("--train", action="store_true",
+                   help="retrain + persist the live ml_exit artifact instead of measuring")
+    p.add_argument("--basis", default="fixed", choices=("fixed", "pv"),
+                   help="measure on the fixed held-return label or the oriented pivot label")
     a = p.parse_args(argv)
     from src.db import repo
+    if a.train:
+        # Before set_read_only — the train appends to the `ml_models` registry.
+        art = eod_train_exit()
+        print("ml_exit: " + (f"{art['n_train']:,} rows (<= {art['train_max_date']})"
+                             if art else "NO ARTIFACT (see log)"))
+        return
     repo.set_read_only(True)
     table = measure_exit(horizon=a.horizon, deadband=a.deadband, max_hold=a.max_hold,
-                         model_name=a.model, min_train_days=a.min_train_days, step_days=a.step_days)
+                         model_name=a.model, min_train_days=a.min_train_days,
+                         step_days=a.step_days, basis=a.basis)
     _print(table, a.horizon)
 
 

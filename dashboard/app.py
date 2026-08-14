@@ -7,6 +7,8 @@ Single source of truth is DuckDB (read-only here). Launch with:
 
 from __future__ import annotations
 
+import base64
+import hmac
 import time
 from datetime import datetime, timezone
 
@@ -21,6 +23,67 @@ from src.utils import ET
 
 app = Dash(__name__, title="LLM Trader Monitor", suppress_callback_exceptions=True)
 server = app.server  # for WSGI deployment if ever needed
+
+_DENY_BODY = b"Authentication required.\n"
+
+
+def _basic_auth_middleware(inner, username: str, password: str):
+    """Wrap a WSGI callable in an HTTP Basic-Auth gate (one shared credential).
+
+    Split out from ``_install_basic_auth`` so the gate can be tested against a
+    stub inner app instead of the whole Dash stack — an auth check nobody can
+    exercise is exactly the kind of mechanism this project refuses to trust.
+    """
+    expected = f"{username}:{password}".encode("utf-8")
+
+    def _gate(environ, start_response):
+        header = environ.get("HTTP_AUTHORIZATION", "")
+        if header.startswith("Basic "):
+            try:
+                supplied = base64.b64decode(header[6:].strip())
+            except Exception:
+                supplied = b""
+            # Constant-time: a plain == leaks the password one byte at a time.
+            if hmac.compare_digest(supplied, expected):
+                return inner(environ, start_response)
+        # No per-request log here on purpose: a crawler on a public URL would
+        # otherwise flood the log with one line per probe.
+        start_response("401 Unauthorized", [
+            ("WWW-Authenticate", 'Basic realm="LLM Trader Monitor", charset="UTF-8"'),
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(_DENY_BODY))),
+            ("Cache-Control", "no-store"),
+        ])
+        return [_DENY_BODY]
+
+    return _gate
+
+
+def _install_basic_auth() -> bool:
+    """Install the gate on the live server. True if the gate is ON.
+
+    Installed at IMPORT time, not in ``run()``, so every entry point is covered —
+    including ``server`` being handed to an external WSGI host, which would
+    otherwise bypass a gate installed only on our own serve path.
+
+    It wraps ``wsgi_app`` rather than using a Flask ``before_request`` hook so it
+    sits in front of EVERYTHING Flask serves: the page, the Dash callback XHRs,
+    and the static component bundles. A gate with a hole in it is worse than no
+    gate, because it looks closed.
+
+    Empty ``dashboard_auth_password`` = no gate. That is the right default for a
+    loopback-only dashboard, and it is why the tunnel launcher probes for a 401
+    instead of trusting that this ran.
+    """
+    password = (settings.dashboard_auth_password or "").strip()
+    if not password:
+        return False
+    username = (settings.dashboard_auth_username or "").strip()
+    app.server.wsgi_app = _basic_auth_middleware(app.server.wsgi_app, username, password)
+    return True
+
+
+AUTH_ENABLED = _install_basic_auth()
 
 _TABLE_KW = dict(
     page_size=25,           # rows shown per page (applies to every table)
@@ -766,6 +829,10 @@ _IC_TOOLTIP = (
     "n grows every run — judge nothing on a thin panel.")
 
 _IC_HORIZONS = (1, 5, 10)
+# The PIVOT pseudo-horizon leads the fixed grid (2026-08-12): "pv" is the
+# DECISION basis (filter / IC weights / states), the fixed columns stay for
+# monitoring. (suffix, display) pairs drive both the rows and the headers.
+_IC_BLOCKS = (("pv", "pivot"),) + tuple((f"{h}d", f"{h}d") for h in _IC_HORIZONS)
 
 
 def _ic_category_table(subset, labels):
@@ -773,27 +840,27 @@ def _ic_category_table(subset, labels):
     rows = []
     for _, r in subset.iterrows():
         row = {"method": labels.get(r["method"], r["method"]), "views": int(r["views"])}
-        for h in _IC_HORIZONS:
-            n, ic, hit, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
-                               r.get(f"hit_{h}d"), r.get(f"simret_{h}d"))
-            icstd, icir = r.get(f"icstd_{h}d"), r.get(f"icir_{h}d")
-            row[f"n_{h}d"] = int(n) if pd.notna(n) else None
-            row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
-            row[f"icstd_{h}d"] = round(float(icstd), 3) if pd.notna(icstd) else None
-            row[f"icir_{h}d"] = round(float(icir), 2) if pd.notna(icir) else None
-            row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
-            row[f"simret_{h}d"] = round(float(sim), 2) if pd.notna(sim) else None
+        for sfx, _disp in _IC_BLOCKS:
+            n, ic, hit, sim = (r.get(f"n_{sfx}"), r.get(f"ic_{sfx}"),
+                               r.get(f"hit_{sfx}"), r.get(f"simret_{sfx}"))
+            icstd, icir = r.get(f"icstd_{sfx}"), r.get(f"icir_{sfx}")
+            row[f"n_{sfx}"] = int(n) if pd.notna(n) else None
+            row[f"ic_{sfx}"] = round(float(ic), 3) if pd.notna(ic) else None
+            row[f"icstd_{sfx}"] = round(float(icstd), 3) if pd.notna(icstd) else None
+            row[f"icir_{sfx}"] = round(float(icir), 2) if pd.notna(icir) else None
+            row[f"hit_{sfx}"] = round(float(hit), 1) if pd.notna(hit) else None
+            row[f"simret_{sfx}"] = round(float(sim), 2) if pd.notna(sim) else None
         rows.append(row)
     cols = [{"name": "Method", "id": "method"},
             {"name": "Views", "id": "views", "type": "numeric", "format": _INT}]
-    for h in _IC_HORIZONS:
+    for sfx, disp in _IC_BLOCKS:
         cols += [
-            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
-            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"IC std@{h}d", "id": f"icstd_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"ICIR@{h}d", "id": f"icir_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"Sim win@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"Sim ret@{h}d %", "id": f"simret_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"n@{disp}", "id": f"n_{sfx}", "type": "numeric", "format": _INT},
+            {"name": f"IC@{disp}", "id": f"ic_{sfx}", "type": "numeric", "format": _NUM2},
+            {"name": f"IC std@{disp}", "id": f"icstd_{sfx}", "type": "numeric", "format": _NUM2},
+            {"name": f"ICIR@{disp}", "id": f"icir_{sfx}", "type": "numeric", "format": _NUM2},
+            {"name": f"Sim win@{disp} %", "id": f"hit_{sfx}", "type": "numeric", "format": _NUM2},
+            {"name": f"Sim ret@{disp} %", "id": f"simret_{sfx}", "type": "numeric", "format": _NUM2},
         ]
     longest = max(_IC_HORIZONS)
     cond = []
@@ -910,7 +977,9 @@ _SIM_PERF_TOOLTIP = (
     "predictive of direction shows IC > 0 / Win > 50 PERSISTING across horizons; judge "
     "nothing on a thin n.")
 
-_SIM_HORIZONS = ("30m", "3h", "6h", "1d", "3d", "1w", "2w", "1m")
+# "pv" first — the H/L pivot pseudo-horizon is the decision basis
+# (2026-08-13 standardization); the fixed grid stays as monitors.
+_SIM_HORIZONS = ("pv", "30m", "3h", "6h", "1d", "3d", "1w", "2w", "1m")
 
 # Per-horizon metric columns, in display order (matches the IC table: n, IC, win,
 # ret). Each: (header template, id template, numeric format).
@@ -1137,7 +1206,7 @@ _PREDICT_EDGE_TOOLTIP = (
     "promoting to a discovery-prioritisation / sizing tilt (Tier 1). A spread ≈ 0, or a 'best' "
     "bucket that contradicts the hypothesis, means it doesn't.")
 
-_PRED_HORIZONS = (1, 5, 10)
+_PRED_HORIZONS = ("pv", 1, 5, 10)
 
 _PRICEVOL_TOOLTIP = (
     "Do penny / thin-volume names behave differently from pricier / liquid ones — the question behind "
@@ -1214,18 +1283,20 @@ def _predictability_section():
         for _, r in edges.iterrows():
             row = {"label": r["label"]}
             for h in _PRED_HORIZONS:
-                hs, hb, ss = (r.get(f"hit_spread_{h}d"), r.get(f"hit_best_{h}d"),
-                              r.get(f"simret_spread_{h}d"))
-                row[f"hitsp_{h}d"] = round(float(hs), 2) if pd.notna(hs) else None
-                row[f"best_{h}d"] = hb if (hb is not None and pd.notna(hb)) else "—"
-                row[f"simsp_{h}d"] = round(float(ss), 3) if pd.notna(ss) else None
+                sfx = "pv" if h == "pv" else f"{h}d"
+                hs, hb, ss = (r.get(f"hit_spread_{sfx}"), r.get(f"hit_best_{sfx}"),
+                              r.get(f"simret_spread_{sfx}"))
+                row[f"hitsp_{sfx}"] = round(float(hs), 2) if pd.notna(hs) else None
+                row[f"best_{sfx}"] = hb if (hb is not None and pd.notna(hb)) else "—"
+                row[f"simsp_{sfx}"] = round(float(ss), 3) if pd.notna(ss) else None
             erows.append(row)
         ecols = [{"name": "Feature", "id": "label"}]
         for h in _PRED_HORIZONS:
+            sfx, disp = ("pv", "pivot") if h == "pv" else (f"{h}d", f"{h}d")
             ecols += [
-                {"name": f"Hit spread@{h}d %", "id": f"hitsp_{h}d", "type": "numeric", "format": _NUM2},
-                {"name": f"Best@{h}d", "id": f"best_{h}d"},
-                {"name": f"Sim spread@{h}d %", "id": f"simsp_{h}d", "type": "numeric", "format": _NUM2},
+                {"name": f"Hit spread@{disp} %", "id": f"hitsp_{sfx}", "type": "numeric", "format": _NUM2},
+                {"name": f"Best@{disp}", "id": f"best_{sfx}"},
+                {"name": f"Sim spread@{disp} %", "id": f"simsp_{sfx}", "type": "numeric", "format": _NUM2},
             ]
         children += [
             html.Div("Feature edge — best-minus-worst bucket separation", style={
@@ -1246,29 +1317,31 @@ def _predictability_section():
                "bucket": "—" if is_base else r["bucket"], "range": rng,
                "n_rows": int(r["n_rows"])}
         for h in _PRED_HORIZONS:
-            n, ic, hit, sim = (r.get(f"n_{h}d"), r.get(f"ic_{h}d"),
-                               r.get(f"hit_{h}d"), r.get(f"simret_{h}d"))
-            row[f"n_{h}d"] = int(n) if pd.notna(n) else 0
-            row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
-            row[f"hit_{h}d"] = round(float(hit), 1) if pd.notna(hit) else None
-            row[f"sim_{h}d"] = round(float(sim), 2) if pd.notna(sim) else None
+            sfx = "pv" if h == "pv" else f"{h}d"
+            n, ic, hit, sim = (r.get(f"n_{sfx}"), r.get(f"ic_{sfx}"),
+                               r.get(f"hit_{sfx}"), r.get(f"simret_{sfx}"))
+            row[f"n_{sfx}"] = int(n) if pd.notna(n) else 0
+            row[f"ic_{sfx}"] = round(float(ic), 3) if pd.notna(ic) else None
+            row[f"hit_{sfx}"] = round(float(hit), 1) if pd.notna(hit) else None
+            row[f"sim_{sfx}"] = round(float(sim), 2) if pd.notna(sim) else None
         brows.append(row)
     bcols = [{"name": "Feature", "id": "label"}, {"name": "Bucket", "id": "bucket"},
              {"name": "Range", "id": "range"},
              {"name": "Rows", "id": "n_rows", "type": "numeric", "format": _INT}]
     for h in _PRED_HORIZONS:
+        sfx, disp = ("pv", "pivot") if h == "pv" else (f"{h}d", f"{h}d")
         bcols += [
-            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
-            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"Hit@{h}d %", "id": f"hit_{h}d", "type": "numeric", "format": _NUM2},
-            {"name": f"Sim@{h}d %", "id": f"sim_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"n@{disp}", "id": f"n_{sfx}", "type": "numeric", "format": _INT},
+            {"name": f"IC@{disp}", "id": f"ic_{sfx}", "type": "numeric", "format": _NUM2},
+            {"name": f"Hit@{disp} %", "id": f"hit_{sfx}", "type": "numeric", "format": _NUM2},
+            {"name": f"Sim@{disp} %", "id": f"sim_{sfx}", "type": "numeric", "format": _NUM2},
         ]
-        for c in (f"ic_{h}d", f"sim_{h}d"):
+        for c in (f"ic_{sfx}", f"sim_{sfx}"):
             cond += [
                 {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c}, "color": figures.POS},
                 {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": figures.NEG},
             ]
-        hc = f"hit_{h}d"
+        hc = f"hit_{sfx}"
         cond += [
             {"if": {"filter_query": f"{{{hc}}} >= 50", "column_id": hc}, "color": figures.POS},
             {"if": {"filter_query": f"{{{hc}}} < 50", "column_id": hc}, "color": figures.NEG},
@@ -1309,7 +1382,7 @@ _SOURCE_TRADE_TOOLTIP = (
     "return > 0. Open trades contribute their live mark-to-market. Judge alongside the unbiased "
     "panel view — a handful of trades from one source is anecdote, not evidence.")
 
-_SRC_HORIZONS = (1, 5, 10)
+_SRC_HORIZONS = ("pv", 1, 5, 10)
 
 
 def _source_perf_section():
@@ -1332,30 +1405,32 @@ def _source_perf_section():
             row = {"source": r["source"], "rows": int(r["rows"]),
                    "funnel_pct": round(float(fp), 1) if pd.notna(fp) else None}
             for h in _SRC_HORIZONS:
-                n, fwd, win, ic = (r.get(f"n_{h}d"), r.get(f"fwd_{h}d"),
-                                   r.get(f"win_{h}d"), r.get(f"ic_{h}d"))
-                row[f"n_{h}d"] = int(n) if pd.notna(n) else 0
-                row[f"fwd_{h}d"] = round(float(fwd), 2) if pd.notna(fwd) else None
-                row[f"win_{h}d"] = round(float(win), 1) if pd.notna(win) else None
-                row[f"ic_{h}d"] = round(float(ic), 3) if pd.notna(ic) else None
+                sfx = "pv" if h == "pv" else f"{h}d"
+                n, fwd, win, ic = (r.get(f"n_{sfx}"), r.get(f"fwd_{sfx}"),
+                                   r.get(f"win_{sfx}"), r.get(f"ic_{sfx}"))
+                row[f"n_{sfx}"] = int(n) if pd.notna(n) else 0
+                row[f"fwd_{sfx}"] = round(float(fwd), 2) if pd.notna(fwd) else None
+                row[f"win_{sfx}"] = round(float(win), 1) if pd.notna(win) else None
+                row[f"ic_{sfx}"] = round(float(ic), 3) if pd.notna(ic) else None
             rows.append(row)
         cols = [{"name": "Source", "id": "source"},
                 {"name": "Rows", "id": "rows", "type": "numeric", "format": _INT},
                 {"name": "Funnel %", "id": "funnel_pct", "type": "numeric", "format": _NUM2}]
         cond = []
         for h in _SRC_HORIZONS:
+            sfx, disp = ("pv", "pivot") if h == "pv" else (f"{h}d", f"{h}d")
             cols += [
-                {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
-                {"name": f"Fwd ret@{h}d %", "id": f"fwd_{h}d", "type": "numeric", "format": _NUM2},
-                {"name": f"Win@{h}d %", "id": f"win_{h}d", "type": "numeric", "format": _NUM2},
-                {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM2},
+                {"name": f"n@{disp}", "id": f"n_{sfx}", "type": "numeric", "format": _INT},
+                {"name": f"Fwd ret@{disp} %", "id": f"fwd_{sfx}", "type": "numeric", "format": _NUM2},
+                {"name": f"Win@{disp} %", "id": f"win_{sfx}", "type": "numeric", "format": _NUM2},
+                {"name": f"IC@{disp}", "id": f"ic_{sfx}", "type": "numeric", "format": _NUM2},
             ]
-            for c in (f"fwd_{h}d", f"ic_{h}d"):
+            for c in (f"fwd_{sfx}", f"ic_{sfx}"):
                 cond += [
                     {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c}, "color": figures.POS},
                     {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": figures.NEG},
                 ]
-            wc = f"win_{h}d"
+            wc = f"win_{sfx}"
             cond += [
                 {"if": {"filter_query": f"{{{wc}}} >= 50", "column_id": wc}, "color": figures.POS},
                 {"if": {"filter_query": f"{{{wc}}} < 50", "column_id": wc}, "color": figures.NEG},
@@ -1498,25 +1573,28 @@ _CONF_COMPONENTS_EXIT_NOTE = (
     "not a new signal.")
 
 
-_DEFAULT_CONF_HORIZONS = (1, 5, 10)
+# "pv" leads (2026-08-13 standardization: pivot target first, fixed as monitors)
+_DEFAULT_CONF_HORIZONS = ("pv", 1, 5, 10)
 
 
 def _conf_component_ic_table(icdf: pd.DataFrame) -> dash_table.DataTable:
     rows = icdf.rename(columns={"label": "Variant"}).to_dict("records")
     cols = [{"name": "Variant", "id": "Variant"}]
     for h in _DEFAULT_CONF_HORIZONS:
+        sfx, disp = ("pv", "pivot") if h == "pv" else (f"{h}d", f"{h}d")
         cols += [
-            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
-            {"name": f"IC@{h}d", "id": f"ic_{h}d", "type": "numeric", "format": _NUM3},
-            {"name": f"ICIR@{h}d", "id": f"icir_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"n@{disp}", "id": f"n_{sfx}", "type": "numeric", "format": _INT},
+            {"name": f"IC@{disp}", "id": f"ic_{sfx}", "type": "numeric", "format": _NUM3},
+            {"name": f"ICIR@{disp}", "id": f"icir_{sfx}", "type": "numeric", "format": _NUM2},
         ]
     cond = [{"if": {"filter_query": '{Variant} = "Live (all combined)"'},
             "backgroundColor": "#1f2937"}]
     for h in _DEFAULT_CONF_HORIZONS:
+        sfx = "pv" if h == "pv" else f"{h}d"
         cond += [
-            {"if": {"filter_query": f"{{ic_{h}d}} > 0.03", "column_id": f"ic_{h}d"},
+            {"if": {"filter_query": f"{{ic_{sfx}}} > 0.03", "column_id": f"ic_{sfx}"},
              "color": figures.POS},
-            {"if": {"filter_query": f"{{ic_{h}d}} < -0.03", "column_id": f"ic_{h}d"},
+            {"if": {"filter_query": f"{{ic_{sfx}}} < -0.03", "column_id": f"ic_{sfx}"},
              "color": figures.NEG},
         ]
     return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
@@ -1526,10 +1604,11 @@ def _conf_component_band_table(banddf: pd.DataFrame) -> dash_table.DataTable:
     rows = banddf.rename(columns={"label": "Variant", "band_label": "Band"}).to_dict("records")
     cols = [{"name": "Variant", "id": "Variant"}, {"name": "Band", "id": "Band"}]
     for h in _DEFAULT_CONF_HORIZONS:
+        sfx, disp = ("pv", "pivot") if h == "pv" else (f"{h}d", f"{h}d")
         cols += [
-            {"name": f"n@{h}d", "id": f"n_{h}d", "type": "numeric", "format": _INT},
-            {"name": f"Win@{h}d %", "id": f"win_{h}d", "type": "numeric", "format": _NUM1},
-            {"name": f"Ret@{h}d %", "id": f"ret_{h}d", "type": "numeric", "format": _NUM2},
+            {"name": f"n@{disp}", "id": f"n_{sfx}", "type": "numeric", "format": _INT},
+            {"name": f"Win@{disp} %", "id": f"win_{sfx}", "type": "numeric", "format": _NUM1},
+            {"name": f"Ret@{disp} %", "id": f"ret_{sfx}", "type": "numeric", "format": _NUM2},
         ]
     cond = [{"if": {"filter_query": '{Band} = "High (0.65+)"'}, "backgroundColor": "#1f2937"}]
     return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
@@ -1607,6 +1686,7 @@ def _methods_tab():
         _method_source_toggle("methods-source"),
         _sim_column_filters(),
         dcc.Loading(html.Div(id="methods-body")),
+        _safe(_method_decile_section),
         _safe(_ic_section),
         _safe(_mc_overfit_section),
         _safe(_confidence_components_section),
@@ -1618,6 +1698,54 @@ def _methods_tab():
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
         models_table,
     ])
+
+
+def _method_decile_section():
+    """Per-method decile curve on the pivot basis, method picked by dropdown —
+    the visual companion to the 2026-08-13 rank directive: the combine now
+    consumes each method's within-day RANK, and this is exactly that rank's
+    decile payoff. Full-panel (window-toggle independent; the ranks are
+    within-day, so mixing windows is safe)."""
+    from src.performance.tracker import METHOD_LABELS
+    res = data.method_decile_curves()
+    methods = sorted((res.get("methods") or {}).keys())
+    if not methods:
+        return html.Div("No settled pivot rows yet — the decile view fills as "
+                        "pivots confirm.", style={"color": "#6b7280"})
+    labels = dict(METHOD_LABELS)
+    default = "ext_gap" if "ext_gap" in methods else methods[0]
+    meta = res.get("meta") or {}
+    sub = (f"{meta.get('rows', 0):,} settled panel rows · {meta.get('days', 0)} days "
+           f"({meta.get('d0', '')} → {meta.get('d1', '')}) · means winsorized "
+           f"{meta.get('winsor', ['', ''])[0]}..{meta.get('winsor', ['', ''])[1]}%")
+    return html.Div([
+        _h3("Method decile curve — signed pivot return by within-day score rank",
+            "Each panel row's method score is ranked WITHIN ITS DAY among that method's non-zero "
+            "scores and bucketed into deciles; bars show the decile's mean SIGNED move to the next "
+            "H/L pivot (win% and n in the hover). This is the exact consumption the rank basis "
+            "(method_score_basis=rank) feeds the combine: an upward slope = the day's stronger "
+            "scores genuinely carry more upside; a flat or n-shaped curve = the ranking carries "
+            "little. Pick a method below."),
+        html.Div(sub, style={"color": "#6b7280", "fontSize": 12, "marginBottom": 6}),
+        dcc.Dropdown(id="method-decile-dd",
+                     options=[{"label": labels.get(m, m), "value": m} for m in methods],
+                     value=default, clearable=False,
+                     style={"width": 340, "marginBottom": 8}),
+        dcc.Loading(dcc.Graph(id="method-decile-graph",
+                              figure=figures.method_decile_fig(
+                                  res["methods"][default], default,
+                                  labels.get(default, default)))),
+    ])
+
+
+@app.callback(Output("method-decile-graph", "figure"),
+              Input("method-decile-dd", "value"))
+def _method_decile_update(method):
+    from src.performance.tracker import METHOD_LABELS
+    res = data.method_decile_curves()
+    curve = (res.get("methods") or {}).get(method) or {}
+    return figures.method_decile_fig(curve, method or "",
+                                     dict(METHOD_LABELS).get(method, method or ""))
 
 
 @app.callback(Output("methods-body", "children"),
@@ -1897,6 +2025,8 @@ _TICKER_PERF_TIPS = {
     "View": "Of those, days the combined score carried an actual direction (|score| ≥ 0.02). The rest are no-view days and are EXCLUDED from the returns, not counted as zero.",
     "Avg score": "Mean combined_score. Positive = the system leans bullish on this name overall.",
     "Avg conf": "Mean confidence. Compare against the ~0.85 actionable bar to see how far off being tradeable a name typically is.",
+    "Ret pivot %": "Mean oriented return to the next H/L pivot extreme (the standing decision basis) — % from the signal day's close to the next confirmed swing high/low, in the signal's direction.",
+    "Hit pivot %": "Share of pivot-settled view-days where the signal's direction matched the sign of the move to the next pivot extreme.",
     "Ret 1d %": "SIMULATED: mean return if the system had taken the signal's own direction each day and held 1 session. A bearish call on a stock that fell counts as a WIN.",
     "Hit 1d %": "Share of 1-day observations where the signal's direction was right.",
     "Ret 5d %": "Same, held 5 sessions — the swing horizon most of the calibration targets.",
@@ -1912,6 +2042,7 @@ _TICKER_PERF_TIPS = {
 }
 
 _TICKER_PERF_COLS = ["Ticker", "Source", "Scored", "View", "Avg score", "Avg conf",
+                     "Ret pivot %", "Hit pivot %",
                      "Ret 1d %", "Hit 1d %", "Ret 5d %", "Hit 5d %",
                      "Ret 10d %", "Hit 10d %",
                      "Recs", "Dir recs", "Actionable", "Trades", "Open", "Real ret %"]
@@ -1931,6 +2062,7 @@ def _ticker_perf_block(window_days):
         "Ticker": r["ticker"], "Source": r.get("source"),
         "Scored": r["signal_days"], "View": r["view_days"],
         "Avg score": r["avg_score"], "Avg conf": r.get("avg_conf"),
+        "Ret pivot %": r.get("ret_pv"), "Hit pivot %": r.get("hit_pv"),
         "Ret 1d %": r.get("ret_1d"), "Hit 1d %": r.get("hit_1d"),
         "Ret 5d %": r.get("ret_5d"), "Hit 5d %": r.get("hit_5d"),
         "Ret 10d %": r.get("ret_10d"), "Hit 10d %": r.get("hit_10d"),
@@ -2012,7 +2144,8 @@ def _arm_eval_block(window_days):
                      "(requires ENABLE_SHADOW_ARMS).", style={"color": "#6b7280"}),
         ])
 
-    horizon = 5 if 5 in (res.get("horizons") or []) else (res.get("horizons") or [1])[0]
+    _hs = res.get("horizons") or [1]
+    horizon = "pv" if "pv" in _hs else (5 if 5 in _hs else _hs[0])
 
     srows = [{
         "Arm": r["label"], "Calls": r["calls"],
@@ -2029,7 +2162,8 @@ def _arm_eval_block(window_days):
     } for p in res["pairs"].get(horizon, [])]
 
     return html.Div([
-        _h3(f"Synthesis prompt arms — dual-case vs blind vs sighted ({horizon}-day)",
+        _h3("Synthesis prompt arms — dual-case vs blind vs sighted "
+            + ("(pivot target)" if horizon == "pv" else f"({horizon}-day)"),
             "Each tick EVERY prompt arm is asked about EVERY ticker — one arm drives the run, the others are shadow "
             "calls nobody acts on — so the arms are compared on the same ticker-days with the same engine and the same "
             "context, with the prompt as the only difference. Without that pairing an arm is only observable on the runs "
@@ -2223,24 +2357,29 @@ def _exit_forward_block(session=None, direction=None):
 
     reason_rows = [{
         "reason": r["exit_reason"], "trades": r["trades"],
+        "mean_pv": r.get("mean_pv"), "pos_pv": r.get("pct_pos_pv"),
         **{f"mean_{h}": r.get(f"mean_{h}d") for h in hs},
         **{f"pos_{h}": r.get(f"pct_pos_{h}d") for h in hs},
     } for r in rep["by_reason"] + [{"exit_reason": "ALL exits", **rep["overall"]}]]
     reason_cols = ([{"name": "Exit reason", "id": "reason"},
-                    {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT}]
+                    {"name": "Trades", "id": "trades", "type": "numeric", "format": _INT},
+                    {"name": "Mean →pivot %", "id": "mean_pv", "type": "numeric", "format": _NUM2}]
                    + [{"name": f"Mean +{h}d %", "id": f"mean_{h}", "type": "numeric", "format": _NUM2}
                       for h in hs]
+                   + [{"name": "%+ →pivot", "id": "pos_pv", "type": "numeric", "format": _NUM1}]
                    + [{"name": f"%+ @{h}d", "id": f"pos_{h}", "type": "numeric", "format": _NUM1}
                       for h in hs])
 
     trade_rows = [{
         "ticker": r["ticker"], "exit_date": r["exit_date"], "ret": r["return_pct"],
+        "fwd_pv": r.get("fwd_pv"),
         **{f"fwd_{h}": r.get(f"fwd_{h}d") for h in hs},
         "reason": r["exit_reason"],
     } for r in rep["per_trade"]]
     trade_cols = ([{"name": "Ticker", "id": "ticker"},
                    {"name": "Exit date", "id": "exit_date"},
-                   {"name": "Realized %", "id": "ret", "type": "numeric", "format": _NUM2}]
+                   {"name": "Realized %", "id": "ret", "type": "numeric", "format": _NUM2},
+                   {"name": "Fwd →pivot %", "id": "fwd_pv", "type": "numeric", "format": _NUM2}]
                   + [{"name": f"Fwd +{h}d %", "id": f"fwd_{h}", "type": "numeric", "format": _NUM2}
                      for h in hs]
                   + [{"name": "Exit reason", "id": "reason"}])
@@ -3274,6 +3413,12 @@ def run() -> None:
     """Run the dashboard, auto-restarting on an unexpected crash so it stays alive."""
     host, port = settings.dashboard_host, settings.dashboard_port
     logger.info(f"Dashboard starting at http://{host}:{port}  (Ctrl+C to stop)")
+    if AUTH_ENABLED:
+        logger.info(f"  🔒 Basic-Auth ON — user '{settings.dashboard_auth_username}' "
+                    "(shared password from DASHBOARD_AUTH_PASSWORD)")
+    else:
+        logger.info("  🔓 Basic-Auth OFF (no DASHBOARD_AUTH_PASSWORD) — anyone who can "
+                    "reach this port sees positions and P&L. Required before exposing it publicly.")
     if host in ("0.0.0.0", "::"):
         # Bound to all interfaces → reachable from other devices: the LAN when
         # home, and the Tailscale tailnet from anywhere (incl. cellular).

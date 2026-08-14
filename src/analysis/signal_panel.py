@@ -72,6 +72,24 @@ _DAILY_TECHNICAL = frozenset(c[:-4] for c in SIGNAL_TIMEFRAME_COLUMNS if c.endsw
 _FUNDAMENTAL_SET = frozenset(SIGNAL_FUNDAMENTAL_COLUMNS)
 
 
+def fwd_col(h) -> tuple:
+    """Horizon token -> ``(forward-return column, key suffix)``.
+
+    The canonical resolution every panel-reading evaluation shares (2026-08-13
+    standardization directive): ``"pv"`` — the H/L signed-pivot pseudo-horizon,
+    the decision basis — maps to ``("fwd_ret_pivot", "pv")``; an int ``h`` maps
+    to ``(f"fwd_ret_{h}d", f"{h}d")``, the fixed monitoring grid."""
+    return ("fwd_ret_pivot", "pv") if h == "pv" else (f"fwd_ret_{h}d", f"{h}d")
+
+
+def int_horizons(horizons: Sequence) -> list:
+    """The fixed-day subset of a horizon list — what ``build_panel(horizons=)``
+    accepts (the pivot label rides every panel unconditionally, so ``"pv"``
+    never needs to reach it)."""
+    ints = [h for h in horizons if h != "pv"]
+    return ints or [5]
+
+
 def category_for(method: str) -> str:
     """Map a method/score column to its IC category."""
     if method.endswith("_30m"):
@@ -345,6 +363,59 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
 
     for h in horizons:
         df[f"fwd_ret_{h}d"] = df.apply(lambda r: fwd(r, h), axis=1)
+
+    # PIVOT label (2026-08-12, user directive): the signed % return to the next
+    # pivot (`pivot_target.next_pivot_targets` — the ml_ohlcv-v2 training
+    # target) as `fwd_ret_pivot`, with `end_date_pivot` for walk-forward
+    # consumers (a variable-horizon label settles at its OWN end date, so
+    # "label printed" cutoffs must read the row's end, not a fixed offset).
+    # Point-in-time by TRUNCATION at the as-of cutoff: a pivot settles only if
+    # its CONFIRMING bar (pivot+1) is inside the visible window — one bar
+    # stricter than the fixed-horizon guard above, matching the label's real
+    # information timing. Unsettled rows stay NaN (never backfilled).
+    try:
+        import numpy as _np
+
+        from src.analysis.pivot_target import next_pivot_targets
+        from src.data.cache import load_ohlcv as _load_hl
+        pv_ret = pd.Series(float("nan"), index=df.index)
+        pv_end = pd.Series(None, index=df.index, dtype=object)
+        for tk, ridx in df.groupby("ticker").groups.items():
+            dts = dates_by_ticker.get(tk) or []
+            if _asof_d is not None:
+                dts = dts[:bisect_left(dts, _asof_d)]
+            if len(dts) < 50:
+                continue
+            closes = closes_by_ticker[tk]
+            c = _np.asarray([closes[d] for d in dts], dtype=float)
+            # H/L basis (2026-08-12): marks live on each bar's high/low; a
+            # missing frame degrades to closes-as-extremes rather than dropping
+            # the ticker's label.
+            harr = larr = c
+            try:
+                _f = _load_hl(tk)
+                if _f is not None and not _f.empty and "High" in _f.columns:
+                    _idx = pd.DatetimeIndex(_f.index)
+                    _hv = pd.to_numeric(_f["High"], errors="coerce").to_numpy(dtype=float)
+                    _lv = pd.to_numeric(_f["Low"], errors="coerce").to_numpy(dtype=float)
+                    _hm = {t.date(): v for t, v in zip(_idx, _hv) if v == v}
+                    _lm = {t.date(): v for t, v in zip(_idx, _lv) if v == v}
+                    harr = _np.asarray([_hm.get(d, closes[d]) for d in dts], dtype=float)
+                    larr = _np.asarray([_lm.get(d, closes[d]) for d in dts], dtype=float)
+            except Exception:
+                harr = larr = c
+            sp, end = next_pivot_targets(c, harr, larr)
+            pos = _np.searchsorted(_np.array(dts), df.loc[ridx, "_sig_date"].to_numpy())
+            ok = pos < len(dts)
+            for r, p, k in zip(ridx, pos, ok):
+                if k and end[p] >= 0:
+                    pv_ret.at[r] = float(sp[p])
+                    pv_end.at[r] = dts[int(end[p])].isoformat()
+        df["fwd_ret_pivot"] = pv_ret
+        df["end_date_pivot"] = pv_end
+    except Exception as _e:
+        logger.debug(f"[signal_panel] pivot label unavailable: {_e}")
+
     out = df.drop(columns=["_sig_date"])
     if _key is not None:
         # One panel per (args, run) — keep only the newest few so a long-lived
@@ -488,37 +559,41 @@ def compute_ic(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
             has_view &= s_all < 0
         row: dict = {"method": method, "category": category_for(method),
                      "views": int(has_view.sum())}
-        for h in horizons:
-            col = f"fwd_ret_{h}d"
+        # The PIVOT pseudo-horizon (2026-08-12) rides the same block under the
+        # "pv" suffix whenever the panel carries its label — the decision-basis
+        # IC beside the fixed monitoring grid.
+        h_list = list(horizons) + (["pv"] if "fwd_ret_pivot" in panel.columns else [])
+        for h in h_list:
+            col, sfx = fwd_col(h)
             f_all = pd.to_numeric(panel.get(col), errors="coerce")
             valid = has_view & f_all.notna()
             n = int(valid.sum())
-            row[f"n_{h}d"] = n
+            row[f"n_{sfx}"] = n
             if n < min_n:
-                row[f"ic_{h}d"] = None
-                row[f"icstd_{h}d"] = None
-                row[f"icir_{h}d"] = None
-                row[f"icdays_{h}d"] = 0
-                row[f"hit_{h}d"] = None
-                row[f"simret_{h}d"] = None
+                row[f"ic_{sfx}"] = None
+                row[f"icstd_{sfx}"] = None
+                row[f"icir_{sfx}"] = None
+                row[f"icdays_{sfx}"] = 0
+                row[f"hit_{sfx}"] = None
+                row[f"simret_{sfx}"] = None
                 continue
             s, f = s_all[valid], f_all[valid]
-            row[f"ic_{h}d"] = _spearman(s, f)
+            row[f"ic_{sfx}"] = _spearman(s, f)
             # Confidence: stdev + information-ratio of the PER-DAY IC (each day one
             # observation → not inflated by same-day cross-sectional correlation).
             # ``icdays`` = how many signal-days backed it (the evidence the IC-weight
             # shrinkage uses; a column the dashboard ignores).
             _, ic_std, icir, ic_days = periodic_ic_stats(
                 panel.loc[valid, "signal_date"], s, f, min_per_day, min_days)
-            row[f"icstd_{h}d"] = round(ic_std, 4) if ic_std is not None else None
-            row[f"icir_{h}d"] = round(icir, 3) if icir is not None else None
-            row[f"icdays_{h}d"] = int(ic_days)
+            row[f"icstd_{sfx}"] = round(ic_std, 4) if ic_std is not None else None
+            row[f"icir_{sfx}"] = round(icir, 3) if icir is not None else None
+            row[f"icdays_{sfx}"] = int(ic_days)
             moved = f != 0
-            row[f"hit_{h}d"] = (float(((s > 0) == (f > 0))[moved].mean() * 100)
-                                if moved.any() else None)
+            row[f"hit_{sfx}"] = (float(((s > 0) == (f > 0))[moved].mean() * 100)
+                                 if moved.any() else None)
             # Simulated solo return: trade the SIGN of the score, hold to horizon.
             signed = f.where(s > 0, -f)        # +f when score>0 (long), −f when score<0 (short)
-            row[f"simret_{h}d"] = round(float(signed.mean()), 4)
+            row[f"simret_{sfx}"] = round(float(signed.mean()), 4)
         rows.append(row)
     out = pd.DataFrame(rows)
     if out.empty:

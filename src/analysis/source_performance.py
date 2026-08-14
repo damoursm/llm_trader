@@ -26,7 +26,7 @@ This module turns that stamp into evidence two ways:
 Both are pure (DataFrame / list in, plain structures out) so they're unit-
 testable; ``load_*`` + ``main`` are the live-DB convenience layer.
 
-Usage:  python -m src.analysis.source_performance [--horizons 1,5,10] [--days 90]
+Usage:  python -m src.analysis.source_performance [--horizons pv,1,5,10] [--days 90]
                                                   [--min-n 10]
 """
 
@@ -38,7 +38,8 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
-from src.analysis.signal_panel import _spearman, build_panel, periodic_ic_stats
+from src.analysis.signal_panel import (_spearman, build_panel, fwd_col,
+                                       int_horizons, periodic_ic_stats)
 
 # A score below this magnitude is "no view" (the aggregator had nothing) and is
 # excluded from the source's IC / simulated return — matches signal_panel.py.
@@ -64,7 +65,7 @@ def _source_label(val) -> str:
     return s if s and s.lower() not in ("nan", "none") else _UNSTAMPED
 
 
-def compute_source_performance(panel: pd.DataFrame, horizons: Sequence[int] = (1, 5, 10),
+def compute_source_performance(panel: pd.DataFrame, horizons: Sequence = ("pv", 1, 5, 10),
                                min_n: int = 10, min_per_day: int = 5,
                                min_days: int = 3) -> pd.DataFrame:
     """Per-``universe_source`` forward-return performance over the signals panel.
@@ -109,18 +110,19 @@ def compute_source_performance(panel: pd.DataFrame, horizons: Sequence[int] = (1
                  if "combined_score" in g.columns
                  else pd.Series(float("nan"), index=g.index))
         for h in horizons:
-            fwd = pd.to_numeric(g.get(f"fwd_ret_{h}d"), errors="coerce")
+            _col, _sfx = fwd_col(h)
+            fwd = pd.to_numeric(g.get(_col), errors="coerce")
             valid = fwd.notna()
             n = int(valid.sum())
-            row[f"n_{h}d"] = n
+            row[f"n_{_sfx}"] = n
             if n < min_n:
                 for k in ("fwd", "win", "ic", "icir", "simret"):
-                    row[f"{k}_{h}d"] = None
+                    row[f"{k}_{_sfx}"] = None
                 continue
             f = fwd[valid]
-            row[f"fwd_{h}d"] = round(float(f.mean()), 4)
+            row[f"fwd_{_sfx}"] = round(float(f.mean()), 4)
             moved = f != 0
-            row[f"win_{h}d"] = (round(float((f[moved] > 0).mean() * 100.0), 2)
+            row[f"win_{_sfx}"] = (round(float((f[moved] > 0).mean() * 100.0), 2)
                                 if bool(moved.any()) else None)
 
             # IC / simret condition on a real aggregate signal (non-zero score).
@@ -129,14 +131,14 @@ def compute_source_performance(panel: pd.DataFrame, horizons: Sequence[int] = (1
             if int(has_view.sum()) >= min_n:
                 sv, fv = s[has_view], f[has_view]
                 ic = _spearman(sv, fv)
-                row[f"ic_{h}d"] = round(ic, 3) if ic is not None else None
+                row[f"ic_{_sfx}"] = round(ic, 3) if ic is not None else None
                 _, _, icir, _ = periodic_ic_stats(
                     g.loc[valid, "signal_date"][has_view], sv, fv, min_per_day, min_days)
-                row[f"icir_{h}d"] = round(icir, 2) if icir is not None else None
+                row[f"icir_{_sfx}"] = round(icir, 2) if icir is not None else None
                 signed = fv.where(sv > 0, -fv)   # +f for a long call, −f for a short
-                row[f"simret_{h}d"] = round(float(signed.mean()), 4)
+                row[f"simret_{_sfx}"] = round(float(signed.mean()), 4)
             else:
-                row[f"ic_{h}d"] = row[f"icir_{h}d"] = row[f"simret_{h}d"] = None
+                row[f"ic_{_sfx}"] = row[f"icir_{_sfx}"] = row[f"simret_{_sfx}"] = None
         rows.append(row)
 
     out = pd.DataFrame(rows)
@@ -192,10 +194,10 @@ def compute_source_trade_perf(trades: Iterable[dict]) -> list:
 
 # ── live-DB convenience layer ────────────────────────────────────────────────
 
-def load_source_performance(horizons: Sequence[int] = (1, 5, 10),
+def load_source_performance(horizons: Sequence = ("pv", 1, 5, 10),
                             days: Optional[int] = None, min_n: int = 10) -> pd.DataFrame:
     """Build the signals panel and compute per-source performance over it."""
-    panel = build_panel(horizons=horizons, days=days)
+    panel = build_panel(horizons=int_horizons(horizons), days=days)
     if panel is None or panel.empty:
         return pd.DataFrame()
     return compute_source_performance(panel, horizons=horizons, min_n=min_n)
@@ -240,8 +242,9 @@ def _print_report(horizons: Sequence[int], days: Optional[int], min_n: int) -> N
             fp_s = f"{fp:>9.1f}" if pd.notna(fp) else f"{'—':>9}"
             line = f"{str(r['source']):<18}{int(r['rows']):>7}{fp_s}"
             for h in horizons:
-                n, fwd, win, ic = (r.get(f"n_{h}d"), r.get(f"fwd_{h}d"),
-                                   r.get(f"win_{h}d"), r.get(f"ic_{h}d"))
+                _sfx = fwd_col(h)[1]
+                n, fwd, win, ic = (r.get(f"n_{_sfx}"), r.get(f"fwd_{_sfx}"),
+                                   r.get(f"win_{_sfx}"), r.get(f"ic_{_sfx}"))
                 line += f"{int(n) if pd.notna(n) else 0:>6}"
                 line += f"{fwd:>+9.2f}" if pd.notna(fwd) else f"{'—':>9}"
                 line += f"{win:>7.1f}%" if pd.notna(win) else f"{'—':>8}"
@@ -266,14 +269,15 @@ def _print_report(horizons: Sequence[int], days: Optional[int], min_n: int) -> N
 def main(argv: Optional[Iterable[str]] = None) -> None:
     p = argparse.ArgumentParser(
         description="Per-discovery-source forward-return + realized-trade performance.")
-    p.add_argument("--horizons", default="1,5,10",
+    p.add_argument("--horizons", default="pv,1,5,10",
                    help="comma-separated forward horizons in sessions (default 1,5,10)")
     p.add_argument("--days", type=int, default=None,
                    help="only signals from the last N calendar days (default: all)")
     p.add_argument("--min-n", type=int, default=10,
                    help="minimum joint observations before a horizon's stats report (default 10)")
     args = p.parse_args(list(argv) if argv is not None else None)
-    horizons = tuple(int(h) for h in str(args.horizons).split(",") if h.strip())
+    horizons = tuple((h.strip() if h.strip() == "pv" else int(h))
+                     for h in str(args.horizons).split(",") if h.strip())
     _print_report(horizons, args.days, args.min_n)
 
 

@@ -102,7 +102,17 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # pivot` (panel IC +0.0639, t +2.31, edge +2.58pp over 14,610 rows /
     # 2026-08-08); record in memory/pivot-horizon-target-2026-08.md. Ordinary
     # retrains within v2 stay the ml_models registry's job, per the module rule.
-    "ml_ohlcv": datetime(2026, 8, 8, 16, 30, tzinfo=timezone.utc),
+    # 2026-08-12 21:00 UTC (deploy-2 restart): the PIVOT DEFINITION moved —
+    # close-based zero-threshold zigzag → H/L basis (peaks on highs, troughs on
+    # lows, targets to the pivot bar's EXTREME) + the 1% minimum-move threshold
+    # (`pivot_min_move_pct`; both user directives, same day). The target AND
+    # the 9 leg features changed meaning, so every stored ml_ohlcv score is a
+    # different quantity. Serving carries its own second guard: the artifact
+    # is stamped `pivot_basis` ("hl1") and a stale-basis artifact ABSTAINS
+    # (BASIS_STALE), so between this instant and the retrain landing the
+    # method scores nothing rather than something wrong. Supersedes the
+    # 2026-08-08 v1→v2 entry (any pre-hl1 row is already pre-this-epoch).
+    "ml_ohlcv": datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc),
     # 2026-08-10 16:20 UTC (scheduler restart; the instant sits between the last
     # v1 run 16:00:14 and the first v2 run 16:38:50 — the restarted scheduler's
     # misfire-grace catch-up tick stamped 16:38:50, EARLIER than the restart
@@ -161,7 +171,17 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
 #   2026-07-19 family-agreement + tape factors — bounded to +/-12% and +/-8%.
 #   2026-07-27 market-relative weighting/filter — changes the weights inside an
 #   unchanged formula; the panel's own drift is already visible without masking.
-CONFIDENCE_EPOCH: datetime = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+#
+#   2026-08-14 method RANK basis (user directive): the combine consumes every
+#   method's CENTERED WITHIN-RUN RANK instead of its absolute score
+#   (`aggregator._rank_transform_run`, `method_score_basis`). Raw scores stay
+#   persisted (no scorer epoch — outputs unchanged), but |combined| and every
+#   confidence ingredient built on the map (coherence, sources_agreeing,
+#   family votes) now live on a different scale: mean |eff score| jumps from
+#   ~0.1-0.2 to ~0.5 by construction. Same categorical test as 2026-07-22.
+#   Instant = the first scheduler restart with the code; rows before it were
+#   produced by the absolute-basis combine.
+CONFIDENCE_EPOCH: datetime = datetime(2026, 8, 14, 2, 0, tzinfo=timezone.utc)
 
 # Columns the confidence epoch governs: the value plus the six ingredients that
 # are only interpretable alongside it.

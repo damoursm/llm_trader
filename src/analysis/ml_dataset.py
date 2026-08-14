@@ -405,9 +405,11 @@ def build_panel_dataset(horizons: Sequence[int] = (5, 10), days: Optional[int] =
     silently drops — judges it. Same column schema as ``build_dataset`` so the
     walk-forward validator can train on one and evaluate on the other.
 
-    Caveat: the 2 cross-sectional features rank within each day's universe, which
-    differs between the deep-cache (training) and panel (eval) sets — a small
-    distribution shift on 2 of the columns, noted rather than hidden.
+    Caveat: the 6 cross-sectional features (``_XRANK_SOURCES``) rank within each
+    day's universe, which differs between the deep-cache (training) and panel
+    (eval) sets — a distribution shift on 6 of the columns, noted rather than
+    hidden. (Said "2" until 2026-08-12; the set grew to 6 and the count was
+    never updated — the number here must track ``_XRANK_SOURCES``.)
     """
     from src.analysis.signal_panel import build_panel
     benchmark = benchmark or settings.horizon_market_benchmark

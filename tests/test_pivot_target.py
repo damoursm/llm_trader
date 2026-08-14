@@ -44,13 +44,16 @@ def test_worked_example_signed_target():
                   19, 20, 19, 18, 19, 20, 21], dtype=float)
     rows = {r["signal_date"]: r for r in _rows(c)}
     d = _dates(len(c))
-    # At i=0 (rising toward the i=2 peak): target = 12/10 - 1 = +20%, end = date[2].
+    # H/L basis: the helper feeds h = c*1.01 / lo = c*0.99, so the target lands
+    # on the pivot bar's EXTREME. At i=0 (rising toward the i=2 peak):
+    # target = (12*1.01)/10 - 1 = +21.2%, end = date[2].
     r0 = rows[d[0].isoformat()]
-    assert r0["sp_buy"] == pytest.approx(20.0)
+    assert r0["sp_buy"] == pytest.approx(21.2)
     assert r0["sp_end"] == d[2].isoformat()
-    # At i=2 (the peak itself): next pivot is the trough at i=4 -> 10/12-1 = -16.67%.
+    # At i=2 (the peak itself): next pivot is the trough at i=4 ->
+    # (10*0.99)/12 - 1 = -17.5%.
     r2 = rows[d[2].isoformat()]
-    assert r2["sp_buy"] == pytest.approx(-16.6667, abs=1e-3)
+    assert r2["sp_buy"] == pytest.approx(-17.5, abs=1e-3)
     assert r2["sp_end"] == d[4].isoformat()
     # sign(target) == sign(tomorrow's move) on every emitted row.
     for i in range(len(c) - 1):
@@ -97,12 +100,15 @@ def test_settled_rows_immune_to_future_mutation():
     probe = None
     for r in rows_before.values():
         j = d.index(pd.Timestamp(r["sp_end"]).date())
-        if j < len(c) - 30:
+        if j < len(c) - 36:
             probe = (r, j)
     assert probe is not None
     r_ref, j_end = probe
     c2 = c.copy()
-    c2[j_end + 2:] = c2[j_end + 2:] * 7.0 + 3.0          # violent future rewrite
+    # The threshold zigzag confirms a pivot only when the 1% reversal PRINTS
+    # (variable lag), so immunity is guaranteed only past the confirmation
+    # bar; +6 bars of 2% noise is deterministic slack for seed 7.
+    c2[j_end + 6:] = c2[j_end + 6:] * 7.0 + 3.0          # violent future rewrite
     rows_after = {r["signal_date"]: r for r in _rows(c2)}
     r_new = rows_after[r_ref["signal_date"]]
     for k, v in r_ref.items():
@@ -161,3 +167,40 @@ def test_within_day_rank_centred_and_per_day():
     assert r[:3] == pytest.approx([-0.5, 0.5, 0.0])       # day 0: 1 < 2 < 3
     assert r[3:] == pytest.approx([-0.5, 0.5])            # day 1: -5 < 0
     assert float(np.abs(r).max()) <= 0.5
+
+
+def test_sub_threshold_wiggles_never_pivot():
+    """The 2026-08-12 min-move directive: runs smaller than
+    ``pivot_min_move_pct`` are not worth the spread and must not become
+    pivots. A 0.5% saw inside a rising trend leaves the up-leg unbroken."""
+    import numpy as np
+
+    from src.analysis.pivot_target import _resolved_pivots
+
+    base = np.linspace(100.0, 130.0, 80)
+    saw = 1.0 + 0.0025 * np.where(np.arange(80) % 2 == 0, 1.0, -1.0)  # ±0.25%
+    c = base * saw
+    h, lo = c * 1.002, c * 0.998                    # intraday range ~0.4% < 1%
+    P, PP, FL, CF = _resolved_pivots(c, h, lo)
+    # the seeding trough at the series start may confirm; no PEAK may exist —
+    # the saw never retraces 1% from a running high inside the trend
+    assert not FL.any(), f"sub-threshold wiggles produced peak pivots at {P[FL]}"
+
+
+def test_pivot_confirmation_is_the_threshold_reversal_bar():
+    """Variable-lag seam: the pivot's confirmation index is the bar whose
+    adverse print reached the threshold — NOT extreme+1."""
+    import numpy as np
+
+    from src.analysis.pivot_target import _resolved_pivots
+
+    c = np.r_[np.linspace(100, 120, 60),            # up-leg to the peak
+              [119.9, 119.85, 119.7, 118.0, 116.0]]  # slow bleed, then the 1% print
+    h, lo = c * 1.0001, c * 0.9999                   # razor-thin bars
+    P, PP, FL, CF = _resolved_pivots(c, h, lo)
+    pk = [k for k in range(len(P)) if FL[k]]
+    assert pk, "need the peak"
+    k = pk[-1]
+    assert P[k] == 59                                # the extreme bar
+    # 120*0.99 = 118.8 — first low at/below that is bar 63 (118.0*0.9999)
+    assert CF[k] == 63, f"confirmation must wait for the 1% print (got {CF[k]})"

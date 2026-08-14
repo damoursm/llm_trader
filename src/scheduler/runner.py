@@ -242,6 +242,81 @@ def _should_run_eod(now_naive: datetime, last_eod_date, eod_time: _time) -> bool
 
 
 _RESCORE_THREAD = None
+_WEEKLY_ML_THREAD = None
+
+
+def _should_run_weekly_ml_train(now_naive: datetime, last_date, at: _time) -> bool:
+    """True on the first poll at/after ``at`` ET on the configured RETRAIN
+    WEEKDAY (default Saturday) it hasn't yet run for. Weekly by construction:
+    the weekday gate fires one day a week, ``last_date`` dedupes within it.
+    Deliberately NOT gated on `is_market_day` — Saturday isn't one, which is
+    the point (quiet machine, fresh full week of settled pivot labels). A
+    machine asleep through the whole window skips that week (the models are
+    at most a week + a weekend stale, and the trainer runs fail-soft)."""
+    if not (settings.enable_eod_ml_train or settings.enable_eod_ml_buy_train
+            or settings.enable_eod_ml_exit_train):
+        return False
+    return (last_date != now_naive.date()
+            and now_naive.weekday() == int(settings.ml_retrain_weekday)
+            and now_naive.time() >= at)
+
+
+def _run_weekly_ml_train() -> None:
+    """Launch the weekly ML retrain in a BACKGROUND thread (single-flight,
+    same pattern as the EOD/rescore). Sequential inside — Saturday has the
+    machine to itself, and the trains share the panel/caches anyway."""
+    global _WEEKLY_ML_THREAD
+    if _WEEKLY_ML_THREAD is not None and _WEEKLY_ML_THREAD.is_alive():
+        logger.warning("[scheduler] weekly ML retrain still running — not starting another")
+        return
+    import threading as _threading
+    _WEEKLY_ML_THREAD = _threading.Thread(target=_weekly_ml_work,
+                                          name="weekly-ml-train", daemon=True)
+    _WEEKLY_ML_THREAD.start()
+    logger.info("[scheduler] weekly ML retrain STARTING in background thread")
+
+
+def _weekly_ml_work() -> None:
+    """The weekly trainer body — every ML artifact, gated by its enable flag
+    (the `enable_eod_ml_*` names are kept for .env compatibility; since
+    2026-08-12 they gate THIS weekly job, not a nightly EOD step)."""
+    # ml_ohlcv: force=True bypasses the ml_pivot_retrain_days throttle — that
+    # throttle paced NIGHTLY calls; under a weekly cadence it could skip a
+    # Saturday whenever an out-of-band retrain (promotion, basis change)
+    # happened mid-week. A stale/failed artifact means the method abstains.
+    if settings.enable_eod_ml_train:
+        try:
+            from src.signals.ml_model import eod_train
+            art = eod_train(force=True)
+            if art:
+                logger.info(f"[scheduler] weekly ml_ohlcv train: {art['n_train']:,} rows "
+                            f"(<= {art['train_max_date']})")
+        except Exception as exc:
+            logger.warning(f"[scheduler] weekly ml_ohlcv train failed: {exc}")
+    # Stackers: a stale/failed artifact only means the ML combine arm falls
+    # back to the weighted combine (combine_source records it). Fail-soft.
+    if settings.enable_eod_ml_buy_train:
+        try:
+            from src.analysis.ml_stacker import eod_train_buy, eod_train_sell
+            for _name, _fn in (("ml_buy", eod_train_buy), ("ml_sell", eod_train_sell)):
+                art = _fn()
+                if art:
+                    logger.info(f"[scheduler] weekly {_name} train: {art['n_train']:,} rows "
+                                f"(<= {art['train_max_date']})")
+        except Exception as exc:
+            logger.warning(f"[scheduler] weekly ml_buy/ml_sell train failed: {exc}")
+    # ML exit-timer: a stale/failed artifact only means the hand-built exit
+    # machinery is kept for arm trades. Fail-soft.
+    if settings.enable_eod_ml_exit_train:
+        try:
+            from src.analysis.ml_exit_dataset import eod_train_exit
+            art = eod_train_exit()
+            if art:
+                logger.info(f"[scheduler] weekly ml_exit train: {art['n_train']:,} rows "
+                            f"(<= {art['train_max_date']})")
+        except Exception as exc:
+            logger.warning(f"[scheduler] weekly ml_exit train failed: {exc}")
+    logger.info("[scheduler] weekly ML retrain complete")
 
 
 def _should_run_nightly_rescore(now_naive: datetime, last_date, at: _time) -> bool:
@@ -415,57 +490,11 @@ def _eod_work() -> None:
         except Exception as exc:
             logger.warning(f"[scheduler] EOD walk-forward failed: {exc}")
 
-    def _ml_step() -> None:
-        # Retrain the ml_ohlcv model (signals/ml_model.py; weighted 0.12 since
-        # 2026-08-11, throttled weekly in pivot mode). A stale/failed artifact
-        # means the method abstains (score 0) — degraded, never a broken tick.
-        if settings.enable_eod_ml_train:
-            try:
-                from src.signals.ml_model import eod_train
-                art = eod_train()
-                if art:
-                    logger.info(f"[scheduler] EOD ml_ohlcv train: {art['n_train']:,} rows "
-                                f"(<= {art['train_max_date']})")
-            except Exception as exc:
-                logger.warning(f"[scheduler] EOD ml_ohlcv train failed: {exc}")
-        # Retrain both stackers on the freshly-materialised panel (the ML combine
-        # arm is LIVE at 50% since 2026-08-11, STACKER_GBM_PARAMS config). A
-        # stale/failed artifact only means the arm falls back to the weighted
-        # combine (combine_source records it). Fail-soft.
-        if settings.enable_eod_ml_buy_train:
-            try:
-                from src.analysis.ml_stacker import eod_train_buy, eod_train_sell
-                for _name, _fn in (("ml_buy", eod_train_buy), ("ml_sell", eod_train_sell)):
-                    art = _fn()
-                    if art:
-                        logger.info(f"[scheduler] EOD {_name} train: {art['n_train']:,} rows "
-                                    f"(<= {art['train_max_date']})")
-            except Exception as exc:
-                logger.warning(f"[scheduler] EOD ml_buy/ml_sell train failed: {exc}")
-        # Retrain the ML EXIT model on the freshly-materialised panel. It only closes
-        # arm-cohort trades and is otherwise panel-first (IC-tracked), so a stale/
-        # failed artifact only means the hand-built exit machinery is kept. Fail-soft.
-        if settings.enable_eod_ml_exit_train:
-            try:
-                from src.analysis.ml_exit_dataset import eod_train_exit
-                art = eod_train_exit()
-                if art:
-                    logger.info(f"[scheduler] EOD ml_exit train: {art['n_train']:,} rows "
-                                f"(<= {art['train_max_date']})")
-            except Exception as exc:
-                logger.warning(f"[scheduler] EOD ml_exit train failed: {exc}")
-
-    # Walk-forward and the ML retrains are independent of each other (both need
-    # the replay-refreshed panel above; neither feeds the other) — run them in
-    # parallel. Two workers, join before returning so the thread's lifetime
-    # brackets the whole job for the single-flight guard.
-    from concurrent.futures import ThreadPoolExecutor as _TPE
-    with _TPE(max_workers=2, thread_name_prefix="eod") as _ex:
-        for _f in (_ex.submit(_wf_step), _ex.submit(_ml_step)):
-            try:
-                _f.result()
-            except Exception as exc:
-                logger.warning(f"[scheduler] EOD parallel stage raised: {exc}")
+    # ML retrains are NOT here anymore (2026-08-12, user directive): models
+    # retrain ONCE A WEEK, Saturday morning — see `_run_weekly_ml_train`. The
+    # EOD keeps the data-freshness chain (warm → retention → replay → the
+    # walk-forward below), which the weekly trains then read on Saturday.
+    _wf_step()
 
     # NOTE the automatic refactor is deliberately NOT here — it runs on its own
     # nightly slot (`_maybe_start_nightly_rescore`, 02:00 ET by default) in a
@@ -642,6 +671,8 @@ def start_scheduler() -> None:
     prev_poll: datetime | None = None
     last_eod_date = None
     eod_time = _parse_hhmm(settings.eod_maintenance_time, _time(16, 20)) or _time(16, 20)
+    last_ml_train_date = None
+    ml_train_time = _parse_hhmm(settings.ml_retrain_time, _time(8, 0)) or _time(8, 0)
     rescore_time = _parse_hhmm(settings.rescore_time, _time(2, 0)) or _time(2, 0)
     last_rescore_date = None
     if settings.enable_eod_maintenance:
@@ -773,6 +804,15 @@ def start_scheduler() -> None:
                 except Exception as exc:
                     logger.exception(f"[scheduler] EOD maintenance raised: {exc}")
                     _alert_crash("EOD maintenance", exc)
+
+            # Weekly ML retrain — Saturday morning (2026-08-12 directive:
+            # models retrain once a week, not nightly).
+            if _should_run_weekly_ml_train(now_naive, last_ml_train_date, ml_train_time):
+                last_ml_train_date = now_naive.date()
+                try:
+                    _run_weekly_ml_train()
+                except Exception as exc:
+                    logger.exception(f"[scheduler] weekly ML retrain raised: {exc}")
 
             _time_module.sleep(poll)
     except (KeyboardInterrupt, SystemExit):
