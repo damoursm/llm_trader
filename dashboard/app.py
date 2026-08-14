@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import ipaddress
 import time
 from datetime import datetime, timezone
 
@@ -26,9 +27,155 @@ server = app.server  # for WSGI deployment if ever needed
 
 _DENY_BODY = b"Authentication required.\n"
 
+# Hostnames that mean "this machine" in a browser's address bar.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
+
+# Headers that exist ONLY because something proxied the request. Their VALUES are
+# never trusted (any client can forge them) — only their PRESENCE is used, and only
+# in the safe direction: present ⇒ not local ⇒ password required. Forging one can
+# therefore lock a caller out, never let one in.
+_PROXY_HEADER_KEYS = frozenset({
+    "HTTP_FORWARDED",            # RFC 7239
+    "HTTP_X_REAL_IP",
+    "HTTP_VIA",
+    "HTTP_CF_CONNECTING_IP",     # Cloudflare
+    "HTTP_TRUE_CLIENT_IP",
+    "HTTP_PROXY_CONNECTION",
+})
+_PROXY_HEADER_PREFIXES = ("HTTP_X_FORWARDED_", "HTTP_X_ORIGINAL_", "HTTP_NGROK_")
+
+_NETWORK_CACHE: dict[str, tuple] = {}
+_HOST_CACHE: dict[str, tuple] = {}
+
+
+def _bypass_hosts() -> tuple:
+    """Parsed ``dashboard_auth_bypass_hosts``, lowercased. Entries starting with
+    "." are suffix matches; the rest are exact hostnames."""
+    raw = (settings.dashboard_auth_bypass_hosts or "").strip()
+    cached = _HOST_CACHE.get(raw)
+    if cached is None:
+        cached = tuple(
+            part.strip().lower().rstrip(".") if not part.strip().startswith(".")
+            else part.strip().lower()
+            for part in raw.split(",") if part.strip()
+        )
+        _HOST_CACHE[raw] = cached
+    return cached
+
+
+def _bypass_networks() -> tuple:
+    """Parsed ``dashboard_auth_bypass_networks``. Empty tuple ⇒ gate everything.
+
+    Memoised on the raw string rather than at import: the value is read on every
+    request, so a bad CIDR must not be able to turn the gate into an exception.
+    """
+    raw = (settings.dashboard_auth_bypass_networks or "").strip()
+    cached = _NETWORK_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            # Fail CLOSED for this entry: an unparseable CIDR grants nothing.
+            logger.warning(f"[dashboard] ignoring unparseable auth-bypass network {part!r}")
+    result = tuple(nets)
+    _NETWORK_CACHE[raw] = result
+    return result
+
+
+def _ip_in(addr: str, nets: tuple) -> bool:
+    """True if ``addr`` parses as an IP inside one of ``nets``."""
+    try:
+        ip = ipaddress.ip_address((addr or "").strip())
+    except ValueError:
+        return False
+    # A v4 socket reached over a dual-stack listener shows up as ::ffff:127.0.0.1,
+    # which is NOT a member of 127.0.0.0/8 until it is unwrapped.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return any(ip in net for net in nets)
+
+
+def _hostname_only(host: str) -> str:
+    """Strip the port (and IPv6 brackets) from a Host header value."""
+    host = (host or "").strip()
+    if host.startswith("["):                       # [::1]:8050
+        end = host.find("]")
+        return host[1:end] if end > 0 else host[1:]
+    if host.count(":") == 1:                       # 127.0.0.1:8050 — a bare IPv6
+        host = host.split(":", 1)[0]               # literal has more than one colon
+    return host
+
+
+def _is_local_request(environ) -> bool:
+    """True only when the request provably came from a trusted local browser.
+
+    ⚠ The obvious implementation — ``REMOTE_ADDR is loopback`` — is WRONG here and
+    would publish live P&L to the open internet. The ngrok tunnel dials out from
+    this PC and forwards the public hostname to 127.0.0.1, so every request from a
+    public visitor ALSO arrives with a loopback peer address. Peer address alone
+    cannot tell the owner's browser from the whole internet.
+
+    Three independent things must hold, any one of which stops a tunnelled request:
+
+    1. the peer address is in ``dashboard_auth_bypass_networks`` (default: this
+       machine) — stops other devices on the LAN/tailnet;
+    2. no proxy header is present — the tunnel edge stamps ``X-Forwarded-For``
+       and friends on everything it relays, and a client can add such a header
+       but cannot remove one;
+    3. the ``Host`` header names a trusted address — a loopback/bypass-network IP
+       literal, or a name the owner listed in ``dashboard_auth_bypass_hosts``
+       (Tailscale MagicDNS). A browser at ``https://<name>.ngrok-free.dev`` sends
+       that name through, and it is on nobody's list.
+
+    (2) only works because ``_serve_once`` tells waitress to keep those headers;
+    waitress deletes them by default, which would silently collapse this to (1)
+    and (3). That coupling is asserted by tests/test_dashboard_auth.py.
+    """
+    nets = _bypass_networks()
+    if not nets:                                   # bypass disabled → gate everything
+        return False
+
+    # Key first: environ also holds non-string objects (wsgi.input, wsgi.errors),
+    # and truth-testing an arbitrary object before knowing it is a header is how
+    # an auth check acquires a way to raise.
+    for key in environ:
+        if not isinstance(key, str):
+            continue
+        if key in _PROXY_HEADER_KEYS or key.startswith(_PROXY_HEADER_PREFIXES):
+            if environ.get(key):
+                return False
+
+    if not _ip_in(environ.get("REMOTE_ADDR", ""), nets):
+        return False
+
+    host = _hostname_only(environ.get("HTTP_HOST", "")).lower().rstrip(".")
+    if not host:                                   # no Host header ⇒ unprovable ⇒ gated
+        return False
+    if host in _LOOPBACK_HOSTNAMES:
+        return _ip_in("127.0.0.1", nets) or _ip_in("::1", nets)
+    if _ip_in(host, nets):                         # a bare IP literal, e.g. 100.90.109.43
+        return True
+    # A NAME — Tailscale MagicDNS is the reason this exists. Only names the owner
+    # listed count; every other name (the public ngrok domain included) is gated.
+    for entry in _bypass_hosts():
+        if host == entry or (entry.startswith(".") and host.endswith(entry)):
+            return True
+    return False
+
 
 def _basic_auth_middleware(inner, username: str, password: str):
     """Wrap a WSGI callable in an HTTP Basic-Auth gate (one shared credential).
+
+    Requests that ``_is_local_request`` proves came from this machine skip the
+    prompt entirely: the point of the password is the PUBLIC URL, and forcing the
+    owner to log in to their own loopback dashboard buys nothing.
 
     Split out from ``_install_basic_auth`` so the gate can be tested against a
     stub inner app instead of the whole Dash stack — an auth check nobody can
@@ -37,6 +184,11 @@ def _basic_auth_middleware(inner, username: str, password: str):
     expected = f"{username}:{password}".encode("utf-8")
 
     def _gate(environ, start_response):
+        # Localhost browses without a login; everything else must present the
+        # shared password. See _is_local_request for why this is not "is the peer
+        # 127.0.0.1" — the tunnel makes the whole internet look like 127.0.0.1.
+        if _is_local_request(environ):
+            return inner(environ, start_response)
         header = environ.get("HTTP_AUTHORIZATION", "")
         if header.startswith("Basic "):
             try:
@@ -3371,7 +3523,17 @@ def _serve_once(host: str, port: int) -> None:
 
     # A few worker threads so a slow performance() render can't block the whole UI;
     # channel_timeout reaps connections that go quiet instead of leaking them.
-    serve(app.server, host=host, port=port, threads=8, channel_timeout=120)
+    #
+    # clear_untrusted_proxy_headers=False is a SECURITY requirement here, not a
+    # relaxation. Waitress defaults it to True, which DELETES X-Forwarded-For /
+    # -Proto / -Host / Forwarded from the environ before the app ever sees them.
+    # Since the ngrok tunnel forwards to 127.0.0.1, that would leave a public
+    # visitor indistinguishable from a browser on this machine, and the localhost
+    # bypass in _is_local_request would hand the open internet a free pass —
+    # silently, with every log line and test still reading normal. We never trust
+    # these headers' values; we only need to SEE that they were sent.
+    serve(app.server, host=host, port=port, threads=8, channel_timeout=120,
+          clear_untrusted_proxy_headers=False)
 
 
 def _lan_ipv4() -> str | None:
@@ -3416,6 +3578,18 @@ def run() -> None:
     if AUTH_ENABLED:
         logger.info(f"  🔒 Basic-Auth ON — user '{settings.dashboard_auth_username}' "
                     "(shared password from DASHBOARD_AUTH_PASSWORD)")
+        nets = _bypass_networks()
+        if nets:
+            logger.info("  🏠 No password from " + ", ".join(str(n) for n in nets)
+                        + " (tunnelled requests are gated even though they arrive "
+                          "from loopback — proxy headers + Host give them away)")
+            hosts = _bypass_hosts()
+            if hosts:
+                logger.info("     ...addressed as " + ", ".join(hosts)
+                            + ", or by IP. Any OTHER hostname is asked for the password.")
+        else:
+            logger.info("  🔒 No bypass — every request needs the password, "
+                        "including this machine (DASHBOARD_AUTH_BYPASS_NETWORKS is empty)")
     else:
         logger.info("  🔓 Basic-Auth OFF (no DASHBOARD_AUTH_PASSWORD) — anyone who can "
                     "reach this port sees positions and P&L. Required before exposing it publicly.")

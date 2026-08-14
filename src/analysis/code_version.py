@@ -61,6 +61,9 @@ METHOD_SOURCES: Dict[str, Tuple[str, ...]] = {
     # Sentiment / news
     "news": ("src.analysis.sentiment",),
     "sent_velocity": ("src.signals.sentiment_velocity",),
+    # news_shock reads the sentiment module's attention_mass too — both modules
+    # move its output, so both are fingerprinted.
+    "news_shock": ("src.signals.news_shock", "src.analysis.sentiment"),
     # Options family. `max_pain` and `oi_skew` have no module of their own —
     # they are scored INLINE in the aggregator from fetched chain data, so the
     # aggregator IS their source. Coarse (any aggregator edit marks them) but

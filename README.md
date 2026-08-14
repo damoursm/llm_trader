@@ -1192,6 +1192,18 @@ When `ENABLE_SENTIMENT_VELOCITY=true`, computes the **rate of change** of news t
 
 ---
 
+### News Shock — abnormal attention (`src/signals/news_shock.py`, 2026-08-14)
+
+The quantitative complement to the news LEVEL: a genuine catalyst is both *directional* and **LOUD relative to the ticker's own normal**; a routine story is not. Panel-first at **weight 0** (measured before it can be weighted, like squeeze/iv_term/avwap).
+
+1. Every run persists each ticker's **recency mass** (Σ per-article exponential recency weights — the freshness-weighted quantity of news; `signals.news_recency_mass` + `news_article_count`).
+2. The baseline is the ticker's own trailing **median daily mass** (`NEWS_SHOCK_BASELINE_DAYS` = 20, needing ≥ `NEWS_SHOCK_MIN_DAYS` = 5 covered days — the column is forward-collected, so the method abstains its first ~week and self-activates).
+3. `score = sign(news) × clip(log₂(mass_today / baseline) / 3, 0, 1)` — 2× normal attention → 0.33, 8× → 1.0. Below-baseline attention scores **0** (quiet is the normal state, not a fade signal); no news direction, no baseline, or a failed baseline query all abstain (fail-soft).
+
+Part of the 2026-08-14 **news-family continuity pass**, which also made the `insider` score continuous (**exact trade notionals** — 13F/Form 4/options-sweep rows knew the precise dollar value and were rounding it into 8 buckets before scoring — plus log-dollar weighting, 7-day-half-life recency decay, seniority and disclosure-lag terms, and 6-decimal persisted precision instead of 3; within-run tie mass had been **81%**, collapsing the method to a single median rank under the ranking system) and the `news` precision scalers continuous (evidence-mass scale replacing the article count, smooth source-diversity curve, a two-decimal LLM precision mandate, and a prompt-version-salted sentiment cache). Both changes are scorer-epoch-registered. Disable with `ENABLE_NEWS_SHOCK=false`.
+
+---
+
 ### Step 3M — Trend Strength (`src/signals/trend_strength.py`)
 
 When `ENABLE_TREND_STRENGTH=true`, computes a trend-**quality** signal for each ticker by combining two of the most empirically durable technical systems. It answers a question the rest of the stack doesn't: *is price in a strong, confirmed directional trend, and which way?* — distinct from price momentum (which measures the *size* of the return) and from RSI/Bollinger (which measure overbought/oversold). Uses the OHLCV chart cache first (works with `ENABLE_FETCH_DATA=false`); minimum 50 bars.

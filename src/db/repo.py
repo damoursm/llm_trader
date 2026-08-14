@@ -15,7 +15,8 @@ from typing import List, Optional
 import pandas as pd
 
 from src.db.connection import connect
-from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_CONFIDENCE_COMPONENT_COLUMNS,
+from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_NEWS_ATTENTION_COLUMNS,
+                           SIGNAL_CONFIDENCE_COMPONENT_COLUMNS,
                            SIGNAL_ABS_SHADOW_COLUMNS,
                            SIGNAL_COMBINED_SIDE_COLUMNS)
 
@@ -315,7 +316,9 @@ _SIGNAL_BASE_COLS = [
 _SIGNAL_COLS = (_SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS)
                + list(SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)
                + list(SIGNAL_COMBINED_SIDE_COLUMNS)
-               + list(SIGNAL_ABS_SHADOW_COLUMNS) + ["combine_source", "scores"])
+               + list(SIGNAL_ABS_SHADOW_COLUMNS)
+               + list(SIGNAL_NEWS_ATTENTION_COLUMNS)
+               + ["combine_source", "scores"])
 
 
 def insert_signals(run_id: str, generated_at: str, signal_date: str,
@@ -349,6 +352,7 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             + [_f(r.get(c)) for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_COMBINED_SIDE_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_ABS_SHADOW_COLUMNS]
+            + [_f(r.get(c)) for c in SIGNAL_NEWS_ATTENTION_COLUMNS]
             + [r.get("combine_source")]
             + [_json(scores)]
         ))

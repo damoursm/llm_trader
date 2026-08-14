@@ -168,17 +168,21 @@ def test_build_panel_fwd_nan_when_history_too_short(monkeypatch):
 
 
 def test_build_panel_dedupes_to_last_run_per_day(monkeypatch):
+    # `tech` (no scorer epoch) rather than `news`: this test pins DEDUPE, and an
+    # epoch-registered method's pre-epoch rows are correctly masked to NaN,
+    # which would make the assertion test the mask instead (bitten 2026-08-14
+    # when `news` gained an epoch).
     import src.analysis.signal_panel as sp
     monkeypatch.setattr(sp, "_close_series", lambda tk: {})
     sig = pd.DataFrame([
         {"generated_at": "2026-06-01T14:00:00", "signal_date": "2026-06-01",
-         "ticker": "STK", "news": 0.1},
+         "ticker": "STK", "tech": 0.1},
         {"generated_at": "2026-06-01T20:00:00", "signal_date": "2026-06-01",
-         "ticker": "STK", "news": 0.9},     # later run wins
+         "ticker": "STK", "tech": 0.9},     # later run wins
     ])
     panel = sp.build_panel(horizons=(1,), signals_df=sig, dedupe="last")
     assert len(panel) == 1
-    assert panel.iloc[0]["news"] == pytest.approx(0.9)
+    assert panel.iloc[0]["tech"] == pytest.approx(0.9)
     # dedupe="all" keeps both
     assert len(sp.build_panel(horizons=(1,), signals_df=sig, dedupe="all")) == 2
 

@@ -424,7 +424,7 @@ _LLM_ENGINES = ("anthropic", "deepseek", "qwen")
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
+_ALL_METHODS = ("news", "sent_velocity", "news_shock", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families. Every
@@ -433,7 +433,7 @@ _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (w
 # out of compute_macro_eval's bundle view and _compute_category_stats' rollup (it
 # contributes to NO category, not an "uncategorized" one).
 METHOD_CATEGORIES: Dict[str, List[str]] = {
-    "Sentiment":   ["news", "sent_velocity"],
+    "Sentiment":   ["news", "sent_velocity", "news_shock"],
     "Technical":   ["tech", "massive", "vwap", "pattern", "momentum", "sector_momentum",
                     "market_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap",
                     "kaufman_long", "kaufman_short", "adx_long", "adx_short",
@@ -518,6 +518,11 @@ METHOD_LABELS.update({
     "avwap":   "Anchored VWAP (52w anchors)",
 })
 
+# News-attention shock (2026-08-14, panel-first, weight 0).
+METHOD_LABELS.update({
+    "news_shock": "News Shock (abnormal attention × news sign)",
+})
+
 # Tier-3 panel-first methods (2026-07-08, weight 0).
 METHOD_LABELS.update({
     "resid_mom":   "Residual Momentum (beta-adj 12-1)",
@@ -541,6 +546,9 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
     return {
         "news":      sig.sentiment_score,
         "sent_velocity": getattr(sig, "sentiment_velocity_score", 0.0),
+        # news_shock (2026-08-14, panel-first at weight 0 — signals/news_shock.py):
+        # sign(news) × abnormal attention vs the ticker's own trailing baseline.
+        "news_shock": getattr(sig, "news_shock_score", 0.0),
         "tech":      sig.technical_score,
         "massive":   getattr(sig, "massive_score", 0.0),
         "insider":   sig.insider_score,

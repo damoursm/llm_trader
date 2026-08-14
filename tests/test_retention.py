@@ -37,9 +37,9 @@ def test_collapse_keeps_last_per_group_in_old_partition():
     old = (date.today() - timedelta(days=30)).isoformat()
     recent = (date.today() - timedelta(days=2)).isoformat()
     # OLD day: same (ticker, method) scored in THREE intraday runs → collapse to 1.
-    _insert("r1", f"{old}T14:00:00+00:00", old, [("AAA", "news", 0.5)])
-    _insert("r2", f"{old}T14:30:00+00:00", old, [("AAA", "news", 0.6)])
-    _insert("r3", f"{old}T15:00:00+00:00", old, [("AAA", "news", 0.7)])   # latest → kept
+    _insert("r1", f"{old}T14:00:00+00:00", old, [("AAA", "tech", 0.5)])
+    _insert("r2", f"{old}T14:30:00+00:00", old, [("AAA", "tech", 0.6)])
+    _insert("r3", f"{old}T15:00:00+00:00", old, [("AAA", "tech", 0.7)])   # latest → kept
     # RECENT day: two runs — must be LEFT RAW.
     _insert("r4", f"{recent}T14:00:00+00:00", recent, [("BBB", "tech", 0.3)])
     _insert("r5", f"{recent}T14:30:00+00:00", recent, [("BBB", "tech", 0.4)])
@@ -61,21 +61,21 @@ def test_collapse_is_behavior_neutral_for_deduped_analysis(monkeypatch):
     monkeypatch.setattr(st, "_daily_series", lambda tk: ([d0, d1], {d0: 100.0, d1: 110.0}))
     monkeypatch.setattr(st, "_intraday_series", lambda tk: [])
     old = (date.today() - timedelta(days=40)).isoformat()
-    _insert("r1", f"{old}T14:00:00+00:00", old, [("A", "news", 0.2)])
-    _insert("r2", f"{old}T15:00:00+00:00", old, [("A", "news", 0.9)])     # latest
+    _insert("r1", f"{old}T14:00:00+00:00", old, [("A", "tech", 0.2)])
+    _insert("r2", f"{old}T15:00:00+00:00", old, [("A", "tech", 0.9)])     # latest
 
     before = st.compute_method_perf(min_n=1, dedupe="last")
     retention.collapse_simulated_trades(raw_days=14)
     after = st.compute_method_perf(min_n=1, dedupe="last")
     # Same single deduped observation → identical views + win/return.
-    b, a = before[before.method == "news"].iloc[0], after[after.method == "news"].iloc[0]
+    b, a = before[before.method == "tech"].iloc[0], after[after.method == "tech"].iloc[0]
     assert int(b["views"]) == int(a["views"]) == 1
     assert b["win_1d"] == a["win_1d"]
 
 
 def test_collapse_noop_when_nothing_old():
     recent = (date.today() - timedelta(days=2)).isoformat()
-    _insert("r1", f"{recent}T14:00:00+00:00", recent, [("A", "news", 0.5)])
+    _insert("r1", f"{recent}T14:00:00+00:00", recent, [("A", "tech", 0.5)])
     assert retention.collapse_simulated_trades(raw_days=14) == 0
     assert _count() == 1
 
@@ -85,7 +85,7 @@ def test_collapse_noop_when_nothing_old():
 def test_prune_beyond_deletes_old_only():
     ancient = (date.today() - timedelta(days=200)).isoformat()
     recent = (date.today() - timedelta(days=10)).isoformat()
-    _insert("r1", f"{ancient}T14:00:00+00:00", ancient, [("A", "news", 0.5)])
+    _insert("r1", f"{ancient}T14:00:00+00:00", ancient, [("A", "tech", 0.5)])
     _insert("r2", f"{recent}T14:00:00+00:00", recent, [("B", "tech", 0.5)])
     removed = retention.prune_beyond("simulated_trades", "signal_date", keep_days=150)
     assert removed == 1
@@ -97,8 +97,8 @@ def test_prune_beyond_deletes_old_only():
 def test_run_retention_disabled_is_noop(monkeypatch):
     monkeypatch.setattr(settings, "enable_sim_retention", False)
     old = (date.today() - timedelta(days=40)).isoformat()
-    _insert("r1", f"{old}T14:00:00+00:00", old, [("A", "news", 0.5)])
-    _insert("r2", f"{old}T15:00:00+00:00", old, [("A", "news", 0.6)])
+    _insert("r1", f"{old}T14:00:00+00:00", old, [("A", "tech", 0.5)])
+    _insert("r2", f"{old}T15:00:00+00:00", old, [("A", "tech", 0.6)])
     assert retention.run_retention() == {}
     assert _count() == 2                                     # untouched
 
@@ -109,8 +109,8 @@ def test_run_retention_reports_counts(monkeypatch):
     monkeypatch.setattr(settings, "sim_retention_keep_days", 150)
     monkeypatch.setattr(settings, "exit_signals_keep_days", 150)
     old = (date.today() - timedelta(days=40)).isoformat()
-    _insert("r1", f"{old}T14:00:00+00:00", old, [("A", "news", 0.5)])
-    _insert("r2", f"{old}T15:00:00+00:00", old, [("A", "news", 0.6)])
+    _insert("r1", f"{old}T14:00:00+00:00", old, [("A", "tech", 0.5)])
+    _insert("r2", f"{old}T15:00:00+00:00", old, [("A", "tech", 0.6)])
     res = retention.run_retention()
     assert res["sim_collapsed"] == 1
     assert "sim_pruned" in res and "exit_signals_pruned" in res

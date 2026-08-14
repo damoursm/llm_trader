@@ -68,7 +68,7 @@ def test_solo_method_perf_asset_filter(monkeypatch):
     def _fake_trade(ticker, atype, score):
         return {"ticker": ticker, "type": atype, "status": "CLOSED", "action": "BUY",
                 "direction": "BULLISH", "return_pct": 2.0, "entry_date": "2026-07-01",
-                "position_size_multiplier": 1.0, "method_scores": {"news": score}}
+                "position_size_multiplier": 1.0, "method_scores": {"tech": score}}
 
     trades = [_fake_trade("AAA", "STOCK", 0.5), _fake_trade("SPY", "ETF", 0.5)]
     monkeypatch.setattr(tr, "_load_trades", lambda: trades)
@@ -76,8 +76,8 @@ def test_solo_method_perf_asset_filter(monkeypatch):
     monkeypatch.setattr(tr, "_compute_nav_compound", lambda ts: 0.0)
 
     allp = tr.compute_solo_method_performance()
-    assert allp.get("news", {}).get("overall", {}).get("trades") == 2
+    assert allp.get("tech", {}).get("overall", {}).get("trades") == 2
     etfp = tr.compute_solo_method_performance(asset_type="etf")
-    assert etfp.get("news", {}).get("overall", {}).get("trades") == 1
+    assert etfp.get("tech", {}).get("overall", {}).get("trades") == 1
     stockp = tr.compute_solo_method_performance(asset_type="stock")
-    assert stockp.get("news", {}).get("overall", {}).get("trades") == 1
+    assert stockp.get("tech", {}).get("overall", {}).get("trades") == 1

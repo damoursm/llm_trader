@@ -570,6 +570,7 @@ def fetch_13f_positions() -> List[InsiderTrade]:
                 role="Superinvestor (13F)",
                 transaction_type=change_type,
                 amount_range=_notional_to_amount_range(value_usd),
+                notional_usd=float(value_usd),
                 transaction_date=curr_date,
                 disclosure_date=curr_date,
                 notes=(
@@ -763,6 +764,7 @@ def fetch_form4_open_market_buys() -> List[InsiderTrade]:
             role=parsed["role"],
             transaction_type="purchase",
             amount_range=_notional_to_amount_range(parsed["notional"]),
+            notional_usd=float(parsed["notional"]),
             transaction_date=parsed["date"],
             disclosure_date=parsed["date"],
             notes=f"Form 4 open-market purchase (~${parsed['notional']:,.0f})",

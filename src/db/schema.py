@@ -43,7 +43,12 @@ from __future__ import annotations
 # add the column here too (new columns only apply to newly created DB files —
 # an existing DB needs a one-time ALTER TABLE signals ADD COLUMN <m> DOUBLE).
 SIGNAL_BASE_METHOD_COLUMNS = (
-    "news", "sent_velocity", "tech", "massive", "insider", "put_call", "max_pain",
+    "news", "sent_velocity",
+    # news_shock (2026-08-14, panel-first at weight 0 — signals/news_shock.py):
+    # sign(news) × abnormal attention vs the ticker's own trailing baseline
+    # (the SIGNAL_NEWS_ATTENTION_COLUMNS below are its forward-collected input).
+    "news_shock",
+    "tech", "massive", "insider", "put_call", "max_pain",
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum",
     "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
     "ext_gap",
@@ -100,6 +105,13 @@ SIGNAL_TIMEFRAME_COLUMNS = tuple(
 # combined_score via the fundamental/corp-action overlays. This tuple is now a
 # CATEGORISATION SUBSET of BASE — signal_panel groups them under the IC table's
 # "Fundamentals" category, and the _ADD_COLUMNS loop below keeps the columns on old DBs.
+# News-attention inputs (2026-08-14, forward-collected): the recency-weighted
+# article mass + fresh-article count persisted per (run, ticker). They are the
+# BASELINE SERIES for the `news_shock` method — today's mass is judged against
+# the ticker's own trailing daily median of this column — and a general
+# attention covariate for panel analyses. NOT method scores (no direction).
+SIGNAL_NEWS_ATTENTION_COLUMNS = ("news_article_count", "news_recency_mass")
+
 SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squeeze",
                               "f_split", "f_dividend")
 
@@ -342,6 +354,7 @@ SCHEMA_STATEMENTS = [
         {", ".join(f"{m} DOUBLE" for m in SIGNAL_METHOD_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_COMBINED_SIDE_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_NEWS_ATTENTION_COLUMNS)},
         combine_source      VARCHAR,
         scores              VARCHAR
     );
@@ -584,6 +597,9 @@ _ADD_COLUMNS = (
     ("recommendations", "expected_move_pct", "DOUBLE"),
     ("recommendations", "market_aligned", "VARCHAR"),
     ("recommendations", "upside_score", "DOUBLE"),
+    # news_shock method column + its attention-input columns (2026-08-14).
+    ("signals", "news_shock", "DOUBLE"),
+    *(("signals", col, "DOUBLE") for col in SIGNAL_NEWS_ATTENTION_COLUMNS),
 )
 
 

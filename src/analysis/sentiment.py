@@ -213,13 +213,24 @@ def _sent_cache_ttl_seconds() -> float:
     return max(1.0, float(getattr(settings, "sentiment_cache_ttl_minutes", 180) or 180)) * 60.0
 
 
+# Salted into the cache key so a PROMPT change invalidates cached raw verdicts.
+# Found 2026-08-14: the key hashed only (ticker, engine, article set), so after
+# a prompt edit the cache kept serving verdicts produced by the OLD prompt for
+# up to the TTL — two tickers scored seconds apart could be on different
+# scoring standards with nothing recording which. Bump on any _SENTIMENT_PREFIX
+# change that could move the score.
+_SENT_PROMPT_VERSION = "v2-2026-08-14"
+
+
 def _sentiment_cache_key(ticker: str, engine: str, articles: List[NewsArticle]) -> str:
-    """Hash of the exact article set that would be sent to the LLM (order-free)."""
+    """Hash of the exact article set that would be sent to the LLM (order-free),
+    salted with the prompt version."""
     ids = sorted(
         f"{a.url or ''}|{a.source}|{a.title}|{a.published_at.isoformat()}"
         for a in articles
     )
-    payload = f"{ticker.upper()}|{engine}|{SENTIMENT_PROVIDER_MODELS.get(engine, engine)}|" + "\n".join(ids)
+    payload = (f"{ticker.upper()}|{engine}|{SENTIMENT_PROVIDER_MODELS.get(engine, engine)}|"
+               f"{_SENT_PROMPT_VERSION}|" + "\n".join(ids))
     return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -401,28 +412,49 @@ def _recency_weight(article: NewsArticle) -> float:
 
 def _article_count_scale(n: int) -> float:
     """
-    Confidence scale based on number of articles scored.
+    LEGACY (superseded 2026-08-14 by `_evidence_scale` on recency MASS —
+    3 fresh articles are not the same evidence as 3 six-day-old ones).
+    Kept for reference/tests; the live path no longer calls it.
     1 article → 0.55,  3 → 0.75,  7 → 0.90,  12+ → 1.0
-    Uses a logarithmic curve so each additional article has diminishing returns.
     """
     if n == 0:
         return 0.0
     return min(1.0, 0.45 + 0.20 * math.log2(n))
 
 
+def attention_mass(articles: List[NewsArticle]) -> tuple[int, float]:
+    """``(n_fresh, Σ recency weights)`` over the fresh (<7d) articles.
+
+    The MASS is the freshness-weighted evidence quantity: one article from an
+    hour ago contributes ~1.0, one from three days ago ~0.06 — so mass is
+    continuous in article ages where a bare count is not. Consumed by the
+    news score's evidence scale AND persisted per ticker
+    (`signals.news_recency_mass`) as the `news_shock` baseline series.
+    """
+    fresh = [a for a in articles if _recency_weight(a) > 0.0]
+    return len(fresh), round(sum(_recency_weight(a) for a in fresh), 4)
+
+
+def _evidence_scale(mass: float) -> float:
+    """Continuous confidence scale on recency mass (2026-08-14, replaces the
+    article-count scale). mass 0.5 → ~0.57, 1 → 0.65, 3 → 0.85, 7+ → 1.0 —
+    same anchors as the old count curve when every article is fresh, smoothly
+    smaller as the set ages."""
+    if mass <= 0:
+        return 0.0
+    return min(1.0, 0.45 + 0.20 * math.log2(1.0 + mass))
+
+
 def _source_diversity_scale(articles: List[NewsArticle]) -> float:
     """
-    Penalise when all articles come from a single source.
-    1 source  → 0.70
-    2 sources → 0.85
-    3+ sources → 1.0
+    Penalise a single-source article set — smoothly (2026-08-14; the old
+    0.70/0.85/1.0 steps quantized the final score into a few branches).
+    1 source → 0.70, 2 → 0.85, 3 → 0.925, 4 → 0.9625, → 1.0 asymptotically.
     """
     unique_sources = len({a.source for a in articles})
-    if unique_sources >= 3:
-        return 1.0
-    if unique_sources == 2:
-        return 0.85
-    return 0.70
+    if unique_sources <= 0:
+        return 0.70
+    return round(1.0 - 0.30 * (0.5 ** (unique_sources - 1)), 4)
 
 
 # Provider sentiment LABEL → unit score (scaled by provider_sentiment_magnitude).
@@ -462,8 +494,11 @@ def _provider_sentiment_score(ticker: str,
         return None
     raw = sum(_recency_weight(a) * s for a, s in scored) / wsum
     arts = [a for a, _ in scored]
-    precision = _article_count_scale(len(arts)) * _source_diversity_scale(arts)
-    score = round(raw * precision, 3)
+    # Mirrors the LLM path's continuous scalers (2026-08-14) — the two paths
+    # must stay comparable, that is this function's contract.
+    _n, _mass = attention_mass(arts)
+    precision = _evidence_scale(_mass) * _source_diversity_scale(arts)
+    score = round(raw * precision, 4)
     src = next((a.provider_sentiment_source for a in arts if a.provider_sentiment_source), "provider")
     pos = sum(1 for _, s in scored if s > 0)
     neg = sum(1 for _, s in scored if s < 0)
@@ -492,6 +527,7 @@ PRECISION MANDATE — false positives are more costly than false negatives:
 - If catalysts conflict, NET them by magnitude and recency — do not mechanically average to 0; the dominant, most recent, highest-impact catalyst drives the sign.
 - Recency matters: articles marked "1h ago" or "6h ago" carry much more weight than "3d ago" or "5d ago".
 - When in doubt, output 0.0. A missed opportunity is better than a wrong call.
+- PRECISION: score with TWO-decimal granularity (e.g. 0.47, -0.62, 0.71). Your score is consumed CROSS-SECTIONALLY — it is ranked against every other ticker scored today — so two catalysts of visibly different strength must NOT receive the same round number. Use the full scale; defaulting to 0.5/0.7/0.8 collapses the ranking.
 
 SOURCE WEIGHTING — the digest mixes hard catalysts with soft sentiment; weight them differently. Each article is tagged "[source | age]":
 - HARD sources move price directly and can justify scores up to ±1.0: SEC 8-K filings, earnings/EPS surprises, analyst rating & price-target changes, and primary financial news (M&A, FDA, guidance, legal/regulatory).
@@ -672,12 +708,13 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
             _record_sentiment_provider("none")
         return 0.0, f"Analysis error: {last_err}"
 
-    # --- Precision adjustments ---
-    count_scale     = _article_count_scale(len(to_score))
+    # --- Precision adjustments (continuous since 2026-08-14, epoch "news") ---
+    _n_fresh, _mass = attention_mass(to_score)
+    evidence_scale  = _evidence_scale(_mass)
     diversity_scale = _source_diversity_scale(to_score)
-    precision_scale = count_scale * diversity_scale
+    precision_scale = evidence_scale * diversity_scale
 
-    adjusted_score = round(raw_score * precision_scale, 3)
+    adjusted_score = round(raw_score * precision_scale, 4)
 
     if precision_scale < 0.90:
         logger.debug(

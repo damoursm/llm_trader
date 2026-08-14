@@ -153,6 +153,122 @@ _TX_SCORE: dict = {
     "13f_decrease":       (-1.0, 0.7),
 }
 
+# ── Continuous insider evidence weights (2026-08-14 quantization fix) ────────
+# The old score was Σ(direction · bucket/8 · tx_mult)/3 — sums of a small
+# discrete product set, so 331 tickers/run shared 62 distinct values (81% tie
+# mass; one value covered 3,027 panel rows). The rank transform hands a tie
+# group one average rank, so most of the method's cross-section collapsed to
+# the median and the payoff-shaping deciles were fit on mush. Three continuous
+# factors replace the steps; epoch-registered (`METHOD_SCORER_EPOCH["insider"]`).
+
+# Geometric midpoint of each disclosure bucket → log-dollar weight. Log because
+# information does not scale linearly with notional: a $1M buy is a stronger
+# tell than a $15k buy, but not 60× stronger.
+_AMOUNT_MIDPOINT = {
+    "$1,001 - $15,000":        3_900.0,
+    "$15,001 - $50,000":      27_400.0,
+    "$50,001 - $100,000":     70_700.0,
+    "$100,001 - $250,000":   158_000.0,
+    "$250,001 - $500,000":   354_000.0,
+    "$500,001 - $1,000,000": 707_000.0,
+    "$1,000,001 - $5,000,000": 2_240_000.0,
+    "Over $5,000,000":      10_000_000.0,
+}
+
+
+def _amount_weight_log(amount_range: str, notional_usd: Optional[float] = None) -> float:
+    """log-dollar weight ∈ (0, 1]: $3.9k → ~0.30, $158k → ~0.70, $10M → 1.0.
+
+    Prefers the EXACT notional when the source knows it (13F holdings, Form 4
+    buys, options sweeps) — those were being rounded into 8 disclosure buckets
+    before scoring, which is the single largest quantizer in this method: a
+    $60k and a $95k purchase produced the same number. Falls back to the
+    bucket midpoint for the sources that genuinely only publish a RANGE
+    (congressional filings, by law) or a percentage (13D/G).
+    """
+    import math as _m
+    val = None
+    if notional_usd and notional_usd > 0:
+        val = float(notional_usd)
+    else:
+        val = _AMOUNT_MIDPOINT.get(amount_range)
+    if not val or val <= 0:
+        return 0.10                      # genuinely unknown — keep the old floor
+    # Anchors: log10($1k) = 3 → 0, log10($10M) = 7 → 1.
+    return round(max(0.05, min(1.0, (_m.log10(val) - 3.0) / 4.0)), 6)
+
+
+_DISCLOSURE_LAG_SPAN = 0.25    # ±25% — a modest, unmeasured prior
+
+
+def _disclosure_lag_weight(t) -> float:
+    """Fast disclosure is a stronger tell than a deadline filing.
+
+    A politician who reports a purchase in 3 days is behaving differently from
+    one who files on day 44 of a 45-day window. Continuous in days, so it also
+    separates otherwise-identical range-only filings (congressional rows carry
+    a real `disclosure_date` distinct from `transaction_date` — for the sources
+    where the two are the same date this returns exactly 1.0 and changes
+    nothing). Span kept deliberately small: this is a prior, not a measurement.
+    """
+    tx = getattr(t, "transaction_date", None)
+    dis = getattr(t, "disclosure_date", None)
+    if tx is None or dis is None:
+        return 1.0
+    try:
+        lag = (dis - tx).days
+    except TypeError:
+        return 1.0
+    if lag <= 0:
+        return 1.0
+    # 0 days → 1.0, 45+ days → 1 - span; smooth exponential in between.
+    import math as _m
+    return round(1.0 - _DISCLOSURE_LAG_SPAN * (1.0 - _m.exp(-lag / 20.0)), 6)
+
+
+_INSIDER_HALF_LIFE_DAYS = 7.0   # a filing loses half its urgency in a week
+_INSIDER_MAX_AGE_DAYS = 45.0    # beyond the fetchers' own windows — ignore
+
+# Seniority: the closer to the numbers, the more a personal-account trade
+# means. Spans kept modest — unmeasured priors must not dominate the measured
+# amount/recency terms. Matched as case-insensitive substrings of `role`.
+_ROLE_WEIGHT = (
+    ("ceo", 1.30), ("chief executive", 1.30),
+    ("cfo", 1.30), ("chief financial", 1.30),
+    ("coo", 1.20), ("president", 1.20), ("chair", 1.15),
+    ("10%", 1.15), ("owner", 1.15),
+    ("senator", 1.10), ("representative", 1.00),
+)
+
+
+def _insider_recency_weight(t) -> float:
+    """Exponential decay on the TRANSACTION date (fallback: disclosure date).
+    Continuous in days — the main tie-breaker between otherwise identical
+    filings. Unparseable dates keep full weight (fail-open, matches the old
+    behaviour of ignoring time entirely)."""
+    import math as _m
+    from datetime import date as _date
+    d = getattr(t, "transaction_date", None) or getattr(t, "disclosure_date", None)
+    if d is None:
+        return 1.0
+    try:
+        age = (_date.today() - d).days
+    except TypeError:
+        return 1.0
+    if age < 0:
+        age = 0
+    if age > _INSIDER_MAX_AGE_DAYS:
+        return 0.0
+    return _m.exp(-_m.log(2) * age / _INSIDER_HALF_LIFE_DAYS)
+
+
+def _insider_role_weight(role: str) -> float:
+    r = (role or "").lower()
+    for needle, w in _ROLE_WEIGHT:
+        if needle in r:
+            return w
+    return 1.0
+
 # Base weights — normalised across active methods at runtime
 _BASE_WEIGHTS = {
     "news":      0.40,
@@ -1141,10 +1257,19 @@ def _insider_score(
     relevant = [t for t in trades if t.ticker.upper() == ticker.upper()]
     if not relevant:
         return 0.0, False, 0, False, 0, ""
-    from src.data.insider_trades import _amount_weight
+    # Continuous evidence weighting (2026-08-14): log-dollar bucket midpoint ×
+    # per-day recency decay × seniority. The recency term is what breaks the
+    # old 81% tie mass — two tickers with the same filing pattern now differ by
+    # WHEN their filings landed. Direction logic and the /3 normaliser scale
+    # are unchanged; epoch-registered as a scorer-output change.
     total = 0.0
     for t in relevant:
-        w  = _amount_weight(t.amount_range)
+        w = (_amount_weight_log(t.amount_range, getattr(t, "notional_usd", None))
+             * _insider_recency_weight(t)
+             * _insider_role_weight(getattr(t, "role", ""))
+             * _disclosure_lag_weight(t))
+        if w <= 0.0:
+            continue
         tx = t.transaction_type
         if tx in _TX_SCORE:
             direction, multiplier = _TX_SCORE[tx]
@@ -1153,12 +1278,12 @@ def _insider_score(
             total += w
         elif "sale" in tx:
             total -= w
-    base_score = round(max(-1.0, min(1.0, total / 3.0)), 3)
+    base_score = round(max(-1.0, min(1.0, total / 3.0)), 4)
 
     # Cluster amplifier — 3+ different insiders buying within 5 days
     cluster_detected, cluster_size = _detect_insider_cluster(ticker, trades)
     if cluster_detected and base_score > 0:
-        amplified = round(min(1.0, base_score * 1.75), 3)
+        amplified = round(min(1.0, base_score * 1.75), 4)
         logger.debug(
             f"[cluster] {ticker}: {cluster_size} insiders within 5d — "
             f"score {base_score:+.3f} → {amplified:+.3f} (1.75×)"
@@ -1173,7 +1298,7 @@ def _insider_score(
         )
         if persistence_detected and base_score > 0:
             pf = _persistence_factor(persistence_count)
-            amplified = round(min(1.0, base_score * pf), 3)
+            amplified = round(min(1.0, base_score * pf), 4)
             logger.debug(
                 f"[persistence] {ticker}: {persistence_buyer} bought {persistence_count}× "
                 f"on separate days — score {base_score:+.3f} → {amplified:+.3f} ({pf:.2f}×)"
@@ -1834,6 +1959,12 @@ def build_signals(
     use_news      = settings.enable_news_sentiment
     # Sentiment velocity reuses article timestamps; no live fetch / LLM call required.
     use_sent_velocity = settings.enable_sentiment_velocity
+    # news_shock attention baselines — ONE panel query per tick, shared by every
+    # ticker's closure (fail-soft {} → the method abstains run-wide).
+    _news_baselines: dict = {}
+    if use_news and settings.enable_news_shock:
+        from src.signals.news_shock import load_attention_baselines
+        _news_baselines = load_attention_baselines()
     use_tech      = settings.enable_technical_analysis and settings.enable_fetch_data
     # Massive/Polygon server-side technicals (RSI+MACD). PROMOTED into the weighted
     # combined_score (2026-06-24) — in _BASE_WEIGHTS + active_flags + the combine +
@@ -2180,6 +2311,24 @@ def build_signals(
                 recent_hours=settings.sentiment_velocity_recent_hours,
                 prior_hours=settings.sentiment_velocity_prior_hours,
             )
+
+        # ── Method 1c: news_shock — abnormal attention (panel-first, weight 0) ──
+        # sign(news) × how far today's recency-mass sits above the ticker's own
+        # trailing baseline. The mass/count are persisted every run (they ARE
+        # the baseline series); the score abstains until the ticker has
+        # news_shock_min_days of accrued history. Stays OUT of method_score_map
+        # (no combine/coherence/votes) exactly like squeeze — panel IC first.
+        news_article_count_v = 0
+        news_recency_mass_v = 0.0
+        news_shock_score_v = 0.0
+        if use_news:
+            from src.analysis.sentiment import attention_mass
+            news_article_count_v, news_recency_mass_v = attention_mass(relevant_articles)
+            if settings.enable_news_shock:
+                from src.signals.news_shock import compute_news_shock
+                news_shock_score_v = compute_news_shock(
+                    sentiment_score, news_recency_mass_v,
+                    _news_baselines.get(ticker.upper()) or _news_baselines.get(ticker))
 
         # ── Method 2: Technical analysis ─────────────────────────────────
         tech_result: TechnicalResult = EMPTY_RESULT
@@ -2812,13 +2961,21 @@ def build_signals(
                 combined_buy_score_abs=round(_abs_buy, 4),
                 combined_sell_score_abs=round(_abs_sell, 4),
                 combine_source=combine_source,
-                sentiment_score=round(sentiment_score, 3),
+                # 6dp, not 3 (2026-08-14): the persisted value is what the rank
+                # transform orders on, and 3dp re-quantized the continuity work
+                # done upstream in sentiment.py — scores cluster near zero, where
+                # 3dp merges genuinely different reads. Display sites format to
+                # 2dp themselves, so precision here costs nothing.
+                sentiment_score=round(sentiment_score, 6),
                 sentiment_velocity_score=round(sent_velocity_score, 3),
                 sentiment_recent=round(sent_recent, 3),
                 sentiment_prior=round(sent_prior, 3),
+                news_shock_score=round(news_shock_score_v, 4),
+                news_article_count=int(news_article_count_v),
+                news_recency_mass=round(news_recency_mass_v, 4),
                 technical_score=round(technical_score, 3),
                 massive_score=round(massive_score, 3),
-                insider_score=round(insider_sc, 3),
+                insider_score=round(insider_sc, 6),   # see sentiment_score above
                 put_call_score=round(pc_score, 3),
                 max_pain_score=round(mp_score, 3),
                 oi_skew_score=round(oi_skew_score, 3),
@@ -2943,7 +3100,9 @@ def build_signals(
             srev_str = f"  strev={st_reversal_v:+.2f}({st_rev_5d_pct:+.1f}%/5d)" if st_reversal_v != 0.0 else ""
             rsi2_str = f"  rsi2={rsi2_rev_v:+.2f}({rsi2_val_v:.0f})" if rsi2_rev_v != 0.0 else ""
             dloc_str = f"  dloc={dloc_rev_v:+.2f}({dloc_loc_pct_v:.0f}%)" if dloc_rev_v != 0.0 else ""
-            sq_str   = f"  sq={squeeze_v:+.2f}[{squeeze_label_v}:{squeeze_bars_v}]" if squeeze_v != 0.0 else ""
+            nsk_str  = (f"  nshock={news_shock_score_v:+.2f}(mass{news_recency_mass_v:.1f})"
+                        if news_shock_score_v != 0.0 else "")
+            sq_str   = (f"  sq={squeeze_v:+.2f}[{squeeze_label_v}:{squeeze_bars_v}]" if squeeze_v != 0.0 else "") + nsk_str
             ivt_str  = f"  ivt={iv_term_v:+.2f}({iv_term_slope_v:+.1f}pts,{iv_term_label_v})" if iv_term_v != 0.0 else ""
             avw_str  = f"  avwap={avwap_v:+.2f}(hi{avwap_hi_pct:+.1f}%/lo{avwap_lo_pct:+.1f}%)" if avwap_v != 0.0 else ""
             rmom_str = f"  rmom={resid_mom_v:+.2f}({resid_mom_pct:+.0f}%,β{resid_mom_beta_v:.1f})" if resid_mom_v != 0.0 else ""

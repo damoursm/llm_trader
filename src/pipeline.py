@@ -408,6 +408,10 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "family_conf_factor": float(getattr(s, "family_conf_factor", 1.0)),
                 "tape_conf_factor": float(getattr(s, "tape_conf_factor", 1.0)),
                 "sector_conf_factor": float(getattr(s, "sector_conf_factor", 1.0)),
+                # news-attention inputs (2026-08-14): the forward-collected
+                # baseline series the news_shock method judges today against.
+                "news_article_count": float(getattr(s, "news_article_count", 0) or 0),
+                "news_recency_mass": float(getattr(s, "news_recency_mass", 0.0) or 0.0),
                 # Buy/sell split sides (2026-07-22): the two camp-conviction
                 # aggregates whose difference is combined_score — persisted so
                 # each side's forward IC is monitored (Signal IC → Buy/Sell side).

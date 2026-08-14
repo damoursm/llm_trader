@@ -107,6 +107,7 @@ def _scan_chain(ticker: str, yt, expiry: str, current_price: float, today: date)
                 role=f"Strike ${strike:.2f} | Exp {expiry}",
                 transaction_type=tx_type,
                 amount_range=_notional_to_amount_range(notional),
+                notional_usd=float(notional),
                 transaction_date=today,
                 disclosure_date=today,
                 notes=(

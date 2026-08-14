@@ -13,9 +13,22 @@
   account NAV and fill prices; anyone holding neither gets a 401. The dashboard
   opens the database READ-ONLY, so even an authenticated visitor can only read.
 
-  This script REFUSES to publish unless it has verified the gate by probing the
-  running dashboard (anonymous request must return 401). Config alone cannot
-  distinguish "gated" from "wide open" - see the preflight below.
+  LOCALHOST IS EXEMPT: browsing http://127.0.0.1:<port> on this PC needs no
+  password. That exemption is the reason the checks below are shaped the way they
+  are - ngrok forwards the public hostname to 127.0.0.1, so a public visitor's
+  peer address is loopback too, and "localhost bypass" done naively would hand the
+  open internet a free pass. The dashboard distinguishes them by the proxy headers
+  and the Host header the tunnel relays (dashboard/app.py::_is_local_request).
+
+  This script REFUSES to publish unless it has verified the gate, TWICE and by
+  probe rather than by config, because "gated" and "wide open" look identical
+  from .env alone:
+    - before the tunnel opens, a local request wearing the tunnel's headers must
+      come back 401 (catches a dashboard whose bypass is too generous);
+    - after the tunnel opens, an anonymous request to the REAL PUBLIC URL must
+      come back 401, or the tunnel is torn down again within seconds.
+  The second check is the one that cannot be fooled: it is the actual request an
+  actual stranger would make.
 
   One-time setup (see CLAUDE.md for the walkthrough):
     1. Sign up free at https://dashboard.ngrok.com/signup
@@ -154,6 +167,24 @@ $authUser = $cfg["DASHBOARD_AUTH_USERNAME"]; if (-not $authUser) { $authUser = "
 $authPass = $cfg["DASHBOARD_AUTH_PASSWORD"]
 $local = "http://127.0.0.1:$Port/"
 
+# Headers a request picks up on its way through the tunnel. The dashboard treats
+# their PRESENCE (never their value) as proof the request is not local, so sending
+# them at the loopback port reproduces what a stranger's request will look like.
+$tunnelLike = @{ "X-Forwarded-For" = "203.0.113.7"; "X-Forwarded-Proto" = "https" }
+$pair = "$($authUser):$($authPass)"
+$basic = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
+
+function Get-Status {
+    param([string]$Uri, [hashtable]$Headers = @{}, [int]$TimeoutSec = 300)
+    try {
+        return [int](Invoke-WebRequest -Uri $Uri -Headers $Headers -UseBasicParsing `
+                                       -TimeoutSec $TimeoutSec -MaximumRedirection 0).StatusCode
+    } catch {
+        if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode }
+        return $null
+    }
+}
+
 if (-not $authPass) {
     Write-Host "DASHBOARD_AUTH_PASSWORD is not set in .env - refusing to publish." -ForegroundColor Red
     Write-Host ""
@@ -163,20 +194,23 @@ if (-not $authPass) {
     exit 1
 }
 
-# 1. Unauthenticated request MUST be rejected.
-$anon = $null
-try   { $anon = [int](Invoke-WebRequest -Uri $local -UseBasicParsing -TimeoutSec 300).StatusCode }
-catch { if ($_.Exception.Response) { $anon = [int]$_.Exception.Response.StatusCode } }
+# 1. A request wearing the tunnel's headers MUST be rejected, even though it
+#    arrives on loopback. This is the localhost bypass being tested from the
+#    dangerous side: if it answers 200 here it will answer 200 to the internet.
+$anon = Get-Status -Uri $local -Headers $tunnelLike
 if ($anon -ne 401) {
     Write-Host "GATE CHECK FAILED - refusing to publish." -ForegroundColor Red
     Write-Host ""
     if ($null -eq $anon) {
         Write-Host "  The dashboard did not answer, so the gate could not be verified."
     } else {
-        Write-Host "  An unauthenticated request to $local returned HTTP $anon, expected 401."
-        Write-Host "  The dashboard is NOT gated. Most likely it is still running from"
-        Write-Host "  before DASHBOARD_AUTH_PASSWORD was set - restart it:"
+        Write-Host "  An unauthenticated tunnel-shaped request to $local returned HTTP $anon,"
+        Write-Host "  expected 401. The dashboard is NOT gated against public traffic."
+        Write-Host "  Most likely it is still running from before DASHBOARD_AUTH_PASSWORD"
+        Write-Host "  was set (settings are read at import) - restart it:"
         Write-Host "      Stop-ScheduledTask -TaskName LlmTraderDashboard; Start-ScheduledTask -TaskName LlmTraderDashboard" -ForegroundColor Cyan
+        Write-Host "  If it was restarted, check DASHBOARD_AUTH_BYPASS_NETWORKS in .env:"
+        Write-Host "  a bypass wider than loopback can let tunnelled traffic through."
     }
     Write-Host ""
     exit 1
@@ -184,11 +218,7 @@ if ($anon -ne 401) {
 
 # 2. The shared credentials MUST actually open it, or you hand out a dead link.
 #    A 401 here means .env and the running process disagree on the password.
-$pair = "$($authUser):$($authPass)"
-$hdr  = @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair)) }
-$authed = $null
-try   { $authed = [int](Invoke-WebRequest -Uri $local -Headers $hdr -UseBasicParsing -TimeoutSec 300).StatusCode }
-catch { if ($_.Exception.Response) { $authed = [int]$_.Exception.Response.StatusCode } }
+$authed = Get-Status -Uri $local -Headers ($tunnelLike + @{ Authorization = $basic })
 if ($authed -eq 401) {
     Write-Host "The password in .env does not open the running dashboard - refusing to publish." -ForegroundColor Red
     Write-Host "Restart the dashboard so it picks up the current DASHBOARD_AUTH_PASSWORD."
@@ -198,18 +228,84 @@ if ($authed -eq 401) {
     Write-Host "Note: authenticated probe returned '$authed' (cold cache rebuilds can be slow)." -ForegroundColor Yellow
 }
 
-Write-Host ""
-Write-Host "  PUBLIC (password-gated):  https://$Domain" -ForegroundColor Green
-Write-Host "  forwarding to             http://127.0.0.1:$Port"
-Write-Host "  Gate verified: anonymous request got 401, shared credentials got $authed." -ForegroundColor Green
-Write-Host "  Share the link WITH the username/password - anyone holding both sees" -ForegroundColor Yellow
-Write-Host "  live positions, P&L and account NAV." -ForegroundColor Yellow
-Write-Host "  Ctrl+C stops the tunnel (the dashboard itself keeps running)."
-Write-Host ""
+# 3. Informational: confirm this PC still browses without a password. Not a
+#    security condition - an owner who gated themselves too is merely annoyed.
+$localAnon = Get-Status -Uri $local -TimeoutSec 60
+if ($localAnon -eq 200) {
+    Write-Host "  Local check: http://127.0.0.1:$Port opens with no password." -ForegroundColor Green
+} else {
+    Write-Host "  Note: local browsing returned '$localAnon' - this PC will be asked for the" -ForegroundColor Yellow
+    Write-Host "  password too (DASHBOARD_AUTH_BYPASS_NETWORKS empty, or an older dashboard)." -ForegroundColor Yellow
+}
 
+# --- open the tunnel, then VERIFY IT FROM THE OUTSIDE -------------------------
 # The ngrok inspect UI stays local-only on http://127.0.0.1:4040 (never tunnelled).
 # --url supersedes the deprecated --domain (agent 3.39+); it wants a full URL, so
 # normalise whatever form NGROK_DOMAIN takes.
 $publicUrl = "https://" + ($Domain -replace '^https?://', '')
-& $ngrok http "--url=$publicUrl" "127.0.0.1:$Port" --log=stdout --log-level=info
-exit $LASTEXITCODE
+$log = Join-Path $env:TEMP "ngrok_dashboard.log"
+
+Write-Host ""
+Write-Host "  Opening tunnel $publicUrl -> http://127.0.0.1:$Port ..."
+$proc = Start-Process -FilePath $ngrok -PassThru -NoNewWindow `
+    -ArgumentList @("http", "--url=$publicUrl", "127.0.0.1:$Port", "--log=stdout", "--log-level=info") `
+    -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+
+# The check that cannot be fooled: the exact request a stranger makes. Everything
+# before this was a local simulation of the tunnel; this is the tunnel.
+# ngrok-skip-browser-warning gets past the free tier's click-through interstitial
+# (ERR_NGROK_6024), which is an edge page - without it the probe would grade
+# ngrok's own HTML instead of the dashboard's answer.
+$skip = @{ "ngrok-skip-browser-warning" = "1" }
+$public = $null
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Seconds 2
+    if ($proc.HasExited) { break }
+    $public = Get-Status -Uri "$publicUrl/" -Headers $skip -TimeoutSec 30
+    # 404/502 = edge is up but the tunnel has not registered yet; keep waiting.
+    if ($public -eq 401 -or $public -eq 200) { break }
+}
+
+if ($proc.HasExited) {
+    Write-Host ""
+    Write-Host "ngrok exited immediately (code $($proc.ExitCode)). Last log lines:" -ForegroundColor Red
+    if (Test-Path $log) { Get-Content $log -Tail 20 }
+    if (Test-Path "$log.err") { Get-Content "$log.err" -Tail 20 }
+    exit 1
+}
+
+if ($public -ne 401) {
+    Write-Host ""
+    Write-Host "PUBLIC GATE CHECK FAILED - tearing the tunnel down." -ForegroundColor Red
+    Write-Host ""
+    if ($null -eq $public) {
+        Write-Host "  $publicUrl never answered, so the gate could not be verified from"
+        Write-Host "  outside. Refusing to leave an unverified tunnel open."
+    } else {
+        Write-Host "  An anonymous request to $publicUrl returned HTTP $public, expected 401."
+        Write-Host "  Live positions and P&L would be readable by anyone with the link."
+    }
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Write-Host "  Tunnel stopped. The local dashboard is untouched and still running."
+    Write-Host ""
+    exit 1
+}
+
+Write-Host ""
+Write-Host "  PUBLIC (password-gated):  $publicUrl" -ForegroundColor Green
+Write-Host "  forwarding to             http://127.0.0.1:$Port"
+Write-Host "  Gate verified FROM THE PUBLIC URL: anonymous got 401, credentials got $authed." -ForegroundColor Green
+Write-Host "  Share the link WITH the username/password - anyone holding both sees" -ForegroundColor Yellow
+Write-Host "  live positions, P&L and account NAV." -ForegroundColor Yellow
+Write-Host "  This PC still browses http://127.0.0.1:$Port with no password."
+Write-Host "  Live traffic inspector: http://127.0.0.1:4040   agent log: $log"
+Write-Host "  Ctrl+C stops the tunnel (the dashboard itself keeps running)."
+Write-Host ""
+
+try {
+    Wait-Process -Id $proc.Id
+} finally {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Write-Host "Tunnel closed. The dashboard is still running locally." -ForegroundColor Yellow
+}
+exit 0

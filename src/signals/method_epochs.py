@@ -138,6 +138,25 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # cells — the designed epoch+replay combo. Basis: the 62-variant parameter
     # sweep (h2 IC +0.0082 vs +0.0036, paired t +2.16; pivot memory 2026-08-10).
     "vwap": datetime(2026, 8, 11, 2, 5, tzinfo=timezone.utc),
+    # 2026-08-14 (scheduler restart, news-family continuity pass): the insider
+    # score's evidence weights went CONTINUOUS — log-dollar bucket midpoints
+    # (was bucket/8 steps), per-day recency decay on the transaction date (was
+    # no time term at all), and a seniority multiplier. Measured motivation:
+    # 331 views/run shared 62 distinct values (81% tie mass; one value covered
+    # 3,027 panel rows), so the rank transform collapsed most of the method to
+    # the median and the shaping deciles were fit on ties. Same direction
+    # logic, same /3 normaliser — but the VALUE for the same filing set is a
+    # different number, so histories must not pool.
+    "insider": datetime(2026, 8, 14, 18, 30, tzinfo=timezone.utc),
+    # Same instant, same pass: the news score's precision scalers went
+    # continuous — evidence mass = Σ per-article recency weights replaces the
+    # article COUNT in the count-scale (3 fresh articles no longer equal 3
+    # stale ones), and the 0.70/0.85/1.0 source-diversity steps became a
+    # smooth curve. The raw LLM verdict also gained a two-decimal instruction
+    # (cache-salted, so old cached verdicts cannot leak into the new scale).
+    # The LLM's round-number quantization (top value 0.7 covered 7.1% of all
+    # nonzero rows) multiplied by step scalers left ~38% within-run tie mass.
+    "news": datetime(2026, 8, 14, 18, 30, tzinfo=timezone.utc),
 }
 
 

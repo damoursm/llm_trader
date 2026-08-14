@@ -570,6 +570,17 @@ class Settings(BaseSettings):
     sentiment_velocity_recent_hours: int = 24   # "recent" window: articles ≤ N hours old
     sentiment_velocity_prior_hours: int = 96    # "prior" window: from recent_hours to N hours old
 
+    # ── news_shock — abnormal news attention (2026-08-14, panel-first weight 0) ──
+    # sign(news) × how far today's recency-mass sits ABOVE the ticker's own
+    # trailing baseline (log2 ratio, full score at 8×). The quantitative
+    # complement to the news LEVEL: a real catalyst is both directional and
+    # LOUD vs the ticker's normal; a routine story is not. Baseline = per-ticker
+    # median of daily `signals.news_recency_mass` (forward-collected — the
+    # method self-activates as the column accrues; abstains until then).
+    enable_news_shock: bool = True
+    news_shock_baseline_days: int = 20   # trailing window for the baseline median
+    news_shock_min_days: int = 5         # covered days required before scoring
+
     enable_technical_analysis: bool = True  # method 2: RSI, MACD, SMA, Bollinger Bands
     enable_insider_trades: bool = True    # method 3: politician + corporate insider trades
 
@@ -2154,6 +2165,31 @@ class Settings(BaseSettings):
     # publishing live P&L.
     dashboard_auth_username: str = "viewer"
     dashboard_auth_password: str = ""
+
+    # Networks whose requests SKIP the password prompt (comma-separated CIDRs).
+    # Default: this machine only — browse http://127.0.0.1:8050 with no login,
+    # while the public tunnel still demands the shared password.
+    #
+    # ⚠ REMOTE_ADDR alone cannot express this: ngrok dials the tunnel into
+    # 127.0.0.1, so every PUBLIC visitor also arrives from a loopback address.
+    # The bypass therefore needs all three of (loopback peer, no proxy headers,
+    # loopback Host) — see dashboard/app.py::_is_local_request, which also
+    # explains why _serve_once must stop waitress from eating the proxy headers.
+    # Empty = no bypass (everything is gated, incl. localhost).
+    dashboard_auth_bypass_networks: str = "127.0.0.0/8,::1"
+
+    # Hostnames that count as "this machine" for the bypass above, on top of the
+    # loopback names and bare IP literals it already accepts. Needed for Tailscale
+    # MagicDNS: a phone browsing http://<machine>.<tailnet>.ts.net:8050 arrives
+    # from a tailnet IP but sends a NAME in the Host header, and a name never
+    # parses as an IP — so without an entry here it would still be asked for the
+    # password. Comma-separated; an entry starting with "." matches any host
+    # ending in it (".ts.net" survives a tailnet rename, an exact name is tighter).
+    # Matched case-insensitively. Empty = only loopback names and IP literals.
+    #
+    # This does NOT weaken the tunnel gate: a tunnelled request still arrives from
+    # loopback carrying proxy headers, and its Host is the public ngrok domain.
+    dashboard_auth_bypass_hosts: str = ""
 
     # ── Broker / live execution (paper-first; OFF by default → no broker calls) ──
     # Pre-production: drive a real broker's PAPER account in parallel with the

@@ -1109,6 +1109,27 @@ HTML_TEMPLATE = """
     </div>
     {% endif %}
 
+    <!-- News Shock (abnormal attention × news sign; panel-first, weight 0) -->
+    {% if sig.news_shock_score is defined and sig.news_shock_score != 0 %}
+    {% set nsk = sig.news_shock_score %}
+    <div class="mrow">
+      <div class="mhdr">
+        <span class="mlabel">News Shock <span style="color:#64748b;font-weight:400;">(abnormal attention)</span></span>
+        <span class="mscore {{ 'sp' if nsk > 0.05 else ('sn' if nsk < -0.05 else 'sz') }}">
+          {{ "%+.2f"|format(nsk) }}
+        </span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar" style="width:{{ (nsk|abs * 100)|int }}%;background:{{ '#16a34a' if nsk >= 0 else '#dc2626' }};"></div>
+      </div>
+      <div class="mtext">
+        {{ sig.news_article_count }} fresh article(s), attention mass {{ "%.1f"|format(sig.news_recency_mass) }} —
+        well above this ticker's own normal, {{ 'confirming the bullish read ▲' if nsk > 0 else 'confirming the bearish read ▼' }}.
+        Measured-only (weight 0) until its forward IC accrues.
+      </div>
+    </div>
+    {% endif %}
+
     <!-- Technical Analysis -->
     {% if use_tech %}
     <div class="mrow">

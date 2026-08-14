@@ -74,6 +74,15 @@ class InsiderTrade(BaseModel):
     transaction_date: date
     disclosure_date: date
     notes: str = ""
+    # EXACT trade notional in USD when the source knows it (2026-08-14). 13F
+    # holdings, Form 4 open-market buys and options sweeps all compute a precise
+    # dollar value and then called `_notional_to_amount_range()` to squeeze it
+    # into one of 8 disclosure-style buckets — the scorer's single largest
+    # quantizer, since a $60k and a $95k buy became the same number. The bucket
+    # string is still populated (the email and prompt render it), but the scorer
+    # now prefers this. None = genuinely unknown (congressional filings disclose
+    # only a RANGE by law; 13D/G disclose a percentage) — those keep the bucket.
+    notional_usd: Optional[float] = None
 
     @property
     def is_bullish(self) -> bool:
@@ -1227,6 +1236,12 @@ class TickerSignal(BaseModel):
     sentiment_velocity_score: float = 0.0  # -1.0 to +1.0  (tanh-normalised Δ tone)
     sentiment_recent: float = 0.0          # mean lexical tone of the recent window
     sentiment_prior: float = 0.0           # mean lexical tone of the prior window
+    # news_shock (2026-08-14, panel-first weight 0): sign(news) × abnormal
+    # attention vs the ticker's own trailing baseline (signals/news_shock.py).
+    # The two attention inputs are persisted so the baseline series accrues.
+    news_shock_score: float = 0.0       # -1.0 to +1.0; 0 = abstain (no news / no baseline / not loud)
+    news_article_count: int = 0         # fresh (<7d) relevant articles this run
+    news_recency_mass: float = 0.0      # Σ per-article recency weights (the attention quantity)
     technical_score: float      # -1.0 to +1.0
     massive_score: float = 0.0  # -1.0 to +1.0  (Massive/Polygon server-side RSI+MACD composite — compared vs `tech`)
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)
