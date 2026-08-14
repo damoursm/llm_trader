@@ -87,13 +87,13 @@ class Settings(BaseSettings):
 
     # Held-positions prompt A/B — probability that a run includes the
     # <open_positions_context> block (the system's current holdings + a
-    # zero-endowment-bias review instruction) in the synthesis prompt.
-    # Re-flipped once per run; the flip is stamped on every trade CLOSED that
-    # run (exit_hold_prompt) so the dashboard's method-evaluation table can
-    # compare exit outcomes prompt-ON vs prompt-OFF over time. 0.5 = even
-    # split for the experiment; 1.0 = always include; 0.0 = never (the LLM
-    # stays blind to holdings, the pre-experiment behavior).
-    open_positions_prompt_share: float = 0.5
+    # (held-positions prompt) — the `open_positions_prompt_share` A/B was RETIRED
+    # 2026-08-14 and the prompt is now unconditional (pipeline Step 4.6). ON led
+    # on both metrics over 401 closed trades but needed ~1,500 per arm to reach
+    # significance (~15 more months); the leading arm was adopted rather than
+    # keep spending half the runs on an experiment that could not conclude.
+    # The setting is deleted rather than pinned to 1.0 so it cannot read as a
+    # live knob — `tests/test_inert_settings.py` would fail it as unread anyway.
 
     # Massive / Polygon.io market data — primary source for equity/ETF price + all
     # OHLCV timeframes (daily bulk via grouped-daily; 30-min intraday via aggregates,
@@ -362,6 +362,55 @@ class Settings(BaseSettings):
     rank_shape_prior_n: int = 200        # per-decile shrink prior (observations)
     rank_shape_min_rows: int = 500       # settled rows before a method is shaped
     rank_shape_ttl_seconds: int = 21600  # calibration cache TTL (6h)
+
+    # ── ML-combine scale (2026-08-14 A/B repair) ──────────────────────────
+    # The stacker convictions (`max(0, 2*P(up)-1)`) live on a FAR smaller scale
+    # than the weighted combine — mean |combined| 0.057 vs 0.297 — because a
+    # calibrated probability near 0.5 is a genuine "no strong view", not a
+    # z-like score. Both live gates are built on the weighted scale, so the ML
+    # arm was structurally unable to act: measured over 46 arm runs it produced
+    # 4.2% directional rows vs the weighted arm's 70.5%, and only 0.2% of its
+    # rows cleared Gate 1 vs 41.7% — and once the rank bands went live it fell
+    # to EXACTLY ZERO directional signals. The A/B was therefore comparing a
+    # near-empty book against a full one.
+    #
+    # Repaired the way the rank basis was: quantile-match the pair (band +
+    # raw_confidence divisor) so the arm reproduces the weighted arm's OWN live
+    # pass rates, making the two cohorts differ in WHICH names they pick rather
+    # than in how often they act. Fit on the tradeable (Gate-4) subset,
+    # ~17.7k ML rows over 4 days vs 2,600 live weighted rows.
+    #
+    # The BANDS quantile-match the weighted arm's live 36.9%/16.1% split. The
+    # DIVISOR is solved against GATE 1 rather than against the |combined|
+    # quantiles: one scalar cannot align two differently-SHAPED distributions
+    # everywhere, and matching the quantile ratio (0.642*0.1915 = 0.123) still
+    # left the arm at 19.8% joint exposure against the weighted 36.5%, because
+    # Gate 1 — not the band — is what actually binds. Solving on Gate 1 gives
+    #   ml_raw_confidence_scale = 0.0658  -> ML Gate-1 36.72% vs weighted 36.73%
+    #                                        joint (directional AND Gate 1)
+    #                                        33.38% vs weighted 36.46%
+    # Sensitivity is gentle: +/-10% on the divisor moves Gate 1 by ~2-3pp.
+    #
+    # NOTE the honest caveat: this equalises EXPOSURE, it does not manufacture
+    # skill. If the stacker's flat convictions reflect genuine ignorance, the
+    # A/B will now say so in P&L instead of hiding it behind an empty book.
+    # Applied ONLY when combine_source == "ml" (both sides stacker-driven); a
+    # partial ml_buy/ml_sell swap mixes two scales in one difference and keeps
+    # the weighted bands, which is the conservative side (fires less).
+    #
+    # !! ml_raw_confidence_scale is PROVISIONAL — pending a multi-day read. !!
+    # Solved on 4 days of PRE-fix rows; the first POST-fix run landed hotter
+    # than predicted (joint exposure 42.4% vs 33.4%, Gate 1 46.7% vs 36.7%,
+    # 10 actionable vs the weighted arm's 0-8 range). NOT retuned on that: one
+    # run against a 4-day sample, inside the weighted arm's own family, and
+    # +/-10% here only moves Gate 1 by 2-3pp — a single observation cannot
+    # justify the change, and per-run retuning fits noise. Re-read after ~5
+    # trading days (compare pct_dir / pct_gate1 / joint and runs.n_actionable
+    # for combine_source 'ml' vs 'weighted'); if ML exposure is still
+    # materially higher, 0.0658 -> ~0.075 pulls Gate 1 to ~33.8%.
+    ml_diff_threshold_long: Optional[float] = 0.0463
+    ml_diff_threshold_short: Optional[float] = 0.0374
+    ml_raw_confidence_scale: float = 0.0658    # PROVISIONAL (see above)
 
     # ANTI-CHASE / OVEREXTENSION GATE (Gate 5 of the actionable filter, 2026-07-22).
     # The BUY-vs-SELL forensics (signals panel, 8.3k ticker-days) found the BUY

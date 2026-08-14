@@ -16,7 +16,9 @@ from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
 from src.data.trending import get_trending_tickers
 from src.signals.aggregator import build_signals, set_ml_combine_arm
-from src.analysis.claude_analyst import generate_recommendations, get_last_synthesis_meta
+from src.analysis.claude_analyst import (SYNTHESIS_PROMPT_VERSION,
+                                         generate_recommendations,
+                                         get_last_synthesis_meta)
 from src.data.insider_trades import fetch_insider_trades, get_tickers_from_smart_money
 from src.data.eight_k import fetch_8k_articles
 from src.data.google_trends import fetch_google_trends
@@ -405,6 +407,7 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "volume_factor": float(getattr(s, "volume_factor", 1.0)),
                 "family_conf_factor": float(getattr(s, "family_conf_factor", 1.0)),
                 "tape_conf_factor": float(getattr(s, "tape_conf_factor", 1.0)),
+                "sector_conf_factor": float(getattr(s, "sector_conf_factor", 1.0)),
                 # Buy/sell split sides (2026-07-22): the two camp-conviction
                 # aggregates whose difference is combined_score — persisted so
                 # each side's forward IC is monitored (Signal IC → Buy/Sell side).
@@ -2166,22 +2169,22 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             pead_context=pead_context,
         )
 
-    # ── Step 4.6: held-positions prompt A/B (coin flip per run) ──────────
-    # 50/50 experiment: half the runs tell the LLM which tickers the system
-    # currently holds (plus a zero-endowment-bias review instruction), half
-    # leave it blind (the pre-experiment behavior). The flip is stamped on
-    # every trade CLOSED this run (exit_hold_prompt) so the dashboard's
-    # method-evaluation table accumulates an exit-outcome comparison.
+    # ── Step 4.6: held-positions prompt — ALWAYS ON since 2026-08-14 ─────
+    # Was a 50/50 A/B (half the runs told the LLM which tickers the system
+    # holds, plus a zero-endowment-bias review instruction; half stayed blind).
+    # CALLED 2026-08-14 on 401 closed trades: ON led on both metrics
+    # (55.4% vs 50.2% gross win, -0.65% vs -1.03% mean return) but at p=0.30 /
+    # p=0.64, and the power calculation says ~1,500 trades PER ARM are needed
+    # for that effect size — roughly 15 more months at the current rate. An
+    # experiment that cannot conclude is not paying for the half of the runs it
+    # costs, so the leading arm was adopted. `exit_hold_prompt` is still stamped
+    # (now always True) to keep the ledger's audit trail honest and the
+    # historical ON/OFF comparison readable.
     open_position_summaries = get_open_position_summaries()
-    hold_prompt_active = bool(open_position_summaries) and (
-        random.random() < float(settings.open_positions_prompt_share)
-    )
+    hold_prompt_active = bool(open_position_summaries)
     if open_position_summaries:
-        logger.info(
-            f"[hold_prompt] {'ON' if hold_prompt_active else 'OFF'} this run "
-            f"(share={settings.open_positions_prompt_share:g}, "
-            f"{len(open_position_summaries)} open position(s))"
-        )
+        logger.info(f"[hold_prompt] ON (always, adopted 2026-08-14) — "
+                    f"{len(open_position_summaries)} open position(s)")
 
     # ── Step 5: Generate recommendations ─────────────────────────────────
     logger.info("Step 5: Generating recommendations...")
@@ -2420,6 +2423,10 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # outcome comparison can be built after the fact, same idiom as the
         # blind flip and the hold-prompt flip.
         "dual_case_synthesis":          dual_case,
+        # Prompt ERA (2026-08-14): a synthesis-prompt rewrite moves every arm's
+        # output at once — without this stamp it lands as an unmarked
+        # discontinuity in the arm evals and LLM-confidence calibrations.
+        "synthesis_prompt_version":     SYNTHESIS_PROMPT_VERSION,
     }
 
     # Fresh cold-fetch allowance for the trade gate (actionable tickers are almost

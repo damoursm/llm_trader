@@ -37,6 +37,16 @@ _DEEPSEEK_ANALYST_SEED = 4242
 _THINKING_SUFFIX = "-thinking"
 _DEEPSEEK_THINKING_SUFFIX = _THINKING_SUFFIX   # back-compat alias
 
+# Version stamp for the synthesis prompt, persisted into the run meta
+# (pipeline run-meta dict -> gate_diag) so prompt-arm and LLM evals can be
+# split by prompt era after the fact — a prompt rewrite otherwise lands as an
+# unmarked discontinuity in every LLM-confidence calibration and arm
+# comparison. Bump on any change that could move the model's outputs
+# (instructions, framing, per-ticker line format); leave alone for pure
+# plumbing. "2026-08-14-rank-process": the selection-process block +
+# percentile standings + rank-era conviction rules (see CLAUDE.md).
+SYNTHESIS_PROMPT_VERSION = "2026-08-14-rank-process"
+
 
 def _split_thinking(model_id: str) -> tuple[str, bool]:
     """Strip a trailing ``-thinking`` logical suffix → (API model, thinking flag).
@@ -713,6 +723,31 @@ def generate_recommendations(
             return method not in _sell_drop
         return True
 
+    # ── Percentile standing of camp scores in TODAY'S cross-section ─────────
+    # (2026-08-14, the rank era.) Camp scores are comparable only WITHIN a run:
+    # the whole pipeline consumes within-run ranks, and the two combine engines
+    # live on very different absolute scales (weighted mean |combined| ~0.30 vs
+    # the ML stackers' ~0.06 — a calibrated probability margin near 0.5 is a
+    # genuine no-view, not a small z-score). Before this annotation, an ML-arm
+    # run showed the model `buy_score=0.08` and the dual-case instruction told
+    # it two weak convictions mean HOLD — the day's STRONGEST view read as
+    # noise, the same scale bug the direction bands had. The pNN standing
+    # (midrank percentile among ALL tickers scored this run, not just the ~40
+    # shown) is engine-invariant. Guarded to >=30 scored so the hold-review's
+    # handful-of-tickers universe never shows degenerate anchors.
+    from bisect import bisect_left as _bl, bisect_right as _br
+
+    _buy_pool = sorted(float(getattr(x, "combined_buy_score", 0.0) or 0.0) for x in signals)
+    _sell_pool = sorted(float(getattr(x, "combined_sell_score", 0.0) or 0.0) for x in signals)
+    _pct_ok = len(signals) >= 30
+
+    def _standing(v: float, pool: list) -> str:
+        """' (pNN today)' midrank percentile, or '' when the pool is too thin."""
+        if not _pct_ok or not pool:
+            return ""
+        r = (_bl(pool, v) + _br(pool, v)) / 2.0
+        return f" (p{100.0 * r / len(pool):.0f} today)"
+
     signal_lines = []
     for s in signals_for_claude:
         if dual_case:
@@ -722,11 +757,14 @@ def generate_recommendations(
             _bear = getattr(s, "combined_sell_score", 0.0) or 0.0
             parts = [
                 f"- {s.ticker}:",
-                f"  BULL CASE conviction={_bull:.2f} | BEAR CASE conviction={_bear:.2f}"
+                f"  BULL CASE conviction={_bull:.2f}{_standing(_bull, _buy_pool)}"
+                f" | BEAR CASE conviction={_bear:.2f}{_standing(_bear, _sell_pool)}"
                 f"  — these are the two camps' SEPARATE convictions, each averaged over"
                 f" only the methods holding that view and vetted for that side."
+                f" Judge each by its pNN STANDING in today's scored universe, not its"
+                f" absolute size (engines run on different scales)."
                 f" Weigh them yourself; neither is a recommendation."
-                f" If both are weak, say HOLD/WATCH.",
+                f" If both stand low, say HOLD/WATCH.",
             ]
         elif blind_synthesis:
             parts = [f"- {s.ticker}:"]
@@ -735,9 +773,11 @@ def generate_recommendations(
             # separate convictions — direction fires on their DIFFERENCE, so the
             # LLM sees a contested read (0.55 vs 0.40) vs a one-sided one
             # (0.55 vs 0.05). Aggregate verdict info → withheld in the blind arm.
+            _bs = float(getattr(s, "combined_buy_score", 0.0) or 0.0)
+            _ss = float(getattr(s, "combined_sell_score", 0.0) or 0.0)
             parts = [f"- {s.ticker}: direction={s.direction}, combined_confidence={s.confidence:.0%}, "
-                     f"buy_score={getattr(s, 'combined_buy_score', 0.0):.2f}, "
-                     f"sell_score={getattr(s, 'combined_sell_score', 0.0):.2f}, "
+                     f"buy_score={_bs:.2f}{_standing(_bs, _buy_pool)}, "
+                     f"sell_score={_ss:.2f}{_standing(_ss, _sell_pool)}, "
                      f"sources_agreeing={s.sources_agreeing}"]
         if not blind_synthesis and settings.enable_horizon_synthesis and getattr(s, "target_horizon", ""):
             _tradeable = "" if getattr(s, "horizon_tradeable", True) else " — NO horizon clears cost, prefer WATCH/HOLD"
@@ -901,8 +941,11 @@ def generate_recommendations(
         signals_text += f"\n\n[{skipped} additional tickers omitted — all had near-zero signals]"
 
     # ── Blind-vs-sighted instruction variants (blind_synthesis A/B) ──────────
-    # SIGHTED values are byte-identical to the pre-A/B prompt (baseline integrity
-    # + the cacheable prefix is unaffected — both blocks sit after the sentinel).
+    # (The sighted block was byte-identical to the pre-A/B prompt until the
+    # 2026-08-14 rank-era rewrite — SYNTHESIS_PROMPT_VERSION marks the era, and
+    # all three arms changed at the same instant so the head-to-head stays
+    # internally comparable; only cross-era comparisons need the version split.
+    # The cacheable prefix is unaffected — the arm blocks sit after the sentinel.)
     # BLIND removes every reference to the withheld aggregate verdict and swaps
     # the "trust the pre-computed confidence" anchor for own-judgment calibration.
     if dual_case:
@@ -941,11 +984,16 @@ def generate_recommendations(
             "   - confidence = your calibrated probability that YOUR chosen direction is right "
             "at the stated horizon. 0.5 = coin flip. Distribute honestly across the list — do "
             "not cluster everything at 0.7-0.9.\n"
+            "   - Each case's '(pNN today)' annotation is that conviction's percentile among "
+            "ALL tickers scored this run. Convictions are comparable only WITHIN a run — "
+            "different combine engines use very different absolute scales — so 'weak' and "
+            "'strong' mean the STANDING, never the raw number: a 0.08 that stands at p95 is "
+            "one of the day's strongest views.\n"
             "   - confidence ≥ 0.85 AND ≥ 2 independent method families agreeing → eligible for BUY / SELL.\n"
             "   - confidence ≥ 0.85 but only one method family in support → HOLD maximum (single-source signals are noise).\n"
             "   - confidence 0.55-0.84 → HOLD (monitor closely).\n"
             "   - confidence < 0.55 → WATCH only.\n"
-            "   - Two similar case convictions, or two weak ones → HOLD/WATCH. Declining to "
+            "   - Two similar case standings, or two low ones → HOLD/WATCH. Declining to "
             "call a direction is a correct and expected output, not a failure.\n"
             "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
@@ -1009,16 +1057,27 @@ def generate_recommendations(
             "   - confidence < 0.55 → WATCH only.\n"
             "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
-            "   - The pre-computed confidence already reflects: every enabled method score "
-            "combined by weight (methods with a confirmed sub-50% solo win rate are already "
-            "excluded from the combine entirely — you are not seeing their scores), "
-            "cross-method coherence (how strongly the methods agree, magnitude-weighted), "
-            "movement potential (ATR + Bollinger-band width), volume confirmation, "
-            "cross-FAMILY agreement breadth (see FAMILY AGREEMENT above), raw-tape confirmation "
-            "(see TAPE STRUCTURE above), cross-sectional rank vs the universe, and sector-ETF "
-            "alignment. It also bakes in recency-weighted sentiment, article count, and source "
-            "diversity inside the news score. Trust it — do not override upward without "
-            "explicit multi-source justification.\n"
+            "   - buy_score/sell_score are the bullish and bearish camps' SEPARATE convictions; "
+            "their '(pNN today)' annotation is that score's percentile among ALL tickers scored "
+            "this run. Camp scores are comparable only WITHIN a run — different combine engines "
+            "use very different absolute scales — so read the STANDING (p90+ = among today's "
+            "strongest such views), never the absolute size. A contested read (both camps "
+            "standing high) deserves less confidence than an equally strong one-sided read.\n"
+            "   - The pre-computed confidence already reflects: each method's WITHIN-RUN RANK "
+            "against the tradeable cross-section rather than its absolute score, mapped through "
+            "that method's own MEASURED rank→payoff curve (a method whose extreme readings "
+            "historically mean-revert already contributes a REVERSED signal at the extreme — "
+            "this is measured, not assumed), weights adapted to each method's demonstrated "
+            "per-side hit rate (methods with a confirmed sub-50% record on a side are excluded "
+            "from that side entirely — you are not seeing their scores), cross-method coherence "
+            "(how strongly the methods agree, magnitude-weighted), movement potential (ATR + "
+            "Bollinger-band width), volume confirmation, cross-FAMILY agreement breadth (see "
+            "FAMILY AGREEMENT above), raw-tape confirmation (see TAPE STRUCTURE above), "
+            "cross-sectional standing vs the universe, and sector-ETF alignment. It also bakes "
+            "in recency-weighted sentiment, article count, and source diversity inside the news "
+            "score. Trust it — do not override upward without explicit multi-source "
+            "justification. Where you ADD value beyond it: judging whether a catalyst is real, "
+            "already priced, or noise — the numbers cannot read the story.\n"
         )
 
     # Build the active-methods description for the prompt
@@ -3009,10 +3068,10 @@ OpEx max-pain aggregator weight this run: {cx.opex_max_pain_weight:.2f} (boost {
     - These are timing modifiers layered onto the per-ticker signals — direction must still come from the
       signal stack and your synthesis."""
 
-    # Build held-positions review block and instruction. A/B'd per run by the
-    # pipeline (open_positions_prompt_share): half the runs the LLM knows what
-    # the system holds, half it stays blind — the coin flip is stamped on
-    # every trade closed that run so exit outcomes are comparable over time.
+    # Build held-positions review block and instruction. ALWAYS ON since
+    # 2026-08-14 (the open_positions_prompt_share A/B was retired, ON adopted —
+    # see pipeline Step 4.6): the pipeline passes open_positions whenever any
+    # exist. `exit_hold_prompt` is still stamped (now always True) on closes.
     open_positions_block        = ""
     open_positions_instructions = ""
     if open_positions:
@@ -3040,6 +3099,11 @@ The system currently HOLDS these positions. Your recommendation for each of thes
       the position (signal reversal). A HOLD/WATCH keeps it open. Do not manufacture reasons to keep a
       position, and do not flip direction merely because the mark is negative — judge the signals, not
       the P&L.
+    - Judge the REMAINING move, not the move already taken. This system optimizes the move from entry
+      to the next swing extreme: a position that has largely paid out its swing and whose standing in
+      today's cross-section is fading is a WEAKER hold than its entry story suggests, even if nothing
+      in the story has broken. Conversely, an underwater position whose forward evidence is intact is
+      not a close candidate merely for being underwater.
     - In the rationale for each held ticker, explicitly CONFIRM or CONTRADICT the held direction in one
       clause (e.g. "held long thesis intact: …" / "held long thesis broken: …")."""
 
@@ -3612,6 +3676,17 @@ Regime guide:
 
 Your defining edge: you are ruthlessly disciplined about false positives. You understand that a wrong BUY or SELL costs capital that cannot be recovered. You output HOLD or WATCH whenever the evidence is mixed, incomplete, or driven by a single source. When you do issue a BUY or SELL, it is because the convergence of evidence makes the directional call highly reliable — and you explain precisely why.
 
+HOW THIS SYSTEM PICKS STOCKS — the process your recommendations feed (every claim below is MEASURED on this system's own trade history, not assumed):
+<selection_process>
+- CROSS-SECTIONAL, NOT ABSOLUTE. Each run scores hundreds of names and consumes every method's WITHIN-RUN RANK against the tradeable universe (price ≥ $5, dollar volume ≥ $5M/day), mapped through that method's own measured rank→payoff curve. A stock is bought for being among today's strongest setups, not for clearing a fixed bar. Judge candidates against each other, not against an abstract standard.
+- THE TARGET IS THE NEXT SWING, NOT A FIXED HORIZON. The optimization objective is the signed move from entry to the next swing extreme (pivot high/low). The median realized pivot horizon is ~1-3 sessions, and the measured edge of actionable calls peaks around day 2 and decays toward zero by day 5. Prefer the name with the largest IMMINENT move; a thesis that needs weeks to pay is usually the wrong pick here.
+- EXITS ARE MECHANICAL AND FAST. Every open position is re-judged EVERY run by the same engine that opened it, and closed on direction flips, trailing/adverse stops, measured per-method horizon expiry, or a learned exit signal. Most holds last 1-5 sessions. You do not need to time the exit — pick the entry with the strongest near-term move and the system manages the close.
+- SELECTIVITY IS ASYMMETRIC (measured). Bullish calls are drawn from roughly the top decile of the tradeable cross-section; bearish calls from roughly the bottom 5%. Sell-heavy books were measured to LOSE. A SELL should be rarer than a BUY and reserved for the extreme of bearish evidence.
+- DO NOT CHASE (measured + mechanically enforced). A BUY on a name already up more than ~12% over the last 5 completed sessions is DEFERRED by a gate: recent big gainers mean-revert at this system's horizon, and extreme momentum readings are among the LEAST reliable bullish evidence here — the strongest-looking chart is often the worst entry. Prefer names EARLY in a repricing, where the catalyst is fresh and the move has not already paid out. (Extreme OFF-HOURS GAP readings, by contrast, are among the MOST informative signals in this system.)
+- EARNINGS BLACKOUT. Actionable calls within 2 days of a scheduled report are removed mechanically (exception: a fresh post-release drift setup ≤1 day after the report).
+- YOUR ROLE IN THE CHAIN. The quantitative layer supplies cross-sectional standing; you supply what it cannot: reading the news, judging whether a catalyst is real, already priced, or noise, spotting incoherence between evidence layers, and vetoing setups the numbers like but the story contradicts. Your calls are then gated mechanically (regime-dependent confidence threshold, ≥2 independent sources, liquidity floor, anti-chase, earnings blackout) and sized by measured calibrations — so a PRECISE, honest confidence is worth more than a bold one.
+</selection_process>
+
 Signal sources available today: {methods_desc}
 {session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}{catalyst_block}{_CACHE_SENTINEL}Today's date: {fmt_et(now_et())}
 {fundamentals_block}{corporate_actions_block}{open_positions_block}INPUT — multi-method ticker signals:
@@ -3626,10 +3701,10 @@ YOUR TASK:
 {agreement_instruction}   - A single strong news print or a single options sweep is NEVER sufficient for BUY/SELL. It may be positioning, it may be noise. Require corroboration.
    - Do NOT ignore trending/discovered tickers just because they are not mega-caps. Small caps with strong smart money conviction and technical breakouts are often your best risk/reward setups.
 
-2. Distinguish time horizons:
-   - "SWING" (2-10 days): catalyst-driven move not yet priced in.
-   - "SHORT-TERM" (1-4 weeks): sector rotation, earnings run-up/fade, macro shift.
-   - "POSITION" (1-3 months): structural change — regulatory, competitive, macro theme.
+2. Distinguish time horizons — label when your THESIS resolves, knowing this book runs SHORT (see <selection_process>: most holds close within 1-5 sessions and the measured edge decays by day 5):
+   - "SWING" (2-10 days): catalyst-driven move not yet priced in. This is the book's natural horizon and should be your default for actionable calls.
+   - "SHORT-TERM" (1-4 weeks): sector rotation, earnings run-up/fade, macro shift — use only when the catalyst path genuinely needs weeks.
+   - "POSITION" (1-3 months): structural change — regulatory, competitive, macro theme. RARE by construction: the exit layer re-judges every position each run and will close it long before months pass unless the evidence keeps re-confirming. A POSITION label requires a thesis strong enough to keep re-earning its hold.
 {tech_instructions}
 {conviction_rules}
 4. Short-selling discipline:

@@ -3,9 +3,15 @@
 ``src/signals/aggregator.py::_score_ticker`` computes the final per-ticker
 confidence as a chain of multipliers on a raw base:
 
-    raw_confidence = min(1, |combined_score| / 0.5)
+    raw_confidence = min(1, |combined_score| / SCALE)   # SCALE = 0.5 on the
+                                                       # absolute basis, the
+                                                       # quantile-matched
+                                                       # rank_raw_confidence_scale
+                                                       # on the rank basis
+                                                       # (aggregator._raw_confidence_scale)
     confidence     = round(min(1, raw_confidence * coherence_factor * movement_factor
-                                  * volume_factor * family_factor * tape_conf_factor), 2)
+                                  * volume_factor * family_factor * tape_conf_factor
+                                  * sector_conf_factor), 2)
 
 Each factor was added independently over time (coherence/movement/volume first,
 family + tape 2026-07-19) on the belief that it improves the signal — but the
@@ -37,7 +43,7 @@ Two views per variant, both over the unbiased panel:
   Low → Medium → High; a flat or inverted spread means that multiplier isn't
   actually separating good trades from bad ones despite moving the number.
 
-The six raw ingredients (``raw_confidence`` + the five factors) are persisted
+The seven raw ingredients (``raw_confidence`` + the six factors) are persisted
 verbatim on the ``signals`` table (2026-07-21, ``SIGNAL_CONFIDENCE_COMPONENT_
 COLUMNS``) rather than re-derived from other stored fields — re-deriving
 ``coherence_factor`` etc. from the per-method score JSON would silently apply
@@ -107,6 +113,7 @@ VARIANTS: Sequence[tuple] = (
     ("raw_volume",    "Raw × Volume",            "volume_factor"),
     ("raw_family",    "Raw × Family agreement",  "family_conf_factor"),
     ("raw_tape",      "Raw × Tape confirmation", "tape_conf_factor"),
+    ("raw_sector",    "Raw × Sector alignment",  "sector_conf_factor"),
     ("live",          "Live (all combined)",     None),
 )
 _LIVE_KEY = "live"

@@ -120,8 +120,7 @@ def test_confidence_epoch_registered_for_the_switch():
 
 def test_abs_shadow_columns_registered():
     """The absolute-basis shadow combine (2026-08-14): schema columns exist,
-    auto-migrated, and the TickerSignal carries the fields — so the basis A/B
-    accrues from the first post-restart run."""
+    auto-migrated, and the TickerSignal carries the fields."""
     from src.db.schema import _ADD_COLUMNS, SIGNAL_ABS_SHADOW_COLUMNS
     from src.models import TickerSignal
     assert SIGNAL_ABS_SHADOW_COLUMNS == (
@@ -130,6 +129,199 @@ def test_abs_shadow_columns_registered():
     for c in SIGNAL_ABS_SHADOW_COLUMNS:
         assert ("signals", c) in migrated
         assert c in TickerSignal.model_fields
+
+
+def test_abs_shadow_is_actually_assigned_on_the_signal():
+    """...and the aggregator POPULATES them.
+
+    The plumbing test above passed for the whole 2026-08-14 commit while the
+    aggregator computed `_abs_buy`/`_abs_sell` and then dropped them on the
+    floor: schema, model fields, repo writer and pipeline reader were all
+    correct, so the column simply stayed NULL on every row and nothing warned.
+    That silently defeated the `ex_combine` basis-invariance guarantee too — the
+    fallback to `combined_score` is unconditional when the twin is never
+    written, which is the RANKED combine post-restart.
+
+    Checked on the AST rather than by running `build_signals` (which needs the
+    full feed stack): the three fields must appear as KEYWORDS on the
+    TickerSignal construction, which a dead store cannot fake.
+    """
+    import ast
+    import inspect
+    from src.db.schema import SIGNAL_ABS_SHADOW_COLUMNS
+    from src.signals import aggregator
+
+    tree = ast.parse(inspect.getsource(aggregator))
+    kwargs: set = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TickerSignal"):
+            kwargs |= {kw.arg for kw in node.keywords if kw.arg}
+    assert kwargs, "no TickerSignal(...) construction found in aggregator"
+    missing = [c for c in SIGNAL_ABS_SHADOW_COLUMNS if c not in kwargs]
+    assert not missing, f"shadow combine computed but never persisted: {missing}"
+
+
+def test_raw_confidence_scale_follows_the_basis():
+    """One resolver, both sites. The cross-sectional overlay re-derives
+    raw_confidence on the adjusted combined score; when it kept a hard-coded
+    /0.5 while the first pass moved to the rank scale, every overlay-touched
+    row persisted components that no longer multiplied back to its confidence."""
+    import ast
+    import inspect
+    from config.settings import settings
+    from src.signals import aggregator
+    from src.signals.aggregator import _raw_confidence_scale
+
+    _basis = settings.method_score_basis
+    try:
+        settings.method_score_basis = "rank"
+        assert _raw_confidence_scale() == pytest.approx(
+            settings.rank_raw_confidence_scale)
+        settings.method_score_basis = "absolute"
+        assert _raw_confidence_scale() == 0.5
+    finally:
+        settings.method_score_basis = _basis
+
+    # Neither site may hard-code the divisor again. A combined-derived numerator
+    # divided by a NUMERIC LITERAL is the defect's signature; dividing by another
+    # expression (the overlay's `abs(new_combined) / old_abs` ratio) is fine.
+    src = inspect.getsource(aggregator)
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)):
+            continue
+        if "combined" not in ast.unparse(node.left):
+            continue
+        assert not (isinstance(node.right, ast.Constant)
+                    and isinstance(node.right.value, (int, float))), (
+            f"raw_confidence divisor must resolve through "
+            f"_raw_confidence_scale(), found literal in: {ast.unparse(node)}")
+
+
+def test_confidence_formula_has_one_implementation():
+    """`confidence` = raw x the five factors, capped and 2dp-rounded — computed
+    by ONE function, so the cross-sectional overlay cannot drift from the first
+    pass again (it has twice: a proportional rescale exact only below the cap /
+    rounding / 0.05 floor, and a stale 0.5 divisor)."""
+    from src.signals.aggregator import _confidence_from
+
+    # The formula itself.
+    assert _confidence_from(0.8, 1.0, 1.0, 1.0, 1.0, 1.0) == 0.8
+    assert _confidence_from(0.5, 1.2, 1.1, 1.0, 1.0, 1.0) == pytest.approx(0.66)
+    assert _confidence_from(0.9, 1.3, 1.2, 1.1, 1.1, 1.1) == 1.0        # capped
+    assert _confidence_from(0.4, 0.5, 1.0, 1.0, 1.0, 1.0) == 0.2
+
+    # A raw base and neutral factors must reproduce the base exactly — the
+    # property confidence_components.py relies on to isolate one factor.
+    for raw in (0.0, 0.13, 0.5, 0.87, 1.0):
+        assert _confidence_from(raw, 1.0, 1.0, 1.0, 1.0, 1.0) == round(raw, 2)
+
+    # The sector multiplier defaults to neutral (the two passes that run before
+    # sector alignment is known) and multiplies in like any other factor.
+    assert _confidence_from(0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0) == 0.8
+    assert _confidence_from(0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 0.75) == 0.6
+    assert _confidence_from(0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.10) == pytest.approx(0.55)
+
+
+def test_cross_sectional_overlay_does_not_rescale_confidence():
+    """The overlay must RE-DERIVE confidence from the adjusted score, never
+    scale the already-rounded, already-capped `sig.confidence`. Pinned on the
+    AST because the rescale reads as reasonable code and its output stays
+    plausible — only the stored components stop multiplying back."""
+    import ast
+    import inspect
+    from src.signals import aggregator
+
+    tree = ast.parse(inspect.getsource(aggregator))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult)):
+            continue
+        operands = {ast.unparse(node.left), ast.unparse(node.right)}
+        assert "sig.confidence" not in operands, (
+            f"cross-sectional overlay is rescaling confidence again: "
+            f"{ast.unparse(node)}")
+
+    # All THREE confidence sites go through the shared helper: the score pass,
+    # the cross-sectional overlay, and the sector-alignment pass.
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_confidence_from"]
+    assert len(calls) == 3, (
+        f"expected the score pass, cross-sectional overlay and sector pass to "
+        f"be the only confidence sites, found {len(calls)}")
+
+
+def test_sector_alignment_factor_is_a_persisted_component():
+    """The sector multiplier (1.10 aligned / 0.75 contradicted) applied to
+    `confidence` for its entire life while being stored nowhere, so a
+    sector-adjusted row could never multiply back from its components and
+    confidence_components.py silently attributed the haircut to whichever
+    factor it was isolating. It is now a first-class component end to end."""
+    import ast
+    import inspect
+    from src.analysis.confidence_components import VARIANTS
+    from src.db.schema import _ADD_COLUMNS, SIGNAL_CONFIDENCE_COMPONENT_COLUMNS
+    from src.models import TickerSignal
+    from src.signals import aggregator
+    from src.signals.method_epochs import CONFIDENCE_EPOCH_COLUMNS
+
+    assert "sector_conf_factor" in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS
+    assert ("signals", "sector_conf_factor") in {(t, c) for t, c, _ in _ADD_COLUMNS}
+    assert "sector_conf_factor" in TickerSignal.model_fields
+    assert TickerSignal.model_fields["sector_conf_factor"].default == 1.0
+    assert "sector_conf_factor" in CONFIDENCE_EPOCH_COLUMNS
+    assert "sector_conf_factor" in {v[2] for v in VARIANTS}
+
+    # The sector pass must STORE it, not just consume it — the dead-store class.
+    tree = ast.parse(inspect.getsource(aggregator))
+    stored = {kw.arg for node in ast.walk(tree)
+              if isinstance(node, ast.Call)
+              for kw in node.keywords if kw.arg}
+    keys = {k.value for node in ast.walk(tree) if isinstance(node, ast.Dict)
+            for k in node.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    assert "sector_conf_factor" in (stored | keys), (
+        "sector factor is applied but never written back onto the signal")
+
+
+def test_ml_combine_has_its_own_scale():
+    """The ML stacker combine is ~5x smaller than the weighted one, so sharing
+    the weighted band + confidence divisor left the arm at 4.2% directional
+    rows (0% once the rank bands went live) and 0.2% past Gate 1 — an A/B
+    comparing a near-empty book against a full one. Both knobs are now
+    combine-aware, and ONLY for the full swap."""
+    from src.signals.aggregator import _direction_bands, _raw_confidence_scale
+    from config.settings import settings
+
+    w_long, w_short = _direction_bands("weighted")
+    m_long, m_short = _direction_bands("ml")
+    assert (m_long, m_short) == (settings.ml_diff_threshold_long,
+                                 settings.ml_diff_threshold_short)
+    assert m_long < w_long and m_short < w_short      # the whole point
+
+    assert _raw_confidence_scale("ml") == settings.ml_raw_confidence_scale
+    assert _raw_confidence_scale("ml") < _raw_confidence_scale("weighted")
+
+    # A partial swap mixes two scales in one difference -> weighted (conservative).
+    for src in ("ml_buy", "ml_sell", "weighted", "", None):
+        assert _direction_bands(src) == (w_long, w_short)
+        assert _raw_confidence_scale(src) == _raw_confidence_scale("weighted")
+
+
+def test_held_positions_prompt_ab_is_retired():
+    """Adopted ON 2026-08-14: the flip is gone and the setting deleted (a
+    pinned-to-1.0 knob reads as live and would fail the inert-config guard)."""
+    import inspect
+    from config.settings import Settings
+    from src import pipeline
+
+    assert "open_positions_prompt_share" not in Settings.model_fields
+    src = inspect.getsource(pipeline)
+    assert "open_positions_prompt_share" not in src
+    # The prompt is now conditioned only on there being open positions.
+    assert "hold_prompt_active = bool(open_position_summaries)" in src
 
 
 # ── payoff-shaped rank mapping (2026-08-14) ─────────────────────────────────

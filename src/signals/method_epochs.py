@@ -180,14 +180,35 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
 #   family votes) now live on a different scale: mean |eff score| jumps from
 #   ~0.1-0.2 to ~0.5 by construction. Same categorical test as 2026-07-22.
 #   Instant = the first scheduler restart with the code; rows before it were
-#   produced by the absolute-basis combine.
-CONFIDENCE_EPOCH: datetime = datetime(2026, 8, 14, 2, 0, tzinfo=timezone.utc)
+#   produced by the absolute-basis combine. Pinned to the ACTUAL restart, not to
+#   the intent: the original placeholder (02:00 UTC) was written before the code
+#   was even committed (05:16 UTC), i.e. it sat inside the absolute era, and only
+#   the date-granular `confidence_epoch()` ("day after a mid-day change" ->
+#   2026-08-15) kept that harmless. Had the restart slipped past 08-15 the mask
+#   would have silently admitted absolute-era rows as current-formula.
+#
+#   The same instant covers the confidence-FORMULA repairs that shipped in the
+#   same restart (2026-08-14): confidence is now computed by ONE function
+#   (`aggregator._confidence_from`) at all three sites, the cross-sectional
+#   overlay RE-DERIVES it from the adjusted score instead of rescaling the
+#   already-rounded/capped value, and the sector-alignment multiplier became a
+#   persisted component (`sector_conf_factor`) instead of an unrecorded seventh
+#   factor. Values move on ~20% of rows (materially where raw_confidence had
+#   capped); measured Gate-1 effect on the live panel was 5 of 787 rows at
+#   >=0.85 falling below it. Verified post-restart: 418/418 rows reconstruct
+#   from their stored components (82/420 before the repairs, 295/420 after the
+#   divisor alone). The instant sits a few minutes AFTER the restart that went
+#   live (first run stamped 13:30:26 UTC), which costs that one run and nothing
+#   else — `confidence_epoch()` is date-granular and returns 2026-08-15, so
+#   every 08-14 row is masked either way.
+CONFIDENCE_EPOCH: datetime = datetime(2026, 8, 14, 13, 35, tzinfo=timezone.utc)
 
 # Columns the confidence epoch governs: the value plus the six ingredients that
 # are only interpretable alongside it.
 CONFIDENCE_EPOCH_COLUMNS: tuple = (
     "confidence", "raw_confidence", "coherence_factor", "movement_factor",
     "volume_factor", "family_conf_factor", "tape_conf_factor",
+    "sector_conf_factor",
 )
 
 

@@ -160,6 +160,11 @@ REPLAY_TABLE_COLUMNS = REPLAYABLE_METHOD_COLUMNS + REPLAYABLE_CONTEXT_COLUMNS
 SIGNAL_CONFIDENCE_COMPONENT_COLUMNS = (
     "raw_confidence", "coherence_factor", "movement_factor",
     "volume_factor", "family_conf_factor", "tape_conf_factor",
+    # 2026-08-14: the third pass's sector-alignment multiplier (1.10 aligned /
+    # 0.75 contradicted). It had been applied to `confidence` since the pass was
+    # written and persisted nowhere, so a sector-adjusted row could not multiply
+    # back from its stored components by construction.
+    "sector_conf_factor",
 )
 
 # Buy/sell split combine sides (2026-07-22) — the two camp-conviction aggregates

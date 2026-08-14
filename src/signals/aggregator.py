@@ -1358,6 +1358,86 @@ def _volume_factor(vol_ratio: float, abs_combined: float, coherence_ratio: float
     return round(1.00 + boost, 3)
 
 
+def _confidence_from(raw_confidence: float, coherence_factor: float,
+                     movement_factor: float, volume_factor: float,
+                     family_conf_factor: float, tape_conf_factor: float,
+                     sector_conf_factor: float = 1.0) -> float:
+    """The confidence formula — the raw base times the six multipliers, capped.
+
+    ONE implementation on purpose. The cross-sectional overlay re-derives
+    confidence on its adjusted combined score, and a second expression there
+    drifted from this one TWICE: it rescaled `sig.confidence` proportionally
+    (exact only below the 2dp rounding, the 1.0 cap and the 0.05 `old_abs`
+    floor — 104 of 384 live rows failed to reconstruct), and it divided by a
+    stale 0.5 after the rank basis moved the scale. Both were invisible from
+    the outside: the numbers stayed plausible.
+
+    `sector_conf_factor` is the third pass's sector-alignment multiplier
+    (boost 1.10 / penalty 0.75), which applied to `confidence` for its whole
+    life while being persisted NOWHERE — a 25% haircut invisible to every
+    reconstruction, so a sector-contradicted row could not multiply back by
+    construction. It defaults to 1.0 for the two passes that run before sector
+    alignment is known.
+
+    The ingredients are persisted verbatim on the signals panel, so
+    `confidence_components.py` can only isolate a factor's contribution if
+    they actually multiply back to the stored confidence.
+    """
+    return round(min(1.0, raw_confidence * coherence_factor * movement_factor
+                     * volume_factor * family_conf_factor * tape_conf_factor
+                     * sector_conf_factor), 2)
+
+
+def _raw_confidence_scale(combine_source: str = "weighted") -> float:
+    """The divisor mapping ``|combined_score|`` onto ``raw_confidence``.
+
+    Basis-dependent since 2026-08-14: the ranked+shaped combine runs hotter
+    than the absolute one, so the rank basis divides by the quantile-matched
+    ``rank_raw_confidence_scale`` to keep raw_confidence's distribution — and
+    Gate 1, the regime threshold table and the sizing tiers built on it —
+    meaning what it meant.
+
+    COMBINE-dependent for the same reason: when the ML stackers replace both
+    camps the score is a calibrated probability margin on a much smaller scale
+    (mean |combined| 0.057 vs 0.297), so the weighted divisor left 99.8% of ML
+    rows below Gate 1 and the arm could not act at all. ``ml_raw_confidence_scale``
+    is its quantile-matched twin. Only the full swap (``"ml"``) gets it — a
+    partial ``ml_buy``/``ml_sell`` swap puts two scales in one difference, and
+    the weighted divisor is the conservative read there.
+
+    ONE resolver on purpose. The cross-sectional overlay re-derives
+    raw_confidence on the adjusted combined score, and a second literal there
+    silently desynchronised the persisted confidence COMPONENTS from the
+    confidence they are supposed to explain (the exact failure the overlay's
+    own 2026-07-27 fix was written to remove).
+    """
+    if str(combine_source or "").lower() == "ml":
+        return float(getattr(settings, "ml_raw_confidence_scale", 0.0658))
+    if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
+        return float(getattr(settings, "rank_raw_confidence_scale", 0.642))
+    return 0.5
+
+
+def _direction_bands(combine_source: str = "weighted") -> tuple:
+    """``(long_band, short_band)`` for the Direction step, per combine + basis.
+
+    Resolved in ONE place because the cross-sectional overlay re-derives
+    direction on its adjusted score and must test the same bars. See
+    `_raw_confidence_scale` for why the ML combine needs its own pair.
+    """
+    from config.settings import directional as _dir
+    if str(combine_source or "").lower() == "ml":
+        sym = float(getattr(settings, "rank_diff_threshold", 0.182))
+        return (float(getattr(settings, "ml_diff_threshold_long", None) or sym),
+                float(getattr(settings, "ml_diff_threshold_short", None) or sym))
+    if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
+        sym = float(getattr(settings, "rank_diff_threshold", 0.182))
+        return (float(_dir("rank_diff_threshold", "long") or sym),
+                float(_dir("rank_diff_threshold", "short") or sym))
+    thr = float(settings.buy_sell_diff_threshold)
+    return thr, thr
+
+
 # ── Within-run rank transform (2026-08-13 user directive) ────────────────────
 
 def _rank_transform_run(raw_maps: dict, tradeable=None) -> tuple:
@@ -1368,7 +1448,11 @@ def _rank_transform_run(raw_maps: dict, tradeable=None) -> tuple:
     finite view are ranked (average ranks on ties) and mapped onto
     ``2·(rank−1)/(n−1) − 1`` ∈ [−1, +1]: the run's strongest view becomes +1,
     the weakest −1, the median ≈ 0 — the same centered-rank convention the ML
-    models train on. Everything else is untouched:
+    models train on. With ``enable_rank_shaping`` (the DEFAULT) that linear
+    grid is replaced per method by its own measured rank→payoff curve, so an
+    anti-predictive extreme maps to the OPPOSITE sign rather than to +1 (see
+    `src/signals/rank_shaping.py`; a method with no curve keeps the linear
+    mapping). Everything else is untouched:
 
     * a ZERO score is an abstention and stays 0.0 (never assigned a rank);
     * an INACTIVE method keeps its raw score (it doesn't join the combine);
@@ -2532,47 +2616,65 @@ def build_signals(
                                   (False, True): "ml_sell", (False, False): "weighted"}[
                     (_conv is not None, _sconv is not None)]
 
-            combined = combined_buy - combined_sell
+            # ── Additive overlays (applied to the buy−sell DIFFERENCE) ────────
+            # Factored into one function so the ABSOLUTE-basis shadow total below
+            # is the SAME QUANTITY as the live one, differing only by the basis.
+            # That matters beyond the A/B: `ex_combine` falls back to
+            # `combined_score` on pre-shadow rows, so if the shadow stopped short
+            # of the overlays the exit model's feature would step at the switch —
+            # the very discontinuity the shadow exists to prevent. None of these
+            # overlays reads the method map, so applying them twice is identical
+            # work on two inputs, not a second decision.
+            def _apply_overlays(x: float) -> float:
+                # Interaction adjustments — small additive corrections for setups
+                # where two methods together are more informative than their
+                # linear contributions suggest.
+                if active_count >= 2:
+                    x += _interaction_adjustment(
+                        x, sentiment_score, technical_score,
+                        insider_sc, pc_score, vol_ratio,
+                    )
 
-            # ── Interaction adjustments ───────────────────────────────────────
-            # Small additive corrections for setups where two methods together
-            # are more informative than their linear contributions suggest.
-            if active_count >= 2:
-                combined += _interaction_adjustment(
-                    combined, sentiment_score, technical_score,
-                    insider_sc, pc_score, vol_ratio,
-                )
+                # Corporate-action directional overlay (additive, event-driven):
+                # f_split (forward-drift / reverse-distress) + f_dividend
+                # (increase / cut), added OUTSIDE the normalised weight pool so a
+                # corporate action nudges the handful of event tickers without
+                # dampening everyone else. Weight is a placeholder — review once
+                # the f_split/f_dividend IC accrues.
+                if corp_factors:
+                    _cf = corp_factors.get(ticker) or corp_factors.get(ticker.upper())
+                    if _cf:
+                        x += settings.corp_action_factor_weight * (
+                            float(_cf.get("f_split", 0.0)) + float(_cf.get("f_dividend", 0.0)))
 
-            # ── Corporate-action directional overlay (additive, event-driven) ──
-            # f_split (forward-drift / reverse-distress) + f_dividend (increase / cut),
-            # added OUTSIDE the normalised weight pool so a corporate action nudges the
-            # handful of event tickers without dampening everyone else. Weight is a
-            # placeholder — review once the f_split/f_dividend IC accrues.
-            if corp_factors:
-                _cf = corp_factors.get(ticker) or corp_factors.get(ticker.upper())
-                if _cf:
-                    combined += settings.corp_action_factor_weight * (
-                        float(_cf.get("f_split", 0.0)) + float(_cf.get("f_dividend", 0.0)))
+                # Massive fundamental factors directional overlay (additive):
+                # value/quality/growth/short-squeeze, added OUTSIDE the normalised
+                # pool (same idiom as corp_factors) so the capped/sparse
+                # fundamentals nudge the event tickers without dampening the rest.
+                # Already IC-monitored in the panel.
+                if fundamental_factors:
+                    _ff = fundamental_factors.get(ticker) or fundamental_factors.get(ticker.upper())
+                    if _ff:
+                        x += settings.fundamental_factor_weight * (
+                            float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
+                            + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
 
-            # ── Massive fundamental factors directional overlay (additive) ─────
-            # value/quality/growth/short-squeeze, added OUTSIDE the normalised pool
-            # (same idiom as corp_factors) so the capped/sparse fundamentals nudge the
-            # event tickers without dampening the rest. Already IC-monitored in the panel.
-            if fundamental_factors:
-                _ff = fundamental_factors.get(ticker) or fundamental_factors.get(ticker.upper())
-                if _ff:
-                    combined += settings.fundamental_factor_weight * (
-                        float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
-                        + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
+                # Trend-predictability directional overlay (additive): the four
+                # scores are already oriented (continuation OR reversal, learned
+                # per method + scaled by trend strength/confidence), so a single
+                # symmetric weight suffices — the orientation, not the weight,
+                # encodes each context's direction quality. Added outside the
+                # normalised pool (sparse per context).
+                if settings.enable_trend_predictability_methods:
+                    x += settings.trend_method_weight * (
+                        kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
+                return x
 
-            # ── Trend-predictability directional overlay (additive) ────────────
-            # The four scores are already oriented (continuation OR reversal, learned
-            # per method + scaled by trend strength/confidence), so a single symmetric
-            # weight suffices — the orientation, not the weight, encodes each context's
-            # direction quality. Added outside the normalised pool (sparse per context).
-            if settings.enable_trend_predictability_methods:
-                combined += settings.trend_method_weight * (
-                    kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
+            combined = _apply_overlays(combined_buy - combined_sell)
+            # The absolute-basis shadow TOTAL. Under method_score_basis="absolute"
+            # this equals `combined` exactly (pre-ML-arm), which is the invariant
+            # `tests/test_method_rank_basis.py` pins.
+            _abs_combined = _apply_overlays(_abs_buy - _abs_sell)
 
             # ── Direction ─────────────────────────────────────────────────────
             # The buy−sell DIFFERENCE clearing the configured band is the buy/sell
@@ -2587,13 +2689,10 @@ def build_signals(
             # asymmetric 10/5 cutoff beat symmetric at t +2.56, sell-heavy
             # grids always lost). `directional()` falls back to the symmetric
             # rank_diff_threshold when a side override is unset.
-            if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
-                from config.settings import directional as _directional
-                _sym = float(getattr(settings, "rank_diff_threshold", 0.182))
-                _band_long = float(_directional("rank_diff_threshold", "long") or _sym)
-                _band_short = float(_directional("rank_diff_threshold", "short") or _sym)
-            else:
-                _band_long = _band_short = settings.buy_sell_diff_threshold
+            # ML-arm runs resolve their own quantile-matched pair (2026-08-14):
+            # the stacker combine is ~5x smaller, so the weighted bands left the
+            # arm at ZERO directional signals once the rank bands went live.
+            _band_long, _band_short = _direction_bands(combine_source)
             direction: Direction
             if combined >= _band_long:
                 direction = "BULLISH"
@@ -2680,18 +2779,13 @@ def build_signals(
                              if fam_agreement is not None else 1.0)
             tape_conf_factor = tape_factor(tape_check, combined,
                                            settings.tape_confirmation_factor_span)
-            # Same quantile match for the confidence scale: /0.703 under rank
-            # keeps raw_confidence's distribution (and Gate 1 / the regime
-            # table / sizing tiers built on it) meaning what it meant.
-            _rc_scale = (float(getattr(settings, "rank_raw_confidence_scale", 0.703))
-                         if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank"
-                         else 0.5)
-            raw_confidence = min(1.0, abs(combined) / _rc_scale)
-            confidence = round(
-                min(1.0, raw_confidence * coherence_factor * movement_factor * volume_factor
-                    * family_factor * tape_conf_factor),
-                2,
-            )
+            # Same quantile match for the confidence scale — see
+            # `_raw_confidence_scale()`, the single resolver the cross-sectional
+            # overlay's re-derivation shares.
+            raw_confidence = min(1.0, abs(combined) / _raw_confidence_scale(combine_source))
+            confidence = _confidence_from(
+                raw_confidence, coherence_factor, movement_factor,
+                volume_factor, family_factor, tape_conf_factor)
 
             # ── Rationale ─────────────────────────────────────────────────────
             rationale_parts = []
@@ -2710,6 +2804,13 @@ def build_signals(
                 combined_score=round(combined, 4),
                 combined_buy_score=round(combined_buy, 4),
                 combined_sell_score=round(combined_sell, 4),
+                # Absolute-basis shadow (2026-08-14) — the weighted combine over
+                # the RAW scores, persisted beside the live one so rank-vs-absolute
+                # settles as a live A/B and `ex_combine` has a basis-invariant
+                # series to read.
+                combined_score_abs=round(_abs_combined, 4),
+                combined_buy_score_abs=round(_abs_buy, 4),
+                combined_sell_score_abs=round(_abs_sell, 4),
                 combine_source=combine_source,
                 sentiment_score=round(sentiment_score, 3),
                 sentiment_velocity_score=round(sent_velocity_score, 3),
@@ -2958,41 +3059,57 @@ def build_signals(
                 # additive relative-value overlay on the TOTAL (like the corp/
                 # fundamental/trend overlays), so it lands on combined_score and
                 # deliberately does NOT touch the persisted buy/sell camp sides.
-                if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
-                    from config.settings import directional as _cs_directional
-                    _cs_sym = float(getattr(settings, "rank_diff_threshold", 0.182))
-                    _cs_band_long = float(_cs_directional("rank_diff_threshold", "long") or _cs_sym)
-                    _cs_band_short = float(_cs_directional("rank_diff_threshold", "short") or _cs_sym)
-                else:
-                    _cs_band_long = _cs_band_short = settings.buy_sell_diff_threshold
+                _cs_band_long, _cs_band_short = _direction_bands(
+                    getattr(sig, "combine_source", "weighted"))
                 if new_combined >= _cs_band_long:
                     new_direction: Direction = "BULLISH"
                 elif new_combined <= -_cs_band_short:
                     new_direction = "BEARISH"
                 else:
                     new_direction = "NEUTRAL"
-                # confidence is derived from |combined| / 0.5 in the original
-                # build; reapply the same mapping but keep the existing
-                # coherence/movement/volume factors baked into sig.confidence
-                # by scaling proportionally to the change in |combined|.
-                old_abs = max(abs(sig.combined_score), 0.05)
-                scale = abs(new_combined) / old_abs
-                new_conf = round(min(1.0, sig.confidence * scale), 2)
-                # Keep the PERSISTED components consistent with the confidence
-                # they are supposed to explain (2026-07-27). This overlay runs
-                # AFTER the components are captured and rescales confidence, so
-                # `raw_confidence` was left describing the pre-overlay combined
-                # score: multiplying the six stored components reproduced the
-                # stored confidence for only 24.7% of rows, versus 92.1% on the
-                # rows this overlay never touched. `confidence_components.py`
-                # was therefore isolating factors of a value that was not the
-                # final confidence. Scaling by |new|/|old| is algebraically the
-                # same as re-deriving raw from the new combined (the mapping is
-                # linear in |combined| below the cap), so recording that is both
-                # correct and faithful to what the code already computes.
-                new_raw = min(1.0, abs(new_combined) / 0.5)
+                # Confidence is RE-DERIVED through the first pass's own formula
+                # on the adjusted combined score (2026-08-14), not rescaled.
+                #
+                # History: this overlay runs after the components are captured,
+                # so it originally rescaled `confidence` and left `raw_confidence`
+                # describing the PRE-overlay score — the six stored components
+                # reproduced the stored confidence for 24.7% of rows vs 92.1% on
+                # untouched ones, i.e. `confidence_components.py` was isolating
+                # factors of a value that was not the final confidence. The
+                # 2026-07-27 fix recorded `new_raw` and scaled confidence by
+                # |new|/|old|, argued to be algebraically identical "below the
+                # cap". That argument holds only below the cap: `sig.confidence`
+                # is already rounded to 2dp and capped at 1.0, and `old_abs`
+                # carries a 0.05 floor, so multiplying it by a large scale
+                # amplifies all three. Measured on the live rank-basis panel,
+                # 104 of 384 uncapped rows still failed to reconstruct (mean
+                # error 0.042, concentrated where |cs| is largest).
+                #
+                # Applying the formula directly makes the identity exact by
+                # construction — this is precisely what `_score_ticker` would
+                # have produced had `combined` been `new_combined` from the
+                # start. The five FACTORS are deliberately reused as captured
+                # rather than recomputed: they need `method_score_map_eff`,
+                # `vol_ratio` and `tape_check`, which are locals of the first
+                # pass, and holding them fixed while the score moves has been
+                # this overlay's design since it was written.
+                new_raw = min(1.0, abs(new_combined)
+                              / _raw_confidence_scale(getattr(sig, "combine_source", "weighted")))
+                new_conf = _confidence_from(
+                    new_raw, sig.coherence_factor, sig.movement_factor,
+                    sig.volume_factor, sig.family_conf_factor, sig.tape_conf_factor)
+                # The absolute-basis shadow takes the same overlay: `cs` is
+                # computed from the RAW per-method scores on the TickerSignal, so
+                # it is basis-INDEPENDENT, and leaving it off the twin would make
+                # the shadow a different quantity from the live total (and from
+                # the pre-shadow `combined_score` that `ex_combine` falls back to).
+                _abs_prev = getattr(sig, "combined_score_abs", None)
+                _abs_new = (max(-2.0, min(2.0, float(_abs_prev) + cs_w * cs))
+                            if _abs_prev is not None else None)
                 updated_signals.append(sig.model_copy(update={
                     "combined_score":         round(new_combined, 4),
+                    "combined_score_abs":     (round(_abs_new, 4)
+                                               if _abs_new is not None else None),
                     "cross_sectional_score":  round(cs, 4),
                     "direction":              new_direction,
                     "confidence":             new_conf,
@@ -3014,8 +3131,20 @@ def build_signals(
         raw_combined  = combined_scores.get(sig.ticker, 0.0)
         sector_factor = _sector_alignment_factor(sig.ticker, raw_combined, signals_by_ticker)
         if sector_factor != 1.0:
-            adjusted = round(min(1.0, sig.confidence * sector_factor), 2)
-            sig = sig.model_copy(update={"confidence": adjusted})
+            # RE-DERIVED through the shared formula, and the factor is PERSISTED
+            # (2026-08-14). This pass used to multiply the already-rounded
+            # `sig.confidence` by an unrecorded seventh multiplier — a 1.10 boost
+            # or a 0.75 penalty that no stored component could explain, so those
+            # rows could never reconstruct and `confidence_components.py` was
+            # attributing the sector haircut to whichever factor it happened to
+            # be isolating.
+            sig = sig.model_copy(update={
+                "confidence": _confidence_from(
+                    sig.raw_confidence, sig.coherence_factor, sig.movement_factor,
+                    sig.volume_factor, sig.family_conf_factor, sig.tape_conf_factor,
+                    sector_factor),
+                "sector_conf_factor": round(sector_factor, 4),
+            })
         final_signals.append(sig)
 
     return final_signals

@@ -1257,18 +1257,21 @@ class TickerSignal(BaseModel):
     tape_confirmation_detail: str = ""     # human-readable component summary
     # Confidence-formula components (2026-07-21) — the exact multiplicative chain
     # `confidence = round(min(1, raw_confidence * coherence_factor * movement_factor
-    # * volume_factor * family_factor * tape_conf_factor), 2)` computed in
-    # aggregator._score_ticker, persisted verbatim (not re-derived) so the signals
+    # * volume_factor * family_factor * tape_conf_factor * sector_conf_factor), 2)`
+    # computed by aggregator._confidence_from (the ONE implementation, called by
+    # the score pass, the cross-sectional overlay and the sector pass),
+    # persisted verbatim (not re-derived) so the signals
     # panel can isolate each component's contribution — see
     # src/analysis/confidence_components.py. Defaults are each factor's NEUTRAL
     # value (1.0 = no effect) so an unset/legacy row multiplies out to a no-op
     # rather than zeroing a downstream product.
-    raw_confidence: float = 0.0        # min(1, |combined_score| / 0.5), pre-multiplier
+    raw_confidence: float = 0.0        # min(1, |combined_score| / aggregator._raw_confidence_scale()), pre-multiplier
     coherence_factor: float = 1.0      # ∈ [0.45, 1.35] magnitude-weighted method agreement
     movement_factor: float = 1.0       # ∈ [0.70, 1.30] ATR%/BB-width%/GEX movement potential
     volume_factor: float = 1.0         # ∈ [0.92, 1.15] cross-method volume confirmation
     family_conf_factor: float = 1.0    # ∈ [1∓family_agreement_factor_span] cross-family vote
     tape_conf_factor: float = 1.0      # ∈ [1∓tape_confirmation_factor_span] raw tape alignment
+    sector_conf_factor: float = 1.0    # 1.10 aligned / 0.75 contradicted (third-pass sector alignment)
     # GEX fields — populated when enable_gex=true
     gex_signal: str = ""           # PINNED | AMPLIFIED | NEUTRAL | ""
     gamma_flip: Optional[float] = None
