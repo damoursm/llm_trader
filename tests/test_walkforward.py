@@ -100,6 +100,87 @@ def test_reset_is_fail_soft_when_a_hook_is_missing(monkeypatch):
     asof_mod.reset_all_calibration_caches()      # must not raise
 
 
+def test_every_registered_module_actually_exposes_a_reset_hook():
+    """The fail-soft above has a hole the walk-forward cannot survive.
+
+    `reset_all_calibration_caches` walks a list of module paths and calls
+    whichever of `reset_cache` / `reset_panel_cache` it finds — guarded by
+    `hasattr`. So a module whose hook is RENAMED (or a path listed with a typo)
+    raises nothing, logs nothing and resets nothing: the TTL cache simply
+    survives the cutoff change and every subsequent walk-forward step answers
+    with the previous step's calibration. That is the failure this whole module
+    exists to prevent, and it is invisible from the outside — exactly the
+    "verify mechanically, never by review" class.
+
+    Behavioural, not a source re-read: a sentinel is planted in each registered
+    module's cache and must be gone afterwards."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(asof_mod.reset_all_calibration_caches)
+    paths = {c.value for node in ast.walk(ast.parse(src.strip()))
+             if isinstance(node, ast.Tuple)
+             for c in node.elts
+             if isinstance(c, ast.Constant) and isinstance(c.value, str)
+             and c.value.startswith("src.")}
+    assert len(paths) >= 4, f"registration list not found (got {paths})"
+
+    planted = []
+    for path in sorted(paths):
+        mod = __import__(path, fromlist=["x"])
+        hooks = [h for h in ("reset_cache", "reset_panel_cache") if hasattr(mod, h)]
+        assert hooks, (
+            f"{path} is registered for as-of flushing but exposes neither "
+            f"reset_cache nor reset_panel_cache — its cache silently survives "
+            f"every cutoff change (rename the hook back, or drop the entry)")
+        caches = [n for n in dir(mod)
+                  if n.endswith("CACHE") and isinstance(getattr(mod, n), dict)]
+        assert caches, f"{path} has a reset hook but no dict cache to reset"
+        for name in caches:
+            cache = getattr(mod, name)
+            if "ts" in cache:
+                # Slot-style ({"ts": …, "<payload>": …}): the hook UPDATES the
+                # slots rather than clearing, so a fresh key would survive
+                # legitimately. Poison the slots instead.
+                cache["ts"] = 1e18
+                for k in cache:
+                    if k != "ts":
+                        cache[k] = "__asof_sentinel__"
+            else:
+                cache["__asof_sentinel__"] = object()
+            planted.append((path, name))
+
+    asof_mod.reset_all_calibration_caches()
+
+    survived = []
+    for path, name in planted:
+        cache = getattr(__import__(path, fromlist=["x"]), name)
+        if "ts" in cache:
+            stale = (cache["ts"] != 0.0
+                     or any(v == "__asof_sentinel__"
+                            for k, v in cache.items() if k != "ts"))
+        else:
+            stale = "__asof_sentinel__" in cache
+        if stale:
+            survived.append(f"{path}.{name}")
+    assert not survived, f"cache(s) survived the as-of flush: {survived}"
+
+
+def test_the_newest_ttl_caches_are_registered():
+    """rank_shaping (the shaped rank->payoff curves, 6h TTL) and news_shock (the
+    per-ticker attention baselines, 20min TTL) both feed live SCORES, so a stale
+    curve or baseline inside a walk-forward step is look-ahead, not just noise.
+    Pinned by name because "I added a module-level TTL cache" is the moment the
+    registration is easiest to forget."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(asof_mod.reset_all_calibration_caches)
+    for path in ("src.signals.rank_shaping", "src.signals.news_shock"):
+        assert path in src, f"{path} is not registered for as-of cache flushing"
+    assert ast.parse(src.strip())          # the source really is this function
+
+
 # ── the ledger leaks outcomes, not entries ────────────────────────────────────
 
 def test_ledger_visibility_keys_on_the_EXIT_not_the_entry():

@@ -220,3 +220,98 @@ def test_ml_arm_stamp_requires_actual_stacker_use():
         assert st("BUY", None) is False and st("SELL", "") is False
     finally:
         tracker.set_ml_arm(False)
+
+
+# ── the arm INSIDE build_signals (integration) ───────────────────────────────
+#
+# Everything above pins the pieces in isolation. The conftest pins
+# `enable_ml_combine=False` / `ml_combine_arm_share=0.0` suite-wide and until
+# now nothing opted back in, so the arm — live on ~50% of production runs — was
+# never executed inside `build_signals`. In particular the four-way
+# `combine_source` mapping was untested, and that string is what decides which
+# direction bands and which confidence divisor a row gets: the 2026-08-14
+# repair hangs off it, and mislabelling a partial swap as a full one would apply
+# the ML scale to a difference that is half weighted.
+
+_ARM_FIXTURE = ["AAPL", "MSFT", "GLD"]
+
+
+def _build_with_arm(monkeypatch, buy, sell):
+    """build_signals with the stacker convictions forced (no artifact needed).
+    `buy`/`sell` are the conviction values, or None to make that side fail soft."""
+    from config.settings import settings
+    import src.analysis.ml_stacker as st
+    import src.signals.aggregator as agg
+
+    monkeypatch.setattr(settings, "enable_ml_combine", True)
+    monkeypatch.setattr(settings, "enable_rank_shaping", False)
+    monkeypatch.setattr(st, "compute_buy_conviction", lambda scores: buy)
+    monkeypatch.setattr(st, "compute_sell_conviction", lambda scores: sell)
+    return {s.ticker: s for s in agg.build_signals(list(_ARM_FIXTURE), [])}
+
+
+def test_full_swap_replaces_both_camps_and_is_labelled_ml(monkeypatch):
+    sigs = _build_with_arm(monkeypatch, 0.05, 0.01)
+    assert sigs
+    for tk, s in sigs.items():
+        assert s.combine_source == "ml", tk
+        assert s.combined_buy_score == pytest.approx(0.05), tk
+        assert s.combined_sell_score == pytest.approx(0.01), tk
+
+
+def test_partial_swap_is_labelled_per_side(monkeypatch):
+    """Fail-soft is PER SIDE: a missing sell model leaves the weighted sell camp
+    in place, and the row must say so — stamping it "ml" would hand a
+    half-weighted difference the ML scale, and would couple its exits to
+    ml_exit on the strength of a side the stacker never decided."""
+    buy_only = _build_with_arm(monkeypatch, 0.05, None)
+    for tk, s in buy_only.items():
+        assert s.combine_source == "ml_buy", tk
+        assert s.combined_buy_score == pytest.approx(0.05), tk
+        assert s.combined_sell_score != pytest.approx(0.05), tk   # still weighted
+
+    sell_only = _build_with_arm(monkeypatch, None, 0.02)
+    for tk, s in sell_only.items():
+        assert s.combine_source == "ml_sell", tk
+        assert s.combined_sell_score == pytest.approx(0.02), tk
+
+
+def test_both_sides_failing_soft_stays_weighted(monkeypatch):
+    """No artifact at all is the common case (fresh checkout, lightgbm absent):
+    the arm coin may be ON and the combine must be untouched AND unlabelled."""
+    sigs = _build_with_arm(monkeypatch, None, None)
+    for tk, s in sigs.items():
+        assert s.combine_source == "weighted", tk
+
+
+def test_ml_rows_get_the_ml_confidence_divisor(monkeypatch):
+    """The 2026-08-14 repair at its real call site. The stacker conviction lives
+    on a ~5x smaller scale, so an ML row divided by the weighted 0.5 sat below
+    Gate 1 essentially always (0.2% pass rate) and the arm could not act."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "enable_cross_sectional", False)
+    sigs = _build_with_arm(monkeypatch, 0.05, 0.01)
+    ml_scale = float(settings.ml_raw_confidence_scale)
+    discriminating = 0
+    for tk, s in sigs.items():
+        assert s.raw_confidence == pytest.approx(
+            min(1.0, abs(s.combined_score) / ml_scale), abs=1e-3), tk
+        # ...and the weighted divisor would have given a DIFFERENT answer here,
+        # so the assertion above is not satisfied by both scales at once.
+        if abs(min(1.0, abs(s.combined_score) / 0.5) - s.raw_confidence) > 0.01:
+            discriminating += 1
+    assert discriminating, "fixture cannot tell the two divisors apart"
+
+
+def test_partial_swap_keeps_the_weighted_divisor(monkeypatch):
+    """Two scales in one difference -> the conservative (weighted) read. Pinned
+    end to end because the resolver's `combine_source == "ml"` check and the
+    aggregator's four-way label have to agree about what "full swap" means."""
+    from config.settings import settings
+    from src.signals.aggregator import _raw_confidence_scale
+    monkeypatch.setattr(settings, "enable_cross_sectional", False)
+    sigs = _build_with_arm(monkeypatch, 0.05, None)
+    scale = _raw_confidence_scale("weighted")
+    for tk, s in sigs.items():
+        assert s.raw_confidence == pytest.approx(
+            min(1.0, abs(s.combined_score) / scale), abs=1e-3), tk

@@ -483,3 +483,100 @@ def test_live_exit_features_fall_back_to_live_combine():
     f = live_exit_features(trade, {}, sig)
     assert f is not None
     assert f["ex_combine"] == pytest.approx(-0.44)             # ds(-1) * 0.44
+
+
+# ── build_signals ON THE RANK BASIS (integration) ───────────────────────────
+#
+# Everything above this line tests `_rank_transform_run` in isolation, and the
+# conftest pins `method_score_basis="absolute"` for the whole suite (legacy
+# fixtures are too thin to rank). The consequence was that NO test ever ran the
+# live production basis end to end: the two-phase wiring in `build_signals`, the
+# `abstained` -> weight-0 contract, the tradeable-pool build and the rank
+# confidence divisor at their real call sites were all unverified, and deleting
+# the `if method_score_basis == "rank"` branch outright left the suite green.
+# These opt back in explicitly.
+
+_FIXTURE = ["AAPL", "MSFT", "GLD"]
+
+
+def _build(monkeypatch, basis: str):
+    from config.settings import settings
+    import src.signals.aggregator as agg
+    monkeypatch.setattr(settings, "method_score_basis", basis)
+    # Shaping off: the curves are calibrated from the panel, which is EMPTY on
+    # the throwaway test DB, so it would be identity anyway — pinning it keeps
+    # the arithmetic below exact rather than incidentally exact.
+    monkeypatch.setattr(settings, "enable_rank_shaping", False)
+    return {s.ticker: s for s in agg.build_signals(list(_FIXTURE), [])}
+
+
+def test_rank_basis_abstains_a_thin_cross_section_end_to_end(monkeypatch):
+    """A 3-ticker run is below `method_rank_min_views` (5) for EVERY method, so
+    on the rank basis the whole book must go to weight 0 — both camps empty and
+    `sources_agreeing` 0 — while the same universe on the absolute basis
+    produces real camps. Same fixture, same data, only the basis differing: the
+    contrast is what proves the transform actually ran."""
+    absolute = _build(monkeypatch, "absolute")
+    ranked = _build(monkeypatch, "rank")
+
+    assert any(s.combined_buy_score or s.combined_sell_score
+               for s in absolute.values()), \
+        "the fixture produced no views at all — test lost its subject"
+    assert any(s.sources_agreeing > 0 for s in absolute.values())
+
+    for tk, s in ranked.items():
+        assert s.combined_buy_score == 0.0, f"{tk} kept a buy camp on a thin run"
+        assert s.combined_sell_score == 0.0, f"{tk} kept a sell camp on a thin run"
+        # The abstention must also reach agreement/coherence, not just the
+        # combine — the documented stream-separation contract.
+        assert s.sources_agreeing == 0, f"{tk} counted an abstained method"
+
+
+def test_abs_shadow_equals_the_absolute_basis_combine(monkeypatch):
+    """The shadow's whole claim: `combined_score_abs` is the SAME QUANTITY as
+    `combined_score`, differing only by the basis (overlays included). Checked
+    by running both bases over one fixture — this is what makes the rank-vs-
+    absolute A/B a comparison and `ex_combine`'s fallback basis-consistent."""
+    absolute = _build(monkeypatch, "absolute")
+    ranked = _build(monkeypatch, "rank")
+    for tk, r in ranked.items():
+        assert r.combined_score_abs is not None, f"{tk}: shadow never written"
+        assert r.combined_score_abs == pytest.approx(
+            absolute[tk].combined_score, abs=1e-3), (
+            f"{tk}: shadow {r.combined_score_abs} != absolute-basis combine "
+            f"{absolute[tk].combined_score}")
+
+
+@pytest.mark.parametrize("overlay", [False, True])
+def test_rank_basis_uses_the_rank_confidence_divisor(monkeypatch, overlay):
+    """`raw_confidence = min(1, |combined| / rank_raw_confidence_scale)` at the
+    REAL call sites, not just in the resolver. The absolute-era 0.5 would put
+    every row ~28% higher, which is the whole point of the quantile match.
+
+    Parametrized over the cross-sectional overlay because there are TWO sites
+    and the overlay's re-derivation OVERWRITES the score pass's value — with the
+    overlay on (the default), a stale literal in the score pass is invisible.
+    Off isolates the score pass; on covers the overlay's own divisor."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "enable_cross_sectional", overlay)
+    ranked = _build(monkeypatch, "rank")
+    scale = float(settings.rank_raw_confidence_scale)
+    assert scale != 0.5, "quantile-matched divisor collapsed onto the old one"
+    for tk, s in ranked.items():
+        assert s.raw_confidence == pytest.approx(
+            min(1.0, abs(s.combined_score) / scale), abs=1e-3), tk
+
+
+def test_tradeable_pool_is_skipped_when_the_gate_is_off(monkeypatch):
+    """`rank_tradeable_only` is only consulted when the Gate-4 liquidity gate is
+    ON; with the gate off the run must rank the full universe rather than
+    failing closed to an empty pool (a liquidity outage must never zero the
+    book). Driven through the real call site: `is_liquid` may not be called."""
+    from config.settings import settings
+    import src.data.liquidity as liq
+    monkeypatch.setattr(settings, "enable_trade_liquidity_gate", False)
+    monkeypatch.setattr(settings, "rank_tradeable_only", True)
+    monkeypatch.setattr(liq, "is_liquid",
+                        lambda *a, **k: pytest.fail("liquidity gate is OFF"))
+    ranked = _build(monkeypatch, "rank")
+    assert len(ranked) == len(_FIXTURE)

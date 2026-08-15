@@ -33,8 +33,9 @@ import pandas as pd
 
 from src.analysis.signal_panel import _spearman, periodic_ic_stats
 from src.analysis.simulated_trades import (HORIZONS, HORIZON_LABELS, PIVOT_LABEL,
-                                           _pivot_targets, _daily_series,
-                                           _fwd_daily, _intraday_series, _fwd_intraday)
+                                           resolve_horizons, _pivot_targets,
+                                           _daily_series, _fwd_daily,
+                                           _intraday_series, _fwd_intraday)
 from src.analysis.exit_methods import exit_category_for
 
 MIN_N = 10
@@ -103,11 +104,15 @@ def extract_activation_events(df: pd.DataFrame, group_cols, ts_col: str,
 
 # ── core computation ───────────────────────────────────────────────────────
 
-def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
+def _accumulate(df: pd.DataFrame, hz=HORIZONS) -> Dict[str, Dict[str, dict]]:
     """Per (method, horizon) collect the (score, direction-oriented forward return,
-    day) triples. ``df`` needs columns ticker/method/score/sigd(date)/ts(str)/dir_sign."""
+    day) triples. ``df`` needs columns ticker/method/score/sigd(date)/ts(str)/dir_sign.
+
+    ``hz`` is a ``resolve_horizons`` result — narrowing it skips the 30-min cache
+    read entirely, which is what most of this function's cost is."""
+    _labels = tuple(h[0] for h in hz) + (PIVOT_LABEL,)
     acc: Dict[str, Dict[str, dict]] = defaultdict(
-        lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in HORIZON_LABELS + (PIVOT_LABEL,)})
+        lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in _labels})
     tickers = df["ticker"].unique()
     daily = {tk: _daily_series(tk) for tk in tickers}
     # ticker -> (series, times); the epoch-ns index is split out ONCE per
@@ -144,7 +149,7 @@ def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
             cell["s"].append(sc)
             cell["f"].append(pv_fwd[pk] * dsign)
             cell["d"].append(sigd)
-        for lbl, interval, steps in HORIZONS:
+        for lbl, interval, steps in hz:
             if interval == "30m":
                 key = (tk, ts, steps)
                 if key not in intra_fwd:
@@ -176,7 +181,8 @@ def _accumulate(df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
 
 
 def _perf_rows(acc: Dict[str, Dict[str, dict]], views: Dict[str, int],
-               min_n: int, min_per_day: int, min_days: int) -> List[dict]:
+               min_n: int, min_per_day: int, min_days: int,
+               labels=None) -> List[dict]:
     """Turn the accumulator into per-method rows (same schema as
     ``simulated_trades.compute_method_perf``: n/win/ret/ic/icstd/icir per horizon).
 
@@ -184,14 +190,17 @@ def _perf_rows(acc: Dict[str, Dict[str, dict]], views: Dict[str, int],
     only events are too recent to have ANY forward return yet must still render
     (views > 0, every n = 0) — otherwise a session filter that isolates such an
     event silently drops the whole row and the per-session trade counts no
-    longer sum to the All-sessions view."""
+    longer sum to the All-sessions view.
+
+    ``labels`` must match the horizon set ``_accumulate`` was given (default:
+    all of them) — it decides which columns the rows carry."""
+    labels = tuple(labels) if labels is not None else HORIZON_LABELS + (PIVOT_LABEL,)
     rows: List[dict] = []
     for method in dict.fromkeys(list(views) + list(acc)):
-        by_h = acc.get(method) or {lbl: {"s": [], "f": [], "d": []}
-                                   for lbl in HORIZON_LABELS + (PIVOT_LABEL,)}
+        by_h = acc.get(method) or {lbl: {"s": [], "f": [], "d": []} for lbl in labels}
         rec: dict = {"method": method, "category": exit_category_for(method),
                      "views": int(views.get(method, 0))}
-        for lbl in HORIZON_LABELS + (PIVOT_LABEL,):
+        for lbl in labels:
             s_list, f_list, d_list = by_h[lbl]["s"], by_h[lbl]["f"], by_h[lbl]["d"]
             n = len(f_list)
             rec[f"n_{lbl}"] = n
@@ -222,7 +231,8 @@ def compute_llm_review_perf_from_reviews(days: Optional[int] = None, min_n: int 
                                          min_per_day: int = 5, min_days: int = 3,
                                          review_df: Optional[pd.DataFrame] = None,
                                          session: Optional[str] = None,
-                                         direction: Optional[str] = None) -> Optional[dict]:
+                                         direction: Optional[str] = None,
+                                         horizons=None) -> Optional[dict]:
     """The ``llm_review`` row (the synthesized decider) from the ``trade_reviews``
     table: hold-conviction = ``+confidence`` when the review reaffirms the entry
     action, ``−confidence`` when it flips (HOLD/WATCH skipped), reduced to
@@ -264,8 +274,10 @@ def compute_llm_review_perf_from_reviews(days: Optional[int] = None, min_n: int 
         rdf = rdf[rdf["dir_sign"] == want]
     if rdf.empty:
         return None
-    acc = _accumulate(rdf)
-    rows = _perf_rows(acc, {"llm_review": int(len(rdf))}, min_n, min_per_day, min_days)
+    hz = resolve_horizons(horizons)
+    acc = _accumulate(rdf, hz)
+    rows = _perf_rows(acc, {"llm_review": int(len(rdf))}, min_n, min_per_day, min_days,
+                      labels=tuple(h[0] for h in hz) + (PIVOT_LABEL,))
     return rows[0] if rows else None
 
 
@@ -274,7 +286,8 @@ def compute_exit_method_perf(days: Optional[int] = None, min_n: int = MIN_N,
                              exit_df: Optional[pd.DataFrame] = None,
                              review_df: Optional[pd.DataFrame] = None,
                              session: Optional[str] = None,
-                             direction: Optional[str] = None) -> pd.DataFrame:
+                             direction: Optional[str] = None,
+                             horizons=None) -> pd.DataFrame:
     """Per exit-method win rate / signed return / IC / IC-std / ICIR per horizon.
 
     All methods come from the ``exit_signals`` panel except ``llm_review`` (the
@@ -289,7 +302,9 @@ def compute_exit_method_perf(days: Optional[int] = None, min_n: int = MIN_N,
     fired in that US-market session (``rth|premarket|afterhours|overnight|
     extended``); ``direction`` (``long|short``) to the held position's side.
     Filters apply AFTER event extraction, so sessions partition the events
-    (All = Σ sessions)."""
+    (All = Σ sessions). ``horizons`` narrows which labels are computed (see
+    ``simulated_trades.resolve_horizons``); default: all."""
+    hz = resolve_horizons(horizons)
     ex = exit_df if exit_df is not None else _load_exit_signals(days)
     rows: List[dict] = []
     if ex is not None and not ex.empty:
@@ -305,15 +320,17 @@ def compute_exit_method_perf(days: Optional[int] = None, min_n: int = MIN_N,
         ex["sigd"] = ex["signal_date"].map(date.fromisoformat)
         ex["dir_sign"] = ex["entry_direction"].map(_dir_sign_of)
         ex["ts"] = ex["reviewed_at"]
-        acc = _accumulate(ex[["ticker", "method", "score", "sigd", "ts", "dir_sign"]])
+        acc = _accumulate(ex[["ticker", "method", "score", "sigd", "ts", "dir_sign"]], hz)
         views = ex.groupby("method").size().to_dict()
-        rows = _perf_rows(acc, views, min_n, min_per_day, min_days)
+        rows = _perf_rows(acc, views, min_n, min_per_day, min_days,
+                          labels=tuple(h[0] for h in hz) + (PIVOT_LABEL,))
 
     out = pd.DataFrame(rows)
     # Replace the panel's llm_review row with the history-backed trade_reviews one.
     review_row = compute_llm_review_perf_from_reviews(days, min_n, min_per_day, min_days,
                                                       review_df=review_df,
-                                                      session=session, direction=direction)
+                                                      session=session, direction=direction,
+                                                      horizons=horizons)
     if review_row is not None:
         if not out.empty:
             out = out[out["method"] != "llm_review"]
@@ -343,7 +360,8 @@ def compute_shadow_exit_method_perf(days: Optional[int] = None, min_n: int = MIN
                                     min_per_day: int = 5, min_days: int = 3,
                                     signals_df: Optional[pd.DataFrame] = None,
                                     session: Optional[str] = None,
-                                    direction: Optional[str] = None) -> pd.DataFrame:
+                                    direction: Optional[str] = None,
+                                    horizons=None) -> pd.DataFrame:
     """Simulate the position-independent exit methods over ALL scored tickers.
 
     Reads the ``signals`` panel, treats each ticker as a hypothetical position held
@@ -361,7 +379,8 @@ def compute_shadow_exit_method_perf(days: Optional[int] = None, min_n: int = MIN
     position epoch). ``session`` restricts to activations that FIRED in that
     US-market session; ``direction`` (``long|short``) to hypothetical positions
     of that side (mirroring ``_dir_sign_of``). Filters apply after event
-    extraction, so sessions partition the events (All = Σ sessions)."""
+    extraction, so sessions partition the events (All = Σ sessions).
+    ``horizons`` narrows which labels are computed; default: all."""
     from src.analysis.signal_panel import _load_signals, session_filter_mask
     df = signals_df if signals_df is not None else _load_signals(days)
     if df is None or getattr(df, "empty", True):
@@ -393,9 +412,11 @@ def compute_shadow_exit_method_perf(days: Optional[int] = None, min_n: int = MIN
     date_map = {d: date.fromisoformat(d) for d in long["signal_date"].unique()}
     long["sigd"] = long["signal_date"].map(date_map)
     ldf = long[["ticker", "method", "score", "sigd", "ts", "dir_sign"]]
-    acc = _accumulate(ldf)
+    hz = resolve_horizons(horizons)
+    acc = _accumulate(ldf, hz)
     out = pd.DataFrame(_perf_rows(acc, ldf.groupby("method").size().to_dict(),
-                                 min_n, min_per_day, min_days))
+                                  min_n, min_per_day, min_days,
+                                  labels=tuple(h[0] for h in hz) + (PIVOT_LABEL,)))
     if out.empty:
         return out
     return out.sort_values("views", ascending=False).reset_index(drop=True)

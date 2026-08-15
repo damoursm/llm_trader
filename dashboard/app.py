@@ -901,7 +901,7 @@ def _method_source_toggle(component_id: str) -> html.Div:
         [
             html.Label("Source:  ",
                        title="Ledger (gated trades): solo-method performance over only the trades the gates let through — apples-to-apples with the real book but a small, selection-biased sample. "
-                             "All scored tickers (simulated): one simulated trade per NEW directional call a method makes (the run it first called the direction — not one per run/day), scored on GROSS forward returns at 30m/3h/6h/1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date), Session (the session the ENTRY was decided in — sessions partition the trades, so All = their sum), and Direction (the side of the method's call — a positive score is its long call).",
+                             "All scored tickers (simulated): one simulated trade per NEW directional call a method makes (the run it first called the direction — not one per run/day), scored on GROSS forward returns at the pivot basis + 1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date), Session (the session the ENTRY was decided in — sessions partition the trades, so All = their sum), and Direction (the side of the method's call — a positive score is its long call).",
                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
             dcc.RadioItems(
                 id=component_id, options=_METHOD_SOURCE_OPTIONS, value="ledger", inline=True,
@@ -1114,7 +1114,7 @@ _SIM_PERF_TOOLTIP = (
     "sum of the four sessions). Scored on GROSS close-to-close forward returns from the "
     "entry tick (no costs; the question is directional predictiveness, not net P&L). This "
     "is the unbiased counterpart to the ledger solo table: every scored ticker counts, "
-    "not only the gate-selected trades that opened. 'Trades' = the method's entry events. Per horizon (30m/3h/6h/1d/3d/1w/2w/1m): "
+    "not only the gate-selected trades that opened. 'Trades' = the method's entry events. Per horizon (pv/1d/3d/1w/2w/1m): "
     "'n@' = joint observations with a forward return, 'IC@' = Spearman rank correlation "
     "between the method's score and the forward return (ranking skill; a persistent "
     "positive IC is real edge, a persistent negative IC is sign-inverted), 'IC std@' / "
@@ -1130,8 +1130,11 @@ _SIM_PERF_TOOLTIP = (
     "nothing on a thin n.")
 
 # "pv" first — the H/L pivot pseudo-horizon is the decision basis
-# (2026-08-13 standardization); the fixed grid stays as monitors.
-_SIM_HORIZONS = ("pv", "30m", "3h", "6h", "1d", "3d", "1w", "2w", "1m")
+# (2026-08-13 standardization); the fixed grid stays as monitors. Derived from
+# `data.PANEL_HORIZONS` so the columns rendered here and the columns actually
+# COMPUTED there can never drift apart (the intraday 30m/3h/6h were dropped
+# 2026-08-15 — see that constant for why).
+_SIM_HORIZONS = ("pv",) + tuple(data.PANEL_HORIZONS)
 
 # Per-horizon metric columns, in display order (matches the IC table: n, IC, win,
 # ret). Each: (header template, id template, numeric format).
@@ -2365,7 +2368,7 @@ _EXIT_PERF_TOOLTIP = (
     "method said get out, the position usually DID move adversely (the exit was right; "
     "below 50 = it fires too early), 'Ret@ %' positive = the average post-activation move "
     "vindicated the exit, 'IC@' positive = deeper exit-conviction ⇒ more adverse "
-    "subsequent move. Per horizon (30m…1m): 'n@' = activations with a forward return, "
+    "subsequent move. Per horizon (pv…1m): 'n@' = activations with a forward return, "
     "'IC std@' / 'ICIR@' = the IC's reliability (per-day; needs several days). The "
     "synthesized `llm_review` row is history-backed from `trade_reviews`; the rest "
     "accrue as the panel fills. Forward-collected — judge nothing on a thin n.")

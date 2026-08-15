@@ -41,6 +41,16 @@ def _retry(fn, what: str = ""):
     raise last
 
 
+# Horizons the simulated ENTRY/EXIT tables report. The three intraday ones
+# (30m/3h/6h) are deliberately absent: computing them forces a read of the whole
+# 30-min OHLCV cache (~2,700 files / ~190 MB), which measured ~28 s of the warm
+# sweep across the three panels — the most expensive columns on the page by a
+# wide margin. Dropping them here is a REPORTING choice only; the live horizon
+# synthesis (`edge_curve`) still sees the full curve, which matters because `6h`
+# is the most-used `target_horizon` in the ledger. Add a label back and it
+# reappears in every simulated table (`app._SIM_HORIZONS` is derived from this).
+PANEL_HORIZONS = ("1d", "3d", "1w", "2w", "1m")
+
 _REC_COLS = (
     "generated_at, ticker, type, direction, action, confidence, time_horizon, "
     "target_horizon, horizon_net_edge_pct, "
@@ -123,12 +133,28 @@ def _data_version() -> Optional[str]:
 def _cached(key, producer, force: bool = False):
     """Version-aware memo: serve the cached value until a NEW pipeline run lands
     (data version changed) or the safety TTL lapses; otherwise recompute via
-    ``producer``. Shared by every heavy accessor."""
+    ``producer``. Shared by every heavy accessor.
+
+    **Serving STALE while a warm is in flight is the load-bearing part** (added
+    2026-08-14). Recomputing here costs ~400 s of pandas on the REQUEST thread and
+    holds the GIL, which is precisely what made the dashboard unreachable — a
+    static 4 KB file timed out from localhost. Moving the sweep to a child process
+    only helps if the parent stops recomputing too; otherwise the first visitor
+    after every run simply re-does the whole sweep in the web process. So while
+    the background warmer is rebuilding, the previous snapshot is served: a few
+    minutes stale beats unreachable, and the swap is atomic per accessor.
+
+    The ``_WARM_STALE_GRACE`` cap keeps a permanently broken warmer from serving
+    ancient numbers forever — past it, correctness wins and we pay the recompute.
+    """
     now = time.time()
     ver = _data_version()
     entry = _perf_cache.get(key)
-    if not force and entry is not None and entry.get("ver") == ver and (now - entry["ts"]) < _PERF_TTL:
-        return entry["data"]
+    if not force and entry is not None:
+        if entry.get("ver") == ver and (now - entry["ts"]) < _PERF_TTL:
+            return entry["data"]
+        if _warm_state.get("in_flight") and (now - entry["ts"]) < _WARM_STALE_GRACE:
+            return entry["data"]
     data = producer()
     _perf_cache[key] = {"ts": now, "data": data, "ver": ver}
     return data
@@ -319,24 +345,25 @@ def arm_eval(days: Optional[int] = None, horizons=("pv", 1, 5, 10)) -> dict:
 def simulated_method_perf(days: Optional[int] = None, min_n: int = 10,
                           session: Optional[str] = None,
                           direction: Optional[str] = None) -> pd.DataFrame:
-    """Per-method directional win rate + mean gross return at 30m/3h/6h/1d/3d/1w/2w/1m
-    over the ``simulated_trades`` table (every scored ticker treated as a solo
-    single-method trade). Cached (the OHLCV join is heavy). ``session`` filters
-    by the session the signal was GENERATED in; ``direction`` by the side of the
-    method's own call (positive score = its long call). Empty until forward
-    returns exist."""
+    """Per-method directional win rate + mean gross return at the pivot basis +
+    ``PANEL_HORIZONS`` (1d/3d/1w/2w/1m) over the ``simulated_trades`` table (every
+    scored ticker treated as a solo single-method trade). Cached (the OHLCV join
+    is heavy). ``session`` filters by the session the signal was GENERATED in;
+    ``direction`` by the side of the method's own call (positive score = its long
+    call). Empty until forward returns exist."""
     from src.analysis.simulated_trades import compute_method_perf
     return _cached(("sim_method_perf", days, int(min_n), session or "all", direction or "all"),
                    lambda: _retry(lambda: compute_method_perf(days=days, min_n=min_n,
-                                                              session=session, direction=direction),
+                                                              session=session, direction=direction,
+                                                              horizons=PANEL_HORIZONS),
                                   "simulated_method_perf"))
 
 
 def exit_method_perf(days: Optional[int] = None, min_n: int = 10,
                      session: Optional[str] = None,
                      direction: Optional[str] = None) -> pd.DataFrame:
-    """Per-EXIT-method win rate / IC / IC-std / ICIR / signed return at
-    30m/3h/6h/1d/3d/1w/2w/1m over the ``exit_signals`` panel (every held position
+    """Per-EXIT-method win rate / IC / IC-std / ICIR / signed return at the pivot
+    basis + ``PANEL_HORIZONS`` over the ``exit_signals`` panel (every held position
     re-scored each tick), plus the synthesized ``llm_review`` row from
     ``trade_reviews``. The exit-side counterpart to ``simulated_method_perf``.
     ``session`` filters by the session the REVIEW happened in; ``direction`` by
@@ -345,7 +372,8 @@ def exit_method_perf(days: Optional[int] = None, min_n: int = 10,
     from src.analysis.exit_panel import compute_exit_method_perf
     return _cached(("exit_method_perf", days, int(min_n), session or "all", direction or "all"),
                    lambda: _retry(lambda: compute_exit_method_perf(days=days, min_n=min_n,
-                                                                   session=session, direction=direction),
+                                                                   session=session, direction=direction,
+                                                                   horizons=PANEL_HORIZONS),
                                   "exit_method_perf"))
 
 
@@ -363,7 +391,8 @@ def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10,
     from src.analysis.exit_panel import compute_shadow_exit_method_perf
     return _cached(("shadow_exit_method_perf", days, int(min_n), session or "all", direction or "all"),
                    lambda: _retry(lambda: compute_shadow_exit_method_perf(days=days, min_n=min_n,
-                                                                          session=session, direction=direction),
+                                                                          session=session, direction=direction,
+                                                                          horizons=PANEL_HORIZONS),
                                   "shadow_exit_method_perf"))
 
 
@@ -633,8 +662,12 @@ def latest_gate_diag() -> dict:
 # here costs a slow page load, never a wrong one.
 
 _WARM_POLL_SECONDS = 20.0
+_WARM_SUBPROCESS_TIMEOUT = 3600.0   # a sweep is ~400s alone, ~1600s against a busy tick
+_WARM_STALE_GRACE = 3 * 3600.0      # how long _cached may serve a stale snapshot
+_WARM_SNAPSHOT = "cache/dashboard_warm.pkl"   # survives a restart (see _load_snapshot)
 _warm_thread = None
-_warm_state: dict = {"ver": None, "running": False}
+_warm_state: dict = {"ver": None, "running": False, "in_flight": False,
+                     "last_ok": 0.0, "last_took": 0.0, "last_entries": 0}
 
 
 def method_decile_curves(days: Optional[int] = None) -> dict:
@@ -737,13 +770,123 @@ def warm_caches(reason: str = "") -> float:
     return took
 
 
+def _repo_root() -> str:
+    import os
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _merge_snapshot(blob: dict, source: str) -> int:
+    """Merge a warm snapshot into ``_perf_cache``. Returns entries merged.
+
+    Each value is unpickled individually so one bad entry costs that accessor
+    alone. Unpickling is the only GIL-held work the parent does here, and it is
+    seconds against the ~400 s the compute would have cost."""
+    import pickle
+    merged = 0
+    for key, raw in (blob.get("cache") or {}).items():
+        try:
+            _perf_cache[key] = pickle.loads(raw)
+            merged += 1
+        except Exception as e:
+            logger.debug(f"[dashboard] warm merge skipped {key!r} ({source}): {e}")
+    return merged
+
+
+def _warm_in_subprocess(ver: str) -> None:
+    """Run the sweep in a CHILD process and merge the result.
+
+    The whole point is that the heavy pandas work happens under a DIFFERENT GIL,
+    so the web server keeps answering while it runs. On any failure we log and
+    return WITHOUT falling back to an in-process sweep — that fallback would
+    reintroduce exactly the outage this exists to prevent. A failed warm costs
+    stale numbers (``_cached`` keeps serving the last snapshot), never a hang.
+    """
+    import os
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+
+    started = time.time()
+    fd, path = tempfile.mkstemp(prefix="dash_warm_", suffix=".pkl")
+    os.close(fd)
+    _warm_state["in_flight"] = True
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "dashboard.warm_worker", path],
+            cwd=_repo_root(), capture_output=True, timeout=_WARM_SUBPROCESS_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or b"").decode(errors="replace").strip().splitlines()[-3:]
+            logger.warning(f"[dashboard] warm subprocess failed (rc={proc.returncode}); "
+                           f"serving the previous snapshot. {' | '.join(tail)}")
+            return
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        merged = _merge_snapshot(blob, "subprocess")
+        took = time.time() - started
+        _warm_state.update(last_ok=time.time(), last_took=took, last_entries=merged)
+        logger.info(f"[dashboard] cache warm (run {ver}) — {merged} entries in {took:.1f}s "
+                    f"in a CHILD process; the server stayed responsive throughout")
+        if blob.get("dropped"):
+            logger.debug(f"[dashboard] warm entries not transferable: {blob['dropped']}")
+        _save_snapshot(path)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[dashboard] warm subprocess exceeded "
+                       f"{_WARM_SUBPROCESS_TIMEOUT:.0f}s; serving the previous snapshot")
+    except Exception as e:
+        logger.warning(f"[dashboard] warm subprocess error: {e}; serving the previous snapshot")
+    finally:
+        _warm_state["in_flight"] = False
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _save_snapshot(src_path: str) -> None:
+    """Keep the newest warm result on disk so a RESTART starts warm.
+
+    Without this, the first page load after every restart recomputes the whole
+    sweep on the request thread — the ~400 s hang that reads to a phone as
+    "Loading…" forever and is indistinguishable from a broken dashboard."""
+    import os
+    import shutil
+    try:
+        dest = os.path.join(_repo_root(), _WARM_SNAPSHOT)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(src_path, dest + ".tmp")
+        os.replace(dest + ".tmp", dest)             # atomic: never a torn snapshot
+    except Exception as e:
+        logger.debug(f"[dashboard] could not persist warm snapshot: {e}")
+
+
+def _load_snapshot() -> None:
+    """Populate the cache from the last persisted sweep, if any (best-effort)."""
+    import os
+    import pickle
+    path = os.path.join(_repo_root(), _WARM_SNAPSHOT)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        merged = _merge_snapshot(blob, "snapshot")
+        age = (time.time() - os.path.getmtime(path)) / 60.0
+        logger.info(f"[dashboard] restored {merged} cache entries from the last warm "
+                    f"snapshot ({age:.0f} min old) — first page load is fast, and the "
+                    f"numbers refresh as soon as the background warm finishes")
+    except Exception as e:
+        logger.debug(f"[dashboard] warm snapshot unreadable: {e}")
+
+
 def _warm_loop() -> None:
     while True:
         try:
             ver = _data_version()
             if ver is not None and ver != _warm_state["ver"]:
                 _warm_state["ver"] = ver
-                warm_caches(f"run {ver}")
+                _warm_in_subprocess(ver)
         except Exception as e:                      # never let the thread die
             logger.debug(f"[dashboard] warm loop error: {e}")
         time.sleep(_WARM_POLL_SECONDS)
@@ -755,8 +898,10 @@ def start_cache_warmer() -> None:
     if _warm_state["running"]:
         return
     import threading
+    _load_snapshot()                                # start warm, not cold
     _warm_state["running"] = True
     _warm_thread = threading.Thread(target=_warm_loop, name="dash-cache-warmer", daemon=True)
     _warm_thread.start()
     logger.info(f"[dashboard] background cache warmer started "
-                f"(polls every {_WARM_POLL_SECONDS:.0f}s; warms on each new pipeline run)")
+                f"(polls every {_WARM_POLL_SECONDS:.0f}s; warms in a CHILD process on each "
+                f"new pipeline run, so the sweep never holds this process's GIL)")

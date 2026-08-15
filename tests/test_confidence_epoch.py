@@ -99,6 +99,23 @@ def test_disabled_leaves_history_visible(monkeypatch):
 
 # ── the component-capture fix ──────────────────────────────────────────────
 
+def _reconstruct(s) -> float:
+    """The confidence formula from the PERSISTED components — all SEVEN.
+
+    `sector_conf_factor` joined the set on 2026-08-14: the sector-alignment
+    multiplier (1.10 aligned / 0.75 contradicted) had been applied to
+    `confidence` since the pass was written while being stored nowhere, so a
+    sector-touched row could not multiply back BY CONSTRUCTION. Leaving it out
+    of this reconstruction would re-open exactly that hole from the test side —
+    the check would keep passing on fixtures where the factor happens to be
+    neutral and fail on the ones where the code is right.
+    """
+    return round(min(1.0, s.raw_confidence * s.coherence_factor
+                     * s.movement_factor * s.volume_factor
+                     * s.family_conf_factor * s.tape_conf_factor
+                     * s.sector_conf_factor), 2)
+
+
 def test_components_reconstruct_confidence_after_the_overlay():
     """The bug: the cross-sectional overlay rescales confidence AFTER the
     components are captured, leaving `raw_confidence` describing the pre-overlay
@@ -116,9 +133,7 @@ def test_components_reconstruct_confidence_after_the_overlay():
             # the ml_ohlcv basis guard shifted a fixture ticker into the
             # neutral branch; any method abstaining can do this.)
             continue
-        prod = (s.raw_confidence * s.coherence_factor * s.movement_factor
-                * s.volume_factor * s.family_conf_factor * s.tape_conf_factor)
-        recon = round(min(1.0, prod), 2)
+        recon = _reconstruct(s)
         assert abs(recon - s.confidence) <= 0.011, (
             f"{s.ticker}: components give {recon} but confidence is {s.confidence} "
             f"(cross_sectional={s.cross_sectional_score})")
@@ -126,12 +141,41 @@ def test_components_reconstruct_confidence_after_the_overlay():
     assert checked >= 1, "every fixture row was gate-zeroed — test lost its subject"
 
 
-def test_raw_confidence_tracks_the_POST_overlay_combined_score():
-    """raw_confidence is min(1, |combined|/0.5) — it must describe the combined
-    score the row actually ends up carrying, not the pre-overlay one."""
+def test_reconstruction_holds_when_the_sector_pass_actually_FIRES(monkeypatch):
+    """The seventh factor's own case.
+
+    `_sector_alignment_factor` needs the ticker's sector ETF to be in the same
+    run AND to carry a non-trivial sentiment/technical/insider blend, which no
+    offline fixture produces — so the reconstruction above has never once seen a
+    non-neutral sector factor. Forcing it is the only way to check that the
+    persisted factor is the one the formula used (a 0.75 haircut stored as 1.0
+    would sail through every other test in this file)."""
     import src.signals.aggregator as agg
+    monkeypatch.setattr(agg, "_sector_alignment_factor", lambda *a, **k: 0.75)
+    sigs = agg.build_signals(["AAPL", "MSFT", "GLD"], [])
+    touched = [s for s in sigs if s.confidence > 0.0]
+    assert touched, "every fixture row was gate-zeroed — test lost its subject"
+    for s in touched:
+        assert s.sector_conf_factor == 0.75, "the applied factor was not persisted"
+        assert abs(_reconstruct(s) - s.confidence) <= 0.011, (
+            f"{s.ticker}: sector-adjusted confidence {s.confidence} does not "
+            f"reconstruct from its components")
+
+
+def test_raw_confidence_tracks_the_POST_overlay_combined_score():
+    """raw_confidence is min(1, |combined|/scale) — it must describe the combined
+    score the row actually ends up carrying, not the pre-overlay one.
+
+    The divisor is resolved through `aggregator._raw_confidence_scale()` rather
+    than written out: it is 0.5 only on the ABSOLUTE basis (which the conftest
+    pins suite-wide), 0.642 under the live rank basis and 0.0658 on an ML-combine
+    row. Hard-coding it here would re-encode precisely the literal the 2026-08-14
+    fix centralised — and `test_method_rank_basis.py` has an AST guard forbidding
+    that same literal in `src/`."""
+    import src.signals.aggregator as agg
+    scale = agg._raw_confidence_scale()
     for s in agg.build_signals(["AAPL", "NVDA", "TSLA"], []):
-        expected = min(1.0, abs(s.combined_score) / 0.5)
+        expected = min(1.0, abs(s.combined_score) / scale)
         assert abs(s.raw_confidence - expected) <= 0.02, (
             f"{s.ticker}: raw_confidence {s.raw_confidence} does not match "
-            f"|combined|/0.5 = {expected}")
+            f"|combined|/{scale} = {expected}")

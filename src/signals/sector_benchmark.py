@@ -85,7 +85,22 @@ def _seed_from_aggregator() -> Dict[str, str]:
         return {}
 
 
-_SEED = _seed_from_aggregator()
+# LAZY since 2026-08-14. Evaluating this at import time made it permanently
+# EMPTY: `aggregator` imports `sector_relative_momentum` at its line 116, which
+# imports this module, which then imported `aggregator._SECTOR_MAP` — defined at
+# aggregator line 368, i.e. not yet executed. The circular import raised, the
+# `except` swallowed it, and every process ran with a zero-entry seed. Measured
+# on the live cache: the curated map never overrode yfinance for a single name,
+# leaving UBER benchmarked against XLK (yfinance calls it Technology) where the
+# map says XLY, and LYFT re-attempting a lookup every run. Resolving on FIRST
+# USE instead of at import means both modules are fully loaded by then.
+_SEED_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _seed() -> Dict[str, str]:
+    if "v" not in _SEED_CACHE:
+        _SEED_CACHE["v"] = _seed_from_aggregator()
+    return _SEED_CACHE["v"]
 
 
 def _yfinance_sector(ticker: str) -> Optional[str]:
@@ -158,15 +173,25 @@ def get_sector_benchmark(ticker: str, asset_type: Optional[str] = None) -> Optio
     if atype == "ETF":
         return None if tk == "SPY" else "SPY"
 
-    # STOCK — try cached → seed → yfinance → SPY.
+    # STOCK — try seed → cached → yfinance → SPY.
+    #
+    # The hand-curated seed is consulted FIRST (matching this module's
+    # documented resolution order). It used to sit behind the cache, which made
+    # a stale yfinance answer permanent: the cache file never expires, so
+    # UBER — classified "Technology" by yfinance and cached as XLK — could never
+    # be corrected by adding it to the curated map, which is the one mechanism
+    # provided for exactly that. The seed is an in-memory dict of ~20 entries,
+    # so checking it first costs nothing.
+    seed = _seed()
+    if tk in seed:
+        bench = seed[tk]
+        if _CACHE.get(tk) != bench:
+            _CACHE[tk] = bench
+            _save_cache(_CACHE)
+        return bench
     if tk in _CACHE:
         b = _CACHE[tk]
         return b if b else None       # explicit empty string = "no benchmark"
-    if tk in _SEED:
-        bench = _SEED[tk]
-        _CACHE[tk] = bench
-        _save_cache(_CACHE)
-        return bench
 
     sector = _yfinance_sector(tk)
     if sector:

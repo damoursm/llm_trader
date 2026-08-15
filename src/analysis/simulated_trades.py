@@ -59,6 +59,33 @@ HORIZONS: Tuple[Tuple[str, str, int], ...] = (
 )
 HORIZON_LABELS = tuple(h[0] for h in HORIZONS)
 
+# The horizons a REPORTING caller asks for. Everything that only monitors can
+# skip the intraday ones (`resolve_horizons`); everything that DECIDES must not.
+DAILY_HORIZON_LABELS = tuple(h[0] for h in HORIZONS if h[1] != "30m")
+
+
+def resolve_horizons(horizons: Optional[Sequence[str]] = None,
+                     ) -> Tuple[Tuple[str, str, int], ...]:
+    """The ``(label, interval, steps)`` rows to compute — all of ``HORIZONS`` by
+    default, or only the named labels.
+
+    The three intraday horizons (30m/3h/6h) are by far the most expensive part
+    of any panel build: they read the WHOLE 30-min OHLCV cache (~2,700 files /
+    ~190 MB) where the daily ones reuse a frame the rest of the system already
+    parsed. A caller that merely REPORTS a curve can name the labels it renders
+    and skip that read.
+
+    The default stays the full set on purpose: this curve is also a live
+    DECISION surface — ``edge_curve`` picks each position's holding window from
+    it, and ``6h`` is the most-used pick in the ledger — so narrowing it here
+    would change exits, not just a table. An unknown label is ignored rather
+    than raising, so a stale persisted dashboard selection can't break a panel.
+    """
+    if horizons is None:
+        return HORIZONS
+    want = {str(h) for h in horizons}
+    return tuple(h for h in HORIZONS if h[0] in want)
+
 
 # ── data access ────────────────────────────────────────────────────────────
 
@@ -439,6 +466,7 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
                         min_per_day: int = 5, min_days: int = 3,
                         session: Optional[str] = None,
                         direction: Optional[str] = None,
+                        horizons: Optional[Sequence[str]] = None,
                         ) -> pd.DataFrame:
     """Per-method directional win rate + mean gross directional return per horizon.
 
@@ -463,7 +491,10 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
     (``long|short``) to the side of the method's call (a positive score is its
     long call). Both filters apply AFTER event extraction — filtering first
     would manufacture phantom transitions across excluded ticks. A window
-    (``days``) edge can make a pre-existing call look new at the boundary."""
+    (``days``) edge can make a pre-existing call look new at the boundary.
+
+    ``horizons`` narrows which labels are COMPUTED (see ``resolve_horizons``) —
+    the columns of an unrequested horizon are simply absent. Default: all."""
     # Fast path: let DuckDB do the event extraction (a lag() window) so only the
     # ~3% of rows that ARE events cross into pandas. Only when reading from the
     # DB (an explicit sim_df must be honoured as given) and only for the events
@@ -509,7 +540,8 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
 
     # Per (method, horizon): collect the (score, forward-return) pairs so n, win
     # rate, mean signed return AND the Spearman IC all come from one source.
-    mp_labels = HORIZON_LABELS + (PIVOT_LABEL,)
+    hz = resolve_horizons(horizons)
+    mp_labels = tuple(h[0] for h in hz) + (PIVOT_LABEL,)
     acc: Dict[str, Dict[str, Dict[str, list]]] = defaultdict(
         lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in mp_labels})
     pv_by_tk: dict = {}
@@ -537,7 +569,7 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
             cell["s"].append(sc)
             cell["f"].append(pv_fwd[pk])
             cell["d"].append(sigd)
-        for lbl, interval, steps in HORIZONS:
+        for lbl, interval, steps in hz:
             if interval == "30m":
                 key = (tk, gen, steps)
                 if key not in intra_fwd:

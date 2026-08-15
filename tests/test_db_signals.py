@@ -68,6 +68,65 @@ def test_fundamentals_are_trade_attributed():
         assert m in scores
 
 
+def test_every_getattr_default_names_a_real_TickerSignal_field():
+    """A `getattr(sig, "<name>", <default>)` that misspells the field returns
+    the DEFAULT forever — the column persists as 0.0 / 1.0 / "STOCK" on every
+    row, which reads as "this method never fires" or "everything is a stock"
+    rather than as a bug. Nothing warns, and `test_fundamentals_are_trade_
+    attributed` above (set(scores) == set(_ALL_METHODS)) cannot see it: the KEY
+    is still there, only its value is a fiction.
+
+    Checked on the AST across the two places that read a TickerSignal by
+    getattr — the trade-attribution extractor and the signals-panel row builder.
+
+    KNOWN VIOLATION, pinned as an equality so it self-clears: `pipeline` reads
+    `getattr(s, "type", "STOCK")` for the panel's asset-class column, and
+    TickerSignal has no `type` field — so `signals.type` is the constant
+    "STOCK" on every row ever written (the LLM-supplied type lives on
+    `recommendations`, not on the signal). Nothing reads the column today. Fix
+    the source and delete the entry here; do not add new ones."""
+    import ast
+    import inspect
+
+    from src import pipeline
+    from src.models import TickerSignal
+    from src.performance import tracker
+
+    KNOWN_FABRICATED = {"type"}
+    fields = set(TickerSignal.model_fields)
+
+    def _sig_getattr_names(fn_or_mod, var: str) -> set:
+        tree = ast.parse(inspect.getsource(fn_or_mod).strip())
+        return {n.args[1].value for n in ast.walk(tree)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "getattr" and len(n.args) >= 2
+                and isinstance(n.args[0], ast.Name) and n.args[0].id == var
+                and isinstance(n.args[1], ast.Constant)
+                and isinstance(n.args[1].value, str)}
+
+    extractor = _sig_getattr_names(tracker._method_scores_from_signal, "sig")
+    assert extractor, "extractor no longer reads the signal by getattr — retarget this guard"
+    assert not (extractor - fields), (
+        f"{sorted(extractor - fields)} read off TickerSignal by getattr but are "
+        f"not fields — every attributed trade would store the default instead")
+
+    # The panel-row builder shares the loop variable name with unrelated
+    # snapshot reads, so restrict to the names it actually persists as columns.
+    from src.db.schema import (SIGNAL_ABS_SHADOW_COLUMNS,
+                               SIGNAL_CONFIDENCE_COMPONENT_COLUMNS,
+                               SIGNAL_NEWS_ATTENTION_COLUMNS)
+    persisted = (set(SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)
+                 | set(SIGNAL_NEWS_ATTENTION_COLUMNS)
+                 | set(SIGNAL_ABS_SHADOW_COLUMNS)
+                 | {"type", "combined_score", "combined_buy_score",
+                    "combined_sell_score", "combine_source"})
+    row_names = _sig_getattr_names(pipeline, "s") & persisted
+    assert row_names, "panel-row builder no longer reads the signal — retarget this guard"
+    assert (row_names - fields) == KNOWN_FABRICATED, (
+        f"panel-row getattr defaults that name no TickerSignal field changed: "
+        f"{sorted(row_names - fields)} (known: {sorted(KNOWN_FABRICATED)})")
+
+
 def test_signal_timeframe_columns_convention():
     """The panel-only multi-timeframe columns follow ``{method}_{tf}`` for a
     known technical method × non-daily timeframe, and compose with the base

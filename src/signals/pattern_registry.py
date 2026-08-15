@@ -59,7 +59,13 @@ from loguru import logger
 
 
 REGISTRY_PATH = Path("cache/pattern_registry.json")
-SCHEMA_VERSION = 2   # bumped: added pattern_accuracy alongside trade win_rate
+# 3 (2026-08-14): added the uncapped per-pattern ``seen`` key list. The bump is
+# load-bearing, not cosmetic — v2 files were written by the broken idempotency
+# guard below and hold wildly inflated counts (46,250 double_top "trades" on a
+# ~400-trade ledger), so they must be DISCARDED rather than migrated. The
+# schema-mismatch branch in load_registry() reinitialises, and the next tick's
+# record_batch(full ledger) rebuilds the registry correctly from source.
+SCHEMA_VERSION = 3
 
 _EMPTY_DIR_BUCKET = {
     "n":            0,
@@ -158,8 +164,24 @@ def _update_bucket(bucket: dict, ret_pct: float, won: bool, pattern_correct: boo
 
 
 def _trade_key(trade: dict) -> str:
-    """Stable per-trade identity for idempotent registration."""
-    return f"{trade.get('ticker','?')}|{trade.get('entry_date','?')}|{trade.get('exit_date','?')}"
+    """Stable per-trade identity for idempotent registration.
+
+    Accepts BOTH shapes on purpose: a ledger trade spells the dates
+    ``entry_date``/``exit_date``, while the per-trade detail this module appends
+    spells them ``entry``/``exit``. Reading only the ledger spelling was the
+    2026-08-14 bug — every stored record keyed as ``TICKER|?|?``, so the
+    duplicate check below never matched anything and `record_batch`, which is
+    handed the FULL ledger on every tick by `tracker.update_open_trades`,
+    re-added every closed pattern trade forever. Measured on the live file:
+    46,250 `double_top` trades against a ~400-trade ledger, one `bull_flag`
+    round trip recorded 506 times. Not cosmetic — `pattern_recognition`
+    weights the registry by `n/(n+prior_n)`, so an inflated count drives the
+    live pattern score's blend weight to ~1.0 and displaces the synthetic
+    prior with a duplicated sample.
+    """
+    entry = trade.get("entry_date") or trade.get("entry") or "?"
+    exit_ = trade.get("exit_date") or trade.get("exit") or "?"
+    return f"{trade.get('ticker','?')}|{entry}|{exit_}"
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -208,9 +230,15 @@ def record_outcome(trade: dict, reg: Optional[dict] = None) -> bool:
         "avg_return":        None,
         "buys":              dict(_EMPTY_DIR_BUCKET),
         "sells":             dict(_EMPTY_DIR_BUCKET),
+        "seen":              [],
         "trades":            [],
     })
-    if any(_trade_key(t) == key for t in p_entry.get("trades", [])):
+    # Idempotency reads the UNCAPPED `seen` list, not `trades`: the per-trade
+    # detail is trimmed to the most recent 200 for file size, so a pattern past
+    # that many round trips would forget its oldest ones and re-add them on
+    # every tick — the same unbounded inflation in slow motion.
+    seen = p_entry.setdefault("seen", [_trade_key(t) for t in p_entry.get("trades", [])])
+    if key in set(seen):
         return False
 
     from src.performance.tracker import is_gross_win
@@ -262,6 +290,7 @@ def record_outcome(trade: dict, reg: Optional[dict] = None) -> bool:
     })
     if len(p_entry["trades"]) > 200:
         p_entry["trades"] = p_entry["trades"][-200:]
+    seen.append(key)
 
     if own_save:
         save_registry(reg)

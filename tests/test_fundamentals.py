@@ -145,7 +145,12 @@ def test_no_fundamentals_block_when_context_absent(monkeypatch):
                                     force_engine="anthropic")
     except Exception:
         pass
-    assert "<fundamentals_context>" not in captured.get("prompt", "")
+    # A NEGATIVE assertion on a captured prompt cannot be trusted until the
+    # prompt was actually captured: if generate_recommendations raised before
+    # reaching the LLM call, `captured` is empty, `.get(...)` yields "" and
+    # `"x" not in ""` passes for the wrong reason. Assert the subject exists.
+    assert "prompt" in captured, "prompt was never built — nothing was tested"
+    assert "<fundamentals_context>" not in captured["prompt"]
 
 
 # ── enrichment: short interest/volume + statement margin/growth ────────────────
