@@ -290,6 +290,23 @@ a { color: var(--accent); }
 
 @media (max-width: 720px) {
   .app-shell { padding: 10px 10px 40px; }
-  .tab-inner { padding: 12px 12px; border-radius: 10px; }
-  .run-chip { display: none; }   /* the phone gets the tabs, not the chip */
+  .tab-inner { padding: 12px 10px; border-radius: 10px; }
+
+  /* The run-status chip STAYS on mobile. An earlier revision hid it to save a
+     row, which had it exactly backwards: the phone is the glance surface, and
+     "when did the bot last run, is it stale" is the one thing worth seeing
+     without opening a tab. It moves to its own full-width row instead. */
+  .app-header { gap: 8px; padding-bottom: 10px; }
+  .brand-sub { display: none; }          /* the tagline is the expendable part */
+  .run-chip { width: 100%; justify-content: flex-start; font-size: 12px; }
+
+  /* Tabs scroll horizontally rather than wrapping into a tall stack that
+     pushes the content off-screen. */
+  .app-tabs { flex-wrap: nowrap !important; overflow-x: auto; }
+  .app-tabs .app-tab { padding: 8px 11px !important; white-space: nowrap; }
+
+  .section-h { font-size: 14.5px; margin-top: 18px; }
+  .filter-bar { gap: 6px 14px; }
+  .filter-item, .filter-item--grow { flex: 1 1 100%; }
+  .kpi { flex: 1 1 calc(50% - 12px); min-width: 0; }   /* two tiles per row */
 }
