@@ -238,6 +238,65 @@ def _install_basic_auth() -> bool:
 
 AUTH_ENABLED = _install_basic_auth()
 
+
+# Routes whose response defines WHICH VERSION of the app the browser is running.
+# The index page lists the asset/bundle URLs; the layout is the page structure;
+# the dependency graph wires the callbacks. A stale copy of any one of them
+# pins the viewer to an old dashboard.
+_VERSION_DEFINING_PREFIXES = ("/_dash-layout", "/_dash-dependencies",
+                              "/_reload-hash", "/_favicon.ico")
+
+
+def _install_cache_headers() -> None:
+    """Make every client run the CURRENT dashboard, with no manual refresh.
+
+    Nothing here sent cache directives, so each browser applied its own
+    heuristic — and phones cache hardest. The result: a deploy landed on the
+    server while a phone kept rendering the previous version indefinitely, with
+    no way to tell from the server side (the logs show a normal 200 for a page
+    the viewer never sees). Only a private tab or a ``?v=`` query string broke
+    it, which is not something anyone should have to remember.
+
+    Three classes, by what the response actually is:
+
+    * **version-defining** (the index page, ``_dash-layout``,
+      ``_dash-dependencies``) → ``no-store``. Small (~4 KB each) and fetched
+      once per page load, so forbidding the cache outright costs nothing
+      measurable and is the only setting that GUARANTEES freshness. This is
+      also what keeps the DATA current: ``serve_layout`` is a function, so a
+      reload rebuilds it against the latest run.
+    * **component suites** (the ~MBs of React/Plotly bundles) → cached for a
+      year as ``immutable``. Their URLs already carry the package version, so a
+      library upgrade changes the URL; caching them hard is what keeps the page
+      fast on a phone despite the above.
+    * **assets** (our ``style.css``, the favicon) → ``no-cache``, i.e. "you may
+      keep a copy but you must revalidate". Dash already appends ``?m=<mtime>``
+      so the URL changes whenever the file does; revalidation is a 304 costing
+      a few hundred bytes and removes the last way to be served a stale
+      stylesheet.
+
+    Pinned by ``tests/test_dashboard_cache_headers.py`` — a regression here is
+    invisible from every server-side surface, which is exactly the class this
+    project refuses to leave to review.
+    """
+    from flask import request
+
+    @app.server.after_request
+    def _set_cache_headers(response):
+        path = request.path or ""
+        if path.startswith("/_dash-component-suites/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-cache"
+        elif path == "/" or path.startswith(_VERSION_DEFINING_PREFIXES):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"          # HTTP/1.0 proxies
+            response.headers["Expires"] = "0"
+        return response
+
+
+_install_cache_headers()
+
 # The system font stack — one typography for UI, tables and charts (figures.py
 # uses the same stack). tabular-nums on cells comes from assets/style.css.
 _FONT_STACK = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
