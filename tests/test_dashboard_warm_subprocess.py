@@ -100,6 +100,63 @@ def test_missing_entry_still_computes_during_a_warm(monkeypatch):
     assert data._cached("never-seen", lambda: "computed") == "computed"
 
 
+def test_an_unchanged_version_never_recomputes_however_old_the_entry(monkeypatch):
+    """THE 2026-08-16 regression. Same run_id ⇒ same database ⇒ the cached value
+    is exactly what a recompute would produce, so age is irrelevant.
+
+    The first fix let the TTL lapse and asked the warmer to re-sweep instead.
+    Over a weekend — when the version never changes at all — that launched a
+    fresh ~530 s child sweep every ~30 min to recompute byte-identical numbers
+    (observed 5×, one run_id, ~965 CPU-seconds). Recomputing known-identical
+    data is waste whichever process pays for it."""
+    _pin_version(monkeypatch, "run-1")
+    data._cached("k", lambda: "old")
+    data._perf_cache["k"]["ts"] = time.time() - data._PERF_TTL - 1
+    data._warm_state.update(running=True, in_flight=False, ver="run-1")
+    called = []
+    assert data._cached("k", lambda: called.append(1) or "new") == "old"
+    assert not called, "recomputed despite an unchanged data version"
+    assert data._warm_state["ver"] == "run-1", "the warmer was told to re-sweep identical data"
+    # ...and the entry is renewed, so it cannot age into any other branch.
+    assert time.time() - data._perf_cache["k"]["ts"] < 5
+
+
+def test_a_new_run_invalidates_immediately_not_after_the_ttl(monkeypatch):
+    """The flip side of the version-first rule: a version MISMATCH must never
+    fall through to the time-based branch, or a fresh run's numbers would sit
+    behind a 30-minute timer."""
+    _pin_version(monkeypatch, "run-1")
+    data._cached("k", lambda: "old")                 # entry is brand new (age ~0)
+    _pin_version(monkeypatch, "run-2")
+    data._warm_state.update(running=True, in_flight=False)
+    assert data._cached("k", lambda: "new") == "new"
+
+
+def test_ttl_applies_only_when_the_version_is_unknown(monkeypatch):
+    """With no freshness signal (the run_id query failed) the TTL is all there
+    is, so it still governs: serve inside the window, recompute past it."""
+    _pin_version(monkeypatch, None)
+    data._cached("k", lambda: "old")
+    data._warm_state.update(running=True, in_flight=False)
+    assert data._cached("k", lambda: "new") == "old"          # inside the TTL
+    data._perf_cache["k"]["ts"] = time.time() - data._PERF_TTL - 1
+    assert data._cached("k", lambda: "new") == "new"          # past it
+
+
+def test_every_warm_target_routes_through_the_cache():
+    """The 2026-08-15 regression: five accessors sat in ``_warm_targets`` but
+    never touched ``_cached``, so the warmer 'covered' them while every page
+    load recomputed them on the request thread (exit_forward alone re-parsed
+    the OHLCV cache — the measured 111 s page). Warming an uncached accessor
+    is indistinguishable from working, so it is asserted mechanically."""
+    import inspect
+    for name, fn in data._warm_targets():
+        assert fn is not None, f"warm target {name!r} does not resolve"
+        assert "_cached(" in inspect.getsource(fn), (
+            f"warm target {name!r} does not route through _cached — warming it "
+            f"does nothing and every page load pays its recompute")
+
+
 # ── the sweep must leave the web process ─────────────────────────────────────
 
 def test_warm_loop_does_not_call_warm_caches_in_process():
@@ -157,6 +214,39 @@ def test_snapshot_round_trips_so_a_restart_starts_warm(tmp_path, monkeypatch):
     data._perf_cache.clear()
     data._load_snapshot()
     assert data._perf_cache["k"]["data"] == "warmed"
+
+
+def test_a_current_snapshot_suppresses_the_restart_sweep(tmp_path, monkeypatch):
+    """A restart must not re-sweep the snapshot it just loaded. `_warm_state["ver"]`
+    started at None, so `_warm_loop` saw "version changed" on every boot and paid a
+    full ~530 s child sweep to recompute what was already in memory."""
+    monkeypatch.setattr(data, "_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(data, "_data_version", lambda: "run-1")
+    src = tmp_path / "src.pkl"
+    with open(src, "wb") as fh:
+        pickle.dump({"ver": "run-1", "cache": {
+            "k": pickle.dumps({"ts": time.time(), "data": "warmed", "ver": "run-1"})}}, fh)
+    data._save_snapshot(str(src))
+
+    data._warm_state["ver"] = None
+    data._load_snapshot()
+    assert data._warm_state["ver"] == "run-1", "a current snapshot still triggers a sweep"
+
+
+def test_a_stale_snapshot_still_triggers_the_sweep(tmp_path, monkeypatch):
+    """The flip side: a snapshot from an older run is real work to redo, so the
+    warmer must NOT adopt its version."""
+    monkeypatch.setattr(data, "_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(data, "_data_version", lambda: "run-2")
+    src = tmp_path / "src.pkl"
+    with open(src, "wb") as fh:
+        pickle.dump({"ver": "run-1", "cache": {
+            "k": pickle.dumps({"ts": time.time(), "data": "old", "ver": "run-1"})}}, fh)
+    data._save_snapshot(str(src))
+
+    data._warm_state["ver"] = None
+    data._load_snapshot()
+    assert data._warm_state["ver"] is None, "a stale snapshot suppressed the needed sweep"
 
 
 def test_load_snapshot_is_silent_when_absent_or_corrupt(tmp_path, monkeypatch):

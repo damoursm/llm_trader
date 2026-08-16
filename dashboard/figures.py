@@ -1,22 +1,71 @@
-"""Plotly figures for the dashboard, reusing src.charts.builder where possible."""
+"""Plotly figures for the dashboard, reusing src.charts.builder where possible.
+
+One visual system for every chart (2026-08-15): the palette below is the single
+source of truth — app.py's conditional table styling reads POS/NEG from here —
+and `_finish()` applies the shared layout (font, hairline grid, transparent
+surfaces, hover style) so figures cannot drift apart one `update_layout` at a
+time.
+
+Palette notes (validated with the dataviz six-checks method, white surface):
+- POS/NEG are STATUS colors (win/loss), not a categorical pair. Green/red is the
+  entrenched finance convention; the naive pair fails deutan CVD separation
+  (ΔE 4.1), so the red is the DARKER #b91c1c — lightness carries the difference
+  a deutan reader can't get from hue (measured ΔE 10.4, target ≥8). Meaning
+  never rides color alone: sign and the zero baseline duplicate it everywhere.
+- BLUE is the neutral/primary series hue; BLUE_LIGHT is its lighter ordinal
+  step (e.g. mean vs p90 bars) — same hue so the pair reads as ordered.
+"""
 
 from __future__ import annotations
 
 import plotly.graph_objects as go
 
-POS = "#16a34a"
-NEG = "#dc2626"
-MUTED = "#6b7280"
+# ── palette (the single source of truth — app.py reads these) ────────────────
+POS = "#0ca30c"          # win / gain / good
+NEG = "#b91c1c"          # loss / critical (darker than the naive red: CVD)
+BLUE = "#2a78d6"         # primary neutral series
+BLUE_LIGHT = "#86b6ef"   # lighter ordinal step of BLUE (p90, secondary)
+WARN = "#fab219"         # status warning fill (bars carry printed labels)
+INK = "#0f172a"          # primary text
+MUTED = "#64748b"        # secondary/muted text
+GRID = "#e2e8f0"         # hairline gridlines
+BASELINE = "#94a3b8"     # zero/reference lines
+
+_FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
+
+
+def _finish(fig: go.Figure, height: int = 340, title: str | None = None,
+            legend: bool = False, y_grid: bool = True, x_grid: bool = False) -> go.Figure:
+    """Apply the shared chart chrome. Every figure below ends with this."""
+    fig.update_layout(
+        font=dict(family=_FONT, size=12.5, color="#334155"),
+        title=(dict(text=title, font=dict(size=13.5, color=INK), x=0, xanchor="left")
+               if title else None),
+        margin=dict(l=8, r=8, t=44 if title else 28, b=8),
+        height=height,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        hoverlabel=dict(bgcolor="white", bordercolor="#cbd5e1",
+                        font=dict(family=_FONT, size=12, color=INK)),
+        showlegend=legend,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                    bgcolor="rgba(0,0,0,0)", font=dict(size=11.5)),
+    )
+    fig.update_xaxes(showgrid=x_grid, gridcolor=GRID, gridwidth=1,
+                     zeroline=False, showline=False,
+                     tickfont=dict(size=11.5, color=MUTED),
+                     title_font=dict(size=12, color=MUTED))
+    fig.update_yaxes(showgrid=y_grid, gridcolor=GRID, gridwidth=1,
+                     zeroline=False, showline=False,
+                     tickfont=dict(size=11.5, color=MUTED),
+                     title_font=dict(size=12, color=MUTED))
+    return fig
 
 
 def _empty(msg: str) -> go.Figure:
     fig = go.Figure()
-    fig.add_annotation(text=msg, showarrow=False, font=dict(size=14, color=MUTED))
-    fig.update_layout(
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=20, r=20, t=30, b=20), height=300,
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    fig.add_annotation(text=msg, showarrow=False, font=dict(size=13, color=MUTED))
+    _finish(fig, height=280)
+    fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False))
     return fig
 
 
@@ -47,14 +96,14 @@ def method_winrate_fig(perf: dict) -> go.Figure:
     fig = go.Figure(go.Bar(
         x=wrs, y=names, orientation="h", marker_color=colors,
         text=[f"{w:.0f}%  (n={n})" for w, n in zip(wrs, ns)], textposition="auto",
+        textfont=dict(size=11),
         hovertemplate="%{y}: %{x:.1f}% win rate<extra></extra>",
     ))
-    fig.add_vline(x=50, line_dash="dot", line_color=MUTED)
-    fig.update_layout(
-        title="Solo win rate by method", xaxis_title="Win rate (%)",
-        margin=dict(l=10, r=10, t=40, b=10), height=max(340, 24 * len(rows)),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    fig.add_vline(x=50, line_dash="dot", line_color=BASELINE)
+    fig.update_layout(bargap=0.3)
+    _finish(fig, height=max(340, 24 * len(rows)),
+            title="Solo win rate by method", y_grid=False, x_grid=True)
+    fig.update_xaxes(title_text="Win rate (%)")
     return fig
 
 
@@ -74,14 +123,13 @@ def bucket_bar_fig(buckets, title: str, y_title: str, pct: bool = False) -> go.F
     fig = go.Figure(go.Bar(
         x=bands, y=means, marker_color=colors, customdata=ns,
         text=[f"{fmt(m)}<br>n={n}" for m, n in zip(means, ns)], textposition="auto",
+        textfont=dict(size=11),
         hovertemplate="%{x}: %{y:.3f}" + unit + " (n=%{customdata})<extra></extra>",
     ))
-    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
-    fig.update_layout(
-        title=title, yaxis_title=y_title, xaxis_title="",
-        margin=dict(l=10, r=10, t=40, b=10), height=320,
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
+    fig.update_layout(bargap=0.35)
+    _finish(fig, height=320, title=title)
+    fig.update_yaxes(title_text=y_title)
     return fig
 
 
@@ -120,7 +168,7 @@ def confidence_return_fig(perf: dict) -> go.Figure:
     if cx:
         fig.add_trace(go.Scatter(
             x=cx, y=cy, mode="markers", name="Closed",
-            marker=dict(size=10, symbol="circle",
+            marker=dict(size=9, symbol="circle", opacity=0.85,
                         color=[POS if v >= 0 else NEG for v in cy], line=dict(width=0)),
             text=ctxt,
             hovertemplate="%{text}: %{y:+.2f}% @ %{x:.0f}% conf<extra>closed</extra>",
@@ -128,7 +176,7 @@ def confidence_return_fig(perf: dict) -> go.Figure:
     if ox:
         fig.add_trace(go.Scatter(
             x=ox, y=oy, mode="markers", name="Open (live M2M)",
-            marker=dict(size=11, symbol="diamond-open",
+            marker=dict(size=10, symbol="diamond-open",
                         color=[POS if v >= 0 else NEG for v in oy], line=dict(width=2)),
             text=otxt,
             hovertemplate="%{text}: %{y:+.2f}% @ %{x:.0f}% conf<extra>open</extra>",
@@ -147,21 +195,21 @@ def confidence_return_fig(perf: dict) -> go.Figure:
             hoverinfo="skip",
         ))
 
-    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
-    fig.update_layout(
-        xaxis_title="Entry confidence (%)", yaxis_title="Return (%)",
-        margin=dict(l=10, r=10, t=30, b=10), height=380,
-        plot_bgcolor="white", paper_bgcolor="white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
+    fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
+    _finish(fig, height=380, legend=True)
+    fig.update_xaxes(title_text="Entry confidence (%)")
+    fig.update_yaxes(title_text="Return (%)")
     return fig
 
 
 def confidence_timeline_fig(reviews, trades) -> go.Figure:
     """Per-ticker hold-review trajectory (fix #2): the opener-pinned review
-    confidence over time (left axis) + price (right axis) + entry/exit decisions,
-    so you can see whether conviction deterioration precedes a direction change.
+    confidence over time + price + entry/exit decisions, so you can see whether
+    conviction deterioration precedes a direction change.
 
+    Two stacked panels sharing the time axis — confidence on top, price below —
+    rather than a dual-axis overlay (two y-scales on one plot invite false
+    intersections; the stacked layout keeps both series honestly scaled).
     Confidence markers are coloured by the review's action (BUY green / SELL red /
     HOLD·WATCH grey); a dashed line marks the entry confidence and a dotted line
     the close floor (the level below which same-direction conviction triggers
@@ -182,17 +230,20 @@ def confidence_timeline_fig(reviews, trades) -> go.Figure:
     act_color = {"BUY": POS, "SELL": NEG, "HOLD": MUTED, "WATCH": MUTED}
     mcolors = [act_color.get(str(a).upper(), MUTED) for a in df["action"]]
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    has_price = bool(df["price"].notna().any())
+    fig = make_subplots(rows=2 if has_price else 1, cols=1, shared_xaxes=True,
+                        row_heights=[0.62, 0.38] if has_price else None,
+                        vertical_spacing=0.07)
 
-    # Confidence trajectory (left), markers coloured by the review's action.
+    # Confidence trajectory (top panel), markers coloured by the review's action.
     fig.add_trace(go.Scatter(
         x=df["t"], y=df["confidence"], mode="lines+markers", name="Review confidence",
-        line=dict(color="#2563eb", width=2),
-        marker=dict(size=9, color=mcolors, line=dict(width=1, color="#1e3a8a")),
+        line=dict(color=BLUE, width=2),
+        marker=dict(size=9, color=mcolors, line=dict(width=1, color="white")),
         customdata=df[["action", "direction", "return_pct"]].values,
         hovertemplate=("%{x|%Y-%m-%d %H:%M} ET<br>conf %{y:.2f} · %{customdata[0]} "
                        "(%{customdata[1]})<br>ret %{customdata[2]:+.2f}%<extra></extra>"),
-    ), secondary_y=False)
+    ), row=1, col=1)
 
     # Entry-confidence baseline + close floor (constant per position; latest value),
     # drawn as full-width lines (robust across plotly versions vs add_hline).
@@ -201,22 +252,22 @@ def confidence_timeline_fig(reviews, trades) -> go.Figure:
     if not ec.empty:
         fig.add_trace(go.Scatter(
             x=[x0, x1], y=[float(ec.iloc[-1])] * 2, mode="lines", name="entry conf",
-            line=dict(color=POS, dash="dash", width=1.5), hoverinfo="skip"), secondary_y=False)
+            line=dict(color=POS, dash="dash", width=1.5), hoverinfo="skip"), row=1, col=1)
     fl = df["conf_floor"].dropna()
     if not fl.empty:
         fig.add_trace(go.Scatter(
             x=[x0, x1], y=[float(fl.iloc[-1])] * 2, mode="lines", name="close floor",
-            line=dict(color=NEG, dash="dot", width=1.5), hoverinfo="skip"), secondary_y=False)
+            line=dict(color=NEG, dash="dot", width=1.5), hoverinfo="skip"), row=1, col=1)
 
-    # Price (right axis).
-    if df["price"].notna().any():
+    # Price (bottom panel).
+    if has_price:
         fig.add_trace(go.Scatter(
             x=df["t"], y=df["price"], mode="lines", name="Price",
-            line=dict(color="#9ca3af", width=1.5),
+            line=dict(color=MUTED, width=1.5),
             hovertemplate="%{x|%Y-%m-%d %H:%M} ET<br>price %{y:.2f}<extra></extra>",
-        ), secondary_y=True)
+        ), row=2, col=1)
 
-    # Entry / exit decision markers from the ledger (on the price axis).
+    # Entry / exit decision markers from the ledger (on the price panel).
     def _parse(iso):
         try:
             ts = pd.to_datetime(iso, utc=True)
@@ -224,42 +275,44 @@ def confidence_timeline_fig(reviews, trades) -> go.Figure:
         except Exception:
             return None
 
+    price_row = 2 if has_price else 1
     for tr in (trades or []):
         e_t, e_p = _parse(tr.get("entry_datetime")), tr.get("entry_price")
-        if e_t is not None and e_p:
+        if e_t is not None and e_p and has_price:
             is_buy = tr.get("action") == "BUY"
             fig.add_trace(go.Scatter(
                 x=[e_t], y=[e_p], mode="markers", showlegend=False,
                 marker=dict(symbol="triangle-up" if is_buy else "triangle-down",
-                            size=14, color=POS if is_buy else NEG,
-                            line=dict(width=1, color="#111827")),
+                            size=13, color=POS if is_buy else NEG,
+                            line=dict(width=1, color="white")),
                 hovertemplate=f"ENTRY {tr.get('action')} @ %{{y:.2f}}<extra></extra>",
-            ), secondary_y=True)
-        if tr.get("status") == "CLOSED":
+            ), row=price_row, col=1)
+        if tr.get("status") == "CLOSED" and has_price:
             x_t, x_p = _parse(tr.get("exit_datetime")), tr.get("exit_price")
             if x_t is not None and x_p:
                 fig.add_trace(go.Scatter(
                     x=[x_t], y=[x_p], mode="markers", showlegend=False,
-                    marker=dict(symbol="x", size=12, color="#111827"),
+                    marker=dict(symbol="x", size=11, color=INK),
                     hovertemplate=f"EXIT @ %{{y:.2f}}<br>{tr.get('exit_reason') or 'close'}<extra></extra>",
-                ), secondary_y=True)
+                ), row=price_row, col=1)
 
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10), height=420,
-        plot_bgcolor="white", paper_bgcolor="white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig.update_yaxes(title_text="Confidence", range=[0, 1], secondary_y=False)
-    fig.update_yaxes(title_text="Price ($)", secondary_y=True, showgrid=False)
+    _finish(fig, height=440 if has_price else 340, legend=True)
+    fig.update_yaxes(title_text="Confidence", range=[0, 1], row=1, col=1)
+    if has_price:
+        fig.update_yaxes(title_text="Price ($)", row=2, col=1)
     return fig
 
 
 def equity_curve_fig(perf: dict) -> go.Figure:
-    """Reuse the existing equity-curve builder; fall back to a placeholder."""
+    """Reuse the existing equity-curve builder (restyled to the shared chrome);
+    fall back to a placeholder."""
     try:
         from src.charts.builder import build_equity_curve
         fig = build_equity_curve(perf.get("closed_trades") or [])
         if fig is not None:
+            _finish(fig, height=int(fig.layout.height or 380),
+                    title=(fig.layout.title.text if fig.layout.title else None),
+                    legend=bool(fig.data and len(fig.data) > 1))
             return fig
     except Exception:
         pass
@@ -280,18 +333,17 @@ def calibration_bar_fig(rep: dict) -> go.Figure:
     fig = go.Figure(go.Bar(
         x=names, y=avgs, marker_color=colors,
         text=[f"{a:+.2f}% (n={n})" for a, n in zip(avgs, ns)], textposition="auto",
+        textfont=dict(size=11),
         hovertemplate="%{x}<br>avg %{y:+.2f}%<extra></extra>",
     ))
-    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
+    fig.update_layout(bargap=0.35)
     slope = rep.get("slope")
     title = "Avg return by confidence bucket"
     if slope is not None:
         title += f"   ·   slope {slope:+.3f}%/pt"
-    fig.update_layout(
-        title=title, yaxis_title="Avg return (%)",
-        margin=dict(l=10, r=10, t=40, b=10), height=340,
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    _finish(fig, height=340, title=title)
+    fig.update_yaxes(title_text="Avg return (%)")
     return fig
 
 
@@ -310,7 +362,8 @@ def mfe_capture_fig(rep: dict) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=xs, y=ys, mode="markers", name="trades", text=txt,
-        marker=dict(size=10, color=[POS if v >= 0 else NEG for v in ys], line=dict(width=0)),
+        marker=dict(size=9, opacity=0.85,
+                    color=[POS if v >= 0 else NEG for v in ys], line=dict(width=0)),
         hovertemplate="%{text}: kept %{y:+.2f}% of a %{x:+.2f}% peak<extra></extra>",
     ))
     lim = max([abs(v) for v in xs + ys] + [1.0])
@@ -318,36 +371,33 @@ def mfe_capture_fig(rep: dict) -> go.Figure:
         x=[0, lim], y=[0, lim], mode="lines", name="full capture",
         line=dict(color=MUTED, dash="dash", width=1.5), hoverinfo="skip",
     ))
-    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
-    fig.update_layout(
-        title="Exit capture — peak (MFE) vs kept (return)",
-        xaxis_title="MFE — peak favorable (%)", yaxis_title="Realized return (%)",
-        margin=dict(l=10, r=10, t=40, b=10), height=380,
-        plot_bgcolor="white", paper_bgcolor="white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
+    fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
+    _finish(fig, height=380, legend=True,
+            title="Exit capture — peak (MFE) vs kept (return)")
+    fig.update_xaxes(title_text="MFE — peak favorable (%)")
+    fig.update_yaxes(title_text="Realized return (%)")
     return fig
 
 
 def slippage_by_session_fig(slip_df) -> go.Figure:
     """Grouped bars of mean + p90 fill-vs-decision slippage (bp, + = adverse) by
     session — the test of whether the LMT cap (20 bp RTH / 80 bp extended) is
-    actually being achieved."""
+    actually being achieved. Mean and p90 are two steps of one ordered measure,
+    so they share a hue at two lightness steps."""
     if slip_df is None or getattr(slip_df, "empty", True):
         return _empty("No filled legs with recorded slippage yet.")
     sessions = slip_df["session"].tolist()
     fig = go.Figure()
     fig.add_trace(go.Bar(x=sessions, y=slip_df["mean_bps"], name="mean",
-                         marker_color="#2563eb",
+                         marker_color=BLUE, textfont=dict(size=11),
                          text=[f"n={int(n)}" for n in slip_df["n"]], textposition="auto"))
-    fig.add_trace(go.Bar(x=sessions, y=slip_df["p90_bps"], name="p90", marker_color="#93c5fd"))
-    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
-    fig.update_layout(
-        barmode="group", title="Fill slippage by session (bp, + = adverse)",
-        yaxis_title="Slippage (bp)", margin=dict(l=10, r=10, t=40, b=10), height=340,
-        plot_bgcolor="white", paper_bgcolor="white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
+    fig.add_trace(go.Bar(x=sessions, y=slip_df["p90_bps"], name="p90",
+                         marker_color=BLUE_LIGHT))
+    fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
+    fig.update_layout(barmode="group", bargap=0.35, bargroupgap=0.08)
+    _finish(fig, height=340, legend=True,
+            title="Fill slippage by session (bp, + = adverse)")
+    fig.update_yaxes(title_text="Slippage (bp)")
     return fig
 
 
@@ -360,25 +410,24 @@ def source_latency_fig(rows: list) -> go.Figure:
     top = [r for r in top if (r.get("median_s") or 0.0) > 0] or top[:1]
     names = [r["source"] for r in top][::-1]
     meds = [r.get("median_s") or 0.0 for r in top][::-1]
-    colors = [(NEG if (r.get("success_rate") or 100.0) < 100.0 else "#2563eb") for r in top][::-1]
+    colors = [(NEG if (r.get("success_rate") or 100.0) < 100.0 else BLUE) for r in top][::-1]
     fig = go.Figure(go.Bar(
         x=meds, y=names, orientation="h", marker_color=colors,
-        text=[f"{m:.1f}s" for m in meds], textposition="auto",
+        text=[f"{m:.1f}s" for m in meds], textposition="auto", textfont=dict(size=11),
         hovertemplate="%{y}: %{x:.2f}s median<extra></extra>",
     ))
-    fig.update_layout(
-        title="Slowest data sources (median fetch s; red = had a failure)",
-        xaxis_title="Median fetch time (s)",
-        margin=dict(l=10, r=10, t=40, b=10), height=max(320, 22 * len(top)),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    fig.update_layout(bargap=0.3)
+    _finish(fig, height=max(320, 22 * len(top)), y_grid=False, x_grid=True,
+            title="Slowest data sources (median fetch s; red = had a failure)")
+    fig.update_xaxes(title_text="Median fetch time (s)")
     return fig
 
 
 def method_coverage_fig(cov: dict) -> go.Figure:
     """Per-method data coverage (% of tickers with a real, non-zero score),
     sorted low→high. A bar is red when coverage DROPPED recently (delta ≤ −20pp —
-    a feed likely went dark); amber for low/sparse; green for healthy/dense."""
+    a feed likely went dark); amber for low/sparse; green for healthy/dense.
+    Every bar carries its printed % label, so state never rides color alone."""
     per = (cov or {}).get("per_method") or []
     if not per:
         return _empty("No method-coverage data yet (needs persisted signal rows).")
@@ -390,21 +439,19 @@ def method_coverage_fig(cov: dict) -> go.Figure:
         d = r.get("delta")
         if d is not None and d <= -20:
             return NEG                           # dropped — likely went dark
-        return POS if (r.get("coverage_pct") or 0) >= 50 else "#f59e0b"
+        return POS if (r.get("coverage_pct") or 0) >= 50 else WARN
     colors = [_color(r) for r in rows][::-1]
     texts = [(f"{c:.0f}%  (Δ{r['delta']:+.0f})" if r.get("delta") is not None else f"{c:.0f}%")
              for c, r in zip(covs, rows[::-1])]
     fig = go.Figure(go.Bar(
         x=covs, y=names, orientation="h", marker_color=colors,
-        text=texts, textposition="auto",
+        text=texts, textposition="auto", textfont=dict(size=11),
         hovertemplate="%{y}: %{x:.1f}% of tickers scored<extra></extra>",
     ))
-    fig.update_layout(
-        title="Per-method coverage (% tickers scored; red = coverage dropped)",
-        xaxis_title="Coverage (%)", xaxis=dict(range=[0, 100]),
-        margin=dict(l=10, r=10, t=40, b=10), height=max(360, 22 * len(rows)),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    fig.update_layout(bargap=0.3)
+    _finish(fig, height=max(360, 22 * len(rows)), y_grid=False, x_grid=True,
+            title="Per-method coverage (% tickers scored; red = coverage dropped)")
+    fig.update_xaxes(title_text="Coverage (%)", range=[0, 100])
     return fig
 
 
@@ -418,25 +465,21 @@ def tracking_error_fig(rep: dict) -> go.Figure:
     xs = [r["entry_date"] for r in by_date]
     ys = [r["mean_d_return"] for r in by_date]
     fig = go.Figure(go.Scatter(
-        x=xs, y=ys, mode="lines+markers", line=dict(color="#2563eb", width=2),
+        x=xs, y=ys, mode="lines+markers", line=dict(color=BLUE, width=2),
+        marker=dict(size=7),
         hovertemplate="%{x}<br>sim − broker %{y:+.2f}%<extra></extra>",
     ))
-    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
-    fig.update_layout(
-        title="Sim − broker return gap by entry date",
-        yaxis_title="Δreturn (sim − broker, %)",
-        margin=dict(l=10, r=10, t=40, b=10), height=340,
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
+    fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
+    _finish(fig, height=340, title="Sim − broker return gap by entry date")
+    fig.update_yaxes(title_text="Δreturn (sim − broker, %)")
     return fig
 
 
 def method_decile_fig(curve: dict, method: str, label: str = "") -> "go.Figure":
     """Decile bars for ONE method on the pivot basis (the rank-directive plot):
     x = within-day score decile (D1 weakest .. D10 strongest), bars = mean
-    winsorized signed pivot return, line = decile win rate on a secondary...
-    NO — one axis (house rule): win% and n ride the hover, return is the bar."""
-    import plotly.graph_objects as go
+    winsorized signed pivot return; win% and n ride the hover (one axis —
+    house rule)."""
     rets = curve.get("ret") or [None] * 10
     wins = curve.get("win") or [None] * 10
     ns = curve.get("n") or [0] * 10
@@ -450,13 +493,11 @@ def method_decile_fig(curve: dict, method: str, label: str = "") -> "go.Figure":
         hovertemplate=("%{x}: mean ret %{y:+.2f}%<br>win %{customdata[0]:.1f}%"
                        "<br>n=%{customdata[1]:,}<extra></extra>"),
     ))
-    fig.update_layout(
-        title=(f"{label or method} — mean signed pivot return by within-day "
-               f"score decile"),
-        yaxis_title="mean ret to next pivot (%)",
-        xaxis_title="within-day score decile (D10 = the day's strongest scores)",
-        margin=dict(l=10, r=10, t=48, b=10), height=360,
-        plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
-    )
-    fig.add_hline(y=0, line_width=1, line_color="#9ca3af")
+    fig.add_hline(y=0, line_width=1, line_color=BASELINE)
+    fig.update_layout(bargap=0.35)
+    _finish(fig, height=360,
+            title=(f"{label or method} — mean signed pivot return by within-day "
+                   f"score decile"))
+    fig.update_yaxes(title_text="mean ret to next pivot (%)")
+    fig.update_xaxes(title_text="within-day score decile (D10 = the day's strongest scores)")
     return fig
