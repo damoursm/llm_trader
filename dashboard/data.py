@@ -445,7 +445,12 @@ def shadow_exit_method_perf(days: Optional[int] = None, min_n: int = 10,
                                   "shadow_exit_method_perf"))
 
 
-def horizon_edge_curve(days: Optional[int] = 90, conf_min: float = 0.78) -> dict:
+def horizon_edge_curve(days: Optional[int] = 90, conf_min: float = 0.85) -> dict:
+    # 0.78 was the actionable floor before 2026-07-21; leaving it here plotted the
+    # curve over a LAXER population than the `cal` block rendered beside it (which
+    # calls calibrate_edge_horizon() with no args, so it uses 0.85) and than the
+    # tooltip claimed. Display-only — the live edge_decay exit reads the
+    # calibration, never this curve — but the two must agree to be comparable.
     """The realized edge-decay curve of combined_score by holding horizon (the
     ground truth behind the edge-decay time-stop) + its calibration
     (``edge_days`` window / ``strength``). Cached (the OHLCV forward-return join is

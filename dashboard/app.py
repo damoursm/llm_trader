@@ -569,7 +569,7 @@ _REC_COL_SPEC = [
     ("ticker", "Ticker", None, "The stock or ETF symbol."),
     ("action", "Action", None, "The call: BUY, SELL, HOLD or WATCH. Only BUY/SELL are actionable (paper-traded)."),
     ("direction", "Direction", None, "Directional lean behind the call — BULLISH or BEARISH."),
-    ("confidence", "Confidence %", _INT, "Model confidence, 0–100%. A BUY/SELL is actionable only above the regime-adjusted threshold (≈78%) with ≥2 agreeing signal sources."),
+    ("confidence", "Confidence %", _INT, "Model confidence, 0–100%. A BUY/SELL is actionable only above the regime-adjusted threshold — baseline 85% at NEUTRAL (RISK_ON 79 / CAUTION 87 / RISK_OFF 89 / PANIC 95, +6pp off-RTH, +10pp overnight) — AND with ≥2 agreeing signal sources (Gate 1b). Note the SCALE moved with the rank basis: raw confidence now divides by rank_raw_confidence_scale (0.642) rather than the old absolute 0.5, and the ML-combine arm uses its own divisor again, so confidence is comparable WITHIN a combine engine, not across eras."),
     ("time_horizon", "Horizon (LLM)", None, "The LLM's intended holding window (SHORT-TERM / SWING / POSITION). Capped at trade time to the mechanical edge horizon — the LLM may confirm or shorten it, never lengthen."),
     ("target_horizon", "Edge horizon", None, "Horizon synthesis: the cost-aware holding horizon (30m/3h/6h/1d/3d/1w/2w/1m) whose net-of-cost expected gross return is highest, from each method's MEASURED per-horizon IC (sign-aware). Blank when the IC panel is too thin or horizon synthesis is off."),
     ("horizon_net_edge_pct", "Net edge %", _NUM2, "Expected GROSS return at the edge horizon minus the round-trip cost hurdle. Positive = the edge clears costs at that horizon; ≤0 means no horizon is worth trading (prefer WATCH/HOLD)."),
@@ -600,10 +600,10 @@ _TRADE_COL_SPEC = [
     ("held", "Held", None, "Wall-clock holding time: days + hours (e.g. 2d 5h), hours (6h), or minutes (45m) for the freshest entries. Open positions measure entry → now; closed ones entry → exit. Legacy date-only rows fall back to the trading-days count (Nd)."),
     ("target_horizon", "Target horizon", None, "Horizon synthesis: the cost-aware holding horizon the position was opened for (e.g. 6h, 1w), capped to the LLM's call. Drives the matched exit time-stop — once held past this window the position must stay strongly confirmed to keep running. Blank for trades opened before horizon synthesis."),
     ("return_pct", "Return %", _NUM2, "Spread-adjusted % return. For OPEN positions this is the live mark-to-market — 'what if you closed right now'."),
-    ("position_size_multiplier", "Size ×", _NUM2, "Capital weight from the confidence tier (1.0× / 1.5× / 2.0×), after the correlation haircut."),
+    ("position_size_multiplier", "Size ×", _NUM2, "Capital weight after the whole sizing chain. Confidence contributes a CONTINUOUS ramp capped at 1.5×, not the old 1.0/1.5/2.0 tiers: the legacy ramp's span above 1.0× is compressed by confidence_size_span (0.5) because entry confidence measured nearly uninformative about outcomes, so paying a full 2.0× for it was sizing on noise. Agreement BREADTH is the evidence-backed conviction signal that replaced the surrendered span. Then: expected-edge blend × predictability tilt → regime haircut → correlation haircut → extended/overnight multiplier."),
     ("filled_notional_usd", "Notional $", _NUM2, "Actual dollars at risk: filled shares × average fill price (real-executions view only)."),
     ("status", "Status", None, "OPEN (held, live mark) or CLOSED (realised)."),
-    ("exit_reason", "Exit reason", None, "Why the position closed: llm_signal_flipped / llm_confidence_loss (the opener's fresh re-judgment), horizon_expired (held past its target-horizon window without strong re-confirmation — the matched exit), macro_regime_exit, intraday_reversal, or a signal-decay backstop. Blank while open."),
+    ("exit_reason", "Exit reason", None, "Why the position closed. LIVE rules: llm_signal_flipped (the opener now calls the opposite direction), horizon_expired (held past its target-horizon window without strong re-confirmation — the matched exit), trailing_stop, adverse_stop, macro_regime_exit, ml_exit (ml_arm trades only), method_horizon, edge_decay, intraday_reversal, and the signal-decay backstop for legacy/rule-opened trades. RETIRED rules still present in history: llm_confidence_loss (OFF — the only exit rule the post-exit forward returns condemned: +1.50/+2.24% left behind at 1d/5d, 62% of those exits kept running) and mechanical_exit (OFF since 2026-08-02 — anti-predictive consensus, and it could not fire at its threshold anyway). Blank while open."),
     ("broker_entry", "IBKR entry", None, "Did the entry order really execute at the broker? ✓ filled (shares) · ⏳ working / partial · ↻ re-anchoring (tick-scoped cancel; resubmits at the current mark) · ✕ cancelled · ✗ rejected/failed · – never sent (broker off, duplicate twin, sizing skip, or pre-broker history). Simulated view only — the IBKR view contains only filled orders by construction."),
     ("broker_exit", "IBKR exit", None, "Same for the closing order. ⏳ pending = the ledger closed the trade and the exit goes out on the next sync. Blank while the position is open."),
 ]
@@ -944,8 +944,10 @@ def _review_timeline_section(ticker: str):
             "Each point is one tick's re-judgment of this position by the SAME synthesis + sentiment "
             "engines that opened it, on fresh news + prices (so it's an apples-to-apples vs the entry "
             "confidence). Marker colour = the review's action (green BUY / red SELL / grey HOLD). "
-            "Dashed line = entry confidence; dotted line = the close floor (same-direction conviction "
-            "below it triggers an llm_confidence_loss exit). Grey line = price; triangles = entry, "
+            "Dashed line = entry confidence; dotted line = the close floor. ⚠ The floor no longer "
+            "triggers an llm_confidence_loss exit on its own (that rule is OFF — it was measured to "
+            "leave money behind); its live consumer is the ramped horizon_expired test, so the floor "
+            "matters only once a position is held past its target horizon. Grey line = price; triangles = entry, "
             "✕ = exit. Watch whether the confidence sliding toward the floor precedes a colour flip."),
         dcc.Graph(figure=figures.confidence_timeline_fig(reviews, trades)),
     ])
@@ -2239,11 +2241,13 @@ def _calibration_block(window_days, session, direction=None):
                            style={"color": "#6b7280"}))
     return html.Div([
         _h3("Confidence calibration — buckets + slope",
-            "Trades bucketed by entry confidence (each bucket is also a position-size "
-            "tier). If higher-confidence buckets earn more — and the slope is positive "
-            "— confidence is carrying return-predictive information worth sizing on; a "
-            "flat/negative slope means the size tiers are sizing on noise. Closed trades "
-            "at realised return, open at live mark. Respects the window + session toggles."),
+            "The bucketed companion to the scatter above: trades grouped by entry "
+            "confidence. A positive slope means confidence carries return-predictive "
+            "information worth sizing on; flat/negative means it does not. The measured "
+            "answer so far is FLAT, which is why the confidence ramp is compressed to a "
+            "1.5× cap instead of the legacy 2.0× — the buckets are points on a continuous "
+            "ramp, not discrete tiers. Closed trades at realised return, open at live "
+            "mark. Respects the window + session toggles."),
         html.Div(cal.get("verdict", ""),
                  style={"color": "#374151", "marginBottom": 8, "fontSize": 13}),
         dcc.Graph(figure=figures.calibration_bar_fig(cal)),
@@ -2344,12 +2348,14 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
                 "Avg return %": st.get("avg_return"),
             })
 
-    # Three-arm prompt bake-off, ledger view. Separate from the boolean above
-    # because the dual arm also sets blind=False, so "OFF" merges dual+sighted.
-    # The unbiased per-ticker version is the shadow-arm block further down.
-    for key, label in (("dual", "Entry eval · prompt arm DUAL-CASE"),
-                       ("blind", "Entry eval · prompt arm BLIND"),
-                       ("sighted", "Entry eval · prompt arm SIGHTED")):
+    # Three-arm prompt bake-off, ledger view — CONCLUDED 2026-08-16, so these are
+    # historical cohorts: only SIGHTED still accrues trades. Separate from the
+    # boolean above because the dual arm also sets blind=False, so "OFF" merges
+    # dual+sighted. The unbiased per-ticker version is the arm block further down,
+    # which carries the verdict.
+    for key, label in (("dual", "Entry eval · prompt arm DUAL-CASE (retired)"),
+                       ("blind", "Entry eval · prompt arm BLIND (retired)"),
+                       ("sighted", "Entry eval · prompt arm SIGHTED (live)")):
         st = (perf.get("synth_arm_eval") or {}).get(key)
         if st and st.get("trades"):
             rows.append({
@@ -2426,10 +2432,13 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
         dcc.Graph(figure=figures.method_winrate_fig(perf)),
         _h3("Return vs entry confidence",
             "Each dot is one trade: its entry confidence (x) against its return (y) — closed trades at their realised return, "
-            "open trades (hollow diamonds) at their live mark-to-market; green = win, red = loss. Confidence sets the position-size "
-            "tier (1.0×/1.5×/2.0×), so an upward-sloping dashed trend line confirms higher-confidence calls actually earn more and "
-            "the sizing is justified; a flat or downward line means confidence isn't carrying directional information. Respects the "
-            "window + session toggles above."),
+            "open trades (hollow diamonds) at their live mark-to-market; green = win, red = loss. Confidence still gates entry "
+            "(Gate 1) and still sizes, but through a ramp deliberately COMPRESSED to a 1.5× cap (confidence_size_span 0.5) "
+            "because this very plot measured it nearly uninformative — so a flat line here is the EXPECTED result, not a bug, "
+            "and it is the reason breadth rather than confidence carries conviction in the sizing chain. What would be news is a "
+            "clearly POSITIVE slope (confidence has started earning its span back) or a clearly NEGATIVE one (it is anti-predictive "
+            "and the span should go to 0). ⚠ Mixed-era caution: the rank basis and the ML-combine arm each rescaled raw confidence, "
+            "so points from different eras are not on one x-axis. Respects the window + session toggles above."),
         dcc.Graph(figure=figures.confidence_return_fig(perf)),
         _calibration_block(window_days, session, direction),
         _h3("Macro evaluation — decision layers (LLM synthesis vs aggregator vs bundles)",
@@ -2548,12 +2557,31 @@ def _ticker_perf_block(window_days):
     ])
 
 
-# ── Synthesis prompt-arm bake-off (dual-case vs blind vs sighted) ──────────
+# ── Synthesis prompt-arm bake-off — CONCLUDED 2026-08-16 ───────────────────
+#
+# The dual/blind/sighted experiment ran 2026-07-25 → 2026-08-16 and ANSWERED:
+# re-evaluated on the pivot basis with day-clustered statistics, no arm is
+# distinguishable. The live pipeline is sighted-only (both shares 0.0,
+# enable_shadow_arms off), so these tables are a CLOSED RESULT, not a running
+# A/B — the surrounding copy says so, because a table that reads as live invites
+# someone to keep waiting for an answer that already arrived.
+
+_ARM_CONCLUDED_TOOLTIP = (
+    "CONCLUDED 2026-08-16 — historical, no new rows. The dual-case / blind / sighted bake-off ran "
+    "2026-07-25 → 2026-08-16: each tick every arm was asked about every ticker (one live, the rest "
+    "shadow), so arms were compared on the same ticker-days with the same engine and context and the "
+    "prompt as the only difference. Re-evaluated on the PIVOT basis with day-clustered statistics "
+    "(22,534 labeled rows, 16 settled days) NO ARM IS DISTINGUISHABLE: the paired disagreement subset "
+    "gives |day-t| < 1 for all three pairs, the nominal winner wins only 38–44% of DAYS, and "
+    "dual-vs-blind flips sign between row- and day-weighting. Sighted was kept on tiebreakers — "
+    "shortest per-ticker block and the least anti-informative confidence (which feeds sizing) — not on "
+    "P&L. The renderer and shadow machinery are kept and tested under explicit opt-in; raise a share "
+    "above 0 (and enable_shadow_arms) to re-open.")
 
 _ARM_SUMMARY_TIPS = {
     "Arm": "Which synthesis prompt produced the call. Dual-case = BULL and BEAR cases side by side, each from its own vetted method set. "
-           "Blind = the aggregator's verdict hidden. Sighted = the legacy prompt showing the verdict.",
-    "Calls": "Ticker-days this arm answered. Every arm is asked about every ticker each tick (one live, the rest shadow), so these should be near-identical — that is what makes the paired table below possible.",
+           "Blind = the aggregator's verdict hidden. Sighted = the prompt showing the verdict — the arm that remains live.",
+    "Calls": "Ticker-days this arm answered while the experiment ran. Every arm was asked about every ticker each tick (one live, the rest shadow), so these are near-identical — that is what makes the paired table below possible. Frozen: no new calls accrue.",
     "Buy %": "Share of its calls that were BUY.",
     "Sell %": "Share of its calls that were SELL.",
     "Flat %": "Share it declined to trade (HOLD/WATCH). Not a failure — the dual-case arm is explicitly told that declining is a valid output, and a decline earns 0 rather than a loss.",
@@ -2584,11 +2612,12 @@ def _arm_eval_block(window_days):
     res = data.arm_eval(days=window_days) or {}
     if not res.get("calls"):
         return html.Div([
-            _h3("Synthesis prompt arms — dual-case vs blind vs sighted",
-                "Each tick every prompt arm is asked about every ticker: one arm drives the run, the others are "
-                "shadow calls nobody acts on. That makes the arms comparable on the SAME ticker-day."),
-            html.Div("No arm calls recorded yet — this fills in from the next tick onward "
-                     "(requires ENABLE_SHADOW_ARMS).", style={"color": "#6b7280"}),
+            _h3("Synthesis prompt arms — CONCLUDED 2026-08-16 (historical)",
+                _ARM_CONCLUDED_TOOLTIP),
+            html.Div("No arm calls recorded in this window. The experiment is closed and "
+                     "no new arm rows accrue (shares 0.0, ENABLE_SHADOW_ARMS off) — widen "
+                     "the window to see the accrued history.",
+                     className="empty-note"),
         ])
 
     _hs = res.get("horizons") or [1]
@@ -2609,14 +2638,14 @@ def _arm_eval_block(window_days):
     } for p in res["pairs"].get(horizon, [])]
 
     return html.Div([
-        _h3("Synthesis prompt arms — dual-case vs blind vs sighted "
+        _h3("Synthesis prompt arms — CONCLUDED 2026-08-16, historical "
             + ("(pivot target)" if horizon == "pv" else f"({horizon}-day)"),
-            "Each tick EVERY prompt arm is asked about EVERY ticker — one arm drives the run, the others are shadow "
-            "calls nobody acts on — so the arms are compared on the same ticker-days with the same engine and the same "
-            "context, with the prompt as the only difference. Without that pairing an arm is only observable on the runs "
-            "where its coin came up, which is exactly the design that made Qwen look best and pro-thinking look broken "
-            "in the 2026-07-22 model bake-off (both were pure calendar artifacts). "
-            f"{res['calls']:,} calls recorded, {res.get('shadow', 0):,} of them shadow."),
+            _ARM_CONCLUDED_TOOLTIP
+            + f" Accrued sample: {res['calls']:,} calls, {res.get('shadow', 0):,} of them shadow."),
+        html.Div("Closed experiment — the live pipeline is SIGHTED-only and no new arm rows "
+                 "accrue. Kept because the accrued history is the evidence behind that "
+                 "decision; the machinery is revivable by raising a share above 0.",
+                 className="section-note"),
         dash_table.DataTable(
             data=srows,
             columns=[{"name": c, "id": c} for c in
@@ -2629,11 +2658,13 @@ def _arm_eval_block(window_days):
             **_TABLE_KW,
         ) if srows else html.Div("No scored arm calls yet.", style={"color": "#6b7280"}),
         _h3("Head-to-head — where the arms actually disagreed",
-            "The row that matters. Two arms agreeing on a ticker tells you nothing about either one, so the return "
+            "The row that mattered. Two arms agreeing on a ticker tells you nothing about either one, so the return "
             "columns are computed ONLY over the ticker-days where they took different sides. A high Agree % means the "
-            "prompt rarely changes the decision — the blind A/B already showed the echo rate moves only 94.5% → 91.4%, "
+            "prompt rarely changes the decision — the blind A/B showed the echo rate moves only 94.5% → 91.4%, "
             "i.e. the model echoes because it reads the same method scores, not because it sees the verdict. "
-            "Treat a Disagree count in the low tens as 'no answer yet', not as a weak result."),
+            "⚠ Read the Edge % column with day-clustered eyes: the FINAL verdict (2026-08-16) is that no pair separates "
+            "— |day-t| < 1 for all three, and the nominal winner wins only 38–44% of DAYS. A non-zero Edge % here is "
+            "the row-weighted point estimate, which is exactly the statistic that overstated these arms."),
         dash_table.DataTable(
             data=prows,
             columns=[{"name": c, "id": c} for c in
@@ -2927,8 +2958,11 @@ def _exit_body(window_value, session_value, direction_value, source_value,
                                          session=session, direction=direction)),
         _h3("Exit-reason outcomes — realized P&L by exit rule (closed ledger trades)",
             "For every CLOSED trade, the realized return grouped by the exit_reason that "
-            "fired (llm_signal_flipped / llm_confidence_loss / horizon_expired / "
-            "macro_regime_exit / the aggregator backstops / intraday_reversal). Always the "
+            "fired. ⚠ This table is CUMULATIVE history, so it still carries rows from two "
+            "RETIRED rules — llm_confidence_loss (OFF; the post-exit forward returns "
+            "condemned it) and mechanical_exit (OFF since 2026-08-02) — which can no longer "
+            "produce new rows. Read those as a record of why they were turned off, not as "
+            "live performance. Always the "
             "real ledger (independent of the Source toggle above) — the concrete realized "
             "outcome of each exit rule, companion to the forward-looking IC table. Honors "
             "the Session (session the trade EXITED in) and Direction toggles; the Window "

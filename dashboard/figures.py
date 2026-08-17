@@ -136,10 +136,12 @@ def bucket_bar_fig(buckets, title: str, y_title: str, pct: bool = False) -> go.F
 def confidence_return_fig(perf: dict) -> go.Figure:
     """Scatter of each trade's return against the confidence that opened it.
 
-    This is the position-sizing calibration check: confidence drives the
-    1.0×/1.5×/2.0× size tier, so higher-confidence trades *should* earn more on
-    average — an upward-sloping trend confirms it, a flat/negative one says the
-    confidence number isn't carrying directional information worth sizing on.
+    This is the position-sizing calibration check. Confidence sizes through a
+    CONTINUOUS ramp capped at 1.5× (``confidence_size_span`` 0.5), not the legacy
+    1.0/1.5/2.0 tiers — and the cap was compressed precisely because this plot
+    measured confidence nearly uninformative. A flat trend is therefore the
+    expected reading; a clearly positive slope would argue for restoring span,
+    a clearly negative one for dropping it to 0.
     Closed trades use their realised return; open trades their live mark-to-market
     (the same convention as the rest of the dashboard). Marker colour is win
     (green) / loss (red); shape is closed (filled circle) / open (hollow diamond).
@@ -212,8 +214,10 @@ def confidence_timeline_fig(reviews, trades) -> go.Figure:
     intersections; the stacked layout keeps both series honestly scaled).
     Confidence markers are coloured by the review's action (BUY green / SELL red /
     HOLD·WATCH grey); a dashed line marks the entry confidence and a dotted line
-    the close floor (the level below which same-direction conviction triggers
-    ``llm_confidence_loss``). Entry/exit markers come from the ledger.
+    the close floor. The floor no longer drives ``llm_confidence_loss`` (that exit
+    is OFF — measured to close positions that kept running); its live consumer is
+    the ramped ``horizon_expired`` test, so it binds only past the target horizon.
+    Entry/exit markers come from the ledger.
     """
     import pandas as pd
     from plotly.subplots import make_subplots
