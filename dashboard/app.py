@@ -612,8 +612,8 @@ _TRADE_COL_SPEC = [
 _METHOD_HEADER_TIPS = {
     "Method": "The signal method (e.g. news sentiment, technical, momentum) — or an LLM engine row: 'Synthesis LLM' made the final BUY/SELL call, 'Sentiment LLM' scored the per-ticker news (run-dominant engine).",
     "Win rate %": "ABSOLUTE. Method rows — solo simulation: for each closed trade, what if ONLY this method had decided the direction? LLM rows — share of the engine's recommended trades (executed or not) currently positive. Cannot separate 'the signal works' from 'the market went up' — compare against Rel win %.",
-    "Rel win %": "MARKET-RELATIVE: share of the method's calls where the stock beat SPY IN THE DIRECTION CALLED, over the whole simulated-trade panel (thousands of observations, not the ~150 attributed trades). This is the basis METHOD WEIGHTING now uses, because weighting is a signal-quality decision and beta is a confound there. Sizing and P&L stay absolute — the book is outright long/short, so alpha you cannot capture must not size it.",
-    "vs base": "Rel win % minus the MEASURED baseline. The bar is NOT 50%: the cap-weighted index beats its typical constituent, so the median stock is market-relative-negative (~48.6% at 1 week). Positive here means the method genuinely adds something; judging against 50% would hold every method to a bar ~1.4pp too high.",
+    "Rel win %": "MARKET-RELATIVE: share of the method's calls where the stock beat SPY IN THE DIRECTION CALLED, over the whole simulated-trade panel (thousands of observations, versus the few hundred attributed ledger trades behind the absolute column). This is the basis METHOD WEIGHTING now uses, because weighting is a signal-quality decision and beta is a confound there. Sizing and P&L stay absolute — the book is outright long/short, so alpha you cannot capture must not size it.",
+    "vs base": "Rel win % minus the MEASURED baseline, which is NOT 50%: the cap-weighted index beats its typical constituent, so the median stock is market-relative-negative. The exact bar is re-measured from the panel and printed above this table — it MOVES, so read it there rather than remembering a number. Positive here means the method genuinely adds something over that bar.",
     "Rel n": "Observations behind Rel win % — the whole scored panel, so typically thousands versus the dozens or low hundreds behind the absolute Win rate %.",
     "Trades": "Method rows: closed trades this method had a view on (|score| ≥ 0.10). LLM rows: every BUY/SELL the engine recommended — actionable or not, executed or simulated — deduped to its last call per ticker per day.",
     "Avg return %": "Average % return across those trades.",
@@ -621,7 +621,7 @@ _METHOD_HEADER_TIPS = {
 
 # Decision-funnel table — header explanations (pipeline stage evaluation).
 _STAGE_HEADER_TIPS = {
-    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each actionable gate (confidence threshold, agreement floor, PANIC/RISK_OFF BUY-block, earnings blackout, liquidity floor). '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners. 'Gate 1b · agreement floor' is the newest gate (2026-07-20) — it mechanically enforces the ≥2-independent-sources rule that was previously only a prompt instruction.",
+    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each actionable gate — Gate 1 regime confidence threshold, Gate 1b agreement floor (≥2 independent sources, mechanical since 2026-07-20), Gate 2 PANIC BUY-block, Gate 3 earnings blackout, Gate 4 liquidity floor (the $5/$5M TRADE floor — a name below it is still fully scored, just never traded), and Gate 5 overextension / anti-chase (BUY-only, defers a BUY that already ran >12% over 5 bars; SELLs are never gated). '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. A drop is attributed to the FIRST gate that rejects it, so the rows partition cleanly. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners.",
     "Trades": "Directional calls in that stage's stream, deduped to the last call per ticker per day. The shrink from row to row is each gate's real selectivity.",
     "Win rate %": "Share of the stage's calls currently positive, scored as pseudo-trades: snapshot price at call time → latest cached close, through the real cost model — every call counts, not just the ones that became ledger trades.",
     "Avg return %": "Average forward % return across the stage's calls on the same pseudo-trade basis. A gate earns its place when this rises from the pre-gate row to the post-gate row.",
@@ -2267,6 +2267,15 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
     # questions (does the signal carry information vs what did it earn), and the
     # gap between them is exactly the beta the absolute number cannot see.
     rel_skill, rel_base = data.market_relative_skill()
+    # The baseline is MEASURED and drifts (48.6% when first documented, 49.8%
+    # a month later), so it is rendered live rather than quoted in a tooltip —
+    # a hardcoded copy of a moving number is stale the day after it is written.
+    _rel_baseline_note = lambda: (
+        f"'vs base' is measured against the current market-relative baseline of "
+        f"{rel_base:.2f}% — the share of the time the median stock beats SPY, NOT 50%. "
+        f"The cap-weighted index beats its typical constituent, so 50% would hold "
+        f"every method to a bar {50.0 - rel_base:+.2f}pp too high. Re-measured from "
+        f"the panel each run.")
 
     rows = []
     for m in order:
@@ -2301,13 +2310,14 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
                 "Avg return %": st.get("avg_return"),
             })
 
-    # Held-positions prompt A/B — exit outcomes grouped by the per-run coin
-    # flip (does telling the LLM what the system holds improve closes?).
-    # Each trade's closing run stamped exit_hold_prompt; pre-experiment
-    # closes carry no stamp and are excluded from both rows.
+    # Held-positions prompt A/B — CONCLUDED: the experiment was retired and ON
+    # adopted, so `exit_hold_prompt` is now always True and the OFF cohort is
+    # frozen history. Kept because it is the evidence for adopting ON. Each
+    # trade's closing run stamped exit_hold_prompt; pre-experiment closes carry
+    # no stamp and are excluded from both rows.
     hp = perf.get("hold_prompt_eval") or {}
-    for key, label in (("on", "Exit eval · hold-prompt ON"),
-                       ("off", "Exit eval · hold-prompt OFF")):
+    for key, label in (("on", "Exit eval · hold-prompt ON (adopted)"),
+                       ("off", "Exit eval · hold-prompt OFF (retired cohort)")):
         st = hp.get(key)
         if st and st.get("trades"):
             rows.append({
@@ -2465,7 +2475,11 @@ def _methods_perf_section(window_days, session=None, direction=None, asset_type=
         _h3("Model evaluation — signal methods (solo simulation) & LLM engines",
             "Method rows: how each signal method would have performed deciding alone (each closed trade re-simulated as if only that method set the direction). "
             "Highlighted LLM rows: every BUY/SELL the engine recommended — executed or simulated — entered at the recommendation-time price, marked at the latest close, "
-            "deduped to the engine's last call per ticker per day. The 50/50 A/B routing flip gives each engine its own runs to be judged on. Hover the column headers for details."),
+            "deduped to the engine's last call per ticker per day. ⚠ The engine A/B is OVER: routing is now 100% deepseek-v4-flash for both synthesis and sentiment "
+            "(the pool is a one-model list, so the alternate branches are unreachable). Multi-engine rows are HISTORICAL — the bake-off concluded that no provider "
+            "differs at either task across eleven paired tests, making engine choice a cost/latency decision. Rows stamped with the rule-based fallback are not an "
+            "LLM at all and rank last by construction. Hover the column headers for details."),
+        html.Div(_rel_baseline_note(), className="section-note"),
         table,
         _ticker_perf_block(window_days),
         _arm_eval_block(window_days),
