@@ -23,9 +23,35 @@ repo.set_read_only(False)
 
 @pytest.fixture()
 def client():
+    """An AUTHENTICATED test client.
+
+    Since 2026-08-16 the bypass lists are empty and the password gates every
+    request, including loopback — so an unauthenticated client gets 401 on
+    everything and would test the deny path instead of the cache headers. The
+    credentials come from settings, so this follows the real configuration
+    rather than pinning a fixture password; with no password configured the
+    gate is off and the header is simply ignored."""
+    import base64
+
+    from config import settings
+
     dash_app.app.server.config["TESTING"] = True
+    pw = (settings.dashboard_auth_password or "").strip()
+    user = (settings.dashboard_auth_username or "").strip()
     with dash_app.app.server.test_client() as c:
+        if pw:
+            token = base64.b64encode(f"{user}:{pw}".encode()).decode()
+            c.environ_base["HTTP_AUTHORIZATION"] = f"Basic {token}"
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _clear_auth_lockout():
+    """A neighbouring test that trips the global lockout would otherwise turn
+    every request here into a 429."""
+    dash_app._auth_failures.clear()
+    dash_app._auth_state.update(locked_until=0.0, announced=False)
+    yield
 
 
 def _cc(resp) -> str:

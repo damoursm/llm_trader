@@ -171,12 +171,89 @@ def _is_local_request(environ) -> bool:
     return False
 
 
+# ── online brute-force protection ────────────────────────────────────────────
+#
+# Security GUARDRAILS, deliberately fixed constants rather than settings (the
+# same rule the risk limits follow): a knob that weakens a defence is a knob
+# that eventually gets turned.
+#
+# The limit is GLOBAL, not per-IP, and that is the point. Behind Tailscale
+# Funnel every request reaches this process from 127.0.0.1, so a per-IP bucket
+# would see one client and protect nothing. The real client address arrives only
+# in X-Forwarded-For — a header an attacker sets freely, so keying a rate limit
+# on it would hand out a fresh quota per forged value. A global bucket cannot be
+# rotated around.
+#
+# Sizing: 20 failures per 5 minutes is ~5,700 guesses/day. Against the
+# 20-character random password this setup ships with, that is not a threat in
+# any human timescale; against a weak password nothing here would save you, so
+# password strength does the real work and this makes the attempt slow, bounded
+# and VISIBLE in the log.
+_AUTH_MAX_FAILURES = 20            # failures tolerated inside the window
+_AUTH_FAILURE_WINDOW = 300.0       # seconds — the sliding window
+_AUTH_LOCKOUT_SECONDS = 300.0      # how long a tripped limit stays tripped
+
+_auth_failures: list = []          # timestamps of recent failed attempts
+_auth_lock = __import__("threading").Lock()
+_auth_state: dict = {"locked_until": 0.0, "announced": False}
+
+
+def _auth_locked_for() -> float:
+    """Seconds remaining on the lockout, or 0.0 when attempts are allowed."""
+    with _auth_lock:
+        remaining = _auth_state["locked_until"] - time.time()
+        if remaining <= 0 and _auth_state["announced"]:
+            _auth_state["announced"] = False
+            logger.info("[dashboard] auth lockout expired — accepting attempts again")
+        return max(0.0, remaining)
+
+
+def _auth_record_failure() -> None:
+    """Count a failed attempt and trip the lockout once the window fills."""
+    now = time.time()
+    with _auth_lock:
+        _auth_failures.append(now)
+        cutoff = now - _AUTH_FAILURE_WINDOW
+        while _auth_failures and _auth_failures[0] < cutoff:
+            _auth_failures.pop(0)
+        if len(_auth_failures) >= _AUTH_MAX_FAILURES and not _auth_state["announced"]:
+            _auth_state["locked_until"] = now + _AUTH_LOCKOUT_SECONDS
+            _auth_state["announced"] = True
+            _auth_failures.clear()
+            # CRITICAL, not warning: on a PUBLIC url this is either an attack or
+            # a badly broken client, and both are worth waking up to. Logged
+            # once per lockout, never per attempt — a crawler would otherwise
+            # flood the log, which is why individual 401s stay silent.
+            logger.critical(
+                f"[dashboard] auth lockout — {_AUTH_MAX_FAILURES} failed password "
+                f"attempts within {_AUTH_FAILURE_WINDOW:.0f}s. Rejecting attempts "
+                f"for {_AUTH_LOCKOUT_SECONDS:.0f}s. If this was not you, the "
+                f"dashboard URL is being probed.")
+
+
+def _auth_record_success() -> None:
+    """A correct password clears the counter — a human who typed it wrong twice
+    before getting it right must not drift toward a lockout."""
+    with _auth_lock:
+        _auth_failures.clear()
+
+
 def _basic_auth_middleware(inner, username: str, password: str):
     """Wrap a WSGI callable in an HTTP Basic-Auth gate (one shared credential).
 
     Requests that ``_is_local_request`` proves came from this machine skip the
-    prompt entirely: the point of the password is the PUBLIC URL, and forcing the
-    owner to log in to their own loopback dashboard buys nothing.
+    prompt. With ``dashboard_auth_bypass_networks`` EMPTY — the shipped
+    configuration since 2026-08-16 — that check always returns False, so every
+    request presents the password, including this PC's own browser. The bypass
+    machinery is kept because it is the difference between "loopback" and "a
+    tunnelled request that merely looks like loopback", and turning it back on
+    is a one-line config change; leaving it wired means the distinction stays
+    tested rather than rotting.
+
+    Failed attempts are rate-limited GLOBALLY (see the guardrails above). The
+    ordering matters: the lockout is checked BEFORE the password comparison, so
+    a tripped limit caps the number of guesses rather than merely the number of
+    successful answers.
 
     Split out from ``_install_basic_auth`` so the gate can be tested against a
     stub inner app instead of the whole Dash stack — an auth check nobody can
@@ -185,11 +262,25 @@ def _basic_auth_middleware(inner, username: str, password: str):
     expected = f"{username}:{password}".encode("utf-8")
 
     def _gate(environ, start_response):
-        # Localhost browses without a login; everything else must present the
-        # shared password. See _is_local_request for why this is not "is the peer
-        # 127.0.0.1" — the tunnel makes the whole internet look like 127.0.0.1.
+        # A bypass network (none by default) browses without a login; everything
+        # else must present the shared password. See _is_local_request for why
+        # this is not "is the peer 127.0.0.1" — Funnel and ngrok alike make the
+        # whole internet look like 127.0.0.1.
         if _is_local_request(environ):
             return inner(environ, start_response)
+
+        # Ahead of the comparison on purpose: this bounds GUESSES, not answers.
+        retry_after = _auth_locked_for()
+        if retry_after > 0:
+            body = b"Too many failed attempts. Try again shortly.\n"
+            start_response("429 Too Many Requests", [
+                ("Retry-After", str(int(retry_after) + 1)),
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+            ])
+            return [body]
+
         header = environ.get("HTTP_AUTHORIZATION", "")
         if header.startswith("Basic "):
             try:
@@ -198,9 +289,15 @@ def _basic_auth_middleware(inner, username: str, password: str):
                 supplied = b""
             # Constant-time: a plain == leaks the password one byte at a time.
             if hmac.compare_digest(supplied, expected):
+                _auth_record_success()
                 return inner(environ, start_response)
+            _auth_record_failure()
+        # A missing header is the browser's first, credential-less request — the
+        # normal prelude to the password prompt, not a guess, so it is not
+        # counted. Only a WRONG credential is.
+        #
         # No per-request log here on purpose: a crawler on a public URL would
-        # otherwise flood the log with one line per probe.
+        # otherwise flood the log with one line per probe. The lockout logs once.
         start_response("401 Unauthorized", [
             ("WWW-Authenticate", 'Basic realm="LLM Trader Monitor", charset="UTF-8"'),
             ("Content-Type", "text/plain; charset=utf-8"),
