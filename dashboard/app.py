@@ -14,8 +14,9 @@ import time
 from datetime import datetime, timezone
 
 import pandas as pd
-from dash import Dash, Input, Output, dash_table, dcc, html
+from dash import Dash, Input, Output, State, dash_table, dcc, html
 from dash.dash_table.Format import Format, Scheme
+from dash.exceptions import PreventUpdate
 from loguru import logger
 
 from config import settings
@@ -170,12 +171,89 @@ def _is_local_request(environ) -> bool:
     return False
 
 
+# ── online brute-force protection ────────────────────────────────────────────
+#
+# Security GUARDRAILS, deliberately fixed constants rather than settings (the
+# same rule the risk limits follow): a knob that weakens a defence is a knob
+# that eventually gets turned.
+#
+# The limit is GLOBAL, not per-IP, and that is the point. Behind Tailscale
+# Funnel every request reaches this process from 127.0.0.1, so a per-IP bucket
+# would see one client and protect nothing. The real client address arrives only
+# in X-Forwarded-For — a header an attacker sets freely, so keying a rate limit
+# on it would hand out a fresh quota per forged value. A global bucket cannot be
+# rotated around.
+#
+# Sizing: 20 failures per 5 minutes is ~5,700 guesses/day. Against the
+# 20-character random password this setup ships with, that is not a threat in
+# any human timescale; against a weak password nothing here would save you, so
+# password strength does the real work and this makes the attempt slow, bounded
+# and VISIBLE in the log.
+_AUTH_MAX_FAILURES = 20            # failures tolerated inside the window
+_AUTH_FAILURE_WINDOW = 300.0       # seconds — the sliding window
+_AUTH_LOCKOUT_SECONDS = 300.0      # how long a tripped limit stays tripped
+
+_auth_failures: list = []          # timestamps of recent failed attempts
+_auth_lock = __import__("threading").Lock()
+_auth_state: dict = {"locked_until": 0.0, "announced": False}
+
+
+def _auth_locked_for() -> float:
+    """Seconds remaining on the lockout, or 0.0 when attempts are allowed."""
+    with _auth_lock:
+        remaining = _auth_state["locked_until"] - time.time()
+        if remaining <= 0 and _auth_state["announced"]:
+            _auth_state["announced"] = False
+            logger.info("[dashboard] auth lockout expired — accepting attempts again")
+        return max(0.0, remaining)
+
+
+def _auth_record_failure() -> None:
+    """Count a failed attempt and trip the lockout once the window fills."""
+    now = time.time()
+    with _auth_lock:
+        _auth_failures.append(now)
+        cutoff = now - _AUTH_FAILURE_WINDOW
+        while _auth_failures and _auth_failures[0] < cutoff:
+            _auth_failures.pop(0)
+        if len(_auth_failures) >= _AUTH_MAX_FAILURES and not _auth_state["announced"]:
+            _auth_state["locked_until"] = now + _AUTH_LOCKOUT_SECONDS
+            _auth_state["announced"] = True
+            _auth_failures.clear()
+            # CRITICAL, not warning: on a PUBLIC url this is either an attack or
+            # a badly broken client, and both are worth waking up to. Logged
+            # once per lockout, never per attempt — a crawler would otherwise
+            # flood the log, which is why individual 401s stay silent.
+            logger.critical(
+                f"[dashboard] auth lockout — {_AUTH_MAX_FAILURES} failed password "
+                f"attempts within {_AUTH_FAILURE_WINDOW:.0f}s. Rejecting attempts "
+                f"for {_AUTH_LOCKOUT_SECONDS:.0f}s. If this was not you, the "
+                f"dashboard URL is being probed.")
+
+
+def _auth_record_success() -> None:
+    """A correct password clears the counter — a human who typed it wrong twice
+    before getting it right must not drift toward a lockout."""
+    with _auth_lock:
+        _auth_failures.clear()
+
+
 def _basic_auth_middleware(inner, username: str, password: str):
     """Wrap a WSGI callable in an HTTP Basic-Auth gate (one shared credential).
 
     Requests that ``_is_local_request`` proves came from this machine skip the
-    prompt entirely: the point of the password is the PUBLIC URL, and forcing the
-    owner to log in to their own loopback dashboard buys nothing.
+    prompt. With ``dashboard_auth_bypass_networks`` EMPTY — the shipped
+    configuration since 2026-08-16 — that check always returns False, so every
+    request presents the password, including this PC's own browser. The bypass
+    machinery is kept because it is the difference between "loopback" and "a
+    tunnelled request that merely looks like loopback", and turning it back on
+    is a one-line config change; leaving it wired means the distinction stays
+    tested rather than rotting.
+
+    Failed attempts are rate-limited GLOBALLY (see the guardrails above). The
+    ordering matters: the lockout is checked BEFORE the password comparison, so
+    a tripped limit caps the number of guesses rather than merely the number of
+    successful answers.
 
     Split out from ``_install_basic_auth`` so the gate can be tested against a
     stub inner app instead of the whole Dash stack — an auth check nobody can
@@ -184,11 +262,25 @@ def _basic_auth_middleware(inner, username: str, password: str):
     expected = f"{username}:{password}".encode("utf-8")
 
     def _gate(environ, start_response):
-        # Localhost browses without a login; everything else must present the
-        # shared password. See _is_local_request for why this is not "is the peer
-        # 127.0.0.1" — the tunnel makes the whole internet look like 127.0.0.1.
+        # A bypass network (none by default) browses without a login; everything
+        # else must present the shared password. See _is_local_request for why
+        # this is not "is the peer 127.0.0.1" — Funnel and ngrok alike make the
+        # whole internet look like 127.0.0.1.
         if _is_local_request(environ):
             return inner(environ, start_response)
+
+        # Ahead of the comparison on purpose: this bounds GUESSES, not answers.
+        retry_after = _auth_locked_for()
+        if retry_after > 0:
+            body = b"Too many failed attempts. Try again shortly.\n"
+            start_response("429 Too Many Requests", [
+                ("Retry-After", str(int(retry_after) + 1)),
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+            ])
+            return [body]
+
         header = environ.get("HTTP_AUTHORIZATION", "")
         if header.startswith("Basic "):
             try:
@@ -197,9 +289,15 @@ def _basic_auth_middleware(inner, username: str, password: str):
                 supplied = b""
             # Constant-time: a plain == leaks the password one byte at a time.
             if hmac.compare_digest(supplied, expected):
+                _auth_record_success()
                 return inner(environ, start_response)
+            _auth_record_failure()
+        # A missing header is the browser's first, credential-less request — the
+        # normal prelude to the password prompt, not a guess, so it is not
+        # counted. Only a WRONG credential is.
+        #
         # No per-request log here on purpose: a crawler on a public URL would
-        # otherwise flood the log with one line per probe.
+        # otherwise flood the log with one line per probe. The lockout logs once.
         start_response("401 Unauthorized", [
             ("WWW-Authenticate", 'Basic realm="LLM Trader Monitor", charset="UTF-8"'),
             ("Content-Type", "text/plain; charset=utf-8"),
@@ -237,6 +335,69 @@ def _install_basic_auth() -> bool:
 
 AUTH_ENABLED = _install_basic_auth()
 
+
+# Routes whose response defines WHICH VERSION of the app the browser is running.
+# The index page lists the asset/bundle URLs; the layout is the page structure;
+# the dependency graph wires the callbacks. A stale copy of any one of them
+# pins the viewer to an old dashboard.
+_VERSION_DEFINING_PREFIXES = ("/_dash-layout", "/_dash-dependencies",
+                              "/_reload-hash", "/_favicon.ico")
+
+
+def _install_cache_headers() -> None:
+    """Make every client run the CURRENT dashboard, with no manual refresh.
+
+    Nothing here sent cache directives, so each browser applied its own
+    heuristic — and phones cache hardest. The result: a deploy landed on the
+    server while a phone kept rendering the previous version indefinitely, with
+    no way to tell from the server side (the logs show a normal 200 for a page
+    the viewer never sees). Only a private tab or a ``?v=`` query string broke
+    it, which is not something anyone should have to remember.
+
+    Three classes, by what the response actually is:
+
+    * **version-defining** (the index page, ``_dash-layout``,
+      ``_dash-dependencies``) → ``no-store``. Small (~4 KB each) and fetched
+      once per page load, so forbidding the cache outright costs nothing
+      measurable and is the only setting that GUARANTEES freshness. This is
+      also what keeps the DATA current: ``serve_layout`` is a function, so a
+      reload rebuilds it against the latest run.
+    * **component suites** (the ~MBs of React/Plotly bundles) → cached for a
+      year as ``immutable``. Their URLs already carry the package version, so a
+      library upgrade changes the URL; caching them hard is what keeps the page
+      fast on a phone despite the above.
+    * **assets** (our ``style.css``, the favicon) → ``no-cache``, i.e. "you may
+      keep a copy but you must revalidate". Dash already appends ``?m=<mtime>``
+      so the URL changes whenever the file does; revalidation is a 304 costing
+      a few hundred bytes and removes the last way to be served a stale
+      stylesheet.
+
+    Pinned by ``tests/test_dashboard_cache_headers.py`` — a regression here is
+    invisible from every server-side surface, which is exactly the class this
+    project refuses to leave to review.
+    """
+    from flask import request
+
+    @app.server.after_request
+    def _set_cache_headers(response):
+        path = request.path or ""
+        if path.startswith("/_dash-component-suites/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-cache"
+        elif path == "/" or path.startswith(_VERSION_DEFINING_PREFIXES):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"          # HTTP/1.0 proxies
+            response.headers["Expires"] = "0"
+        return response
+
+
+_install_cache_headers()
+
+# The system font stack — one typography for UI, tables and charts (figures.py
+# uses the same stack). tabular-nums on cells comes from assets/style.css.
+_FONT_STACK = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
+
 _TABLE_KW = dict(
     page_size=25,           # rows shown per page (applies to every table)
     sort_action="native",   # click a column header to sort — toggles ascending → descending → off
@@ -245,38 +406,44 @@ _TABLE_KW = dict(
     tooltip_duration=None,  # keep the explanation visible until the mouse leaves
     style_table={"overflowX": "auto"},
     style_cell={
-        "fontFamily": "Arial", "fontSize": 13, "padding": "6px",
+        "fontFamily": _FONT_STACK, "fontSize": 12.5, "padding": "6px 10px",
         "textAlign": "left", "whiteSpace": "normal", "height": "auto",
-        "maxWidth": 460,
+        "maxWidth": 460, "border": "0", "borderBottom": "1px solid #eef2f7",
+        "color": "#1e293b",
     },
-    style_header={"backgroundColor": "#f9fafb", "fontWeight": "bold", "cursor": "help"},
+    style_header={
+        "backgroundColor": "#f8fafc", "fontWeight": "600", "cursor": "help",
+        "fontSize": 11.5, "color": "#475569", "textTransform": "uppercase",
+        "letterSpacing": "0.03em", "border": "0",
+        "borderBottom": "1px solid #e2e8f0",
+    },
+    style_data={"backgroundColor": "white"},
 )
 
 
 def _kpi(label: str, value: str, color: str = "#111827", tooltip: str = "") -> html.Div:
     """A stat tile. ``tooltip`` (if given) shows as a hover explanation; the label
-    gets a dotted underline + help cursor to advertise that it's there."""
-    label_style = {"color": "#6b7280", "fontSize": 12, "display": "inline-block"}
+    gets a dotted underline + help cursor to advertise that it's there. Pass a
+    semantic ``color`` (figures.POS/NEG) only when the value carries a sign the
+    reader should see at a glance; the default renders in primary ink."""
+    label_style = {}
     if tooltip:
         label_style["borderBottom"] = "1px dotted #cbd5e1"
+    value_style = {} if color in ("#111827", None) else {"color": color}
     return html.Div(
         [
-            html.Div(label, style=label_style),
-            html.Div(value, style={"color": color, "fontSize": 22, "fontWeight": "bold"}),
+            html.Div(label, className="kpi-label", style=label_style),
+            html.Div(value, className="kpi-value", style=value_style),
         ],
         title=tooltip,
-        style={
-            "padding": "10px 16px", "background": "white", "borderRadius": 8,
-            "boxShadow": "0 1px 3px rgba(0,0,0,0.1)", "minWidth": 130, "margin": 6,
-            "cursor": "help" if tooltip else "default",
-        },
+        className="kpi" + (" kpi--help" if tooltip else ""),
     )
 
 
 def _h3(text: str, tooltip: str = "") -> html.H3:
     """Section heading with an optional hover explanation."""
     return html.H3(text, title=tooltip or None,
-                   style={"cursor": "help"} if tooltip else {})
+                   className="section-h" + (" section-h--help" if tooltip else ""))
 
 
 def _health_banner():
@@ -299,11 +466,9 @@ def _health_banner():
         blocks.append(html.Div(
             [
                 html.B(f"⚠ {len(failures)} data source(s) failed in the latest run"),
-                html.Div(" · ".join(items),
-                         style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
+                html.Div(" · ".join(items), className="banner-detail"),
             ],
-            style={"background": "#fef2f2", "border": "1px solid #fecaca", "color": "#b91c1c",
-                   "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
+            className="banner banner--error",
         ))
 
     # Feeds that WENT DARK: historically-populated sources whose recent runs are
@@ -322,10 +487,9 @@ def _health_banner():
             [
                 html.B(f"📡 {len(dark)} data feed(s) went dark"),
                 html.Div(" · ".join(items) + " — see the Data Quality tab.",
-                         style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
+                         className="banner-detail"),
             ],
-            style={"background": "#fffbeb", "border": "1px solid #fcd34d", "color": "#92400e",
-                   "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
+            className="banner banner--warn",
         ))
 
     try:
@@ -338,10 +502,9 @@ def _health_banner():
             [
                 html.B("🔔 Price provenance alert"),
                 html.Div((pp.get("message") or "") + " — see the Execution tab.",
-                         style={"marginTop": 4, "fontSize": 12, "whiteSpace": "normal"}),
+                         className="banner-detail"),
             ],
-            style={"background": "#fffbeb", "border": "1px solid #fcd34d", "color": "#92400e",
-                   "borderRadius": 8, "padding": "10px 14px", "marginBottom": 12},
+            className="banner banner--warn",
         ))
 
     return html.Div(blocks) if blocks else html.Div()
@@ -565,43 +728,90 @@ def _safe(render):
         return html.Div(f"Could not load data: {e}", style={"padding": 20, "color": "#dc2626"})
 
 
-def serve_layout() -> html.Div:
-    """Build the page fresh on every load.
-
-    Each tab's content is embedded directly as that ``dcc.Tab``'s ``children`` so the
-    Tabs component swaps content on click entirely client-side — no callback on
-    ``tabs.value`` is involved. (A value→callback round trip for the content proved
-    unreliable in the browser even though the server returns the right payload, so
-    every tab showed the first-rendered one; rendering as children is the robust,
-    canonical pattern.) Being a function, the layout is rebuilt per page load, so a
-    long-running dashboard always reflects the latest pipeline run without a restart.
-    """
-    body = {"marginTop": 16}
+def _header() -> html.Div:
+    """Slim brand bar: identity on the left, the latest-run status chip on the
+    right. The chip is deliberately honest about staleness — a run older than
+    ~4 h turns it amber, which is how a silently dead scheduler becomes visible
+    from the phone without opening a single tab."""
+    chip = None
+    try:
+        info = data.latest_run_info()
+    except Exception:
+        info = None
+    if info:
+        started = info.get("started_at")
+        stale = False
+        try:
+            age_h = (datetime.now(timezone.utc)
+                     - datetime.fromisoformat(str(started))).total_seconds() / 3600.0
+            stale = age_h > 4.0
+        except (TypeError, ValueError):
+            pass
+        bits = [f"Last run {_fmt_et(started)} ET"]
+        regime = info.get("macro_regime") or ""
+        mode = info.get("market_mode") or ""
+        if regime or mode:
+            bits.append(" / ".join(b for b in (regime, mode) if b))
+        chip = html.Div(
+            [html.Span(className="dot dot--warn" if stale else "dot dot--ok"),
+             html.Span("  ·  ".join(bits))],
+            className="run-chip" + (" run-chip--stale" if stale else ""),
+            title=("The most recent pipeline run. Amber = older than 4 hours — "
+                   "check that the scheduler is alive." if stale
+                   else "The most recent pipeline run and its macro regime / market mode."),
+        )
     return html.Div(
-        style={"background": "#f3f4f6", "minHeight": "100vh", "fontFamily": "Arial", "padding": 16},
+        [
+            html.Div([
+                html.Div("▲", className="brand-mark"),
+                html.Div([
+                    html.Div("LLM Trader", className="brand-name"),
+                    html.Div("Monitor · DuckDB-backed, read-only", className="brand-sub"),
+                ]),
+            ], className="brand"),
+            chip or html.Div(),
+        ],
+        className="app-header",
+    )
+
+
+def serve_layout() -> html.Div:
+    """Build the page fresh on every load; tab content renders LAZILY.
+
+    Each ``dcc.Tab`` holds its own EMPTY container div; a per-tab callback fills
+    that container the first time the tab becomes active and leaves it alone
+    afterwards (``PreventUpdate`` when it's not the active tab or already has
+    content — so a revisit is instant and nothing recomputes). The initial page
+    therefore ships only the chrome + the active tab, instead of building all
+    six tabs server-side per load — the difference between a sub-second landing
+    and a multi-minute one whenever any tab's data is cold.
+
+    ⚠ Do NOT replace this with a single shared content container swapped on
+    ``tabs.value`` — that pattern was tried and every tab showed the first-
+    rendered content in the browser even though the server returned the right
+    payload. Per-tab containers avoid it structurally: content never moves
+    between containers and component ids stay put, exactly like the old
+    all-embedded layout, just filled on demand.
+
+    Being a function, the layout is rebuilt per page load, so a long-running
+    dashboard always reflects the latest pipeline run without a restart.
+    """
+    return html.Div(
+        className="app-shell",
         children=[
-            html.H1("LLM Trader — Monitor", style={"color": "#111827", "marginBottom": 4}),
-            html.Div("DuckDB-backed · recommendation rationale, method performance, and returns",
-                     style={"color": "#6b7280", "marginBottom": 2}),
-            html.Div("Tip: hover a column header or metric for its definition · click a header to sort (⇅, shift-click multi-sort) · type in a filter cell to search",
-                     style={"color": "#9ca3af", "fontSize": 12, "marginBottom": 12}),
+            _header(),
             _health_banner(),
             dcc.Tabs(
                 id="tabs", value="rationale",
+                className="app-tabs", parent_className="app-tabs-wrap",
                 persistence=True, persistence_type="session",  # keep the selected tab across reloads
                 children=[
-                    dcc.Tab(label="Recommendations & Rationale", value="rationale",
-                            children=dcc.Loading(html.Div(_safe(_rationale_tab), style=body))),
-                    dcc.Tab(label="Entry Performance", value="methods",
-                            children=dcc.Loading(html.Div(_safe(_methods_tab), style=body))),
-                    dcc.Tab(label="Exit Performance", value="exit_perf",
-                            children=dcc.Loading(html.Div(_safe(_exit_perf_tab), style=body))),
-                    dcc.Tab(label="Returns", value="returns",
-                            children=dcc.Loading(html.Div(_safe(_returns_tab), style=body))),
-                    dcc.Tab(label="Execution", value="execution",
-                            children=dcc.Loading(html.Div(_safe(_execution_tab), style=body))),
-                    dcc.Tab(label="Data Quality", value="data_quality",
-                            children=dcc.Loading(html.Div(_safe(_data_quality_tab), style=body))),
+                    dcc.Tab(label=label, value=value,
+                            className="app-tab", selected_className="app-tab--selected",
+                            children=dcc.Loading(
+                                html.Div(id=f"tab-{value}", className="tab-body"),
+                                color="#2a78d6"))
+                    for value, label, _render in _TAB_SPEC
                 ],
             ),
         ],
@@ -613,10 +823,15 @@ app.layout = serve_layout
 
 # ── Tab 1: Recommendations & Rationale ─────────────────────────────────────
 
+_RUN_DROPDOWN_LIMIT = 250   # ~2 weeks of 30-min ticks; 1,200+ options made the
+                            # dropdown unusable and bloated the tab payload.
+
+
 def _rationale_tab():
     runs = data.runs_df()
     if runs.empty:
         return html.Div("No runs recorded yet. Run the pipeline first.", style={"padding": 20})
+    recent = runs.head(_RUN_DROPDOWN_LIMIT)
     options = [
         {
             "label": f"{_fmt_et(getattr(r, 'started_at', None))} ET"
@@ -624,15 +839,18 @@ def _rationale_tab():
                      f"   ·   LLM: {getattr(r, 'llm_synthesis_provider', None) or '–'}",
             "value": r.run_id,
         }
-        for r in runs.itertuples()
+        for r in recent.itertuples()
     ]
+    trimmed = len(runs) - len(recent)
     return html.Div([
         html.Div(
-            [html.Label("Run:  ", title="Pick which pipeline run to inspect. Each entry is one analysis run, shown as its Eastern start time · market mode / macro regime · the LLM used.",
-                        style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1"}),
+            [html.Label("Run", title="Pick which pipeline run to inspect. Each entry is one analysis run, shown as its Eastern start time · market mode / macro regime · the LLM used.",
+                        className="filter-label"),
              dcc.Dropdown(id="run-select", options=options, value=options[0]["value"],
-                          clearable=False, style={"width": 560, "display": "inline-block"})],
-            style={"marginBottom": 12},
+                          clearable=False, style={"width": 560}),
+             html.Span(f"showing the {len(recent)} most recent of {len(runs)} runs",
+                       className="filter-note") if trimmed > 0 else html.Span()],
+            className="filter-item",
         ),
         dcc.Loading(html.Div(id="rationale-body")),
     ])
@@ -733,6 +951,25 @@ def _review_timeline_section(ticker: str):
     ])
 
 
+# ── Filter toggles (shared shell) ────────────────────────────────────────────
+
+def _filter_row(label: str, tooltip: str, component_id: str, options, default: str) -> html.Div:
+    """One labeled segmented control — the shared shell every filter toggle uses.
+    Styling lives in assets/style.css (.seg / .seg-item); the input element is
+    a real radio so Dash persistence keeps working."""
+    return html.Div(
+        [
+            html.Label(label, title=tooltip, className="filter-label"),
+            dcc.RadioItems(
+                id=component_id, options=options, value=default, inline=True,
+                persistence=True, persistence_type="session",
+                className="seg", labelClassName="seg-item", inputClassName="seg-radio",
+            ),
+        ],
+        className="filter-item",
+    )
+
+
 # ── Time-window toggle (shared by the Entry Performance & Returns tabs) ──────
 _WINDOW_OPTIONS = [
     {"label": "1 Week", "value": "7"},
@@ -745,20 +982,10 @@ def _window_toggle(component_id: str) -> html.Div:
     """A 1-week / 1-month / inception selector. The tab's metrics and plots
     recompute against trades ENTERED within the chosen window ('Inception' = every
     trade ever). Defaults to Inception so the initial view shows the full book."""
-    return html.Div(
-        [
-            html.Label("Window:  ",
-                       title="Filter the metrics and plots in this tab to trades entered in the last week, the last month, or since inception (every trade).",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_WINDOW_OPTIONS, value="all", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row(
+        "Window",
+        "Filter the metrics and plots in this tab to trades entered in the last week, the last month, or since inception (every trade).",
+        component_id, _WINDOW_OPTIONS, "all")
 
 
 def _window_days(value):
@@ -794,20 +1021,7 @@ def _session_toggle(component_id: str, title: str = _SESSION_TOGGLE_TITLE) -> ht
     stated in ``title`` — trades are filtered by ENTRY session, exit analyses by
     the review/exit moment, panels by signal-generation time). Pre-market and
     After-hours are the two halves of the coarse 'extended' session."""
-    return html.Div(
-        [
-            html.Label("Session:  ",
-                       title=title,
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_SESSION_OPTIONS, value="all", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row("Session", title, component_id, _SESSION_OPTIONS, "all")
 
 
 def _session_value(value):
@@ -827,20 +1041,10 @@ _DIRECTION_OPTIONS = [
 def _direction_toggle(component_id: str) -> html.Div:
     """Long (BUY) / Short (SELL) / both selector. Filters the tab's metrics and
     plots to positions ENTERED in that direction."""
-    return html.Div(
-        [
-            html.Label("Direction:  ",
-                       title="Filter to LONG positions (BUY entries), SHORT positions (SELL entries), or both.",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_DIRECTION_OPTIONS, value="all", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row(
+        "Direction",
+        "Filter to LONG positions (BUY entries), SHORT positions (SELL entries), or both.",
+        component_id, _DIRECTION_OPTIONS, "all")
 
 
 def _direction_value(value):
@@ -861,22 +1065,12 @@ def _asset_toggle(component_id: str) -> html.Div:
     """Instrument-type selector (Stocks / ETFs / Commodities / all). Filters the
     tab's metrics and plots to trades whose instrument ``type`` matches (the same
     STOCK / ETF / COMMODITY label stored at entry)."""
-    return html.Div(
-        [
-            html.Label("Type:  ",
-                       title="Filter to a single instrument type: individual Stocks, ETFs "
-                             "(sector / factor / index funds), or Commodities (metals, energy, "
-                             "agriculture ETFs). 'All types' = every instrument.",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_ASSET_OPTIONS, value="all", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row(
+        "Type",
+        "Filter to a single instrument type: individual Stocks, ETFs "
+        "(sector / factor / index funds), or Commodities (metals, energy, "
+        "agriculture ETFs). 'All types' = every instrument.",
+        component_id, _ASSET_OPTIONS, "all")
 
 
 def _asset_value(value):
@@ -897,21 +1091,11 @@ def _method_source_toggle(component_id: str) -> html.Div:
     every method's implied BUY/SELL on EVERY scored ticker each run (the
     simulated_trades panel), scored on gross forward returns — thousands of
     observations, unbiased by the trading gates."""
-    return html.Div(
-        [
-            html.Label("Source:  ",
-                       title="Ledger (gated trades): solo-method performance over only the trades the gates let through — apples-to-apples with the real book but a small, selection-biased sample. "
-                             "All scored tickers (simulated): one simulated trade per NEW directional call a method makes (the run it first called the direction — not one per run/day), scored on GROSS forward returns at the pivot basis + 1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date), Session (the session the ENTRY was decided in — sessions partition the trades, so All = their sum), and Direction (the side of the method's call — a positive score is its long call).",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_METHOD_SOURCE_OPTIONS, value="ledger", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row(
+        "Source",
+        "Ledger (gated trades): solo-method performance over only the trades the gates let through — apples-to-apples with the real book but a small, selection-biased sample. "
+        "All scored tickers (simulated): one simulated trade per NEW directional call a method makes (the run it first called the direction — not one per run/day), scored on GROSS forward returns at the pivot basis + 1d/3d/1w/2w/1m — the unbiased directional-predictiveness view. Honors the Window toggle (by signal date), Session (the session the ENTRY was decided in — sessions partition the trades, so All = their sum), and Direction (the side of the method's call — a positive score is its long call).",
+        component_id, _METHOD_SOURCE_OPTIONS, "ledger")
 
 
 # ── Trade-source toggle (simulated ledger vs actual IBKR fills) ──────────────
@@ -925,22 +1109,12 @@ def _source_toggle(component_id: str) -> html.Div:
     """Two books, one toggle. Simulated = the strategy ledger (every decision at
     its decision price through the modeled cost stack). IBKR = only orders that
     actually filled, at real fill prices with real commissions."""
-    return html.Div(
-        [
-            html.Label("Trades:  ",
-                       title="Simulated (model): every decision the strategy made, priced at decision time with modeled spread + commission costs — strategy quality, independent of execution. "
-                             "IBKR (actual fills): only orders that really filled at the broker, at actual average fill prices with the commissions actually charged — execution reality, no modeled costs. "
-                             "The gap between the two views is the execution gap: slippage, unfilled or expired orders, and sizing rounding.",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_SOURCE_OPTIONS, value="sim", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row(
+        "Trades",
+        "Simulated (model): every decision the strategy made, priced at decision time with modeled spread + commission costs — strategy quality, independent of execution. "
+        "IBKR (actual fills): only orders that really filled at the broker, at actual average fill prices with the commissions actually charged — execution reality, no modeled costs. "
+        "The gap between the two views is the execution gap: slippage, unfilled or expired orders, and sizing rounding.",
+        component_id, _SOURCE_OPTIONS, "sim")
 
 
 def _usd(x, signed: bool = True) -> str:
@@ -955,29 +1129,29 @@ def _usd(x, signed: bool = True) -> str:
 # ── Tab 2: Entry Performance ────────────────────────────────────────────────
 
 _IC_TOOLTIP = (
-    "Spearman rank correlation between each method's score and the forward "
-    "close-to-close return at 1/5/10 trading-day horizons. Computed over the "
-    "persisted signals panel — EVERY scored ticker each run, not just the few that "
-    "became trades — so it is unbiased by the trading gates. Split into five "
-    "categories: the 8 OHLCV methods computed on 30-min, daily, and weekly candles "
-    "(the SAME indicators on different bar sizes), Fundamentals, and Other (news, "
-    "sentiment, smart money, options, catalysts — most-recent data). The signed trend "
-    "signals (Kaufman efficiency / ADX·DMI) are evaluated separately in the 'Stock "
-    "discovery — trend signal IC by direction' table below. 'Sim win %' = simulated solo win "
-    "rate (share of non-zero scores whose sign matched the move); 'Sim ret %' = "
-    "simulated solo return (mean sign(score)×forward-return — the gross P&L if that "
-    "method alone decided the trade). 'IC std' = standard deviation of the PER-DAY IC "
-    "and 'ICIR' = mean(daily IC)/std(daily IC) — the IC's reliability: each signal-day "
-    "counts once, so they are NOT inflated by same-day cross-sectional correlation the "
-    "way a standard error off the raw n would be (|ICIR| ≳ 0.5 is a stable edge, ≈ 0 is "
-    "noise); both need several signal-days before they populate. A persistent NEGATIVE "
-    "IC is sign-inverted (a logic bug); IC ≈ 0 at large n is dead weight. 'Views' = scored, non-zero "
-    "observations. Shown as THREE always-visible blocks: the BUY side (each method restricted to "
-    "its positive/bullish scores), the SELL side (its negative/bearish scores), and All calls (both "
-    "combined). Both sides stay on screen regardless of the Direction toggle above — so you can see "
-    "directly that the buy metrics carry on a method's bullish calls and the sell metrics on its "
-    "bearish calls. A predictive sell side shows a POSITIVE IC too (a more-negative score ranking a "
-    "more-negative return). Run/forward-return based (NOT affected by the window/direction toggles); "
+    "Spearman rank correlation between a method's score and the forward "
+    "close-to-close return, at the PIVOT decision basis plus the 1/5/10-day "
+    "monitoring grid. Computed over the persisted signals panel — EVERY scored "
+    "ticker each run, not just the few that became trades — so it is unbiased by "
+    "the trading gates. "
+    "Pick ONE method (or a whole family) above; its three sides then appear as "
+    "rows: BUY = the method restricted to its positive/bullish scores, SELL = its "
+    "negative/bearish scores, ALL = every non-zero score. A genuinely predictive "
+    "sell side shows a POSITIVE IC too (a more-negative score ranking a "
+    "more-negative return), so the sides are read the same way. "
+    "'Sim win %' = simulated solo win rate (share of non-zero scores whose sign "
+    "matched the move); 'Sim ret %' = simulated solo return (mean "
+    "sign(score)×forward-return — the gross P&L if that method alone decided the "
+    "trade). 'IC std' = standard deviation of the PER-DAY IC and 'ICIR' = "
+    "mean(daily IC)/std(daily IC) — the IC's reliability: each signal-day counts "
+    "once, so they are NOT inflated by same-day cross-sectional correlation the "
+    "way a standard error off the raw n would be (|ICIR| ≳ 0.5 is a stable edge, "
+    "≈ 0 is noise); both need several signal-days before they populate. A "
+    "persistent NEGATIVE IC is sign-inverted (a logic bug); IC ≈ 0 at large n is "
+    "dead weight. 'Views' = scored, non-zero observations. "
+    "Deliberately independent of the Direction toggle above (which filters the "
+    "TRADE-based tables by entry direction) — here both sides are always shown "
+    "together, which is the comparison that matters. Run/forward-return based; "
     "n grows every run — judge nothing on a thin panel.")
 
 _IC_HORIZONS = (1, 5, 10)
@@ -986,26 +1160,138 @@ _IC_HORIZONS = (1, 5, 10)
 # monitoring. (suffix, display) pairs drive both the rows and the headers.
 _IC_BLOCKS = (("pv", "pivot"),) + tuple((f"{h}d", f"{h}d") for h in _IC_HORIZONS)
 
+# The three sides, in display order: (side key, row label, accent).
+_IC_SIDES = (("ic_buy", "▲ Buy (bullish calls)", figures.POS),
+             ("ic_sell", "▼ Sell (bearish calls)", figures.NEG),
+             ("ic", "● All calls", "#475569"))
 
-def _ic_category_table(subset, labels):
-    """Build one category's IC DataTable from its rows of the ic DataFrame."""
+# Aggregate score columns — the headline rows, not per-method scores.
+_IC_AGGREGATE = ("combined_score", "cmb_buy", "cmb_sell")
+
+
+def _ic_method_labels() -> dict:
+    """method column → human label, including the aggregate rows."""
+    from src.performance.tracker import METHOD_LABELS
+    labels = dict(METHOD_LABELS)
+    labels["combined_score"] = "All methods (combined = buy − sell)"
+    labels["cmb_buy"] = "Combined BUY side (bull-camp conviction)"
+    labels["cmb_sell"] = "Combined SELL side (bear-camp conviction)"
+    return labels
+
+
+def _ic_family_groups() -> dict:
+    """``family name -> [method columns]`` covering EVERY panel score column.
+
+    The 7 information families from ``agreement.METHOD_FAMILIES`` are the real
+    grouping — they are what the combine votes by, so "how did the Options
+    family do" is a question about the system rather than about a reporting
+    bucket. The weighted pool is only part of the panel though (timeframe
+    variants, the f_* factors and the panel-first methods have no family), so
+    the leftovers are grouped by what they ARE. Every column lands in exactly
+    one group; ``tests/test_dashboard_method_explorer.py`` pins that, because a
+    method silently missing from the dropdown is unreachable in the UI."""
+    from src.analysis.signal_panel import PANEL_SCORE_COLUMNS
+    from src.signals.agreement import METHOD_FAMILIES
+    from src.db.schema import SIGNAL_FUNDAMENTAL_COLUMNS
+
+    known = set(PANEL_SCORE_COLUMNS)
+    groups: dict = {"Aggregate (combined score & camps)":
+                    [m for m in _IC_AGGREGATE if m in known]}
+    claimed = set(groups["Aggregate (combined score & camps)"])
+
+    for family, members in METHOD_FAMILIES.items():
+        present = [m for m in members if m in known and m not in claimed]
+        if present:
+            groups[f"Family · {family}"] = present
+            claimed.update(present)
+
+    def _take(name, predicate):
+        present = [m for m in PANEL_SCORE_COLUMNS
+                   if m not in claimed and predicate(m)]
+        if present:
+            groups[name] = present
+            claimed.update(present)
+
+    _take("Technical · 30-min candles", lambda m: m.endswith("_30m"))
+    _take("Technical · Weekly candles", lambda m: m.endswith("_1w"))
+    _take("Fundamentals & corporate actions",
+          lambda m: m in set(SIGNAL_FUNDAMENTAL_COLUMNS))
+    # Whatever is left: panel-first methods at weight 0 and the additive
+    # overlays — scored and IC-tracked, but outside the family vote.
+    _take("Panel-first & overlays (not in the family vote)", lambda m: True)
+    return groups
+
+
+def _ic_dropdown_options() -> list:
+    """Dropdown options: every family, then every individual method.
+
+    Built from STATIC metadata — no database read — because this runs while the
+    tab is being rendered. Touching ``data.signal_ic()`` here would re-impose the
+    very cost the lazy explorer exists to avoid."""
+    labels = _ic_method_labels()
+    options = []
+    for family, members in _ic_family_groups().items():
+        options.append({"label": f"◆  {family}  ({len(members)})",
+                        "value": f"fam:{family}"})
+    for family, members in _ic_family_groups().items():
+        for m in members:
+            options.append({"label": f"      {labels.get(m, m)}", "value": f"m:{m}"})
+    return options
+
+
+def _ic_resolve(selection) -> list:
+    """Dropdown value → the method columns it covers ([] when nothing picked)."""
+    if not selection:
+        return []
+    if selection.startswith("fam:"):
+        return list(_ic_family_groups().get(selection[4:], []))
+    if selection.startswith("m:"):
+        return [selection[2:]]
+    return []
+
+
+def _ic_rows(res: dict, methods: list, horizons: list) -> list:
+    """One row per (method, side) for the selected methods.
+
+    Sides with NO views are dropped, not shown blank. Two real cases produce
+    them — a method that has only ever scored one way genuinely has no opposite
+    side, and a freshly epoch-registered scorer has its whole history masked to
+    NaN — and in both a row of dashes reads as "measured zero" when the truth is
+    "nothing to measure". Dropping them lets the caller's empty-state say so."""
+    labels = _ic_method_labels()
+    by_side = {}
+    for side_key, _lbl, _accent in _IC_SIDES:
+        df = res.get(side_key)
+        if df is None or getattr(df, "empty", True):
+            by_side[side_key] = {}
+            continue
+        by_side[side_key] = {str(r["method"]): r for _, r in df.iterrows()}
+
     rows = []
-    for _, r in subset.iterrows():
-        row = {"method": labels.get(r["method"], r["method"]), "views": int(r["views"])}
-        for sfx, _disp in _IC_BLOCKS:
-            n, ic, hit, sim = (r.get(f"n_{sfx}"), r.get(f"ic_{sfx}"),
-                               r.get(f"hit_{sfx}"), r.get(f"simret_{sfx}"))
-            icstd, icir = r.get(f"icstd_{sfx}"), r.get(f"icir_{sfx}")
-            row[f"n_{sfx}"] = int(n) if pd.notna(n) else None
-            row[f"ic_{sfx}"] = round(float(ic), 3) if pd.notna(ic) else None
-            row[f"icstd_{sfx}"] = round(float(icstd), 3) if pd.notna(icstd) else None
-            row[f"icir_{sfx}"] = round(float(icir), 2) if pd.notna(icir) else None
-            row[f"hit_{sfx}"] = round(float(hit), 1) if pd.notna(hit) else None
-            row[f"simret_{sfx}"] = round(float(sim), 2) if pd.notna(sim) else None
-        rows.append(row)
+    for m in methods:
+        for side_key, side_label, _accent in _IC_SIDES:
+            r = by_side.get(side_key, {}).get(m)
+            if r is None or not int(r["views"]):
+                continue
+            row = {"method": labels.get(m, m), "side": side_label,
+                   "views": int(r["views"])}
+            for sfx, _disp in horizons:
+                n = r.get(f"n_{sfx}")
+                row[f"n_{sfx}"] = int(n) if pd.notna(n) else None
+                for key, digits in (("ic", 3), ("icstd", 3), ("icir", 2),
+                                    ("hit", 1), ("simret", 2)):
+                    v = r.get(f"{key}_{sfx}")
+                    row[f"{key}_{sfx}"] = round(float(v), digits) if pd.notna(v) else None
+            rows.append(row)
+    return rows
+
+
+def _ic_table(rows: list, horizons: list) -> dash_table.DataTable:
+    """The method-explorer table: rows = method × side, columns = the horizon grid."""
     cols = [{"name": "Method", "id": "method"},
+            {"name": "Side", "id": "side"},
             {"name": "Views", "id": "views", "type": "numeric", "format": _INT}]
-    for sfx, disp in _IC_BLOCKS:
+    for sfx, disp in horizons:
         cols += [
             {"name": f"n@{disp}", "id": f"n_{sfx}", "type": "numeric", "format": _INT},
             {"name": f"IC@{disp}", "id": f"ic_{sfx}", "type": "numeric", "format": _NUM2},
@@ -1014,95 +1300,99 @@ def _ic_category_table(subset, labels):
             {"name": f"Sim win@{disp} %", "id": f"hit_{sfx}", "type": "numeric", "format": _NUM2},
             {"name": f"Sim ret@{disp} %", "id": f"simret_{sfx}", "type": "numeric", "format": _NUM2},
         ]
-    longest = max(_IC_HORIZONS)
-    cond = []
-    for c in (f"ic_{longest}d", f"icir_{longest}d", f"simret_{longest}d"):
-        cond += [
-            {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c},
-             "color": figures.POS, "fontWeight": "bold"},
-            {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c},
-             "color": figures.NEG, "fontWeight": "bold"},
-        ]
-    return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
-
-
-def _ic_category_tables(icdf, labels):
-    """The per-category DataTables for one IC view (all / buy-side / sell-side)."""
-    from src.analysis.signal_panel import IC_CATEGORY_ORDER
-    children = []
-    has_cat = "category" in icdf.columns
-    for category in IC_CATEGORY_ORDER:
-        subset = icdf[icdf["category"] == category] if has_cat else icdf
-        if subset is None or subset.empty:
-            continue
-        children.append(html.Div(category, style={
-            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}))
-        children.append(_ic_category_table(subset, labels))
-        if not has_cat:
-            break
-    return children
+    # Sign colouring on every shown horizon (the old table coloured only the
+    # longest, which hid a sign flip across the curve — the thing worth seeing).
+    cond = [{"if": {"filter_query": '{side} contains "All calls"'},
+             "backgroundColor": "#f8fafc"}]
+    for sfx, _disp in horizons:
+        for c in (f"ic_{sfx}", f"icir_{sfx}", f"simret_{sfx}"):
+            cond += [
+                {"if": {"filter_query": f"{{{c}}} > 0", "column_id": c},
+                 "color": figures.POS, "fontWeight": "bold"},
+                {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c},
+                 "color": figures.NEG, "fontWeight": "bold"},
+            ]
+    return dash_table.DataTable(
+        data=rows, columns=cols, style_data_conditional=cond,
+        style_cell_conditional=[{"if": {"column_id": "method"}, "fontWeight": "600"},
+                                {"if": {"column_id": "side"}, "minWidth": 150}],
+        **_TABLE_KW)
 
 
 def _ic_section():
-    """Per-method information coefficient over the signals panel, split into the
-    30-min / daily / weekly technical categories plus Other.
+    """The method explorer: pick one method (or one family) and see its stats.
 
-    2026-07-23: the BUY side and SELL side are shown as TWO always-visible
-    stacked blocks (not exclusive tabs) — plus an All-calls reference block —
-    so buy-signal skill on a method's bullish calls and sell-signal skill on its
-    bearish calls sit on screen together. That is deliberately kept independent
-    of the Direction toggle above (which filters the TRADE-based tables by trade
-    entry direction): the point is to compare, at a glance, that the buy metrics
-    carry on the bullish calls and the sell metrics carry on the bearish ones,
-    without either hiding the other. Each side restricts to that sign of each
-    method's own score (compute_ic side= in data.signal_ic)."""
-    from src.performance.tracker import METHOD_LABELS
-    res = data.signal_ic()
-    icdf = res.get("ic")
-    heading = _h3("Signal information coefficient (IC) — buy side vs sell side", _IC_TOOLTIP)
-    if icdf is None or getattr(icdf, "empty", True):
-        return html.Div([
-            heading,
-            html.Div(
-                f"Signals panel has {res.get('panel_rows', 0)} row(s) across "
-                f"{res.get('tickers', 0)} ticker(s) — not enough forward-return history "
-                "for IC yet. It accrues automatically every run.",
-                style={"color": "#6b7280"}),
-        ])
-    labels = dict(METHOD_LABELS)
-    labels["combined_score"] = "All methods (combined = buy − sell)"
-    labels["cmb_buy"] = "Combined BUY side (bull-camp conviction)"
-    labels["cmb_sell"] = "Combined SELL side (bear-camp conviction)"
-
-    def _block(title, blurb, df, accent):
-        body = (_ic_category_tables(df, labels)
-                if df is not None and not getattr(df, "empty", True)
-                else [html.Div("No calls on this side yet — accrues every run.",
-                               style={"color": "#6b7280", "marginTop": 6})])
-        return html.Div(
-            [html.Div(title, style={"fontWeight": "bold", "fontSize": 15, "color": accent,
-                                    "marginTop": 20, "marginBottom": 2,
-                                    "borderTop": "1px solid #334155", "paddingTop": 12}),
-             html.Div(blurb, style={"color": "#6b7280", "fontSize": 12, "marginBottom": 4})]
-            + body)
-
+    Replaces the three always-visible buy/sell/all blocks (2026-08-16). Those
+    rendered every panel column three times over five categories — ~15 tables of
+    ~30 columns — and, worse, forced ``data.signal_ic()`` before the tab could
+    paint at all. Here the section renders a dropdown and nothing else; the
+    panel is read only once a selection is made, and the buy/sell split the old
+    blocks carried is now three ROWS of the selected method.
+    """
     return html.Div([
-        heading,
-        _block("▲ Buy side — each method's BULLISH calls",
-               "Restricted to each method's POSITIVE scores: IC = ranking skill within its "
-               "buy calls, Sim win % = share that rose, Sim ret % = long-only gross P&L. "
-               "The combined BUY-camp conviction (cmb_buy) row is the aggregate.",
-               res.get("ic_buy"), figures.POS),
-        _block("▼ Sell side — each method's BEARISH calls",
-               "Restricted to each method's NEGATIVE scores: Sim win % = share that fell, "
-               "Sim ret % = short-only gross P&L. A genuinely predictive sell side shows a "
-               "POSITIVE IC here too (a more-negative score ranking a more-negative return). "
-               "The combined SELL-camp conviction (cmb_sell) row is the aggregate.",
-               res.get("ic_sell"), figures.NEG),
-        _block("● All calls — both directions combined",
-               "Every non-zero score regardless of sign — the classic per-method IC and the "
-               "combined_score headline, for reference.",
-               icdf, "#cbd5e1"),
+        _h3("Method explorer — signal IC, win rate and simulated return", _IC_TOOLTIP),
+        html.Div(
+            "Pick a method or a whole family. Nothing is computed until you do — "
+            "the panel join behind these numbers is the most expensive query on "
+            "the page.",
+            className="section-note"),
+        html.Div(
+            [
+                html.Label("Method", title="Choose one method, or a ◆ family to see all of "
+                                           "its members at once. Families are the 7 INFORMATION "
+                                           "families the combine votes by; the remaining groups "
+                                           "cover the timeframe variants, the fundamental factors "
+                                           "and the panel-first methods that sit outside the vote.",
+                           className="filter-label"),
+                dcc.Dropdown(id="ic-select", options=_ic_dropdown_options(), value=None,
+                             placeholder="Select a method or family…", clearable=True,
+                             persistence=True, persistence_type="session",
+                             style={"flex": 2, "minWidth": 340}),
+                dcc.Dropdown(id="ic-horizons",
+                             options=[{"label": disp, "value": sfx} for sfx, disp in _IC_BLOCKS],
+                             value=[sfx for sfx, _d in _IC_BLOCKS], multi=True,
+                             placeholder="Horizons…", persistence=True,
+                             persistence_type="session",
+                             style={"flex": 1, "minWidth": 220, "marginLeft": 8}),
+            ],
+            className="filter-item filter-item--grow",
+        ),
+        dcc.Loading(html.Div(id="ic-body")),
+    ])
+
+
+@app.callback(Output("ic-body", "children"),
+              Input("ic-select", "value"), Input("ic-horizons", "value"))
+def _ic_body(selection, sel_horizons):
+    """Render the picked method/family. Returns the placeholder WITHOUT reading
+    the panel when nothing is selected — that guard is what keeps opening the tab
+    cheap, so it must stay ahead of the data call."""
+    methods = _ic_resolve(selection)
+    if not methods:
+        return html.Div("↑ Pick a method or a family above to see its IC, win rate "
+                        "and simulated return.", className="empty-note")
+    return _safe(lambda: _ic_body_render(methods, sel_horizons))
+
+
+def _ic_body_render(methods: list, sel_horizons):
+    horizons = [(sfx, disp) for sfx, disp in _IC_BLOCKS
+                if not sel_horizons or sfx in sel_horizons] or list(_IC_BLOCKS)
+    res = data.signal_ic()
+    rows = _ic_rows(res, methods, horizons)
+    if not rows:
+        return html.Div(
+            f"No scored views yet for this selection. The signals panel holds "
+            f"{res.get('panel_rows', 0):,} row(s) across {res.get('tickers', 0):,} "
+            f"ticker(s), but this method has none that count — either it has not "
+            f"scored anything yet, or its scorer was recently changed and the "
+            f"superseded history is masked (see METHOD_SCORER_EPOCH). Both refill "
+            f"forward, run by run.",
+            className="empty-note")
+    return html.Div([
+        html.Div(f"{len(methods)} method(s) × up to 3 sides · panel: "
+                 f"{res.get('panel_rows', 0):,} rows / {res.get('tickers', 0):,} tickers",
+                 className="section-note"),
+        _ic_table(rows, horizons),
     ])
 
 
@@ -1158,23 +1448,23 @@ def _sim_column_filters(h_id: str = "sim-horizons", m_id: str = "sim-metrics") -
     get an independent pair (duplicate component ids would break Dash)."""
     return html.Div(
         [
-            html.Label("Simulated columns:  ",
+            html.Label("Columns",
                        title="Pick which horizons and which metrics (n / IC / Win % / Ret %) "
                              "appear in the category tables below. Applies to all "
                              "category tables at once; clearing a picker shows everything.",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 8}),
+                       className="filter-label"),
             dcc.Dropdown(id=h_id,
                          options=[{"label": h, "value": h} for h in _SIM_HORIZONS],
                          value=list(_SIM_HORIZONS), multi=True, placeholder="Horizons…",
                          persistence=True, persistence_type="session",
-                         style={"flex": 2, "minWidth": 320}),
+                         style={"flex": 2, "minWidth": 300}),
             dcc.Dropdown(id=m_id,
                          options=[{"label": _SIM_METRIC_LABELS[m], "value": m} for m in _SIM_METRIC_ORDER],
                          value=list(_SIM_METRIC_ORDER), multi=True, placeholder="Metrics…",
                          persistence=True, persistence_type="session",
-                         style={"flex": 1, "minWidth": 220, "marginLeft": 8}),
+                         style={"flex": 1, "minWidth": 210, "marginLeft": 8}),
         ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
+        className="filter-item filter-item--grow",
     )
 
 
@@ -1262,7 +1552,7 @@ def _simulated_perf_section(window_days, session=None, direction=None,
         if subset is None or subset.empty:
             continue
         children.append(html.Div(category, style={
-            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}))
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#475569"}))
         children.append(_sim_perf_table(subset, labels, sel_horizons, sel_metrics))
         if not has_cat:
             break
@@ -1320,7 +1610,7 @@ def _policy_eval_section():
             {"name": "Info ratio", "id": "ir", "type": "numeric", "format": _NUM2},
         ]
         children.append(html.Div(f"{h}-day horizon", style={
-            "fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#cbd5e1"}))
+            "fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#475569"}))
         children.append(dash_table.DataTable(
             data=rows, columns=cols,
             style_data_conditional=[
@@ -1328,7 +1618,7 @@ def _policy_eval_section():
                  "color": figures.POS, "fontWeight": "bold"},
                 {"if": {"filter_query": "{vs_flat} < 0", "column_id": "vs_flat"},
                  "color": figures.NEG, "fontWeight": "bold"},
-                {"if": {"filter_query": '{policy} contains "flat"'}, "backgroundColor": "#1f2937"},
+                {"if": {"filter_query": '{policy} contains "flat"'}, "backgroundColor": "#eff6ff"},
             ],
             **_TABLE_KW))
     if not any_data:
@@ -1394,7 +1684,7 @@ def _price_volume_section():
         f"Realized trade return — {tr.get('n_trades', 0)} trades "
         f"({tr.get('n_with_dvol', 0)} with a volume read). Small, selection-biased sample — "
         "watch the n on each bar.",
-        style={"fontWeight": "bold", "marginTop": 8, "marginBottom": 4, "color": "#cbd5e1"}))
+        style={"fontWeight": "bold", "marginTop": 8, "marginBottom": 4, "color": "#475569"}))
     children.append(_pv_row([
         figures.bucket_bar_fig(tr.get("by_price"), "Trade return by stock price", "Avg return %", pct=True),
         figures.bucket_bar_fig(tr.get("by_dvol"), "Trade return by dollar volume", "Avg return %", pct=True),
@@ -1404,7 +1694,7 @@ def _price_volume_section():
     children.append(html.Div(
         f"Signal conviction & realized move — combined_score and mean 5-day forward return over "
         f"{sc.get('n_rows', 0):,} unbiased signals-panel rows.",
-        style={"fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#cbd5e1"}))
+        style={"fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#475569"}))
     children.append(_pv_row([
         figures.bucket_bar_fig(sc.get("by_price"), "Score by stock price", "Avg combined_score"),
         figures.bucket_bar_fig(sc.get("by_dvol"), "Score by dollar volume", "Avg combined_score"),
@@ -1455,7 +1745,7 @@ def _predictability_section():
             ]
         children += [
             html.Div("Feature edge — best-minus-worst bucket separation", style={
-                "fontWeight": "bold", "marginTop": 8, "marginBottom": 4, "color": "#cbd5e1"}),
+                "fontWeight": "bold", "marginTop": 8, "marginBottom": 4, "color": "#475569"}),
             html.Div("Larger spread = the feature sorts predictable from unpredictable names. "
                      "'Best' should be High for trend efficiency / ADX, Mid for volatility.",
                      title=_PREDICT_EDGE_TOOLTIP,
@@ -1501,10 +1791,10 @@ def _predictability_section():
             {"if": {"filter_query": f"{{{hc}}} >= 50", "column_id": hc}, "color": figures.POS},
             {"if": {"filter_query": f"{{{hc}}} < 50", "column_id": hc}, "color": figures.NEG},
         ]
-    cond.append({"if": {"filter_query": '{bucket} = "—"'}, "backgroundColor": "#1f2937"})
+    cond.append({"if": {"filter_query": '{bucket} = "—"'}, "backgroundColor": "#eff6ff"})
     children += [
         html.Div("Bucket detail — combined_score prediction quality within each feature bucket",
-                 style={"fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+                 style={"fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#475569"}),
         dash_table.DataTable(data=brows, columns=bcols, style_data_conditional=cond, **_TABLE_KW),
     ]
     return html.Div(children)
@@ -1657,7 +1947,7 @@ def _mc_overfit_section():
             f"{sel['n_judgeable']} judgeable methods (5–95%: {sel['kept_null_lo']}–"
             f"{sel['kept_null_hi']}); the live filter kept {sel['kept_actual']} "
             f"(p ≥ actual = {sel['p_ge_actual']}). → {sel.get('verdict', '')}",
-            style={"color": "#cbd5e1", "marginBottom": 8})
+            style={"color": "#475569", "marginBottom": 8})
     elif sel.get("verdict"):
         sel_line = html.Div(sel["verdict"], style={"color": "#6b7280", "marginBottom": 8})
 
@@ -1743,7 +2033,7 @@ def _conf_component_ic_table(icdf: pd.DataFrame) -> dash_table.DataTable:
             {"name": f"ICIR@{disp}", "id": f"icir_{sfx}", "type": "numeric", "format": _NUM2},
         ]
     cond = [{"if": {"filter_query": '{Variant} = "Live (all combined)"'},
-            "backgroundColor": "#1f2937"}]
+            "backgroundColor": "#eff6ff"}]
     for h in _DEFAULT_CONF_HORIZONS:
         sfx = "pv" if h == "pv" else f"{h}d"
         cond += [
@@ -1765,7 +2055,7 @@ def _conf_component_band_table(banddf: pd.DataFrame) -> dash_table.DataTable:
             {"name": f"Win@{disp} %", "id": f"win_{sfx}", "type": "numeric", "format": _NUM1},
             {"name": f"Ret@{disp} %", "id": f"ret_{sfx}", "type": "numeric", "format": _NUM2},
         ]
-    cond = [{"if": {"filter_query": '{Band} = "High (0.65+)"'}, "backgroundColor": "#1f2937"}]
+    cond = [{"if": {"filter_query": '{Band} = "High (0.65+)"'}, "backgroundColor": "#eff6ff"}]
     return dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW)
 
 
@@ -1786,11 +2076,11 @@ def _confidence_components_section():
     return html.Div([
         heading,
         html.Div(f"{rep['panel_rows']} scored ticker-tick(s) with factor data",
-                 style={"color": "#cbd5e1", "marginBottom": 8}),
+                 style={"color": "#475569", "marginBottom": 8}),
         _conf_component_ic_table(icdf),
         html.Div("By conviction band (does win rate / return rise with THIS variant's own "
                  "conviction level?):",
-                 style={"marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+                 style={"marginTop": 14, "marginBottom": 4, "color": "#475569"}),
         _conf_component_band_table(banddf),
     ])
 
@@ -1812,10 +2102,10 @@ def _exit_confidence_components_block(session=None, direction=None):
     return html.Div([
         note,
         html.Div(f"{rep['panel_rows']} held-position re-read(s) with factor data",
-                 style={"color": "#cbd5e1", "marginBottom": 8}),
+                 style={"color": "#475569", "marginBottom": 8}),
         _conf_component_ic_table(icdf),
         html.Div("By conviction band:",
-                 style={"marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+                 style={"marginTop": 14, "marginBottom": 4, "color": "#475569"}),
         _conf_component_band_table(banddf),
     ])
 
@@ -1834,12 +2124,14 @@ def _methods_tab():
     ) if model_rows else html.Div("No runs recorded yet.", style={"color": "#6b7280"})
 
     return html.Div([
-        _window_toggle("methods-window"),
-        _session_toggle("methods-session"),
-        _direction_toggle("methods-direction"),
-        _asset_toggle("methods-asset"),
-        _method_source_toggle("methods-source"),
-        _sim_column_filters(),
+        html.Div([
+            _window_toggle("methods-window"),
+            _session_toggle("methods-session"),
+            _direction_toggle("methods-direction"),
+            _asset_toggle("methods-asset"),
+            _method_source_toggle("methods-source"),
+            _sim_column_filters(),
+        ], className="filter-bar"),
         dcc.Loading(html.Div(id="methods-body")),
         _safe(_method_decile_section),
         _safe(_ic_section),
@@ -2400,21 +2692,11 @@ def _exit_source_toggle(component_id: str) -> html.Div:
     actually held (real book; the only place horizon / llm_review exist). Simulated =
     every scored ticker as a hypothetical position held in its aggregate direction —
     the position-independent methods over the whole universe (large, unbiased)."""
-    return html.Div(
-        [
-            html.Label("Source:  ",
-                       title="Held positions (ledger): each exit method's ACTIVATIONS against the positions we ACTUALLY held — the tick it first said 'get out' (conviction crossed negative), attributed to that tick's session. The real book (small, selection-biased), and the ONLY view with horizon + the synthesized llm_review. "
-                             "All scored tickers (simulated): the same activation events over EVERY scored ticker treated as a hypothetical position held in its aggregate direction (aggregator + the signal-methods-as-exits) — the large, unbiased sample backfilled from the signals panel. horizon / llm_review are held-only and don't appear here.",
-                       style={"cursor": "help", "borderBottom": "1px dotted #cbd5e1", "marginRight": 4}),
-            dcc.RadioItems(
-                id=component_id, options=_EXIT_SOURCE_OPTIONS, value="held", inline=True,
-                persistence=True, persistence_type="session",
-                inputStyle={"marginLeft": 14, "marginRight": 4},
-                labelStyle={"cursor": "pointer"},
-            ),
-        ],
-        style={"display": "flex", "alignItems": "center", "marginBottom": 12},
-    )
+    return _filter_row(
+        "Source",
+        "Held positions (ledger): each exit method's ACTIVATIONS against the positions we ACTUALLY held — the tick it first said 'get out' (conviction crossed negative), attributed to that tick's session. The real book (small, selection-biased), and the ONLY view with horizon + the synthesized llm_review. "
+        "All scored tickers (simulated): the same activation events over EVERY scored ticker treated as a hypothetical position held in its aggregate direction (aggregator + the signal-methods-as-exits) — the large, unbiased sample backfilled from the signals panel. horizon / llm_review are held-only and don't appear here.",
+        component_id, _EXIT_SOURCE_OPTIONS, "held")
 
 
 def _exit_perf_section(window_days, source="held", sel_horizons=None, sel_metrics=None,
@@ -2466,7 +2748,7 @@ def _exit_perf_section(window_days, source="held", sel_horizons=None, sel_metric
         if subset is None or subset.empty:
             continue
         children.append(html.Div(category, style={
-            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}))
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#475569"}))
         children.append(_sim_perf_table(subset, labels, sel_horizons, sel_metrics))
         if not has_cat:
             break
@@ -2543,10 +2825,10 @@ def _exit_forward_block(session=None, direction=None):
                if rep.get("n_pending") else "")
     return html.Div([
         html.Div(f"{rep['verdict']}  ({rep['n']} closed trade(s) with forward bars{pending})",
-                 style={"color": "#cbd5e1", "marginBottom": 8}),
+                 style={"color": "#475569", "marginBottom": 8}),
         dash_table.DataTable(data=reason_rows, columns=reason_cols, **_TABLE_KW),
         html.Div("Per-trade detail (most recent exits first)", style={
-            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#cbd5e1"}),
+            "fontWeight": "bold", "marginTop": 14, "marginBottom": 4, "color": "#475569"}),
         dash_table.DataTable(data=trade_rows, columns=trade_cols, **_TABLE_KW),
     ])
 
@@ -2606,13 +2888,13 @@ def _exit_mc_block(session=None, direction=None):
          "color": figures.POS},
         {"if": {"filter_query": '{verdict} contains "BEATEN"', "column_id": "verdict"},
          "color": figures.NEG},
-        {"if": {"filter_query": '{reason} = "ALL exits"'}, "backgroundColor": "#1f2937"},
+        {"if": {"filter_query": '{reason} = "ALL exits"'}, "backgroundColor": "#eff6ff"},
     ]
     skipped = (f" · {rep['n_skipped']} trade(s) skipped (no cached window)"
                if rep.get("n_skipped") else "")
     return html.Div([
         html.Div(f"{rep['n']} closed trade(s) in the MC{skipped}",
-                 style={"color": "#cbd5e1", "marginBottom": 8}),
+                 style={"color": "#475569", "marginBottom": 8}),
         dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond,
                              **_TABLE_KW),
     ])
@@ -2620,11 +2902,13 @@ def _exit_mc_block(session=None, direction=None):
 
 def _exit_perf_tab():
     return html.Div([
-        _window_toggle("exit-window"),
-        _session_toggle("exit-session", title=_EXIT_SESSION_TITLE),
-        _direction_toggle("exit-direction"),
-        _exit_source_toggle("exit-source"),
-        _sim_column_filters("exit-horizons", "exit-metrics"),
+        html.Div([
+            _window_toggle("exit-window"),
+            _session_toggle("exit-session", title=_EXIT_SESSION_TITLE),
+            _direction_toggle("exit-direction"),
+            _exit_source_toggle("exit-source"),
+            _sim_column_filters("exit-horizons", "exit-metrics"),
+        ], className="filter-bar"),
         dcc.Loading(html.Div(id="exit-body")),
     ])
 
@@ -2775,7 +3059,7 @@ def _exit_policy_eval_section():
             {"name": "Info ratio", "id": "ir", "type": "numeric", "format": _NUM2},
         ]
         children.append(html.Div(f"{h}-day horizon", style={
-            "fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#cbd5e1"}))
+            "fontWeight": "bold", "marginTop": 12, "marginBottom": 4, "color": "#475569"}))
         children.append(dash_table.DataTable(
             data=rows, columns=cols,
             style_data_conditional=[
@@ -2787,7 +3071,7 @@ def _exit_policy_eval_section():
                 {"if": {"filter_query": "{fwd_on_close} < 0", "column_id": "fwd_on_close"},
                  "color": figures.POS},
                 {"if": {"filter_query": '{policy} contains "always hold"'},
-                 "backgroundColor": "#1f2937"},
+                 "backgroundColor": "#eff6ff"},
             ],
             **_TABLE_KW))
     if not any_data:
@@ -2920,11 +3204,13 @@ def _trades_table(trades: list, table_id: str | None = None):
 
 def _returns_tab():
     return html.Div([
-        _source_toggle("returns-source"),
-        _window_toggle("returns-window"),
-        _session_toggle("returns-session"),
-        _direction_toggle("returns-direction"),
-        _asset_toggle("returns-asset"),
+        html.Div([
+            _source_toggle("returns-source"),
+            _window_toggle("returns-window"),
+            _session_toggle("returns-session"),
+            _direction_toggle("returns-direction"),
+            _asset_toggle("returns-asset"),
+        ], className="filter-bar"),
         dcc.Loading(html.Div(id="returns-body")),
     ])
 
@@ -3503,6 +3789,49 @@ def _method_coverage_section():
         dcc.Graph(figure=figures.method_coverage_fig(cov)),
         dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW),
     ])
+
+
+# ── Lazy tab hydration ───────────────────────────────────────────────────────
+# (value, tab label, renderer). serve_layout builds one EMPTY container per tab
+# from this spec; the callbacks below fill each container the FIRST time its tab
+# becomes active and never again (sticky — a revisit is instant). Defined after
+# the renderers so the spec can reference them directly.
+_TAB_SPEC = (
+    ("rationale", "Recommendations & Rationale", _rationale_tab),
+    ("methods", "Entry Performance", _methods_tab),
+    ("exit_perf", "Exit Performance", _exit_perf_tab),
+    ("returns", "Returns", _returns_tab),
+    ("execution", "Execution", _execution_tab),
+    ("data_quality", "Data Quality", _data_quality_tab),
+)
+
+
+def _fill_tab(active, existing, value, render):
+    """The per-tab hydration rule (module-level so tests can pin it): render
+    only when this tab is the active one AND its container is still empty;
+    anything else is a no-op, which is what makes revisits instant and keeps
+    nested component state alive across tab switches."""
+    if active != value or existing:
+        raise PreventUpdate
+    return html.Div(_safe(render), className="tab-inner")
+
+
+def _register_tab_callbacks() -> None:
+    """One callback per tab: fill `tab-<value>` when that tab first becomes
+    active. On page load Dash fires all six with the current tab value — five
+    raise PreventUpdate immediately, one renders. Clicking a new tab renders it
+    once; after that its `children` State is non-empty and it is left alone, so
+    nested components (toggles, tables) keep their state across tab switches
+    exactly as when everything was embedded up front."""
+    for value, _label, render in _TAB_SPEC:
+        @app.callback(Output(f"tab-{value}", "children"),
+                      Input("tabs", "value"),
+                      State(f"tab-{value}", "children"))
+        def _fill(active, existing, _value=value, _render=render):
+            return _fill_tab(active, existing, _value, _render)
+
+
+_register_tab_callbacks()
 
 
 def _serve_once(host: str, port: int) -> None:

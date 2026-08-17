@@ -1,4 +1,31 @@
 <#
+  DECOMMISSIONED 2026-08-16 -- superseded by Tailscale Funnel. DO NOT RUN.
+
+  The dashboard now has exactly ONE public access point:
+
+      https://victushp.tail8e1bf1.ts.net
+
+  set up with `tailscale funnel --bg --https=443 http://127.0.0.1:8050`. Funnel
+  gives a real Let's Encrypt certificate, needs no second agent process, and has
+  none of the free-tier ngrok friction (the one-time browser interstitial and the
+  enforced minimum agent version whose ERR_NGROK_121 reads like an auth error).
+
+  This script is kept as the record of HOW the gate was verified rather than
+  trusted -- the two-probe pattern below is still the right shape for any future
+  exposure -- but running it would re-open a SECOND way in, which is exactly what
+  "one point of access" was meant to end. The guard immediately below stops that.
+
+  Note the environment it was written for no longer exists: DASHBOARD_HOST is now
+  127.0.0.1 (so nothing but a local proxy can reach the app at all) and the
+  localhost/tailnet bypasses are EMPTY (so the password gates every request,
+  including this PC's). The "LOCALHOST IS EXEMPT" paragraph below is therefore
+  historical.
+
+  To genuinely retire ngrok, delete NGROK_TOKEN and NGROK_DOMAIN from .env and
+  revoke the token in the ngrok dashboard.
+
+  ---- original documentation follows ----
+
   Publish the monitoring dashboard on a PUBLIC HTTPS URL via an ngrok tunnel.
 
     powershell -ExecutionPolicy Bypass -File "<repo>\scripts\run_public_dashboard.ps1"
@@ -62,6 +89,31 @@ param(
     [switch]$Force
 )
 $ErrorActionPreference = "Stop"
+
+# ---- DECOMMISSIONED GUARD (2026-08-16) ----------------------------------
+# A second public entrance is worse than no second entrance: it would be the
+# one nobody remembers to check when the password is rotated or the gate is
+# changed. Refuse loudly rather than quietly publishing a rival URL.
+#
+# Note this ALSO cannot work as written any more: the dashboard binds
+# 127.0.0.1 and every bypass is empty, so the script's own pre-flight probes
+# (which expect a localhost request to succeed WITHOUT the password) would
+# fail. Better to say why than to let it die confusingly.
+Write-Host ""
+Write-Host "  This script is DECOMMISSIONED." -ForegroundColor Yellow
+Write-Host "  The dashboard's single public access point is Tailscale Funnel:"
+Write-Host "      https://victushp.tail8e1bf1.ts.net" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Check it with:   tailscale funnel status"
+Write-Host "  Re-arm it with:  tailscale funnel --bg --https=443 http://127.0.0.1:8050"
+Write-Host "  Turn it off:     tailscale funnel --https=443 off"
+Write-Host ""
+Write-Host "  Opening an ngrok tunnel now would create a SECOND way in. If you"
+Write-Host "  truly intend that, read the header of this file first and remove"
+Write-Host "  this guard deliberately."
+Write-Host ""
+exit 1
+# -------------------------------------------------------------------------
 
 $root = Split-Path -Parent $PSScriptRoot          # scripts\ -> repo root
 

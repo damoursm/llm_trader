@@ -60,13 +60,35 @@ _REC_COLS = (
 )
 
 
+# The columns the run list actually consumes (dropdown + models-used table).
+# ``SELECT *`` here dragged the gate_diag JSON blob of every run (1,200+) into
+# every page build; the full row is still available per run via run_row().
+_RUN_LIST_COLS = ("run_id, started_at, market_mode, macro_regime, "
+                  "llm_synthesis_provider, llm_sentiment_provider")
+
+
 def runs_df() -> pd.DataFrame:
-    return _retry(lambda: repo.fetch_df("SELECT * FROM runs ORDER BY started_at DESC"), "runs")
+    return _retry(lambda: repo.fetch_df(
+        f"SELECT {_RUN_LIST_COLS} FROM runs ORDER BY started_at DESC"), "runs")
 
 
 def latest_run_id() -> Optional[str]:
-    df = runs_df()
+    df = _retry(lambda: repo.fetch_df(
+        "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"), "latest_run")
     return None if df.empty else str(df.iloc[0]["run_id"])
+
+
+def latest_run_info() -> Optional[dict]:
+    """One cheap row for the header chip: when the last pipeline run happened and
+    under which regime/mode. None when there are no runs (or on a read error —
+    the header must never take the page down)."""
+    try:
+        df = _retry(lambda: repo.fetch_df(
+            f"SELECT {_RUN_LIST_COLS} FROM runs ORDER BY started_at DESC LIMIT 1"),
+            "latest_run_info")
+    except Exception:
+        return None
+    return None if df.empty else df.iloc[0].to_dict()
 
 
 def run_row(run_id: str):
@@ -146,14 +168,41 @@ def _cached(key, producer, force: bool = False):
 
     The ``_WARM_STALE_GRACE`` cap keeps a permanently broken warmer from serving
     ancient numbers forever — past it, correctness wins and we pay the recompute.
+
+    **A KNOWN data version makes the entry fresh, full stop** (2026-08-15,
+    corrected 2026-08-16). The version (latest ``run_id``) is the real freshness
+    signal: same version ⇒ same database ⇒ the cached value is not merely
+    tolerable, it is exactly what a recompute would produce. So a version match
+    refreshes the entry's timestamp and serves it — there is nothing to redo.
+
+    The first attempt at this let the TTL lapse and asked the warmer to re-sweep
+    instead. That inverted the quiet-day case it was written for: over a weekend
+    the version never changes, so every ~30 min of TTL plus one page visit
+    launched another ~530 s child sweep that recomputed byte-identical numbers
+    (observed 5×, one run_id, ~965 CPU-seconds). Recomputing known-identical
+    data is waste whichever process pays for it.
+
+    The TTL therefore only bites when the version is UNKNOWN (``None`` — the
+    run_id query failed), which is the case it was always meant to cover: no
+    freshness signal, so fall back to time.
+
+    Order matters: the version check comes FIRST, and a version MISMATCH must
+    never fall through to the TTL — a new run has to invalidate immediately, or
+    fresh numbers would sit behind a 30-minute timer.
     """
     now = time.time()
     ver = _data_version()
     entry = _perf_cache.get(key)
     if not force and entry is not None:
-        if entry.get("ver") == ver and (now - entry["ts"]) < _PERF_TTL:
+        if ver is not None and entry.get("ver") == ver:
+            entry["ts"] = now        # same DB ⇒ a recompute changes nothing
             return entry["data"]
-        if _warm_state.get("in_flight") and (now - entry["ts"]) < _WARM_STALE_GRACE:
+        age = now - entry["ts"]
+        # A new run landed (or the version is unreadable): serve the previous
+        # snapshot only while the warmer is actually rebuilding it.
+        if _warm_state.get("in_flight") and age < _WARM_STALE_GRACE:
+            return entry["data"]
+        if ver is None and age < _PERF_TTL:
             return entry["data"]
     data = producer()
     _perf_cache[key] = {"ts": now, "data": data, "ver": ver}
@@ -415,10 +464,12 @@ def exit_reason_breakdown(session: Optional[str] = None,
     """Per-exit-reason realized performance over CLOSED trades (trades / win_rate /
     avg / median / compound / best / worst) — the realized outcome of each exit
     RULE. ``session`` filters by the session the trade EXITED in (the rule's
-    firing moment); ``direction`` by the position's side. Cheap; not windowed."""
+    firing moment); ``direction`` by the position's side. Cached; not windowed."""
     from src.performance.tracker import compute_exit_reason_perf
-    return _retry(lambda: compute_exit_reason_perf(session=session, direction=direction),
-                  "exit_reason_breakdown")
+    return _cached(("exit_reason_breakdown", session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_exit_reason_perf(session=session,
+                                                                   direction=direction),
+                                  "exit_reason_breakdown"))
 
 
 def exit_forward(session: Optional[str] = None,
@@ -426,10 +477,15 @@ def exit_forward(session: Optional[str] = None,
     """Post-exit forward-return report over CLOSED trades — what each exited
     position would have earned held 1/3/5/10 more sessions, per trade and per
     exit rule (analysis/exit_forward.py). Same session (exit session) /
-    direction filter semantics as ``exit_reason_breakdown``; not windowed."""
+    direction filter semantics as ``exit_reason_breakdown``; not windowed.
+    Cached (walks the OHLCV cache per closed trade — this was the single
+    heaviest uncached call on the page: warming it did nothing while every
+    page load re-paid the OHLCV parse on the request thread)."""
     from src.analysis.exit_forward import compute_exit_forward_report
-    return _retry(lambda: compute_exit_forward_report(session=session, direction=direction),
-                  "exit_forward")
+    return _cached(("exit_forward", session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_exit_forward_report(session=session,
+                                                                      direction=direction),
+                                  "exit_forward"))
 
 
 def monte_carlo_methods() -> dict:
@@ -485,37 +541,49 @@ def confidence_calibration(window_days: Optional[int] = None, session: Optional[
                            direction: Optional[str] = None) -> dict:
     """Confidence-calibration report (buckets + slope) over the windowed/session/
     direction perf bundle's closed + open trades — so it tracks the tab's toggles
-    and reuses the cached perf computation."""
-    perf = performance(window_days=window_days, session=session, direction=direction)
+    and reuses the cached perf computation. Cached so the warmer covers it."""
     from src.analysis.confidence_calibration import compute_calibration
-    trades = (perf.get("closed_trades") or []) + (perf.get("open_trades") or [])
-    return compute_calibration(trades)
+
+    def _q():
+        perf = performance(window_days=window_days, session=session, direction=direction)
+        trades = (perf.get("closed_trades") or []) + (perf.get("open_trades") or [])
+        return compute_calibration(trades)
+    return _cached(("confidence_calibration", window_days or "all", session or "all",
+                    direction or "all"), lambda: _retry(_q, "confidence_calibration"))
 
 
 def exit_quality(window_days: Optional[int] = None, session: Optional[str] = None,
                  direction: Optional[str] = None) -> dict:
     """MFE/MAE exit-quality report over the windowed/session/direction closed trades
-    (the sim ledger carries the excursion fields)."""
-    perf = performance(window_days=window_days, session=session, direction=direction)
+    (the sim ledger carries the excursion fields). Cached so the warmer covers it."""
     from src.analysis.exit_quality import compute_exit_quality
-    return compute_exit_quality(perf.get("closed_trades") or [])
+
+    def _q():
+        perf = performance(window_days=window_days, session=session, direction=direction)
+        return compute_exit_quality(perf.get("closed_trades") or [])
+    return _cached(("exit_quality", window_days or "all", session or "all",
+                    direction or "all"), lambda: _retry(_q, "exit_quality"))
 
 
 def broker_forensics() -> dict:
     """Slippage / fill-rate / drift / reject forensics over the broker tables
-    (all runs — not windowed)."""
+    (all runs — not windowed). Cached so the warmer covers it."""
     from src.analysis.broker_forensics import (
         compute_forensics, load_broker_orders, load_broker_reconciles)
-    return _retry(lambda: compute_forensics(load_broker_orders(), load_broker_reconciles()),
-                  "broker_forensics")
+    return _cached("broker_forensics",
+                   lambda: _retry(lambda: compute_forensics(load_broker_orders(),
+                                                            load_broker_reconciles()),
+                                  "broker_forensics"))
 
 
 def tracking_error() -> dict:
     """Sim-vs-broker tracking-error report over every trade with a matching
-    broker fill."""
+    broker fill. Cached (walks OHLCV per matched trade) so the warmer covers it."""
     from src.analysis.tracking_error import compute_tracking_error
-    trades = _retry(lambda: repo.load_trades(), "tracking_error")
-    return compute_tracking_error(trades)
+
+    def _q():
+        return compute_tracking_error(repo.load_trades())
+    return _cached("tracking_error", lambda: _retry(_q, "tracking_error"))
 
 
 def source_reliability(days: int = 14) -> list:
@@ -741,6 +809,7 @@ def _warm_targets():
              "confidence_calibration", "monte_carlo_methods", "monte_carlo_exits",
              "policy_comparison", "exit_policy_comparison", "horizon_edge_curve",
              "exit_quality", "broker_forensics", "tracking_error",
+             "exit_reason_breakdown",
              "source_reliability", "method_coverage", "broker_trades",
              # 2026-07-25: both share the memoised panel, so they are cheap —
              # but an unwarmed accessor still costs the FIRST visitor after
@@ -862,7 +931,16 @@ def _save_snapshot(src_path: str) -> None:
 
 
 def _load_snapshot() -> None:
-    """Populate the cache from the last persisted sweep, if any (best-effort)."""
+    """Populate the cache from the last persisted sweep, if any (best-effort).
+
+    A snapshot written for the CURRENT run also adopts its version as the
+    warmer's starting point, so a restart does not immediately re-sweep data it
+    just restored. Without that, ``_warm_state["ver"]`` began at None and every
+    restart paid a full ~530 s child sweep to recompute the snapshot it had
+    loaded seconds earlier — invisible except as fan noise (observed
+    2026-08-15: restore at 15:06, redundant sweep finished 15:12). A snapshot
+    from an OLDER run is left alone: there the sweep is real work.
+    """
     import os
     import pickle
     path = os.path.join(_repo_root(), _WARM_SNAPSHOT)
@@ -873,9 +951,16 @@ def _load_snapshot() -> None:
             blob = pickle.load(fh)
         merged = _merge_snapshot(blob, "snapshot")
         age = (time.time() - os.path.getmtime(path)) / 60.0
+        current = _data_version()
+        fresh = merged > 0 and current is not None and blob.get("ver") == current
+        if fresh:
+            _warm_state["ver"] = current
         logger.info(f"[dashboard] restored {merged} cache entries from the last warm "
-                    f"snapshot ({age:.0f} min old) — first page load is fast, and the "
-                    f"numbers refresh as soon as the background warm finishes")
+                    f"snapshot ({age:.0f} min old) — "
+                    + ("already current (run {}), so no re-sweep is needed".format(current)
+                       if fresh else
+                       "first page load is fast, and the numbers refresh as soon as "
+                       "the background warm finishes"))
     except Exception as e:
         logger.debug(f"[dashboard] warm snapshot unreadable: {e}")
 
