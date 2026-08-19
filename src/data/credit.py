@@ -127,6 +127,7 @@ def fetch_credit_context() -> Optional[CreditContext]:
             interval="1d",
             progress=False,
             auto_adjust=True,
+            timeout=30,
         )
     except Exception as e:
         logger.warning(f"[credit] yfinance download failed: {e}")

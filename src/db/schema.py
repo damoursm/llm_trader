@@ -48,6 +48,12 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     # sign(news) × abnormal attention vs the ticker's own trailing baseline
     # (the SIGNAL_NEWS_ATTENTION_COLUMNS below are its forward-collected input).
     "news_shock",
+    # news_bear_fresh (2026-08-15, panel-first at weight 0 —
+    # signals/news_bear_fresh.py): bearish news × un-priced-tape guard.
+    "news_bear_fresh",
+    # catalyst_tilt (2026-08-15, panel-first at weight 0 —
+    # signals/catalyst_tilt.py): news × learned per-(catalyst, side) orientation.
+    "catalyst_tilt",
     "tech", "massive", "insider", "put_call", "max_pain",
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum",
     "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
@@ -111,6 +117,15 @@ SIGNAL_TIMEFRAME_COLUMNS = tuple(
 # the ticker's own trailing daily median of this column — and a general
 # attention covariate for panel analyses. NOT method scores (no direction).
 SIGNAL_NEWS_ATTENTION_COLUMNS = ("news_article_count", "news_recency_mass")
+
+# News-event dataset columns (2026-08-15): the sentiment LLM's dominant catalyst
+# class (sentiment.NEWS_CATALYST_TYPES) + its RAW verdict before the evidence/
+# diversity scalers — typed (name, sql_type) pairs because catalyst is VARCHAR.
+# Joined against `fwd_ret_pivot` by `python -m src.analysis.news_events` to
+# learn "what kind of news → what kind of move". Historical rows predate the
+# capture (NULL); the backfill table below covers them.
+SIGNAL_NEWS_EVENT_COLUMNS = (("news_catalyst", "VARCHAR"),
+                             ("news_raw_score", "DOUBLE"))
 
 SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squeeze",
                               "f_split", "f_dividend")
@@ -355,8 +370,27 @@ SCHEMA_STATEMENTS = [
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_COMBINED_SIDE_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_NEWS_ATTENTION_COLUMNS)},
+        {", ".join(f"{c} {t}" for c, t in SIGNAL_NEWS_EVENT_COLUMNS)},
         combine_source      VARCHAR,
         scores              VARCHAR
+    );
+    """,
+    # Historical catalyst classifications for panel rows that predate the live
+    # `news_catalyst` capture — written by `python -m src.analysis.news_backfill`
+    # from re-fetched Polygon headlines. Keyed (ticker, signal_date); catalyst
+    # NULL = attempted but no headline coverage for that day (so re-runs skip
+    # it). The analysis layer COALESCEs live column first, this table second —
+    # provenance stays separate: `signals` records what the run saw, this table
+    # records a LATER classification of externally re-fetched headlines.
+    """
+    CREATE TABLE IF NOT EXISTS news_event_backfill (
+        ticker              VARCHAR,
+        signal_date         VARCHAR,
+        catalyst            VARCHAR,
+        headline_count      INTEGER,
+        top_headline        VARCHAR,
+        classifier_version  VARCHAR,
+        classified_at       VARCHAR
     );
     """,
     """
@@ -600,6 +634,12 @@ _ADD_COLUMNS = (
     # news_shock method column + its attention-input columns (2026-08-14).
     ("signals", "news_shock", "DOUBLE"),
     *(("signals", col, "DOUBLE") for col in SIGNAL_NEWS_ATTENTION_COLUMNS),
+    # News-event dataset columns (2026-08-15): catalyst class + raw LLM verdict.
+    *(("signals", col, coltype) for col, coltype in SIGNAL_NEWS_EVENT_COLUMNS),
+    # news_bear_fresh method column (2026-08-15, panel-first).
+    ("signals", "news_bear_fresh", "DOUBLE"),
+    # catalyst_tilt method column (2026-08-15, panel-first).
+    ("signals", "catalyst_tilt", "DOUBLE"),
 )
 
 

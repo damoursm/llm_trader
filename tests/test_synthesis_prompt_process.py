@@ -142,7 +142,10 @@ def test_prompt_version_exists_and_is_stamped_into_the_run_meta():
     import inspect
     from src import pipeline
 
-    assert ca.SYNTHESIS_PROMPT_VERSION == "2026-08-14-rank-process"
+    # Pinned as a LITERAL on purpose: the failure this produces on any prompt
+    # edit is the point — it forces a conscious version bump, without which the
+    # eval surfaces silently pool two prompt eras. Update it WITH the edit.
+    assert ca.SYNTHESIS_PROMPT_VERSION == "2026-08-19-confidence-placement"
     src = inspect.getsource(pipeline)
     assert '"synthesis_prompt_version"' in src
     assert "SYNTHESIS_PROMPT_VERSION" in src

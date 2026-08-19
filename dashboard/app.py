@@ -579,10 +579,10 @@ _REC_COL_SPEC = [
     ("shadow_target_horizon", "Shadow horizon", None, "SHADOW (not yet live): horizon from the direction-aware, MARKET-NEUTRAL edge curve — each method weighted by its per-side (bull/bear) skill on returns net of SPY. Compare against 'Edge horizon' to see where direction-conditioning + drift-removal change the call."),
     ("shadow_direction", "Shadow dir", None, "SHADOW: the direction the market-neutral curve favours. When it DISAGREES with 'Direction', a method that is anti-predictive on this side has been flipped — the disagreement is the thing to watch before promoting the shadow curve."),
     ("shadow_horizon_net_edge_pct", "Shadow net %", _NUM2, "SHADOW: market-relative (alpha over SPY) net edge at the shadow horizon, after the cost hurdle. Smaller than 'Net edge %' by construction (market drift removed) — that gap is how much of the live edge was just beta/drift."),
-    ("actionable", "Actionable", None, "TRUE = passed the confidence + sources-agreeing gate and was paper-traded. FALSE = monitor only."),
+    ("actionable", "Actionable", None, "TRUE = cleared ALL SIX gates and was paper-traded: Gate 1 regime confidence threshold, Gate 1b ≥2 agreeing sources, Gate 2 PANIC BUY-block, Gate 3 earnings blackout, Gate 4 liquidity floor ($5 / $5M — below it a name is still fully scored, just never traded), Gate 5 overextension anti-chase (BUY-only). FALSE = monitor only; the Entry Performance tab's decision funnel shows which gate dropped it, attributed to the FIRST one that rejected it."),
     ("dominant_method", "Top Method", None, "The signal method that contributed most to this call (e.g. news, technical, momentum)."),
     ("type", "Type", None, "Asset class — STOCK, ETF or COMMODITY."),
-    ("llm_provider", "LLM", None, "Which model synthesised the recommendation (e.g. Claude Haiku, DeepSeek)."),
+    ("llm_provider", "LLM", None, "Which engine synthesised the recommendation. Routing is now 100% deepseek-v4-flash (the A/B pool is a one-model list), so this is constant on current runs and varies only across older history. 'rule-based' means no LLM answered at all and the mechanical fallback wrote the call — the chain is DeepSeek → Qwen → (Anthropic, currently unfunded/dead) → rule-based."),
     ("generated_at", "Generated (ET)", None, "When the recommendation was produced, in US/Eastern time."),
     ("rationale", "Rationale", None, "The model's plain-English reasoning for the call."),
 ]
@@ -598,12 +598,12 @@ _TRADE_COL_SPEC = [
     ("exit_dt", "Exit (ET)", None, "When the position was closed, in US/Eastern time. Blank while still open."),
     ("exit_price", "Exit $", _NUM2, "Fill price at exit. Blank while the position is open."),
     ("held", "Held", None, "Wall-clock holding time: days + hours (e.g. 2d 5h), hours (6h), or minutes (45m) for the freshest entries. Open positions measure entry → now; closed ones entry → exit. Legacy date-only rows fall back to the trading-days count (Nd)."),
-    ("target_horizon", "Target horizon", None, "Horizon synthesis: the cost-aware holding horizon the position was opened for (e.g. 6h, 1w), capped to the LLM's call. Drives the matched exit time-stop — once held past this window the position must stay strongly confirmed to keep running. Blank for trades opened before horizon synthesis."),
+    ("target_horizon", "Target horizon", None, "Horizon synthesis: the cost-aware holding horizon the position was opened for (currently 1m on nearly every call — the selected horizon has drifted 1w → 2w → 1m since late July, and the intraday picks 3h/6h stopped being chosen around then), capped to the LLM's call. Drives the matched exit time-stop — once held past this window the position must stay strongly confirmed to keep running. Blank for trades opened before horizon synthesis."),
     ("return_pct", "Return %", _NUM2, "Spread-adjusted % return. For OPEN positions this is the live mark-to-market — 'what if you closed right now'."),
     ("position_size_multiplier", "Size ×", _NUM2, "Capital weight after the whole sizing chain. Confidence contributes a CONTINUOUS ramp capped at 1.5×, not the old 1.0/1.5/2.0 tiers: the legacy ramp's span above 1.0× is compressed by confidence_size_span (0.5) because entry confidence measured nearly uninformative about outcomes, so paying a full 2.0× for it was sizing on noise. Agreement BREADTH is the evidence-backed conviction signal that replaced the surrendered span. Then: expected-edge blend × predictability tilt → regime haircut → correlation haircut → extended/overnight multiplier."),
     ("filled_notional_usd", "Notional $", _NUM2, "Actual dollars at risk: filled shares × average fill price (real-executions view only)."),
     ("status", "Status", None, "OPEN (held, live mark) or CLOSED (realised)."),
-    ("exit_reason", "Exit reason", None, "Why the position closed. LIVE rules: llm_signal_flipped (the opener now calls the opposite direction), horizon_expired (held past its target-horizon window without strong re-confirmation — the matched exit), trailing_stop, adverse_stop, macro_regime_exit, ml_exit (ml_arm trades only), method_horizon, edge_decay, intraday_reversal, and the signal-decay backstop for legacy/rule-opened trades. RETIRED rules still present in history: llm_confidence_loss (OFF — the only exit rule the post-exit forward returns condemned: +1.50/+2.24% left behind at 1d/5d, 62% of those exits kept running) and mechanical_exit (OFF since 2026-08-02 — anti-predictive consensus, and it could not fire at its threshold anyway). Blank while open."),
+    ("exit_reason", "Exit reason", None, "Why the position closed. LIVE rules: llm_signal_flipped (the opener now calls the opposite direction), horizon_expired (held past its target-horizon window without strong re-confirmation — the matched exit), trailing_stop, adverse_stop, macro_regime_exit, ml_exit (ml_arm trades only), method_horizon, edge_decay, intraday_reversal, and the signal-decay backstop for legacy/rule-opened trades. RETIRED rules still present in history: llm_confidence_loss (OFF — the only exit rule the post-exit forward returns condemned: +1.50/+2.24% left behind at 1d/5d, 62% of those exits kept running), its older alias confidence_loss (same rule, pre-rename — count the two together when reading the exit-reason table), and mechanical_exit (OFF since 2026-08-02 — anti-predictive consensus, and it could not fire at its threshold anyway). Blank while open."),
     ("broker_entry", "IBKR entry", None, "Did the entry order really execute at the broker? ✓ filled (shares) · ⏳ working / partial · ↻ re-anchoring (tick-scoped cancel; resubmits at the current mark) · ✕ cancelled · ✗ rejected/failed · – never sent (broker off, duplicate twin, sizing skip, or pre-broker history). Simulated view only — the IBKR view contains only filled orders by construction."),
     ("broker_exit", "IBKR exit", None, "Same for the closing order. ⏳ pending = the ledger closed the trade and the exit goes out on the next sync. Blank while the position is open."),
 ]
@@ -888,7 +888,11 @@ def _rationale_body(run_id):
         html.Div(f"LLM — synthesis: {syn}   ·   sentiment: {sent}",
                  style={"color": "#374151", "fontSize": 14, "marginBottom": 12}),
         _h3(f"APIs used this run  ·  {ok_n}/{len(src)} succeeded",
-            "Each external data source the pipeline called this run — green ✓ succeeded, red ✗ failed. Hover a chip for the error or status."),
+            "Each external data source the pipeline called this run — green ✓ succeeded, red ✗ failed. Hover a chip for the error or status. "
+            "⚠ A green ✓ means the CALL succeeded, NOT that data came back: a feed that returns an empty list is a success here. That is exactly "
+            "how the EDGAR full-text feeds sat silently empty for months. Emptiness is tracked separately — the Data Quality tab's dark-feed "
+            "detector flags a source whose recent fetches are ALL empty against its own history, and the amber banner at the top of the page "
+            "raises it. Judge coverage there, not from these chips."),
         html.Div(chips or "No source records.", style={"marginBottom": 18}),
         _h3(f"Recommendations  ·  {len(recs_disp)} shown",
             "Every BUY/SELL/HOLD/WATCH the model produced this run. Green-tinted rows are actionable (paper-traded). Hover a column header for its definition. Click any row to chart that ticker's hold-review confidence over time below."),
@@ -2136,6 +2140,7 @@ def _methods_tab():
         ], className="filter-bar"),
         dcc.Loading(html.Div(id="methods-body")),
         _safe(_method_decile_section),
+        _safe(_gate_funnel_section),
         _safe(_ic_section),
         _safe(_mc_overfit_section),
         _safe(_confidence_components_section),
@@ -2146,6 +2151,151 @@ def _methods_tab():
         _h3("LLM models used (synthesis & sentiment)",
             "Which exact LLMs actually ran across all recorded pipeline runs — the final-call 'synthesis' model and the per-ticker 'sentiment' model — including any DeepSeek or rule-based fallbacks. Not affected by the window toggle above (it's run-based, not trade-based). Hover a column header for details."),
         models_table,
+    ])
+
+
+_GATE_FUNNEL_TOOLTIP = (
+    "Each actionable GATE judged on the H/L PIVOT target by the cohort it DROPS versus the one it "
+    "lets through, oriented by the direction that would have been traded (sign(action) x the signed "
+    "move to the next pivot). A gate earns its place when what it drops does WORSE than what it keeps. "
+    "Gates run in cascade order and a drop is attributed to the FIRST gate that rejects it, so each row "
+    "only sees the candidates still alive when it runs and the cohorts partition cleanly. "
+    "\u26a0 THE COLUMN TO READ IS 'Value', NOT the raw returns. Orientation makes raw means "
+    "incomparable across cohorts with different BUY/SELL mixes \u2014 a short's oriented return is "
+    "minus the population drift by construction, so a short-heavy cohort looks worse for no reason but "
+    "drift. Every cohort is therefore benchmarked against a random draw with ITS OWN side mix, and the "
+    "reported 'excess' / 'Value' are net of that. "
+    "'Value' = the excess a gate KEEPS minus the excess it THREW AWAY; positive means the drop was "
+    "right. 'IC' treats passing the gate as a binary score against the oriented outcome (positive = "
+    "the names it lets through do better); 'ICIR' is the per-day mean/std of that IC, so a gate that is "
+    "right on average but flips day to day reads as unreliable. 't (drop)' is day-clustered on the "
+    "EXCESS \u2014 each signal-day counts once, because same-day returns are correlated and a raw-row t "
+    "is inflated several-fold. "
+    "\u26a0 STANDING CAVEAT: nothing in this cascade has ever been statistically distinguishable \u2014 "
+    "every |t| measured \u2264 1.3. Read direction and magnitude, never significance, and treat any "
+    "gate whose 'Dropped' is in the low tens as NO ANSWER: Gate 5's verdict flipped sign on one added "
+    "row between two runs a day apart.")
+
+
+_GATE_SOURCE_OPTIONS = [
+    {"label": "Stamped (real gate decisions)", "value": "stamped"},
+    {"label": "Simulated (all scored tickers)", "value": "simulated"},
+]
+
+
+def _gate_funnel_section():
+    """Per-gate funnel performance on the pivot basis (restored 2026-08-18)."""
+    return html.Div([
+        _h3("Gate performance \u2014 what each gate dropped vs kept (pivot target)",
+            _GATE_FUNNEL_TOOLTIP),
+        _filter_row(
+            "Gate source",
+            "Stamped: the gates' REAL recorded decisions (runs.gate_diag), but only on tickers the "
+            "LLM turned into a BUY/SELL \u2014 a small, selection-biased sample judged after an "
+            "upstream stage already liked the name. "
+            "Simulated: the same cascade logic replayed over EVERY scored ticker-day, ~10x the rows "
+            "and free of that bias, using the AGGREGATOR's own direction (there is no LLM in a "
+            "simulation). The two measure gates against DIFFERENT streams, so they can legitimately "
+            "disagree \u2014 and they do. Every simulated input is point-in-time: the run-up and "
+            "liquidity are recomputed from bars visible on the signal date, never the current tail.",
+            "gate-source", _GATE_SOURCE_OPTIONS, "simulated"),
+        dcc.Loading(html.Div(id="gate-funnel-body")),
+    ])
+
+
+@app.callback(Output("gate-funnel-body", "children"), Input("gate-source", "value"))
+def _gate_funnel_body(source):
+    return _safe(lambda: _gate_funnel_table(source or "simulated"))
+
+
+def _gate_funnel_table(source: str = "simulated"):
+    res = data.gate_performance(source=source)
+    return _funnel_table(res, drop_label="Dropped", keep_label="Kept",
+                         empty="No gate-stamped calls with a settled pivot label yet "
+                               "\u2014 this fills in as pivots confirm.")
+
+
+def _funnel_table(res, drop_label="Dropped", keep_label="Kept", empty=""):
+    """Shared renderer for the gate and exit-rule funnels.
+
+    They are the same measurement with the noun swapped: a stage, the cohort it
+    removed, the cohort it left, and whether removing that cohort helped. One
+    renderer keeps the two tables literally comparable -- and stops the
+    columns drifting apart, which is how two "identical" tables stop meaning the
+    same thing."""
+    df, meta = res.get("rows"), res.get("meta") or {}
+    if df is None or getattr(df, "empty", True):
+        return html.Div(empty or "Nothing to show yet.", className="empty-note")
+
+    rows = []
+    for r in df.to_dict("records"):
+        stage = r["stage"]
+        if "Gate 1b" in stage:
+            stage += "  (RETIRED 2026-08-17)"
+        rows.append({
+            "stage": stage,
+            "seen": r["seen"],
+            "dropped": None if pd.isna(r["dropped"]) else int(r["dropped"]),
+            "drop_win": None if pd.isna(r["drop_win"]) else round(r["drop_win"], 1),
+            "drop_exc": None if pd.isna(r["drop_exc"]) else round(r["drop_exc"], 3),
+            "kept": r["kept"],
+            "keep_win": None if pd.isna(r["keep_win"]) else round(r["keep_win"], 1),
+            "keep_exc": None if pd.isna(r["keep_exc"]) else round(r["keep_exc"], 3),
+            "value": None if pd.isna(r["value"]) else round(r["value"], 3),
+            "ic": None if pd.isna(r["ic"]) else round(r["ic"], 3),
+            "icir": None if pd.isna(r["icir"]) else round(r["icir"], 2),
+            "t": None if pd.isna(r["drop_t"]) else round(r["drop_t"], 2),
+            "days": r["ic_days"],
+        })
+    cols = [
+        {"name": "Stage", "id": "stage"},
+        {"name": "Seen", "id": "seen", "type": "numeric", "format": _INT},
+        {"name": drop_label, "id": "dropped", "type": "numeric", "format": _INT},
+        {"name": f"{drop_label} win %", "id": "drop_win", "type": "numeric", "format": _NUM1},
+        {"name": f"{drop_label} excess pp", "id": "drop_exc", "type": "numeric", "format": _NUM3},
+        {"name": keep_label, "id": "kept", "type": "numeric", "format": _INT},
+        {"name": f"{keep_label} win %", "id": "keep_win", "type": "numeric", "format": _NUM1},
+        {"name": f"{keep_label} excess pp", "id": "keep_exc", "type": "numeric", "format": _NUM3},
+        {"name": "Value pp", "id": "value", "type": "numeric", "format": _NUM3},
+        {"name": "IC", "id": "ic", "type": "numeric", "format": _NUM3},
+        {"name": "ICIR", "id": "icir", "type": "numeric", "format": _NUM2},
+        {"name": f"t ({drop_label.lower()})", "id": "t", "type": "numeric", "format": _NUM2},
+        {"name": "IC days", "id": "days", "type": "numeric", "format": _INT},
+    ]
+    cond = [
+        {"if": {"filter_query": "{value} > 0", "column_id": "value"},
+         "color": figures.POS, "fontWeight": "bold"},
+        {"if": {"filter_query": "{value} < 0", "column_id": "value"},
+         "color": figures.NEG, "fontWeight": "bold"},
+        # Small-n rows are noise, not findings -- grey them so they are not read
+        # as verdicts (Gate 5 flipped sign on one added row).
+        {"if": {"filter_query": "{dropped} < 30 && {dropped} > 0"},
+         "backgroundColor": "#f8fafc", "color": "#94a3b8", "fontStyle": "italic"},
+        {"if": {"filter_query": '{stage} contains "PASS"'}, "backgroundColor": "#ecfdf5"},
+        {"if": {"filter_query": '{stage} contains "STILL HELD"'}, "backgroundColor": "#ecfdf5"},
+        {"if": {"filter_query": '{stage} contains "reference"'}, "backgroundColor": "#eff6ff"},
+    ]
+    casc = meta.get("cascade_value")
+    note = (f"{meta.get('calls', 0):,} gate-stamped BUY/SELL calls over {meta.get('days', 0)} days "
+            f"({meta.get('d0', '')} \u2192 {meta.get('d1', '')}) \u00b7 population drift "
+            f"{meta.get('drift', 0):+.3f}% \u00b7 {meta.get('passed', 0):,} traded. "
+            + (f"Whole cascade vs trading every LLM call: {casc:+.3f} pp."
+               if casc == casc else "")
+            + " Greyed rows have too few drops to mean anything.")
+    if meta.get("source") == "simulated":
+        note += (" SIMULATED: the aggregator's own direction, point-in-time run-up/liquidity. "
+                 "Gate 3 (earnings blackout) is NOT simulable \u2014 the historical earnings "
+                 "calendar as it stood on each date is not stored, so its row is structurally "
+                 "empty rather than 'never fired'."
+                 + (f" Confidence is read UNMASKED ({meta.get('conf_masked_pct')}% of panel rows "
+                    "carry a superseded-epoch value): masked confidence is NaN, and NaN < threshold "
+                    "is False, so Gate 1 would silently reject nothing. Descriptive only \u2014 it "
+                    "feeds no weight."
+                    if meta.get("conf_masked_pct") else ""))
+    return html.Div([
+        html.Div(note, className="section-note"),
+        dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond,
+                             **_TABLE_KW),
     ])
 
 
@@ -2707,8 +2857,13 @@ _EXIT_PERF_TOOLTIP = (
     "vindicated the exit, 'IC@' positive = deeper exit-conviction ⇒ more adverse "
     "subsequent move. Per horizon (pv…1m): 'n@' = activations with a forward return, "
     "'IC std@' / 'ICIR@' = the IC's reliability (per-day; needs several days). The "
-    "synthesized `llm_review` row is history-backed from `trade_reviews`; the rest "
-    "accrue as the panel fills. Forward-collected — judge nothing on a thin n.")
+    "synthesized `llm_review` row is history-backed from `trade_reviews`. "
+    "⚠ Two rows are NOT symmetric with the others. `ml_exit` is deliberately EXCLUDED from "
+    "`exit_method_consensus` so it cannot contaminate the baseline it is judged against, and it "
+    "actually DRIVES the close only for trades stamped `ml_arm` (the stacker-entry cohort) — for "
+    "every other position it is computed and persisted but acts on nothing, so its row is a "
+    "shadow measurement there. `llm_review` is the live decider for everything else. "
+    "Forward-collected — judge nothing on a thin n.")
 
 _EXIT_SHADOW_TOOLTIP = (
     "The SIMULATED exit book: every scored ticker (the signals panel) treated as a hypothetical "
@@ -2945,6 +3100,46 @@ def _exit_mc_block(session=None, direction=None):
     ])
 
 
+
+
+_EXIT_RULES_TOOLTIP = (
+    "Each EXIT RULE judged on the H/L PIVOT target by the positions it CLOSES versus the ones it lets "
+    "run, scored on the ORIENTED REMAINING MOVE to the next pivot from that held day (+ = the leg "
+    "still runs our way after this tick). A rule earns its place when what it closes was about to do "
+    "WORSE than what it held, so \u2018Value\u2019 is positive for a good rule \u2014 the same sign "
+    "convention as the gate table above it. "
+    "This is NOT the exit-IC table: that measures each exit METHOD's continuous conviction score, "
+    "while this measures the binary RULE with its live thresholds \u2014 the thing that actually "
+    "closes a position. A method can have a useful score and a badly-calibrated threshold, and only "
+    "this view separates the two. "
+    "Rules fire in monitor_open_positions order and a position is attributed to the FIRST one that "
+    "fires, so the cohorts partition. "
+    "\u26a0 SIMULATED over the same held-position walk the ML exit-timer trains on. Rules that cannot "
+    "be reconstructed from panel state are NOT simulated and are listed under the table rather than "
+    "silently passing \u2014 a rule that never fires looks identical to one that cannot run. "
+    "\u2018Combine flipped\u2019 is a PROXY for llm_signal_flipped (there is no LLM in a simulation): "
+    "it fires when the aggregator's own combine turns against the position.")
+
+
+def _exit_rules_section():
+    """Per-exit-rule funnel on the pivot basis (2026-08-18)."""
+    res = data.exit_rule_performance()
+    meta = res.get("meta") or {}
+    body = _funnel_table(res, drop_label="Closed", keep_label="Held",
+                         empty="No simulated held-days with a settled pivot label yet.")
+    unsim = ", ".join(meta.get("unsimulated") or [])
+    foot = (f"NOT simulable (absent from the table entirely, not shown as zero): {unsim}. "
+            f"Direction recovered for {meta.get('dir_known_pct')}% of rows \u2014 the adverse stop is "
+            f"asymmetric (long 8% / short 20%), so a missing direction would mis-fire every short."
+            if unsim else "")
+    return html.Div([
+        _h3("Exit-rule performance \u2014 what each rule closed vs held (pivot target)",
+            _EXIT_RULES_TOOLTIP),
+        body,
+        html.Div(foot, className="section-note") if foot else html.Div(),
+    ])
+
+
 def _exit_perf_tab():
     return html.Div([
         html.Div([
@@ -2970,6 +3165,7 @@ def _exit_body(window_value, session_value, direction_value, source_value,
         _safe(lambda: _exit_perf_section(_window_days(window_value), source_value,
                                          sim_horizons, sim_metrics,
                                          session=session, direction=direction)),
+        _safe(_exit_rules_section),
         _h3("Exit-reason outcomes — realized P&L by exit rule (closed ledger trades)",
             "For every CLOSED trade, the realized return grouped by the exit_reason that "
             "fired. ⚠ This table is CUMULATIVE history, so it still carries rows from two "
@@ -3012,7 +3208,9 @@ _HORIZON_EDGE_TOOLTIP = (
     "hypothetical entry in its signal's direction), restricted to the ACTIONABLE subset "
     "(confidence ≥ 0.85 — the traded population). This is the ground truth the horizon time-stop "
     "rests on, at thousands of observations where the held-position `horizon` IC can't reach "
-    "(only ~5 real positions have ever outlived their window). Per horizon: 'n' = observations, "
+    "(when this was written only ~5 real positions had outlived their window; the ledger now "
+    "carries 124 horizon_expired closes, so the held-position view is no longer the bottleneck "
+    "it was — the panel is still the larger sample). Per horizon: 'n' = observations, "
     "'IC' = Spearman(combined_score, forward return), 'win %' = directional hit, 'edge %' = mean "
     "sign(score)×forward-return (the P&L of following the signal that long). A peak-then-decay "
     "shape (edge positive early, ≤0 later) justifies a time-stop at the decay point. The measured "
@@ -3073,10 +3271,17 @@ _EXIT_POLICY_TOOLTIP = (
     "you WANT it negative (you avoided a drop). 'exit_alpha' = held_mean − allhold_mean: how "
     "much better the book you CARRY does than holding everything; > 0 means the rule earns its "
     "keep, and 'always hold' is the 0 baseline. This validates whether an exit-BREADTH or "
-    "aggregator rule beats the current LLM-scalar close BEFORE any of it is wired live. "
-    "Replayed over the exit_signals panel (every held tick, deduped to last-per-day) + OHLCV "
-    "forward returns — but that panel is NEW, so this fills in slowly; judge nothing until it "
-    "spans many days (info_ratio populates only after >1 day).")
+    "aggregator rule beats the live close (the LLM hold-review, or `ml_exit` on the `ml_arm` "
+    "cohort) BEFORE any of it is wired live. Replayed over the exit_signals panel (every held "
+    "tick, deduped to last-per-day) + OHLCV forward returns. "
+    "⚠ THE LIMITATION THAT MATTERS: this evaluator is MYOPIC — it scores each position-DAY "
+    "independently, so it structurally cannot evaluate any rule that spans days (a trailing "
+    "stop, a time-stop, a min-hold). For those, use the SEQUENTIAL close-once simulator: "
+    "`python -m src.analysis.exit_policy_sim`. There the headline metric is EXCESS, not "
+    "mean_ret — on a decaying book the raw return of any rule mostly reflects how LONG it "
+    "holds, so fixed-day controls trace return-vs-hold with zero information; only the "
+    "remainder after subtracting that curve at the same average hold is timing skill. "
+    "Re-run it before adding any time-based exit constraint.")
 
 
 def _exit_policy_eval_section():
@@ -3356,7 +3561,7 @@ def _broker_returns_section(window_value, session_value=None, direction_value=No
                     tooltip="Cumulative P&L of these trades (realized + open, this window) as a % of your LATEST IBKR account NAV (NetLiquidation), converted to USD — the account-relative impact. Uses the real account equity, not just per-trade fills; approximate (latest NAV vs windowed P&L).")]
               if s.get("account_return_pct") is not None else []),
             _kpi("Win rate", _pct(s.get("win_rate")),
-                 tooltip="Share of broker positions with a positive net return on actual fills — CLOSED round-trips at their realized return, still-OPEN positions at their live mark (same open-inclusive convention as the Simulated view, so the two toggle sides are comparable)."),
+                 tooltip="GROSS win rate on real fills — share of broker positions that moved the way they were supposed to, on raw fill prices, with commissions deliberately NOT applied (they are measured by the return and P&L tiles instead). Same convention as the Simulated view, which is what makes the two toggle sides comparable — and it means a position can be a win with a negative net return when the move was right but smaller than the round trip. CLOSED round-trips at their realized move, still-OPEN positions at their live mark (open-inclusive, matching the Simulated side)."),
             _kpi("Avg return", _pct(s.get("avg_return"), signed=True),
                  tooltip="Mean % return on actual fill prices net of actual commissions, EQUAL-weighted across every position (open at its live mark; compare with 'Return (wtd)', which is CLOSED-only and weights by real dollars)."),
             _kpi("Median return", _pct(s.get("median_return"), signed=True),
@@ -3477,13 +3682,15 @@ def _returns_section(window_value, session_value=None, direction_value=None, ass
                  figures.POS if (compound or 0) >= 0 else figures.NEG,
                  tooltip="Path-faithful compound return over the selected window: each day's capital-weighted return across active positions, chained over real closing prices. Counts trades ENTERED within the window; open positions are included at their live mark."),
             _kpi("Win rate", _pct(stats.get("win_rate")),
-                 tooltip="Share of trades with a positive spread-adjusted return. A flat round-trip is a loss (you pay the bid-ask spread). Open positions count at their live mark."),
+                 tooltip="GROSS win rate — share of trades that moved the way they were supposed to, on RAW prices. Costs are deliberately NOT applied here; they are measured by the return metrics beside it. "
+                         "⚠ So a trade CAN be a win with a negative return: right direction, move smaller than the round trip. That is correct, not a bug — a cost-adjusted win rate silently answers two questions at once ('was the direction right?' and 'was the move bigger than costs?'), and the second is an execution property that moves with the spread model, the venue and the session. It would make the same signal score worse purely for being traded in wide markets, and every cost recalibration would rewrite the win rate of history that did not change. "
+                         "A flat round-trip is not a win (no directional move). Trades whose prices are unusable are dropped from BOTH numerator and denominator, so a data gap cannot masquerade as a bad signal. Open positions count at their live mark."),
             _kpi("Avg return", _pct(stats.get("avg_return"), signed=True),
                  tooltip="Mean per-trade % return, equal-weighted across all trades in the window (open trades at their live mark)."),
             _kpi("Median return", _pct(stats.get("median_return"), signed=True),
                  tooltip="Median per-trade % return in the window — the middle trade, unaffected by a single outsized win/loss (open trades at their live mark). Compare with 'Avg return': a median well below the average means a few big winners are lifting the mean."),
             _kpi("Weighted avg", _pct(stats.get("weighted_avg_return"), signed=True),
-                 tooltip="Per-trade % return weighted by position size (the confidence-tier multiplier), so larger positions count more."),
+                 tooltip="Per-trade % return weighted by position size, so larger positions count more. Size is the whole sizing chain — the compressed confidence ramp (max 1.5×) × agreement breadth × expected-edge blend × predictability tilt, then the regime and correlation haircuts and the extended/overnight multiplier — not a confidence tier alone."),
             _kpi("Best", _pct(stats.get("best"), signed=True), figures.POS,
                  tooltip="Best single-trade % return in the window."),
             _kpi("Worst", _pct(stats.get("worst"), signed=True), figures.NEG,
@@ -3519,11 +3726,41 @@ def _returns_section(window_value, session_value=None, direction_value=None, ass
 
 # ── Tab 4: Execution (price provenance · broker forensics · tracking error) ──
 
+_EXEC_SESSION_TITLE = (
+    "Filter the execution analyses to a US-market session. For the broker-order "
+    "blocks this is the session the ORDER WAS SUBMITTED in — the only session that "
+    "means anything for execution, and the most informative cut on this tab: the "
+    "fill rate runs 56.6% in RTH against 4.8% overnight, so an unfiltered number "
+    "blends two different regimes. For tracking error it is the session the TRADE "
+    "was entered in, matching the performance tabs. Pre-market and After-hours both "
+    "map onto the broker log's coarse 'extended' bucket.")
+
+
 def _execution_tab():
     return html.Div([
+        html.Div([
+            _window_toggle("exec-window"),
+            _session_toggle("exec-session", title=_EXEC_SESSION_TITLE),
+            _direction_toggle("exec-direction"),
+        ], className="filter-bar"),
+        dcc.Loading(html.Div(id="exec-body")),
+    ])
+
+
+@app.callback(Output("exec-body", "children"),
+              Input("exec-window", "value"), Input("exec-session", "value"),
+              Input("exec-direction", "value"))
+def _exec_body(window_value, session_value, direction_value):
+    days = _window_days(window_value)
+    session = _session_value(session_value)
+    direction = _direction_value(direction_value)
+    return html.Div([
+        # Price provenance is a snapshot of the LATEST RUN's gate_diag, not a
+        # queryable history, so there is nothing for the filters to slice. Left
+        # unfiltered and labelled rather than hidden — it is a standing alarm.
         _safe(_provenance_section),
-        _safe(_broker_forensics_section),
-        _safe(_tracking_error_section),
+        _safe(lambda: _broker_forensics_section(days, session, direction)),
+        _safe(lambda: _tracking_error_section(days, session, direction)),
     ])
 
 
@@ -3535,7 +3772,12 @@ def _provenance_section():
                   "Standing guard against the stale-price class: each new trade's recorded "
                   "entry price is compared to the run's analysis snapshot for that ticker. A "
                   "divergence beyond the session band (RTH tight, off-hours wider) is flagged — "
-                  "the automatic version of the one-off CRDO fill-vs-snapshot audit. Latest run.")
+                  "the automatic version of the one-off CRDO fill-vs-snapshot audit. "
+                  "Trades whose snapshot anchor was NOT a live quote (price_source != 'live', i.e. "
+                  "the deterministic prev-close fallback) are deliberately SKIPPED rather than "
+                  "flagged — comparing a live fill against a previous close would manufacture a "
+                  "divergence that says nothing about execution. So 'n checked' is legitimately "
+                  "smaller than the number of trades opened. Latest run only.")
     if not pp:
         return html.Div([heading, html.Div(
             "No price-provenance record in the latest run (no trades opened, no snapshot, "
@@ -3564,27 +3806,72 @@ def _provenance_section():
     return html.Div([heading, body])
 
 
-def _broker_forensics_section():
-    """Slippage / fill-rate / drift / reject forensics (item #3)."""
-    rep = data.broker_forensics()
+def _broker_forensics_section(days=None, session=None, direction=None):
+    """Slippage / fill-rate / drift / reject forensics (item #3), sliced by the
+    tab's window / session / direction filters."""
+    rep = data.broker_forensics(days=days, session=session, direction=direction)
     heading = _h3("Broker execution forensics",
                   "Over all persisted broker orders: fill rate vs kill rate (the settle-or-kill "
-                  "design), fill slippage by session (is the LMT cap achievable?), how often broker "
-                  "positions drift from the ledger, and what the broker rejects. broker_mode must be "
-                  "on for rows to accrue.")
+                  "design), how far fills land from the DECISION price by session, how often broker "
+                  "positions drift from the ledger, and what the broker rejects. Currently "
+                  f"broker_mode={settings.broker_mode} with {settings.broker_order_type} orders — a "
+                  "marketable limit at the model price ± the session cap (20 bp RTH / 80 extended / "
+                  "150 overnight), forced to a limit outside RTH because IBKR rejects MKT there. "
+                  "broker_mode must be on for rows to accrue.")
     if not rep.get("n_orders"):
         return html.Div([heading, html.Div(
             "No broker orders recorded yet (broker_mode off / dry-run, or nothing submitted).",
             style={"color": "#6b7280"})])
     fo, d = rep["fill_outcomes"], rep["drift"]
+    fr = rep.get("fill_rate") or {}
+    per_retry = fr.get("per_retry") or {}
+    per_trade = fr.get("per_trade") or {}
+    by_intent = fr.get("by_intent") or {}
     cards = html.Div(
         [
-            _kpi("Fill rate", _pct(fo.get("fill_rate")),
-                 tooltip="Filled orders ÷ terminal orders (still-working and no-op rows excluded)."),
+            _kpi("Fill rate · per trade", _pct(per_trade.get("rate")),
+                 figures.POS if (per_trade.get("rate") or 0) >= 70 else figures.NEG,
+                 tooltip=f"DID WE GET THE TRADE ON? Of {per_trade.get('n', 0):,} intended trades, "
+                         f"{per_trade.get('filled', 0):,} eventually filled — every retry of the same "
+                         f"trade pooled onto one key ({per_trade.get('avg_retries') or 0:.2f} "
+                         "submissions each on average). This is the number that says whether the "
+                         "strategy is actually being executed. A partial fill counts: the position WAS "
+                         "established, just smaller."),
+            _kpi("Fill rate · per retry", _pct(per_retry.get("rate")),
+                 tooltip=f"WHEN WE PLACE AN ORDER, DOES IT FILL? {per_retry.get('filled', 0):,} of "
+                         f"{per_retry.get('n', 0):,} individual orders. Each resubmission gets its own "
+                         "ref (-r1, -r2, … observed as deep as -r85), so this counts every attempt "
+                         "separately. ⚠ It is LOW BY DESIGN: settle-or-kill gives an order one tick, "
+                         "re-anchors it every ~6s and cancels it at broker_settle_seconds, then "
+                         "resubmits re-anchored. Read it as execution QUALITY — the gap between this "
+                         "and the per-trade rate is how much retrying is doing for you. Consequence "
+                         "worth knowing: the real-fill cost calibration samples filled legs only, so "
+                         "it understates the cost of the trades we intended."),
+            _kpi("Per trade · entry / exit",
+                 f"{_pct((by_intent.get('ENTRY') or {}).get('rate'))} / "
+                 f"{_pct((by_intent.get('EXIT') or {}).get('rate'))}",
+                 tooltip="The per-TRADE rate split by intent, because the two failures are not "
+                         "comparable. A missed entry is an opportunity not taken. A missed EXIT leaves "
+                         "a position open at the broker that the ledger already believes is closed — "
+                         "which is exactly where position drift comes from, so read a weak exit number "
+                         "together with the Drift tile."),
             _kpi("Order events", str(rep["n_orders"]),
-                 tooltip="Total persisted broker order / fill-repair events."),
+                 tooltip="Total persisted broker order / fill-repair events — every SUBMIT, "
+                         "SETTLE_REANCHOR, SETTLE_KILL/FILL, drift flatten and repair. Several per "
+                         "intended trade, which is exactly why the fill rate above is computed per "
+                         "TRADE and not per event. The 'Fill outcomes' table below breaks these "
+                         "events down — read it to see WHERE orders die, not as a fill rate."),
             _kpi("Drift runs", f"{d.get('runs_with_drift', 0)}/{d.get('n_runs', 0)}",
-                 tooltip="Reconcile runs where a broker position diverged from the ledger."),
+                 tooltip="⚠ NOT affected by the filters above — this counts reconcile RUNS, not orders, "
+                         "so there is nothing coherent to slice it by (a run either found an unexplained "
+                         "position or it did not). "
+                         "Reconcile runs where a broker position could not be explained by the ledger. "
+                         "A steady nonzero share is EXPECTED rather than alarming: a position that is "
+                         "pending-open or pending-fill at the moment of the sweep reads as drift for "
+                         "that run and resolves itself, and those benign cases are already excluded "
+                         "from the broker-health verdict that raises the email banner. What matters is "
+                         "a PERSISTENT drift on the same ticker across runs — that is a real orphan, "
+                         "and broker_drift_action ('flatten') price-caps it out rather than adopting it."),
         ],
         style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
     )
@@ -3606,16 +3893,22 @@ def _broker_forensics_section():
     return html.Div([
         heading, cards,
         dcc.Graph(figure=figures.slippage_by_session_fig(rep["slippage_by_session"])),
-        _h3("Fill outcomes", "Count of order events by terminal outcome (filled / killed / failed / working / skipped)."),
+        _h3("Fill outcomes (EVENTS, not trades)",
+            "Count of order EVENTS by outcome — filled / killed / failed / working / skipped. "
+            "One intended trade emits several of these (SUBMIT, a SETTLE_REANCHOR every ~6s, then "
+            "SETTLE_KILL or SETTLE_FILL), so the ratio of 'filled' to the rest here is NOT the fill "
+            "rate — it reads roughly 2× high, because rows still marked 'working' are mostly "
+            "re-anchor events belonging to intents that were later killed. Use this to see WHERE "
+            "orders die; use the Fill rate tile above for how often a trade actually got on."),
         outcomes_table,
         _h3("Reject reasons", "Failed / rejected orders grouped by the broker error message."),
         reject_table,
     ])
 
 
-def _tracking_error_section():
-    """Sim-vs-broker tracking error (item #4)."""
-    rep = data.tracking_error()
+def _tracking_error_section(days=None, session=None, direction=None):
+    """Sim-vs-broker tracking error (item #4), sliced by the tab's filters."""
+    rep = data.tracking_error(window_days=days, session=session, direction=direction)
     heading = _h3("Sim-vs-broker tracking error",
                   "The gap between the modeled ledger and actual IBKR fills, per matched trade. A "
                   "line hugging zero = the model tracks reality; a persistent one-sided drift = a "
@@ -3632,7 +3925,7 @@ def _tracking_error_section():
                  tooltip="Mean (sim − broker) return; + = the sim is optimistic vs real fills."),
             _kpi("Mean entry gap",
                  f"{o['mean_entry_bps']:+.0f} bp" if o.get("mean_entry_bps") is not None else "–",
-                 tooltip="Mean signed entry-price gap (broker − sim) in basis points."),
+                 tooltip="Mean signed entry-price gap (broker − sim) in basis points. A nonzero gap is EXPECTED, not a defect: the ledger records the decision price while IBKR reports the average cost of however the order actually filled, so the two are different quantities BY DESIGN. What would be a bug is a gap that is large AND one-sided AND growing — that is the stale-price signature. Judge it together with the Δreturn series below, which is the metric that actually matters."),
         ],
         style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
     )
@@ -3673,7 +3966,36 @@ def _data_quality_tab():
         _safe(_source_reliability_section),
         _safe(_method_coverage_section),
         _safe(_calibrations_section),
+        _safe(_model_artifacts_section),
     ])
+
+
+def _model_artifacts_section():
+    """The four ML artifacts: age + stamped bases. Every consumer is fail-soft,
+    so a dead weekly retrain is invisible everywhere else."""
+    rows = data.model_artifacts()
+    heading = _h3("Model artifacts — is the weekly retrain landing?",
+                  "Age and stamped bases of the four ML models (retrained Saturday 08:00 ET). "
+                  "Every consumer is FAIL-SOFT by design — ml_exit reverts to the hand-built "
+                  "exits, ml_ohlcv scores 0.0, the stackers fall back to the weighted combine — "
+                  "so a retrain that stopped landing looks exactly like normal operation from every "
+                  "other surface. Red = older than 9 days or missing. ml_exit also shows its stamped "
+                  "bases: label_basis must be pv (the pivot standard) and combine_basis absolute (the "
+                  "basis-invariant feature series serving feeds it).")
+    cols = [{"name": "Model", "id": "model"},
+            {"name": "Age (days)", "id": "age_days", "type": "numeric", "format": _NUM1},
+            {"name": "Label basis", "id": "label_basis"},
+            {"name": "Combine basis", "id": "combine_basis"},
+            {"name": "Status", "id": "status"}]
+    cond = [
+        {"if": {"filter_query": '{status} = "fresh"', "column_id": "status"},
+         "color": figures.POS, "fontWeight": "bold"},
+        {"if": {"filter_query": '{status} contains "stale" || {status} contains "MISSING"'},
+         "backgroundColor": "#fef2f2", "color": figures.NEG, "fontWeight": "bold"},
+    ]
+    return html.Div([heading,
+                     dash_table.DataTable(data=rows, columns=cols,
+                                          style_data_conditional=cond, **_TABLE_KW)])
 
 
 def _calibrations_section():
@@ -3694,19 +4016,54 @@ def _calibrations_section():
         return html.Div([heading, html.Div(
             "No calibration snapshot yet — appears after the next pipeline run on this code.",
             style={"color": "#6b7280"})])
+    def _state(c) -> str:
+        """One word for what this row is DOING — the thing the raw numbers hide."""
+        v, p, n = c.get("value"), c.get("prior"), c.get("n_evidence") or 0
+        if v is None:
+            return "inactive"
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if v == 0.0 and p not in (None, 0, 0.0):
+            return "OFF (learned)" if n else "OFF (no evidence)"
+        if v == 0.0:
+            return "off"
+        if not n:
+            return "prior (no evidence)"
+        return "learned"
+
     rows = [{
-        "name": c.get("name"), "value": c.get("value"), "prior": c.get("prior"),
+        "name": c.get("name"), "state": _state(c),
+        "value": c.get("value"), "prior": c.get("prior"),
         "n": c.get("n_evidence"), "unit": c.get("unit"), "note": c.get("note"),
     } for c in cals]
     cols = [
         {"name": "Parameter", "id": "name"},
+        {"name": "State", "id": "state"},
         {"name": "Value", "id": "value", "type": "numeric", "format": _NUM4},
         {"name": "Prior", "id": "prior", "type": "numeric", "format": _NUM4},
         {"name": "Evidence n", "id": "n", "type": "numeric", "format": _INT},
         {"name": "Unit", "id": "unit"},
         {"name": "Basis", "id": "note"},
     ]
-    return html.Div([heading, dash_table.DataTable(data=rows, columns=cols, **_TABLE_KW)])
+    cond = [
+        # A parameter that has learned its way to ZERO against a nonzero prior has
+        # switched its own mechanism off. That is a legitimate outcome, but it is
+        # invisible in a column of numbers — and it is exactly the state worth
+        # noticing, because the mechanism keeps LOOKING configured.
+        {"if": {"filter_query": '{state} contains "OFF"'}, "backgroundColor": "#fffbeb"},
+        {"if": {"filter_query": '{state} contains "prior"'}, "color": "#92400e"},
+    ]
+    return html.Div([
+        heading,
+        html.Div("'State' reads the row for you: LEARNED = evidence moved it off the prior; "
+                 "PRIOR = no evidence yet, the documented fallback is in force; OFF (learned) = the "
+                 "calibration has driven its own mechanism to zero, which is a real verdict "
+                 "('do not size on this') but leaves the parameter still looking configured.",
+                 className="section-note"),
+        dash_table.DataTable(data=rows, columns=cols,
+                             style_data_conditional=cond, **_TABLE_KW)])
 
 
 def _source_reliability_section():
@@ -3793,15 +4150,27 @@ def _method_coverage_section():
     from src.performance.tracker import METHOD_LABELS
     cov = data.method_coverage(_DQ_LOOKBACK_DAYS)
     per = cov.get("per_method") or []
+    # A method's WEIGHT is what makes its coverage matter. 0.4% coverage on a
+    # panel-first method at weight 0 is it accruing normally; 0% on a weighted
+    # method means a live voter is silently absent from every combine. The old
+    # table sorted both by coverage alone, so the two were indistinguishable.
+    from src.signals.aggregator import _BASE_WEIGHTS
+    _w = dict(_BASE_WEIGHTS)
+
     heading = _h3("Per-method data coverage",
                   "For each signal method, the share of scored tickers with a REAL (non-zero) score — a "
                   "method reads 0.0 ('no view') when its data source failed for a ticker, so a feed going "
                   "dark shows as collapsing coverage before it shows as bad performance. Δ = recent minus "
-                  "prior coverage; a large negative Δ is the alarm. From the signals panel.")
+                  "prior coverage; a large negative Δ is the alarm. "
+                  "Read coverage TOGETHER WITH the Weight column: a weight-0 method is panel-first and "
+                  "accruing, so thin coverage costs nothing, while a WEIGHTED method at low coverage is a "
+                  "live voter that is abstaining on most tickers. From the signals panel.")
     if not per:
         return html.Div([heading, html.Div("No signal rows in the window yet.",
                                             style={"color": "#6b7280"})])
     drops = [r for r in per if r.get("delta") is not None and r["delta"] <= -20]
+    silent = [r for r in per if _w.get(r["method"], 0.0) > 0
+              and (r.get("coverage_pct") or 0.0) < 1.0]
     cards = html.Div(
         [
             _kpi("Methods", str(len(per)),
@@ -3810,14 +4179,24 @@ def _method_coverage_section():
                  tooltip="Total run×ticker rows in the window (the coverage denominator)."),
             _kpi("Coverage drops", str(len(drops)), figures.NEG if drops else figures.POS,
                  tooltip="Methods whose coverage fell ≥20pp recent-vs-prior — a feed that likely went dark."),
+            _kpi("Silent weighted", str(len(silent)), figures.NEG if silent else figures.POS,
+                 tooltip="WEIGHTED methods scoring on <1% of tickers — a voter carrying real weight that "
+                         "is effectively absent from the combine. Two very different causes and the table "
+                         "cannot tell them apart, so check the enable_* flag: a method switched OFF is "
+                         "expected here (its weight simply renormalises away), while an ENABLED method at "
+                         "0% is either legitimately abstaining or broken, and only the second is a bug. "
+                         + (f"Currently: {', '.join(r['method'] for r in silent)}." if silent else "")),
         ],
         style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12},
     )
-    rows = [{"method": METHOD_LABELS.get(r["method"], r["method"]), "coverage": r["coverage_pct"],
+    rows = [{"method": METHOD_LABELS.get(r["method"], r["method"]),
+             "weight": round(_w.get(r["method"], 0.0), 3),
+             "coverage": r["coverage_pct"],
              "scored": r["n_scored"], "total": r["n_total"], "recent": r["recent_pct"],
              "prior": r["prior_pct"], "delta": r["delta"]} for r in per]
     cols = [
         {"name": "Method", "id": "method"},
+        {"name": "Weight", "id": "weight", "type": "numeric", "format": _NUM2},
         {"name": "Coverage %", "id": "coverage", "type": "numeric", "format": _NUM2},
         {"name": "Scored", "id": "scored", "type": "numeric", "format": _INT},
         {"name": "Of", "id": "total", "type": "numeric", "format": _INT},
@@ -3825,14 +4204,23 @@ def _method_coverage_section():
         {"name": "Prior %", "id": "prior", "type": "numeric", "format": _NUM2},
         {"name": "Δ (pp)", "id": "delta", "type": "numeric", "format": _NUM2},
     ]
-    cond = [{"if": {"filter_query": "{delta} <= -20", "column_id": "delta"},
-             "color": figures.NEG, "fontWeight": "bold"}]
+    cond = [
+        {"if": {"filter_query": "{delta} <= -20", "column_id": "delta"},
+         "color": figures.NEG, "fontWeight": "bold"},
+        # A weighted method scoring almost nothing is the row worth finding.
+        {"if": {"filter_query": "{weight} > 0 && {coverage} < 1"},
+         "backgroundColor": "#fef2f2"},
+        {"if": {"filter_query": "{weight} > 0", "column_id": "weight"},
+         "fontWeight": "bold"},
+    ]
     return html.Div([
         heading,
         html.Div("Low coverage is NORMAL for sparse methods (PEAD, extended-gap, options-derived put_call / "
-                 "max_pain / OI-skew / IV — they only fire for a subset of tickers). The actionable signal "
-                 "is a negative Δ: a method whose coverage dropped means its feed went dark.",
-                 style={"color": "#374151", "marginBottom": 8, "fontSize": 13}),
+                 "max_pain / OI-skew / IV — they only fire for a subset of tickers), and for panel-first "
+                 "methods at Weight 0, which are still accruing history. Two things are actionable: a "
+                 "negative Δ (a feed went dark), and a red row — a method carrying real WEIGHT that scores "
+                 "on under 1% of tickers, i.e. a live voter that is absent from nearly every combine.",
+                 className="section-note"),
         cards,
         dcc.Graph(figure=figures.method_coverage_fig(cov)),
         dash_table.DataTable(data=rows, columns=cols, style_data_conditional=cond, **_TABLE_KW),

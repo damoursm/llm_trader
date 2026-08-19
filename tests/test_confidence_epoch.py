@@ -168,8 +168,10 @@ def test_raw_confidence_tracks_the_POST_overlay_combined_score():
 
     The divisor is resolved through `aggregator._raw_confidence_scale()` rather
     than written out: it is 0.5 only on the ABSOLUTE basis (which the conftest
-    pins suite-wide), 0.642 under the live rank basis and 0.0658 on an ML-combine
-    row. Hard-coding it here would re-encode precisely the literal the 2026-08-14
+    pins suite-wide), `rank_raw_confidence_scale` under the live rank basis and
+    `ml_raw_confidence_scale` on an ML-combine row (retuned 2026-08-18 — which is
+    why none of the three belongs here as a literal). Hard-coding it would
+    re-encode precisely the literal the 2026-08-14
     fix centralised — and `test_method_rank_basis.py` has an AST guard forbidding
     that same literal in `src/`."""
     import src.signals.aggregator as agg

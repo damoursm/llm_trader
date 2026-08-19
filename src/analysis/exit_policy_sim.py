@@ -164,9 +164,12 @@ def simulate(df: pd.DataFrame, policies: Dict[str, Policy],
         if c not in df.columns:
             raise ValueError(f"exit frame missing {c}")
     df = df.sort_values(["ticker", "entry_date", "days_held"])
+    # "is_long" rides along when the caller merged a direction (the adverse
+    # stop is asymmetric -- long 8% / short 20% -- so a directionless state
+    # would mis-fire every short by 12pp).
     state_cols = [c for c in ("days_held", "ex_ret", "ex_mfe", "ex_mae", "ex_giveback",
                               "ex_from_mae", "ex_combine", "ex_combine_delta",
-                              "ex_elapsed_ratio", "ex_consensus", "ml_exit")
+                              "ex_elapsed_ratio", "ex_consensus", "ml_exit", "is_long")
                   if c in df.columns]
 
     # Pre-extract each position's day sequence once; every policy replays it.

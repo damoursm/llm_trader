@@ -86,6 +86,38 @@ class AccountPnl:
 
 
 @dataclass
+class Quote:
+    """Live top-of-book for one ticker — what a marketable limit must reach.
+
+    ``mid`` is the fair reference the cost cap is measured FROM; ``bid``/``ask``
+    are what an order actually has to cross to trade. Any field may be None
+    (thin books frequently quote one side only), so every consumer treats an
+    incomplete quote as "no quote" and falls back to the mid-based cap.
+    """
+    ticker: str
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+
+    @property
+    def mid(self) -> Optional[float]:
+        if self.bid and self.ask and self.bid > 0 and self.ask > 0:
+            return (self.bid + self.ask) / 2.0
+        return None
+
+    @property
+    def spread_bps(self) -> Optional[float]:
+        m = self.mid
+        if m and self.ask and self.bid and self.ask >= self.bid:
+            return (self.ask - self.bid) / m * 10_000.0
+        return None
+
+    def opposite(self, side: str) -> Optional[float]:
+        """The side an order must cross: ask for a BUY, bid for a SELL."""
+        px = self.ask if (side or "").upper() == "BUY" else self.bid
+        return float(px) if px and px > 0 else None
+
+
+@dataclass
 class BorrowInfo:
     """Short-borrow availability / cost for one ticker (IBKR-unique data).
 
@@ -186,6 +218,21 @@ class Broker(ABC):
         Default: unsupported (None). IBKRBroker overrides this so the tracker's
         live-price path can prefer the broker's real-time feed — the same source
         that fills the orders — over yfinance. Read-only; never places an order.
+        """
+        return None
+
+    def get_quote(self, ticker: str) -> Optional["Quote"]:
+        """Live bid/ask for *ticker*, or None when unavailable.
+
+        Exists because ``get_market_price`` returns a LAST/MID price, and a
+        marketable limit has to reach the OPPOSITE side of the book. Pricing a
+        buy at ``mid × (1 + cap)`` fills only when the cap happens to exceed the
+        half-spread — fine in RTH, hopeless in a thin extended book where the
+        spread can be several hundred bp, which is where the measured off-hours
+        fill rate of ~5% came from.
+
+        Default: unsupported (None), and every caller must degrade to the
+        mid-based cap rather than refusing to trade.
         """
         return None
 

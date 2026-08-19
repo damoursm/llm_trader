@@ -197,6 +197,7 @@ def fetch_move_context(today: Optional[date] = None) -> Optional[MOVEContext]:
             end=end,
             auto_adjust=True,
             progress=False,
+            timeout=30,
         )
         if data is not None and not data.empty:
             # Single-ticker download returns flat columns

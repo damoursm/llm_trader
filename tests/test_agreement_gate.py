@@ -1,19 +1,28 @@
-"""Agreement floor (actionable-filter Gate 1b, 2026-07-20).
+"""Agreement floor (actionable-filter Gate 1b, 2026-07-20) — DECOMMISSIONED OFF
+2026-08-17.
 
-CLAUDE.md documents "a single strong signal source never produces a BUY/SELL
-regardless of score" as a baseline invariant, but a 2026-07-20 audit found NO
-pipeline gate actually enforced it — sources_agreeing >= 2 was only a PROMPT
-INSTRUCTION the LLM was trusted to self-apply. This gate makes it mechanical:
-pipeline._passes_agreement_gate drops a BUY/SELL whose OWN direction matches the
-aggregator's sig.direction (the common "echo" case) when sig.sources_agreeing is
-below the configured floor. A genuine LLM override (direction != sig.direction)
-or a missing signal passes unchecked — sources_agreeing isn't attributable to a
-call the aggregator didn't itself make.
+The gate dropped a BUY/SELL whose OWN direction matched the aggregator's
+sig.direction (the common "echo" case) when sig.sources_agreeing was below the
+configured floor; an LLM override or a missing signal passed unchecked. The
+pivot-basis gate funnel measured it wrong-signed twice (the dropped cohort
+outperforms the survivors: gate value −0.168pp, re-run −0.062pp) and it fires
+on ~0.7% of candidates under the rank-basis bands, so it was switched off (user
+directive, 2026-08-17) — default False AND .env false, the same
+revivable-dead-branch convention as the retired synthesis arms. The mechanics
+below stay tested under explicit opt-in so flipping the flag back restores a
+working gate.
 """
 
-from config.settings import settings
+from config.settings import Settings, settings
 from src.pipeline import _passes_agreement_gate
 from src.models import TickerSignal
+
+
+def test_gate_is_decommissioned_off_by_default():
+    """The 2026-08-17 decommission: the CODE default is False, so a fresh
+    environment (no .env) cannot silently resurrect the wrong-signed gate.
+    The live .env pins ENABLE_AGREEMENT_GATE=false on top."""
+    assert Settings.model_fields["enable_agreement_gate"].default is False
 
 
 def _sig(direction="BULLISH", sources_agreeing=0):

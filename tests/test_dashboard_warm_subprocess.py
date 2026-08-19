@@ -207,13 +207,60 @@ def test_snapshot_round_trips_so_a_restart_starts_warm(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "_repo_root", lambda: str(tmp_path))
     src = tmp_path / "src.pkl"
     with open(src, "wb") as fh:
-        pickle.dump({"ver": "run-1", "cache": {
+        pickle.dump({"ver": "run-1", "code": data._code_fingerprint(), "cache": {
             "k": pickle.dumps({"ts": time.time(), "data": "warmed", "ver": "run-1"})}}, fh)
 
     data._save_snapshot(str(src))
     data._perf_cache.clear()
     data._load_snapshot()
     assert data._perf_cache["k"]["data"] == "warmed"
+
+
+def test_a_snapshot_from_different_code_is_discarded(tmp_path, monkeypatch):
+    """2026-08-17: the cache is versioned by DATA (run_id) and was blind to code.
+    When broker_forensics' fill_rate grew per_retry/per_trade sub-dicts, the
+    restored snapshot still held the OLD shape — the restore succeeded, the
+    accessor returned a dict no consumer understood, and the UI rendered '–'
+    with nothing to say why. Indistinguishable from 'no data yet'."""
+    monkeypatch.setattr(data, "_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(data, "_data_version", lambda: "run-1")
+    src = tmp_path / "src.pkl"
+    with open(src, "wb") as fh:
+        pickle.dump({"ver": "run-1", "code": "STALEFINGERPRINT", "cache": {
+            "k": pickle.dumps({"ts": time.time(), "data": "old-shape", "ver": "run-1"})}}, fh)
+    data._save_snapshot(str(src))
+
+    data._perf_cache.clear()
+    data._load_snapshot()
+    assert data._perf_cache == {}, "a snapshot from different code was restored"
+
+
+def test_a_snapshot_from_the_same_code_is_restored(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(data, "_data_version", lambda: "run-1")
+    monkeypatch.setattr(data, "_code_fingerprint", lambda: "SAMEFINGERPRINT")
+    src = tmp_path / "src.pkl"
+    with open(src, "wb") as fh:
+        pickle.dump({"ver": "run-1", "code": "SAMEFINGERPRINT", "cache": {
+            "k": pickle.dumps({"ts": time.time(), "data": "warmed", "ver": "run-1"})}}, fh)
+    data._save_snapshot(str(src))
+
+    data._perf_cache.clear()
+    data._load_snapshot()
+    assert data._perf_cache["k"]["data"] == "warmed"
+
+
+def test_the_worker_stamps_the_code_fingerprint(tmp_path, monkeypatch):
+    """Parity: the child must WRITE the stamp the parent checks, or every
+    snapshot is discarded and the sweep runs on every boot forever."""
+    from dashboard import warm_worker
+    monkeypatch.setattr(data, "_data_version", lambda: "run-7")
+    monkeypatch.setattr(data, "warm_caches", lambda reason="": None)
+    out = tmp_path / "out.pkl"
+    assert warm_worker.main(str(out)) == 0
+    with open(out, "rb") as fh:
+        blob = pickle.load(fh)
+    assert blob.get("code") == data._code_fingerprint()
 
 
 def test_a_current_snapshot_suppresses_the_restart_sweep(tmp_path, monkeypatch):
@@ -224,7 +271,7 @@ def test_a_current_snapshot_suppresses_the_restart_sweep(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "_data_version", lambda: "run-1")
     src = tmp_path / "src.pkl"
     with open(src, "wb") as fh:
-        pickle.dump({"ver": "run-1", "cache": {
+        pickle.dump({"ver": "run-1", "code": data._code_fingerprint(), "cache": {
             "k": pickle.dumps({"ts": time.time(), "data": "warmed", "ver": "run-1"})}}, fh)
     data._save_snapshot(str(src))
 
@@ -240,7 +287,7 @@ def test_a_stale_snapshot_still_triggers_the_sweep(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "_data_version", lambda: "run-2")
     src = tmp_path / "src.pkl"
     with open(src, "wb") as fh:
-        pickle.dump({"ver": "run-1", "cache": {
+        pickle.dump({"ver": "run-1", "code": data._code_fingerprint(), "cache": {
             "k": pickle.dumps({"ts": time.time(), "data": "old", "ver": "run-1"})}}, fh)
     data._save_snapshot(str(src))
 

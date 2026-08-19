@@ -241,6 +241,7 @@ def fetch_global_macro_context(today: Optional[date] = None) -> Optional[GlobalM
             end=end,
             auto_adjust=True,
             progress=False,
+            timeout=30,
         )
     except Exception as e:
         logger.warning(f"[global_macro] yfinance download failed: {e}")

@@ -355,7 +355,13 @@ def _extended_session_weight_overlay(profile: dict) -> dict:
             out[m] = out[m] * fresh_mult
     return out
 
-# Put/call contrarian score mapping
+# Put/call contrarian score mapping — the LABEL fallback only since 2026-08-16.
+# The live path scores CONTINUOUSLY from the raw ratio (see _pc_ratio_score):
+# the label map quantized 1,230 panel rows onto FOUR values (±0.35/±0.7), which
+# collapsed each day's ~24-name cross-section into ≤4 rank-tie blocks — the
+# decile curve was tie-block noise and the payoff-shaping fit on it flipped
+# out-of-sample (ΔIC −0.269, the 2026-08-16 shape audit). Same disease and same
+# cure as the news/insider continuity pass. Epoch "put_call".
 _PC_SIGNAL_SCORE = {
     "EXTREME_PUTS":  +0.70,
     "PUTS_HEAVY":    +0.35,
@@ -363,6 +369,22 @@ _PC_SIGNAL_SCORE = {
     "CALLS_HEAVY":   -0.35,
     "EXTREME_CALLS": -0.70,
 }
+
+# Per-side log scales anchored to the OLD extreme values at their documented
+# thresholds (put_call.py: puts side full at ratio 2.0, calls side full at 0.3),
+# so the continuous curve is the step map's own quantity with the steps removed:
+# tanh(ln(2.0)/0.80) = +0.70 and tanh(ln(0.3)/1.39) = −0.70.
+_PC_LOG_SCALE_PUTS = 0.80
+_PC_LOG_SCALE_CALLS = 1.39
+
+
+def _pc_ratio_score(ratio: float) -> float:
+    """Continuous contrarian put/call score from the RAW ratio (+ = puts-heavy
+    fear = contrarian bullish, the panel-supported orientation)."""
+    import math
+    r = min(20.0, max(0.05, float(ratio)))
+    scale = _PC_LOG_SCALE_PUTS if r >= 1.0 else _PC_LOG_SCALE_CALLS
+    return round(math.tanh(math.log(r) / scale), 4)
 
 # Sector → ETF mapping for sector-alignment second pass
 _SECTOR_MAP: dict = {
@@ -1310,10 +1332,21 @@ def _insider_score(
 
 
 def _put_call_score_for(ticker: str, put_call_context) -> float:
+    """Continuous since 2026-08-16 (epoch "put_call"): score from the raw
+    ratio so two puts-heavy names at 1.6 and 3.0 no longer share a value; the
+    5-label step map remains the fallback for rows without a usable ratio.
+    Coverage is unchanged — the fetcher still surfaces only the extremes, so
+    the un-surfaced middle abstains at 0.0 exactly as before."""
     if put_call_context is None:
         return 0.0
     for sig in put_call_context.ticker_signals:
         if sig.ticker.upper() == ticker.upper():
+            ratio = getattr(sig, "put_call_ratio", None)
+            try:
+                if ratio is not None and float(ratio) > 0:
+                    return _pc_ratio_score(float(ratio))
+            except (TypeError, ValueError):
+                pass
             return _PC_SIGNAL_SCORE.get(sig.signal, 0.0)
     return 0.0
 
@@ -1537,7 +1570,13 @@ def _raw_confidence_scale(combine_source: str = "weighted") -> float:
     own 2026-07-27 fix was written to remove).
     """
     if str(combine_source or "").lower() == "ml":
-        return float(getattr(settings, "ml_raw_confidence_scale", 0.0658))
+        # SELF-CALIBRATING since 2026-08-18: the divisor is a saturation
+        # control and the stackers' conviction scale moves with every weekly
+        # retrain, so it is re-solved from the panel (TTL-cached, single-flight)
+        # to pin the ML saturation SHARE at the weighted arm's. Fail-soft
+        # returns the static setting, which stays the documented prior.
+        from src.signals.ml_scale import calibrate_ml_confidence_scale
+        return float(calibrate_ml_confidence_scale())
     if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
         return float(getattr(settings, "rank_raw_confidence_scale", 0.642))
     return 0.5
@@ -2291,12 +2330,19 @@ def build_signals(
         # ── Method 1: News sentiment (the LEVEL) ──────────────────────────
         sentiment_score = 0.0
         news_rationale  = "News sentiment disabled."
+        news_meta: dict = {}
         relevant_articles: list = []
         if use_news or use_sent_velocity:
             relevant_articles = filter_relevant_articles(ticker, articles)
         if use_news:
-            sentiment_score, news_rationale = analyse_sentiment(
+            _sent = analyse_sentiment(
                 ticker, relevant_articles, force_engine=force_sentiment_engine)
+            # Positional, arity-tolerant: the live function returns
+            # (score, rationale, meta) since 2026-08-15, but a legacy 2-tuple
+            # (test doubles) must keep working — meta is additive event-dataset
+            # metadata (catalyst class + raw verdict), never a decision input.
+            sentiment_score, news_rationale = _sent[0], _sent[1]
+            news_meta = _sent[2] if len(_sent) > 2 and isinstance(_sent[2], dict) else {}
 
         # ── Method 1b: Sentiment velocity (Δsentiment, not level) ─────────
         # Rate of change of news tone (recent window − prior window). The change
@@ -2329,6 +2375,19 @@ def build_signals(
                 news_shock_score_v = compute_news_shock(
                     sentiment_score, news_recency_mass_v,
                     _news_baselines.get(ticker.upper()) or _news_baselines.get(ticker))
+
+        # ── Method 1d: catalyst_tilt (2026-08-15, PANEL-FIRST weight 0) ────
+        # The news read × a learned per-(catalyst, side) orientation from the
+        # news-event dataset (signals/catalyst_tilt.py, self-calibrating,
+        # shrunk toward ABSTAIN so it never duplicates `news`). Needs the v4
+        # catalyst capture in news_meta; abstains without one. Stays OUT of
+        # method_score_map like news_shock — panel IC first.
+        catalyst_tilt_v = 0.0
+        if use_news and settings.enable_catalyst_tilt:
+            from src.signals.catalyst_tilt import (calibrate_catalyst_tilt,
+                                                   compute_catalyst_tilt_score)
+            catalyst_tilt_v = compute_catalyst_tilt_score(
+                sentiment_score, news_meta.get("catalyst"), calibrate_catalyst_tilt())
 
         # ── Method 2: Technical analysis ─────────────────────────────────
         tech_result: TechnicalResult = EMPTY_RESULT
@@ -2426,9 +2485,10 @@ def build_signals(
             (market_momentum_score, market_momentum_1m_pct,
              market_momentum_3m_pct, _) = compute_market_relative_momentum_score(ticker)
 
-        # ── Method 10: Money Flow Indicators ─────────────────────────────
-        # Composite of MFI (14-period volume-weighted RSI), CMF (20-period
-        # Chaikin Money Flow), and OBV slope z-score.
+        # ── Method 10: Money Flow (Chaikin CMF) ──────────────────────────
+        # v3 (2026-08-16): CMF alone — the 3y gated battery measured the
+        # MFI/OBV terms as anti-predictive/informationless dilution. mfi_value
+        # is still returned as an aux display reading (prompt + email).
         # Positive = institutional accumulation; negative = distribution.
         money_flow_score = 0.0
         mfi_value        = 50.0
@@ -2496,6 +2556,18 @@ def build_signals(
         dloc_rev_v = dloc_loc_pct_v = 0.0
         if settings.enable_dloc_rev:
             dloc_rev_v, dloc_loc_pct_v = compute_dloc_rev_score(ticker, df=_shared_df)
+        # news_bear_fresh (2026-08-15, PANEL-FIRST weight 0): the bearish news
+        # read scaled by how much of it the 3-session tape has already priced —
+        # abstains at a 2σ aligned decline (never short into a hole), boosted
+        # ≤1.5x when the tape ignored the bad news. Bull/zero news abstains, so
+        # the panel measures exactly the interaction, never a news duplicate.
+        # Stays OUT of method_score_map (no combine/coherence/votes), like
+        # news_shock; reaches the panel via the TickerSignal field.
+        news_bear_fresh_v = 0.0
+        if settings.enable_news_bear_fresh and use_news:
+            from src.signals.news_bear_fresh import compute_news_bear_fresh
+            news_bear_fresh_v, _nbf_z3 = compute_news_bear_fresh(
+                ticker, sentiment_score, df=_shared_df)
 
         # ── Method 10e: Tier-2 panel-first methods (weight 0, same contract) ──
         # TTM squeeze (vol coil/release, momentum-signed), IV term-structure
@@ -2804,9 +2876,20 @@ def build_signals(
                 if fundamental_factors:
                     _ff = fundamental_factors.get(ticker) or fundamental_factors.get(ticker.upper())
                     if _ff:
+                        # f_short_squeeze is EXCLUDED from the additive sum
+                        # (2026-08-16 shape audit): the factor is a pure short-
+                        # crowding MAGNITUDE (always ≥ 0 by construction —
+                        # fundamentals.py left its direction "for the IC to
+                        # reveal"), and the revealed payoff is a REPLICATED
+                        # U — the middle of the crowding range is BEARISH
+                        # (extremes-vs-middle contrast +1.70/+1.37pp in the two
+                        # panel halves, ~t 3.3) — so consuming it as linear-
+                        # positive pushed measured-bearish names bullish. It
+                        # keeps scoring/persisting (panel-first accrual) until
+                        # a proper U mapping is justified by more history.
                         x += settings.fundamental_factor_weight * (
                             float(_ff.get("f_value", 0.0)) + float(_ff.get("f_quality", 0.0))
-                            + float(_ff.get("f_growth", 0.0)) + float(_ff.get("f_short_squeeze", 0.0)))
+                            + float(_ff.get("f_growth", 0.0)))
 
                 # Trend-predictability directional overlay (additive): the four
                 # scores are already oriented (continuation OR reversal, learned
@@ -2971,8 +3054,17 @@ def build_signals(
                 sentiment_recent=round(sent_recent, 3),
                 sentiment_prior=round(sent_prior, 3),
                 news_shock_score=round(news_shock_score_v, 4),
+                news_bear_fresh_score=round(news_bear_fresh_v, 4),
+                catalyst_tilt_score=round(catalyst_tilt_v, 4),
                 news_article_count=int(news_article_count_v),
                 news_recency_mass=round(news_recency_mass_v, 4),
+                # News-event dataset fields (2026-08-15): the LLM's catalyst
+                # class + its RAW verdict (pre evidence/diversity scalers), so
+                # `python -m src.analysis.news_events` can associate event type
+                # and magnitude with the pivot forward return.
+                news_catalyst=news_meta.get("catalyst"),
+                news_raw_score=(None if news_meta.get("raw_score") is None
+                                else round(float(news_meta["raw_score"]), 4)),
                 technical_score=round(technical_score, 3),
                 massive_score=round(massive_score, 3),
                 insider_score=round(insider_sc, 6),   # see sentiment_score above

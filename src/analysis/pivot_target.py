@@ -76,34 +76,23 @@ def pivot_basis() -> str:
     return f"hl{_min_move_pct():g}"
 
 
-def _resolved_pivots(c: np.ndarray, h: np.ndarray, lo: np.ndarray):
-    """The single causal pivot SEQUENCE as a THRESHOLD zigzag on highs/lows:
-    ``(indices, prices, is_peak_flags, confirm_indices)``.
-
-    A swing high is the running maximum of the HIGH series; it becomes a PEAK
-    pivot only once some later bar's LOW prints ``pivot_min_move_pct`` percent
-    below it (the mirror on lows for troughs) — so every leg moved at least
-    the threshold and sub-threshold wiggles never become pivots (2026-08-12
-    user directive: weak runs aren't worth the spread). ``confirm_indices[k]``
-    is the bar at which pivot ``k`` became knowable — the VARIABLE-lag
-    confirmation seam that replaced the fixed one-bar lag: leg features at bar
-    *i* may only use pivots with ``conf <= i``, and a truncated series simply
-    never emits an unconfirmed pivot, which is the whole point-in-time story.
-
-    Per bar the machine does exactly ONE of extend or reverse, and the
-    reversal always tests against the extreme as of the PRIOR bar: a bar whose
-    own range spans the threshold must not confirm a reversal against the
-    extreme it itself just set (with typical daily ranges above 1% that
-    self-trigger degenerates into a pivot on almost every bar — caught by the
-    monotone-series probe). Extension wins an outside bar (continuation-
-    favoring, deterministic; intra-bar order is unknowable from daily data),
-    so its reversal, if real, confirms on a later bar against the updated
-    extreme. Ties keep the FIRST extreme bar."""
+def _pivot_scan(c: np.ndarray, h: np.ndarray, lo: np.ndarray):
+    """The zigzag pass underlying ``_resolved_pivots``, additionally returning
+    the machine's terminal state: ``(resolved, pending)`` where ``resolved`` is
+    the usual ``(indices, prices, is_peak_flags, confirm_indices)`` and
+    ``pending`` is the still-UNCONFIRMED running candidate
+    ``(ext_idx, ext_price, is_peak)`` — the extreme the NEXT pivot will be, if
+    and when its ``pivot_min_move_pct`` reversal prints, still extending with
+    every new extreme until then. ``None`` before the first pivot confirms
+    (direction unknown). The loop is the single implementation; the pending
+    state is exactly what the confirmation seam withholds from the resolved
+    sequence, so it must only ever feed PROVISIONAL surfaces (live trade
+    monitoring), never a settled label."""
     n = len(c)
     empty = (np.asarray([], dtype=int), np.asarray([], dtype=float),
              np.asarray([], dtype=bool), np.asarray([], dtype=int))
     if n == 0:
-        return empty
+        return empty, None
     thr = _min_move_pct() / 100.0
     idxs: List[int] = []
     prices: List[float] = []
@@ -157,8 +146,97 @@ def _resolved_pivots(c: np.ndarray, h: np.ndarray, lo: np.ndarray):
                 up = True
                 ext_i, ext_px = i, float(h[i])
 
+    pending = None if up is None else (int(ext_i), float(ext_px), bool(up))
     return (np.asarray(idxs, dtype=int), np.asarray(prices, dtype=float),
-            np.asarray(flags, dtype=bool), np.asarray(confs, dtype=int))
+            np.asarray(flags, dtype=bool), np.asarray(confs, dtype=int)), pending
+
+
+def _resolved_pivots(c: np.ndarray, h: np.ndarray, lo: np.ndarray):
+    """The single causal pivot SEQUENCE as a THRESHOLD zigzag on highs/lows:
+    ``(indices, prices, is_peak_flags, confirm_indices)``.
+
+    A swing high is the running maximum of the HIGH series; it becomes a PEAK
+    pivot only once some later bar's LOW prints ``pivot_min_move_pct`` percent
+    below it (the mirror on lows for troughs) — so every leg moved at least
+    the threshold and sub-threshold wiggles never become pivots (2026-08-12
+    user directive: weak runs aren't worth the spread). ``confirm_indices[k]``
+    is the bar at which pivot ``k`` became knowable — the VARIABLE-lag
+    confirmation seam that replaced the fixed one-bar lag: leg features at bar
+    *i* may only use pivots with ``conf <= i``, and a truncated series simply
+    never emits an unconfirmed pivot, which is the whole point-in-time story.
+
+    Per bar the machine does exactly ONE of extend or reverse, and the
+    reversal always tests against the extreme as of the PRIOR bar: a bar whose
+    own range spans the threshold must not confirm a reversal against the
+    extreme it itself just set (with typical daily ranges above 1% that
+    self-trigger degenerates into a pivot on almost every bar — caught by the
+    monotone-series probe). Extension wins an outside bar (continuation-
+    favoring, deterministic; intra-bar order is unknowable from daily data),
+    so its reversal, if real, confirms on a later bar against the updated
+    extreme. Ties keep the FIRST extreme bar. Implemented by ``_pivot_scan``;
+    this wrapper discards the pending (unconfirmed) state."""
+    return _pivot_scan(c, h, lo)[0]
+
+
+def live_next_pivot(c: np.ndarray, h: np.ndarray, lo: np.ndarray, i0: int) -> Optional[dict]:
+    """The LIVE view of "the first pivot after bar ``i0``" — settled when its
+    confirming reversal has printed, PROVISIONAL until then.
+
+    Returns ``{"price", "idx", "is_peak", "resolved", "confirm_idx"}`` or
+    ``None`` (short window / no anchor / direction never established).
+
+    Semantics, in resolution order:
+    - If a CONFIRMED pivot with index > ``i0`` exists, that is the answer
+      (``resolved=True``) — identical pivot sequence as ``next_pivot_targets``,
+      but WITHOUT the ``MAX_PIVOT_DAYS`` training cap: a monitoring surface
+      wants the swing's actual end, the cap only excludes stale rows from
+      training.
+    - Otherwise the answer is the machine's PENDING candidate — the running
+      leg extreme, which by construction keeps extending through sub-threshold
+      wiggles and freezes only when the ``pivot_min_move_pct`` reversal prints
+      (``resolved=False``, ``confirm_idx=None``).
+    - If the pending candidate's own bar is ≤ ``i0`` (the anchor sits past the
+      leg's extreme-so-far), the first pivot after ``i0`` belongs to a LATER
+      leg. We take the as-if-the-current-leg-stands view: alternate forward —
+      the opposite-side running extreme strictly after the candidate — until
+      the index clears ``i0``. Genuinely ambiguous (a new leg extreme would
+      re-route it), which is exactly what provisional means; ties keep the
+      first bar, matching the machine.
+    - If NO completed bar after the anchor has printed yet (an entry on/after
+      the newest session), the freshest running candidate is returned as a
+      LEG-CONTINUATION SEED (``seed=True``, its bar at/before the anchor) —
+      the weakest provisional state, superseded the moment a completed bar
+      lands past the anchor. All other returns carry ``seed=False``.
+
+    PROVISIONAL values must never feed a settled-label surface (panel labels,
+    calibrations, training sets) — they are biased small early in a leg and
+    revisable by construction. Trade monitoring / open-position evaluation
+    only."""
+    n = len(c)
+    if n < 50 or not (0 <= int(i0) < n):
+        return None
+    i0 = int(i0)
+    (P, PP, FL, CF), pending = _pivot_scan(c, h, lo)
+    k = int(np.searchsorted(P, i0, side="right"))
+    if k < len(P):
+        return {"price": float(PP[k]), "idx": int(P[k]), "is_peak": bool(FL[k]),
+                "resolved": True, "confirm_idx": int(CF[k]), "seed": False}
+    if pending is None:
+        return None
+    ext_i, ext_px, is_peak = pending
+    while ext_i <= i0:
+        seg0 = ext_i + 1
+        if seg0 >= n:
+            return {"price": float(ext_px), "idx": int(ext_i), "is_peak": bool(is_peak),
+                    "resolved": False, "confirm_idx": None, "seed": True}
+        if is_peak:
+            j = seg0 + int(np.argmin(lo[seg0:]))
+            ext_i, ext_px, is_peak = j, float(lo[j]), False
+        else:
+            j = seg0 + int(np.argmax(h[seg0:]))
+            ext_i, ext_px, is_peak = j, float(h[j]), True
+    return {"price": float(ext_px), "idx": int(ext_i), "is_peak": bool(is_peak),
+            "resolved": False, "confirm_idx": None, "seed": False}
 
 
 def next_pivot_targets(c: np.ndarray, h: np.ndarray, lo: np.ndarray):

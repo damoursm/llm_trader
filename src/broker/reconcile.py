@@ -55,7 +55,7 @@ from loguru import logger
 
 from config.settings import settings
 from src.broker import Broker, FillSummary, OrderRequest, get_broker
-from src.broker.base import OrderResult
+from src.broker.base import OrderResult, Quote
 from src.broker.fx import usd_per_unit
 from src.broker.sizing import shares_for, shares_for_notional, within_caps
 from src.db import repo
@@ -83,7 +83,84 @@ def _cost_bps(side: str, model: float, fill: float) -> Optional[float]:
     return round(sign * (fill - model) / model * 10000, 1)
 
 
-def _limit_price_for(side: str, model: float, outside_rth: bool = False) -> Optional[float]:
+def _quote_for(broker, ticker: str) -> Optional["Quote"]:
+    """Live two-sided quote, or None. Never raises and never blocks the caller:
+    a broker without ``get_quote`` (or any failure) degrades to the mid-based
+    cap, which is the behaviour that shipped before spread-aware limits."""
+    if not getattr(settings, "broker_spread_aware_limits", False):
+        return None
+    try:
+        return broker.get_quote(ticker)
+    except Exception as e:
+        logger.debug(f"[broker] quote fetch failed for {ticker}: {e}")
+        return None
+
+
+def _session_cap_bps(outside_rth: bool) -> float:
+    """The configured cost cap in bp for the CURRENT session."""
+    if outside_rth:
+        from src.performance.market_calendar import current_session
+        return float(settings.broker_limit_cap_bps_overnight
+                     if current_session() == "overnight"
+                     else settings.broker_limit_cap_bps_extended)
+    return float(settings.broker_limit_cap_bps)
+
+
+def _effective_cap_bps(outside_rth: bool, quote: Optional["Quote"]) -> float:
+    """Cost cap widened, when needed, to actually CROSS the quoted spread.
+
+    A fixed bp cap conflates two different things: how far the price has run
+    from our decision, and how wide the book simply is right now. The limit is
+    priced off a LAST/MID (``get_market_price`` never returns the ask), so an
+    order is marketable only when ``cap >= half-spread``. That holds in RTH and
+    fails badly off-hours, where a thin book can quote hundreds of bp — which is
+    why off-hours filled ~5% while RTH filled ~57%, and why the fills that DID
+    happen consumed only a small slice of their cap: those were the tight names.
+    The wide ones never filled at all, so they never appeared in the statistic.
+
+    So when a real two-sided quote exists, the cap is raised to cover the
+    half-spread times ``broker_spread_cap_mult`` — enough to reach the far side
+    with a little room — never LOWERED below the configured cap, and always
+    bounded by ``broker_limit_cap_bps_max``. With no quote, the configured cap
+    stands unchanged.
+    """
+    base = _session_cap_bps(outside_rth)
+    if not getattr(settings, "broker_spread_aware_limits", False) or quote is None:
+        return base
+    # OFF-RTH WIDENING IS OFF BY MEASUREMENT (2026-08-17), not by caution.
+    #
+    # Widening only ever creates fills whose half-spread EXCEEDED the old cap —
+    # orders that already filled are untouched, since a marketable limit executes
+    # at the touch. So the newly-fillable off-hours cohort pays at least the old
+    # cap per side: >=160 bp round trip extended, >=300 bp overnight.
+    #
+    # What that cohort earns, GROSS, does not come close. Real closed trades by
+    # entry session: extended +1.09% mean / +0.07% median (n=140), overnight
+    # -0.46% / +0.07% (n=71). The simulated panel agrees at scale: extended
+    # -0.09% mean / -0.66% median (n=3,883), overnight -0.14% / -0.64%
+    # (n=11,274). Every one of those is far below the 1.60% / 3.00% a round trip
+    # would need, so enabling those fills books a measured loss however good the
+    # signal is. Worse, the newly-fillable names are the WIDE-spread ones — the
+    # thin tail of an already break-even population.
+    #
+    # RTH is the opposite case and keeps the widening: fills there measured p90
+    # 19.1 bp against the old 20 bp cap (binding), spreads are tight so the
+    # widening rarely triggers at all, and gross returns are not being asked to
+    # clear a 160 bp hurdle.
+    if outside_rth and not getattr(settings, "broker_spread_aware_off_rth", False):
+        return base
+    spread = quote.spread_bps
+    if not spread or spread <= 0:
+        return base
+    mult = float(getattr(settings, "broker_spread_cap_mult", 1.5) or 1.5)
+    ceiling = float(getattr(settings, "broker_limit_cap_bps_max", 0.0) or 0.0)
+    needed = (spread / 2.0) * mult
+    eff = max(base, needed)
+    return min(eff, ceiling) if ceiling > 0 else eff
+
+
+def _limit_price_for(side: str, model: float, outside_rth: bool = False,
+                     quote: Optional["Quote"] = None) -> Optional[float]:
     """Marketable-limit cap: model price ± the session's cap in the adverse
     direction, rounded *away* from the model to a valid US-equity tick so the
     cap is never tighter than configured. Off-RTH uses the wider
@@ -92,17 +169,27 @@ def _limit_price_for(side: str, model: float, outside_rth: bool = False) -> Opti
     cancelled next tick, and chase the market on stale data) — and the
     OVERNIGHT session the wider-still ``broker_limit_cap_bps_overnight``
     (derived live from the clock: the session is fixed for a tick in practice).
-    None for unusable model prices."""
+    None for unusable model prices.
+
+    ``quote`` (optional) makes the cap SPREAD-AWARE — see ``_effective_cap_bps``
+    — and then guarantees the limit actually REACHES the far side of the book
+    (ask for a buy, bid for a sell) whenever that price sits inside the
+    effective cap. Reaching it costs nothing: a marketable limit executes at the
+    touch, so the limit only decides WHETHER the order can trade, not the price
+    paid. Without a quote the behaviour is byte-for-byte the old mid-based cap.
+    """
     if not model or model <= 0:
         return None
-    if outside_rth:
-        from src.performance.market_calendar import current_session
-        bps = float(settings.broker_limit_cap_bps_overnight
-                    if current_session() == "overnight"
-                    else settings.broker_limit_cap_bps_extended)
-    else:
-        bps = float(settings.broker_limit_cap_bps)
+    bps = _effective_cap_bps(outside_rth, quote)
     cap = model * (1 + bps / 10000.0) if side == "BUY" else model * (1 - bps / 10000.0)
+    far = quote.opposite(side) if quote is not None else None
+    if far:
+        # Move the limit TO the far side when the cap already covers it. Never
+        # past the cap — that ceiling is the cost discipline, and an order the
+        # cap cannot reach is one we have decided not to pay for.
+        cap = max(cap, far) if side == "BUY" else min(cap, far)
+        cap = min(cap, model * (1 + bps / 10000.0)) if side == "BUY" \
+            else max(cap, model * (1 - bps / 10000.0))
     tick = 0.01 if model >= 1.0 else 0.0001
     steps = cap / tick
     cap = (math.ceil(steps) if side == "BUY" else math.floor(steps)) * tick
@@ -476,7 +563,8 @@ def _submit_with_retry(broker: Broker, req: OrderRequest, model_price: float,
             broker.connect()   # idempotent; revives a dropped session
         except Exception:
             pass
-        cap = _limit_price_for(req.side, model_price, req.outside_rth)
+        cap = _limit_price_for(req.side, model_price, req.outside_rth,
+                               _quote_for(broker, req.ticker))
         if cap:
             req = replace(req, order_type="LMT", limit_price=cap)
         res = broker.submit_order(req)
@@ -555,6 +643,27 @@ def _order_is_gone(broker: Broker, ref: str) -> bool:
         return False
 
 
+def _working_refs(broker: Broker) -> Optional[set]:
+    """The set of client_refs CONFIRMED working at the broker, or None if the
+    broker could not be read.
+
+    Deliberately not ``not _order_is_gone(...)``: that helper answers "is this
+    order dead?" and returns False when the broker is unreadable, so an unknown
+    order reads as alive. That fail-OPEN is right for the cancel path (leave the
+    leg alone this tick) and exactly wrong for resting, where the fatal case is
+    keeping a leg parked against an order that no longer exists — a DAY LMT
+    expired at the session close leaves a 'Submitted' leg that would never be
+    resubmitted, and for an EXIT that means a position that must flatten simply
+    never does. So this returns None on any read failure and the caller declines
+    to rest. Fetched ONCE per sync rather than per leg.
+    """
+    try:
+        return {(o.client_ref or "") for o in broker.get_open_orders()}
+    except Exception as e:
+        logger.debug(f"[broker] open-order read failed, not resting this tick: {e}")
+        return None
+
+
 def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
                            positions: Optional[dict] = None,
                            sync_started: Optional[datetime] = None) -> bool:
@@ -592,6 +701,11 @@ def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
     max_min = int(settings.broker_unfilled_cancel_minutes)
     if not tick_scoped and max_min <= 0:
         return False
+    rest_ok = bool(getattr(settings, "broker_rest_unfilled_orders", False))
+    rest_bps = float(getattr(settings, "broker_rest_max_drift_bps", 0.0) or 0.0)
+    # One broker read for the whole pass. None ⇒ unreadable ⇒ rest nothing.
+    working = _working_refs(broker) if (rest_ok and rest_bps > 0) else None
+    n_rested = 0
     changed = False
     for t in trades:
         for prefix, intent, want_status in (("broker_", "ENTRY", "OPEN"),
@@ -608,10 +722,45 @@ def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
             sub_at = t.get(f"{prefix}submitted_at")
             age = _age_minutes(sub_at)
             stale = bool(tick_scoped and sync_started and _predates(sub_at, sync_started))
-            if not stale and max_min > 0 and age is not None and age >= max_min:
+            aged_out = bool(max_min > 0 and age is not None and age >= max_min)
+            if not stale and aged_out:
                 stale = True
             if not stale:
                 continue
+            # REST INSTEAD OF KILL while the price is still near the decision.
+            # A one-tick lifetime left the order in the book ~1.7% of the time,
+            # which is the whole reason off-hours fills sat near 5%. The order
+            # is a capped LMT, so resting cannot fill worse than its own limit;
+            # what resting adds is adverse selection, bounded here by drift.
+            # The age ceiling still wins, and so does a leg the pass below no
+            # longer wants (it never reaches this loop in a wanted state).
+            ref_now = t.get(f"{prefix}client_ref")
+            # Rest ONLY an order confirmed still working. A dead order (a DAY
+            # LMT expired at the session close) must fall through to the
+            # expiry handling below and be resubmitted — resting it parks the
+            # leg forever, and for an EXIT that leaves a position that has to
+            # flatten never flattening.
+            if (rest_ok and stale and not aged_out and rest_bps > 0
+                    and working is not None and ref_now in working):
+                # Each leg is judged against ITS OWN decision price: the entry
+                # leg against entry_price, the exit leg against exit_price.
+                # Using entry_price for both would measure an exit's drift from
+                # a price that may be days and many percent away, so a legitimate
+                # exit would be re-anchored every tick while a stale one rested.
+                anchor = (t.get("exit_price") or t.get("entry_price")) if intent == "EXIT" \
+                    else t.get("entry_price")
+                mark = _live_price(t["ticker"])
+                if anchor and mark:
+                    try:
+                        drift = abs(float(mark) - float(anchor)) / float(anchor) * 10_000.0
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        drift = None
+                    if drift is not None and drift <= rest_bps:
+                        n_rested += 1
+                        logger.debug(
+                            f"[broker] {t['ticker']} {intent} order resting "
+                            f"({drift:.0f} bp from decision ≤ {rest_bps:.0f}) — kept working")
+                        continue
             ref = t.get(f"{prefix}client_ref")
             try:
                 cancelled = bool(ref) and broker.cancel_order(ref)
@@ -668,6 +817,13 @@ def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
                 f"{intent} {t['ticker']} ({age_s}, from a previous tick) — "
                 "resubmitting re-anchored at the current mark"
             )
+    if n_rested:
+        report["orders_rested"] = report.get("orders_rested", 0) + n_rested
+        logger.info(
+            f"[broker] {n_rested} unfilled order(s) LEFT RESTING — still within "
+            f"{rest_bps:.0f} bp of their decision price. They keep working the book "
+            f"between ticks instead of being cancelled, which is what a one-tick "
+            f"lifetime cost in fills (measured 4.8% overnight / 56.6% RTH).")
     return changed
 
 
@@ -864,7 +1020,7 @@ def _flatten_orphan(broker: Broker, ticker: str, broker_qty: float,
         )
         return None
 
-    limit = _limit_price_for(side, live, outside_rth)
+    limit = _limit_price_for(side, live, outside_rth, _quote_for(broker, ticker))
     req = OrderRequest(
         ticker=ticker, side=side, quantity=qty,
         order_type="LMT", limit_price=limit,
@@ -1063,7 +1219,8 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
                 if qty <= 0:
                     continue
                 new_ref = f"{_leg_ref_base(t, prefix)}-r{n}"
-                limit = _limit_price_for(side, live, outside_rth)
+                limit = _limit_price_for(side, live, outside_rth,
+                                         _quote_for(broker, t["ticker"]))
                 res = _submit_with_retry(broker, OrderRequest(
                     ticker=t["ticker"], side=side, quantity=qty,
                     order_type="LMT", limit_price=limit,
@@ -1478,7 +1635,9 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 changed = True
                 continue
             side = _entry_side(t["action"])
-            limit = _limit_price_for(side, price, outside_rth) if use_limit else None
+            limit = (_limit_price_for(side, price, outside_rth,
+                                      _quote_for(broker, t["ticker"]))
+                     if use_limit else None)
             ref = t.get("recommendation_id") or f"{t.get('run_id', '')}-{t['ticker']}"
             if resubmit_n:
                 ref = f"{ref}-r{resubmit_n}"   # fresh ref per resubmission cycle
@@ -1566,7 +1725,9 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 live = _live_price(t["ticker"])
                 if live:
                     model = live
-            limit = _limit_price_for(side, model, outside_rth) if use_limit else None
+            limit = (_limit_price_for(side, model, outside_rth,
+                                      _quote_for(broker, t["ticker"]))
+                     if use_limit else None)
             ref = (t.get("recommendation_id") or t["ticker"]) + "-exit"
             if exit_resubmit_n:
                 ref = f"{ref}-r{exit_resubmit_n}"

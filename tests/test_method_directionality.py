@@ -49,31 +49,31 @@ def test_money_flow_sign_follows_the_tape():
     assert down < 0, f"falling tape should read bearish, got {down:+.3f}"
 
 
-def test_mfi_abstains_inside_the_neutral_band():
-    """MFI's contrarian reading is only standard at the extremes. Inside the
-    neutral band it must return exactly 0 (abstain) rather than inverting the
-    prevailing trend and cancelling the other components."""
-    from src.signals.money_flow import _mfi_contrarian_score
-    assert _mfi_contrarian_score(50.0) == 0.0
-    assert _mfi_contrarian_score(36.0) == 0.0
-    assert _mfi_contrarian_score(64.0) == 0.0
-    # Outside the band the contrarian sign applies: oversold bullish, overbought bearish.
-    assert _mfi_contrarian_score(20.0) == pytest.approx(1.0)
-    assert _mfi_contrarian_score(80.0) == pytest.approx(-1.0)
-    assert _mfi_contrarian_score(10.0) == pytest.approx(1.0)   # clamped
-    assert _mfi_contrarian_score(95.0) == pytest.approx(-1.0)  # clamped
-    # Monotonic through the ramp.
-    assert 0 < _mfi_contrarian_score(30.0) < 1.0
-    assert -1.0 < _mfi_contrarian_score(70.0) < 0
+def test_money_flow_v3_score_is_cmf_only():
+    """v3 (2026-08-16): the score is exactly tanh(tanh(cmf/0.15)/0.6) — the
+    3-year gated battery measured CMF alone at IC +0.048/t +11.8 vs the
+    composite's +0.035, with OBV informationless (t +0.97) and the contrarian
+    MFI term anti-predictive (t −2.72). MFI survives only as the aux display
+    value; it must NOT move the score."""
+    import numpy as np
+    from src.signals.money_flow import compute_money_flow_score
+    for df in (UP, DOWN, _series(0.0)):
+        score, mfi, cmf = compute_money_flow_score("TEST", df)
+        expected = round(float(np.tanh(np.tanh(cmf / 0.15) / 0.6)), 3)
+        assert score == pytest.approx(expected, abs=1e-9)
+        assert 0.0 <= mfi <= 100.0                     # aux value still returned
 
 
-def test_obv_slope_preserves_direction():
-    """The OBV term used a z-score against its own history, which measures
-    ACCELERATION: a steadily-falling OBV scored ~0 or even positive. It must
-    now carry the sign of the actual flow."""
-    from src.signals.money_flow import _compute_obv_z
-    assert _compute_obv_z(UP) > 0, "accumulation should be positive"
-    assert _compute_obv_z(DOWN) < 0, "distribution should be negative"
+def test_money_flow_tail_slice_matches_full_history():
+    """The scorer computes on the trailing slice for latency — outputs must be
+    IDENTICAL to a full-history compute (rolling windows at the last bar only
+    depend on the trailing rows)."""
+    from src.signals.money_flow import _TAIL_BARS, compute_money_flow_score
+    long_up = _series(+0.004, n=1200)
+    assert len(long_up) > _TAIL_BARS
+    full = compute_money_flow_score("TEST", long_up)
+    tail = compute_money_flow_score("TEST", long_up.tail(_TAIL_BARS))
+    assert full == tail
 
 
 def test_money_flow_stays_in_range():

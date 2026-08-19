@@ -115,13 +115,19 @@ def test_gate_is_inert_when_the_epoch_is_off(monkeypatch):
 
 def test_method_scores_have_the_same_guarantee():
     """The method-score half of the rule was already in place — assert it so the
-    two halves cannot drift apart."""
+    two halves cannot drift apart. Dates derive from the registry itself so a
+    method's epoch moving again (money_flow did: 07-24 → 08-16 at the v3
+    reform) breaks nothing — the test pins the MECHANISM, not any instant."""
+    from datetime import timedelta
+
     from src.signals.method_epochs import score_is_comparable, METHOD_SCORER_EPOCH
     assert "money_flow" in METHOD_SCORER_EPOCH
-    assert score_is_comparable("money_flow", "2026-07-01") is False
-    assert score_is_comparable("money_flow", "2026-07-26") is True
+    cutoff = METHOD_SCORER_EPOCH["money_flow"]
+    assert score_is_comparable("money_flow", (cutoff - timedelta(days=1)).isoformat()) is False
+    assert score_is_comparable("money_flow", (cutoff + timedelta(days=1)).isoformat()) is True
     # vwap gained an epoch 2026-08-11 (window 20 -> 5): its old rows are now
     # correctly NON-comparable, and a method with no epoch stays always-true.
     assert score_is_comparable("vwap", "2020-01-01") is False
-    assert score_is_comparable("vwap", "2026-08-12") is True
+    vw = METHOD_SCORER_EPOCH["vwap"]
+    assert score_is_comparable("vwap", (vw + timedelta(days=1)).isoformat()) is True
     assert score_is_comparable("tech", "2020-01-01") is True

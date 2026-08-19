@@ -1240,8 +1240,23 @@ class TickerSignal(BaseModel):
     # attention vs the ticker's own trailing baseline (signals/news_shock.py).
     # The two attention inputs are persisted so the baseline series accrues.
     news_shock_score: float = 0.0       # -1.0 to +1.0; 0 = abstain (no news / no baseline / not loud)
+    # news_bear_fresh (2026-08-15, panel-first weight 0 — signals/news_bear_fresh.py):
+    # bearish news scaled by tape freshness (0 at a 2σ aligned decline; ≤1.5x
+    # when un-fallen). Always ≤ 0; bull/zero news abstains at 0.0.
+    news_bear_fresh_score: float = 0.0
+    # catalyst_tilt (2026-08-15, panel-first weight 0 — signals/catalyst_tilt.py):
+    # news × learned per-(catalyst, side) orientation (may FLIP a read); 0.0 =
+    # abstain (no catalyst captured, thin/flat cell, or calibration unavailable).
+    catalyst_tilt_score: float = 0.0
     news_article_count: int = 0         # fresh (<7d) relevant articles this run
     news_recency_mass: float = 0.0      # Σ per-article recency weights (the attention quantity)
+    # News-event dataset (2026-08-15): the sentiment LLM's dominant catalyst
+    # class (sentiment.NEWS_CATALYST_TYPES; None = not captured — provider path,
+    # engine failure, or a pre-v4 cached verdict) and its RAW verdict before the
+    # evidence/diversity scalers. Joined vs the pivot forward return by
+    # `python -m src.analysis.news_events`.
+    news_catalyst: Optional[str] = None
+    news_raw_score: Optional[float] = None
     technical_score: float      # -1.0 to +1.0
     massive_score: float = 0.0  # -1.0 to +1.0  (Massive/Polygon server-side RSI+MACD composite — compared vs `tech`)
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)

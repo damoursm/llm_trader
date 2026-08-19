@@ -264,7 +264,7 @@ def _fetch_ticker_yf(ticker: str) -> Tuple[Optional[yf.Ticker], Optional[pd.Data
     while True:
         try:
             t = yf.Ticker(ticker)
-            hist = t.history(period="5d", interval="1d")
+            hist = t.history(period="5d", interval="1d", timeout=30)
             if not hist.empty:
                 return t, hist
             logger.debug(f"[market_data] {ticker}: empty history (skipping)")
@@ -295,7 +295,7 @@ def _extended_last_price(t) -> Optional[float]:
     which includes extended prints.
     """
     try:
-        bars = t.history(period="1d", interval="1m", prepost=True)
+        bars = t.history(period="1d", interval="1m", prepost=True, timeout=30)
         if bars is None or bars.empty or "Close" not in bars.columns:
             return None
         closes = bars["Close"].dropna()
@@ -560,7 +560,7 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False,
     rl_hits = 0
     while True:
         try:
-            df = yf.Ticker(ticker).history(period=period, interval="1d")
+            df = yf.Ticker(ticker).history(period=period, interval="1d", timeout=30)
             if not df.empty:
                 merged = _drop_forming_bar(_merge_ohlcv(cached, df))
                 save_ohlcv(ticker, merged)
@@ -632,7 +632,7 @@ def _fetch_intraday_yf(ticker: str, interval: str = "30m") -> pd.DataFrame:
     a patchy 30m panel (the ticker simply scores on daily/weekly this tick).
     """
     try:
-        hist = yf.Ticker(ticker).history(period="60d", interval=interval)
+        hist = yf.Ticker(ticker).history(period="60d", interval=interval, timeout=30)
     except Exception as e:
         if _is_rate_limit(e):
             logger.debug(f"[market_data] {interval} rate-limited for {ticker} — skipping")

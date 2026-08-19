@@ -2,11 +2,19 @@
 Corporate actions — upcoming ex-dividends + recent/upcoming stock splits.
 
 Source: Massive/Polygon dividends & splits calendars (market-wide, date-filtered —
-two paginated calls), filtered to the scored universe. Returns a
+paginated calls), filtered to the scored universe. Returns a
 CorporateActionsContext fed into the LLM synthesis prompt as a WHEN/mechanics
-overlay (instruction §29), never a directional trigger:
+overlay (instruction §29):
   * ex-dividend date → price drops by ~the dividend (not weakness; mild income support),
   * stock split → price / share-count rescale (OHLCV signals around it can mislead).
+
+Plus the two directional factor scores (additive combine overlay + panel IC):
+  * f_split — forward-split drift / reverse-split distress;
+  * f_dividend — EVENT-windowed, RAISE-ONLY dividend-change score (2026-08-16
+    rework, epoch "f_dividend"): declared raises drift up for ~the first week
+    after DECLARATION, monotone in raise size; cuts abstain (their drift did
+    not replicate out-of-sample) — see `_dividend_change_score` for the
+    measured basis and memory/dividend-factor-rework-2026-08.md for the study.
 
 Cached daily. Fail-graceful: any error / no entitlement → None (run continues).
 """
@@ -63,21 +71,59 @@ def _split_factor(split_evs: List[SplitEvent], window: int) -> Optional[float]:
     return round(max(-1.0, -max(0.5, mag * decay)), 3)         # reverse: stronger negative
 
 
-def _dividend_factor(div_rows: List[dict]) -> Optional[float]:
-    """Directional dividend factor (+ = bullish). + for an increase / initiation, − for
-    a cut, from the latest declared cash amount vs ~1 year earlier. ``div_rows`` are the
-    raw dividend rows for one ticker, NEWEST first."""
-    pays = [d for d in div_rows if d.get("cash_amount")]
-    if not pays:
+def _dividend_change(div_rows: List[dict]) -> Optional[float]:
+    """Relative change of the latest REGULAR dividend vs the prior comparable one.
+
+    ``div_rows`` are one ticker's raw rows, NEWEST first. Comparable = both
+    regular cash dividends (type CD — specials mixed into the comparison were
+    the source of the old factor's fake deep cuts: 18 of 24 panel readings
+    ≤ −0.9 decomposed as data artifacts, only 6 as real cuts) with the SAME
+    frequency. None when no valid pair exists — which also retires the old
+    "single row → +0.4 initiation" heuristic, measured at −0.61% mean pivot
+    return / 42.9% win (truncated history masquerading as initiation)."""
+    cds = [d for d in div_rows
+           if d.get("cash_amount") and (d.get("dividend_type") or "CD") == "CD"]
+    if len(cds) < 2:
         return None
-    latest = float(pays[0]["cash_amount"])
-    if len(pays) == 1:
-        return 0.4                                            # initiation / single payment → mild +
-    freq = int(pays[0].get("frequency") or 4) or 4
-    prior = float(pays[min(freq, len(pays) - 1)].get("cash_amount") or 0)   # ~1yr back
-    if prior <= 0:
+    latest = cds[0]
+    freq = latest.get("frequency")
+    for prior in cds[1:]:
+        if prior.get("frequency") == freq:
+            p = float(prior["cash_amount"] or 0)
+            if p <= 0:
+                return None
+            return float(latest["cash_amount"]) / p - 1.0
+    return None
+
+
+def _dividend_change_score(chg: Optional[float], days_since_decl: Optional[int],
+                           window: int) -> Optional[float]:
+    """EVENT-windowed dividend-RAISE score (+ = bullish stock), None = abstain.
+
+    Measured basis (2026-08-16 two-year event study — declaration-date events,
+    gated, signed pivot target, 5,804 labeled events;
+    memory/dividend-factor-rework-2026-08.md): the RAISE side is monotone and
+    replicates across both year-halves — flat +0.28% → raise +0.42% →
+    big raise +1.17% (59.4% win) → huge raise +1.98% to the next pivot — and
+    the drift is CONFINED to the first ~5 sessions after declaration (d5→d10
+    ≈ 0 in every bucket), so the score decays to zero across ``window`` days
+    and abstains beyond it (the old factor held a stale reading for a whole
+    quarter). CUTS abstain entirely: the big-cut drift did NOT replicate
+    (H1 −1.86% / H2 +0.27% — a sign that flips across halves does not ship),
+    and small cuts measured positive in both halves — cut events are
+    confounded with the distress-bounce mean reversion this system keeps
+    measuring, so the honest score is no view.
+
+    tanh(chg × 4): +5% → +0.20, +10% → +0.38, +25% → +0.76, +50% → +0.96.
+    """
+    if chg is None or days_since_decl is None or days_since_decl < 0 \
+            or days_since_decl > window:
         return None
-    return round(max(-1.0, min(1.0, tanh((latest - prior) / prior * 8))), 3)
+    if chg < 0.01:
+        return None                    # cuts + flats: abstain (see docstring)
+    decay = 1.0 - days_since_decl / (window + 1.0)
+    score = round(min(1.0, tanh(chg * 4.0) * decay), 3)
+    return score if score >= 0.05 else None
 
 
 def fetch_corporate_actions_context(tickers: List[str]) -> Optional[CorporateActionsContext]:
@@ -129,19 +175,33 @@ def fetch_corporate_actions_context(tickers: List[str]) -> Optional[CorporateAct
             splits.append(ev)
             splits_by_tk.setdefault(tk, []).append(ev)
 
-    # f_dividend needs reliable per-ticker history (the market-wide calendar truncates
-    # it → false "initiations"), so pull each ticker's recent dividends directly —
-    # capped to the first N universe names (one call each; non-payers return []).
+    # f_dividend — EVENT discovery (2026-08-16 rework, epoch "f_dividend"): one
+    # market-wide declaration-window query finds every dividend DECLARED in the
+    # trailing event window (full-universe coverage — the old per-ticker loop
+    # reached only the first 60 insertion-order names, most of whose calls the
+    # 5/min budget rejected anyway); per-ticker history is fetched only for the
+    # handful of fresh in-universe declarers, to find the prior comparable
+    # regular payment.
     div_factor_by_tk: Dict[str, float] = {}
-    cap = settings.corp_actions_div_max_tickers
-    seen = 0
-    for tk in dict.fromkeys(t.upper() for t in tickers if is_valid_ticker(t)):
-        if cap > 0 and seen >= cap:
+    window = int(settings.corp_actions_div_event_window_days)
+    decl_lo = today - timedelta(days=window)
+    fetches = 0
+    for r in polygon_client.get_recent_dividend_declarations(
+            decl_lo.isoformat(), today.isoformat()):
+        tk = (r.get("ticker") or "").upper()
+        decl = _pdate(r.get("declaration_date"))
+        if (tk not in universe or tk in div_factor_by_tk or decl is None
+                or not r.get("cash_amount")
+                or (r.get("dividend_type") or "CD") != "CD"
+                or not is_valid_ticker(tk)):
+            continue
+        if fetches >= int(settings.corp_actions_div_max_event_fetches):
             break
-        seen += 1
-        df = _dividend_factor(polygon_client.get_dividend_history(tk, limit=6))
-        if df is not None:
-            div_factor_by_tk[tk] = df
+        fetches += 1
+        chg = _dividend_change(polygon_client.get_dividend_history(tk, limit=8))
+        score = _dividend_change_score(chg, (today - decl).days, window)
+        if score is not None:
+            div_factor_by_tk[tk] = score
 
     # Directional factor scores per ticker — consumed by the panel IC, the aggregator
     # overlay, and the §29 synthesis block.

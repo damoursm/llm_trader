@@ -149,6 +149,7 @@ def fetch_bond_internals_context(today: Optional[date] = None) -> Optional[BondI
             end=end,
             auto_adjust=True,
             progress=False,
+            timeout=30,   # a wedged socket here froze the whole scheduler 2026-08-17
         )
     except Exception as e:
         logger.warning(f"[bond_internals] yfinance download failed: {e}")

@@ -412,6 +412,11 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 # baseline series the news_shock method judges today against.
                 "news_article_count": float(getattr(s, "news_article_count", 0) or 0),
                 "news_recency_mass": float(getattr(s, "news_recency_mass", 0.0) or 0.0),
+                # news-event dataset (2026-08-15): the LLM's catalyst class +
+                # raw pre-scaler verdict — src/analysis/news_events.py joins
+                # them against the pivot forward return.
+                "news_catalyst": getattr(s, "news_catalyst", None),
+                "news_raw_score": getattr(s, "news_raw_score", None),
                 # Buy/sell split sides (2026-07-22): the two camp-conviction
                 # aggregates whose difference is combined_score — persisted so
                 # each side's forward IC is monitored (Signal IC → Buy/Sell side).

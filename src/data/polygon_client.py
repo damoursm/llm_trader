@@ -256,6 +256,42 @@ def get_news(limit: int = 1000) -> List[dict]:
     return j["results"]
 
 
+def get_ticker_news_history(ticker: str, gte: str, lte: str,
+                            page_delay_s: float = 0.0,
+                            max_pages: int = 6) -> List[dict]:
+    """HISTORICAL per-ticker news from ``/v2/reference/news`` (verified served
+    on the free key for at least ~2 months back, 2026-08-15).
+
+    ``gte``/``lte`` are ISO instants for ``published_utc``. ``page_delay_s``
+    sleeps BEFORE each follow-up page — every page is one API call against the
+    free tier's 5/min budget, and the news-backfill job runs for hours beside
+    the live scheduler, so the caller sets a polite spacing rather than racing
+    the shared limit. Returns raw article dicts (title, published_utc,
+    publisher.name, description, insights, tickers); empty on failure."""
+    if not is_available():
+        return []
+    import time as _time
+    out: List[dict] = []
+    j = _get("/v2/reference/news", {
+        "ticker": ticker, "published_utc.gte": gte, "published_utc.lte": lte,
+        "order": "asc", "limit": 1000,
+    })
+    pages = 1
+    while j and j.get("results"):
+        out.extend(j["results"])
+        nxt = j.get("next_url")
+        if not nxt or pages >= max_pages:
+            break
+        pages += 1
+        if page_delay_s > 0:
+            _time.sleep(page_delay_s)
+        try:
+            j = _follow_next_url(nxt)
+        except Exception:
+            break
+    return out
+
+
 def get_bars(ticker: str, period: str = "3mo") -> pd.DataFrame:
     """
     Fetch daily OHLCV bars for *ticker* covering *period*.
@@ -387,6 +423,20 @@ def get_ratios_batch(tickers: List[str], chunk: int = 100) -> Dict[str, dict]:
     return out
 
 
+def _follow_next_url(nxt: str):
+    """Fetch a Polygon ``next_url`` WITHOUT clobbering its query string.
+
+    ``httpx.get(url, params=...)`` REPLACES the URL's existing query entirely —
+    so passing ``params={"apiKey": ...}`` here silently dropped the cursor,
+    filters and limit, and every page after the first returned 10 unfiltered
+    default rows (found 2026-08-16 pulling dividend history: page 2 jumped from
+    2024 to 2029 ex-dates). Append the key to the cursor URL instead."""
+    sep = "&" if "?" in nxt else "?"
+    r = httpx.get(f"{nxt}{sep}apiKey={settings.polygon_api_key}", timeout=_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
 def _get_paginated(path: str, params: dict, max_pages: int = 10) -> List[dict]:
     """GET a v3 reference endpoint following ``next_url`` cursors. Returns the
     concatenated ``results`` (capped at ``max_pages`` pages). Empty on failure."""
@@ -400,9 +450,7 @@ def _get_paginated(path: str, params: dict, max_pages: int = 10) -> List[dict]:
             break
         pages += 1
         try:
-            r = httpx.get(nxt, params={"apiKey": settings.polygon_api_key}, timeout=_TIMEOUT)
-            r.raise_for_status()
-            j = r.json()
+            j = _follow_next_url(nxt)
         except Exception:
             break
     return out
@@ -435,6 +483,22 @@ def get_splits_calendar(start: str, end: str) -> List[dict]:
     return _get_paginated("/v3/reference/splits", {
         "execution_date.gte": start, "execution_date.lte": end, "limit": 1000,
     })
+
+
+def get_recent_dividend_declarations(gte: str, lte: str, max_pages: int = 4) -> List[dict]:
+    """Market-wide dividends DECLARED in [gte, lte] (ISO dates), newest first.
+
+    Server-side ``declaration_date`` filtering (probe-verified 2026-08-16) —
+    one small paginated query replaces per-ticker history scans for
+    dividend-change EVENT discovery: every fresh declaration market-wide, in
+    ~1-3 pages. Rows carry ticker / declaration_date / ex_dividend_date /
+    cash_amount / frequency / dividend_type. Empty when unavailable."""
+    if not is_available():
+        return []
+    return _get_paginated("/v3/reference/dividends", {
+        "declaration_date.gte": gte, "declaration_date.lte": lte,
+        "limit": 1000, "order": "desc", "sort": "declaration_date",
+    }, max_pages=max_pages)
 
 
 def get_dividend_history(ticker: str, limit: int = 6) -> List[dict]:

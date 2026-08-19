@@ -18,7 +18,8 @@ from src.db.connection import connect
 from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_NEWS_ATTENTION_COLUMNS,
                            SIGNAL_CONFIDENCE_COMPONENT_COLUMNS,
                            SIGNAL_ABS_SHADOW_COLUMNS,
-                           SIGNAL_COMBINED_SIDE_COLUMNS)
+                           SIGNAL_COMBINED_SIDE_COLUMNS,
+                           SIGNAL_NEWS_EVENT_COLUMNS)
 
 
 # When True, read paths open read-only connections. The dashboard sets this so it
@@ -318,6 +319,7 @@ _SIGNAL_COLS = (_SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS)
                + list(SIGNAL_COMBINED_SIDE_COLUMNS)
                + list(SIGNAL_ABS_SHADOW_COLUMNS)
                + list(SIGNAL_NEWS_ATTENTION_COLUMNS)
+               + [c for c, _t in SIGNAL_NEWS_EVENT_COLUMNS]
                + ["combine_source", "scores"])
 
 
@@ -353,6 +355,7 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             + [_f(r.get(c)) for c in SIGNAL_COMBINED_SIDE_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_ABS_SHADOW_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_NEWS_ATTENTION_COLUMNS]
+            + [r.get("news_catalyst"), _f(r.get("news_raw_score"))]
             + [r.get("combine_source")]
             + [_json(scores)]
         ))
@@ -364,6 +367,32 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             f"INSERT INTO signals ({', '.join(_SIGNAL_COLS)}) VALUES ({placeholders})",
             out,
         )
+        conn.execute("COMMIT")
+
+
+_BACKFILL_COLS = ["ticker", "signal_date", "catalyst", "headline_count",
+                  "top_headline", "classifier_version", "classified_at"]
+
+
+def insert_news_event_backfill(rows: List[dict]) -> None:
+    """Upsert historical catalyst classifications keyed (ticker, signal_date).
+
+    Written by `src/analysis/news_backfill.py` in small batches while the live
+    scheduler may hold the write lock — one short transaction per call, riding
+    `connect()`'s lock-retry. A re-classification of the same key replaces the
+    old row (DELETE + INSERT), so re-runs with a newer classifier are safe."""
+    if not rows:
+        return
+    vals = [tuple(r.get(c) for c in _BACKFILL_COLS) for r in rows]
+    keys = [(r.get("ticker"), r.get("signal_date")) for r in rows]
+    placeholders = ", ".join(["?"] * len(_BACKFILL_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM news_event_backfill WHERE ticker = ? AND signal_date = ?", keys)
+        conn.executemany(
+            f"INSERT INTO news_event_backfill ({', '.join(_BACKFILL_COLS)}) "
+            f"VALUES ({placeholders})", vals)
         conn.execute("COMMIT")
 
 

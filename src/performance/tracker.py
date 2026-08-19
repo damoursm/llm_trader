@@ -424,7 +424,7 @@ _LLM_ENGINES = ("anthropic", "deepseek", "qwen")
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "news_shock", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
+_ALL_METHODS = ("news", "sent_velocity", "news_shock", "news_bear_fresh", "catalyst_tilt", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families. Every
@@ -433,7 +433,7 @@ _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (w
 # out of compute_macro_eval's bundle view and _compute_category_stats' rollup (it
 # contributes to NO category, not an "uncategorized" one).
 METHOD_CATEGORIES: Dict[str, List[str]] = {
-    "Sentiment":   ["news", "sent_velocity", "news_shock"],
+    "Sentiment":   ["news", "sent_velocity", "news_shock", "news_bear_fresh", "catalyst_tilt"],
     "Technical":   ["tech", "massive", "vwap", "pattern", "momentum", "sector_momentum",
                     "market_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap",
                     "kaufman_long", "kaufman_short", "adx_long", "adx_short",
@@ -463,7 +463,7 @@ METHOD_LABELS: Dict[str, str] = {
     "momentum":   "Price Momentum",
     "sector_momentum": "Sector-Relative Momentum",
     "market_momentum": "Market-Relative Momentum (vs SPY)",
-    "money_flow": "Money Flow (MFI+CMF+OBV)",
+    "money_flow": "Money Flow (Chaikin CMF)",
     "trend_strength": "Trend Strength (ADX/DMI+Donchian)",
     "pead":       "Post-Earnings Drift (PEAD)",
     "iv_rank":    "IV Rank + Directional",
@@ -523,6 +523,16 @@ METHOD_LABELS.update({
     "news_shock": "News Shock (abnormal attention × news sign)",
 })
 
+# Bear-news freshness guard (2026-08-15, panel-first, weight 0).
+METHOD_LABELS.update({
+    "news_bear_fresh": "News Bear Fresh (bear news × un-priced tape guard)",
+})
+
+# Catalyst-class-conditioned news orientation (2026-08-15, panel-first, weight 0).
+METHOD_LABELS.update({
+    "catalyst_tilt": "Catalyst Tilt (news × learned per-class orientation)",
+})
+
 # Tier-3 panel-first methods (2026-07-08, weight 0).
 METHOD_LABELS.update({
     "resid_mom":   "Residual Momentum (beta-adj 12-1)",
@@ -549,6 +559,12 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         # news_shock (2026-08-14, panel-first at weight 0 — signals/news_shock.py):
         # sign(news) × abnormal attention vs the ticker's own trailing baseline.
         "news_shock": getattr(sig, "news_shock_score", 0.0),
+        # news_bear_fresh (2026-08-15, panel-first at weight 0): bearish news
+        # scaled by tape freshness; bull/zero news abstains.
+        "news_bear_fresh": getattr(sig, "news_bear_fresh_score", 0.0),
+        # catalyst_tilt (2026-08-15, panel-first at weight 0): news × learned
+        # per-(catalyst, side) orientation; abstains without a catalyst capture.
+        "catalyst_tilt": getattr(sig, "catalyst_tilt_score", 0.0),
         "tech":      sig.technical_score,
         "massive":   getattr(sig, "massive_score", 0.0),
         "insider":   sig.insider_score,
@@ -3900,6 +3916,102 @@ def _refresh_open_trade_ohlcv(trades: List[dict]) -> None:
         logger.info(f"[tracker] Refreshed OHLCV cache for {refreshed} open-trade ticker(s)")
 
 
+def _update_pivot_targets(trades: List[dict]) -> None:
+    """Per-tick H/L pivot target for every OPEN trade — pure observability.
+
+    Each trade's target is the FIRST pivot on/after its entry session, on the
+    same threshold-zigzag machine as the evaluation label
+    (``pivot_target.live_next_pivot``): SETTLED once its ``pivot_min_move_pct``
+    reversal has printed, PROVISIONAL until then — the running leg extreme,
+    which keeps extending with every new high/low (and with the live mark,
+    below) and freezes only at confirmation, converging to the settled label
+    by construction.
+
+    Anchor: the last completed bar STRICTLY BEFORE ``entry_date``, so the
+    entry session's own extreme can itself be the pivot — an intraday fill
+    rides that swing. (The panel label anchors at signal-date CLOSE and counts
+    pivots strictly after it; this surface evaluates FILLS, hence the
+    deliberate one-bar difference.)
+
+    Live extension: a provisional candidate is extended by the trade's fresh
+    ``current_price`` when the live mark is beyond the completed-bars extreme
+    (today's forming bar isn't in the daily series until the close). The live
+    mark only ever EXTENDS the candidate — confirmation stays on completed
+    bars, so a spiky mark can widen the provisional target but never fake a
+    resolution.
+
+    Fields stamped: ``pivot_target_price`` / ``pivot_target_date`` /
+    ``pivot_target_pct`` (vs the trade's own entry fill, market-signed) /
+    ``pivot_is_peak`` / ``pivot_resolved`` / ``pivot_confirmed_date`` /
+    ``pivot_capture_pct`` (% of the entry→target move traversed at the current
+    mark; >100 = overshot a settled target). On a failed compute the previous
+    tick's fields are left in place (last known state), never cleared.
+    PROVISIONAL values must never feed a settled-label surface — monitoring
+    and open-position evaluation only."""
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    if not open_trades:
+        return
+    try:
+        from src.analysis.pivot_target import live_next_pivot, _series
+    except Exception as e:
+        logger.warning(f"[tracker] pivot-target update skipped — import failed: {e}")
+        return
+
+    today_iso = date.today().isoformat()
+    series_cache: dict = {}
+    n_resolved = n_provisional = 0
+    for trade in open_trades:
+        try:
+            tk = trade.get("ticker")
+            entry_iso = trade.get("entry_date") or ""
+            entry_px = float(trade.get("entry_price") or 0.0)
+            if not tk or not entry_iso or not entry_px > 0:
+                continue
+            if tk not in series_cache:
+                series_cache[tk] = _series(tk)
+            s = series_cache[tk]
+            if s is None:
+                continue
+            idx, c, h, lo = s
+            entry_d = date.fromisoformat(entry_iso[:10])
+            i0 = bisect_left(idx, entry_d) - 1     # last bar strictly before entry
+            if i0 < 0:
+                continue
+            piv = live_next_pivot(c, h, lo, i0)
+            if piv is None:
+                continue
+            px = float(piv["price"])
+            px_date = idx[piv["idx"]].isoformat()
+            if not piv["resolved"]:
+                cur = trade.get("current_price")
+                if cur is not None and cur > 0:
+                    if piv["is_peak"] and cur > px:
+                        px, px_date = float(cur), today_iso
+                    elif not piv["is_peak"] and cur < px:
+                        px, px_date = float(cur), today_iso
+            trade["pivot_target_price"] = round(px, 4)
+            trade["pivot_target_date"] = px_date
+            trade["pivot_target_pct"] = round((px / entry_px - 1.0) * 100.0, 3)
+            trade["pivot_is_peak"] = bool(piv["is_peak"])
+            trade["pivot_resolved"] = bool(piv["resolved"])
+            trade["pivot_confirmed_date"] = (idx[piv["confirm_idx"]].isoformat()
+                                             if piv["resolved"] else None)
+            cur = trade.get("current_price")
+            denom = px - entry_px
+            if cur is not None and cur > 0 and abs(denom) > 1e-9:
+                capture = (float(cur) - entry_px) / denom * 100.0
+                trade["pivot_capture_pct"] = round(max(-500.0, min(500.0, capture)), 1)
+            if piv["resolved"]:
+                n_resolved += 1
+            else:
+                n_provisional += 1
+        except Exception as e:
+            logger.debug(f"[tracker] pivot-target update failed for {trade.get('ticker')}: {e}")
+    if n_resolved or n_provisional:
+        logger.info(f"[tracker] Pivot targets updated on {n_resolved + n_provisional} open trade(s) "
+                    f"({n_resolved} resolved / {n_provisional} provisional)")
+
+
 def update_open_trades() -> None:
     """Refresh current prices and unrealised P&L for all open trades.
 
@@ -3991,6 +4103,11 @@ def update_open_trades() -> None:
         # (monitor_open_positions) or an opposite signal appears
         # (close_trades_on_signal_reversal). days_held above is kept for display.
 
+    # Live H/L pivot target per open trade (provisional until its confirming
+    # reversal prints; runs after the mark loop so the live extension and
+    # capture read this tick's current_price).
+    _update_pivot_targets(trades)
+
     _save_trades(trades)
     logger.info(f"[tracker] Updated {updated} open trade(s)")
 
@@ -4022,10 +4139,17 @@ def log_performance_summary() -> None:
         logger.info(f"  Open positions ({len(open_trades)})")
         for t in sorted(open_trades, key=lambda x: x["entry_date"], reverse=True):
             mul = t.get("position_size_multiplier", 1.0)
+            piv = ""
+            if t.get("pivot_target_price") is not None:
+                state = "resolved" if t.get("pivot_resolved") else "prov"
+                cap = t.get("pivot_capture_pct")
+                cap_s = f" cap={cap:+.0f}%" if cap is not None else ""
+                piv = (f"  pivot={fmt_price(t['pivot_target_price'])} "
+                       f"({t.get('pivot_target_pct', 0.0):+.1f}% {state}{cap_s})")
             logger.info(
                 f"    {t['action']:<4} {t['ticker']:<6} | "
                 f"date={t['entry_date']}  entry={fmt_price(t['entry_price'])}  now={fmt_price(t['current_price'])}  "
-                f"P&L={t['return_pct']:+.2f}%  size={mul}×  ({t['days_held']}d held)"
+                f"P&L={t['return_pct']:+.2f}%  size={mul}×  ({t['days_held']}d held){piv}"
             )
 
     # Closed positions

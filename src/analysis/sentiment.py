@@ -7,9 +7,13 @@ per-LLM evaluation; the other engine is the error fallback.
 
 Precision controls:
   - Recency decay: articles weighted by age before scoring (fresh=1.0x, 18h=0.5x, ~2d=0.16x, >7d dropped)
-  - Article-count scaling: a score from 1 article is dampened vs 10+ articles
+  - Evidence-mass scaling: the raw verdict is scaled by Σ per-article recency
+    weights (continuous since 2026-08-14 — 3 fresh articles ≠ 3 stale ones)
   - Source diversity: if all articles come from a single source, apply a confidence penalty
   - Relevance fallback fix: if <2 relevant articles found, return [] (not all articles)
+  - Prompt (v3, `_SENT_PROMPT_VERSION`-salted into the verdict cache key):
+    band-then-placement magnitude rubric, priced-in/remaining-move check,
+    4-tier source-credibility ladder, rationale emitted before the score
 """
 
 import hashlib
@@ -219,7 +223,12 @@ def _sent_cache_ttl_seconds() -> float:
 # up to the TTL — two tickers scored seconds apart could be on different
 # scoring standards with nothing recording which. Bump on any _SENTIMENT_PREFIX
 # change that could move the score.
-_SENT_PROMPT_VERSION = "v2-2026-08-14"
+# v3-2026-08-15: derivation-based two-decimal placement (v2's example values
+# 0.47/−0.62/0.71 had become the modal raw verdicts), priced-in/remaining-move
+# check, company-PR + aggregator source tiers, rationale-before-score order.
+# v4-2026-08-15: + "catalyst" output field (NEWS_CATALYST_TYPES) so every
+# verdict lands in the news-event dataset typed; score semantics unchanged.
+_SENT_PROMPT_VERSION = "v4-2026-08-15"
 
 
 def _sentiment_cache_key(ticker: str, engine: str, articles: List[NewsArticle]) -> str:
@@ -283,14 +292,15 @@ def _sentiment_cache_get(key: str) -> Optional[dict]:
     return None
 
 
-def _sentiment_cache_put(key: str, raw_score: float, rationale: str, engine: str) -> None:
+def _sentiment_cache_put(key: str, raw_score: float, rationale: str, engine: str,
+                         catalyst: Optional[str] = None) -> None:
     global _SENT_CACHE_DIRTY
     if not getattr(settings, "enable_sentiment_cache", True):
         return
     with _SENT_CACHE_LOCK:
         cache = _sent_cache_load_locked()
         cache[key] = {"raw_score": raw_score, "rationale": rationale,
-                      "engine": engine, "ts": time.time()}
+                      "catalyst": catalyst, "engine": engine, "ts": time.time()}
         _SENT_CACHE_DIRTY = True
         _sent_cache_flush_locked()
 
@@ -365,7 +375,10 @@ def _get_haiku() -> anthropic.Anthropic:
     return _haiku_client
 
 
-def _parse_response(raw: str) -> tuple[float, str]:
+def _parse_response(raw: str) -> tuple[float, str, Optional[str]]:
+    """→ ``(score, rationale, catalyst)``; catalyst normalized onto
+    NEWS_CATALYST_TYPES (None when the model omitted the field — pre-v4 cache
+    entries and degraded responses)."""
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -375,7 +388,7 @@ def _parse_response(raw: str) -> tuple[float, str]:
         data = json.loads(raw)
         score = max(-1.0, min(1.0, float(data["score"])))
         rationale = str(data["rationale"])
-        return score, rationale
+        return score, rationale, normalize_catalyst(data.get("catalyst"))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         # Salvage a truncated/malformed response (e.g. DeepSeek hitting the
         # 256-token cap mid-rationale → invalid JSON, observed for XBI). The score
@@ -388,7 +401,8 @@ def _parse_response(raw: str) -> tuple[float, str]:
         score = max(-1.0, min(1.0, float(m.group(1))))
         rm = re.search(r'"rationale"\s*:\s*"(.*?)(?:"\s*[},]|$)', raw, re.DOTALL)
         rationale = rm.group(1).strip() if rm else "Rationale unavailable (truncated response)."
-        return score, rationale
+        cm = re.search(r'"catalyst"\s*:\s*"([A-Za-z_\- ]+)"', raw)
+        return score, rationale, normalize_catalyst(cm.group(1) if cm else None)
 
 
 def _recency_weight(article: NewsArticle) -> float:
@@ -507,6 +521,50 @@ def _provider_sentiment_score(ticker: str,
     return score, rationale
 
 
+# ── News-event taxonomy (2026-08-15) ─────────────────────────────────────────
+# The fixed catalyst classes the sentiment LLM (and the historical backfill
+# classifier — src/analysis/news_backfill.py) must choose from, so the live and
+# backfilled halves of the news-event dataset pool. Persisted per (run, ticker)
+# as `signals.news_catalyst` and joined against the pivot forward return by
+# `python -m src.analysis.news_events` — the "what kind of news → what kind of
+# move" event study. Append-only in practice: renaming a class forks its
+# history (the analysis groups on the stored string).
+NEWS_CATALYST_TYPES = (
+    "earnings",              # reported results beat/miss (no guidance change)
+    "guidance",              # outlook raised/cut (with or without results)
+    "analyst",               # rating / price-target actions
+    "ma_deal",               # M&A, tender, take-private, stake-with-intent
+    "fda_clinical",          # FDA decisions, trial readouts, medical data
+    "legal_regulatory",      # lawsuits, investigations, fines, policy actions
+    "management",            # CEO/CFO/board changes
+    "capital_structure",     # offering/dilution, buyback, dividend, split, debt
+    "distress",              # going concern, bankruptcy, delisting risk
+    "contract_partnership",  # contract wins/losses, partnerships with terms
+    "product",               # launches, recalls, operational incidents
+    "index_membership",      # index adds/drops
+    "insider_activity",      # insider/13D-G buying-selling as the news itself
+    "short_squeeze_social",  # social/positioning attention (Reddit, short interest)
+    "macro_sector",          # market/sector-wide, not ticker-specific
+    "company_pr",            # promotional company-issued release, no hard numbers
+    "other",                 # a real ticker-specific catalyst outside the classes
+    "none",                  # no event at all
+)
+
+
+def normalize_catalyst(value) -> Optional[str]:
+    """Map a model-emitted catalyst label onto the fixed taxonomy.
+
+    None/empty → None ("not captured" — distinct from "none", the model's
+    explicit no-event verdict); a recognised label → itself; anything else →
+    "other" (the model invented a class — keep the event, don't lose it)."""
+    if value is None:
+        return None
+    v = str(value).strip().lower().replace(" ", "_").replace("-", "_")
+    if not v:
+        return None
+    return v if v in NEWS_CATALYST_TYPES else "other"
+
+
 # FIXED, ticker-FREE instruction prefix — identical for every ticker, so it forms
 # a shared prefix that DeepSeek auto-caches across the ~40 per-ticker calls in a
 # run (and Anthropic would cache via cache_control IF it met the per-model minimum
@@ -519,27 +577,45 @@ Your task: analyse the recent news for THE TARGET TICKER (specified at the end) 
 
 PRECISION MANDATE — false positives are more costly than false negatives:
 - Score 0.0 unless you identify a SPECIFIC, IDENTIFIABLE catalyst with a clear price mechanism. Vague positive/negative sentiment does NOT count.
-- Reserve scores above ±0.7 for high-impact, unambiguous catalysts: earnings beats/misses with guidance change, FDA approvals/rejections, M&A announcements, major regulatory actions, CEO departure, bankruptcy risk.
-- Scores ±0.3–0.6: clear but moderate catalyst — analyst upgrade/downgrade with PT, supply chain disruption, contract win/loss.
-- Scores ±0.1–0.2: minor directional catalyst — relevant but unlikely to move price significantly.
-- Score 0.0 if: news is noise, recycled information, or there is no clear directional catalyst.
 - Score ONLY news materially about the target ticker itself — ignore passing mentions, sector round-ups, or macro pieces that merely list it; those are not ticker-specific catalysts.
 - If catalysts conflict, NET them by magnitude and recency — do not mechanically average to 0; the dominant, most recent, highest-impact catalyst drives the sign.
 - Recency matters: articles marked "1h ago" or "6h ago" carry much more weight than "3d ago" or "5d ago".
 - When in doubt, output 0.0. A missed opportunity is better than a wrong call.
-- PRECISION: score with TWO-decimal granularity (e.g. 0.47, -0.62, 0.71). Your score is consumed CROSS-SECTIONALLY — it is ranked against every other ticker scored today — so two catalysts of visibly different strength must NOT receive the same round number. Use the full scale; defaulting to 0.5/0.7/0.8 collapses the ranking.
 
-SOURCE WEIGHTING — the digest mixes hard catalysts with soft sentiment; weight them differently. Each article is tagged "[source | age]":
-- HARD sources move price directly and can justify scores up to ±1.0: SEC 8-K filings, earnings/EPS surprises, analyst rating & price-target changes, and primary financial news (M&A, FDA, guidance, legal/regulatory).
-- SOFT sources are attention/positioning, NOT catalysts, and cap at ±0.2 on their own: Reddit/WSB social sentiment, Google Trends search spikes, short-interest shifts. They are corroborating color, never a standalone thesis. A soft source ALIGNED with a hard catalyst modestly amplifies conviction; if it CONTRADICTS the hard catalyst, discount it.
+MAGNITUDE — build the score in two steps, band then exact placement:
+- ±0.60–1.00 high-impact, unambiguous: earnings beat/miss WITH a guidance change, FDA approval/rejection, M&A, major regulatory or legal action, CEO departure, going-concern/bankruptcy or delisting risk, large dilutive offering.
+- ±0.25–0.60 clear but moderate: analyst upgrade/downgrade with price target, EPS surprise without guidance change, contract win/loss with disclosed size, supply-chain disruption.
+- ±0.05–0.25 minor: directionally relevant but unlikely to move price much.
+- PLACE the score inside its band from the specifics: surprise size vs expectations, disclosed dollar amounts relative to the company's size, source independence, corroboration across independent outlets, freshness, and how much of the reaction has already happened.
+- PRECISION: your score is consumed CROSS-SECTIONALLY — it is ranked against every other ticker scored today, and ties destroy the ranking. Express it with TWO-decimal granularity where the second decimal comes from the placement weighing above, never from habit: two catalysts of visibly different strength must NOT share a value, round numbers (0.30/0.50/0.70) are almost never the honest result of a real weighing, and you must NEVER reuse the numeric values shown in the examples below.
 
-Respond with a JSON object with exactly these fields:
-- "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral
-- "rationale": one to three sentences explaining (1) the specific catalyst and (2) the exact price mechanism. If score is 0.0, state why no actionable catalyst was identified.
+PRICED-IN CHECK — score the REMAINING move from now, not the catalyst's total worth:
+- If the digest itself reports that the stock already moved sharply on this catalyst ("shares surged 40%", "up 75% pre-market"), most of the catalyst is consumed. Score only the expected FOLLOW-THROUGH — after an outsized one-day spike that residual is small and often NEGATIVE (extended movers mean-revert).
+- "Why is X up/down today" recap pieces report a move already taken; a recap is not a fresh catalyst.
+- An all-cash acquisition target pinned near the fixed offer price has ~no remaining move: 0.0.
+- A hard catalyst 2–3 days old has mostly been traded; score it only if a multi-day repricing mechanism is still working (e.g. estimate revisions after a guidance change).
+- Asymmetry: fresh NEGATIVE hard catalysts (misses, guidance cuts, going-concern, regulatory action) tend to keep drifting down for several sessions even after a first sell-off — do not treat the first red day as full pricing. Positive spikes are more often fully priced immediately.
 
-Examples:
-{"score": 0.6, "rationale": "Q3 earnings beat with raised FY guidance (hard catalyst) reprices forward estimates over the next few sessions."}
-{"score": 0.0, "rationale": "Only a Reddit mention spike and a generic sector round-up; no ticker-specific hard catalyst identified."}"""
+SOURCE TIERS — each article is tagged "[source | age]"; weight the tag, not just the words:
+- HARD (can justify up to ±1.0): SEC 8-K filings, earnings/EPS surprises, analyst rating & price-target changes, and primary financial journalism (Reuters, Bloomberg, WSJ, Barron's, CNBC) on M&A, FDA, guidance, legal/regulatory events.
+- COMPANY-ISSUED (PRNewswire, GlobeNewswire, Business Wire, Accesswire, Proactive): self-selected promotion. A promotional release — partnership, LOI, product launch, "record" results without numbers — caps at ±0.30 unless it discloses binding dollar amounts material to the company's size or is corroborated by independent reporting. NEGATIVE facts inside company-issued text (going concern, dilution, guidance cut, compliance notice) are involuntary disclosures — weight them FULLY.
+- AGGREGATOR/COMMENTARY (Zacks, Motley Fool, Simply Wall St., 24/7 Wall St., StockStory, Insider Monkey, Trefis, GuruFocus, MarketBeat, Barchart, "best stocks" listicles): opinion and recycled facts, not catalysts. Score the underlying fact only if it is itself fresh and hard; a listicle or comparison mention alone is 0.0.
+- SOFT (cap ±0.2 on their own): Reddit/WSB, StockTwits, Google Trends spikes, short-interest shifts, dark-pool prints. Corroborating color, never a standalone thesis — aligned with a hard catalyst it modestly amplifies conviction; contradicting one, discount it.
+- One EVENT is one catalyst: ten syndicated articles about the same event do not make it ten times bigger. Independent corroboration raises confidence in the FACT, not the magnitude.
+
+Respond with a JSON object with exactly these fields, in this order:
+- "rationale": one to three sentences naming (1) the specific catalyst, (2) the exact price mechanism, and (3) what is already priced in. If score is 0.0, state why no actionable catalyst was identified. The rationale comes FIRST so the score is decided from the reasoning, not before it.
+- "catalyst": the DOMINANT catalyst class behind your read, exactly one of: __CATALYST_TYPES__. Use "none" when there is no event at all; when a real event nets to 0.0 (e.g. fully priced in), still name its class. "company_pr" = promotional company-issued release with no hard numbers; "macro_sector" = not ticker-specific.
+- "score": float between -1.0 (very bearish) and +1.0 (very bullish), 0.0 is neutral.
+
+Examples (format only — the numbers are placeholders, derive your own):
+{"rationale": "CEO resigned effective immediately with no successor named (hard catalyst, 3h ago); the leadership vacuum reprices the name lower over coming sessions, and the digest reports no move yet.", "catalyst": "management", "score": -0.66}
+{"rationale": "Only a Reddit mention spike and a generic listicle comparison; no ticker-specific hard catalyst identified.", "catalyst": "none", "score": 0.0}"""
+
+# Interpolate the taxonomy once at import — the prompt and NEWS_CATALYST_TYPES
+# cannot drift apart, and the string stays byte-stable for prefix caching.
+_SENTIMENT_PREFIX = _SENTIMENT_PREFIX.replace(
+    "__CATALYST_TYPES__", ", ".join(NEWS_CATALYST_TYPES))
 
 
 def _anthropic_user_content(prefix: str, suffix: str, model: str):
@@ -559,7 +635,7 @@ def _anthropic_user_content(prefix: str, suffix: str, model: str):
 
 
 def analyse_sentiment(ticker: str, articles: List[NewsArticle],
-                      force_engine: Optional[str] = None) -> tuple[float, str]:
+                      force_engine: Optional[str] = None) -> tuple[float, str, dict]:
     """
     Score news sentiment for a ticker with precision controls applied.
 
@@ -571,28 +647,33 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
     per-run A/B order (`_PRIMARY_SENTIMENT_ENGINE` first, the other as fallback).
 
     Returns:
-        (score, rationale)
+        (score, rationale, meta)
         score: float in [-1.0, +1.0] after recency/count/diversity adjustments
         rationale: brief explanation citing the specific news catalyst
+        meta: {"catalyst": <NEWS_CATALYST_TYPES or None>, "raw_score": <pre-scaler
+        verdict or None>} — the news-event dataset fields (2026-08-15). Empty-ish
+        on degraded paths; consumers must .get(). The aggregator tolerates legacy
+        2-tuples from test doubles, so meta is additive, never load-bearing.
     """
     if not articles:
-        return 0.0, "No recent news articles found."
+        return 0.0, "No recent news articles found.", {}
 
     # Filter out stale articles (>7 days) before scoring
     fresh_articles = [a for a in articles if _recency_weight(a) > 0.0]
     if not fresh_articles:
-        return 0.0, "All available articles are older than 7 days — no actionable signal."
+        return 0.0, "All available articles are older than 7 days — no actionable signal.", {}
 
     # Provider-sentiment hybrid (latency win): when enough fresh articles already
     # carry a provider sentiment (e.g. Polygon insights), score from those and
     # skip the LLM call entirely. Bypassed for force_engine (the opener-pinned
     # hold-review must re-judge with its OWN LLM engine for apples-to-apples).
+    # No catalyst: provider insights carry a sentiment label, not an event class.
     if force_engine is None:
         provider = _provider_sentiment_score(ticker, fresh_articles)
         if provider is not None:
             _record_sentiment_provider("provider")
             logger.info(f"{ticker} provider_sentiment={provider[0]:+.2f} (LLM scorer skipped)")
-            return provider
+            return provider[0], provider[1], {}
 
     # Sort by recency weight descending; send top 20 to LLM
     weighted = sorted(fresh_articles, key=_recency_weight, reverse=True)
@@ -618,6 +699,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
 
     raw_score = None
     rationale = "Analysis unavailable."
+    catalyst: Optional[str] = None
 
     # Primary engine per the run's A/B flip (reset_sentiment_providers); the
     # other provider remains the error fallback. Determinism per engine:
@@ -638,6 +720,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
     if cached is not None:
         raw_score = float(cached["raw_score"])
         rationale = str(cached.get("rationale") or "Rationale unavailable (cached).")
+        catalyst = normalize_catalyst(cached.get("catalyst"))
         if _tally:
             _record_sentiment_provider(str(cached.get("engine") or order[0]))
         logger.debug(
@@ -668,7 +751,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                     extra_body=thinking_body(_max_think),   # route dialect (qwen_api)
                 )
                 _log_cache_hit(ticker, "qwen", response)
-                raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
+                raw_score, rationale, catalyst = _parse_response(response.choices[0].message.content.strip())
             elif engine == "deepseek":
                 deepseek = _get_deepseek()
                 if deepseek is None:        # no API key — try the other engine
@@ -682,7 +765,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                     extra_body=(_DEEPSEEK_THINKING_ON if _max_think else _DEEPSEEK_THINKING_OFF),
                 )
                 _log_cache_hit(ticker, "deepseek", response)
-                raw_score, rationale = _parse_response(response.choices[0].message.content.strip())
+                raw_score, rationale, catalyst = _parse_response(response.choices[0].message.content.strip())
             else:
                 client = _get_haiku()
                 message = client.messages.create(
@@ -692,11 +775,11 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
                                "content": _anthropic_user_content(_SENTIMENT_PREFIX, suffix, HAIKU_MODEL)}],
                     temperature=0,
                 )
-                raw_score, rationale = _parse_response(message.content[0].text.strip())
+                raw_score, rationale, catalyst = _parse_response(message.content[0].text.strip())
             logger.info(f"{ticker} raw_sentiment={raw_score:+.2f} ({engine}, {len(to_score)} articles)")
             if _tally:
                 _record_sentiment_provider(engine)
-            _sentiment_cache_put(cache_key, raw_score, rationale, engine)
+            _sentiment_cache_put(cache_key, raw_score, rationale, engine, catalyst)
             break
         except Exception as e:
             last_err = e
@@ -706,7 +789,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
         logger.error(f"Sentiment analysis failed for {ticker}: {last_err}")
         if _tally:
             _record_sentiment_provider("none")
-        return 0.0, f"Analysis error: {last_err}"
+        return 0.0, f"Analysis error: {last_err}", {}
 
     # --- Precision adjustments (continuous since 2026-08-14, epoch "news") ---
     _n_fresh, _mass = attention_mass(to_score)
@@ -723,7 +806,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle],
             f"scale={precision_scale:.2f})"
         )
 
-    return adjusted_score, rationale
+    return adjusted_score, rationale, {"catalyst": catalyst, "raw_score": raw_score}
 
 
 def filter_relevant_articles(ticker: str, articles: List[NewsArticle]) -> List[NewsArticle]:

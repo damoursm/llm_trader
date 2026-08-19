@@ -54,6 +54,47 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 _ES_DISPLAY_REQUIRED = 0x00000002
 
 
+def _run_tick_watchdogged(**kwargs) -> None:
+    """``run_pipeline`` under a whole-tick wall-clock watchdog
+    (``tick_watchdog_seconds``, 0 disables).
+
+    The broker reconcile carries its own 600 s watchdog; this covers the REST
+    of a tick. The 2026-08-17 freeze was a yfinance socket wedged inside the
+    Step-3 fetch pool (`fetch_bond_internals_context`), leaving the main
+    thread joining the executor forever — a state neither ``--supervise`` nor
+    Task-Scheduler restart-on-failure can see, because both need the process
+    to EXIT. On expiry: CRITICAL log + ``os._exit(1)``; the supervisor
+    relaunches, and ``reconcile.sync()`` is idempotent on restart (fill
+    refresh, stale-cancel, orphan sweep), which is what makes a mid-tick exit
+    recoverable. EOD maintenance and the weekly ML retrains run in background
+    threads and are NOT under this timer."""
+    cap = float(getattr(settings, "tick_watchdog_seconds", 0) or 0)
+    if cap <= 0:
+        run_pipeline(**kwargs)
+        return
+    import os
+    import threading
+
+    def _tick_watchdog_kill():
+        try:
+            logger.critical(
+                f"[scheduler] tick exceeded {cap:.0f}s wall-clock — something outside "
+                "the broker reconcile is stuck (wedged data fetch / LLM stream); "
+                "force-exiting so --supervise relaunches a fresh scheduler "
+                "(this was the 2026-08-17 bond_internals yfinance freeze).")
+        except Exception:
+            pass
+        os._exit(1)
+
+    wd = threading.Timer(cap, _tick_watchdog_kill)
+    wd.daemon = True
+    wd.start()
+    try:
+        run_pipeline(**kwargs)
+    finally:
+        wd.cancel()
+
+
 def _keep_system_awake(enable: bool) -> None:
     """Ask Windows not to idle into sleep / Modern Standby while the scheduler runs.
 
@@ -678,6 +719,26 @@ def start_scheduler() -> None:
     if settings.enable_eod_maintenance:
         logger.info(f"EOD maintenance at/after {eod_time.strftime('%H:%M')} ET: "
                     "forward-return cache warm + table retention (market days).")
+    # Announce the weekly-retrain state at startup. A HELD retrain is silent by
+    # construction (`_should_run_weekly_ml_train` just returns False), and a
+    # frozen model that everyone believes is refreshing weekly is the same
+    # "looks configured, does nothing" class the inert-config guard exists for —
+    # except here the freeze is intentional, so it gets stated rather than
+    # guarded.
+    _ml_flags = {"ml_ohlcv": settings.enable_eod_ml_train,
+                 "ml_buy+ml_sell": settings.enable_eod_ml_buy_train,
+                 "ml_exit": settings.enable_eod_ml_exit_train}
+    _ml_on = [k for k, v in _ml_flags.items() if v]
+    if _ml_on:
+        logger.info(f"Weekly ML retrain {ml_train_time.strftime('%H:%M')} ET on weekday "
+                    f"{settings.ml_retrain_weekday}: {', '.join(_ml_on)}"
+                    + (f" (HELD: {', '.join(k for k, v in _ml_flags.items() if not v)})"
+                       if len(_ml_on) < len(_ml_flags) else ""))
+    else:
+        logger.info("Weekly ML retrain HELD OFF for every artifact "
+                    "(ENABLE_EOD_ML_{TRAIN,BUY_TRAIN,EXIT_TRAIN}=false) — "
+                    "ml_ohlcv / ml_buy / ml_sell / ml_exit are FROZEN at their "
+                    "current artifacts. See .env for why and how to resume.")
     try:
         while True:
             now_naive = now_et().replace(tzinfo=None)
@@ -732,8 +793,8 @@ def start_scheduler() -> None:
                         # decision is authoritative for scheduled ticks
                         # (every slot when scheduler_email_every_tick, else
                         # the 16:00 closing report only).
-                        run_pipeline(send_email=send_email, observe_only=observe,
-                                     email_if_configured=False)
+                        _run_tick_watchdogged(send_email=send_email, observe_only=observe,
+                                              email_if_configured=False)
                     except Exception as exc:  # never let one tick kill the loop
                         logger.exception(f"[scheduler] tick raised: {exc}")
                         _alert_crash("pipeline tick", exc)   # log-only was silent to the operator
@@ -777,8 +838,8 @@ def start_scheduler() -> None:
                             f"{slot_dt.strftime('%H:%M')} ET slot (email=False)"
                         )
                         try:
-                            run_pipeline(send_email=False, observe_only=observe,
-                                         email_if_configured=False)
+                            _run_tick_watchdogged(send_email=False, observe_only=observe,
+                                                  email_if_configured=False)
                         except Exception as exc:
                             logger.exception(f"[scheduler] catch-up tick raised: {exc}")
                             _alert_crash("catch-up tick", exc)

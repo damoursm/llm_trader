@@ -42,8 +42,11 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(cac.settings, "enable_corporate_actions", True)
     monkeypatch.setattr(cac.settings, "enable_fetch_data", True)
     monkeypatch.setattr(cac.polygon_client, "is_available", lambda: True)
-    # default: no per-ticker dividend history (tests opt in) — never hits the network
-    monkeypatch.setattr(cac.polygon_client, "get_dividend_history", lambda tk, limit=6: [])
+    # defaults: no declarations / no per-ticker history (tests opt in) — never
+    # hits the network
+    monkeypatch.setattr(cac.polygon_client, "get_recent_dividend_declarations",
+                        lambda gte, lte, max_pages=4: [])
+    monkeypatch.setattr(cac.polygon_client, "get_dividend_history", lambda tk, limit=8: [])
 
 
 def test_fetch_filters_to_universe_and_builds(monkeypatch, tmp_path):
@@ -90,29 +93,61 @@ def test_split_factor_direction():
     assert cac._split_factor([], 30) is None
 
 
-def test_dividend_factor_direction():
-    inc = [{"cash_amount": 0.27, "frequency": 4}, {"cash_amount": 0.26, "frequency": 4},
-           {"cash_amount": 0.26, "frequency": 4}, {"cash_amount": 0.26, "frequency": 4},
-           {"cash_amount": 0.24, "frequency": 4}]                       # latest 0.27 vs ~1yr 0.24
-    assert cac._dividend_factor(inc) > 0
-    cut = [{"cash_amount": 0.10, "frequency": 4}] + [{"cash_amount": 0.30, "frequency": 4}] * 4
-    assert cac._dividend_factor(cut) < 0
-    assert cac._dividend_factor([{"cash_amount": 0.5, "frequency": 4}]) == 0.4   # initiation
-    assert cac._dividend_factor([]) is None
+def test_dividend_change_prior_selection():
+    """Latest regular vs the prior COMPARABLE regular — specials and frequency
+    mixes (the old factor's fake-deep-cut artifacts) are skipped."""
+    rows = [{"cash_amount": 0.30, "frequency": 4, "dividend_type": "CD"},
+            {"cash_amount": 2.00, "frequency": 1, "dividend_type": "SD"},   # special — skipped
+            {"cash_amount": 0.10, "frequency": 12, "dividend_type": "CD"},  # freq mix — skipped
+            {"cash_amount": 0.25, "frequency": 4, "dividend_type": "CD"}]
+    assert cac._dividend_change(rows) == pytest.approx(0.30 / 0.25 - 1)
+    # one-row history is NOT an initiation signal any more (measured −0.61%)
+    assert cac._dividend_change([{"cash_amount": 0.5, "frequency": 4, "dividend_type": "CD"}]) is None
+    assert cac._dividend_change([]) is None
+    # no comparable prior at all → abstain
+    assert cac._dividend_change(
+        [{"cash_amount": 0.5, "frequency": 4, "dividend_type": "CD"},
+         {"cash_amount": 2.0, "frequency": 1, "dividend_type": "SD"}]) is None
+
+
+def test_dividend_change_score_bands_and_decay():
+    """Event-windowed, raise-only, with the measured abstain bands."""
+    w = 10
+    assert cac._dividend_change_score(0.25, 0, w) == pytest.approx(0.762, abs=1e-3)   # fresh huge raise
+    assert cac._dividend_change_score(0.05, 0, w) == pytest.approx(0.197, abs=1e-3)   # small raise, mild
+    assert cac._dividend_change_score(0.0, 0, w) is None                              # flat abstains
+    # ALL cuts abstain — the big-cut drift did not replicate across year-halves.
+    assert cac._dividend_change_score(-0.05, 0, w) is None
+    assert cac._dividend_change_score(-0.50, 0, w) is None
+    assert cac._dividend_change_score(0.25, w + 1, w) is None                         # past the window
+    fresh = cac._dividend_change_score(0.25, 0, w)
+    stale = cac._dividend_change_score(0.25, 8, w)
+    assert 0 < stale < fresh                                                          # decay
+    assert cac._dividend_change_score(None, 0, w) is None
+    assert cac._dividend_change_score(0.25, None, w) is None
 
 
 def test_context_carries_factor_scores(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
-    # KO per-ticker dividend history: latest 0.53 vs ~1yr-ago 0.48 → increase
+    # KO declared a raise 2 days ago (0.53 vs prior comparable 0.48 → +10.4%);
+    # ZZZZ declared too but is outside the universe.
+    decl = (_TODAY - timedelta(days=2)).isoformat()
+    monkeypatch.setattr(cac.polygon_client, "get_recent_dividend_declarations",
+        lambda gte, lte, max_pages=4: [
+            {"ticker": "KO", "declaration_date": decl, "cash_amount": 0.53,
+             "frequency": 4, "dividend_type": "CD"},
+            {"ticker": "ZZZZ", "declaration_date": decl, "cash_amount": 1.0,
+             "frequency": 4, "dividend_type": "CD"}])
     monkeypatch.setattr(cac.polygon_client, "get_dividend_history",
-        lambda tk, limit=6: ([{"cash_amount": 0.53, "frequency": 4}, {"cash_amount": 0.53, "frequency": 4},
-                              {"cash_amount": 0.48, "frequency": 4}, {"cash_amount": 0.48, "frequency": 4},
-                              {"cash_amount": 0.48, "frequency": 4}] if tk == "KO" else []))
+        lambda tk, limit=8: ([{"cash_amount": 0.53, "frequency": 4, "dividend_type": "CD"},
+                              {"cash_amount": 0.48, "frequency": 4, "dividend_type": "CD"}]
+                             if tk == "KO" else []))
     monkeypatch.setattr(cac.polygon_client, "get_splits_calendar",
         lambda s, e: [{"ticker": "NVDA", "execution_date": _TODAY.isoformat(), "split_from": 1, "split_to": 10}])
     ctx = cac.fetch_corporate_actions_context(["KO", "NVDA"])
     assert ctx is not None
-    assert ctx.factor_scores["KO"]["f_dividend"] > 0      # 0.53 vs ~1yr 0.48 → increase
+    assert ctx.factor_scores["KO"]["f_dividend"] > 0.2    # fresh declared raise
+    assert "ZZZZ" not in ctx.factor_scores                # outside universe
     assert ctx.factor_scores["NVDA"]["f_split"] > 0       # forward 1→10 split
 
 

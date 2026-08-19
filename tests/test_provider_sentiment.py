@@ -64,7 +64,7 @@ def test_analyse_sentiment_uses_provider_and_skips_llm(monkeypatch):
     monkeypatch.setattr(sent, "_get_haiku", _boom)
 
     arts = [_art("u1", "AAPL", "positive"), _art("u2", "AAPL", "negative", source="Benzinga")]
-    score, rationale = sent.analyse_sentiment("AAPL", arts)
+    score, rationale, _meta = sent.analyse_sentiment("AAPL", arts)
     assert "provider" in rationale.lower()       # provider path taken (no LLM)
 
 

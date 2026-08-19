@@ -41,7 +41,12 @@ def main(out_path: str) -> int:
             dropped.append(f"{key!r}: {type(e).__name__}")
 
     with open(out_path, "wb") as fh:
-        pickle.dump({"ver": ver, "cache": cache, "dropped": dropped}, fh,
+        # "code" lets the parent reject a snapshot written by DIFFERENT code:
+        # cached values can change shape across a deploy, and a restored old
+        # shape renders as empty with nothing to explain why (see
+        # data._code_fingerprint).
+        pickle.dump({"ver": ver, "code": data._code_fingerprint(),
+                     "cache": cache, "dropped": dropped}, fh,
                     protocol=pickle.HIGHEST_PROTOCOL)
     print(f"warm_worker: {len(cache)} entries written, {len(dropped)} dropped", flush=True)
     return 0

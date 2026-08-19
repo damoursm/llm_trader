@@ -140,6 +140,7 @@ def fetch_breadth_context() -> Optional[BreadthContext]:
             interval="1d",
             progress=False,
             auto_adjust=True,
+            timeout=30,
         )
     except Exception as e:
         logger.warning(f"[breadth] yfinance download failed: {e}")

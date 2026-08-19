@@ -38,7 +38,7 @@ def _live_rate(pair: str, _day: str) -> Optional[float]:
     """Latest close for an FX pair (e.g. 'CADUSD=X'). Cached by (pair, day)."""
     try:
         import yfinance as yf
-        hist = yf.Ticker(pair).history(period="5d")
+        hist = yf.Ticker(pair).history(period="5d", timeout=30)
         if not hist.empty:
             close = hist["Close"].dropna()
             if not close.empty:

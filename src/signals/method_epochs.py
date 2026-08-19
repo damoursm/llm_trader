@@ -91,7 +91,20 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # z-score against its own history (which measured acceleration and read a
     # falling tape as bullish). Before this instant the scorer returned the same
     # sign on a rising and a falling tape — tests/test_method_directionality.py.
-    "money_flow": datetime(2026, 7, 24, 20, 1, tzinfo=timezone.utc),
+    # 2026-08-17 01:40 UTC (v3; the shared deploy boundary — see the `news`
+    # entry for how it was placed by the runs): the
+    # score is CMF ALONE. The 3-year gated battery (754 daily cross-sections /
+    # 752k rows / 1,206 tickers, signed pivot target) measured the v2 composite
+    # at IC +0.0349 (t +10.2) but CMF alone at +0.0479 (t +11.8, paired t +9.0
+    # over the composite, best every year, both sides balanced); the OBV slope
+    # term carried nothing (+0.0038, t +0.97, robust to renormalisation) and
+    # the contrarian-MFI term was ANTI-predictive (−0.0140, t −2.72; flipped it
+    # merely tied no-MFI, paired t −0.3). Same-frame output changes wherever
+    # OBV/MFI were active → histories must not pool. money_flow is REPLAYABLE:
+    # the panel history is REGENERATED under v3 (replay --write ran with the
+    # change; the nightly refactor keeps it current), so the mask only covers
+    # what replay cannot restore. Supersedes the 07-24 instant.
+    "money_flow": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
     # 2026-08-08 16:30 UTC (scheduler restart): ml_ohlcv v1 → v2 — a CATEGORICAL
     # swap, not a retrain. v1 was P(up)−P(down) from a 10-day market-relative
     # classifier, emitted only on the clean-trend+liquid subset (NO_VIEW
@@ -148,7 +161,7 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # logic, same /3 normaliser — but the VALUE for the same filing set is a
     # different number, so histories must not pool.
     "insider": datetime(2026, 8, 14, 18, 30, tzinfo=timezone.utc),
-    # Same instant, same pass: the news score's precision scalers went
+    # 2026-08-14 18:30 UTC: the news score's precision scalers went
     # continuous — evidence mass = Σ per-article recency weights replaces the
     # article COUNT in the count-scale (3 fresh articles no longer equal 3
     # stale ones), and the 0.70/0.85/1.0 source-diversity steps became a
@@ -156,7 +169,76 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # (cache-salted, so old cached verdicts cannot leak into the new scale).
     # The LLM's round-number quantization (top value 0.7 covered 7.1% of all
     # nonzero rows) multiplied by step scalers left ~38% within-run tie mass.
-    "news": datetime(2026, 8, 14, 18, 30, tzinfo=timezone.utc),
+    # 2026-08-17 01:40 UTC (prompt v3/v4 — the RAW-verdict standard moved, the
+    # scalers did not). Measured on 2,265 v2-prompt calls: nonzero verdicts
+    # collapsed onto 29 distinct values (98% tie mass) and the MODAL values
+    # were v2's own example numbers (0.47/−0.62/0.71 — the "two-decimal"
+    # instruction produced two-decimal-LOOKING copies, not variance); and
+    # post-surge catalysts kept full magnitude (+0.90 AFTER a reported 75–115%
+    # pre-market spike — the measured BUY-side chasing cohort Gate 5 exists
+    # for). v3 derives the second decimal from a band-then-placement rubric,
+    # adds a priced-in/remaining-move check with the negative-drift asymmetry,
+    # tiers company-issued PR and aggregator listicles below independent
+    # reporting, and emits rationale BEFORE score. Same article set → a
+    # different verdict by design, so the histories must not pool.
+    #
+    # BOUNDARY — MOVED at deploy time, exactly as the rule demands. It was
+    # provisionally written as 2026-08-16 01:00 UTC on the assumption of a
+    # restart before the Sunday-night overnight open (Sun 20:30 ET). The
+    # restart actually landed at 2026-08-17 01:42 UTC (Sun 21:42 ET), by which
+    # time the overnight session had already run TWO OLD-CODE ticks past that
+    # provisional instant (runs 2026-08-17_003019 and _013003, 397 signal rows
+    # each). Leaving it would have admitted old-formula rows as current — the
+    # exact failure the 2026-08-14 confidence-epoch near-miss warned about.
+    # Placed by the RUNS, per the standing convention: strictly after the last
+    # old-code run (generated_at 2026-08-17T01:30:03Z) and strictly before the
+    # first new-code run (the post-restart catch-up tick for the 21:30 ET slot,
+    # generated_at 2026-08-17T01:42:5xZ; `run_id`/`generated_at` are
+    # `datetime.now(timezone.utc)` at run start, NOT the slot time — verified
+    # at pipeline.py:1375). Supersedes the 08-14 instant (any pre-v3 row is
+    # already pre-this-epoch). All eight instants registered this weekend share
+    # this boundary for the same reason.
+    "news": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    # 2026-08-17 01:40 UTC (shared deploy boundary): f_dividend reworked from a
+    # stale trailing-year tilt (latest cash vs ~1yr ago, scored EVERY day for a
+    # quarter, specials/frequency-mixes included — 18 of its 24 deep-cut panel
+    # readings decomposed as data artifacts, and its +0.4 one-row "initiation"
+    # measured −0.61%/42.9% win) to an EVENT-windowed, RAISE-ONLY declaration
+    # factor: regular-vs-prior-comparable change, tanh(chg×4), linear decay to
+    # 0 across ~10 days. Two-year event study (5,804 gated labeled events):
+    # the raise side is monotone and replicates in both halves (flat +0.28% →
+    # raise +0.42% → big +1.17% → huge +1.98%, drift confined to ~5 sessions,
+    # d5→d10 ≈ 0); ALL cuts abstain — the big-cut drift flipped sign across
+    # halves (H1 −1.86% / H2 +0.27%), and small cuts were positive in both.
+    # A different quantity on every row → histories must not pool.
+    # Non-replayable (external feed).
+    "f_dividend": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    # 2026-08-17 01:40 UTC (shared deploy boundary), all four trend-context
+    # methods at once: the learned ORIENTATION these persisted scores BAKE IN
+    # (score = orientation × context strength) was rebased — old: a drift-
+    # biased continuation-rate at the fixed horizon shrunk toward a +1
+    # CONTINUATION prior, which held every context at +0.28..+0.39 while the
+    # panel measured all four DESCENDING on the pivot basis (adx_long daily IC
+    # −0.049 t −3.2; the 2026-08-16 decile-direction audit). New: per-day rank
+    # IC of the orientation-FREE feature vs the signed pivot target, shrunk
+    # toward 0 = abstain — so the same context can now carry the OPPOSITE sign
+    # (or none). Sign semantics changed → histories must not pool. Not
+    # replayable (the orientation depends on panel state at serve time).
+    "kaufman_long": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    "kaufman_short": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    "adx_long": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    "adx_short": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    # 2026-08-17 01:40 UTC (shared deploy boundary): put_call went CONTINUOUS —
+    # the 5-label step map emitted FOUR distinct values across 1,230 panel rows
+    # (±0.35/±0.70), collapsing each day's ~24-name cross-section into ≤4
+    # rank-tie blocks; the decile curve was tie-block noise and the payoff
+    # shaping fit on it flipped out-of-sample (ΔIC −0.269 in the 2026-08-16
+    # shape audit). Now tanh(ln(ratio)/scale) with per-side scales anchored to
+    # the OLD extreme values at their documented thresholds (2.0 → +0.70,
+    # 0.3 → −0.70) — the same quantity with the steps removed, but the VALUE
+    # for the same chain is different → histories must not pool. Same disease,
+    # same cure, same rule as the news/insider continuity epochs (2026-08-14).
+    "put_call": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
 }
 
 

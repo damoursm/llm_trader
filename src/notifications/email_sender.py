@@ -351,7 +351,7 @@ HTML_TEMPLATE = """
   <thead>
     <tr>
       <th>Ticker</th><th>Action</th><th>Entry (date / time ET)</th><th>Entry Px</th>
-      <th>Mark (time ET)</th><th>Current Px</th><th>P&amp;L</th><th>Size</th><th>Corr</th><th>Days</th>
+      <th>Mark (time ET)</th><th>Current Px</th><th>P&amp;L</th><th>Pivot Tgt</th><th>Size</th><th>Corr</th><th>Days</th>
     </tr>
   </thead>
   <tbody>
@@ -374,6 +374,15 @@ HTML_TEMPLATE = """
       <td style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.current_price) }}</td>
       <td class="{{ 'pos' if t.return_pct > 0 else 'neg' }}">
         {{ "%+.2f"|format(t.return_pct) }}%
+      </td>
+      <td style="font-size:11px;">
+        {% if t.pivot_target_price is defined and t.pivot_target_price %}
+          <span style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.pivot_target_price) }}</span>
+          <span class="{{ 'pos' if t.pivot_target_pct|default(0) > 0 else 'neg' }}">({{ "%+.1f"|format(t.pivot_target_pct|default(0)) }}%)</span>
+          <br><span style="color:#64748b;font-size:10px;" title="H/L pivot target: the next swing extreme on the pivot_min_move_pct zigzag; provisional targets keep extending until the reversal confirms">
+            {{ 'resolved' if t.pivot_resolved|default(false) else 'provisional' }}{% if t.pivot_capture_pct is defined and t.pivot_capture_pct is not none %} &middot; {{ "%.0f"|format(t.pivot_capture_pct) }}% captured{% endif %}
+          </span>
+        {% else %}<span style="color:#475569;">&mdash;</span>{% endif %}
       </td>
       <td style="color:{% if mul >= 2.0 %}#4ade80{% elif mul >= 1.5 %}#60a5fa{% else %}#94a3b8{% endif %};">
         {{ mul }}×
@@ -5040,7 +5049,7 @@ HTML_TEMPLATE = """
 {% set top_mf  = mf_leaders[:5] %}
 {% set bot_mf  = mf_leaders[-5:] | reverse | list %}
 {% if top_mf %}
-<h2>Money Flow <span style="font-size:13px;font-weight:400;color:#94a3b8;">(MFI · CMF · OBV — accumulation vs distribution)</span></h2>
+<h2>Money Flow <span style="font-size:13px;font-weight:400;color:#94a3b8;">(Chaikin CMF — accumulation vs distribution; MFI shown as context)</span></h2>
 <div class="card" style="padding:14px 18px;">
   <div style="display:flex;gap:28px;flex-wrap:wrap;">
     <div style="flex:1;min-width:240px;">

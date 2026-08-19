@@ -285,8 +285,8 @@ def test_sentiment_cache_skips_llm_on_identical_article_set(monkeypatch):
     sent.reset_sentiment_providers()
     arts = [_art("u1"), _art("u2", "second headline")]
 
-    s1, _ = sent.analyse_sentiment("AAA", arts)
-    s2, _ = sent.analyse_sentiment("AAA", arts)
+    s1, _, _m1 = sent.analyse_sentiment("AAA", arts)
+    s2, _, _m2 = sent.analyse_sentiment("AAA", arts)
     assert len(calls) == 1                     # second scoring served from cache
     assert s1 == s2                            # identical adjusted score
     # Cache hits still tally (the verdict IS that engine's) so per-LLM
@@ -322,8 +322,8 @@ def test_sentiment_cache_shared_between_main_and_forced_review(monkeypatch):
     monkeypatch.setattr(sent, "_get_deepseek", lambda: _stub_deepseek(calls))
     sent.reset_sentiment_providers()
     arts = [_art("u1")]
-    s_main, _ = sent.analyse_sentiment("AAA", arts)                          # main pass (miss)
-    s_review, _ = sent.analyse_sentiment("AAA", arts, force_engine="deepseek")  # review (hit)
+    s_main, _, _mm = sent.analyse_sentiment("AAA", arts)                     # main pass (miss)
+    s_review, _, _mr = sent.analyse_sentiment("AAA", arts, force_engine="deepseek")  # review (hit)
     assert len(calls) == 1
     assert s_main == s_review
     assert sent.get_sentiment_provider_summary() == "deepseek×1"   # forced hit never tallies

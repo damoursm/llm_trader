@@ -20,6 +20,7 @@ from loguru import logger
 from config.settings import settings
 from src.broker.base import (
     AccountPnl, AccountSnapshot, BorrowInfo, Broker, FillSummary, OpenOrderInfo, OrderRequest, OrderResult, Position,
+    Quote,
 )
 
 # Non-USD base currencies already flagged this process — the account config is
@@ -656,6 +657,54 @@ class IBKRBroker(Broker):
             except Exception:
                 pass
         return None
+
+    def get_quote(self, ticker: str) -> Optional["Quote"]:
+        """Live bid/ask snapshot — what a marketable limit actually has to cross.
+
+        Same ``reqTickers`` snapshot as ``get_market_price`` (Cboe One + IEX, the
+        feed that fills the orders) but reading the two sides of the book instead
+        of collapsing them to a last/mid. Bounded by the same short timeout, for
+        the same reason: a thin pre-market name never resolves and would
+        otherwise burn the full request timeout on every priced leg.
+
+        Returns None unless BOTH sides are present and sane (ask ≥ bid > 0) —
+        a one-sided book cannot tell us what crossing costs, and the caller's
+        fallback (the mid-based cap) is the honest answer there.
+        """
+        if not self._ensure_connected():
+            return None
+        ib = self._ib
+        prev_timeout = getattr(ib, "RequestTimeout", 0)
+        try:
+            price_to = float(getattr(settings, "broker_price_timeout_seconds", 0) or 0)
+            if price_to > 0:
+                try:
+                    ib.RequestTimeout = price_to
+                except Exception:
+                    pass
+            tickers = ib.reqTickers(self._qualify(ticker))
+            self._note_request(None)
+            if not tickers:
+                return None
+            t = tickers[0]
+
+            def _px(v):
+                # NaN != NaN filters IBKR's empty ticks; guard None/non-positive.
+                return float(v) if v is not None and v == v and float(v) > 0 else None
+
+            bid, ask = _px(getattr(t, "bid", None)), _px(getattr(t, "ask", None))
+            if bid is None or ask is None or ask < bid:
+                return None
+            return Quote(ticker=ticker, bid=bid, ask=ask)
+        except Exception as e:
+            self._note_request(e)
+            logger.debug(f"[broker:ibkr] get_quote {ticker} failed: {_exc_text(e)}")
+            return None
+        finally:
+            try:
+                ib.RequestTimeout = prev_timeout
+            except Exception:
+                pass
 
     def get_short_borrow(self, tickers: List[str]) -> Dict[str, BorrowInfo]:
         """Short-borrow availability per ticker via the shortable-shares tick (236).

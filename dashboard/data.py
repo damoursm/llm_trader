@@ -570,25 +570,47 @@ def exit_quality(window_days: Optional[int] = None, session: Optional[str] = Non
                     direction or "all"), lambda: _retry(_q, "exit_quality"))
 
 
-def broker_forensics() -> dict:
-    """Slippage / fill-rate / drift / reject forensics over the broker tables
-    (all runs — not windowed). Cached so the warmer covers it."""
+def broker_forensics(days: Optional[int] = None, session: Optional[str] = None,
+                     direction: Optional[str] = None) -> dict:
+    """Slippage / fill-rate / drift / reject forensics over the broker tables.
+
+    ``days`` / ``session`` / ``direction`` slice the ORDER log by submission
+    time and order side (``broker_forensics.filter_orders``). Session is the
+    highest-value cut here — the fill rate runs 56.6% in RTH against 4.8%
+    overnight, so an unfiltered number is a blend of two different regimes.
+    The drift block inside the bundle is per-reconcile-RUN and is deliberately
+    not sliced. Cached per filter combination so the warmer covers the default."""
     from src.analysis.broker_forensics import (
         compute_forensics, load_broker_orders, load_broker_reconciles)
-    return _cached("broker_forensics",
-                   lambda: _retry(lambda: compute_forensics(load_broker_orders(),
-                                                            load_broker_reconciles()),
-                                  "broker_forensics"))
+    return _cached(("broker_forensics", days or "all", session or "all", direction or "all"),
+                   lambda: _retry(lambda: compute_forensics(
+                       load_broker_orders(), load_broker_reconciles(),
+                       days=days, session=session, direction=direction),
+                       "broker_forensics"))
 
 
-def tracking_error() -> dict:
+def tracking_error(window_days: Optional[int] = None, session: Optional[str] = None,
+                   direction: Optional[str] = None) -> dict:
     """Sim-vs-broker tracking-error report over every trade with a matching
-    broker fill. Cached (walks OHLCV per matched trade) so the warmer covers it."""
+    broker fill. Filtered on the TRADE (entry date / entry session / position
+    side) with the tracker's own helpers, so 'session' means the same thing here
+    as on the performance tabs. Cached (walks OHLCV per matched trade)."""
     from src.analysis.tracking_error import compute_tracking_error
+    from src.performance.tracker import _match_direction, _session_matches
 
     def _q():
-        return compute_tracking_error(repo.load_trades())
-    return _cached("tracking_error", lambda: _retry(_q, "tracking_error"))
+        trades = repo.load_trades()
+        if window_days is not None:
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+            trades = [t for t in trades if (t.get("entry_date") or "") >= cutoff]
+        if session:
+            trades = [t for t in trades if _session_matches(t, session)]
+        if direction:
+            trades = [t for t in trades if _match_direction(t, direction)]
+        return compute_tracking_error(trades)
+    return _cached(("tracking_error", window_days or "all", session or "all",
+                    direction or "all"), lambda: _retry(_q, "tracking_error"))
 
 
 def source_reliability(days: int = 14) -> list:
@@ -743,6 +765,62 @@ _warm_state: dict = {"ver": None, "running": False, "in_flight": False,
                      "last_ok": 0.0, "last_took": 0.0, "last_entries": 0}
 
 
+def exit_rule_performance(days: Optional[int] = 45) -> dict:
+    """Per-EXIT-RULE funnel on the H/L pivot target -- the exit twin of
+    ``gate_performance``. Each rule judged by the positions it CLOSES vs the ones
+    it lets run, on the oriented REMAINING move to the next pivot. Cached: it
+    walks the simulated held-position dataset, which is the expensive part."""
+    from src.analysis.exit_rules import compute_exit_rule_performance
+    return _cached(("exit_rule_performance", days or "all"),
+                   lambda: _retry(lambda: compute_exit_rule_performance(days=days),
+                                  "exit_rule_performance"))
+
+
+def model_artifacts() -> list:
+    """Age + stamped bases of the four ML artifacts. Cheap (file stat + one
+    unpickle of the small exit config); NOT cached -- staleness is the point.
+
+    Surfaced because every consumer is FAIL-SOFT: a missing or stale artifact
+    silently reverts its method to the hand-built path (ml_exit -> hand-built
+    exits, ml_ohlcv -> 0.0, stackers -> weighted combine), which looks exactly
+    like normal operation. The weekly retrain is Saturday 08:00 ET, so anything
+    older than ~9 days means the retrain has stopped landing."""
+    import os
+    out = []
+    for name, path in (("ml_ohlcv", "cache/ml/ml_ohlcv_model.pkl"),
+                       ("ml_buy (stacker)", "cache/ml/ml_buy_model.pkl"),
+                       ("ml_sell (stacker)", "cache/ml/ml_sell_model.pkl"),
+                       ("ml_exit", "cache/ml/ml_exit_model.pkl")):
+        row = {"model": name, "age_days": None, "label_basis": None,
+               "combine_basis": None, "status": "MISSING"}
+        try:
+            if os.path.exists(path):
+                row["age_days"] = round((time.time() - os.path.getmtime(path)) / 86400.0, 1)
+                row["status"] = "stale (>9d)" if row["age_days"] > 9 else "fresh"
+                if name == "ml_exit":
+                    from src.analysis.ml_exit_dataset import _load_exit_artifact
+                    cfg = ((_load_exit_artifact() or {}).get("config")) or {}
+                    row["label_basis"] = cfg.get("label_basis")
+                    row["combine_basis"] = cfg.get("combine_basis")
+        except Exception as e:
+            row["status"] = f"unreadable: {e}"
+        out.append(row)
+    return out
+
+
+def gate_performance(days: Optional[int] = None, source: str = "stamped") -> dict:
+    """Per-GATE entry-funnel performance on the H/L pivot target.
+
+    Each gate judged by the cohort it DROPS vs the one it keeps, reported as
+    EXCESS over a same-side random draw (a short's oriented return is negative by
+    construction, so raw means are not comparable across cohorts with different
+    BUY/SELL mixes) with day-clustered t. Cached -- it rebuilds the panel."""
+    from src.analysis.gate_funnel import compute_gate_performance
+    return _cached(("gate_performance", days or "all", source),
+                   lambda: _retry(lambda: compute_gate_performance(days=days, source=source),
+                                  "gate_performance"))
+
+
 def method_decile_curves(days: Optional[int] = None) -> dict:
     """Per-method DECILE curves on the pivot basis (2026-08-13 rank directive's
     dashboard companion): for every method column with data, each panel row's
@@ -820,6 +898,7 @@ def _warm_targets():
              # but an unwarmed accessor still costs the FIRST visitor after
              # every run, which is nearly every visit at a 30-min tick.
              "ticker_perf", "arm_eval", "market_relative_skill",
+             "gate_performance", "exit_rule_performance",
              "method_decile_curves")
     return [(n, globals().get(n)) for n in names]
 
@@ -935,6 +1014,40 @@ def _save_snapshot(src_path: str) -> None:
         logger.debug(f"[dashboard] could not persist warm snapshot: {e}")
 
 
+def _code_fingerprint() -> str:
+    """Cheap fingerprint of the code that PRODUCES cached values.
+
+    The cache is versioned by DATA (the latest run_id), which is right for
+    "have the numbers changed" and blind to "has the SHAPE changed". A code
+    change that restructures a cached value — e.g. broker_forensics' fill_rate
+    growing per_retry/per_trade sub-dicts — leaves a snapshot on disk whose
+    shape no consumer understands any more. The restore succeeds, the accessor
+    returns the old dict, and the UI renders "–" with nothing anywhere saying
+    why. That is indistinguishable from "no data yet".
+
+    So the snapshot also carries a fingerprint of the producing modules'
+    (size, mtime). Any edit invalidates it and the sweep re-runs — costing one
+    warm cycle, which is the cheap side of this trade.
+    """
+    import hashlib
+    import os
+    root = _repo_root()
+    parts = []
+    for sub in ("dashboard", os.path.join("src", "analysis"), os.path.join("src", "performance")):
+        d = os.path.join(root, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".py"):
+                continue
+            try:
+                st = os.stat(os.path.join(d, name))
+                parts.append(f"{sub}/{name}:{st.st_size}:{int(st.st_mtime)}")
+            except OSError:
+                continue
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
 def _load_snapshot() -> None:
     """Populate the cache from the last persisted sweep, if any (best-effort).
 
@@ -954,6 +1067,13 @@ def _load_snapshot() -> None:
     try:
         with open(path, "rb") as fh:
             blob = pickle.load(fh)
+        stamped, mine = blob.get("code"), _code_fingerprint()
+        if stamped != mine:
+            logger.info(f"[dashboard] warm snapshot discarded — it was written by different "
+                        f"code (fingerprint {stamped} vs {mine}). Cached values can change "
+                        f"SHAPE across a deploy, and a restored old shape renders as empty "
+                        f"with nothing to explain why; recomputing instead.")
+            return
         merged = _merge_snapshot(blob, "snapshot")
         age = (time.time() - os.path.getmtime(path)) / 60.0
         current = _data_version()

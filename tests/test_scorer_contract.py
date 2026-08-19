@@ -47,13 +47,21 @@ _MIRROR_EXEMPT = {"pattern"}
 
 
 def _frame(closes, volume=1e6):
+    """Synthetic OHLCV with REALISTIC bar geometry: open = prior close, the
+    range brackets the bar's move. The old frame (High=c×1.01, Low=c×0.99,
+    Close=c) closed every bar dead-CENTER of its range, which made the harness
+    structurally blind to range-position indicators — CMF read exactly 0 on
+    every tape, so money_flow's mirror test was passing through terms that no
+    longer exist (found 2026-08-16 at the v3 CMF-only reform). Same
+    construction as tests/test_method_directionality.py."""
     c = np.asarray(closes, dtype=float)
     n = len(c)
     if n == 0:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    o = np.r_[c[:1], c[:-1]]
     return pd.DataFrame(
-        {"Open": c * 0.995, "High": c * 1.01, "Low": c * 0.99, "Close": c,
-         "Volume": np.full(n, float(volume))},
+        {"Open": o, "High": np.maximum(o, c) * 1.01, "Low": np.minimum(o, c) * 0.99,
+         "Close": c, "Volume": np.full(n, float(volume))},
         index=pd.date_range("2025-01-01", periods=n, freq="D"),
     )
 

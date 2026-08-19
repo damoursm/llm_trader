@@ -294,10 +294,20 @@ def test_eod_maintenance_no_longer_hosts_the_refactor():
 
 # ── weekly ML retrain scheduling (2026-08-12: once a week, Saturday morning) ──
 
-def test_weekly_ml_train_fires_only_on_the_configured_weekday():
+def test_weekly_ml_train_fires_only_on_the_configured_weekday(monkeypatch):
     from datetime import datetime, time
+    from config.settings import settings
     import src.scheduler.runner as runner
 
+    # The subject here is the WEEKDAY/dedupe gate, so the enable flags are pinned
+    # ON: since 2026-08-19 the live .env HOLDS all three off for the ML A/B
+    # window, which short-circuits this function before the weekday is ever
+    # consulted. Reading them from the environment would make this test assert
+    # the deployment state instead of the scheduling logic — the sibling test
+    # below owns the flags.
+    monkeypatch.setattr(settings, "enable_eod_ml_train", True)
+    monkeypatch.setattr(settings, "enable_eod_ml_buy_train", True)
+    monkeypatch.setattr(settings, "enable_eod_ml_exit_train", True)
     at = time(8, 0)
     sat = datetime(2026, 8, 15, 8, 30)          # Saturday (weekday 5)
     assert runner._should_run_weekly_ml_train(sat, None, at)

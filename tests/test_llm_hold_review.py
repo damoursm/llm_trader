@@ -423,7 +423,7 @@ def test_analyse_sentiment_force_engine_pins_to_anthropic(monkeypatch):
                         lambda: (_ for _ in ()).throw(AssertionError("deepseek used under force anthropic")))
     art = NewsArticle(title="FDA approval", summary="material catalyst " * 5,
                       url="u", source="Reuters", published_at=datetime.now(timezone.utc))
-    score, _ = sent.analyse_sentiment("X", [art], force_engine="anthropic")
+    score, _, _meta = sent.analyse_sentiment("X", [art], force_engine="anthropic")
     assert calls == ["anthropic"]
 
 

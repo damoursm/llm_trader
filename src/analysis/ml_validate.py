@@ -152,6 +152,32 @@ def run(horizons: Sequence[int] = (5, 10), bases: Sequence[str] = ("raw", "rel")
     return pd.DataFrame(rows)
 
 
+def _warn_if_not_production_training_set(deep_parquet: str) -> Optional[str]:
+    """Return a banner when this run trains on a DIFFERENT deep set than the one
+    production serves, else None.
+
+    Measured 2026-08-18: the gate's ``--from-parquet`` default is the small
+    offline set (``dataset_multi``: 1,500 tickers, stride 2 -> ~388k merged
+    training rows) while ``ml_model.train_and_persist_pivot`` trains the live
+    artifact on ``dataset_full`` (~9M rows). The gate's OOS predictions
+    correlated with the LIVE persisted ``ml_ohlcv`` scores at within-day rank
+    corr +0.044 / +0.604 on the two judgeable days — i.e. a PROMOTE verdict was
+    being read as a statement about a model production does not run. Nothing in
+    the output said so, which is the silent-failure class this repo verifies
+    mechanically rather than by review."""
+    try:
+        from src.signals.ml_model import _PIVOT_PARQUET
+    except Exception:
+        return None
+    used, prod = str(deep_parquet or ""), str(_PIVOT_PARQUET)
+    if used.replace("\\", "/").endswith(prod.replace("\\", "/")):
+        return None
+    return (f"TRAINING-SET MISMATCH: this validation trained on '{used}', but the "
+            f"live artifact trains on '{prod}'. The verdict below describes the "
+            f"ARCHITECTURE as trained here, NOT the model in production. Re-run "
+            f"with --from-parquet {prod} for a production-equivalent read.")
+
+
 def validate_pivot_on_panel(deep_parquet: str, step_days: int = 5,
                             threads: int = 6,
                             min_train_rows: int = 20000) -> pd.DataFrame:
@@ -263,7 +289,7 @@ def _print(table: pd.DataFrame, model_name: str, deadband: float) -> None:
           "survivorship.")
 
 
-def _print_pivot(preds: pd.DataFrame) -> None:
+def _print_pivot(preds: pd.DataFrame, deep_parquet: Optional[str] = None) -> None:
     """Summarise the pivot-candidate panel run against its PRE-REGISTERED bar
     (fixed 2026-08-08, before the run): (1) per-day IC t >= 2 on the full panel;
     (2) direction edge > 0; (3) Gate-4 tradeable-subset IC > 0 (sign only);
@@ -327,6 +353,18 @@ def _print_pivot(preds: pd.DataFrame) -> None:
         print(f"  [{'PASS' if ok else 'FAIL'}] ({i}) {txt}")
     print(f"\nVERDICT: {'PROMOTE' if all([ok1, ok2, ok3, ok4]) else 'DO NOT PROMOTE'} "
           "(bar pre-registered 2026-08-08)")
+    banner = _warn_if_not_production_training_set(deep_parquet) if deep_parquet else None
+    if banner:
+        logger.warning(f"[ml_validate:pivot] {banner}")
+        print(f"\n!! {banner}")
+    # The bar was pre-registered against the CLOSE-basis zero-threshold pivot
+    # target; the 2026-08-12 redefinition (H/L extremes + pivot_min_move_pct)
+    # made the same statistic run several times larger (+0.064/t+2.31 then vs
+    # +0.244/t+9.32 on 08-18 with no comparable model change), so t >= 2 is now
+    # cleared trivially. Pivot ICs either side of that date are DIFFERENT
+    # QUANTITIES and must not be compared.
+    print("NOTE: the t>=2 bar predates the 2026-08-12 H/L pivot redefinition; "
+          "ICs across that date are not comparable and the bar needs re-setting.")
 
 
 def main(argv=None) -> None:
@@ -350,10 +388,15 @@ def main(argv=None) -> None:
     from src.db import repo
     repo.set_read_only(True)
     if a.target == "pivot":
+        # Surface the mismatch BEFORE the (slow) run too, so an operator who
+        # walks away still learns the verdict will not describe production.
+        pre = _warn_if_not_production_training_set(a.from_parquet)
+        if pre:
+            logger.warning(f"[ml_validate:pivot] {pre}")
         preds = validate_pivot_on_panel(a.from_parquet, threads=a.threads)
         if a.save_preds and preds is not None and not preds.empty:
             preds.to_csv(a.save_preds, index=False)
-        _print_pivot(preds)
+        _print_pivot(preds, deep_parquet=a.from_parquet)
         return
     horizons = tuple(int(h) for h in str(a.horizons).split(",") if h.strip())
     bases = tuple(b for b in str(a.bases).split(",") if b.strip())

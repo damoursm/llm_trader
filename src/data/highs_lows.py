@@ -127,6 +127,7 @@ def fetch_highs_lows_context() -> Optional[HighsLowsContext]:
             interval="1d",
             progress=False,
             auto_adjust=True,
+            timeout=30,
         )
     except Exception as e:
         logger.warning(f"[highs_lows] yfinance download failed: {e}")

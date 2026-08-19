@@ -49,7 +49,7 @@ def compute_intraday_timing(ticker: str) -> Optional[dict]:
         return None
     try:
         prepost = current_session() != "rth"
-        df = yf.Ticker(ticker).history(period=_PERIOD, interval=_INTERVAL, prepost=prepost)
+        df = yf.Ticker(ticker).history(period=_PERIOD, interval=_INTERVAL, prepost=prepost, timeout=30)
     except Exception as e:
         logger.debug(f"[intraday] fetch failed for {ticker}: {e}")
         return None

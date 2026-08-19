@@ -45,7 +45,82 @@ _DEEPSEEK_THINKING_SUFFIX = _THINKING_SUFFIX   # back-compat alias
 # (instructions, framing, per-ticker line format); leave alone for pure
 # plumbing. "2026-08-14-rank-process": the selection-process block +
 # percentile standings + rank-era conviction rules (see CLAUDE.md).
-SYNTHESIS_PROMPT_VERSION = "2026-08-14-rank-process"
+SYNTHESIS_PROMPT_VERSION = "2026-08-19-confidence-placement"
+
+
+# ── Confidence PLACEMENT rubric (v2026-08-19) ────────────────────────────────
+# THE BUG THIS FIXES. The conviction rules stated the bands as bare thresholds
+# ("confidence >= 0.85 ... 0.55-0.84 ... a 90%+ call requires ...") and the
+# THRESHOLD VALUES BECAME THE ANSWERS — the same anchoring pathology the
+# sentiment prompt hit in v2 (memory/sentiment-prompt-v3-2026-08.md: "numeric
+# examples in a prompt become the modal outputs"). Measured over the three days
+# after the 2026-08-17 deploy: distinct confidence values collapsed 28 -> 8, the
+# modal value was exactly 0.85, and 20-35% of BUY/SELL calls came back at
+# exactly 1.00 (vs 8.7% before).
+#
+# WHY IT MATTERED, mechanically: the ~1.00 bucket IS the cohort that clears
+# Gate 1 (the regime-adjusted bar runs ~0.89, so the big 0.85 bucket was already
+# being dropped). On 2026-08-18, 135 of 420 calls came in at 1.00 and 169
+# survived Gate 1 — so the inflation, not any signal change, roughly DOUBLED the
+# trading rate (weighted arm 2.17 -> 4.53 survivors/run) and pushed the book to
+# 44/50 broker positions. Confidence also drives the SIZING ramp, which
+# saturates at 1.00, so a third of entries were sized identically.
+#
+# THE FIX — band-then-placement, mirroring the sentiment v3 repair that worked:
+# the bands still choose the ACTION (unchanged, so Gate 1's level is preserved),
+# and a named-modifier procedure chooses the NUMBER inside the band. Deliberately
+# no worked numeric example: any value written here can become the next
+# attractor, so the modifiers are named and their magnitude is described in
+# words ("a few hundredths"), never demonstrated with a figure.
+#
+# ⚠ THE OVER-CORRECTION, and why the wording below is what it is. The FIRST
+# version of this rubric justified the 1.00 ban with the truth — "this book's
+# realised directional hit rate is close to a coin flip" — and the very first
+# live run came back with every call at 0.76-0.82: perfect granularity, zero at
+# 1.00, and **10 of 10 candidates dropped by Gate 1, zero survivors**. The
+# lesson is specific and worth keeping: THIS CONFIDENCE IS NOT A CALIBRATED
+# PROBABILITY, it is a conviction score that Gate 1 thresholds at 0.85. Tell a
+# model the honest base rate and it will honestly answer ~0.5 — which is below
+# every gate, so the book stops trading. The ban is therefore justified
+# MECHANICALLY (a ceiling value carries no ranking information and saturates the
+# sizer), never by appeal to the true hit rate. The action↔band consistency rule
+# ("emitting BUY/SELL *is* choosing the actionable band") is the second half of
+# the repair: it stops the model issuing BUY/SELL with a monitor-band number.
+#
+# ONE definition shared by all three arm variants (dual-case / blind / sighted).
+# Duplicating it three times is how the original drifted, and this repo has been
+# bitten by a constant living at two sites more than once.
+_CONFIDENCE_PLACEMENT = (
+    "   - PLACING THE NUMBER — the bands above choose the ACTION, and this chooses "
+    "the number INSIDE the band you already chose. THE TWO MUST AGREE: emitting "
+    "BUY or SELL *is* choosing the actionable band, so the number then belongs at "
+    "0.85 or above. A BUY/SELL carrying a monitor-band number is a contradiction — "
+    "if the evidence only supports a monitor-band number, the action is HOLD.\n"
+    "     (a) Choose the band: actionable 0.85+, monitor 0.55-0.84, watch below "
+    "0.55.\n"
+    "     (b) Place WITHIN that band. Start from the band's lower edge and move UP "
+    "for each factor that genuinely applies, DOWN for each that cuts against: a "
+    "SECOND INDEPENDENT family confirming (families, not method count); tape "
+    "structure aligned with the direction; a dated specific catalyst rather than a "
+    "standing theme; the move still ahead of the market rather than largely made; "
+    "corroboration by independent reporting rather than a single company release.\n"
+    "     (c) Each factor is worth a few hundredths — not a jump to the top of the "
+    "band. Land on TWO DECIMALS and report exactly that.\n"
+    "   - The number's JOB is to RANK your own calls against each other: it sets "
+    "position SIZE and the actionable cut. Two tickers whose evidence differs must "
+    "NOT receive the same confidence, and a page of identical values tells the "
+    "sizing layer nothing.\n"
+    "   - NEVER output 1.00 or 0.99. A value pinned at the ceiling saturates "
+    "position sizing and carries NO ranking information — it tells the system "
+    "every such call is identical, which is never true. Reserve 0.95+ for an "
+    "exceptional case you justify explicitly in the rationale.\n"
+    "   - The band edges are BOUNDARIES, not answers. If your placement lands on "
+    "one, decide which side the evidence is actually on and report that value. "
+    "Likewise do not fall back on a round value (x.x0 / x.x5) unless the placement "
+    "genuinely lands there.\n"
+    "   - Do NOT inflate: a top-of-band read requires several converging "
+    "INDEPENDENT families PLUS a clear price catalyst.\n"
+)
 
 
 def _split_thinking(model_id: str) -> tuple[str, bool]:
@@ -600,7 +675,43 @@ def _recommendations_from_data(data, analyst_source: str, now) -> List["Recommen
                 f"[claude] {analyst_source} recommendation skipped — missing/invalid field "
                 f"({type(e).__name__}: {e}): {str(r)[:160]}"
             )
+    _warn_on_degenerate_confidence(out, analyst_source)
     return out
+
+
+# A confidence distribution can COLLAPSE without anything failing: every call
+# still parses, the pipeline still runs, and only the trading RATE moves (the
+# 2026-08-17 regression put 20-35% of calls at exactly 1.00 and doubled the
+# Gate-1 pass rate). The prompt rubric is the fix; this is the detector, because
+# "the model quietly stopped varying its confidence" is otherwise
+# indistinguishable from normal operation. Thresholds are module constants, not
+# settings — a knob that silences a detector is a knob that gets turned.
+_CONF_MAX_ONES_FRAC = 0.10      # >10% at exactly 1.00 is the regression signature
+_CONF_MIN_DISTINCT = 10         # fewer distinct values than this = collapsed grid
+_CONF_MIN_CALLS = 25            # below this the shape is not informative
+
+
+def _warn_on_degenerate_confidence(recs: List["Recommendation"], source: str) -> None:
+    """Log once per call when the actionable confidence grid has collapsed."""
+    try:
+        vals = [round(float(r.confidence), 4) for r in recs
+                if getattr(r, "action", None) in ("BUY", "SELL")
+                and r.confidence is not None]
+        if len(vals) < _CONF_MIN_CALLS:
+            return
+        ones = sum(1 for v in vals if v >= 0.9999) / len(vals)
+        distinct = len(set(vals))
+        if ones > _CONF_MAX_ONES_FRAC or distinct < _CONF_MIN_DISTINCT:
+            from collections import Counter
+            top = ", ".join(f"{v}×{n}" for v, n in Counter(vals).most_common(3))
+            logger.warning(
+                f"[claude] {source} CONFIDENCE GRID DEGENERATE on {len(vals)} BUY/SELL "
+                f"calls: {distinct} distinct values, {ones:.0%} at exactly 1.00 "
+                f"(top: {top}). Confidence drives Gate 1 AND position sizing, so a "
+                f"collapsed grid silently moves the trading rate — see the placement "
+                f"rubric in _CONFIDENCE_PLACEMENT.")
+    except Exception:      # a monitor must never break the tick
+        pass
 
 
 def generate_recommendations(
@@ -825,7 +936,12 @@ def generate_recommendations(
                 f">0 = bullish structure"
             )
         if use_news and _kept("news", s.sentiment_score):
-            parts.append(f"  News sentiment={s.sentiment_score:+.2f} | {s.rationale}")
+            # Catalyst-class tag (2026-08-16): the sentiment engine types every
+            # read (prompt v4); instruction 1c carries the measured per-class
+            # base rates. "none" is omitted — it means no event, not a class.
+            _cat = getattr(s, "news_catalyst", None)
+            _cat_tag = f" [{_cat}]" if _cat and _cat != "none" else ""
+            parts.append(f"  News sentiment={s.sentiment_score:+.2f}{_cat_tag} | {s.rationale}")
         if _kept("ext_gap", getattr(s, "ext_gap_score", 0.0)) and getattr(s, "ext_gap_score", 0.0):
             parts.append(
                 f"  EXTENDED-SESSION GAP={s.ext_gap_score:+.2f} "
@@ -852,7 +968,7 @@ def generate_recommendations(
         if use_insider and _kept("insider", s.insider_score) and s.insider_summary:
             parts.append(f"  Insider activity: {s.insider_summary}")
         if use_put_call_signal and _kept("put_call", s.put_call_score) and s.put_call_score:
-            parts.append(f"  Put/call score={s.put_call_score:+.2f} (contrarian; >0=extreme puts=bullish bias, <0=extreme calls=bearish bias)")
+            parts.append(f"  Put/call score={s.put_call_score:+.2f} (contrarian, continuous in the P/C ratio; >0=puts-heavy=bullish bias, <0=calls-heavy=bearish bias)")
         if _kept("vwap", s.vwap_score) and s.vwap_score:
             dist = f" ({s.vwap_distance_pct:+.1f}% from VWAP)" if s.vwap_distance_pct else ""
             parts.append(f"  VWAP_score={s.vwap_score:+.2f}{dist}")
@@ -907,7 +1023,7 @@ def generate_recommendations(
         mfi_val  = getattr(s, "mfi_value", 50.0)
         cmf_val  = getattr(s, "cmf_value", 0.0)
         if _kept("money_flow", mf_score) and mf_score:
-            parts.append(f"  MoneyFlow_score={mf_score:+.2f} (MFI={mfi_val:.0f}, CMF={cmf_val:+.2f})  (>0=accumulation, <0=distribution)")
+            parts.append(f"  MoneyFlow_score={mf_score:+.2f} (Chaikin CMF={cmf_val:+.2f}; MFI={mfi_val:.0f} context only)  (>0=accumulation, <0=distribution)")
         ts_score = getattr(s, "trend_strength_score", 0.0)
         ts_lbl   = getattr(s, "trend_strength_label", "")
         if _kept("trend_strength") and (ts_score or (ts_lbl and ts_lbl not in ("NO_DATA", "NO_TREND"))):
@@ -995,7 +1111,7 @@ def generate_recommendations(
             "   - confidence < 0.55 → WATCH only.\n"
             "   - Two similar case standings, or two low ones → HOLD/WATCH. Declining to "
             "call a direction is a correct and expected output, not a failure.\n"
-            "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
+            + _CONFIDENCE_PLACEMENT +
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
         )
     elif blind_synthesis:
@@ -1026,7 +1142,7 @@ def generate_recommendations(
             "   - confidence ≥ 0.85 but only one method family in support → HOLD maximum (single-source signals are noise).\n"
             "   - confidence 0.55-0.84 → HOLD (monitor closely).\n"
             "   - confidence < 0.55 → WATCH only.\n"
-            "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
+            + _CONFIDENCE_PLACEMENT +
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
         )
     else:
@@ -1055,7 +1171,7 @@ def generate_recommendations(
             "   - confidence ≥ 0.85 but sources_agreeing = 1 → HOLD maximum (single-source signals are noise).\n"
             "   - confidence 0.55-0.84 → HOLD (monitor closely).\n"
             "   - confidence < 0.55 → WATCH only.\n"
-            "   - Do NOT inflate confidence. A 90%+ call requires multiple converging signals with clear price catalyst.\n"
+            + _CONFIDENCE_PLACEMENT +
             "   - When in doubt, HOLD is the correct output — a wrong BUY/SELL destroys capital.\n"
             "   - buy_score/sell_score are the bullish and bearish camps' SEPARATE convictions; "
             "their '(pNN today)' annotation is that score's percentile among ALL tickers scored "
@@ -1105,7 +1221,7 @@ def generate_recommendations(
     if settings.enable_price_momentum:
         active_methods.append("price momentum / perceived value (1m/2m returns normalised vs own trailing history)")
     if settings.enable_money_flow:
-        active_methods.append("money flow indicators (MFI 14-period, CMF 20-period, OBV slope — accumulation vs distribution)")
+        active_methods.append("money flow (Chaikin CMF 20-period — accumulation vs distribution; MFI shown as context)")
     if settings.enable_trend_strength:
         active_methods.append("trend strength (ADX/DMI directional movement + Donchian 20-day breakout — trend quality & confirmation)")
     if settings.enable_pead:
@@ -2930,6 +3046,26 @@ Avoid chasing pre-earnings longs on NEUTRAL/MISS tickers even if news is bullish
     - Persistence alone, with no other confirming method, is a WATCH — never a standalone BUY."""
 
     # Build sentiment-velocity instruction (Δsentiment, not level)
+    # News catalyst-CLASS base rates (2026-08-16). The sentiment engine tags
+    # every read with its dominant catalyst class (the [class] on the news
+    # line); the news-event dataset (4,075 typed historical events vs the
+    # pivot target) measured strong per-class asymmetries. Surfaced as
+    # judgment context — the mechanical `catalyst_tilt` method is PANEL-FIRST
+    # at weight 0, so this is NOT double-counted in combined_score today;
+    # revisit this block if catalyst_tilt is ever promoted into the combine.
+    news_catalyst_instruction = ""
+    if use_news and any((getattr(s, "news_catalyst", None) or "none") != "none"
+                        for s in signals_for_claude):
+        news_catalyst_instruction = """
+1c. News catalyst CLASSES (measured base rates — the [class] tag on the news line):
+    This system's own event history says a news read's reliability depends on WHAT KIND of news it is:
+    - Bullish reads driven by analyst actions, company PR, management changes or index adds have historically FADED at this horizon — demand independent corroboration before acting on them.
+    - Bullish reads on contract/partnership, insider-activity, product and guidance news have FOLLOWED THROUGH.
+    - Freshly DECLARED dividend raises drift up for ~a week, monotonically in the raise size.
+    - A nonzero read tagged [none] (no identifiable event behind it) has usually been WRONG — treat it as noise.
+    The class prices the PRIOR; a coherent story can still override it, but say why.
+"""
+
     velocity_instruction = ""
     if any(getattr(s, "sentiment_velocity_score", 0.0) for s in signals_for_claude):
         velocity_instruction = """
@@ -3492,29 +3628,24 @@ Regime guide:
     money_flow_instructions = ""
     if settings.enable_money_flow:
         money_flow_instructions = """
-16. Money Flow Indicators overlay (MFI + CMF + OBV):
-    MoneyFlow_score ∈ [-1, +1] is a composite of three volume-based indicators.
-    Measures whether institutional capital is accumulating (buying) or distributing (selling).
-
-    Components:
-    - MFI (Money Flow Index, 14-period): volume-weighted RSI. < 20 = oversold/accumulation, > 80 = overbought/distribution.
-    - CMF (Chaikin Money Flow, 20-period): positive = buyers in control; negative = sellers in control.
-    - OBV slope z-score: rising = sustained buying pressure; falling = distribution.
+16. Money Flow overlay (Chaikin Money Flow):
+    MoneyFlow_score ∈ [-1, +1] is CMF alone (20-period volume-weighted close-position-in-range) —
+    positive = buyers absorbing supply near the highs of each bar (institutional accumulation),
+    negative = sellers in control (distribution). The MFI value shown beside it is CONTEXT ONLY
+    (an overbought/oversold oscillator reading; it does not enter the score).
 
     Interpretation:
-    - MoneyFlow_score > +0.5: strong institutional accumulation. Smart money is building positions.
-      Confirms BULLISH signals, especially when combined with positive news or insider buying.
-    - MoneyFlow_score > +0.2: mild accumulation bias — gentle tailwind for BULLISH direction.
+    - MoneyFlow_score > +0.5: strong institutional accumulation — confirms BULLISH signals,
+      especially alongside positive news or insider buying.
     - MoneyFlow_score near 0 (|score| < 0.15): no clear flow signal; price/volume in equilibrium.
-    - MoneyFlow_score < -0.2: mild distribution — caution on new BUY entries; existing longs at risk.
-    - MoneyFlow_score < -0.5: strong distribution. Institutional selling. Weight against BUY calls.
-      For SELL signals: strong confirming evidence that sellers are already active.
+    - MoneyFlow_score < -0.5: strong distribution — weight against BUY calls; for SELL calls,
+      confirming evidence that sellers are already active.
 
     Use-case rules:
     - Do NOT use money flow as the sole basis for BUY/SELL — it requires convergence with at least one other signal.
-    - Divergence alert: if price rises but MoneyFlow_score is falling (negative), the move may be weak — caution.
-    - High MFI (> 80) alone is not bearish — it can persist in strong trends. Weight CMF and OBV equally.
-    - In early-stage breakouts, CMF turning positive before price fully breaks out is an early warning signal."""
+    - Divergence alert: price rising while MoneyFlow_score is negative means the move lacks
+      accumulation behind it — caution.
+    - CMF turning positive before a breakout completes is an early accumulation tell."""
 
     # Trend strength (ADX/DMI + Donchian breakout) instruction
     trend_strength_instructions = ""
@@ -3667,8 +3798,8 @@ Regime guide:
                 + "</corporate_actions_context>\n\n"
             )
             corporate_actions_instructions = """
-29. Corporate-actions overlay — DIRECTIONAL signals + mechanics:
-    - DIRECTIONAL (a conviction input — corroborate, don't trade on it alone): a FORWARD split signals optimism + better liquidity → mild bullish drift; a REVERSE split is usually delisting-distress → bearish. A dividend INCREASE / INITIATION signals confidence in future cash flows → bullish; a CUT / OMISSION is a distress signal → bearish (the strongest of the four). Let these raise/lower conviction and shape horizon.
+29. Corporate-actions overlay — DIRECTIONAL signals + mechanics (base rates MEASURED on this system's own event history):
+    - DIRECTIONAL (a conviction input — corroborate, don't trade on it alone): a FORWARD split signals optimism + better liquidity → mild bullish drift; a REVERSE split is usually delisting-distress → bearish. A freshly DECLARED dividend RAISE drifts up for ~a week, monotonically in the raise size — the bigger and fresher the raise, the stronger the bullish tilt. A dividend CUT is NOT an automatic bearish signal at this horizon: measured cuts had usually already been priced (the stock often bounces post-cut) — treat a cut as context, not a short thesis, unless the broader distress story is fresh and uncorroborated by price.
     - MECHANICS (NOT directional): on the EX-DIVIDEND date price drops ~the dividend — don't read that gap as weakness; around a SPLIT execution date price/share count rescale — treat OHLCV signals near the date with caution (the level shift can masquerade as a move).
 """
 
@@ -3710,7 +3841,7 @@ YOUR TASK:
 4. Short-selling discipline:
    - SELL means initiating a short position (or buying an inverse ETF).
    - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
-{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}{catalyst_instructions}{open_positions_instructions}{fundamentals_instructions}{corporate_actions_instructions}
+{news_catalyst_instruction}{velocity_instruction}{insider_instructions}{macro_instructions}{macro_surprise_instructions}{fedwatch_instructions}{bond_instructions}{revision_instructions}{cot_instructions}{ipo_instructions}{vix_instructions}{move_instructions}{dix_instructions}{global_macro_instructions}{sector_rotation_instructions}{rotation_drivers_instructions}{business_cycle_instructions}{intermarket_instructions}{macro_news_instructions}{credit_instructions}{pc_instructions}{tick_instructions}{breadth_instructions}{highs_lows_instructions}{mcclellan_instructions}{whisper_instructions}{earnings_instructions}{gex_instructions}{pattern_instructions}{vwap_instructions}{momentum_instructions}{money_flow_instructions}{trend_strength_instructions}{pead_instructions}{iv_rank_instructions}{iv_expr_instructions}{relative_value_instructions}{cluster_instruction}{persistence_instruction}{opex_instructions}{seasonality_instructions}{catalyst_instructions}{open_positions_instructions}{fundamentals_instructions}{corporate_actions_instructions}
 Commodity tickers always present in the list: {commodity_tickers}
 — Label these as type "COMMODITY". Apply your macro expertise:
   - Precious metals (GLD, SLV, IAU, GDX, PPLT, PALL): driven by real rates, USD strength/weakness, geopolitical risk, and central bank policy expectations. A falling real rate environment or rising macro uncertainty is structurally bullish for gold and silver.
@@ -3723,8 +3854,8 @@ Output a JSON object of the form {{"recommendations": [ ... ]}} where each array
 - "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
 - "action": "BUY" | "SELL" | "HOLD" | "WATCH"
 - "time_horizon": "SWING" | "SHORT-TERM" | "POSITION" | "N/A"
-- "confidence": float 0.0-1.0
 - "rationale": 2-3 sentences — cite the specific catalysts from ALL active signal layers, explain the price mechanism, state expected time horizon and key risk.
+- "confidence": two-decimal float, strictly below 1.00 — placed by the procedure in the conviction rules. Emit it LAST, after the rationale that justifies it.
 
 Return ALL tickers from the input. No markdown, JSON only."""
 

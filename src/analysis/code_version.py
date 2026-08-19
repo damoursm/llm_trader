@@ -64,6 +64,13 @@ METHOD_SOURCES: Dict[str, Tuple[str, ...]] = {
     # news_shock reads the sentiment module's attention_mass too — both modules
     # move its output, so both are fingerprinted.
     "news_shock": ("src.signals.news_shock", "src.analysis.sentiment"),
+    # news_bear_fresh multiplies the news verdict, so the sentiment module moves
+    # its output exactly as it moves news_shock's.
+    "news_bear_fresh": ("src.signals.news_bear_fresh", "src.analysis.sentiment"),
+    # catalyst_tilt multiplies the news verdict by a map calibrated from the
+    # news-event dataset — all three modules move its output.
+    "catalyst_tilt": ("src.signals.catalyst_tilt", "src.analysis.news_events",
+                      "src.analysis.sentiment"),
     # Options family. `max_pain` and `oi_skew` have no module of their own —
     # they are scored INLINE in the aggregator from fetched chain data, so the
     # aggregator IS their source. Coarse (any aggregator edit marks them) but

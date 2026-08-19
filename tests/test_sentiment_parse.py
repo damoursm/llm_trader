@@ -14,11 +14,12 @@ from src.analysis.sentiment import _parse_response
 
 
 def test_valid_json():
-    assert _parse_response('{"score": 0.4, "rationale": "ok"}') == (0.4, "ok")
+    # 3-tuple since 2026-08-15 (catalyst field); a reply without one → None.
+    assert _parse_response('{"score": 0.4, "rationale": "ok"}') == (0.4, "ok", None)
 
 
 def test_markdown_fenced_json():
-    assert _parse_response('```json\n{"score": -0.2, "rationale": "x"}\n```') == (-0.2, "x")
+    assert _parse_response('```json\n{"score": -0.2, "rationale": "x"}\n```') == (-0.2, "x", None)
 
 
 def test_score_clamped_to_unit_range():
@@ -29,7 +30,7 @@ def test_score_clamped_to_unit_range():
 def test_truncated_response_salvages_score():
     trunc = ('{\n  "score": 0.35,\n  "rationale": "Strong biotech momentum with '
              'several positive catalysts including FDA approvals that could drive')
-    score, rationale = _parse_response(trunc)
+    score, rationale, _catalyst = _parse_response(trunc)
     assert score == 0.35
     assert "biotech momentum" in rationale
 

@@ -136,6 +136,7 @@ def fetch_tick_context() -> Optional[TICKContext]:
             period=f"{_LOOKBACK_DAYS + 2}d",
             interval="1d",
             auto_adjust=False,
+            timeout=30,
         )
     except Exception as e:
         logger.warning(f"[tick] yfinance fetch failed: {e}")

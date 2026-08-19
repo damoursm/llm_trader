@@ -13,13 +13,17 @@ trend strength is multiplied by a **learned orientation** ∈ [−1, +1]:
                        outputs a BULLISH score to predict a bounce)
     |orientation|     → confidence; magnitude also scales with trend strength
 
-The orientation is measured per method from the signals panel — how often that
-trend context has actually continued vs reversed at the swing horizon — and shrunk
-toward a CONTINUATION prior (+1) by signal-days, so each method starts as
-continuation and flips toward reversal only as the forward returns confirm it
-(e.g. it learns "clean downtrends bounce → predict up"). See
-``calibrate_trend_orientation``. The final score follows the house sign convention
-(positive = predicted up, negative = predicted down, |score| = confidence).
+The orientation is measured per method from the signals panel on the PIVOT
+basis (2026-08-16 rebase): the per-day rank IC of the raw signed trend FEATURE
+against the signed pivot target within the method's active context, shrunk
+toward 0 = ABSTAIN by signal-days — an unproven context contributes NOTHING
+(the catalyst_tilt idiom). The old formula shrank toward a +1 CONTINUATION
+prior on a drift-biased continuation-rate statistic at the fixed horizon,
+which held all four contexts at +0.28..+0.39 while the panel measured them
+DESCENDING (adx_long daily IC −0.049, t −3.2 — the 2026-08-16 decile-direction
+audit). See ``calibrate_trend_orientation``. The final score follows the house
+sign convention (positive = predicted up, negative = predicted down,
+|score| = confidence).
 
 Because a name is up- OR down-trending (never both), each method is sparse and
 one-sided in its CONTEXT, which is why they fold into ``combined_score`` as an
@@ -128,29 +132,40 @@ def _store_orient(now: float, orient: dict, feature_panel: Optional[pd.DataFrame
         _orient_cache.update(ts=now, orient=orient)
 
 
+# A mean daily IC at/above this magnitude maps to a FULL ±1 orientation
+# (before the days-based shrinkage). 0.04 is a strong IC for these features.
+_ORIENT_IC_SCALE = 0.04
+
+
 def calibrate_trend_orientation(feature_panel: Optional[pd.DataFrame] = None) -> dict:
-    """Per-method orientation ∈ [−1, +1] — whether each trend context should
-    predict CONTINUATION (+1) or REVERSAL (−1), learned from the signals panel.
+    """Per-method orientation ∈ [−1, +1] — CONTINUATION (+) or REVERSAL (−),
+    learned from the signals panel on the PIVOT basis (2026-08-16 rebase).
 
     For each method's active context (uptrend for ``*_long``, downtrend for
-    ``*_short``), measures how often the trend CONTINUED at the swing horizon
-    (``predictability_horizon``): ``agree`` = share whose forward move matched the
-    trend, ``orient_obs = 2·agree − 1`` (+1 pure continuation, −1 pure reversal).
-    That is shrunk toward the CONTINUATION prior (+1) by SIGNAL-DAYS
-    (``trend_orientation_prior_n``), so a method starts as continuation and flips
-    toward reversal only as independent days of forward returns confirm it — the
-    same evidence-throttled idiom as the sizing calibrations. Cached
-    (``trend_orientation_cal_ttl_seconds``) and fully fail-soft (→ all +1
-    continuation), so this layer never breaks scoring. Reports each orientation to
+    ``*_short``): the per-day Spearman IC of the raw signed trend FEATURE
+    (``er_signed``/``adx_signed`` — deliberately the orientation-FREE inputs,
+    because the persisted METHOD scores carry the served orientation, and
+    calibrating on those would let a served flip feed back into its own next
+    calibration) against the signed PIVOT target, on the tradeable-price
+    subset. ``orient_obs = clip(mean_daily_IC / _ORIENT_IC_SCALE, −1, +1)``,
+    shrunk toward **0 = ABSTAIN** by signal-days (``trend_orientation_prior_n``)
+    — an unproven context contributes NOTHING (the catalyst_tilt idiom). The
+    old formula shrank toward a +1 continuation prior on a drift-biased
+    continuation-rate at the fixed horizon, which held every context at
+    +0.28..+0.39 while the panel measured all four DESCENDING (the 2026-08-16
+    decile-direction audit; epoch-registered on the four methods because the
+    persisted scores are orientation-inclusive). Cached
+    (``trend_orientation_cal_ttl_seconds``) and fully fail-soft (→ all 0.0,
+    abstain), so this layer never breaks scoring. Reports each orientation to
     the calibration registry."""
     if not settings.enable_trend_predictability_methods:
-        return dict(_CONTINUATION)
+        return dict(_ZERO)
     now = time.time()
     if feature_panel is None and _orient_cache["orient"] is not None \
             and (now - _orient_cache["ts"]) < float(settings.trend_orientation_cal_ttl_seconds):
         return _orient_cache["orient"]
 
-    orient = dict(_CONTINUATION)
+    orient = dict(_ZERO)
     diag: dict = {}
     try:
         horizon = int(settings.predictability_horizon)
@@ -164,7 +179,24 @@ def calibrate_trend_orientation(feature_panel: Optional[pd.DataFrame] = None) ->
             _store_orient(now, orient, feature_panel)
             return orient
 
-        fwd = pd.to_numeric(fp.get(f"fwd_ret_{horizon}d"), errors="coerce")
+        # Pivot label first (the decision basis); fixed horizon only as the
+        # fallback for frames that predate the pivot column.
+        _pv = fp.get("fwd_ret_pivot")
+        fwd = pd.to_numeric(_pv, errors="coerce") if _pv is not None else None
+        if fwd is None or not fwd.notna().any():
+            _alt = fp.get(f"fwd_ret_{horizon}d")
+            fwd = pd.to_numeric(_alt, errors="coerce") if _alt is not None else None
+        if fwd is None:
+            _store_orient(now, orient, feature_panel)
+            return orient
+        # Tradeable-price subset (pivot numbers are only meaningful gated);
+        # fail-soft to the full frame when the column is absent (test fixtures).
+        if "price" in fp.columns:
+            pr = pd.to_numeric(fp["price"], errors="coerce")
+            gated = pr >= float(getattr(settings, "trade_min_price", 5.0))
+            if int(gated.sum()) >= int(settings.trend_orientation_cal_min_rows):
+                fp = fp[gated]
+                fwd = fwd[gated]
         prior_n = max(0, int(settings.trend_orientation_prior_n))
         min_rows = int(settings.trend_orientation_cal_min_rows)
         for m, (fcol, side) in _METHOD_SPEC.items():
@@ -172,25 +204,29 @@ def calibrate_trend_orientation(feature_panel: Optional[pd.DataFrame] = None) ->
             if raw is None or fwd is None:
                 continue
             active = (raw > _EPS) if side > 0 else (raw < -_EPS)
-            valid = active & fwd.notna()
-            if int(valid.sum()) < min_rows:
-                continue                                   # keep the +1 continuation prior
-            f = fwd[valid]
-            moved = f != 0
-            if not bool(moved.any()):
+            valid = active & fwd.notna() & raw.notna()
+            if int(valid.sum()) < min_rows or "signal_date" not in fp.columns:
+                continue                                   # keep the 0 abstain prior
+            sub = pd.DataFrame({"day": fp.loc[valid, "signal_date"].astype(str).str[:10],
+                                "x": raw[valid], "y": fwd[valid]})
+            ics = []
+            for _, g in sub.groupby("day"):
+                if len(g) < 5 or g["x"].nunique() < 3:
+                    continue
+                ics.append(g["x"].rank().corr(g["y"].rank()))
+            ics = pd.Series(ics, dtype=float).dropna()
+            n_days = int(len(ics))
+            if n_days < 5:
                 continue
-            cont = (f > 0) if side > 0 else (f < 0)        # did the trend continue?
-            agree = float(cont[moved].mean())
-            orient_obs = 2.0 * agree - 1.0                 # +1 continuation … −1 reversal
-            n_days = int(fp.loc[valid, "signal_date"].nunique()) if "signal_date" in fp.columns else 0
-            denom = prior_n + n_days
-            o = ((prior_n * 1.0 + n_days * orient_obs) / denom) if denom > 0 else 1.0
+            ic_mean = float(ics.mean())
+            orient_obs = max(-1.0, min(1.0, ic_mean / _ORIENT_IC_SCALE))
+            o = n_days * orient_obs / (n_days + prior_n) if (n_days + prior_n) > 0 else 0.0
             orient[m] = round(max(-1.0, min(1.0, o)), 3)
-            diag[m] = (round(agree, 3), n_days)
+            diag[m] = (round(ic_mean, 4), n_days)
         _report_orient(orient, diag)
     except Exception as e:
         logger.debug(f"[trend_predict] orientation calibration failed: {e}")
-        orient = dict(_CONTINUATION)
+        orient = dict(_ZERO)
     _store_orient(now, orient, feature_panel)
     return orient
 
@@ -199,12 +235,12 @@ def _report_orient(orient: dict, diag: dict) -> None:
     try:
         from src.performance.calibration import report_calibration
         for m in TREND_PREDICT_METHODS:
-            agree, n_days = diag.get(m, (None, 0))
+            ic_mean, n_days = diag.get(m, (None, 0))
             report_calibration(
-                f"trend_orient_{m}", value=orient.get(m, 1.0), prior=1.0,
+                f"trend_orient_{m}", value=orient.get(m, 0.0), prior=0.0,
                 n_evidence=n_days, unit="orient (+cont/−rev)",
-                note=(f"continuation rate {agree} over {n_days} signal-day(s)"
-                      if agree is not None else "continuation prior (thin data)"))
+                note=(f"pivot daily IC {ic_mean} over {n_days} signal-day(s)"
+                      if ic_mean is not None else "abstain prior (thin data)"))
     except Exception:
         pass
 

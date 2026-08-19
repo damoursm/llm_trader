@@ -122,7 +122,13 @@ class Settings(BaseSettings):
     enable_corporate_actions: bool = True
     corp_actions_div_lookahead_days: int = 14   # surface ex-dividends within this many days
     corp_actions_split_window_days: int = 30    # surface splits within ± this many days
-    corp_actions_div_max_tickers: int = 60      # per-ticker dividend-history fetches for the increase/cut factor (0 = off)
+    # f_dividend EVENT window (2026-08-16 rework): score only dividends DECLARED
+    # within this many trailing days, decaying to 0 across it — the measured
+    # drift is confined to the first ~5 sessions after declaration. Discovery is
+    # one market-wide declaration-window query (full-universe coverage); history
+    # is fetched per fresh declarer only, capped below.
+    corp_actions_div_event_window_days: int = 10
+    corp_actions_div_max_event_fetches: int = 40
     # Additive (NOT normalised-pool) overlay weight for the directional corporate-action
     # factors (f_split + f_dividend) on combined_score — event-driven so it never dampens
     # the ~95% of tickers with no action. Placeholder; tune once IC data accrues.
@@ -221,7 +227,9 @@ class Settings(BaseSettings):
     # rows accumulate the outcome comparison (same idiom as
     # open_positions_prompt_share). Hold-review calls are NEVER blinded (stable
     # exit governance; only the entry side is under test). 0.0 = off, 1.0 = always.
-    blind_synthesis_share: float = 0.5
+    # RETIRED 2026-08-16 → 0.0 (see the arm-decommission note on
+    # enable_shadow_arms below). Raise it to re-open the blind/sighted axis.
+    blind_synthesis_share: float = 0.0
 
     # ── Dual-case synthesis (2026-07-25) ─────────────────────────────────────
     # Presents the BULL CASE and the BEAR CASE side by side, each built from its
@@ -244,7 +252,9 @@ class Settings(BaseSettings):
     # SUPERSEDES the blind/sighted axis when active (a symmetric two-case
     # presentation is inherently verdict-free), so the arms stay at three —
     # dual / blind / sighted — instead of fragmenting into four cells.
-    dual_case_synthesis_share: float = 0.5
+    # RETIRED 2026-08-16 → 0.0 (see the arm-decommission note on
+    # enable_shadow_arms below). Raise it to re-open the dual-case arm.
+    dual_case_synthesis_share: float = 0.0
 
     # ── Shadow synthesis arms (per-ticker arm bake-off, 2026-07-25) ────────
     # Ask EVERY prompt arm about EVERY ticker each tick: the live arm drives the
@@ -256,7 +266,26 @@ class Settings(BaseSettings):
     # Cost: two extra SYNTHESIS calls per tick. Synthesis is one call for the
     # whole top-N ticker set (unlike per-ticker sentiment, the real cost
     # driver), and shadow calls run off the critical path, so orders never wait.
-    enable_shadow_arms: bool = True
+    #
+    # ── ARMS DECOMMISSIONED 2026-08-16 (user directive) — SIGHTED ONLY ───────
+    # The bake-off ran 2026-07-25 → 2026-08-16 and ANSWERED: on the PIVOT basis
+    # (the decision basis) with day-clustered statistics over 16 settled days /
+    # 22,534 labeled arm rows, NO arm is distinguishable from another — the
+    # paired disagreement subset (the only place a prompt changes a decision)
+    # gives |day-t| < 1 for all three pairs, the nominal winner wins just 38-44%
+    # of DAYS, and dual-vs-blind FLIPS SIGN between row- and day-weighting.
+    # Unpaired means (sighted +0.071%/day, t 0.74) are not evidence. So the 3x
+    # synthesis cost was buying nothing and all three knobs are now off:
+    # every run is SIGHTED, no shadow calls. Sighted was kept on the
+    # tiebreakers, not on P&L: the shortest per-ticker block (dual renders BULL
+    # AND BEAR lines for every ticker) and the least anti-informative
+    # confidence (+0.015 vs dual −0.033), which matters because confidence
+    # feeds sizing. The dual/blind rendering code and `arm_recommendations`
+    # history are KEPT (same convention as the retired Qwen/Claude sentiment
+    # split): flipping any share back above 0 re-opens the experiment, and the
+    # accrued rows stay analysable via `python -m src.analysis.arm_eval`.
+    # See memory/shadow-arms-2026-07.md for the full verdict.
+    enable_shadow_arms: bool = False
     # Hard bound on the join at persist time. A shadow arm that overruns is
     # abandoned (live arm still persisted) rather than delaying the run.
     shadow_arms_join_timeout_seconds: float = 300.0
@@ -398,19 +427,78 @@ class Settings(BaseSettings):
     # partial ml_buy/ml_sell swap mixes two scales in one difference and keeps
     # the weighted bands, which is the conservative side (fires less).
     #
-    # !! ml_raw_confidence_scale is PROVISIONAL — pending a multi-day read. !!
-    # Solved on 4 days of PRE-fix rows; the first POST-fix run landed hotter
-    # than predicted (joint exposure 42.4% vs 33.4%, Gate 1 46.7% vs 36.7%,
-    # 10 actionable vs the weighted arm's 0-8 range). NOT retuned on that: one
-    # run against a 4-day sample, inside the weighted arm's own family, and
-    # +/-10% here only moves Gate 1 by 2-3pp — a single observation cannot
-    # justify the change, and per-run retuning fits noise. Re-read after ~5
-    # trading days (compare pct_dir / pct_gate1 / joint and runs.n_actionable
-    # for combine_source 'ml' vs 'weighted'); if ML exposure is still
-    # materially higher, 0.0658 -> ~0.075 pulls Gate 1 to ~33.8%.
+    # RETUNED 2026-08-18 (0.0658 -> 0.12) on the multi-day read the note above
+    # asked for. The ML arm was over-exposed by a factor that REPLICATED on
+    # every post-fix day: ML 2.28/1.67/3.43/2.40 Gate-1 survivors per run vs the
+    # weighted arm's 1.06/0.00/1.89/1.00 — 2.15x / 1.81x / 2.40x, and 2.12x
+    # (08-14+) vs 2.11x (08-16+, post-retrain) on the aggregates.
+    #
+    # THE MECHANISM, which is not what the note above assumed. The divisor does
+    # not reach Gate 1 mechanically — the LLM restates its own confidence. It
+    # reaches Gate 1 by SATURATION: every row with |combined| >= the divisor
+    # clips to raw_confidence 1.0 and is shown to the model as
+    # "combined_confidence=100%". Measured on ml-source BUY/SELL candidates,
+    # the anchor bin is decisive:
+    #     anchor <0.60 -> 12.4% pass | 0.60-0.85 -> 6.4% | 0.85-1.00 -> 16.7%
+    #     anchor ==1.00 -> 67.2% pass
+    # and the LLM tracks the ML anchor closely (spearman +0.68 stated-vs-anchor)
+    # BECAUSE it varies. On weighted runs the anchor is saturated for ~all of
+    # the top-40 prompt slots (mean 0.997), so it carries no information and the
+    # model ignores it (spearman +0.015, its own ~0.86 prior instead). A 100%
+    # anchor is only persuasive when other rows are not at 100%.
+    #
+    # So the divisor is a SATURATION control, and 0.0658 clipped 60-77% of
+    # ml-source candidates. 0.12 cuts that to ~21% and predicts 1.45 survivors
+    # per run against the weighted arm's 1.24 (1.16x). Deliberately left
+    # slightly HOT: the response model holds each anchor bin's pass rate fixed
+    # while the distribution moves, which is least trustworthy once saturation
+    # is squeezed out, and an arm that goes SILENT teaches nothing and looks
+    # identical to one that is losing (the 08-12 failure this whole line of work
+    # exists to fix). Not a point estimate: the parity crossing is only
+    # identified to ~0.095-0.152 across windows because the response flattens
+    # above ~0.14; 0.12 is the middle of that band and inside a 0.12-0.16
+    # near-parity plateau (1.16x -> 0.96x).
+    #
+    # KNOWN DRIFT: the stackers retrain WEEKLY and their conviction scale moves
+    # with the artifact (all-row saturation went 16.3% -> ~26% across the 08-15
+    # retrain), so a hardcoded divisor decays. Re-read after each retrain;
+    # the durable fix is to pin the SATURATION SHARE (weighted's ~9%) as a
+    # self-calibrating quantile of the live ml-source |combined| distribution.
+    # Also note the divisor feeds SIZING through the confidence ramp, so this
+    # brings ML position sizes toward the weighted arm's too.
     ml_diff_threshold_long: Optional[float] = 0.0463
     ml_diff_threshold_short: Optional[float] = 0.0374
-    ml_raw_confidence_scale: float = 0.0658    # PROVISIONAL (see above)
+    ml_raw_confidence_scale: float = 0.12    # saturation control; see above
+
+    # SELF-CALIBRATING ML DIVISOR (2026-08-18) — src/signals/ml_scale.py.
+    # The constant above cannot hold: it controls SATURATION, and the stackers
+    # retrain weekly onto a new conviction scale, so a divisor tuned this week
+    # drifts out of exposure parity next week and the A/B silently becomes
+    # unreadable again. What is pinned instead is the saturation SHARE — the
+    # weighted arm's own clip rate, measured live and shrunk toward
+    # `ml_saturation_target` — and the divisor is re-solved as the matching
+    # quantile of the ml-source |combined_score| distribution. That quantile is
+    # NOT censored by the divisor in force (combined_score is persisted
+    # unclipped) and the ML divisor never enters its own inputs, so re-deriving
+    # it from the panel is sound rather than a backtest. Shrunk toward the
+    # constant above by evidence, clamped to a fixed multiplicative band
+    # (module constants, not settings), reported to the calibration registry,
+    # and fail-soft to the constant on any error. Honours analysis_asof.
+    enable_ml_scale_calibration: bool = True
+    # Trailing evidence window (TRADING days; the query pads for weekends).
+    # Short enough to re-centre within days of a retrain, long enough that the
+    # quantile is stable — ~4k ml rows/day makes 5 days ~20k observations.
+    ml_scale_window_days: int = 5
+    # Evidence floor: below this many ml-source rows the static value holds.
+    ml_scale_min_rows: int = 2000
+    # Shrinkage strength, in observations, for BOTH the target share (toward
+    # ml_saturation_target) and the divisor (toward ml_raw_confidence_scale).
+    ml_scale_prior_n: int = 4000
+    # Documented prior for the parity target: the weighted arm's measured
+    # saturation share (9.17% of its rows clipped at raw_confidence 1.0 over
+    # 2026-08-12..18). The live weighted measurement overrides this as evidence
+    # accrues; the prior only holds when the weighted arm is thin.
+    ml_saturation_target: float = 0.09
 
     # ANTI-CHASE / OVEREXTENSION GATE (Gate 5 of the actionable filter, 2026-07-22).
     # The BUY-vs-SELL forensics (signals panel, 8.3k ticker-days) found the BUY
@@ -580,6 +668,19 @@ class Settings(BaseSettings):
     enable_news_shock: bool = True
     news_shock_baseline_days: int = 20   # trailing window for the baseline median
     news_shock_min_days: int = 5         # covered days required before scoring
+    # news_bear_fresh (2026-08-15, panel-first weight 0 — signals/news_bear_fresh.py):
+    # bear-news freshness guard — the bearish news score scaled DOWN by how much
+    # of the bad news the 3-session tape has already priced (abstains entirely at
+    # a 2σ aligned decline: never short into a hole) and up to 1.5x when the tape
+    # ignored or rose against it. Bull/zero news abstains. Measured: bear-event
+    # daily IC +0.095 (t +2.96) vs +0.029 for news alone, pivot basis, gated.
+    enable_news_bear_fresh: bool = True
+    # catalyst_tilt (2026-08-15, panel-first weight 0 — signals/catalyst_tilt.py):
+    # the news read × a learned per-(catalyst, side) orientation from the
+    # news-event dataset (self-calibrating, 6h refresh, shrunk toward ABSTAIN).
+    # Held-out LOMO: IC +0.039 (t +2.22) where raw news measured −0.054 on the
+    # same rows. Needs the v4 catalyst capture; abstains without one.
+    enable_catalyst_tilt: bool = True
 
     enable_technical_analysis: bool = True  # method 2: RSI, MACD, SMA, Bollinger Bands
     enable_insider_trades: bool = True    # method 3: politician + corporate insider trades
@@ -1411,25 +1512,28 @@ class Settings(BaseSettings):
     enable_tape_confirmation: bool = True
     tape_confirmation_factor_span: float = 0.08
 
-    # ── Agreement floor (MECHANICAL gate; 2026-07-20) ─────────────────────────
-    # CLAUDE.md documents "a single strong signal source never produces a BUY/SELL
-    # regardless of score" as a baseline invariant of the actionable filter — but a
-    # 2026-07-20 audit found NO pipeline gate actually enforced it: sources_agreeing
-    # ≥ 2 was only a PROMPT INSTRUCTION the LLM was trusted to self-apply, so a
-    # single-source call could reach the ledger if the model ever misjudged it. This
-    # makes the documented invariant mechanically true: pipeline.py's actionable
-    # filter gains "Gate 1b — agreement floor", dropping any BUY/SELL whose sig.
-    # sources_agreeing < min_sources_agreeing_gate WHENEVER the recommendation's own
-    # direction matches the aggregator's sig.direction (the ~96% common "echo" case
-    # per the 2026-07-12 agreement study — sources_agreeing is computed relative to
-    # sig.direction, so it isn't a meaningful count for a genuine LLM override; an
-    # override passes this gate unchecked and stays governed by the confidence
-    # threshold + prompt instructions alone, unchanged from before). Counted in
-    # gate_diag.dropped_low_agreement + the per-ticker gate_outcomes stamp
-    # ("low_agreement"), and evaluated end-to-end (pass vs drop, simulated
-    # performance) by tracker.compute_stage_eval's decision-funnel — visible on the
-    # dashboard's Entry Performance tab as "Gate 1b" rows, exactly like gates 1-4.
-    enable_agreement_gate: bool = True
+    # ── Agreement floor (Gate 1b; 2026-07-20) — DECOMMISSIONED OFF 2026-08-17 ──
+    # Added 2026-07-20 to mechanically enforce the then-documented "a single strong
+    # source never produces a BUY/SELL" invariant (previously only a prompt
+    # instruction): drop any BUY/SELL whose sig.sources_agreeing <
+    # min_sources_agreeing_gate whenever the recommendation ECHOES the aggregator's
+    # direction (an LLM override passes unchecked — the count isn't attributable to
+    # a call the aggregator didn't make).
+    # SWITCHED OFF 2026-08-17 (user directive: remove gates not helping) on the
+    # pivot-basis gate funnel, measured twice: the cohort it DROPS outperforms the
+    # cohort it KEEPS (gate value −0.168pp on 45d/153 drops, re-run −0.062pp on
+    # 46d/158 drops — wrong-signed both times, never right-signed; not significant,
+    # like everything in the cascade, but the only gate whose point estimate
+    # SUBTRACTS). Under the rank-basis direction bands it is nearly vestigial
+    # anyway (0.7% of candidates in the current era — a name clearing the
+    # top-decile/bottom-5% band almost always has ≥2 agreeing sources). The prompt
+    # instruction remains; the mechanical gate reverts to pre-07-20 behaviour.
+    # Machinery kept revivable: flip this on to restore the gate; the floor below
+    # is its threshold. gate_diag.dropped_low_agreement stays (reads 0), and
+    # sources_agreeing is still computed/persisted everywhere (it feeds coherence,
+    # family votes and the panel — only the GATE is off). See
+    # memory/gate-funnel-pivot-2026-08.md.
+    enable_agreement_gate: bool = False
     min_sources_agreeing_gate: int = 2
 
     # ── IC-informed adaptive weights (panel-driven; ON, but CONFIDENCE-GATED) ──
@@ -2240,6 +2344,17 @@ class Settings(BaseSettings):
     # the task manager restarts it (a fresh tick > a permanent freeze). Set well
     # above a legitimate slow reconcile; 0 disables. See pipeline.py.
     broker_sync_watchdog_seconds: int = 600
+    # Hard wall-clock backstop on a WHOLE scheduled tick (scheduler/runner.py):
+    # the broker watchdog above only covers reconcile, so a hang anywhere else —
+    # a wedged data fetch blocking the pipeline pool join (the 2026-08-17
+    # yfinance/bond_internals 4.5-hour freeze), a stuck LLM stream — froze the
+    # scheduler with no recovery (--supervise needs an EXIT). Fires CRITICAL +
+    # os._exit(1) so the supervisor relaunches. Must sit far above the slowest
+    # legitimate tick (~15 min measured; EOD/ML retrains run in background
+    # threads and are NOT under this timer) and comfortably above the broker
+    # watchdog so a broker hang still gets attributed by ITS watchdog first.
+    # 0 disables.
+    tick_watchdog_seconds: int = 2700
     # Prefer IBKR's real-time last/mark price (free Cboe One + IEX feed via the
     # broker connection) over yfinance in tracker._fetch_price — the same data
     # that fills the orders, so the mark matches the execution venue. Requires an
@@ -2279,7 +2394,48 @@ class Settings(BaseSettings):
     #           −91 bp ATGL fills on thin RTH books). Off-RTH ticks force LMT
     #           regardless (IBKR rejects MKT outside regular hours).
     broker_order_type: str = "LMT"                # "LMT" | "MKT"
-    broker_limit_cap_bps: float = 20.0            # LMT only: max adverse distance from model price (RTH)
+    # LMT only: max adverse distance from the model price (RTH).
+    # Raised 20 -> 45 (2026-08-17). 20 bp was measurably BINDING: of RTH fills,
+    # p90 landed at 19.1 bp and p95 at 20.5 against the 20 bp cap, with 11.9%
+    # inside a tenth of the cap and 8.1% only clearing it because a re-anchor
+    # had moved the reference. A cap that the fills pile up against is one that
+    # is turning marginal orders into no-fills.
+    # This is a CEILING, not a price paid: a marketable limit fills at the best
+    # available price up to the limit, so widening it cannot make an existing
+    # good fill worse -- it only admits fills that previously did not happen.
+    # Off-RTH is deliberately unchanged; there the cap is NOT the constraint
+    # (fills consume a p50 of only ~8-20 bp of an 80/150 bp cap), liquidity is.
+    broker_limit_cap_bps: float = 45.0
+    # SPREAD-AWARE limits (2026-08-17). The limit is priced off a LAST/MID —
+    # get_market_price never returns the ask — so an order is marketable only
+    # when the cap happens to exceed the HALF-SPREAD. That holds in RTH and
+    # fails badly off-hours, where a thin book quotes hundreds of bp: measured
+    # 56.6% RTH vs 4.8% overnight fills. The surviving fills consumed only a
+    # small slice of their cap, which looked like "the cap is fine" but was
+    # survivorship — the wide names never filled, so they never entered the
+    # statistic at all.
+    # With this on, a real two-sided quote raises the cap to cover
+    # half_spread * broker_spread_cap_mult (never LOWERS it below the
+    # configured cap) and the limit is pushed to the far side of the book when
+    # the cap covers it. Reaching the far side costs nothing: a marketable
+    # limit executes at the touch, so this decides whether the order can trade,
+    # not the price paid. No quote ⇒ unchanged mid-based behaviour.
+    broker_spread_aware_limits: bool = True
+    # ...but RTH ONLY, by measurement (2026-08-17). Widening only creates fills
+    # whose half-spread exceeded the old cap, so the newly-fillable off-hours
+    # cohort pays >=160 bp round trip (extended) / >=300 bp (overnight). Measured
+    # GROSS returns for off-hours entries are nowhere near that -- real closed
+    # trades +1.09% mean / +0.07% median extended and -0.46% / +0.07% overnight;
+    # the simulated panel -0.09% / -0.66% and -0.14% / -0.64% over 15k rows. So
+    # those fills would book a measured loss regardless of signal quality, and
+    # the newly-fillable names are the widest-spread tail of that population.
+    # Flip to True only with evidence that off-hours gross returns clear the
+    # round trip. See src/broker/reconcile.py::_effective_cap_bps.
+    broker_spread_aware_off_rth: bool = False
+    broker_spread_cap_mult: float = 1.5     # x half-spread; >1 leaves room to cross
+    # Absolute ceiling on the widened cap — the backstop that keeps a garbage
+    # quote (a stale one-tick book at 4am) from authorising an unbounded price.
+    broker_limit_cap_bps_max: float = 400.0
     # Off-RTH the book is thin and the REAL spread is ~4× wider (the sim's own
     # cost model charges 4× extended / 10× overnight half-spreads) — a 20 bp
     # cap sits INSIDE the extended spread, so every off-RTH order rests
@@ -2415,6 +2571,29 @@ class Settings(BaseSettings):
     # mark; exits always resubmit re-anchored. No order ever works the book
     # on a previous tick's price. False: legacy age rule below.
     broker_tick_scoped_orders: bool = True
+    # LET UNFILLED ORDERS REST ACROSS TICKS while the price stays near the
+    # decision (2026-08-17). Tick-scoping alone put an order in the book for
+    # broker_settle_seconds (30 s) out of a ~30-minute tick -- about 1.7%
+    # presence -- and then killed it. Measured consequence: a 19.3% fill rate
+    # overall, and 4.8% overnight / 10.2% pre-market, where liquidity arrives
+    # sporadically and a 30-second window almost never coincides with a
+    # counterparty. RTH, whose ticks overlap continuous trading, filled 56.6%.
+    #
+    # With this on, an order that predates the sync is KEPT WORKING instead of
+    # cancelled, so long as the mark is still within broker_rest_max_drift_bps
+    # of the price the decision was made at. Drift beyond that (either way) is
+    # a reason to re-decide, so it falls through to the normal stale-cancel and
+    # is resubmitted re-anchored. broker_unfilled_cancel_minutes remains the
+    # absolute ceiling, and a resting order can never fill worse than its own
+    # capped limit -- the exposure this adds is adverse selection (we fill when
+    # the market comes to us), which is exactly what the drift bound limits.
+    # False restores strict one-tick lifetimes.
+    broker_rest_unfilled_orders: bool = True
+    # Symmetric |mark - decision| bound, in bp, for keeping an order resting.
+    # Deliberately tighter than broker_resubmit_max_adverse_bps (100), because
+    # that ceiling gates a one-shot resubmission decision while this governs
+    # CONTINUOUS presence in the book between ticks.
+    broker_rest_max_drift_bps: float = 60.0
     # Age fallback (used when tick-scoped is False; also an upper bound when
     # True): an ACCEPTED order resting unfilled this many minutes is
     # cancelled and resubmitted re-anchored at the current mark. Partial
@@ -2851,7 +3030,10 @@ class Settings(BaseSettings):
     # bounce" and predict the bounce). See signals/trend_predictability.py.
     enable_trend_predictability_methods: bool = True
     trend_method_weight: float = 0.10        # additive-overlay weight on the 4 oriented trend scores
-    trend_orientation_prior_n: int = 25      # signal-days of the +1 continuation prior (shrinkage)
+    # Signal-days of shrinkage toward 0 = ABSTAIN (2026-08-16 rebase — was a +1
+    # continuation prior, which held measured-descending contexts at positive
+    # multipliers; see trend_predictability.calibrate_trend_orientation).
+    trend_orientation_prior_n: int = 25
     trend_orientation_cal_days: int = 60     # panel window used to calibrate (recent regime)
     trend_orientation_cal_min_rows: int = 40  # min active rows before a method's orientation is measured
     trend_orientation_cal_ttl_seconds: int = 21600  # orientation cache TTL (6h; changes ~daily)

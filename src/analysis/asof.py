@@ -119,7 +119,8 @@ def reset_all_calibration_caches() -> None:
             pass
     for path in ("src.analysis.market_relative", "src.analysis.method_horizons",
                  "src.analysis.signal_panel", "src.analysis.simulated_trades",
-                 "src.signals.rank_shaping", "src.signals.news_shock"):
+                 "src.signals.rank_shaping", "src.signals.news_shock",
+                 "src.signals.catalyst_tilt", "src.signals.ml_scale"):
         try:
             m = __import__(path, fromlist=["x"])
             for fn in ("reset_cache", "reset_panel_cache"):

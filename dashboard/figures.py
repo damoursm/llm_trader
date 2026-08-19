@@ -384,10 +384,19 @@ def mfe_capture_fig(rep: dict) -> go.Figure:
 
 
 def slippage_by_session_fig(slip_df) -> go.Figure:
-    """Grouped bars of mean + p90 fill-vs-decision slippage (bp, + = adverse) by
-    session — the test of whether the LMT cap (20 bp RTH / 80 bp extended) is
-    actually being achieved. Mean and p90 are two steps of one ordered measure,
-    so they share a hue at two lightness steps."""
+    """Grouped bars of mean + p90 fill-vs-DECISION slippage (bp, + = adverse) by
+    session. Mean and p90 are two steps of one ordered measure, so they share a
+    hue at two lightness steps.
+
+    ⚠ This is NOT a test of LMT-cap compliance, which it was previously labelled
+    as. ``slippage_bps`` is measured against the ``model_price`` the decision was
+    made at, while the cap (20 bp RTH / 80 extended / 150 overnight) bounds the
+    LIMIT against the price at SUBMISSION — and the settle loop re-anchors an
+    unfilled order at a fresh quote every ~6 s. So a fill can land far outside
+    the cap relative to the original decision without the cap ever being
+    breached; what this chart measures is how far the market moved between
+    deciding and filling, which is the more useful number but a different one.
+    """
     if slip_df is None or getattr(slip_df, "empty", True):
         return _empty("No filled legs with recorded slippage yet.")
     sessions = slip_df["session"].tolist()
@@ -400,7 +409,7 @@ def slippage_by_session_fig(slip_df) -> go.Figure:
     fig.add_hline(y=0, line_dash="dot", line_color=BASELINE)
     fig.update_layout(barmode="group", bargap=0.35, bargroupgap=0.08)
     _finish(fig, height=340, legend=True,
-            title="Fill slippage by session (bp, + = adverse)")
+            title="Fill slippage vs decision price by session (bp, + = adverse)")
     fig.update_yaxes(title_text="Slippage (bp)")
     return fig
 

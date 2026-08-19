@@ -89,48 +89,63 @@ def test_reversal_orientation_flips_the_score():
 
 # ── orientation calibration ──────────────────────────────────────────────────
 
-def _orient_panel(n_days, per=8, side="up", forward="continue"):
-    """Panel of one trend context: `side` up/down sets er_signed/adx_signed sign;
-    `forward` continue/reverse sets whether the forward move follows the trend."""
+def _orient_panel(n_days, per=8, side="up", forward="continue", label="fwd_ret_pivot"):
+    """Panel of one trend context with WITHIN-DAY feature variance (the 2026-08-16
+    rebase correlates feature vs forward return per day): `side` up/down sets the
+    signed-feature sign; `forward` continue/reverse sets whether a stronger trend
+    means a bigger move WITH the trend (continue) or AGAINST it (reverse)."""
     rows = []
     for d in range(n_days):
         day = f"2026-03-{d + 1:02d}"
-        er = adx = (0.5 if side == "up" else -0.5)
-        trend_up = side == "up"
-        fwd = (2.0 if trend_up else -2.0) if forward == "continue" else (-2.0 if trend_up else 2.0)
-        for _ in range(per):
-            rows.append({"signal_date": day, "er_signed": er, "adx_signed": adx,
-                         "fwd_ret_5d": float(fwd)})
+        for i in range(per):
+            mag = 0.10 + 0.10 * i
+            er = mag if side == "up" else -mag
+            fwd = er * 10.0
+            if forward == "reverse":
+                fwd = -fwd
+            rows.append({"signal_date": day, "er_signed": er, "adx_signed": er,
+                         label: float(fwd)})
     return pd.DataFrame(rows)
 
 
-def test_orientation_continuation_stays_positive(monkeypatch):
+def test_orientation_continuation_goes_positive(monkeypatch):
     monkeypatch.setattr(settings, "trend_orientation_cal_min_rows", 10)
+    monkeypatch.setattr(settings, "trend_orientation_prior_n", 5)
     o = calibrate_trend_orientation(_orient_panel(15, side="up", forward="continue"))
-    assert o["kaufman_long"] == pytest.approx(1.0, abs=1e-6)   # uptrends continued → +1
-    assert o["kaufman_short"] == pytest.approx(1.0)            # no downtrend rows → prior +1
+    assert o["kaufman_long"] == pytest.approx(15 / 20, abs=1e-6)   # perfect IC, shrunk by days
+    assert o["kaufman_short"] == 0.0                # no downtrend rows → ABSTAIN prior
 
 
 def test_orientation_learns_reversal(monkeypatch):
-    # Downtrends that BOUNCE (forward up) → the short-context orientation flips
-    # toward reversal (negative), so the method will predict the bounce.
+    # Downtrends where a STRONGER downtrend precedes a BIGGER bounce → the
+    # short-context orientation goes negative (predict the bounce).
     monkeypatch.setattr(settings, "trend_orientation_cal_min_rows", 10)
-    monkeypatch.setattr(settings, "trend_orientation_prior_n", 5)   # let evidence win faster
+    monkeypatch.setattr(settings, "trend_orientation_prior_n", 5)
     o = calibrate_trend_orientation(_orient_panel(20, side="down", forward="reverse"))
     assert o["kaufman_short"] < 0        # downtrend context → predict reversal (up)
     assert o["adx_short"] < 0
-    assert o["kaufman_long"] == pytest.approx(1.0)   # untouched → continuation prior
+    assert o["kaufman_long"] == 0.0      # untouched context → abstain, never asserted
 
 
-def test_orientation_thin_data_holds_continuation(monkeypatch):
+def test_orientation_fixed_horizon_fallback(monkeypatch):
+    # Frames without the pivot column fall back to fwd_ret_{horizon}d.
+    monkeypatch.setattr(settings, "trend_orientation_cal_min_rows", 10)
+    monkeypatch.setattr(settings, "trend_orientation_prior_n", 5)
+    o = calibrate_trend_orientation(_orient_panel(15, side="up", label="fwd_ret_5d"))
+    assert o["kaufman_long"] > 0.5
+
+
+def test_orientation_thin_data_abstains(monkeypatch):
+    """Unproven contributes NOTHING — the old +1 continuation prior held
+    measured-descending contexts at positive multipliers."""
     monkeypatch.setattr(settings, "trend_orientation_cal_min_rows", 500)  # nothing clears it
     o = calibrate_trend_orientation(_orient_panel(3, side="down", forward="reverse"))
-    assert o == {m: 1.0 for m in TREND_PREDICT_METHODS}       # all stay at the +1 prior
+    assert o == {m: 0.0 for m in TREND_PREDICT_METHODS}
 
 
-def test_orientation_disabled_returns_continuation(monkeypatch):
+def test_orientation_disabled_abstains(monkeypatch):
     monkeypatch.setattr(settings, "enable_trend_predictability_methods", False)
-    assert calibrate_trend_orientation(_orient_panel(20)) == {m: 1.0 for m in TREND_PREDICT_METHODS}
+    assert calibrate_trend_orientation(_orient_panel(20)) == {m: 0.0 for m in TREND_PREDICT_METHODS}
 
 
 def test_methods_reach_attribution_bridge():

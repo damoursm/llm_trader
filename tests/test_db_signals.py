@@ -114,9 +114,11 @@ def test_every_getattr_default_names_a_real_TickerSignal_field():
     # snapshot reads, so restrict to the names it actually persists as columns.
     from src.db.schema import (SIGNAL_ABS_SHADOW_COLUMNS,
                                SIGNAL_CONFIDENCE_COMPONENT_COLUMNS,
-                               SIGNAL_NEWS_ATTENTION_COLUMNS)
+                               SIGNAL_NEWS_ATTENTION_COLUMNS,
+                               SIGNAL_NEWS_EVENT_COLUMNS)
     persisted = (set(SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)
                  | set(SIGNAL_NEWS_ATTENTION_COLUMNS)
+                 | {c for c, _t in SIGNAL_NEWS_EVENT_COLUMNS}
                  | set(SIGNAL_ABS_SHADOW_COLUMNS)
                  | {"type", "combined_score", "combined_buy_score",
                     "combined_sell_score", "combine_source"})

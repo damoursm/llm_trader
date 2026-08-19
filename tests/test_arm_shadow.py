@@ -1,9 +1,15 @@
-"""Shadow synthesis arms (2026-07-25).
+"""Shadow synthesis arms (2026-07-25) — DECOMMISSIONED 2026-08-16.
 
-Each tick the live arm's recommendations drive the run and the OTHER arms are
-asked the same question about the same tickers, so the arms become comparable
-per ticker-day. These tests pin the properties that make a shadow call safe to
-run in production and honest to compare against:
+The arm experiment is OVER (user directive): production runs SIGHTED only, with
+no shadow calls. `test_arms_are_decommissioned` pins that as configuration; the
+rest of this file keeps testing the shadow machinery under an explicit opt-in,
+because the arms stay REVIVABLE (raise any share above 0) and the accrued
+`arm_recommendations` history stays analysable.
+
+Each tick the live arm's recommendations drive the run and — when re-enabled —
+the OTHER arms are asked the same question about the same tickers, so the arms
+become comparable per ticker-day. These tests pin the properties that make a
+shadow call safe to run in production and honest to compare against:
 
   * the live arm is REUSED, never re-asked (a second call would cost money and
     could answer differently, breaking the pairing);
@@ -44,6 +50,46 @@ def _start(generate, live_arm="dual", live_recs=None, **kw):
         signals=[_Sig("AAA")], live_arm=live_arm,
         live_recs=live_recs if live_recs is not None else [_Rec("AAA")],
         synth_kwargs={}, generate=generate, **kw)
+
+
+# ── decommission (2026-08-16) ──────────────────────────────────────────────
+
+def test_arms_are_decommissioned_sighted_only():
+    """The bake-off answered NO DIFFERENCE on the pivot basis (paired
+    disagreement |day-t| < 1 across all three pairs over 16 settled days), so
+    the 3x synthesis cost was retired: every run is SIGHTED, no shadow calls.
+
+    Pinned as DEFAULTS, not just .env, so a fresh environment cannot resurrect
+    a 3x-cost experiment silently. Flipping any of the three back is a
+    deliberate re-open — and this test is the place that says so.
+    """
+    import inspect
+
+    from config.settings import Settings
+    from src import pipeline
+
+    fields = Settings.model_fields
+    assert fields["dual_case_synthesis_share"].default == 0.0
+    assert fields["blind_synthesis_share"].default == 0.0
+    assert fields["enable_shadow_arms"].default is False
+
+    # The knobs remain the re-open path: the pipeline must still RESOLVE the arm
+    # from these two shares (a hardcoded arm would make the shares inert).
+    src = inspect.getsource(pipeline)
+    assert "settings.dual_case_synthesis_share" in src
+    assert "settings.blind_synthesis_share" in src
+
+
+def test_no_shadow_calls_under_the_shipped_default(monkeypatch):
+    """The behavioural half: with the shipped setting there is no branch at
+    all — `maybe_start` returns None, so the caller skips the persist step and
+    the tick makes exactly ONE synthesis call."""
+    monkeypatch.setattr(settings, "enable_shadow_arms", False)   # undo the autouse opt-in
+
+    def _boom(*a, **k):
+        raise AssertionError("a shadow synthesis call was made while decommissioned")
+
+    assert _start(_boom) is None
 
 
 # ── what gets asked ────────────────────────────────────────────────────────
