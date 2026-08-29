@@ -94,16 +94,99 @@ _TICK_COST_FRAC: dict = {}       # run_id → mean one-way cost FRACTION of that
 _SESSION_COST_FRAC: dict = {}    # fine bucket (rth|premarket|afterhours|overnight) → mean fraction
 _LEG_REF_RUN: dict = {}          # client_ref → run_id (maps a leg to the tick it was decided in)
 
+# ── (price × dollar-volume) cost buckets (2026-08-25, user directive) ───────
+# "For the trades that weren't filled, approximate the costs using the average
+# of that tick for all stocks of that volume and price that we have had filled."
+# Realized fill costs are bucketed by LIQUIDITY CLASS — price band × trailing
+# dollar-volume band — so an unfilled leg is priced like the fills of stocks
+# that TRADE like it, not like the parametric formula. Band edges are module
+# constants (measurement meta-parameters stay fixed, per the calibration
+# framework); each session-bucket mean is Bayesian-shrunk toward its session
+# mean and clamped, so a two-fill bucket cannot invent a wild cost.
+_PRICE_BAND_EDGES = (20.0, 100.0)          # <20 | 20–100 | ≥100
+_ADV_BAND_EDGES = (20e6,)                  # <20M | ≥20M trailing median $vol
+_BUCKET_CLAMP = (0.25, 4.0)                # bucket mean vs session mean bounds
+_TICK_BUCKET_COST: dict = {}     # (run_id, pband, aband) → mean fraction
+_SESSION_BUCKET_COST: dict = {}  # (fine_session, pband, aband) → shrunk fraction
+
+
+def price_band(price) -> Optional[int]:
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return None
+    if p <= 0 or p != p:
+        return None
+    for i, edge in enumerate(_PRICE_BAND_EDGES):
+        if p < edge:
+            return i
+    return len(_PRICE_BAND_EDGES)
+
+
+def adv_band(adv) -> Optional[int]:
+    try:
+        a = float(adv)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or a != a:
+        return None
+    for i, edge in enumerate(_ADV_BAND_EDGES):
+        if a < edge:
+            return i
+    return len(_ADV_BAND_EDGES)
+
+
+_ADV_MEMO: dict = {"day": None, "map": {}}
+
+
+def adv_of(ticker: Optional[str]) -> Optional[float]:
+    """Trailing 60-bar median dollar volume from the OHLCV cache, memoised per
+    day (liquidity class moves slowly; re-walking the cache per leg would cost
+    seconds every tick). None on any failure — the resolver then skips the
+    bucketed tiers rather than guessing."""
+    if not ticker:
+        return None
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    if _ADV_MEMO["day"] != today:
+        _ADV_MEMO["day"] = today
+        _ADV_MEMO["map"] = {}
+    m = _ADV_MEMO["map"]
+    tk = str(ticker).upper()
+    if tk in m:
+        return m[tk]
+    val = None
+    try:
+        import pandas as pd
+        from src.data.cache import load_ohlcv
+        df = load_ohlcv(tk)
+        if df is not None and not df.empty and "Volume" in df.columns:
+            c = pd.to_numeric(df["Close"], errors="coerce")
+            v = pd.to_numeric(df["Volume"], errors="coerce")
+            med = (c * v).tail(60).median()
+            val = float(med) if med == med else None
+    except Exception:
+        val = None
+    m[tk] = val
+    return val
+
 
 def set_cost_attribution(tick_costs: Optional[dict], session_costs: Optional[dict],
-                         ref_to_run: Optional[dict]) -> None:
+                         ref_to_run: Optional[dict],
+                         tick_bucket: Optional[dict] = None,
+                         session_bucket: Optional[dict] = None) -> None:
     """Install the per-trade cost lookups (or clear them all with None). Values
     are one-way FRACTIONS (e.g. 0.0018), already sanity-banded and min-sampled
-    by the builder in tracker."""
+    by the builder in tracker. ``tick_bucket``/``session_bucket`` are the
+    liquidity-class refinements (2026-08-25), keyed (run_id, pband, aband) and
+    (fine_session, pband, aband)."""
     global _TICK_COST_FRAC, _SESSION_COST_FRAC, _LEG_REF_RUN
+    global _TICK_BUCKET_COST, _SESSION_BUCKET_COST
     _TICK_COST_FRAC = {str(k): max(0.0, float(v)) for k, v in (tick_costs or {}).items()}
     _SESSION_COST_FRAC = {str(k): max(0.0, float(v)) for k, v in (session_costs or {}).items()}
     _LEG_REF_RUN = {str(k): str(v) for k, v in (ref_to_run or {}).items()}
+    _TICK_BUCKET_COST = {k: max(0.0, float(v)) for k, v in (tick_bucket or {}).items()}
+    _SESSION_BUCKET_COST = {k: max(0.0, float(v)) for k, v in (session_bucket or {}).items()}
 
 
 def session_bucket_fine(raw) -> str:
@@ -177,23 +260,32 @@ def real_leg_cost_frac(side: str, filled_qty, model_price, fill_price,
 
 def resolve_leg_cost(*, side: str, price: float, asset_type: str, session_fine: str,
                      ref, filled_qty, model_price, fill_price, commission,
-                     coarse_session: Optional[str] = None, run=None) -> float:
-    """The per-trade one-way cost FRACTION for one leg, by the hierarchy:
-      1. the leg's OWN realized cost, if it filled at the broker;
-      2. else the average of the trades that filled in the SAME tick (run);
-      3. else the average for the leg's time-of-day period;
-      4. else the modeled / global-override cost.
-    Attribution is OFF (→ straight to the modeled/global cost, i.e. today's
-    behaviour) when the master switch is off or no lookups are installed.
-    Sub-``sim_real_fill_min_price`` legs always use the model — the fills the
-    averages are built from are liquid names, so charging that to a penny stock
-    understates its true spread (same guard as ``_one_side_cost``).
+                     coarse_session: Optional[str] = None, run=None,
+                     adv=None) -> float:
+    """The per-trade one-way cost FRACTION for one leg, by the hierarchy
+    (2026-08-25 user directive — realized fills first, the parametric formula
+    demoted to the cold-start prior):
+      1. the leg's OWN realized cost, if it filled at the broker
+         ("we shouldn't approximate costs that were actually filled");
+      2. else the SAME-TICK average of fills in the leg's LIQUIDITY CLASS
+         (price band × dollar-volume band);
+      3. else the plain same-tick average;
+      4. else the leg's time-of-day period average in its liquidity class;
+      5. else the plain time-of-day period average;
+      6. else ``_one_side_cost`` — which itself prefers the calibrated
+         session/flat REAL-fill overrides and reaches the hand-built formula
+         only on a fills-free DB (fresh install) or a sub-min-price leg.
+    Attribution is OFF (→ straight to tier 6) when the master switch is off.
+    Sub-``sim_real_fill_min_price`` legs always use tier 6's model — the fills
+    the averages are built from are liquid names, so charging that to a penny
+    stock understates its true spread (same guard as ``_one_side_cost``).
 
-    ``coarse_session`` is the leg's STORED session stamp; it drives the modeled
-    tier-4 fallback (the source of truth for the spread multiplier) so a trade
-    whose ``entry_session``/``exit_session`` is set still gets the right modeled
-    spread even when its timestamp — the fine-bucket source — is absent. Falls
-    back to the fine bucket's coarse mapping when the stamp is missing."""
+    ``coarse_session`` is the leg's STORED session stamp; it drives the tier-6
+    fallback (the source of truth for the spread multiplier) so a trade whose
+    ``entry_session``/``exit_session`` is set still gets the right modeled
+    spread even when its timestamp — the fine-bucket source — is absent.
+    ``adv`` = the ticker's trailing median dollar volume (``adv_of``); None
+    skips the bucketed tiers rather than guessing a class."""
     coarse = coarse_session or _coarse_of_fine(session_fine)
     if not settings.sim_per_trade_cost_attribution:
         return _one_side_cost(price, asset_type, coarse)
@@ -205,13 +297,21 @@ def resolve_leg_cost(*, side: str, price: float, asset_type: str, session_fine: 
         real = real_leg_cost_frac(side, filled_qty, model_price, fill_price, commission)
         if real is not None:
             return real
+        pb, ab = price_band(price), adv_band(adv)
         # Tick average: the run the leg was DECIDED in. The entry leg passes it
         # directly (trade.run_id); otherwise fall back to the ref→run map (only
         # populated for FILLED legs — so this second path only helps a filled
         # leg whose own cost was banded out as an outlier).
         rk = str(run) if run is not None else (_LEG_REF_RUN.get(str(ref)) if ref is not None else None)
-        if rk is not None and rk in _TICK_COST_FRAC:
-            return _TICK_COST_FRAC[rk]
+        if rk is not None:
+            if pb is not None and ab is not None \
+                    and (rk, pb, ab) in _TICK_BUCKET_COST:
+                return _TICK_BUCKET_COST[(rk, pb, ab)]
+            if rk in _TICK_COST_FRAC:
+                return _TICK_COST_FRAC[rk]
+        if pb is not None and ab is not None \
+                and (session_fine, pb, ab) in _SESSION_BUCKET_COST:
+            return _SESSION_BUCKET_COST[(session_fine, pb, ab)]
         if session_fine in _SESSION_COST_FRAC:
             return _SESSION_COST_FRAC[session_fine]
     return _one_side_cost(price, asset_type, coarse)
@@ -285,6 +385,7 @@ def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: 
     correctly falls to the tick/session/model estimate)."""
     action = str(trade.get("action") or "BUY").upper()
     asset_type = trade.get("type", "STOCK")
+    _adv = adv_of(trade.get("ticker"))       # liquidity class for the bucketed tiers
     if which == "entry":
         side = "BUY" if action == "BUY" else "SELL"
         return resolve_leg_cost(
@@ -292,7 +393,8 @@ def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: 
             coarse_session=trade.get("entry_session"), run=trade.get("run_id"),
             ref=trade.get("broker_client_ref") or trade.get("recommendation_id"),
             filled_qty=trade.get("broker_fill_qty"), model_price=trade.get("entry_price"),
-            fill_price=trade.get("broker_fill_price"), commission=trade.get("broker_commission"))
+            fill_price=trade.get("broker_fill_price"), commission=trade.get("broker_commission"),
+            adv=_adv)
     # exit leg — the closing side is the opposite of the entry
     side = "SELL" if action == "BUY" else "BUY"
     return resolve_leg_cost(
@@ -300,7 +402,8 @@ def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: 
         coarse_session=trade.get("exit_session"),
         ref=trade.get("broker_exit_client_ref"),
         filled_qty=trade.get("broker_exit_fill_qty"), model_price=trade.get("exit_price"),
-        fill_price=trade.get("broker_exit_fill_price"), commission=trade.get("broker_exit_commission"))
+        fill_price=trade.get("broker_exit_fill_price"), commission=trade.get("broker_exit_commission"),
+        adv=_adv)
 
 
 def effective_cost_hurdle_pct() -> float:

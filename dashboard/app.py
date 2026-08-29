@@ -579,7 +579,7 @@ _REC_COL_SPEC = [
     ("shadow_target_horizon", "Shadow horizon", None, "SHADOW (not yet live): horizon from the direction-aware, MARKET-NEUTRAL edge curve — each method weighted by its per-side (bull/bear) skill on returns net of SPY. Compare against 'Edge horizon' to see where direction-conditioning + drift-removal change the call."),
     ("shadow_direction", "Shadow dir", None, "SHADOW: the direction the market-neutral curve favours. When it DISAGREES with 'Direction', a method that is anti-predictive on this side has been flipped — the disagreement is the thing to watch before promoting the shadow curve."),
     ("shadow_horizon_net_edge_pct", "Shadow net %", _NUM2, "SHADOW: market-relative (alpha over SPY) net edge at the shadow horizon, after the cost hurdle. Smaller than 'Net edge %' by construction (market drift removed) — that gap is how much of the live edge was just beta/drift."),
-    ("actionable", "Actionable", None, "TRUE = cleared ALL SIX gates and was paper-traded: Gate 1 regime confidence threshold, Gate 1b ≥2 agreeing sources, Gate 2 PANIC BUY-block, Gate 3 earnings blackout, Gate 4 liquidity floor ($5 / $5M — below it a name is still fully scored, just never traded), Gate 5 overextension anti-chase (BUY-only). FALSE = monitor only; the Entry Performance tab's decision funnel shows which gate dropped it, attributed to the FIRST one that rejected it."),
+    ("actionable", "Actionable", None, "TRUE = cleared every gate and was paper-traded: Gate 1 regime confidence threshold, Gate 1c per-run rank cap (top-K floor passers by confidence; deferred, not condemned — since 2026-08-21), Gate 1b agreement floor (OFF since 2026-08-17, measured wrong-signed), Gate 2 PANIC BUY-block, Gate 3 earnings blackout, Gate 4 liquidity floor ($5 / $5M — below it a name is still fully scored, just never traded), Gate 5 overextension anti-chase (BUY-only). FALSE = monitor only; the Entry Performance tab's decision funnel shows which gate dropped it, attributed to the FIRST one that rejected it."),
     ("dominant_method", "Top Method", None, "The signal method that contributed most to this call (e.g. news, technical, momentum)."),
     ("type", "Type", None, "Asset class — STOCK, ETF or COMMODITY."),
     ("llm_provider", "LLM", None, "Which engine synthesised the recommendation. Routing is now 100% deepseek-v4-flash (the A/B pool is a one-model list), so this is constant on current runs and varies only across older history. 'rule-based' means no LLM answered at all and the mechanical fallback wrote the call — the chain is DeepSeek → Qwen → (Anthropic, currently unfunded/dead) → rule-based."),
@@ -621,7 +621,7 @@ _METHOD_HEADER_TIPS = {
 
 # Decision-funnel table — header explanations (pipeline stage evaluation).
 _STAGE_HEADER_TIPS = {
-    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each actionable gate — Gate 1 regime confidence threshold, Gate 1b agreement floor (≥2 independent sources, mechanical since 2026-07-20), Gate 2 PANIC BUY-block, Gate 3 earnings blackout, Gate 4 liquidity floor (the $5/$5M TRADE floor — a name below it is still fully scored, just never traded), and Gate 5 overextension / anti-chase (BUY-only, defers a BUY that already ran >12% over 5 bars; SELLs are never gated). '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. A drop is attributed to the FIRST gate that rejects it, so the rows partition cleanly. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners.",
+    "Stage": "One step of the decision pipeline, in execution order: the mechanical Aggregator, the LLM Synthesis stream it feeds, then each actionable gate — Gate 1 regime confidence threshold, Gate 1c per-run rank cap (since 2026-08-21: among floor passers keep the run's top-K by confidence — measured selection-neutral while immunizing the trade RATE against LLM confidence-scale drift; a capped name is deferred, not condemned), Gate 1b agreement floor (OFF since 2026-08-17 — measured wrong-signed twice; rows before that are historical), Gate 2 PANIC BUY-block, Gate 3 earnings blackout, Gate 4 liquidity floor (the $5/$5M TRADE floor — a name below it is still fully scored, just never traded), and Gate 5 overextension / anti-chase (BUY-only, defers a BUY that already ran >12% over 5 bars; SELLs are never gated). '→ past Gate k' = the calls still alive after that gate; '✂ Gate k drops' = exactly what that gate discarded. A drop is attributed to the FIRST gate that rejects it, so the rows partition cleanly. Compare a drops row against its survivor row: drops performing WORSE = the gate is filtering losers (working); drops performing BETTER = the gate is throwing away winners.",
     "Trades": "Directional calls in that stage's stream, deduped to the last call per ticker per day. The shrink from row to row is each gate's real selectivity.",
     "Win rate %": "Share of the stage's calls currently positive, scored as pseudo-trades: snapshot price at call time → latest cached close, through the real cost model — every call counts, not just the ones that became ledger trades.",
     "Avg return %": "Average forward % return across the stage's calls on the same pseudo-trade basis. A gate earns its place when this rises from the pre-gate row to the post-gate row.",
@@ -4227,6 +4227,125 @@ def _method_coverage_section():
     ])
 
 
+def _follow_through_tab():
+    """Follow-through (2026-08-25): the exit-as-entry mechanism. Two surfaces —
+    the PANEL accrual (every selected candidate, judged on the h=1 next-session
+    rule it actually trades plus the settled pivot basis) and the REAL book
+    (`entry_mechanism="follow_through"` trades). Sides split per the house
+    evaluation standard. The validation benchmark quoted in the explainer is a
+    FIXED offline result (2026-08-24/25), not a live number."""
+    panel = data.follow_through_panel()
+    book = data.follow_through_trades()
+    daily, cands = panel.get("daily"), panel.get("cands")
+    n_cands = 0 if cands is None or getattr(cands, "empty", True) else len(cands)
+
+    kpis = []
+    if daily is not None and not getattr(daily, "empty", True):
+        recent = daily.tail(10)
+        kpis.append(_kpi("candidates / day (10d)",
+                         f"{float(recent['n_selected'].mean()):.1f}",
+                         tooltip="Selected follow-through candidates per panel day, "
+                                 "last 10 days. The offline spec measured ~12/day; "
+                                 "a persistent 0 means the level guard is abstaining "
+                                 "or the mechanism broke silently — check both."))
+    if n_cands:
+        h1 = cands["h1_ret"].dropna()
+        if len(h1):
+            kpis.append(_kpi("mean h=1 outcome", f"{h1.mean():+.2f}%",
+                             color=(figures.POS if h1.mean() > 0 else figures.NEG),
+                             tooltip=f"Oriented next-session close-to-close return of "
+                                     f"selected candidates (n={len(h1)}) — the holding "
+                                     f"rule the book actually trades. Validation "
+                                     f"benchmark (offline, 2026-08-24): +1.42% gross."))
+        pvs = cands["pivot_ret"].dropna()
+        if len(pvs):
+            kpis.append(_kpi("mean pivot outcome (settled)", f"{pvs.mean():+.2f}%",
+                             color=(figures.POS if pvs.mean() > 0 else figures.NEG),
+                             tooltip=f"Oriented move to the next SETTLED H/L pivot from "
+                                     f"the candidate day (n={len(pvs)}) — the decision "
+                                     f"basis. Benchmark: +2.62% potential."))
+    st = book.get("all") or {}
+    if st.get("n"):
+        gw = st.get("gross_win")
+        kpis.append(_kpi("book: trades (open)", f"{st['n']} ({st.get('open', 0)})",
+                         tooltip="Real follow-through trades in the ledger; they exit "
+                                 "at the first RTH tick ≥ 15:30 the next session "
+                                 "(ft_horizon), hard stop 2 days."))
+        if gw is not None:
+            # tracker.gross_win_rate returns a PERCENT already (0-100) — do NOT
+            # rescale (shipped once as gw*100 → "6670%"; regression-tested now).
+            kpis.append(_kpi("book: gross win", f"{gw:.0f}%",
+                             tooltip="GROSS win rate (house convention — direction "
+                                     "only, no costs). The h=1 hit rate measured "
+                                     "~50% with skew-carried means, so a near-50% "
+                                     "read with positive mean returns is EXPECTED, "
+                                     "not a failure."))
+        if st.get("avg_net") is not None:
+            kpis.append(_kpi("book: avg net return", f"{st['avg_net']:+.2f}%",
+                             color=(figures.POS if st["avg_net"] > 0 else figures.NEG),
+                             tooltip="Mean cost-adjusted return per trade (open trades "
+                                     "at live M2M). Offline net expectation after the "
+                                     "measured 0.21–0.53% round trip: ~+0.9–1.2%."))
+
+    side_rows = []
+    for tag, key in (("ALL", "all"), ("LONG", "long"), ("SHORT", "short")):
+        s = book.get(key) or {}
+        if s.get("n"):
+            side_rows.append({"side": tag, "n": s["n"], "open": s.get("open", 0),
+                              # gross_win_rate is already a percent — no rescale
+                              "gross win %": s.get("gross_win"),
+                              "avg net %": s.get("avg_net")})
+
+    trade_rows = [{
+        "entry": t.get("entry_date"), "ticker": t.get("ticker"),
+        "action": t.get("action"), "entry px": t.get("entry_price"),
+        "exit px": t.get("exit_price"), "net %": t.get("return_pct"),
+        "exit reason": t.get("exit_reason") or "", "status": t.get("status"),
+        "ft score": t.get("ft_score_at_entry"),
+    } for t in sorted(book.get("trades") or [], key=lambda t: str(t.get("entry_date")),
+                      reverse=True)]
+
+    cand_rows = []
+    if n_cands:
+        cshow = cands.sort_values(["signal_date", "ft_score"],
+                                  ascending=[False, True]).head(200)
+        cand_rows = [{"day": r.signal_date, "ticker": r.ticker,
+                      "dir": ("LONG" if (r.ft_dir or 0) > 0 else "SHORT"),
+                      "ft score": r.ft_score, "h1 %": r.h1_ret,
+                      "pivot %": r.pivot_ret,
+                      "settled": "yes" if r.settled else "…"}
+                     for r in cshow.itertuples(index=False)]
+
+    ret_cond = [
+        {"if": {"filter_query": "{net %} > 0", "column_id": "net %"}, "color": figures.POS},
+        {"if": {"filter_query": "{net %} < 0", "column_id": "net %"}, "color": figures.NEG},
+    ]
+    cand_cond = [
+        {"if": {"filter_query": "{h1 %} > 0", "column_id": "h1 %"}, "color": figures.POS},
+        {"if": {"filter_query": "{h1 %} < 0", "column_id": "h1 %"}, "color": figures.NEG},
+        {"if": {"filter_query": "{pivot %} > 0", "column_id": "pivot %"}, "color": figures.POS},
+        {"if": {"filter_query": "{pivot %} < 0", "column_id": "pivot %"}, "color": figures.NEG},
+    ]
+
+    return html.Div([
+        html.Div("When a (hypothetical) held position's exit score is extreme — the "
+                 "within-tick bottom 5% below −0.50, first day of its episode — the tape "
+                 "has followed through against it, and the book joins the move: an "
+                 "opposite-direction entry in the same tick, closed the next session. "
+                 "Bypasses the LLM funnel and gates by design; sized flat at 0.5×. "
+                 "Panel columns accrue whether or not trading is on.",
+                 className="section-note"),
+        html.Div(kpis, style={"display": "flex", "flexWrap": "wrap", "marginBottom": 12}),
+        dcc.Graph(figure=figures.follow_through_daily_fig(daily, cands)),
+        html.H4("Book by side"),
+        dash_table.DataTable(data=side_rows, **_TABLE_KW),
+        html.H4("Trades"),
+        dash_table.DataTable(data=trade_rows, style_data_conditional=ret_cond, **_TABLE_KW),
+        html.H4("Selected candidates (panel accrual, latest 200)"),
+        dash_table.DataTable(data=cand_rows, style_data_conditional=cand_cond, **_TABLE_KW),
+    ])
+
+
 # ── Lazy tab hydration ───────────────────────────────────────────────────────
 # (value, tab label, renderer). serve_layout builds one EMPTY container per tab
 # from this spec; the callbacks below fill each container the FIRST time its tab
@@ -4238,6 +4357,7 @@ _TAB_SPEC = (
     ("exit_perf", "Exit Performance", _exit_perf_tab),
     ("returns", "Returns", _returns_tab),
     ("execution", "Execution", _execution_tab),
+    ("follow_through", "Follow-Through", _follow_through_tab),
     ("data_quality", "Data Quality", _data_quality_tab),
 )
 

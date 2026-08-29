@@ -783,14 +783,38 @@ def generate_recommendations(
 
     # Cap the signal list sent to Claude:
     # - Always include tickers with any meaningful signal (confidence > 10% or insider activity)
-    # - Fill up to 40 tickers sorted by confidence descending
+    # - Fill up to 40 tickers sorted by the shortlist key, descending
     # This prevents JSON truncation when the universe is large.
+    #
+    # THE SHORTLIST KEY (2026-08-21). Names below this cut can never be traded,
+    # so the key bounds everything downstream — and the historical default
+    # (aggregator CONFIDENCE) measured ANTI-selective on the pivot basis:
+    # per-day rank IC of confidence vs the oriented outcome −0.044 (t −2.53),
+    # top-40-by-confidence beaten by RANDOM-40 in 30/30 seeds (+0.365%/run,
+    # t +2.18). The best measured alternative key is the max WEIGHTED-CAMP
+    # conviction, max(|buy|,|sell|) (+0.43%/run vs confidence, t +1.70) — a
+    # contested name (buy .5 / sell .4) has a tiny |combined| yet real
+    # conviction, which the confidence chain erases. It is NOT the default
+    # because it CANNOT yet clear the house replication bar: the camp columns
+    # have only existed 22 days, all in one contiguous window, so no
+    # independent-half test exists (and the context-gate H2 sign-flip is the
+    # standing warning about 20-day exploratory winners). Flip
+    # `prompt_shortlist_key=camp_max` once it replicates (~2026-09-15, when a
+    # true H1/H2 split exists). Confidence stays the tiebreak either way.
     _MAX_SIGNALS = 40
+
+    def _shortlist_key(s):
+        if str(getattr(settings, "prompt_shortlist_key", "confidence")).lower() == "camp_max":
+            camp = max(abs(float(getattr(s, "combined_buy_score", 0.0) or 0.0)),
+                       abs(float(getattr(s, "combined_sell_score", 0.0) or 0.0)))
+            return (camp, float(s.confidence or 0.0))
+        return (float(s.confidence or 0.0),)
+
     meaningful      = [s for s in signals if s.confidence > 0.10 or s.insider_summary]
     noise           = [s for s in signals if s not in meaningful]
-    ranked          = sorted(meaningful, key=lambda s: s.confidence, reverse=True)
+    ranked          = sorted(meaningful, key=_shortlist_key, reverse=True)
     if len(ranked) < _MAX_SIGNALS:
-        ranked     += sorted(noise, key=lambda s: s.confidence, reverse=True)[:_MAX_SIGNALS - len(ranked)]
+        ranked     += sorted(noise, key=_shortlist_key, reverse=True)[:_MAX_SIGNALS - len(ranked)]
     signals_for_claude = ranked[:_MAX_SIGNALS]
     skipped            = len(signals) - len(signals_for_claude)
     if skipped:

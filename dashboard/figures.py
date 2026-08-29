@@ -514,3 +514,33 @@ def method_decile_fig(curve: dict, method: str, label: str = "") -> "go.Figure":
     fig.update_yaxes(title_text="mean ret to next pivot (%)")
     fig.update_xaxes(title_text="within-day score decile (D10 = the day's strongest scores)")
     return fig
+
+
+def follow_through_daily_fig(daily, cands) -> go.Figure:
+    """Follow-through accrual: selected candidates per day (bars) + the mean
+    h=1 oriented outcome of that day's candidates (line, right axis; sign
+    duplicated by marker color so it never rides color alone)."""
+    import pandas as pd
+    if daily is None or getattr(daily, "empty", True):
+        return _empty("No follow-through rows yet (columns began 2026-08-25).")
+    d = daily.copy()
+    d["signal_date"] = d["signal_date"].astype(str).str[:10]
+    fig = go.Figure()
+    fig.add_bar(x=d["signal_date"], y=d["n_selected"], name="candidates selected",
+                marker_color=MUTED, opacity=0.55)
+    if cands is not None and not getattr(cands, "empty", True) and "h1_ret" in cands:
+        m = (cands.dropna(subset=["h1_ret"])
+                  .groupby("signal_date")["h1_ret"].mean().reset_index())
+        if not m.empty:
+            fig.add_scatter(x=m["signal_date"], y=m["h1_ret"], yaxis="y2",
+                            mode="lines+markers", name="mean h=1 outcome (%)",
+                            line=dict(color=INK, width=1.5),
+                            marker=dict(size=7, color=[POS if v > 0 else NEG
+                                                       for v in m["h1_ret"]]))
+    fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                                  zeroline=True, zerolinecolor=GRID,
+                                  tickfont=dict(size=11.5, color=MUTED)))
+    _finish(fig, height=300, legend=True,
+            title="Follow-through — candidates/day and their next-session outcome")
+    fig.update_layout(yaxis_title_text="selected / day")
+    return fig

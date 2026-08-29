@@ -256,6 +256,109 @@ def trades_for_ticker(ticker: str) -> list:
     return [t for t in trades if t.get("ticker") == ticker]
 
 
+def follow_through_panel(force: bool = False) -> dict:
+    """The follow-through mechanism's panel accrual (signals.ft_* columns,
+    2026-08-25): per-day scored/selected counts + every SELECTED candidate
+    (dedup last run per day/ticker) joined to its two cache-only outcomes —
+    the h=1 oriented close-to-close return (the mechanism's own holding rule)
+    and the SETTLED oriented pivot target (the house decision basis; NaN until
+    the confirming bar prints). Returns {"daily": DataFrame, "cands": DataFrame}."""
+    def _build():
+        try:
+            daily = _retry(lambda: repo.fetch_df("""
+                SELECT signal_date, COUNT(DISTINCT CASE WHEN ft_score IS NOT NULL
+                           THEN ticker END) AS n_scored,
+                       COUNT(DISTINCT CASE WHEN ft_selected = 1.0
+                           THEN ticker END) AS n_selected
+                FROM signals GROUP BY signal_date
+                HAVING n_scored > 0 ORDER BY signal_date
+            """), "ft_daily")
+            cands = _retry(lambda: repo.fetch_df("""
+                SELECT signal_date, ticker, ft_score, ft_dir FROM (
+                    SELECT signal_date, ticker, ft_score, ft_dir, ft_selected,
+                           row_number() OVER (PARTITION BY signal_date, ticker
+                                              ORDER BY generated_at DESC) rn
+                    FROM signals WHERE ft_selected = 1.0)
+                WHERE rn = 1 ORDER BY signal_date, ticker
+            """), "ft_cands")
+        except Exception:
+            return {"daily": pd.DataFrame(), "cands": pd.DataFrame()}
+        if cands is None or cands.empty:
+            return {"daily": daily if daily is not None else pd.DataFrame(),
+                    "cands": pd.DataFrame()}
+        from datetime import date as _date
+        from bisect import bisect_left
+        from src.analysis.simulated_trades import _pivot_targets
+        from src.data.cache import load_ohlcv
+        cands = cands.copy()
+        cands["signal_date"] = cands["signal_date"].astype(str).str[:10]
+        h1, pv, settled = [], [], []
+        series: dict = {}
+        for r in cands.itertuples(index=False):
+            tk = str(r.ticker)
+            if tk not in series:
+                try:
+                    c = pd.to_numeric(load_ohlcv(tk)["Close"], errors="coerce").dropna()
+                    dts = [i.date() for i in c.index]
+                    px = c.to_numpy(dtype=float)
+                    piv = _pivot_targets(dts, dict(zip(dts, px)), ticker=tk)
+                    series[tk] = (dts, px, piv)
+                except Exception:
+                    series[tk] = None
+            s = series[tk]
+            if s is None:
+                h1.append(None); pv.append(None); settled.append(False)
+                continue
+            dts, px, (pdts, sp, endx) = s
+            d0 = _date.fromisoformat(r.signal_date)
+            try:
+                i = dts.index(d0)
+            except ValueError:
+                h1.append(None); pv.append(None); settled.append(False)
+                continue
+            dirn = float(r.ft_dir or 0.0)
+            h1.append(round(dirn * (px[i + 1] / px[i] - 1.0) * 100.0, 3)
+                      if i + 1 < len(px) and px[i] > 0 else None)
+            out_pv, ok = None, False
+            if pdts:
+                pi = bisect_left(pdts, d0)
+                if pi < len(pdts) and endx[pi] >= 0:
+                    out_pv, ok = round(dirn * float(sp[pi]), 3), True
+            pv.append(out_pv); settled.append(ok)
+        cands["h1_ret"] = h1
+        cands["pivot_ret"] = pv
+        cands["settled"] = settled
+        return {"daily": daily, "cands": cands}
+    return _cached("follow_through_panel", _build, force=force)
+
+
+def follow_through_trades(force: bool = False) -> dict:
+    """The REAL follow-through book (`entry_mechanism="follow_through"`):
+    row dicts + summary stats (gross win per the house convention, net returns,
+    sides split — the /evaluate standard). Reads through repo.load_trades()."""
+    def _build():
+        from src.performance.tracker import gross_win_rate
+        try:
+            trades = [t for t in _retry(lambda: repo.load_trades(), "ft_trades")
+                      if t.get("entry_mechanism") == "follow_through"]
+        except Exception:
+            trades = []
+
+        def _stats(sub):
+            closed = [t for t in sub if t.get("status") == "CLOSED"]
+            rets = [float(t.get("return_pct") or 0.0) for t in sub
+                    if t.get("return_pct") is not None]
+            return {"n": len(sub), "open": sum(1 for t in sub if t.get("status") == "OPEN"),
+                    "closed": len(closed),
+                    "gross_win": gross_win_rate(sub),
+                    "avg_net": (round(sum(rets) / len(rets), 3) if rets else None)}
+        return {"trades": trades,
+                "all": _stats(trades),
+                "long": _stats([t for t in trades if t.get("action") == "BUY"]),
+                "short": _stats([t for t in trades if t.get("action") == "SELL"])}
+    return _cached("follow_through_trades", _build, force=force)
+
+
 def broker_trades(force: bool = False) -> list:
     """The IBKR-fills projection of the ledger (real executions, real
     commissions — see ``src.performance.broker_view``), cached briefly.
@@ -899,7 +1002,10 @@ def _warm_targets():
              # every run, which is nearly every visit at a 30-min tick.
              "ticker_perf", "arm_eval", "market_relative_skill",
              "gate_performance", "exit_rule_performance",
-             "method_decile_curves")
+             "method_decile_curves",
+             # Follow-through tab (2026-08-25): the panel accrual walks the
+             # OHLCV cache per candidate ticker — warm it like the rest.
+             "follow_through_panel", "follow_through_trades")
     return [(n, globals().get(n)) for n in names]
 
 

@@ -62,6 +62,53 @@ def build_decision_panel(days: Optional[int] = None, horizon: int = 5,
     panel = panel[panel[col].notna()].copy()
     if panel.empty:
         return pd.DataFrame()
+
+    # GATE-INPUT REPAIR (2026-08-21). `_passes_gate` reads `confidence`, but
+    # `build_panel` masks it behind CONFIDENCE_EPOCH — and every row whose
+    # forward return has SETTLED predates that epoch, so the harness spent a
+    # week gating on an all-NaN column and reporting `n_decisions=0` for every
+    # policy without complaint (found while building the Thompson-sampling
+    # sim; the exact "looks configured, does nothing" class). Repair: fill the
+    # masked confidence from `signals_backtest` — the CURRENT entry
+    # architecture recomputed over history. Reading that table here is
+    # legitimate because this module is an EVALUATION surface, explicitly
+    # firewalled OUT of every calibration path (tests pin that no calibration
+    # imports policy_eval); the tier-2 firewall forbids calibrations, not
+    # evaluations. Rows are backtest-confidence where masked, live where not.
+    conf = pd.to_numeric(panel.get("confidence"), errors="coerce")
+    if conf.isna().all():
+        try:
+            from src.db import repo
+            bt = repo.fetch_df("""
+                SELECT signal_date, ticker, confidence AS bt_conf FROM (
+                    SELECT signal_date, ticker, confidence,
+                           row_number() OVER (PARTITION BY signal_date, ticker
+                                              ORDER BY generated_at DESC) rn
+                    FROM signals_backtest) WHERE rn = 1""")
+        except Exception:
+            bt = None
+        if bt is not None and not bt.empty:
+            bt["signal_date"] = bt["signal_date"].astype(str).str[:10]
+            key = panel["signal_date"].astype(str).str[:10]
+            m = bt.set_index(["signal_date", "ticker"])["bt_conf"]
+            panel["confidence"] = [
+                m.get((d, t), float("nan")) for d, t in zip(key, panel["ticker"])]
+            from loguru import logger
+            n_ok = int(pd.to_numeric(panel["confidence"], errors="coerce").notna().sum())
+            logger.warning(
+                f"[policy_eval] live `confidence` is fully epoch-masked on this "
+                f"window — substituted the signals_backtest rescore for "
+                f"{n_ok:,}/{len(panel):,} rows (current-architecture values; "
+                f"evaluation surface only)")
+    # Refuse SILENCE either way: an all-NaN gate input means every policy
+    # evaluates zero decisions, which must never look like a clean result.
+    if pd.to_numeric(panel["confidence"], errors="coerce").isna().all():
+        from loguru import logger
+        logger.warning(
+            "[policy_eval] gate input `confidence` is entirely NaN (epoch mask + "
+            "no signals_backtest rows) — every policy will report n_decisions=0. "
+            "Run `python -m src.analysis.backtest --write` first.")
+
     panel["dir_sign"] = panel["direction"].map(_dir_sign)
     panel["fwd"] = panel["dir_sign"] * panel[col].astype(float)     # oriented return %
     panel["session"] = (session_of_ts(panel["generated_at"])

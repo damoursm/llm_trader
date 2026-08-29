@@ -119,13 +119,83 @@ def test_exit_floor_static_when_no_separating_boundary(monkeypatch):
 # ── #6: unified expected-edge sizing ─────────────────────────────────────────
 
 def _mk_trade(breadth_n, ret, n_set=20, action="BUY", conf=0.8, status="CLOSED",
-              news=0.5, momentum=0.5, combined=0.4, session="rth"):
+              news=0.5, momentum=0.5, combined=0.4, session="rth", entry=None):
     ms = {f"m{i}": (0.5 if i < breadth_n else 0.0) for i in range(n_set)}
     ms["news"] = news if breadth_n else 0.0
     ms["momentum"] = momentum if breadth_n else 0.0
-    return {"ticker": "T", "action": action, "status": status, "return_pct": ret,
-            "confidence": conf, "entry_session": session, "method_scores": ms,
-            "signal_at_entry": {"combined_score": combined}}
+    t = {"ticker": "T", "action": action, "status": status, "return_pct": ret,
+         "confidence": conf, "entry_session": session, "method_scores": ms,
+         "signal_at_entry": {"combined_score": combined}}
+    if entry is not None:
+        t["entry_datetime"] = entry
+    return t
+
+
+def _epoch_dates():
+    """Entry stamps strictly before / after EVERY epoch the edge model gates on
+    — derived from the registries (the money_flow lesson: hardcoded dates break
+    the day an epoch moves)."""
+    from datetime import timedelta
+    from src.signals.method_epochs import (CONFIDENCE_EPOCH,
+                                           METHOD_SCORER_EPOCH)
+    cutoffs = [CONFIDENCE_EPOCH] + [e for m, e in METHOD_SCORER_EPOCH.items()
+                                    if m in ("news", "momentum") and e]
+    before = (min(cutoffs) - timedelta(days=3)).isoformat()
+    after = (max(cutoffs) + timedelta(days=3)).isoformat()
+    return before, after
+
+
+def test_edge_fit_excludes_pre_epoch_rows(monkeypatch):
+    """THE 2026-08-22 GATE: the model regresses returns on entry confidence and
+    the news score, both of which re-scaled at their epochs — an ungated fit
+    describes the MIXTURE. Rows with a known pre-epoch entry must be excluded
+    from the FIT; the count must reflect only the comparable sample."""
+    from src.performance import edge_sizing as es
+    monkeypatch.setattr(settings, "edge_sizing_enabled", True)
+    monkeypatch.setattr(settings, "edge_min_closed", 20)
+    before, after = _epoch_dates()
+    clean = ([_mk_trade(16, +3.0, entry=after) for _ in range(15)]
+             + [_mk_trade(4, -3.0, entry=after) for _ in range(15)])
+    stale = [_mk_trade(16, -50.0, entry=before) for _ in range(40)]
+    model = es.fit_edge_model(clean + stale)
+    assert model is not None
+    assert model["n"] == 30, "pre-epoch rows must not enter the fit"
+    # and the stale cohort alone must not be able to resurrect a fit
+    assert es.fit_edge_model(stale) is None
+
+
+def test_edge_fit_fails_open_on_missing_dates():
+    """A trade with NO entry stamp is COMPARABLE (the helpers' documented
+    fail-open) — a malformed timestamp must never erase history."""
+    from src.performance.edge_sizing import _row_is_comparable
+    assert _row_is_comparable(_mk_trade(10, 1.0)) is True
+
+
+def test_edge_combined_feature_prefers_the_abs_twin():
+    """The combined feature must ride ONE basis across the rank cutover: the
+    abs twin when snapshotted, `combined_score` (absolute on pre-shadow rows)
+    otherwise — the ex_combine convention."""
+    from src.performance.edge_sizing import trade_features
+    t = _mk_trade(10, 1.0)
+    t["signal_at_entry"] = {"combined_score": 0.80, "combined_score_abs": 0.20}
+    assert trade_features(t)[2] == pytest.approx(0.20)     # abs twin, not 0.80
+    t["signal_at_entry"] = {"combined_score": 0.44}
+    assert trade_features(t)[2] == pytest.approx(0.44)     # pre-shadow fallback
+
+
+def test_edge_serving_is_unaffected_by_the_fit_gate(monkeypatch):
+    """The gate restricts what the model LEARNS from, never what it SIZES: a
+    brand-new trade (post-epoch by construction) must still get a ratio."""
+    from src.performance import edge_sizing as es
+    monkeypatch.setattr(settings, "edge_sizing_enabled", True)
+    monkeypatch.setattr(settings, "edge_min_closed", 20)
+    _, after = _epoch_dates()
+    trades = ([_mk_trade(16, +3.0, entry=after) for _ in range(15)]
+              + [_mk_trade(4, -3.0, entry=after) for _ in range(15)])
+    model = es.fit_edge_model(trades)
+    ratio, meta = es.edge_blend_ratio(
+        es.trade_features(_mk_trade(16, 0.0, entry=after)), 1.0, model)
+    assert meta["w"] > 0 and 0.6 <= ratio <= 1.6
 
 
 def test_edge_model_learns_breadth_return_relation(monkeypatch):

@@ -279,7 +279,12 @@ def test_walkforward_stamps_the_calibration_date_not_a_global_hash():
     try:
         out = bt.run_backtest(walk_forward=True)
         assert not out.empty
-        assert out.iloc[0]["weight_set"].startswith("wf:")
+        # Since 2026-08-20 the stamp is "<arch>|wf:<as_of>" — the entry
+        # architecture is part of what a backtest ran under, and rows from
+        # different architectures must never be pooled.
+        tag = out.iloc[0]["weight_set"]
+        assert "|wf:" in tag, tag
+        assert tag.split("|", 1)[0] in ("rank-v1", "abs-v1"), tag
     finally:
         wf.load_weight_history = orig_load
         repo.fetch_df = orig_fetch

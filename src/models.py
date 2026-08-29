@@ -1197,6 +1197,14 @@ class TickerSignal(BaseModel):
     combined_score_abs: Optional[float] = None
     combined_buy_score_abs: Optional[float] = None
     combined_sell_score_abs: Optional[float] = None
+    # Follow-through candidate state (2026-08-25, src/signals/follow_through.py):
+    # ft_score = the most-negative hypothetical-cohort exit conviction this run
+    # (None = not scored); ft_dir = the implied OPPOSITE-direction entry
+    # (+1 long / −1 short / 0 none); ft_selected = chosen by the tail + level +
+    # first-episode-day rules as an entry candidate this tick.
+    ft_score: Optional[float] = None
+    ft_dir: float = 0.0
+    ft_selected: bool = False
     # Which combine produced the two sides above (2026-08-02): "weighted" (the
     # hand-weighted camps) or "ml"/"ml_buy"/"ml_sell" when the ML-combine A/B arm
     # supplied that side. Recorded PER SIDE because the swap is fail-soft per side

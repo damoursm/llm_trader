@@ -163,3 +163,130 @@ def shape_score(method: str, pct: float,
 def reset_cache() -> None:
     """asof / test hook."""
     _CACHE.update(ts=0.0, shapes=None)
+
+
+# ── Walk-forward SHAPE history (2026-08-21) ──────────────────────────────────
+# `weight_history` walk-forwards the WEIGHTS, but the shaped curves — a fitted
+# CONSUMPTION layer — rode at today's fit, so a tier-2 backtest read curves
+# fitted on the very window it was scoring (measured 2026-08-20: that alone
+# flips the current arch's pivot IC from −0.041 to +0.049). These helpers give
+# curves their own as-of series, the exact sibling of walkforward.py: each row
+# is `calibrate_rank_shapes()` run under `analysis_asof(as_of)`, so a curve can
+# never see rows at or after its own date.
+
+def materialize_shape_history(start: Optional[str] = None,
+                              end: Optional[str] = None,
+                              step_days: int = 5) -> int:
+    """Append missing as-of shape rows every ``step_days`` calendar days from
+    ``start`` (default: the panel's first day) through ``end`` (default:
+    today). Idempotent — existing as_of dates are skipped, so the EOD call
+    appends at most one step. Returns rows written."""
+    import json as _json
+    from datetime import date as _date, timedelta as _td
+
+    from src.analysis.asof import analysis_asof
+    from src.db import repo
+    from src.db.connection import connect
+
+    have = set()
+    try:
+        df = repo.fetch_df("SELECT DISTINCT as_of FROM shape_history")
+        if df is not None and not df.empty:
+            have = set(df["as_of"].astype(str))
+    except Exception:
+        pass
+    if start is None:
+        try:
+            d0 = repo.fetch_df("SELECT min(substr(signal_date,1,10)) AS d FROM signals")
+            start = str(d0["d"].iloc[0])
+        except Exception:
+            return 0
+    end_d = _date.fromisoformat(str(end)[:10]) if end else _date.today()
+    cur = _date.fromisoformat(str(start)[:10])
+    stamp = None
+    written = 0
+    while cur <= end_d:
+        as_of = cur.isoformat()
+        if as_of not in have:
+            try:
+                with analysis_asof(as_of):
+                    shapes = calibrate_rank_shapes()
+            except Exception as e:
+                logger.warning(f"[rank_shaping] shape history {as_of} failed: {e}")
+                shapes = None
+            if shapes is not None:
+                if stamp is None:
+                    from datetime import datetime, timezone
+                    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                rows = ([(as_of, m, _json.dumps(c), stamp) for m, c in sorted(shapes.items())]
+                        or [(as_of, "__none__", "[]", stamp)])   # "computed, no curves"
+                with connect() as con:
+                    con.executemany(
+                        "INSERT INTO shape_history (as_of, method, curve, computed_at) "
+                        "VALUES (?, ?, ?, ?)", rows)
+                written += len(rows)
+        cur += _td(days=max(1, int(step_days)))
+    # Always ensure TODAY has a row so the EOD append keeps the series current
+    # even when today falls off the stride grid.
+    today = _date.today().isoformat()
+    if today not in have and today != as_of and end is None:
+        return written + materialize_shape_history(start=today, end=today, step_days=1)
+    if written:
+        logger.info(f"[rank_shaping] shape history: wrote {written} row(s)")
+    return written
+
+
+def load_shape_history():
+    """The full as-of series as ``{as_of: {method: curve}}`` (sorted keys)."""
+    import json as _json
+
+    from src.db import repo
+    try:
+        df = repo.fetch_df("SELECT as_of, method, curve FROM shape_history")
+    except Exception:
+        return {}
+    if df is None or df.empty:
+        return {}
+    out: dict = {}
+    for r in df.itertuples(index=False):
+        d = out.setdefault(str(r.as_of), {})
+        if r.method != "__none__":
+            try:
+                d[str(r.method)] = list(_json.loads(r.curve))
+            except Exception:
+                continue
+    return dict(sorted(out.items()))
+
+
+def shapes_for_date(day: str, hist: Optional[dict] = None):
+    """The curves in force ON ``day``: the latest as_of STRICTLY BEFORE it
+    (a same-day calibration saw that day's rows under asof semantics only if
+    strictly earlier — mirror `weights_for_date`'s convention). ``None`` when
+    no earlier calibration exists — the caller must treat that as identity,
+    never as today's curves."""
+    hist = load_shape_history() if hist is None else hist
+    if not hist:
+        return None
+    day = str(day)[:10]
+    best = None
+    for as_of in hist:                      # sorted
+        if as_of < day:
+            best = as_of
+        else:
+            break
+    return dict(hist[best]) if best is not None else None
+
+
+if __name__ == "__main__":       # pragma: no cover - operator CLI
+    import argparse
+    ap = argparse.ArgumentParser(description="Walk-forward shape history")
+    ap.add_argument("--materialize", action="store_true")
+    ap.add_argument("--step-days", type=int, default=5)
+    a = ap.parse_args()
+    if a.materialize:
+        print(f"wrote {materialize_shape_history(step_days=a.step_days)} row(s)")
+    else:
+        h = load_shape_history()
+        print(f"shape_history: {len(h)} as-of date(s)")
+        for k in list(h)[-5:]:
+            print(f"  {k}: {len(h[k])} curve(s)")

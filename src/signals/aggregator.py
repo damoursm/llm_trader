@@ -1604,7 +1604,7 @@ def _direction_bands(combine_source: str = "weighted") -> tuple:
 
 # ── Within-run rank transform (2026-08-13 user directive) ────────────────────
 
-def _rank_transform_run(raw_maps: dict, tradeable=None) -> tuple:
+def _rank_transform_run(raw_maps: dict, tradeable=None, shapes=None) -> tuple:
     """Replace every method's scores with their CENTERED WITHIN-RUN rank.
 
     ``raw_maps`` is ``{ticker: {method: (active, score)}}`` — the full run's
@@ -1652,8 +1652,12 @@ def _rank_transform_run(raw_maps: dict, tradeable=None) -> tuple:
         min_views = max(2, int(getattr(settings, "method_rank_min_views", 5)))
     except Exception:
         min_views = 5
-    _shapes = None
-    if bool(getattr(settings, "enable_rank_shaping", True)):
+    # ``shapes`` (2026-08-21): an explicit curve set overrides the live TTL
+    # lookup — the walk-forward backtest passes each date's own as-of curves so
+    # history is never scored through curves fitted on it. None = live lookup
+    # (unchanged); {} = shaping explicitly OFF (identity for every method).
+    _shapes = shapes
+    if _shapes is None and bool(getattr(settings, "enable_rank_shaping", True)):
         try:
             from src.signals.rank_shaping import get_rank_shapes
             _shapes = get_rank_shapes()
@@ -2795,6 +2799,17 @@ def build_signals(
                 method_score_map, weights_local, _buy_filtered, _sell_filtered,
                 _buy_mults, _sell_mults)
 
+            # ── Tape composite (score-independent, cache-only OHLCV) ──────────
+            # Hoisted above the ML arm (2026-08-22): the stackers consume
+            # `tape_score` as their 22nd feature, and the CHECK depends only on
+            # the ticker — it is the FACTOR below that needs the combined score.
+            # Computed once; the confidence site reuses it through a flag-scoped
+            # view so `enable_tape_confirmation=false` still means a neutral
+            # confidence factor while the arm keeps its feature.
+            tape_check = None
+            if settings.enable_tape_confirmation or ml_combine_arm_active():
+                tape_check = compute_tape_confirmation(ticker)
+
             # Provenance default — overwritten inside the arm block below when the ML
             # stackers actually produce a conviction (fail-soft is per SIDE).
             combine_source = "weighted"
@@ -2818,6 +2833,18 @@ def build_signals(
                     "iv_rank": iv_rank_score_v, "iv_expr": iv_expr_score_v,
                     "coint": coint_score_v, "ext_gap": ext_gap_score_v,
                     "broker_advisor": broker_advisor_score_v,
+                    # 22nd method (2026-08-24): the deep-cache price model's own
+                    # score — near-inert as a stacker feature until its
+                    # post-epoch panel history thickens, wired so serve matches
+                    # training the day it does.
+                    "ml_ohlcv": ml_ohlcv_v,
+                    # 23rd feature (2026-08-22) — NOT a method score: the live
+                    # tape composite, matching the panel's replay-derived
+                    # `tape_score` column the artifact trained on. NaN (not 0.0)
+                    # when unavailable, mirroring the panel's missing-row
+                    # convention; the model imputes its train median.
+                    "tape_score": (float(tape_check.score) if tape_check is not None
+                                   else float("nan")),
                 }
                 _conv = compute_buy_conviction(_daily_scores)
                 if _conv is not None:
@@ -2992,9 +3019,11 @@ def build_signals(
                     vote_threshold=settings.family_vote_threshold)
 
             # ── Tape confirmation (score-independent raw price/volume state) ──
-            tape_check = None
-            if settings.enable_tape_confirmation:
-                tape_check = compute_tape_confirmation(ticker)
+            # Computed ONCE above the ML arm block; this flag-scoped view keeps
+            # the confidence factor + persistence semantics identical to the
+            # pre-hoist behaviour in every flag state (the arm alone computing
+            # the tape must not activate the confidence factor).
+            tape_for_conf = tape_check if settings.enable_tape_confirmation else None
 
             # ── Movement potential (ATR + BB width + GEX) ────────────────────
             movement_factor = _movement_factor(atr_pct, bb_width_pct) * _gex_movement_modifier(gex_sig)
@@ -3009,7 +3038,7 @@ def build_signals(
             # combined direction. Both neutral when their flag is off / no data.
             family_factor = (fam_agreement.factor(settings.family_agreement_factor_span)
                              if fam_agreement is not None else 1.0)
-            tape_conf_factor = tape_factor(tape_check, combined,
+            tape_conf_factor = tape_factor(tape_for_conf, combined,
                                            settings.tape_confirmation_factor_span)
             # Same quantile match for the confidence scale — see
             # `_raw_confidence_scale()`, the single resolver the cross-sectional
@@ -3081,9 +3110,9 @@ def build_signals(
                 family_coherence=(fam_agreement.coherence if fam_agreement else 0.0),
                 family_net_score=(fam_agreement.net_score if fam_agreement else 0.0),
                 family_detail=(fam_agreement.detail if fam_agreement else ""),
-                tape_confirmation_score=(tape_check.score if tape_check else 0.0),
-                tape_confirmation_label=(tape_check.label if tape_check else ""),
-                tape_confirmation_detail=(tape_check.detail if tape_check else ""),
+                tape_confirmation_score=(tape_for_conf.score if tape_for_conf else 0.0),
+                tape_confirmation_label=(tape_for_conf.label if tape_for_conf else ""),
+                tape_confirmation_detail=(tape_for_conf.detail if tape_for_conf else ""),
                 raw_confidence=round(raw_confidence, 4),
                 coherence_factor=round(coherence_factor, 4),
                 movement_factor=round(movement_factor, 4),

@@ -51,7 +51,14 @@ from src.db.schema import SIGNAL_BASE_METHOD_COLUMNS
 # The stacker's features: every individual method score. All weight-INDEPENDENT
 # (combined_score/confidence are NOT here — that is the circularity guard). The
 # panel persists exactly these columns, so the dataset is essentially build_panel.
-STACKER_FEATURES: List[str] = list(SIGNAL_BASE_METHOD_COLUMNS)
+# Plus `tape_score` (2026-08-22): the score-independent price/volume tape
+# composite — a replay CONTEXT column, not a method column. The panel gets it
+# from the signals_replay merge; serving computes it live (the same
+# `compute_tape_confirmation` the confidence factor uses). Measured as the one
+# robust feature ADDITION of the 27-arm redesign: +0.0175 IC/day over the same
+# model without it (t +2.72, wins 72% of days, same-sign halves) — until now the
+# tape's direction was only a confidence qualifier, never scored.
+STACKER_FEATURES: List[str] = list(SIGNAL_BASE_METHOD_COLUMNS) + ["tape_score"]
 
 # The LIVE feature set — 21 of the weighted methods in the aggregator's
 # `method_score_map`. DELIBERATELY NOT the full post-2026-08-11 set of 27: the
@@ -67,6 +74,16 @@ STACKER_LIVE_FEATURES: List[str] = [
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum",
     "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint",
     "ext_gap", "broker_advisor",
+    # 22nd method (2026-08-24, user directive): the deep-cache price model's own
+    # score. Panel coverage is ~7% (epoch-masked before 2026-08-13), so today it
+    # is near-inert (the exit model measured byte-identical predictions at the
+    # same coverage) — it self-activates as post-epoch history accrues. The
+    # OTHER five 2026-08-11 promoted methods stay excluded (measured harmful as
+    # a six-pack at t −1.79; re-test ~2026-09-10). Shared with the exit model
+    # via EXIT_METHODS' derivation.
+    "ml_ohlcv",
+    # 23rd feature (2026-08-22, NOT a method column — see STACKER_FEATURES note):
+    "tape_score",
 ]
 
 # Kept as columns for the BASELINE comparison (NOT fed to the model): the current
@@ -98,6 +115,12 @@ def build_stacker_dataset(horizons: Sequence[int] = (1, 5, 10), days: Optional[i
         return pd.DataFrame()
 
     feats = [c for c in STACKER_FEATURES if c in panel.columns]
+    if "tape_score" not in feats:
+        # The 22nd feature comes from the signals_replay merge; a panel without
+        # it means the replay materialisation is missing/stale. Training would
+        # silently fit a 21-feature model — loud, because that is invisible.
+        logger.warning("[ml_stacker] panel has no tape_score column — replay "
+                       "materialisation missing? Training will drop the feature.")
     base = [c for c in _BASELINE_COLUMNS if c in panel.columns]
     # combined_sell_score is kept (not a feature, not a baseline) so the swap
     # validation can form combined_score = swapped_buy - combined_sell_score.
@@ -226,9 +249,24 @@ STACKER_GBM_PARAMS = dict(num_leaves=15, min_child_samples=20,
                           learning_rate=0.05, n_estimators=200)
 
 
+def stacker_model_class() -> str:
+    """The configured model class, normalised. Unknown values fall back to
+    "logistic" (the measured default) rather than erroring — the revert knob is
+    for operators, and a typo must not kill training."""
+    v = str(getattr(settings, "stacker_model_class", "logistic")).strip().lower()
+    return v if v in ("logistic", "gbm") else "logistic"
+
+
 def _stacker_model_factory():
-    from src.analysis.ml_train import LightGBMModel
-    return LightGBMModel(**STACKER_GBM_PARAMS)
+    """One factory for BOTH stackers AND the calibrator's OOF walk (the
+    calibration curve must be fit on the same model class it corrects).
+    "logistic" = SoftmaxLogistic (2026-08-22 default — see the setting's note);
+    "gbm" reverts to the small-data LightGBM classifier."""
+    if stacker_model_class() == "gbm":
+        from src.analysis.ml_train import LightGBMModel
+        return LightGBMModel(**STACKER_GBM_PARAMS)
+    from src.analysis.ml_train import SoftmaxLogistic
+    return SoftmaxLogistic()
 
 
 _BUY_MODEL_PATH = _Path("cache/ml/ml_buy_model.pkl")
@@ -323,7 +361,7 @@ def train_and_persist_buy(days: Optional[int] = None, path=_BUY_MODEL_PATH) -> O
     """Train the buy stacker on the panel (5d market-relative) over the 21 live
     method features; pickle it. Returns the artifact or None."""
     import numpy as _np
-    from src.analysis.ml_train import LightGBMModel, label_from_return
+    from src.analysis.ml_train import label_from_return
     h = BUY_TRAIN_CONFIG["horizon"]
     df = build_stacker_dataset(horizons=[h], days=days)
     if df.empty:
@@ -342,12 +380,13 @@ def train_and_persist_buy(days: Optional[int] = None, path=_BUY_MODEL_PATH) -> O
     if len(X) < 500 or len(_np.unique(y)) < 2:
         logger.warning(f"[ml_buy] insufficient training rows ({len(X)})")
         return None
-    model = LightGBMModel(**STACKER_GBM_PARAMS).fit(X, y)
+    model = _stacker_model_factory().fit(X, y)
     # Calibrate on OUT-OF-FOLD predictions BEFORE the final all-data fit is used
     # live, so the probability the combine consumes means what it says.
     cal, cal_diag = (_fit_calibrator(df, h, cfg["basis"], feats, cfg["deadband"])
                      if settings.enable_ml_probability_calibration else (None, {}))
     art = {"model": model, "features": feats, "config": dict(cfg),
+           "model_class": stacker_model_class(),
            "calibrator": cal, "calibration": cal_diag,
            "trained_at": _dt.now(_tz.utc).isoformat(timespec="seconds"),
            "n_train": int(len(X)), "train_max_date": str(df["signal_date"].max())}
@@ -368,7 +407,7 @@ def _record_buy_registry(art: dict) -> None:
             con.execute(
                 "INSERT INTO ml_models (trained_at, method, model_type, horizon, basis, "
                 "n_train, train_max_date, features, config) VALUES (?,?,?,?,?,?,?,?,?)",
-                [art["trained_at"], "ml_buy", "gbm", int(art["config"]["horizon"]),
+                [art["trained_at"], "ml_buy", stacker_model_class(), int(art["config"]["horizon"]),
                  art["config"]["basis"], art["n_train"], art["train_max_date"],
                  json.dumps(art["features"]), json.dumps(art["config"])])
     except Exception as e:
@@ -441,7 +480,7 @@ def train_and_persist_sell(days: Optional[int] = None, path=_SELL_MODEL_PATH) ->
     """Train the sell stacker on the panel (5d market-relative, label NEGATED so
     'up' = the short worked) over the 21 live method features; pickle it."""
     import numpy as _np
-    from src.analysis.ml_train import LightGBMModel, label_from_return
+    from src.analysis.ml_train import label_from_return
     h = SELL_TRAIN_CONFIG["horizon"]
     df = build_stacker_dataset(horizons=[h], days=days)
     if df.empty:
@@ -462,7 +501,7 @@ def train_and_persist_sell(days: Optional[int] = None, path=_SELL_MODEL_PATH) ->
     if len(X) < 500 or len(_np.unique(y)) < 2:
         logger.warning(f"[ml_sell] insufficient training rows ({len(X)})")
         return None
-    model = LightGBMModel(**STACKER_GBM_PARAMS).fit(X, y)
+    model = _stacker_model_factory().fit(X, y)
     # Calibrate on OOF predictions of the SELL problem: walk_forward_predict needs
     # the negated-return basis column ("the short worked"), matching this model's label.
     cal, cal_diag = (None, {})
@@ -477,6 +516,7 @@ def train_and_persist_sell(days: Optional[int] = None, path=_SELL_MODEL_PATH) ->
             df[scol] = -pd.to_numeric(df[ycol], errors="coerce")
             cal, cal_diag = _fit_calibrator(df, h, "sellinv", feats, cfg["deadband"])
     art = {"model": model, "features": feats, "config": dict(cfg),
+           "model_class": stacker_model_class(),
            "calibrator": cal, "calibration": cal_diag,
            "trained_at": _dt.now(_tz.utc).isoformat(timespec="seconds"),
            "n_train": int(len(X)), "train_max_date": str(df["signal_date"].max())}
@@ -497,7 +537,7 @@ def _record_sell_registry(art: dict) -> None:
             con.execute(
                 "INSERT INTO ml_models (trained_at, method, model_type, horizon, basis, "
                 "n_train, train_max_date, features, config) VALUES (?,?,?,?,?,?,?,?,?)",
-                [art["trained_at"], "ml_sell", "gbm", int(art["config"]["horizon"]),
+                [art["trained_at"], "ml_sell", stacker_model_class(), int(art["config"]["horizon"]),
                  art["config"]["basis"], art["n_train"], art["train_max_date"],
                  json.dumps(art["features"]), json.dumps(art["config"])])
     except Exception as e:

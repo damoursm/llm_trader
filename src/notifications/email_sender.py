@@ -473,7 +473,11 @@ HTML_TEMPLATE = """
     <td style="color:{{ '#16a34a' if row.action == 'BUY' else '#dc2626' }};font-weight:700;">
       {{ row.action }}
     </td>
-    <td style="color:#60a5fa;font-weight:600;">{{ (row.confidence * 100)|round(1) }}%</td>
+    {# A MECHANICAL entry (follow-through) has no LLM confidence: the field is
+       present-but-None, and `None * 100` raised here, killing the whole tick
+       inside Jinja (2026-08-26). Render an em dash -- the trade genuinely has
+       no confidence, and 0% would assert it had the lowest possible one. #}
+    <td style="color:#60a5fa;font-weight:600;">{{ (row.confidence * 100)|round(1) ~ '%' if row.confidence is not none else '&mdash;' }}</td>
     <td class="{{ 'pos' if row.return_pct > 0 else 'neg' }}">
       {{ "%+.2f"|format(row.return_pct) }}%
     </td>

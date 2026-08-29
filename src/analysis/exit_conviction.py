@@ -47,7 +47,7 @@ from config.settings import settings
 # exit panel first (st_reversal in particular scores every winner's up-week as
 # exit pressure, which is exactly the hypothesis to TEST, not assume).
 _CONSENSUS_SKIP = frozenset({"llm_review", "aggregator", "horizon", "edge_decay",
-                             "macro_regime", "mfe", "mae",
+                             "macro_regime", "mfe", "mae", "held_rank",
                              "hi52", "mom_12_1", "st_reversal",
                              "rsi2_rev", "dloc_rev",
                              "squeeze", "iv_term", "avwap",

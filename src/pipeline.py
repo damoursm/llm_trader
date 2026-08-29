@@ -426,6 +426,11 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "combined_score_abs": getattr(s, "combined_score_abs", None),
                 "combined_buy_score_abs": getattr(s, "combined_buy_score_abs", None),
                 "combined_sell_score_abs": getattr(s, "combined_sell_score_abs", None),
+                # Follow-through candidate columns (2026-08-25, panel-first):
+                # min-cohort exit conviction, follow-through direction, selection.
+                "ft_score": getattr(s, "ft_score", None),
+                "ft_dir": float(getattr(s, "ft_dir", 0.0) or 0.0),
+                "ft_selected": (1.0 if getattr(s, "ft_selected", False) else 0.0),
                 "scores": all_scores,
             })
         if sig_rows:
@@ -1110,7 +1115,8 @@ def _persist_exit_signals(run_id, hold_reviews, open_trades, signals_by_ticker, 
     rows = []
     for t in open_trades:
         hr = (hold_reviews or {}).get(t["ticker"])
-        scores = build_exit_scores(t, hr, signals_by_ticker, macro_regime_context)
+        scores = build_exit_scores(t, hr, signals_by_ticker, macro_regime_context,
+                                   _hr_all_trades=open_trades)
         for method, score in scores.items():
             rows.append({
                 "reviewed_at": now,
@@ -1218,6 +1224,50 @@ def _apply_actionable_gates(recommendations, *, confidence_threshold,
     Gate order is load-bearing: each drop is attributed to the FIRST gate that
     rejected it, and ``tracker.compute_stage_eval``'s funnel reads those stamps.
     """
+    # Gate 1c precompute — the per-run RANK CAP (2026-08-21). An absolute
+    # confidence floor lets a whole run abstain (measured informative: Gate 1
+    # is the funnel's one right-signed gate) but inherits the LLM's confidence
+    # SCALE: when the scale drifts, the trade rate drifts with it (the
+    # 2026-08-17 prompt incident doubled it with no signal change; measured
+    # cv 0.21-0.46). A pure rank gate is scale-immune but forces trades on
+    # runs the LLM judged weak — measured WORSE (-0.36..-0.50 %/day paired).
+    # The hybrid keeps both properties: among the calls clearing the floor,
+    # keep only the run's top-`gate1_rank_cap` by stated confidence. Measured
+    # selection-NEUTRAL (-0.027 %/day, t -0.30) while cutting the trade-rate
+    # cv 0.46 -> 0.28 — it works BECAUSE within-run confidence rank carries no
+    # information (per-run rank IC -0.023), so dropping the lowest passers on
+    # hot runs costs nothing. Deterministic tie-break (confidence, then
+    # ticker) so reruns cannot reshuffle the boundary. 0 disables.
+    _cap = int(getattr(settings, "gate1_rank_cap", 0) or 0)
+    _cap_keep: set = set()
+    if _cap > 0:
+        _floor_passers = [
+            r for r in recommendations
+            if r.action in ("BUY", "SELL")
+            and r.confidence >= confidence_threshold + side_threshold_adj.get(r.action, 0.0)
+        ]
+        _floor_passers.sort(key=lambda r: (-float(r.confidence or 0.0), str(r.ticker)))
+        _kept = _floor_passers[:_cap]
+        # SIDE FLOOR (2026-08-22): the pooled ordering is direction-neutral in
+        # principle (a SELL at 0.92 outranks a BUY at 0.88), but SELLs are only
+        # ~28% of floor passers by COMPOSITION, so a pooled top-K came out
+        # all-BUY in 188 of 662 SELL-passing runs — starving the side the
+        # funnel measures as the profitable one (PASS SELL +0.132pp vs BUY
+        # −0.435pp). With K >= 2, each side that has at least one floor passer
+        # is guaranteed one slot: the best call of the missing side evicts the
+        # kept call with the LOWEST confidence (never the missing side's own).
+        # Measured (cap_side_mix.py): SELL share 24.3% -> ~30%, oriented
+        # outcome −0.054 -> −0.005/call, rate cv unchanged at 0.28. Symmetric
+        # by construction, though BUYs are the majority side in practice.
+        if _cap >= 2 and _kept:
+            for _side in ("BUY", "SELL"):
+                if any(r.action == _side for r in _kept):
+                    continue
+                _best = next((r for r in _floor_passers if r.action == _side), None)
+                if _best is not None:
+                    _kept = _kept[:-1] + [_best]     # evict the lowest kept
+        _cap_keep = {r.ticker for r in _kept}
+
     actionable: List = []
     for r in recommendations:
         if r.action not in ("BUY", "SELL"):
@@ -1233,6 +1283,13 @@ def _apply_actionable_gates(recommendations, *, confidence_threshold,
         if r.confidence < _side_thr:
             gate_diag["dropped_below_threshold"] += 1
             gate_outcomes[r.ticker] = "below_threshold"
+            continue
+        # Gate 1c — the rank cap (see the precompute above): a floor passer
+        # outside the run's top-K is DEFERRED, not condemned — the same name
+        # re-qualifies at any later tick it makes the cut.
+        if _cap > 0 and r.ticker not in _cap_keep:
+            gate_diag["dropped_rank_cap"] += 1
+            gate_outcomes[r.ticker] = "rank_capped"
             continue
         # Gate 1b — agreement floor: mechanically enforces the CLAUDE.md-documented
         # "a single strong signal source never produces a BUY/SELL" invariant
@@ -2398,6 +2455,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     gate_diag: dict = {
         "buy_sell_candidates":          0,
         "dropped_below_threshold":      0,
+        "dropped_rank_cap":             0,
         "dropped_low_combined_score":   0,
         "dropped_low_agreement":        0,
         "dropped_buy_blocked":          0,
@@ -2563,6 +2621,34 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             synth_arm=arm_shadow.live_arm_name(dual_case, blind_synthesis),
             macro_regime_context=macro_regime_context,   # RISK_OFF sizing haircut
         ) or {}
+
+        # ── FOLLOW-THROUGH (2026-08-25): exit-as-entry candidates ────────────
+        # Score every Gate-4 name's hypothetical held cohorts with the live
+        # ml_exit artifact; the within-tick extreme tail becomes SAME-TICK
+        # opposite-direction entries (the edge is a point event — next-day entry
+        # measured −0.88%). Stamped onto the TickerSignal fields BEFORE
+        # _persist_run so the panel accrues ft_score/ft_dir/ft_selected either
+        # way; trading is its own flag. Runs AFTER record_new_trades (the LLM
+        # book gets first claim on a ticker) and BEFORE the broker reconcile
+        # (so ft entries ride this tick's sync). Fail-soft: {} touches nothing.
+        try:
+            from src.signals.follow_through import compute_follow_through
+            # TickerSignal carries no price — join it from the run's snapshots,
+            # exactly as _persist_run does for the signals table.
+            _ft_px = {s.ticker: s.price for s in (snapshots or [])
+                      if getattr(s, "price", None)}
+            _ft_map = compute_follow_through(signals_by_ticker, price_by_ticker=_ft_px)
+            for _s in signals:
+                _r = _ft_map.get(_s.ticker)
+                if _r is not None:
+                    _s.ft_score = round(float(_r["score"]), 4)
+                    _s.ft_dir = float(_r["dir"])
+                    _s.ft_selected = bool(_r["selected"])
+            if _ft_map and settings.enable_follow_through_trading:
+                from src.performance.tracker import record_follow_through_trades
+                record_follow_through_trades(_ft_map, signals_by_ticker, run_id=run_id)
+        except Exception as _ft_e:
+            logger.warning(f"[follow_through] tick integration failed (fail-soft): {_ft_e}")
 
         # Broker shadow execution (paper-first): once the internal ledger is final for
         # this tick, reconcile a real broker (IBKR paper) against it — submit entries

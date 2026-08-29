@@ -47,7 +47,15 @@ _cache: dict = {"ts": 0.0, "model": None}
 def trade_features(trade: dict) -> Optional[List[float]]:
     """The model's feature vector for a stored trade (None when the trade
     carries no attribution). Signed scores are oriented in the trade's
-    direction, so 'the signal supported this position' is always positive."""
+    direction, so 'the signal supported this position' is always positive.
+
+    The combined-score feature prefers the ABSOLUTE-basis twin
+    (``signal_at_entry.combined_score_abs``, snapshotted at entry since
+    2026-08-14) and falls back to ``combined_score`` — which on pre-shadow rows
+    IS absolute — so the series stays on ONE basis across the rank cutover.
+    The exact ``ex_combine`` convention from ml_exit, for the exact same
+    reason: a basis change must never shift a fitted model's feature
+    distribution mid-life."""
     ms = trade.get("method_scores") or {}
     if not ms:
         return None
@@ -57,14 +65,39 @@ def trade_features(trade: dict) -> Optional[List[float]]:
         return None
     sign = 1.0 if trade.get("action") == "BUY" else -1.0
     sig = trade.get("signal_at_entry") or {}
+    combined = sig.get("combined_score_abs")
+    if combined is None:
+        combined = sig.get("combined_score") or 0.0
     return [
         float(frac),
         float(trade.get("confidence") or 0.0),
-        sign * float(sig.get("combined_score") or 0.0),
+        sign * float(combined),
         sign * float(ms.get("news") or 0.0),
         sign * float(ms.get("momentum") or 0.0),
         1.0 if (trade.get("entry_session") or "rth") != "rth" else 0.0,
     ]
+
+
+def _row_is_comparable(trade: dict) -> bool:
+    """STANDING RULE (calibration comparability): a calibration may only fit
+    data the current code produced — satisfied by RESTRICTING, never by
+    converting. This model regresses returns on entry-time CONFIDENCE and the
+    NEWS / MOMENTUM method scores, all of which have scale epochs:
+    ``confidence`` re-scaled at CONFIDENCE_EPOCH (2026-08-14; measured 75% of
+    eligible closes carried the pre-split scale when the sibling calibrations
+    were gated) and ``news`` re-scaled at its 2026-08-17 scorer epoch (mean
+    |news| halved at the v3/v4 prompt). Fitting across a scale break makes a
+    coefficient describe the MIXTURE, not the relationship. Found ungated
+    2026-08-22 (the only decision-feeding confidence consumer without the
+    gate); the evidence blend ``w = n/(n+prior_n)`` is exactly what makes the
+    smaller clean sample safe. Fail-OPEN on missing dates, like the helpers
+    themselves — a malformed timestamp must not erase history."""
+    from src.signals.method_epochs import (confidence_is_comparable,
+                                           score_is_comparable)
+    when = trade.get("entry_datetime") or trade.get("entry_date")
+    return (confidence_is_comparable(when)
+            and score_is_comparable("news", when)
+            and score_is_comparable("momentum", when))
 
 
 def fit_edge_model(trades: List[dict]) -> Optional[dict]:
@@ -72,14 +105,22 @@ def fit_edge_model(trades: List[dict]) -> Optional[dict]:
     trades. Returns ``{beta, mean, std, y_mean, target_std, n}`` or None when
     fewer than ``edge_min_closed`` usable closes exist (→ the layer is inert)."""
     rows, ys = [], []
+    n_incomparable = 0
     for t in trades:
         if t.get("status") != "CLOSED" or t.get("return_pct") is None:
+            continue
+        if not _row_is_comparable(t):
+            n_incomparable += 1              # superseded scale — never fit it
             continue
         f = trade_features(t)
         if f is None:
             continue
         rows.append(f)
         ys.append(float(t["return_pct"]))
+    if n_incomparable:
+        logger.debug(f"[edge_sizing] {n_incomparable} closed trade(s) excluded "
+                     f"from the fit (pre-epoch confidence/news scale); "
+                     f"{len(rows)} comparable rows remain")
     n = len(rows)
     if n < max(int(settings.edge_min_closed), len(FEATURES) + 2):
         return None

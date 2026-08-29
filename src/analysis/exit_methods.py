@@ -42,7 +42,7 @@ from config.settings import settings
 # excursions / state, so (like horizon / llm_review) they never appear in the
 # universe shadow book.
 EXIT_DECISION_METHODS = ("llm_review", "aggregator", "macro_regime", "horizon",
-                         "edge_decay", "mfe", "mae", "ml_exit")
+                         "edge_decay", "mfe", "mae", "ml_exit", "held_rank")
 
 # Dashboard Exit-IC table grouping (mirrors signal_panel.IC_CATEGORY_ORDER).
 EXIT_CATEGORY_DECISION = "Exit decision (synthesized review + overlays)"
@@ -60,6 +60,7 @@ EXIT_METHOD_LABELS: Dict[str, str] = {
     "mfe":          "Favorable excursion / give-back (trailing)",
     "mae":          "Adverse excursion / drawdown (stop)",
     "ml_exit":      "ML exit model (learned exit-timer)",
+    "held_rank":    "Held-window score rank (signal decay vs own history)",
 }
 
 # Regime → hold-pressure for a LONG position (× the position's dir_sign). Only
@@ -233,7 +234,152 @@ def _edge_decay_pressure(trade: dict) -> float:
     return -min(1.0, held / edge_days - 1.0)
 
 
-def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_context) -> Dict[str, float]:
+# -- held-window score rank (2026-08-22, PANEL-FIRST) -------------------------
+#
+# The user-directed exit method: for a HELD position, where does the ticker's
+# CURRENT aggregate score rank within the pool of that same ticker's scores over
+# every tick since the position was entered? The entry side ranks a name against
+# the day's UNIVERSE ("which stock"); this ranks it against its own held-window
+# history ("is this position's signal now at its weakest since we got in").
+# Self-normalizing per ticker, so cross-ticker scale never enters.
+#
+# Panel-first: scored + persisted to `exit_signals` (IC accrues live), in
+# exit_conviction._CONSENSUS_SKIP (never nudges the confidence floor), no
+# closing rule -- the same probation every new entry method serves.
+#
+# The pool reads the ABSOLUTE-basis shadow combine (`combined_score_abs`,
+# falling back to `combined_score` on pre-shadow rows, which ARE absolute) for
+# the same reason ml_exit's `ex_combine` does: a held window can span an
+# ml-arm/weighted flip or a shaped-curve refresh, and a rank over two different
+# scales in one pool is not a rank. Today's in-memory value uses the same
+# preference, so pool and current observation are one quantity.
+#
+# Ordering invariant (pinned by a test): `monitor_open_positions` runs BEFORE
+# `_persist_run` writes this tick's signals rows, so the DB pool never contains
+# today's score -- it is appended from the in-memory TickerSignal, exactly once.
+
+_HELD_RANK_TTL_SECONDS = 20 * 60          # one pool query per tick (runner >=30m)
+_HELD_RANK_CACHE: Dict[str, object] = {"ts": 0.0, "key": None, "pools": None}
+
+
+def _abs_combine(sig) -> Optional[float]:
+    """The basis-invariant combine of a TickerSignal (abs shadow preferred)."""
+    if sig is None:
+        return None
+    v = getattr(sig, "combined_score_abs", None)
+    if v is None or v != v:
+        v = getattr(sig, "combined_score", None)
+    try:
+        return float(v) if v is not None and v == v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _held_rank_pools(trades: list, force: bool = False) -> Dict[str, list]:
+    """``{ticker: [(generated_at, score), ...]}`` since the EARLIEST open entry.
+
+    One query per tick for every held ticker (the per-trade entry filter happens
+    in ``_held_rank_from_live`` -- positions on the same ticker can differ).
+    Fail-soft to ``{}``: the method then abstains rather than scoring on a
+    partial pool.
+    """
+    import time as _time
+    # Callers pass whatever ledger slice they hold (the monitor passes ALL
+    # trades); the pool is only about OPEN positions, so filter here -- one
+    # wrong caller must not widen the query to the whole closed history.
+    trades = [t for t in (trades or [])
+              if str(t.get("status") or "OPEN").upper() == "OPEN"]
+    open_keys = sorted({str(t.get("ticker")) for t in trades if t.get("ticker")})
+    min_entry = min((str(t.get("entry_datetime") or t.get("entry_date") or "")
+                     for t in trades if (t.get("entry_datetime") or t.get("entry_date"))),
+                    default="")
+    key = (tuple(open_keys), min_entry[:10])
+    now = _time.time()
+    if (not force and _HELD_RANK_CACHE["pools"] is not None
+            and _HELD_RANK_CACHE["key"] == key
+            and (now - float(_HELD_RANK_CACHE["ts"])) < _HELD_RANK_TTL_SECONDS):
+        return _HELD_RANK_CACHE["pools"]        # type: ignore[return-value]
+    pools: Dict[str, list] = {}
+    if open_keys and min_entry:
+        try:
+            from src.db import repo
+            ph = ", ".join(["?"] * len(open_keys))
+            df = repo.fetch_df(
+                f"SELECT ticker, generated_at, combined_score_abs, combined_score "
+                f"FROM signals WHERE ticker IN ({ph}) AND generated_at >= ? "
+                f"ORDER BY generated_at",
+                [*open_keys, min_entry])
+            if df is not None and not df.empty:
+                for r in df.itertuples(index=False):
+                    v = r.combined_score_abs
+                    if v is None or v != v:
+                        v = r.combined_score
+                    if v is None or v != v:
+                        continue
+                    pools.setdefault(str(r.ticker), []).append(
+                        (str(r.generated_at), float(v)))
+        except Exception as e:
+            logger.warning(f"[held_rank] pool query failed (method abstains): {e}")
+            pools = {}
+    _HELD_RANK_CACHE.update(ts=now, key=key, pools=pools)
+    return pools
+
+
+def reset_cache() -> None:
+    """Test / asof hook (mirrors news_shock.reset_cache)."""
+    _HELD_RANK_CACHE.update(ts=0.0, key=None, pools=None)
+
+
+def held_rank_score(oriented_pool: list, oriented_now: float,
+                    min_ticks: Optional[int] = None) -> float:
+    """Signed hold-conviction from the held-window rank: ``2*pct - 1``.
+
+    ``oriented_pool`` = the position-ORIENTED scores of every tick since entry
+    (excluding now); ``oriented_now`` = today's oriented score. pct is the
+    average-tie rank of now within pool + {now}, over its size -- so today at
+    its held-window best -> +1 (keep), at its worst -> -1 (exit pressure), and
+    a pool of near-ties -> ~0 (no view). Abstains (0.0) below ``min_ticks``
+    total observations: a rank in a pool of two is a coin, not a signal.
+    """
+    if oriented_now is None or oriented_now != oriented_now:
+        return 0.0
+    floor = int(min_ticks if min_ticks is not None
+                else getattr(settings, "held_rank_min_ticks", 5))
+    vals = [float(v) for v in oriented_pool if v is not None and v == v]
+    vals.append(float(oriented_now))
+    n = len(vals)
+    if n < max(2, floor):
+        return 0.0
+    below = sum(1 for v in vals if v < oriented_now)
+    ties = sum(1 for v in vals if v == oriented_now)
+    # MID-rank percentile ((rank - 0.5)/n with average ties): symmetric by
+    # construction -- the pool minimum scores -(n-1)/n and the maximum +(n-1)/n,
+    # an all-tie pool scores exactly 0. The naive (rank/n) form is asymmetric
+    # (min of 5 -> -0.6 while max -> +1.0), which would bias the persisted
+    # panel bullish for no reason.
+    pct = (below + ties / 2.0) / n
+    return round(2.0 * pct - 1.0, 6)
+
+
+def _held_rank_from_live(trade: dict, today_signal, all_open_trades: list) -> float:
+    """The live wrapper: pool since THIS position's entry, oriented, scored."""
+    now_raw = _abs_combine(today_signal)
+    if now_raw is None:
+        return 0.0
+    ds = _dir_sign(trade)
+    if ds == 0.0:
+        return 0.0
+    entry = str(trade.get("entry_datetime") or trade.get("entry_date") or "")
+    if not entry:
+        return 0.0
+    pools = _held_rank_pools(all_open_trades)
+    series = pools.get(str(trade.get("ticker"))) or []
+    oriented = [v * ds for ts, v in series if ts >= entry]
+    return held_rank_score(oriented, now_raw * ds)
+
+
+def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_context,
+                      _hr_all_trades: Optional[list] = None) -> Dict[str, float]:
     """Signed hold-conviction score per exit method for one held position.
 
     ``trade`` is the open-trade dict; ``hold_review`` its opener-pinned
@@ -299,6 +445,22 @@ def build_exit_scores(trade: dict, hold_review, signals_by_ticker, macro_regime_
                 scores["ml_exit"] = mx
         except Exception:
             pass
+
+    # 4d. Held-window score rank (2026-08-22, panel-first): today's aggregate
+    #     score ranked within THIS position's own tick history since entry --
+    #     signal decay against the position's own past, not the universe.
+    #     `_hr_all_trades` is threaded by the monitor/persist callers so ONE
+    #     pool query serves every held position; absent (tests, ad-hoc), the
+    #     pool covers just this trade.
+    if getattr(settings, "enable_held_rank_exit_signal", True):
+        try:
+            _hr = _held_rank_from_live(trade, today_signal,
+                                       _hr_all_trades if _hr_all_trades is not None
+                                       else [trade])
+            if _hr:
+                scores["held_rank"] = _hr
+        except Exception as e:
+            logger.debug(f"[held_rank] score failed for {ticker}: {e}")
 
     # 5. The entry signal methods, re-scored on the held ticker and oriented.
     if today_signal is not None:

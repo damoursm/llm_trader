@@ -15,14 +15,71 @@ from src.db.schema import SIGNAL_BASE_METHOD_COLUMNS
 
 # ── feature set + circularity ────────────────────────────────────────────────
 
-def test_live_features_are_21_weighted_methods_no_combine():
+def test_live_features_are_22_weighted_methods_plus_tape_no_combine():
     # The live stacker trains/infers on exactly the weighted methods the combine
-    # uses — a subset of the persisted base columns, and NEVER a weight-derived
-    # aggregate (the circularity guard).
-    assert len(ms.STACKER_LIVE_FEATURES) == 21
-    assert set(ms.STACKER_LIVE_FEATURES).issubset(set(SIGNAL_BASE_METHOD_COLUMNS))
+    # uses (21 + `ml_ohlcv`, added 2026-08-24 by user directive — near-inert at
+    # ~7% post-epoch coverage until history accrues) plus `tape_score`
+    # (2026-08-22: the score-independent tape composite; a replay CONTEXT
+    # column, hence the explicit carve-out from the method-column subset check)
+    # — and NEVER a weight-derived aggregate (the circularity guard).
+    assert len(ms.STACKER_LIVE_FEATURES) == 23
+    assert "tape_score" in ms.STACKER_LIVE_FEATURES
+    assert "ml_ohlcv" in ms.STACKER_LIVE_FEATURES
+    methods_only = [f for f in ms.STACKER_LIVE_FEATURES if f != "tape_score"]
+    assert len(methods_only) == 22
+    assert set(methods_only).issubset(set(SIGNAL_BASE_METHOD_COLUMNS))
     for banned in ("combined_score", "combined_buy_score", "combined_sell_score", "confidence"):
         assert banned not in ms.STACKER_LIVE_FEATURES
+
+
+def test_model_factory_dispatches_on_the_setting(monkeypatch):
+    # "logistic" (the 2026-08-22 measured default) -> SoftmaxLogistic;
+    # "gbm" reverts to the small-data LightGBM classifier; junk falls back to
+    # logistic rather than erroring (operator knob, fail-soft).
+    from config.settings import settings
+    from src.analysis.ml_train import SoftmaxLogistic
+    monkeypatch.setattr(settings, "stacker_model_class", "logistic")
+    assert isinstance(ms._stacker_model_factory(), SoftmaxLogistic)
+    monkeypatch.setattr(settings, "stacker_model_class", "GBM")
+    assert type(ms._stacker_model_factory()).__name__ == "LightGBMModel"
+    monkeypatch.setattr(settings, "stacker_model_class", "typo")
+    assert isinstance(ms._stacker_model_factory(), SoftmaxLogistic)
+
+
+def test_softmax_logistic_serves_through_the_conviction_path(tmp_path, monkeypatch):
+    # End-to-end on the NEW model class: train a tiny SoftmaxLogistic artifact
+    # through train-time plumbing stand-ins and serve it via
+    # compute_buy_conviction — bull_bear + calibrate + centering all apply, and
+    # a missing tape_score key imputes (train median) instead of erroring.
+    import pickle
+
+    import numpy as np
+
+    from src.analysis.ml_train import SoftmaxLogistic
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, len(ms.STACKER_LIVE_FEATURES)))
+    y = (X[:, 0] + 0.5 * rng.normal(size=400) > 0).astype(int) * 2   # classes {0, 2}
+    model = SoftmaxLogistic().fit(X, y)
+    art = {"model": model, "features": list(ms.STACKER_LIVE_FEATURES),
+           "config": {"horizon": 5, "basis": "rank_pv", "deadband": 0.0},
+           "model_class": "logistic", "calibrator": None, "calibration": {},
+           "trained_at": "2026-08-22T00:00:00+00:00", "n_train": 400,
+           "train_max_date": "2026-08-21"}
+    p = tmp_path / "ml_buy_model.pkl"
+    with open(p, "wb") as fh:
+        pickle.dump(art, fh)
+    monkeypatch.setattr(ms, "_BUY_MODEL_PATH", p)
+    ms.reset_buy_caches()
+    try:
+        scores = {f: 0.4 for f in ms.STACKER_LIVE_FEATURES}
+        conv = ms.compute_buy_conviction(scores)
+        assert conv is not None and 0.0 <= conv <= 1.0
+        # tape_score absent from the dict -> NaN -> imputed, never an error
+        scores.pop("tape_score")
+        conv2 = ms.compute_buy_conviction(scores)
+        assert conv2 is not None and 0.0 <= conv2 <= 1.0
+    finally:
+        ms.reset_buy_caches()
 
 
 def test_live_features_match_the_aggregator_method_map():

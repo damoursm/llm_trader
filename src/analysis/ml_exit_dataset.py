@@ -49,9 +49,12 @@ from src.analysis.exit_methods import method_horizon_days
 from src.analysis.ml_dataset import _benchmark_series
 from src.analysis.ml_stacker import STACKER_LIVE_FEATURES
 
-# The method scores the exit model sees (oriented to the position) — the same 21
-# weighted methods the consensus uses, so the comparison is apples-to-apples on
-# the methods and the ML model's win must come from LEARNING + the state features.
+# The method scores the exit model sees (oriented to the position) — ONE list
+# with the stacker's, so a feature decision propagates to the exit at its next
+# retrain instead of forking. `ml_ohlcv` entered here first (2026-08-23 as an
+# exit-only extension) and moved UPSTREAM into STACKER_LIVE_FEATURES on
+# 2026-08-24, collapsing the extension back into the shared derivation. It is
+# in `_CONSENSUS_SKIP`, so the `ex_consensus` baseline ignores it either way.
 EXIT_METHODS: List[str] = list(STACKER_LIVE_FEATURES)
 
 # Position-state features — the exit-specific signal the consensus cannot see.
@@ -68,7 +71,8 @@ def _dir_sign(direction) -> float:
 
 
 def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
-                       max_hold: int = 12, entry_stride: int = 1) -> pd.DataFrame:
+                       max_hold: int = 12, entry_stride: int = 1,
+                       entries: str = "directional") -> pd.DataFrame:
     """Simulate held positions over the panel; one row per (position, held-day).
 
     ``horizon`` = the label look-ahead (sessions held from the current day).
@@ -76,6 +80,15 @@ def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
     subsamples entry days per ticker. Returns an ``ml_train``-compatible frame:
     ``EXIT_FEATURE_COLUMNS`` + ``ex_consensus`` (baseline) + ``fwd_ret_pos_<h>d``
     (the oriented held-return label) + ``end_date_<h>d`` (point-in-time guard).
+
+    ``entries`` (2026-08-23): ``"directional"`` opens hypothetical positions only
+    where the panel fired a direction (the band-conditioned ~15% of names — the
+    historical behaviour); ``"all"`` also opens one for every other scored name,
+    oriented by the SIGN of its abs-basis combine (skipped only when that is
+    NaN/0) — ~6x the rows from the same days, so the exit model trains on the
+    full cross-section rather than the gated sliver. Every row stamps
+    ``entry_directional`` so evaluation can still target the real held
+    population.
     """
     from src.analysis.signal_panel import build_panel
     panel = build_panel(horizons=[horizon], days=days)
@@ -119,8 +132,14 @@ def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
 
         for ei in range(0, n - 1, entry_stride):
             ds = _dir_sign(dirs[ei])
-            if ds == 0.0:
-                continue
+            directional = ds != 0.0
+            if not directional:
+                if entries != "all":
+                    continue
+                c0 = comb[ei]
+                if c0 is None or c0 != c0 or c0 == 0.0:
+                    continue
+                ds = 1.0 if c0 > 0 else -1.0
             ep, ec = px[ei], comb[ei]
             if not ep or ep <= 0 or ep != ep:
                 continue
@@ -144,6 +163,11 @@ def build_exit_dataset(horizon: int = 3, days: Optional[int] = None,
                     # policy simulator group a position's held-days and walk them
                     # in order. Not a feature.
                     "entry_date": dates[ei],
+                    # Population stamp (2026-08-23): True = the panel fired this
+                    # direction (the real held book's population); False = a
+                    # combine-sign hypothetical added by entries="all". Not a
+                    # feature — evaluation/selection only.
+                    "entry_directional": directional,
                     "ex_ret": oret, "ex_mfe": mfe, "ex_mae": mae,
                     "ex_giveback": mfe - oret, "ex_from_mae": oret - mae,
                     "ex_combine": (ds * hc if hc == hc else np.nan),
@@ -289,7 +313,13 @@ def train_and_persist_exit(days: Optional[int] = None, path=_EXIT_MODEL_PATH) ->
     cfg = dict(EXIT_TRAIN_CONFIG)
     cfg["horizon"] = int(settings.ml_exit_horizon_days)
     h = cfg["horizon"]
-    df = build_exit_dataset(horizon=h, days=days, max_hold=cfg["max_hold"])
+    # Training population (2026-08-23): "all" widens the simulated book to every
+    # scored name (combine-sign hypotheticals) — ~6x rows from the same days;
+    # "directional" is the historical band-conditioned population. Stamped in
+    # the artifact so a served model's training basis is always inspectable.
+    cfg["population"] = str(getattr(settings, "ml_exit_train_population", "directional")).lower()
+    df = build_exit_dataset(horizon=h, days=days, max_hold=cfg["max_hold"],
+                            entries=cfg["population"])
     ycol = f"fwd_ret_pos_{h}d"
     if df.empty or ycol not in df.columns:
         logger.warning("[ml_exit] no exit data to train on")
@@ -440,6 +470,20 @@ def live_exit_features(trade: dict, signals_by_ticker: Optional[dict], today_sig
     }
     oriented = _method_scores_from_signal(trade.get("ticker"), trade.get("direction"), signals_by_ticker)
     for m in EXIT_METHODS:
+        if m == "tape_score":
+            # NOT a method column (2026-08-22, the stacker's 22nd feature):
+            # resolve from the TickerSignal's tape field — the same composite
+            # the panel's replay-derived `tape_score` column holds — so the
+            # exit model's next retrain gets a live twin instead of a planted
+            # train/serve mismatch. The frozen 30-feature artifact never asks
+            # for this key (the vector is built from art["features"]).
+            _sig = (signals_by_ticker or {}).get(trade.get("ticker")) or today_signal
+            tv = getattr(_sig, "tape_confirmation_score", None) if _sig is not None else None
+            try:
+                feats[f"ex_{m}"] = ds * float(tv) if tv is not None and tv == tv else np.nan
+            except (TypeError, ValueError):
+                feats[f"ex_{m}"] = np.nan
+            continue
         v = oriented.get(m)
         try:
             feats[f"ex_{m}"] = ds * float(v) if v is not None and v == v else np.nan

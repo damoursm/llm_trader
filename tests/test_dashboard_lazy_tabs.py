@@ -35,10 +35,10 @@ def _walk(node):
         yield from _walk(ch)
 
 
-def test_spec_covers_all_six_tabs():
+def test_spec_covers_all_tabs():
     values = [v for v, _l, _r in dash_app._TAB_SPEC]
     assert values == ["rationale", "methods", "exit_perf", "returns",
-                      "execution", "data_quality"]
+                      "execution", "follow_through", "data_quality"]
     assert all(callable(r) for _v, _l, r in dash_app._TAB_SPEC)
 
 

@@ -67,15 +67,17 @@ def test_every_entry_method_reaches_the_exit_rescore():
 
 
 def test_exit_model_features_are_the_stackers_by_identity():
-    """One list, not a copy: `EXIT_METHODS is STACKER_LIVE_FEATURES` would be
-    too strong (list() wraps it), so equality + provenance are asserted. If the
-    stacker's measured feature decision changes, the exit model follows at its
-    next retrain instead of forking."""
+    """One list again (2026-08-24): `ml_ohlcv` moved upstream into
+    STACKER_LIVE_FEATURES, collapsing the brief exit-only extension. Equality +
+    source-derivation are asserted so the two feature sets can never fork —
+    also guards the duplicate-column bug an additive derivation would create
+    now that the upstream list carries ml_ohlcv itself."""
     import inspect
 
     from src.analysis.ml_exit_dataset import EXIT_METHODS
     from src.analysis.ml_stacker import STACKER_LIVE_FEATURES
     assert list(EXIT_METHODS) == list(STACKER_LIVE_FEATURES)
+    assert len(set(EXIT_METHODS)) == len(EXIT_METHODS), "duplicate feature"
     src = inspect.getsource(__import__("src.analysis.ml_exit_dataset",
                                        fromlist=["x"]))
     assert "EXIT_METHODS: List[str] = list(STACKER_LIVE_FEATURES)" in src, (

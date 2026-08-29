@@ -210,6 +210,15 @@ SIGNAL_COMBINED_SIDE_COLUMNS = ("combined_buy_score", "combined_sell_score")
 SIGNAL_ABS_SHADOW_COLUMNS = ("combined_score_abs", "combined_buy_score_abs",
                              "combined_sell_score_abs")
 
+# Follow-through candidate columns (2026-08-25, src/signals/follow_through.py —
+# panel-first accrual for the exit-as-entry mechanism): ft_score = the MOST
+# NEGATIVE hypothetical-cohort exit conviction for the ticker this run; ft_dir =
+# the follow-through (opposite) direction it implies (+1 long / −1 short / 0
+# none); ft_selected = 1.0 when the tail+level+first-episode-day rules chose it
+# as an entry candidate. NOT method scores (an entry mechanism, not a combine
+# voter); NULL on rows written before the columns existed.
+SIGNAL_FT_COLUMNS = ("ft_score", "ft_dir", "ft_selected")
+
 SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS runs (
@@ -488,6 +497,23 @@ SCHEMA_STATEMENTS = [
     );
     """,
     """
+    -- Walk-forward SHAPE history (src/signals/rank_shaping.py, 2026-08-21):
+    -- the payoff-shaped rank curves as they would have been calibrated on each
+    -- date, fitted under analysis_asof(as_of) so a curve can never see rows at
+    -- or after its own date. The sibling of weight_history for the FITTED
+    -- CONSUMPTION layer: without it a tier-2 backtest reads TODAY's curves
+    -- over the very window they were fitted on (measured 2026-08-20: that
+    -- flips the current arch's pivot IC from -0.041 to +0.049 — pure
+    -- in-sample). One row per (as_of, method); a method absent on a date means
+    -- "no curve existed" = identity, exactly the live fail-soft.
+    CREATE TABLE IF NOT EXISTS shape_history (
+        as_of        VARCHAR,
+        method       VARCHAR,
+        curve        VARCHAR,    -- JSON [10 floats], decile midpoints
+        computed_at  VARCHAR
+    );
+    """,
+    """
     -- Tier 2 BACKTEST (src/analysis/backtest.py): combined_score + confidence
     -- recomputed under a NAMED weight set. Deliberately a SEPARATE table from
     -- signals_replay, because these values depend on the weights and the
@@ -616,6 +642,8 @@ _ADD_COLUMNS = (
     # source is recorded per ticker per side: weighted | ml | ml_buy | ml_sell.
     # Lets every panel analysis segment ML-combine vs weighted-combine performance.
     ("signals", "combine_source", "VARCHAR"),
+    # Follow-through candidate columns (2026-08-25) on an existing DB.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_FT_COLUMNS),
     # IBKR account P&L snapshot (reqPnL) on an existing broker_reconciles table.
     ("broker_reconciles", "pnl_daily", "DOUBLE"),
     ("broker_reconciles", "pnl_unrealized", "DOUBLE"),

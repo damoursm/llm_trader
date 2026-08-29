@@ -93,6 +93,40 @@ def test_exit_state_is_causal_future_days_do_not_move_past_rows(monkeypatch):
             f"a future bar moved a past held-position feature ({c}) — leak"
 
 
+def test_entries_all_widens_to_combine_sign_hypotheticals(monkeypatch):
+    """entries="all" (2026-08-23): a NEUTRAL-direction name with a nonzero
+    combine gets a hypothetical position oriented by the combine's SIGN and
+    stamped entry_directional=False; a zero-combine neutral name still gets
+    nothing; the directional population is unchanged and remains the default."""
+    rows = []
+    for i, d in enumerate(f"2026-06-{dd:02d}" for dd in range(1, 7)):
+        for tk, direction, comb in (("DIR", "BULLISH", 0.30),
+                                    ("NEU", "NEUTRAL", -0.20),
+                                    ("ZER", "NEUTRAL", 0.0)):
+            r = {"signal_date": d, "ticker": tk, "price": 100.0 + i,
+                 "direction": direction, "combined_score": comb, "fwd_ret_1d": 1.0}
+            for m in me.EXIT_METHODS:
+                r[m] = 0.2
+            rows.append(r)
+    _mock(monkeypatch, pd.DataFrame(rows))
+
+    d_dir = me.build_exit_dataset(horizon=1, max_hold=4)          # default population
+    assert set(d_dir["ticker"]) == {"DIR"}
+    assert d_dir["entry_directional"].all()
+
+    d_all = me.build_exit_dataset(horizon=1, max_hold=4, entries="all")
+    assert set(d_all["ticker"]) == {"DIR", "NEU"}                 # ZER: no orientation
+    neu = d_all[d_all["ticker"] == "NEU"]
+    assert (~neu["entry_directional"]).all()
+    # oriented by the combine's sign (−0.20 => short): a rising tape is a
+    # NEGATIVE oriented held return for the hypothetical short.
+    assert (neu["ex_ret"] < 0).all()
+    # the directional subpopulation is byte-identical to the default build
+    sub = d_all[d_all["entry_directional"]].reset_index(drop=True)
+    assert len(sub) == len(d_dir)
+    assert np.allclose(sub["ex_ret"], d_dir["ex_ret"], equal_nan=True)
+
+
 # ── Phase 1: live wiring ─────────────────────────────────────────────────────
 
 def test_ml_exit_registered_as_exit_decision_method():
@@ -174,12 +208,16 @@ def test_live_features_match_the_dataset_state(monkeypatch):
 
     class Sig:
         combined_score = 0.30                              # consistent with the panel's held-day combine
+        tape_confirmation_score = 0.2                      # the live twin of the panel's tape_score
     trade = {"ticker": "AAA", "action": "BUY", "direction": "BULLISH", "entry_price": 100.0,
              "current_price": 105.0, "entry_date": "2026-06-01",
              "signal_at_entry": {"combined_score": 0.30},
              "method_scores": {m: 0.2 for m in me.EXIT_METHODS}}
     lf = me.live_exit_features(trade, {"AAA": Sig()}, Sig())
-    for c in me.EXIT_STATE_FEATURES + ["ex_tech", "ex_momentum"]:
+    # ex_tape_score rides the parity check (2026-08-22): the dataset reads the
+    # panel's replay-derived tape_score column; the live side must resolve the
+    # SAME quantity from the TickerSignal's tape field, oriented identically.
+    for c in me.EXIT_STATE_FEATURES + ["ex_tech", "ex_momentum", "ex_tape_score"]:
         a, b = float(row[c]), float(lf[c])
         assert (np.isnan(a) and np.isnan(b)) or abs(a - b) < 1e-6, f"parity mismatch on {c}"
 

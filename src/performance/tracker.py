@@ -1295,6 +1295,7 @@ def compute_macro_eval(window_days: Optional[int] = None,
 
 _STAGE_OUTCOME_PASS = "pass"
 _STAGE_OUTCOME_G1 = "below_threshold"
+_STAGE_OUTCOME_G1C = "rank_capped"     # per-run rank cap (2026-08-21 on) — stamp-only
 _STAGE_OUTCOME_G1B = "low_agreement"
 _STAGE_OUTCOME_G2 = "buy_blocked"
 _STAGE_OUTCOME_G3 = "earnings_blackout"
@@ -1338,9 +1339,9 @@ def _classify_stage_outcome(call: dict, ctx: dict) -> str:
     """Which gate (if any) dropped this recommendation — the per-run stamp when
     present, else the exact reconstruction described above."""
     stamp = ctx.get("outcomes", {}).get(call["ticker"])
-    if stamp in (_STAGE_OUTCOME_PASS, _STAGE_OUTCOME_G1, _STAGE_OUTCOME_G1B,
-                 _STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4,
-                 _STAGE_OUTCOME_G5):
+    if stamp in (_STAGE_OUTCOME_PASS, _STAGE_OUTCOME_G1, _STAGE_OUTCOME_G1C,
+                 _STAGE_OUTCOME_G1B, _STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3,
+                 _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G5):
         return stamp
     if call["confidence"] < ctx["threshold"]:
         return _STAGE_OUTCOME_G1
@@ -1443,10 +1444,15 @@ def compute_stage_eval(window_days: Optional[int] = None,
         return [c for c in calls if c["_outcome"] in outcomes]
 
     _emit("LLM Synthesis (all BUY/SELL)", "stage", calls)
-    surviving = {_STAGE_OUTCOME_G1B, _STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3,
-                 _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G5, _STAGE_OUTCOME_PASS}
+    surviving = {_STAGE_OUTCOME_G1C, _STAGE_OUTCOME_G1B, _STAGE_OUTCOME_G2,
+                 _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G5,
+                 _STAGE_OUTCOME_PASS}
     _emit("→ past Gate 1 · regime confidence threshold", "stage", _sub(surviving))
     _emit("✂ Gate 1 drops (confidence below threshold)", "dropped", _sub({_STAGE_OUTCOME_G1}))
+    surviving -= {_STAGE_OUTCOME_G1C}
+    _emit("→ past Gate 1c · per-run rank cap", "stage", _sub(surviving))
+    _emit("✂ Gate 1c drops (deferred: outside the run's top-K)", "dropped",
+          _sub({_STAGE_OUTCOME_G1C}))
     surviving -= {_STAGE_OUTCOME_G1B}
     _emit("→ past Gate 1b · agreement floor (sources_agreeing)", "stage", _sub(surviving))
     _emit("✂ Gate 1b drops (< min sources agreeing)", "dropped", _sub({_STAGE_OUTCOME_G1B}))
@@ -1689,16 +1695,29 @@ def _compute_confidence_ranked(closed_trades: List[dict]) -> List[dict]:
     Each row adds a cumulative_avg and cumulative_win_rate that reflect the
     portfolio return if you had *only* taken the top-N most confident signals.
     """
-    sorted_trades = sorted(
-        closed_trades,
-        key=lambda t: t.get("confidence", 0.0),
-        reverse=True,
-    )
+    # A trade can legitimately carry confidence=None: follow-through entries are
+    # mechanical (no LLM verdict), so the field is present-but-null rather than
+    # absent — and `dict.get(k, default)` returns the DEFAULT ONLY WHEN THE KEY
+    # IS MISSING, so `t.get("confidence", 0.0)` hands None straight to sorted()
+    # and every tick raises "'<' not supported between float and NoneType".
+    # (2026-08-26: crashed every tick from 07:45 once one such trade closed.)
+    # Ranking is BY confidence, so a trade without one cannot be ranked on it:
+    # it sorts last rather than being coerced to a fake 0.0 that would read as
+    # "lowest confidence" in a table about confidence.
+    def _conf_key(t):
+        c = t.get("confidence")
+        try:
+            return float(c) if c is not None else float("-inf")
+        except (TypeError, ValueError):
+            return float("-inf")
+
+    sorted_trades = sorted(closed_trades, key=_conf_key, reverse=True)
     rows = []
     running_sum = 0.0
     running_wins = 0
     for i, t in enumerate(sorted_trades, 1):
-        ret = t.get("return_pct", 0.0)
+        ret = t.get("return_pct")
+        ret = float(ret) if ret is not None else 0.0
         running_sum += ret
         if is_gross_win(t):            # GROSS (convention); cumulative_avg stays net
             running_wins += 1
@@ -1706,7 +1725,9 @@ def _compute_confidence_ranked(closed_trades: List[dict]) -> List[dict]:
             "rank":                 i,
             "ticker":               t["ticker"],
             "action":               t["action"],
-            "confidence":           t.get("confidence", 0.0),
+            # None stays None (renders as blank): a mechanical entry has no
+            # confidence, and 0.0 would claim it had the lowest possible one.
+            "confidence":           t.get("confidence"),
             "return_pct":           ret,
             "entry_date":           t.get("entry_date", ""),
             "exit_date":            t.get("exit_date", ""),
@@ -1720,8 +1741,13 @@ def _compute_confidence_ranked(closed_trades: List[dict]) -> List[dict]:
 # Position sizing helpers
 # ---------------------------------------------------------------------------
 
-def _position_multiplier(confidence: float) -> float:
+def _position_multiplier(confidence: Optional[float]) -> float:
     """Map confidence to a position-size multiplier.
+
+    ``None`` (a mechanical entry with no LLM verdict — e.g. follow-through)
+    returns the NEUTRAL 1.0x: no confidence means no confidence-based opinion
+    about size, which is different from "lowest confidence" (0.78 and below also
+    maps to 1.0x, so this is consistent rather than special).
 
     The piecewise-linear LEGACY shape pins conf ≤0.78 → 1.0×, 0.85 → 1.50×,
     0.92 → 1.85×, ≥0.95 → 2.00× (continuous — a confidence of 0.86 doesn't
@@ -1738,6 +1764,8 @@ def _position_multiplier(confidence: float) -> float:
     replaced the surrendered span. Rounded to 2 decimals for storage stability
     and clean composition with the correlation haircut downstream.
     """
+    if confidence is None:
+        return 1.0
     if confidence <= 0.78:
         legacy = 1.00
     elif confidence >= 0.95:
@@ -3433,6 +3461,178 @@ def _adverse_stop_triggered(trade: dict) -> bool:
     return ret <= -abs(pct)
 
 
+# ── FOLLOW-THROUGH book (2026-08-25, src/signals/follow_through.py) ─────────
+# Mechanical one-session trades opened OPPOSITE an extreme exit-score trigger.
+# They own their exits: the swing exit stack (LLM review, consensus, trailing,
+# horizon machinery) measured WRONG for this signal — capture is front-loaded
+# (h=1 close realizes +1.42% and the remaining move after it is ADVERSE −1.05%)
+# — so the only exits are the one-session time rule + the two safety closes.
+
+def _ft_exit_reason(trade: dict, macro_regime_context=None) -> Optional[str]:
+    """Exit reason for a follow-through trade, else None (keep holding).
+    Safety first (hard adverse stop; PANIC while long), then the ONE-SESSION
+    rule: on the next trading day, close at the first RTH tick at/after
+    `ft_exit_after_et` (the measured h=1-close exit); `ft_max_hold_days`
+    trading days is the hard stop when that window was missed (halt/holiday)."""
+    if _adverse_stop_triggered(trade):
+        return "adverse_stop"
+    if trade.get("action") == "BUY" and macro_regime_context is not None \
+            and str(getattr(macro_regime_context, "regime", "")).upper() == "PANIC":
+        return "macro_regime_exit"
+    try:
+        held = _trading_days_held(trade["entry_date"])
+    except Exception:
+        return None
+    if held >= int(settings.ft_max_hold_days):
+        return "ft_horizon"
+    if held >= 1:
+        now = _now_iso()
+        if _session_of_iso(now) == "rth" \
+                and datetime.now(ET).strftime("%H:%M") >= str(settings.ft_exit_after_et):
+            return "ft_horizon"
+    return None
+
+
+def _close_trade_now(trade: dict, reason: str, decision_at: str, executed_at: str,
+                     hold_prompt_active: Optional[bool]) -> bool:
+    """Close one open trade in place with the monitor's exact close idiom
+    (live mark → costs → field stamps). Mirrors the inline block in
+    `monitor_open_positions` — keep the two in sync. Returns True on close."""
+    exit_price = trade.get("current_price")
+    if not exit_price or exit_price <= 0:
+        exit_price = _fetch_price(trade["ticker"])
+        if not exit_price or exit_price <= 0:
+            logger.warning(f"[monitor] Cannot close {trade['ticker']} ({reason}) — no usable price")
+            return False
+    mul = trade.get("position_size_multiplier", 1.0)
+    exit_session = _session_of_iso(executed_at)
+    e_cost, x_cost = _leg_costs(trade, exit_price, executed_at)
+    ret = _pct_return(trade["action"], trade["entry_price"], exit_price, trade.get("type", "STOCK"),
+                      entry_session=trade.get("entry_session"), exit_session=exit_session,
+                      entry_cost=e_cost, exit_cost=x_cost,
+                      borrow_cost=_borrow_cost(trade, executed_at))
+    exit_ref = _reference_close(trade["ticker"])
+    trade["status"]                 = "CLOSED"
+    trade["exit_date"]              = date.today().isoformat()
+    trade["exit_datetime"]          = executed_at
+    trade["exit_session"]           = exit_session
+    trade["exit_decision_datetime"] = trade.get("current_price_datetime") or decision_at
+    trade["exit_price"]             = float(exit_price)
+    trade["exit_ref_close"]         = exit_ref["close"] if exit_ref else None
+    trade["exit_ref_close_date"]    = exit_ref["date"] if exit_ref else None
+    trade["return_pct"]             = round(ret, 3)
+    trade["weighted_return_pct"]    = round(ret * mul, 3)
+    trade["days_held"]              = _trading_days_held(trade["entry_date"])
+    trade["exit_reason"]            = reason
+    trade["exit_hold_prompt"]       = hold_prompt_active
+    logger.info(f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
+                f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  [follow-through book]")
+    return True
+
+
+def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict],
+                                 run_id: Optional[str] = None) -> int:
+    """Open the tick's selected follow-through candidates as mechanical trades.
+
+    Bypasses the LLM funnel BY DESIGN (the validated spec never consulted it);
+    guards: one open trade per ticker across ALL books, no re-entry same day,
+    `ft_max_entries_per_day` cap, session sizing haircuts as everywhere else.
+    Flows to the broker through the ordinary reconcile like any ledger trade."""
+    if not (getattr(settings, "enable_follow_through_trading", False) and ft_map):
+        return 0
+    cands = sorted((t for t, r in ft_map.items() if r.get("selected")),
+                   key=lambda t: ft_map[t]["score"])
+    if not cands:
+        return 0
+    trades = _load_trades()
+    today = date.today().isoformat()
+    open_or_today = {t["ticker"] for t in trades
+                     if t.get("status") == "OPEN" or t.get("entry_date") == today}
+    ft_today = sum(1 for t in trades if t.get("entry_mechanism") == "follow_through"
+                   and t.get("entry_date") == today)
+    decision_at = _now_iso()
+    executed_at = _execution_iso()
+    entry_session = _session_of_iso(executed_at)
+    ext_mult = float(settings.overnight_size_multiplier if entry_session == "overnight"
+                     else settings.extended_size_multiplier)
+    opened = 0
+    for ticker in cands:
+        if ft_today + opened >= int(settings.ft_max_entries_per_day):
+            break
+        if ticker in open_or_today:
+            continue
+        rec = ft_map[ticker]
+        ds = float(rec.get("dir") or 0.0)
+        if ds == 0.0:
+            continue
+        price = _fetch_price(ticker)
+        if not price or price <= 0:
+            continue
+        sig = (signals_by_ticker or {}).get(ticker)
+        mscores = _method_scores_from_signal(ticker, "BULLISH" if ds > 0 else "BEARISH",
+                                             signals_by_ticker)
+        multiplier = float(settings.ft_size_multiplier)
+        if entry_session != "rth" and ext_mult < 0.999:
+            multiplier = round(multiplier * ext_mult, 3)
+        ref = _reference_close(ticker)
+        trade = {
+            "ticker": ticker, "run_id": run_id,
+            "recommendation_id": hashlib.sha1(
+                f"ft|{run_id or today}|{ticker}".encode("utf-8")).hexdigest()[:16],
+            "type": "STOCK",
+            "action": "BUY" if ds > 0 else "SELL",
+            "direction": "BULLISH" if ds > 0 else "BEARISH",
+            "confidence": None,
+            "position_size_multiplier": multiplier,
+            "confidence_size_multiplier": 1.0,
+            "correlation_size_multiplier": 1.0,
+            "sector_key": None,
+            "entry_date": today, "entry_datetime": executed_at,
+            "entry_session": entry_session,
+            "ml_arm": False, "combine_source": None,
+            "extended_size_multiplier": ext_mult if entry_session != "rth" else 1.0,
+            "decision_datetime": decision_at,
+            "entry_price": float(price),
+            "entry_ref_close": ref["close"] if ref else None,
+            "entry_ref_close_date": ref["date"] if ref else None,
+            "rationale": (f"follow-through: extreme exit score "
+                          f"{rec.get('score'):+.2f} on the "
+                          f"{'short' if ds > 0 else 'long'} cohort entered "
+                          f"{rec.get('cohort_entry_date')} — joining the move"),
+            "time_horizon": "SWING", "target_horizon": "1d",
+            "current_price": float(price), "current_price_datetime": decision_at,
+            "return_pct": 0.0, "weighted_return_pct": 0.0, "days_held": 0,
+            "exit_date": None, "exit_datetime": None, "exit_decision_datetime": None,
+            "exit_price": None, "exit_ref_close": None, "exit_ref_close_date": None,
+            "exit_reason": None, "status": "OPEN",
+            "method_scores": mscores,
+            "methods_agreeing": _methods_agreeing(mscores,
+                                                  "BUY" if ds > 0 else "SELL"),
+            "dominant_method": "follow_through",
+            "llm_synthesis_model": None, "llm_sentiment_model": None,
+            "universe_source": "follow_through",
+            "entry_mechanism": "follow_through",
+            "ft_score_at_entry": rec.get("score"),
+            "ft_cohort_entry_date": rec.get("cohort_entry_date"),
+            "signal_at_entry": ({"combined_score": getattr(sig, "combined_score", None),
+                                 "combined_score_abs": getattr(sig, "combined_score_abs", None),
+                                 "confidence": getattr(sig, "confidence", None)}
+                                if sig is not None else {}),
+            "max_favorable_excursion": 0.0, "mfe_date": today,
+            "max_adverse_excursion": 0.0, "mae_date": today,
+        }
+        trades.append(trade)
+        open_or_today.add(ticker)
+        opened += 1
+        logger.info(f"[tracker] follow-through OPEN {trade['action']} {ticker} "
+                    f"@ {fmt_price(price)} (ft_score={rec.get('score'):+.2f}, "
+                    f"size={multiplier}×, exit=next-session {settings.ft_exit_after_et} ET)")
+    if opened:
+        _save_trades(trades)
+        logger.info(f"[tracker] {opened} follow-through trade(s) recorded")
+    return opened
+
+
 # ── ML combine arm (2026-08-01) ──────────────────────────────────────────────
 # The exit reasons that ALWAYS fire on an arm trade regardless of any hold
 # window: a genuine direction flip, a PANIC/RISK_OFF regime close, and the hard
@@ -3561,6 +3761,17 @@ def monitor_open_positions(
         if trade.get("status") != "OPEN":
             continue
 
+        # ── FOLLOW-THROUGH book: owns its exits; the whole LLM/consensus
+        # machinery below is measured WRONG for this one-session signal, so
+        # these trades take only _ft_exit_reason (time rule + safety) and
+        # skip everything else. See src/signals/follow_through.py.
+        if trade.get("entry_mechanism") == "follow_through":
+            _ft_r = _ft_exit_reason(trade, macro_regime_context)
+            if _ft_r is not None and _close_trade_now(trade, _ft_r, decision_at,
+                                                      executed_at, hold_prompt_active):
+                closed_count += 1
+            continue
+
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
         hold_review = (hold_reviews or {}).get(trade["ticker"])
         exit_adj = 0.0
@@ -3574,7 +3785,8 @@ def monitor_open_positions(
         if _use_escores or settings.enable_mechanical_exit or settings.enable_ml_exit_model:
             try:
                 _escores = build_exit_scores(trade, hold_review, signals_by_ticker,
-                                             macro_regime_context)
+                                             macro_regime_context,
+                                             _hr_all_trades=trades)
                 if hold_review is not None:
                     if settings.enable_exit_conviction:
                         exit_adj += exit_floor_adjustment(_escores, exit_conv_cal)
@@ -5163,8 +5375,12 @@ def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
                                         set_cost_attribution)
     if settings.sim_per_trade_cost_attribution and legs:
         from collections import defaultdict
+        from src.performance.spread import adv_band, adv_of, price_band, _BUCKET_CLAMP
+        from src.performance.calibration import shrink as _shrink
         per_run: Dict[str, List[float]] = defaultdict(list)
         per_bucket: Dict[str, List[float]] = defaultdict(list)
+        per_run_lc: Dict[tuple, List[float]] = defaultdict(list)      # (run, pb, ab)
+        per_sess_lc: Dict[tuple, List[float]] = defaultdict(list)     # (fine, pb, ab)
         ref_to_run: Dict[str, str] = {}
         for leg in legs:
             f1 = real_leg_cost_frac(leg.get("side"), leg.get("filled_qty"),
@@ -5178,12 +5394,49 @@ def calibrate_sim_costs(trades: Optional[List[dict]] = None) -> Optional[float]:
                 ref_to_run[ref] = run
             if run:
                 per_run[run].append(f1)
-            per_bucket[session_bucket_fine(leg.get("submitted_at"))].append(f1)
+            fine = session_bucket_fine(leg.get("submitted_at"))
+            per_bucket[fine].append(f1)
+            # Liquidity class (2026-08-25): price band from the leg's own fill
+            # price, dollar-volume band from the cached trailing median.
+            pb = price_band(leg.get("fill_price"))
+            ab = adv_band(adv_of(leg.get("ticker")))
+            if pb is not None and ab is not None:
+                if run:
+                    per_run_lc[(run, pb, ab)].append(f1)
+                per_sess_lc[(fine, pb, ab)].append(f1)
         tick_min = max(1, int(settings.sim_cost_tick_min_legs))
         sess_min = max(1, int(settings.session_cost_min_legs))
         tick_costs = {r: sum(v) / len(v) for r, v in per_run.items() if len(v) >= tick_min}
         session_costs = {b: sum(v) / len(v) for b, v in per_bucket.items() if len(v) >= sess_min}
-        set_cost_attribution(tick_costs, session_costs, ref_to_run)
+        # Bucketed tables: same-tick liquidity-class means (small min-legs — a
+        # tick rarely has many same-class fills) and the session-class means,
+        # each Bayesian-shrunk toward ITS session's overall mean and clamped so
+        # a two-fill bucket cannot invent a wild cost.
+        tb_min = max(1, int(settings.sim_cost_tick_bucket_min_legs))
+        sb_min = max(1, int(settings.sim_cost_bucket_min_legs))
+        prior_n = max(0, int(settings.sim_cost_bucket_prior_n))
+        tick_bucket = {k: sum(v) / len(v) for k, v in per_run_lc.items() if len(v) >= tb_min}
+        session_bucket = {}
+        for (fine, pb, ab), vals in per_sess_lc.items():
+            if len(vals) < sb_min:
+                continue
+            base = session_costs.get(fine)
+            if base is None or base <= 0:
+                continue
+            obs = sum(vals) / len(vals)
+            shrunk = _shrink(base, prior_n, obs, len(vals))
+            lo, hi = _BUCKET_CLAMP
+            session_bucket[(fine, pb, ab)] = min(max(shrunk, base * lo), base * hi)
+        set_cost_attribution(tick_costs, session_costs, ref_to_run,
+                             tick_bucket=tick_bucket, session_bucket=session_bucket)
+        if session_bucket:
+            _sb = sorted(v * 100 for v in session_bucket.values())
+            report_calibration(
+                "sim_cost_buckets", value=len(session_bucket), prior=None,
+                n_evidence=sum(len(v) for v in per_sess_lc.values()),
+                unit="buckets",
+                note=f"liquidity-class one-way costs "
+                     f"{_sb[0]:.3f}–{_sb[-1]:.3f}%/leg; tick-level {len(tick_bucket)}")
     else:
         set_cost_attribution(None, None, None)
 

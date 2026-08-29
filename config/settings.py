@@ -1536,6 +1536,33 @@ class Settings(BaseSettings):
     enable_agreement_gate: bool = False
     min_sources_agreeing_gate: int = 2
 
+    # ── Gate 1c — per-run RANK CAP on Gate-1 passers (2026-08-21) ─────────────
+    # Among the BUY/SELL calls clearing the regime confidence floor, keep only
+    # the run's top-K by stated confidence; the rest are DEFERRED ("rank_capped"
+    # in gate_outcomes — they re-qualify any tick they make the cut). WHY BOTH
+    # HALVES: the absolute floor preserves ABSTENTION (an empty run is
+    # informative — Gate 1 is the funnel's one right-signed gate) but inherits
+    # the LLM's confidence SCALE, so the trade rate rides calibration drift
+    # (2026-08-17: the prompt incident DOUBLED it with no signal change). A pure
+    # rank gate is scale-immune but forces trades on weak runs — measured WORSE
+    # (-0.36..-0.50 %/day paired, t -1.0..-1.5). The hybrid measured
+    # selection-NEUTRAL (-0.027 %/day, t -0.30, 44 days) while cutting the
+    # trade-rate cv 0.46 -> 0.28 — free precisely because within-run confidence
+    # rank carries no information (per-run rank IC -0.023, t -1.17). K=3 is the
+    # measured point; 0 disables (pure absolute gate, pre-2026-08-21 behavior).
+    # See memory/ranking-stage-map-2026-08.md.
+    gate1_rank_cap: int = 3
+
+    # ── Prompt shortlist key (claude_analyst top-40 cut; 2026-08-21) ──────────
+    # "confidence" (live default) | "camp_max". Confidence measured
+    # ANTI-selective on the pivot basis (random-40 beats it, 30/30 seeds);
+    # camp_max — max(|combined_buy|,|combined_sell|) — is the best measured
+    # replacement (+0.43%/run, t +1.70) but its columns have only 22 days of
+    # history, all one window, so it CANNOT yet clear the replication bar.
+    # Flip to "camp_max" once an independent-half test exists (~2026-09-15).
+    # Full rationale at the claude_analyst._shortlist_key definition.
+    prompt_shortlist_key: str = "confidence"
+
     # ── IC-informed adaptive weights (panel-driven; ON, but CONFIDENCE-GATED) ──
     # A better-founded sibling of the win-rate layer above. Instead of solo win rate
     # from the gate-selected (thin, biased) trade ledger, it tilts each method's weight
@@ -1694,6 +1721,22 @@ class Settings(BaseSettings):
     # reflected without a manual `python -m src.analysis.replay --write`.
     enable_eod_replay_refresh: bool = True
     eod_replay_refresh_days: int = 45       # 0/None => all history
+    # Tier-2 sibling (2026-08-20): refresh `signals_backtest` — the CURRENT
+    # entry architecture recomputed over history — on the same trailing span,
+    # right after the walk-forward step. Auto-refactor already rewrites it when
+    # scorer CODE moves; this covers plain new data, so "what would today's
+    # strategy have decided" stays queryable without a manual
+    # `python -m src.analysis.backtest --write`. Firewalled analysis surface;
+    # never feeds calibrations.
+    enable_eod_backtest_refresh: bool = True
+    # Walk-forward SHAPE history (2026-08-21): append today's as-of rank-shaping
+    # curves to `shape_history` at EOD — `weight_history`'s sibling for the
+    # fitted consumption layer, consumed by the tier-2 backtest's wf mode so
+    # history is never scored through curves fitted on it (the 2026-08-20
+    # in-sample finding: today's curves alone flip the backtest's pivot IC from
+    # −0.041 to +0.049). Backfill: `python -m src.signals.rank_shaping
+    # --materialize`.
+    enable_eod_shape_history: bool = True
 
     # Walk-forward calibration (src/analysis/walkforward.py). Appends today's
     # point-in-time weight state to `weight_history`, which is what lets a
@@ -1784,6 +1827,15 @@ class Settings(BaseSettings):
     # never closes it. Fail-soft: no artifact ⇒ the hand-built exit machinery is
     # kept. A confident hold-conviction ≤ −ml_exit_threshold triggers the close.
     enable_ml_exit_model: bool = True
+    # held_rank exit signal (2026-08-22, PANEL-FIRST): today's aggregate score
+    # ranked within the position's OWN tick history since entry (abs-basis
+    # combine, self-normalizing per ticker). Scored + persisted to exit_signals
+    # so its exit-side IC accrues; in _CONSENSUS_SKIP and owns NO closing rule
+    # until the panel proves it -- the standard new-method probation.
+    enable_held_rank_exit_signal: bool = True
+    # Minimum pool size (ticks incl. today) before held_rank scores; below it
+    # the method abstains (a rank among two observations is a coin).
+    held_rank_min_ticks: int = 5
     ml_exit_threshold: float = 0.35            # oriented hold-conviction ≤ −this → ml_exit
     ml_exit_horizon_days: int = 5              # label look-ahead the exit model optimises
     # Retrain the exit model at EOD on the freshly-materialised panel.
@@ -1883,6 +1935,58 @@ class Settings(BaseSettings):
     # the signed pivot target (fails soft to the fixed rank_5d label while the
     # panel's settled-pivot rows are thin); "rank_5d" pins the legacy label.
     stacker_label_basis: str = "pivot_rank"
+    # ── Liquidity-class cost buckets (2026-08-25, user directive) ───────────
+    # "Decommission the in-house cost model": filled legs already charge their
+    # OWN realized cost; UNFILLED legs now take the average realized cost of
+    # fills in the same LIQUIDITY CLASS (price band × trailing dollar-volume
+    # band — edges are module constants in spread.py), same tick first, then
+    # the time-of-day period, Bayesian-shrunk toward the session mean and
+    # clamped. The hand-built spread formula survives ONLY as the cold-start
+    # prior (fills-free DB) and the sub-$ penny-stock guard.
+    sim_cost_bucket_min_legs: int = 3       # session-class bucket needs this many fills
+    sim_cost_tick_bucket_min_legs: int = 2  # same-tick same-class average needs this many
+    sim_cost_bucket_prior_n: int = 8        # shrink bucket mean toward the session mean
+
+    # ── FOLLOW-THROUGH (2026-08-25, user directive; src/signals/follow_through.py).
+    # At each tick, every Gate-4 scored name's hypothetical held positions
+    # (cohorts entered 1..ft_max_cohort_days sessions ago in the panel direction
+    # of that day) are scored with the LIVE ml_exit artifact via the production
+    # serving path; the most-negative cohort score is the ticker's ft_score. The
+    # within-tick extreme tail becomes OPPOSITE-direction entry candidates — the
+    # market followed through against the position; the entry joins it.
+    # Validated 2026-08-24/25 (walk-forward, live pivot labels): spec tail
+    # +2.62% pivot potential (t +4.05), h=1-close realized +1.42% (t +2.51),
+    # RT cost 0.21-0.53%; edge is a POINT EVENT (next-day entry −0.88%) and
+    # capture is the overnight gap => same-tick entry + next-session exit.
+    enable_follow_through: bool = True            # score + persist (panel-first accrual)
+    enable_follow_through_trading: bool = True    # open the mechanical one-session trades
+    ft_tail_pct: float = 0.05                     # within-tick bottom share of ft_score
+    ft_score_max: float = -0.50                   # level guard (abstains on weak days)
+    ft_max_cohort_days: int = 15                  # hypothetical-position entry ages scanned
+    ft_size_multiplier: float = 0.5               # conservative flat sizing (new mechanism)
+    ft_max_entries_per_day: int = 12              # the measured daily candidate rate
+    ft_max_hold_days: int = 2                     # hard stop if the h=1 window is missed
+    ft_exit_after_et: str = "15:30"               # first RTH tick at/after this on day+1 closes
+    ft_score_budget_seconds: float = 150.0        # per-tick scoring time guard (fail-soft;
+                                                  # warm-process sweep ~5-15s, cold ~45-90s)
+    # ml_exit TRAINING POPULATION (2026-08-23): "all" = simulate a held position
+    # for EVERY scored name (combine-sign orientation where no direction fired)
+    # — ~2.2x the training rows from the same days (145k vs 66k; most neutral
+    # names have combine exactly 0 and correctly get nothing); "directional" =
+    # only names the panel fired a direction on (the historical band-conditioned
+    # population). Evaluation stays on the directional population either way
+    # (that is what the model serves). Walk-forward verdict (scratchpad
+    # exit_upgrade_0823): wide training +0.0128 IC/day paired on the directional
+    # eval set, same-sign halves, LONG +0.011 / SHORT flat -> "all".
+    ml_exit_train_population: str = "all"
+    # Stacker MODEL CLASS (2026-08-22): "logistic" = pure-numpy SoftmaxLogistic —
+    # the measured winner of the 27-arm redesign (paired vs the GBM classifier
+    # +0.0345 IC/day, t +2.17, same-sign halves; scratchpad stacker_redesign*_0822):
+    # at ~50 panel days the GBM's capacity is spent memorising one regime while
+    # the linear model generalises. "gbm" reverts to the pre-2026-08-22
+    # LightGBMModel classifier (STACKER_GBM_PARAMS). Serving is class-agnostic —
+    # both implement bull_bear and the artifact carries the fitted object.
+    stacker_model_class: str = "logistic"
     # "pv" since 2026-08-12 (pivot basis; "1d,3d" restores the fixed pair — the
     # arm requires negativity at EVERY listed label, so one pivot label = one test).
     inversion_panel_horizons: str = "pv"

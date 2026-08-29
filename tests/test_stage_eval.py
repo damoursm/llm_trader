@@ -106,33 +106,36 @@ def test_funnel_counts_and_order(fake_env):
     rows = tr.compute_stage_eval()
     labels = [r["label"] for r in rows]
 
-    # All fourteen rows present, funnel order, each gate's drops right after its
-    # survivors. No fixture call is stamped "low_agreement" or "overextended",
-    # so those stages drop nothing here — see the dedicated tests for the cases
-    # where they do.
+    # All sixteen rows present (Gate 1c added 2026-08-21), funnel order, each
+    # gate's drops right after its survivors. No fixture call is stamped
+    # "rank_capped" / "low_agreement" / "overextended", so those stages drop
+    # nothing here — see the dedicated tests for the cases where they do.
     assert labels[0] == "Aggregator (combined signal)"
     assert labels[1] == "LLM Synthesis (all BUY/SELL)"
     assert [l for l in labels[2:] if l.startswith("→")] == [
         "→ past Gate 1 · regime confidence threshold",
+        "→ past Gate 1c · per-run rank cap",
         "→ past Gate 1b · agreement floor (sources_agreeing)",
         "→ past Gate 2 · PANIC/RISK_OFF BUY-block",
         "→ past Gate 3 · earnings blackout",
         "→ past Gate 4 · liquidity floor",
         "→ past Gate 5 · overextension (anti-chase) = ACTIONABLE",
     ]
-    assert len([l for l in labels if l.startswith("✂")]) == 6
+    assert len([l for l in labels if l.startswith("✂")]) == 7
 
     by = _by_label(rows)
     assert by["Aggregator (combined signal)"]["trades"] == 1            # AGG
     assert by["LLM Synthesis (all BUY/SELL)"]["trades"] == 6
     # BBB out at gate 1; DDD at gate 2; FFF at gate 3; CCC at gate 4.
     assert by["→ past Gate 1 · regime confidence threshold"]["trades"] == 5
+    assert by["→ past Gate 1c · per-run rank cap"]["trades"] == 5
     assert by["→ past Gate 1b · agreement floor (sources_agreeing)"]["trades"] == 5
     assert by["→ past Gate 2 · PANIC/RISK_OFF BUY-block"]["trades"] == 4
     assert by["→ past Gate 3 · earnings blackout"]["trades"] == 3
     assert by["→ past Gate 4 · liquidity floor"]["trades"] == 2         # AAA + EEE
     assert by["→ past Gate 5 · overextension (anti-chase) = ACTIONABLE"]["trades"] == 2
     assert _one(rows, "Gate 1 drops")["trades"] == 1
+    assert _one(rows, "Gate 1c drops")["trades"] == 0
     assert _one(rows, "Gate 1b drops")["trades"] == 0
     assert _one(rows, "Gate 2 drops")["trades"] == 1
     assert _one(rows, "Gate 3 drops")["trades"] == 1

@@ -33,17 +33,22 @@ class _Rec:
 
 def _diag():
     return {k: 0 for k in ("buy_sell_candidates", "dropped_below_threshold",
-                           "dropped_low_agreement", "dropped_buy_blocked",
-                           "dropped_earnings_blackout", "dropped_untradeable",
-                           "dropped_overextended", "actionable_survivors")}
+                           "dropped_rank_cap", "dropped_low_agreement",
+                           "dropped_buy_blocked", "dropped_earnings_blackout",
+                           "dropped_untradeable", "dropped_overextended",
+                           "actionable_survivors")}
 
 
 @pytest.fixture(autouse=True)
 def _all_gates_open(monkeypatch):
     """Every gate passes by default; each test closes exactly one."""
+    from config.settings import settings
     monkeypatch.setattr(pl, "_passes_agreement_gate", lambda direction, sig: True)
     monkeypatch.setattr(pl, "_is_tradeable", lambda t, b: True)
     monkeypatch.setattr(pl, "_is_overextended", lambda t: False)
+    # Gate 1c off by default here so each single-gate test stays single-gate;
+    # the cap has its own tests below.
+    monkeypatch.setattr(settings, "gate1_rank_cap", 0)
 
 
 def _run(recs, **kw):
@@ -75,6 +80,142 @@ def test_hold_and_watch_are_not_candidates():
     assert out == []
     assert diag["buy_sell_candidates"] == 0
     assert outcomes == {}
+
+
+# ── Gate 1c — the per-run rank cap (2026-08-21) ────────────────────────────
+# Hybrid floor+cap: the absolute floor preserves ABSTENTION, the cap kills the
+# trade-rate's dependence on the LLM's confidence SCALE (the 08-17 incident
+# doubled the rate with no signal change). Measured selection-neutral because
+# within-run confidence rank carries no information.
+
+def _cap_on(monkeypatch, k):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "gate1_rank_cap", k)
+
+
+def test_gate1c_caps_the_floor_passers_at_k(monkeypatch):
+    _cap_on(monkeypatch, 2)
+    recs = [_Rec("AAA", confidence=0.95), _Rec("BBB", confidence=0.90),
+            _Rec("CCC", confidence=0.86), _Rec("DDD", confidence=0.99)]
+    out, diag, outcomes = _run(recs)
+    assert sorted(r.ticker for r in out) == ["AAA", "DDD"]   # the top-2
+    assert diag["dropped_rank_cap"] == 2
+    assert outcomes["BBB"] == "rank_capped" and outcomes["CCC"] == "rank_capped"
+    assert diag["actionable_survivors"] == 2
+
+
+def test_gate1c_never_fires_below_the_cap(monkeypatch):
+    _cap_on(monkeypatch, 3)
+    out, diag, _ = _run([_Rec("AAA", confidence=0.9), _Rec("BBB", confidence=0.86)])
+    assert len(out) == 2 and diag["dropped_rank_cap"] == 0
+
+
+def test_gate1c_preserves_abstention(monkeypatch):
+    """The cap must NOT turn into a rank gate: a run where nothing clears the
+    absolute floor still trades NOTHING (the empty run is information — pure
+    top-K was measured worse for exactly this reason)."""
+    _cap_on(monkeypatch, 3)
+    out, diag, outcomes = _run([_Rec("AAA", confidence=0.80),
+                                _Rec("BBB", confidence=0.70)])
+    assert out == []
+    assert diag["dropped_below_threshold"] == 2
+    assert diag["dropped_rank_cap"] == 0
+
+
+def test_gate1c_counts_floor_failures_before_capping(monkeypatch):
+    """The cap ranks only FLOOR PASSERS — a sub-floor call must not occupy a
+    cap slot, and its drop stays attributed to Gate 1."""
+    _cap_on(monkeypatch, 2)
+    recs = [_Rec("HI1", confidence=0.99), _Rec("LOW", confidence=0.5),
+            _Rec("HI2", confidence=0.90), _Rec("HI3", confidence=0.88)]
+    out, diag, outcomes = _run(recs)
+    assert sorted(r.ticker for r in out) == ["HI1", "HI2"]
+    assert outcomes["LOW"] == "below_threshold"
+    assert outcomes["HI3"] == "rank_capped"
+
+
+def test_gate1c_tie_break_is_deterministic(monkeypatch):
+    """Equal confidences at the boundary resolve by ticker, so a rerun cannot
+    reshuffle which name traded."""
+    _cap_on(monkeypatch, 1)
+    recs = [_Rec("ZZZ", confidence=0.90), _Rec("AAA", confidence=0.90)]
+    out, _, outcomes = _run(recs)
+    assert [r.ticker for r in out] == ["AAA"]
+    assert outcomes["ZZZ"] == "rank_capped"
+
+
+def test_gate1c_respects_the_per_side_floor(monkeypatch):
+    """The cap's floor is the SAME side-adjusted bar Gate 1 uses — a SELL that
+    fails its tightened bar is not a floor passer."""
+    _cap_on(monkeypatch, 2)
+    recs = [_Rec("B1", confidence=0.90), _Rec("S1", "SELL", confidence=0.88),
+            _Rec("B2", confidence=0.86)]
+    out, diag, outcomes = _run(recs, side_threshold_adj={"BUY": 0.0, "SELL": 0.04})
+    # S1 (0.88) beats B2 (0.86) on raw confidence, but fails its side-adjusted
+    # 0.89 bar — so it must NOT occupy a cap slot, and B2 trades.
+    assert sorted(r.ticker for r in out) == ["B1", "B2"]
+    assert outcomes["S1"] == "below_threshold"
+
+
+def test_gate1c_side_floor_rescues_the_best_sell(monkeypatch):
+    """THE CROWDING FIX (2026-08-22): SELLs are only ~28% of floor passers by
+    composition, so a pooled top-K came out all-BUY in 28% of SELL-passing
+    runs — starving the side the funnel measures as profitable. Each side with
+    a floor passer gets one guaranteed slot, evicting the lowest kept call."""
+    _cap_on(monkeypatch, 3)
+    recs = [_Rec("B1", confidence=0.99), _Rec("B2", confidence=0.95),
+            _Rec("B3", confidence=0.93), _Rec("S1", "SELL", confidence=0.90),
+            _Rec("B4", confidence=0.88)]
+    out, diag, outcomes = _run(recs)
+    assert sorted(r.ticker for r in out) == ["B1", "B2", "S1"]
+    assert outcomes["B3"] == "rank_capped"       # evicted: lowest of the kept
+    assert outcomes["B4"] == "rank_capped"
+    assert diag["actionable_survivors"] == 3     # K unchanged — a slot moved
+
+
+def test_gate1c_side_floor_is_symmetric(monkeypatch):
+    _cap_on(monkeypatch, 2)
+    recs = [_Rec("S1", "SELL", confidence=0.99), _Rec("S2", "SELL", confidence=0.95),
+            _Rec("B1", confidence=0.90)]
+    out, _, outcomes = _run(recs)
+    assert sorted(r.ticker for r in out) == ["B1", "S1"]
+    assert outcomes["S2"] == "rank_capped"
+
+
+def test_gate1c_side_floor_never_invents_a_passer(monkeypatch):
+    """A side with NO floor passer gets nothing — the floor's abstention is
+    untouched (a sub-bar SELL must not ride in on the guarantee)."""
+    _cap_on(monkeypatch, 2)
+    recs = [_Rec("B1", confidence=0.99), _Rec("B2", confidence=0.95),
+            _Rec("S1", "SELL", confidence=0.70)]
+    out, _, outcomes = _run(recs)
+    assert sorted(r.ticker for r in out) == ["B1", "B2"]
+    assert outcomes["S1"] == "below_threshold"
+
+
+def test_gate1c_side_floor_noop_when_both_sides_kept(monkeypatch):
+    _cap_on(monkeypatch, 3)
+    recs = [_Rec("B1", confidence=0.99), _Rec("S1", "SELL", confidence=0.97),
+            _Rec("B2", confidence=0.93), _Rec("B3", confidence=0.90)]
+    out, _, outcomes = _run(recs)
+    assert sorted(r.ticker for r in out) == ["B1", "B2", "S1"]
+    assert outcomes["B3"] == "rank_capped"
+
+
+def test_gate1c_side_floor_skipped_at_k1(monkeypatch):
+    """K=1 cannot host a guarantee for both sides — the pooled winner stands."""
+    _cap_on(monkeypatch, 1)
+    recs = [_Rec("B1", confidence=0.99), _Rec("S1", "SELL", confidence=0.95)]
+    out, _, outcomes = _run(recs)
+    assert [r.ticker for r in out] == ["B1"]
+    assert outcomes["S1"] == "rank_capped"
+
+
+def test_gate1c_zero_disables(monkeypatch):
+    _cap_on(monkeypatch, 0)
+    recs = [_Rec(f"T{i}", confidence=0.86 + i / 100) for i in range(6)]
+    out, diag, _ = _run(recs)
+    assert len(out) == 6 and diag["dropped_rank_cap"] == 0
 
 
 # ── each gate in isolation ─────────────────────────────────────────────────

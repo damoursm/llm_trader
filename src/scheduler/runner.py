@@ -537,6 +537,38 @@ def _eod_work() -> None:
     # walk-forward below), which the weekly trains then read on Saturday.
     _wf_step()
 
+    # Walk-forward SHAPE history (2026-08-21): append today's as-of curve row so
+    # the rank-shaping layer has the same point-in-time series the weights have
+    # (`weight_history`'s sibling). Idempotent per date; runs BEFORE the
+    # backtest tail below, which consumes it in walk-forward mode.
+    if settings.enable_eod_shape_history:
+        try:
+            from src.signals.rank_shaping import materialize_shape_history
+            from datetime import date as _d
+            n = materialize_shape_history(start=_d.today().isoformat(), step_days=1)
+            if n:
+                logger.info(f"[scheduler] EOD shape history: {n} row(s) appended")
+        except Exception as exc:
+            logger.warning(f"[scheduler] EOD shape history failed: {exc}")
+
+    # Tier-2 rescoring tail (2026-08-20): keep `signals_backtest` — "what would
+    # the CURRENT entry architecture have decided" — current for the newest
+    # runs. Auto-refactor rewrites the WHOLE table when scorer code moves; this
+    # covers the other staleness source, plain new data, by recomputing the
+    # same trailing span the replay above refreshed (walk-forward weights make
+    # earlier rows fixed facts). Runs AFTER the walk-forward step so today's
+    # rows resolve today's calibration instead of being skipped. Firewalled
+    # table (nothing in the calibration path reads it) — staleness here only
+    # ever degrades an ANALYSIS surface, so fail-soft.
+    if settings.enable_eod_backtest_refresh:
+        try:
+            from src.analysis.backtest import materialize as bt_materialize
+            n = bt_materialize(days=(int(settings.eod_replay_refresh_days) or None))
+            logger.info(f"[scheduler] EOD backtest: {n:,} ticker-days rescored "
+                        "under the current entry architecture")
+        except Exception as exc:
+            logger.warning(f"[scheduler] EOD backtest refresh failed: {exc}")
+
     # NOTE the automatic refactor is deliberately NOT here — it runs on its own
     # nightly slot (`_maybe_start_nightly_rescore`, 02:00 ET by default) in a
     # background thread. It is a ~40-minute job, and this function runs INLINE
