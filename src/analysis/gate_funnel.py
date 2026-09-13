@@ -60,6 +60,7 @@ GATE_STAGES = (
     ("buy_blocked",       "Gate 2 - regime BUY block"),
     ("earnings_blackout", "Gate 3 - earnings blackout"),
     ("untradeable",       "Gate 4 - liquidity floor"),
+    ("wide_book",         "Gate 4b - live-book width cap"),
     ("overextended",      "Gate 5 - anti-chase"),
 )
 
@@ -201,7 +202,11 @@ def load_gate_calls(days: Optional[int] = None) -> pd.DataFrame:
 
 _REGIME_THRESHOLD = {"PANIC": 0.95, "RISK_OFF": 0.89, "CAUTION": 0.87,
                      "NEUTRAL": 0.85, "RISK_ON": 0.79}
-_SIM_UNSIMULATED = ("earnings_blackout",)
+# Gate 4b (the live-NBBO width cap, 2026-09-03) is likewise not simulable from
+# the panel: its input is the point-in-time book at the tick, and the NBBO
+# store (cache/nbbo_history.parquet) is instant-keyed, not a per-signal-day
+# feature. Its live rows are judged on the STAMPED funnel like every gate.
+_SIM_UNSIMULATED = ("earnings_blackout", "wide_book")
 
 
 def _pit_ohlcv_features(tickers, days_needed: dict) -> dict:

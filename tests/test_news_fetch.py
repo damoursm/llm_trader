@@ -35,8 +35,43 @@ def test_filter_relevant_keyword_fallback_for_untagged():
     assert len(filter_relevant_articles("INTC", arts)) == 2
 
 
-def test_filter_relevant_below_threshold_returns_empty():
+def test_filter_relevant_below_threshold_returns_empty(monkeypatch):
+    from src.analysis import sentiment
+    monkeypatch.setattr(sentiment.settings, "news_relevance_min_articles", 2)
     assert filter_relevant_articles("CRDO", [_art("Credo soars", "great", ["CRDO"])]) == []
+
+
+def test_filter_relevant_one_confirmed_article_is_a_digest():
+    """Default minimum is ONE (2026-09-04): a single article a feed tagged to the
+    company is evidence — the evidence-mass scaler discounts the thin digest;
+    dropping it to nothing threw away a verdict for the min-2 of the old filter."""
+    assert len(filter_relevant_articles("CRDO", [_art("Credo soars", "great", ["CRDO"])])) == 1
+
+
+def test_filter_relevant_no_substring_sweep():
+    """The 2026-09-04 root cause: ``"ar" in "market"`` used to be a hit, so a
+    short symbol received the whole pool. Untagged prose that merely CONTAINS
+    the letters is not about the company."""
+    arts = [_art("Market rally broadens", "Traders start to price in cuts", []),
+            _art("Barclays upgrades carmakers", "Sector view", [])]
+    assert filter_relevant_articles("AR", arts) == []
+    # ...but an explicit symbol or the registrant name IS.
+    from src.data import company_names
+    company_names._seed_for_tests({"AR": "Antero Resources Corp"})
+    arts += [_art("Antero Resources raises output guidance", "", []),
+             _art("Gas producers rally", "Antero (NYSE: AR) led the group", [])]
+    got = filter_relevant_articles("AR", arts)
+    assert [a.title for a in got] == ["Antero Resources raises output guidance", "Gas producers rally"]
+
+
+def test_filter_relevant_legacy_behind_flag(monkeypatch):
+    """``enable_name_relevance=False`` restores the pre-2026-09-04 filter
+    (substring match, minimum two)."""
+    from src.analysis import sentiment
+    monkeypatch.setattr(sentiment.settings, "enable_name_relevance", False)
+    arts = [_art("Market rally broadens", "", []), _art("Barclays upgrades carmakers", "", [])]
+    assert len(filter_relevant_articles("AR", arts)) == 2          # the old sweep
+    assert filter_relevant_articles("CRDO", [_art("x", "", ["CRDO"])]) == []   # old min 2
 
 
 def test_parse_news_time_iso_epoch_none():
@@ -157,8 +192,11 @@ def test_fetch_google_news_maps_tickers_and_queries_business_wire(monkeypatch):
     monkeypatch.setattr(news_fetcher.feedparser, "parse", fake_parse)
     arts = news_fetcher.fetch_google_news(["AAPL"])
 
-    assert len(seen) == 2                                  # general + Business Wire query
+    # symbol query + Business Wire query + the company-name query (AAPL carries a
+    # curated alias, so a name phrase exists even with the SEC list offline).
+    assert len(seen) == 3
     assert any("businesswire.com" in u for u in seen)
+    assert any("%22apple%22+stock" in u for u in seen), seen
     assert arts and all(a.tickers == ["AAPL"] for a in arts)
     assert any(a.source == "google_news/Reuters" for a in arts)
 
@@ -199,6 +237,63 @@ def test_fetch_google_news_skips_non_equity_and_caps(monkeypatch):
 def test_fetch_google_news_disabled(monkeypatch):
     monkeypatch.setattr(news_fetcher.settings, "enable_google_news", False)
     assert news_fetcher.fetch_google_news(["AAPL"]) == []
+
+
+# ── Search-feed tag confirmation (2026-09-04) ────────────────────────────────
+
+def test_confirmed_tags_keeps_only_articles_that_mention_the_company():
+    from src.data import company_names
+    company_names._seed_for_tests({"AR": "Antero Resources Corp", "DIS": "Walt Disney Co"})
+    ct = news_fetcher._confirmed_tags
+    assert ct("AR", "Antero Resources beats", "") == ["AR"]             # name phrase
+    assert ct("AR", "Gas names rally", "Antero (NYSE: AR) led") == ["AR"]  # explicit symbol
+    assert ct("DIS", "Disney+ price hike", "") == ["DIS"]                # distinctive token, feed-vouched
+    assert ct("AR", "AR-15 maker files for bankruptcy", "") == []        # not the company
+    assert ct("AR", "Apple's AR headset delayed", "") == []              # AR = augmented reality
+    assert ct("DIS", "Streaming wars heat up", "Netflix raises prices") == []  # a peer story
+
+
+def test_confirmed_tags_symbol_word_for_unnamed_symbol():
+    """No registrant name known (fresh symbol, SEC list lacking it): the bare
+    symbol as a case-sensitive word still confirms, an ordinary acronym does not."""
+    ct = news_fetcher._confirmed_tags
+    assert ct("CRDO", "CRDO beats estimates", "") == ["CRDO"]
+    assert ct("CRDO", "Semis rally", "chip names up") == []
+
+
+def test_confirmed_tags_unconditional_behind_flag(monkeypatch):
+    monkeypatch.setattr(news_fetcher.settings, "enable_name_relevance", False)
+    assert news_fetcher._confirmed_tags("AR", "Apple's AR headset delayed", "") == ["AR"]
+
+
+def test_fetch_ticker_news_related_item_stays_untagged(monkeypatch):
+    """yfinance ``Ticker.news`` is Yahoo's RELATED feed: an item about a peer
+    is returned for the queried symbol. It enters the pool (another name's
+    filter may claim it) but is NOT tagged as the queried company's news."""
+    from src.data import company_names
+    company_names._seed_for_tests({"AMD": "Advanced Micro Devices Inc"})
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    class FakeTicker:
+        def __init__(self, sym):
+            self.sym = sym
+
+        @property
+        def news(self):
+            return [
+                {"content": {"title": "AMD unveils MI400", "summary": "", "pubDate": now,
+                             "provider": {"displayName": "Reuters"},
+                             "canonicalUrl": {"url": "http://x/1"}}},
+                {"content": {"title": "Nvidia hits record high", "summary": "Blackwell demand",
+                             "pubDate": now, "provider": {"displayName": "Reuters"},
+                             "canonicalUrl": {"url": "http://x/2"}}},
+            ]
+
+    monkeypatch.setattr(yfinance, "Ticker", FakeTicker)
+    monkeypatch.setattr(news_fetcher.settings, "enable_ticker_news", True)
+    arts = {a.title: a for a in fetch_ticker_news(["AMD"])}
+    assert arts["AMD unveils MI400"].tickers == ["AMD"]
+    assert arts["Nvidia hits record high"].tickers == []            # in the pool, untagged
 
 
 def test_fetch_rss_includes_pr_wires(monkeypatch):
@@ -262,3 +357,115 @@ def test_pipeline_fetch_news_fast_lanes_rss(monkeypatch):
     assert rss_calls == [1]                                # RSS fetched fresh despite cache hit
     titles = {a.title for a in out}
     assert {"cached-bundle", "breaking wire"} <= titles    # merged
+
+
+# ── Google News: company-NAME query + feed-status tally (2026-09-04) ─────────
+
+def test_fetch_google_news_adds_company_name_query_when_a_name_is_known(monkeypatch):
+    import time as _t
+    from src.data import company_names
+    _genable(monkeypatch)
+    company_names._seed_for_tests({"AR": "Antero Resources Corp"})
+    recent = _t.gmtime()
+    seen = []
+
+    def fake_parse(url):
+        seen.append(url)
+        return _gfeed([{"title": "Antero Resources raises guidance", "summary": "",
+                        "link": f"http://g/{len(seen)}", "published_parsed": recent}])
+
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", fake_parse)
+    arts = news_fetcher.fetch_google_news(["AR"])
+
+    # symbol query + name query + Business Wire query — the name query carries the
+    # registrant title minus its suffix, quoted, so Google matches the phrase.
+    assert len(seen) == 3
+    assert any("%22antero+resources%22+stock" in u for u in seen), seen
+    assert any("%22AR%22+stock" in u for u in seen), seen
+    # The name-query hits are confirmed by the name-phrase tier, so they tag AR.
+    assert arts and all(a.tickers == ["AR"] for a in arts)
+
+
+def test_google_name_query_is_absent_without_a_name():
+    # Offline fixture: no symbol has a name (and ZQZX has no curated alias) → no
+    # name query, and no crash.
+    assert news_fetcher._google_name_query("ZQZX") is None
+    assert news_fetcher._google_name_query("") is None
+
+
+def test_fetch_google_news_warns_on_non_200_feed_status(monkeypatch):
+    from loguru import logger
+    _genable(monkeypatch)
+    monkeypatch.setattr(news_fetcher.settings, "google_news_business_wire", False)
+
+    class _Throttled:
+        status = 429
+        entries = []
+
+    monkeypatch.setattr(news_fetcher.feedparser, "parse", lambda url: _Throttled())
+    msgs = []
+    sink = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
+    try:
+        # Alias-free symbols: one symbol query each, so exactly two feeds.
+        assert news_fetcher.fetch_google_news(["ZQZX", "ZQZY"]) == []
+    finally:
+        logger.remove(sink)
+    # One WARNING for the batch, carrying the count and the status — a throttle
+    # must not read as a quiet news day.
+    hits = [m for m in msgs if "Google News" in m and "non-200" in m]
+    assert len(hits) == 1 and "429" in hits[0] and "2 feed" in hits[0], msgs
+
+
+# ── freshest-cluster cut (A/B treatment arm, not wired into scoring) ─────────
+
+def _aged(hours, title="h"):
+    return NewsArticle(title=title, summary="s" * 40, url=f"u{hours}", source="Reuters",
+                       published_at=datetime.now(timezone.utc) - timedelta(hours=hours))
+
+
+def test_recent_cluster_keeps_the_fresh_group_and_drops_the_stale_one():
+    from src.analysis.sentiment import recent_cluster
+    arts = [_aged(0.5), _aged(2), _aged(6), _aged(96), _aged(100)]
+    kept = recent_cluster(arts)
+    assert [a.url for a in kept] == ["u0.5", "u2", "u6"]
+
+
+def test_recent_cluster_is_relative_so_a_quiet_ticker_keeps_its_digest():
+    """A FIXED window would empty the digest on a name whose only coverage is
+    days old — and an empty digest is an abstention, a bigger change than the
+    one under test. The cut is relative, so the freshest article always
+    survives and nothing is dropped when everything is equally stale."""
+    from src.analysis.sentiment import recent_cluster
+    arts = [_aged(48), _aged(96), _aged(120)]
+    assert len(recent_cluster(arts)) == 3
+    assert recent_cluster([_aged(150)]) != []
+
+
+def test_recent_cluster_floor_protects_the_same_days_coverage():
+    """Without the 24h floor a 30-minute article would cut at 90 minutes and
+    throw away this morning's coverage of the same story."""
+    from src.analysis.sentiment import recent_cluster
+    arts = [_aged(0.5), _aged(8), _aged(20)]
+    assert len(recent_cluster(arts)) == 3
+    assert len(recent_cluster(arts, floor_hours=2.0)) == 1
+
+
+def test_recent_cluster_is_hour_quantised_and_empty_safe():
+    """Same quantisation as `_recency_weight`: two runs inside one hour must cut
+    identically, or a borderline article re-keys the verdict cache mid-hour."""
+    from src.analysis.sentiment import recent_cluster
+    assert recent_cluster([]) == []
+    arts = [_aged(0.1), _aged(23.4), _aged(30)]
+    assert [a.url for a in recent_cluster(arts)] == [a.url for a in recent_cluster(arts)]
+
+
+def test_recent_cluster_is_not_wired_into_scoring():
+    """It is the treatment arm of a pre-registered A/B
+    (`scripts/compare_news_truncation.py`), so the live digest must still be
+    built from every relevant article — a silently-shipped cut would make the
+    measurement meaningless."""
+    import inspect
+
+    import src.analysis.sentiment as sent
+    src = inspect.getsource(sent.analyse_sentiment)
+    assert "recent_cluster" not in src

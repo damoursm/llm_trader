@@ -15,21 +15,63 @@ from src.db.schema import SIGNAL_BASE_METHOD_COLUMNS
 
 # ── feature set + circularity ────────────────────────────────────────────────
 
-def test_live_features_are_22_weighted_methods_plus_tape_no_combine():
-    # The live stacker trains/infers on exactly the weighted methods the combine
-    # uses (21 + `ml_ohlcv`, added 2026-08-24 by user directive — near-inert at
-    # ~7% post-epoch coverage until history accrues) plus `tape_score`
-    # (2026-08-22: the score-independent tape composite; a replay CONTEXT
-    # column, hence the explicit carve-out from the method-column subset check)
-    # — and NEVER a weight-derived aggregate (the circularity guard).
-    assert len(ms.STACKER_LIVE_FEATURES) == 23
-    assert "tape_score" in ms.STACKER_LIVE_FEATURES
-    assert "ml_ohlcv" in ms.STACKER_LIVE_FEATURES
-    methods_only = [f for f in ms.STACKER_LIVE_FEATURES if f != "tape_score"]
-    assert len(methods_only) == 22
+def test_live_features_split_into_signed_scores_and_unsigned_context():
+    # 29 SIGNED scores (the 22 weighted methods + tape_score + the six news
+    # additions of 2026-09-07) and 23 UNSIGNED context features (the evidence
+    # counts, the pre-combine market state, and the 18-class catalyst one-hot).
+    assert len(ms.STACKER_LIVE_FEATURES) == 54   # +news_quiet 2026-09-11
+    assert ms.STACKER_LIVE_FEATURES == ms.STACKER_SIGNED_FEATURES + ms.STACKER_CONTEXT_FEATURES
+    assert len(ms.STACKER_SIGNED_FEATURES) == 31   # +news_quiet 2026-09-11
+    assert len(ms.STACKER_CONTEXT_FEATURES) == 23
+    for f in ("tape_score", "ml_ohlcv", "news_shock", "news_bear_fresh",
+              "catalyst_tilt", "news_raw_score", "news_unpriced", "news_unpriced_all"):
+        assert f in ms.STACKER_SIGNED_FEATURES
+    # the method columns are still a subset of the panel's method set; the four
+    # carve-outs are panel columns that are not METHOD scores.
+    carve = {"tape_score", "news_raw_score"}
+    methods_only = [f for f in ms.STACKER_SIGNED_FEATURES if f not in carve]
     assert set(methods_only).issubset(set(SIGNAL_BASE_METHOD_COLUMNS))
-    for banned in ("combined_score", "combined_buy_score", "combined_sell_score", "confidence"):
+
+
+def test_the_combine_and_everything_derived_from_it_stay_out():
+    """The circularity guard, widened 2026-09-07. `confidence` and
+    `raw_confidence` are functions of the combine this model PRODUCES, and the
+    other confidence factors are computed downstream of it — at serving time
+    they do not exist yet when the stacker runs, so training on them would be a
+    train/serve skew on top of the circularity. What goes in instead is the
+    market state UNDERNEATH them, which is available before the combine."""
+    for banned in ("combined_score", "combined_buy_score", "combined_sell_score",
+                   "confidence", "raw_confidence", "coherence_factor",
+                   "volume_factor", "family_conf_factor", "tape_conf_factor",
+                   "sector_conf_factor", "movement_factor"):
         assert banned not in ms.STACKER_LIVE_FEATURES
+    for kept in ("atr_pct", "bb_width_pct", "vol_ratio"):
+        assert kept in ms.STACKER_CONTEXT_FEATURES
+
+
+def test_catalyst_onehot_covers_the_fixed_taxonomy_and_never_invents_a_class():
+    from src.analysis.sentiment import NEWS_CATALYST_TYPES
+    row = ms.catalyst_onehot("earnings")
+    assert set(row) == set(ms.CATALYST_ONEHOT_FEATURES)
+    assert len(row) == len(NEWS_CATALYST_TYPES) == 18
+    assert row["cat_earnings"] == 1.0 and sum(row.values()) == 1.0
+    # an unknown or missing class is ALL-ZERO, not a fabricated `none`: `none`
+    # is a real verdict meaning "read it, nothing there".
+    assert sum(ms.catalyst_onehot(None).values()) == 0.0
+    assert sum(ms.catalyst_onehot("alien_invasion").values()) == 0.0
+    assert ms.catalyst_onehot(" MA_Deal ")["cat_ma_deal"] == 1.0
+
+
+def test_exit_model_takes_the_signed_features_only():
+    """Every exit feature is oriented by the position's direction, and orienting
+    a count, a width or a one-hot multiplies a magnitude by a meaningless
+    sign."""
+    import src.analysis.ml_exit_dataset as me
+    assert me.EXIT_METHODS == list(ms.STACKER_SIGNED_FEATURES)
+    for unsigned in ("news_article_count", "news_recency_mass", "atr_pct",
+                     "cat_earnings"):
+        assert unsigned not in me.EXIT_METHODS
+        assert f"ex_{unsigned}" not in me.EXIT_FEATURE_COLUMNS
 
 
 def test_model_factory_dispatches_on_the_setting(monkeypatch):
@@ -88,9 +130,30 @@ def test_live_features_match_the_aggregator_method_map():
     import inspect
     import src.signals.aggregator as agg
     src = inspect.getsource(agg._score_ticker) if hasattr(agg, "_score_ticker") else inspect.getsource(agg)
-    # every live feature appears as a method_score_map key in the aggregator
+    # Every live feature must be supplied at serving. Most appear as literal
+    # dict keys; the catalyst block is spread in from `catalyst_onehot`, whose
+    # key set is pinned against the feature list above — the two together are
+    # the parity guarantee.
     for m in ms.STACKER_LIVE_FEATURES:
+        if m in ms.CATALYST_ONEHOT_FEATURES:
+            continue
         assert f'"{m}":' in src, f"{m} not found as a method_score_map key in aggregator"
+    assert "**catalyst_onehot(" in src, "the catalyst one-hot is not spread into the serving dict"
+
+
+def test_serving_supplies_missing_news_inputs_as_nan_not_zero():
+    """A 0.0 is a REAL verdict here ("read it, nothing there"), so a run that
+    captured no raw verdict must serve NaN and let the model impute — the panel
+    column is NULL on exactly those rows."""
+    import math
+
+    import src.signals.aggregator as agg
+    assert math.isnan(agg._news_raw_feature(None))
+    assert math.isnan(agg._news_raw_feature({}))
+    assert math.isnan(agg._news_raw_feature({"raw_score": None}))
+    assert agg._news_raw_feature({"raw_score": -0.42}) == -0.42
+    assert math.isnan(agg._f_or_nan(None)) and math.isnan(agg._f_or_nan(float("nan")))
+    assert agg._f_or_nan("1.5") == 1.5
 
 
 # ── the centered conviction map ──────────────────────────────────────────────
@@ -302,8 +365,12 @@ def _build_with_arm(monkeypatch, buy, sell):
 
     monkeypatch.setattr(settings, "enable_ml_combine", True)
     monkeypatch.setattr(settings, "enable_rank_shaping", False)
-    monkeypatch.setattr(st, "compute_buy_conviction", lambda scores: buy)
-    monkeypatch.setattr(st, "compute_sell_conviction", lambda scores: sell)
+    # The doubles must mirror the real signature, `ranked=` included — the
+    # serving path passes the run's centered-rank news map (2026-09-07).
+    monkeypatch.setattr(st, "compute_buy_conviction",
+                        lambda scores, ranked=None: buy)
+    monkeypatch.setattr(st, "compute_sell_conviction",
+                        lambda scores, ranked=None: sell)
     return {s.ticker: s for s in agg.build_signals(list(_ARM_FIXTURE), [])}
 
 
@@ -372,3 +439,219 @@ def test_partial_swap_keeps_the_weighted_divisor(monkeypatch):
     for tk, s in sigs.items():
         assert s.raw_confidence == pytest.approx(
             min(1.0, abs(s.combined_score) / scale), abs=1e-3), tk
+
+
+# ── news context features on the panel (2026-09-07) ─────────────────────────
+
+def _panel_frame():
+    import pandas as pd
+    return pd.DataFrame({
+        "ticker": ["AAA", "BBB"],
+        "signal_date": ["2026-08-20", "2026-09-06"],
+        "news_catalyst": ["earnings", "guidance"],
+        "news_raw_score": [0.4, -0.3],
+        "news_recency_mass": [2.0, 3.0],
+        "news_article_count": [4, 6],
+    })
+
+
+def test_news_epoch_mask_hides_the_pre_epoch_news_columns(monkeypatch):
+    """`build_panel` masks METHOD scores; the raw verdict, the catalyst and the
+    evidence counts are not method columns, so the same scorer-epoch rule is
+    applied here — otherwise the training set mixes two news eras."""
+    from datetime import date
+    import src.analysis.ml_stacker as m
+    monkeypatch.setattr(m, "_news_epoch_day", lambda: date(2026, 9, 5).isoformat())
+    out = m.add_news_features(_panel_frame())
+    pre, post = out.iloc[0], out.iloc[1]
+    assert pre["news_raw_score"] != pre["news_raw_score"]          # NaN
+    assert pre["news_article_count"] != pre["news_article_count"]
+    assert pre["cat_earnings"] != pre["cat_earnings"]
+    assert post["news_raw_score"] == -0.3                          # post-epoch kept
+    assert post["cat_guidance"] == 1.0
+
+
+def test_news_epoch_mask_can_be_switched_off_for_a_measurement_arm(monkeypatch):
+    from datetime import date
+    from config.settings import settings
+    import src.analysis.ml_stacker as m
+    monkeypatch.setattr(m, "_news_epoch_day", lambda: date(2026, 9, 5).isoformat())
+    monkeypatch.setattr(settings, "enable_stacker_news_epoch_mask", False, raising=False)
+    out = m.add_news_features(_panel_frame())
+    assert out.iloc[0]["news_raw_score"] == 0.4
+    assert out.iloc[0]["cat_earnings"] == 1.0
+
+
+def test_catalyst_backfill_fills_only_untyped_rows(monkeypatch, tmp_path):
+    """The backfill classifier is a different provenance from the live scorer,
+    so it fills a NULL and never overwrites a label the scorer emitted."""
+    import pandas as pd
+    from config.settings import settings
+    import src.analysis.ml_stacker as m
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "t.db"), raising=False)
+    monkeypatch.setattr(m, "_news_epoch_day", lambda: None)
+    from src.db import repo
+    repo.insert_news_event_backfill([
+        {"ticker": "AAA", "signal_date": "2026-08-20", "catalyst": "ma_deal",
+         "headline_count": 2, "top_headline": "h", "classifier_version": "bf1",
+         "classified_at": "2026-08-21T00:00:00+00:00"},
+        {"ticker": "BBB", "signal_date": "2026-09-06", "catalyst": "distress",
+         "headline_count": 2, "top_headline": "h", "classifier_version": "bf1",
+         "classified_at": "2026-09-06T00:00:00+00:00"},
+    ])
+    df = _panel_frame()
+    df.loc[0, "news_catalyst"] = None                       # never typed live
+    out = m.add_news_features(df)
+    assert out.iloc[0]["cat_ma_deal"] == 1.0                # filled from backfill
+    assert out.iloc[1]["cat_guidance"] == 1.0               # live label kept
+    assert out.iloc[1]["cat_distress"] == 0.0
+
+
+# ── news basis: rank, and the artifact decides (2026-09-07) ─────────────────
+
+def test_centered_rank_conventions():
+    """Zeros abstain, NaN survives, ties share a rank, a thin cross-section is
+    neutral rather than an invented extreme."""
+    import math
+    r = ms.centered_rank([0.1, 0.5, 0.3, 0.0, None, 0.5])
+    assert r[0] == -1.0 and r[2] == pytest.approx(-1 / 3)
+    assert r[1] == r[5] == pytest.approx(2 / 3)          # tie -> shared rank
+    assert r[3] == 0.0                                   # zero abstains
+    assert math.isnan(r[4])                              # missing stays missing
+    assert ms.centered_rank([0.4]) == [0.0]              # no cross-section
+    assert ms.centered_rank([]) == []
+    # invariant to any positive rescale — the whole point (engines differ 2.7x)
+    a = ms.centered_rank([0.1, 0.2, 0.4])
+    b = ms.centered_rank([0.27, 0.54, 1.08])
+    assert a == b
+
+
+def test_training_and_serving_share_one_transform():
+    """A rank the two sides compute differently is worse than no rank: the
+    dataset builder and the aggregator must call the SAME function."""
+    import inspect
+
+    import src.signals.aggregator as agg
+    assert "centered_rank_pooled(" in inspect.getsource(ms.apply_news_basis)
+    assert "centered_rank_pooled(" in inspect.getsource(ms.rank_news_features)
+    assert "rank_news_features" in inspect.getsource(agg.build_signals)
+    # and both sides must rank over the Gate-4 pool, not the whole universe
+    assert "tradeable=_tradeable" in inspect.getsource(agg.build_signals)
+    assert "_tradeable_pools(" in inspect.getsource(ms.apply_news_basis)
+
+
+def test_serving_dispatches_on_the_artifacts_own_stamp():
+    """An artifact trained on ABSOLUTE values must keep receiving them even
+    while the setting says rank — otherwise flipping the setting silently
+    changes what a frozen model is fed."""
+    absolute = {"config": {}}
+    ranked_art = {"config": {"news_basis": "rank"}}
+    assert ms.news_basis_of(absolute) == "absolute"
+    assert ms.news_basis_of(ranked_art) == "rank"
+    assert ms.news_basis_of(None) == "absolute"
+    raw = {"news": 0.9, "tech": 0.2}
+    rnk = {"news": -1.0}
+    # absolute artifact -> the raw value, even when a rank map is supplied
+    assert ms._feature_value("news", raw, rnk, absolute) == 0.9
+    # rank artifact -> the ranked value
+    assert ms._feature_value("news", raw, rnk, ranked_art) == -1.0
+    # a non-news feature is never re-routed
+    assert ms._feature_value("tech", raw, {"tech": -1.0}, ranked_art) == 0.2
+    # no rank map (fail-soft) -> raw
+    assert ms._feature_value("news", raw, None, ranked_art) == 0.9
+
+
+def test_the_live_frozen_artifact_is_not_silently_rebased():
+    """The shipped stackers were trained 2026-08-24 on absolute news values.
+    Until they are retrained, serving must feed them absolute values."""
+    art = ms._load_buy_artifact()
+    if art is None:
+        pytest.skip("no artifact on this machine")
+    if str((art.get("config") or {}).get("news_basis") or "") != "rank":
+        assert ms.news_basis_of(art) == "absolute"
+
+
+def test_apply_news_basis_ranks_within_the_day_only(monkeypatch):
+    """Ranking across days would mix regimes and could not be reproduced at
+    serve time, where only the current run's cross-section exists."""
+    import pandas as pd
+    from config.settings import settings
+    monkeypatch.setattr(settings, "stacker_news_basis", "rank", raising=False)
+    df = pd.DataFrame({"signal_date": ["d1"] * 3 + ["d2"] * 3,
+                       "ticker": list("ABCABC"),
+                       "news": [0.9, 0.1, 0.0, 0.02, 0.01, 0.03]})
+    out = ms.apply_news_basis(df)
+    assert list(out.news) == [1.0, -1.0, 0.0, 0.0, -1.0, 1.0]
+    monkeypatch.setattr(settings, "stacker_news_basis", "absolute", raising=False)
+    assert list(ms.apply_news_basis(df).news) == [0.9, 0.1, 0.0, 0.02, 0.01, 0.03]
+
+
+def test_pooled_news_rank_matches_the_combines_own_transform():
+    """The news features must be ranked EXACTLY as every other method is
+    (2026-09-09 directive) — same tradeable pool, same tie-averaging, same
+    observe-only interpolation. A second implementation of the house rank is
+    how the two silently drift, so this pins `centered_rank_pooled` against
+    `aggregator._rank_transform_run` itself.
+
+    Shaping is deliberately switched OFF on the aggregator side (`shapes={}`):
+    the shaped curves are fitted on the same forward returns the stacker trains
+    against, so they belong in the combine and not inside a model feature — that
+    is the ONE intended difference between the two.
+    """
+    import random
+
+    from src.signals.aggregator import _rank_transform_run
+    random.seed(11)
+    tickers = [f"T{i}" for i in range(40)]
+    vals = {t: random.choice([0.0, round(random.uniform(-1, 1), 3)]) for t in tickers}
+    for t in tickers[:6]:
+        vals[t] = 0.25                                  # a real tie group
+    pool = set(tickers[:22])                            # the rest are observe-only
+    combine, _ = _rank_transform_run({t: {"news": (True, vals[t])} for t in tickers},
+                                     tradeable=pool, shapes={})
+    mine = ms.centered_rank_pooled([(t, vals[t]) for t in tickers], pool)
+    for t in tickers:
+        if vals[t] == 0.0:
+            assert mine[t] == 0.0                       # zeros abstain on both sides
+            continue
+        assert round(mine[t], 4) == combine[t]["news"][1]
+    # observe-only names land INSIDE the tradeable range, never past its ends
+    assert max(abs(mine[t]) for t in tickers if t not in pool and vals[t]) <= 1.0
+    # tradeable=None is the documented fail-soft: the plain full-universe rank
+    plain = ms.centered_rank([vals[t] for t in tickers])
+    none_pool = ms.centered_rank_pooled([(t, vals[t]) for t in tickers], None)
+    assert [round(none_pool[t], 9) for t in tickers] == [round(v, 9) for v in plain]
+
+
+def test_pooled_news_rank_fails_soft_on_a_thin_pool():
+    """A pool of one cannot order anything; the transform must return a neutral
+    0.0 rather than a fabricated extreme, and must never raise."""
+    pairs = [("A", 0.9), ("B", 0.1), ("C", -0.4)]
+    assert set(ms.centered_rank_pooled(pairs, {"A"}).values()) == {0.0}
+    assert set(ms.centered_rank_pooled(pairs, set()).values()) == {0.0}
+
+
+def test_training_pool_is_point_in_time(monkeypatch):
+    """The training-side pool judges liquidity on the bars visible ON the signal
+    date. A name that only became liquid LATER must not be in an earlier day's
+    pool — a pool built from future liquidity leaks, and the live path has no
+    such option."""
+    import pandas as pd
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "trade_min_price", 5.0, raising=False)
+    monkeypatch.setattr(settings, "trade_min_dollar_volume", 5e6, raising=False)
+
+    def fake_ohlcv(tk, *a, **k):
+        idx = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+        vol = [1e3, 1e3, 1e9] if tk == "LATE" else [1e9, 1e9, 1e9]
+        return pd.DataFrame({"Close": [10.0] * 3, "Volume": vol}, index=idx)
+
+    monkeypatch.setattr("src.data.cache.load_ohlcv", fake_ohlcv)
+    rows = [{"signal_date": d, "ticker": t, "price": 10.0}
+            for d in ("2026-01-02", "2026-01-03")
+            for t in ["LATE"] + [f"OK{i}" for i in range(40)]]
+    pools = ms._tradeable_pools(pd.DataFrame(rows))
+    assert "LATE" not in (pools["2026-01-02"] or set())     # not yet liquid
+    assert "LATE" in (pools["2026-01-03"] or set())         # liquid that day
+    assert "OK0" in (pools["2026-01-02"] or set())

@@ -196,11 +196,7 @@ def compute_st_reversal_score(ticker: str, df: Optional[pd.DataFrame] = None) ->
     ret_pct = round(ret_5d * 100, 2)
 
     # Liquidity floor — fail-closed: no/short volume data ⇒ no view.
-    if "Volume" not in df.columns:
-        return 0.0, ret_pct
-    dollar = (pd.to_numeric(df["Volume"], errors="coerce")
-              * pd.to_numeric(df["Close"], errors="coerce")).dropna().tail(_DVOL_WINDOW)
-    if len(dollar) < _DVOL_WINDOW or float(dollar.mean()) < float(settings.st_reversal_min_dollar_volume):
+    if not _dollar_volume_ok(df, settings.st_reversal_min_dollar_volume):
         logger.debug(f"[st_reversal] {ticker}: below liquidity floor — no view")
         return 0.0, ret_pct
 
@@ -213,13 +209,14 @@ def compute_st_reversal_score(ticker: str, df: Optional[pd.DataFrame] = None) ->
 
 def _dollar_volume_ok(df: pd.DataFrame, floor: float) -> bool:
     """The st_reversal liquidity floor, shared by every short-horizon MR scorer
-    here — below it a 1-5 day "reversal" is mostly bid-ask bounce, i.e. the
-    SIGNAL is fake, not merely untradeable. Fail-closed on missing volume."""
-    if "Volume" not in df.columns:
-        return False
-    dollar = (pd.to_numeric(df["Volume"], errors="coerce")
-              * pd.to_numeric(df["Close"], errors="coerce")).dropna().tail(_DVOL_WINDOW)
-    return len(dollar) >= _DVOL_WINDOW and float(dollar.mean()) >= float(floor)
+    here (st_reversal itself included since 2026-09-03 — it used to inline a
+    second copy) — below it a 1-5 day "reversal" is mostly bid-ask bounce, i.e.
+    the SIGNAL is fake, not merely untradeable. Fail-closed on missing volume
+    or fewer than ``_DVOL_WINDOW`` valid bars. Byte-identical to the former
+    inline formula, so no scorer epoch."""
+    from src.data.liquidity import dollar_volume
+    dv = dollar_volume(df, _DVOL_WINDOW, min_bars=_DVOL_WINDOW)
+    return dv is not None and dv >= float(floor)
 
 
 def compute_rsi2_rev_score(ticker: str, df: Optional[pd.DataFrame] = None) -> Tuple[float, float]:

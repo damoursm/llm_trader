@@ -1,14 +1,21 @@
 # Production deployment (Windows) — reliable always-on scheduling
 
-Two independent pieces must stay up for unattended trading:
+Three independent pieces must stay up for unattended trading (what is LIVE on this box as of 2026-09-05 is in the last column):
 
 | Piece | Job | Kept alive by |
 |---|---|---|
-| **Scheduler** (`main.py --schedule`) | runs the pipeline every 30 min, places paper/live orders | a Windows **service** (NSSM) or **Task Scheduler**, auto-restart on crash |
-| **TWS / IB Gateway** | the broker connection the scheduler talks to | **IBC** (auto-login + daily `AutoRestartTime`) |
+| **Scheduler** (`main.py --supervise`, via `scripts\run_scheduler.bat`) | runs the pipeline every 30 min, places paper/live orders | Task Scheduler job **`LlmTraderScheduler`** (auto-restart on crash); inside it `--supervise` relaunches the `--schedule` child whenever a watchdog force-exits it |
+| **IB Gateway** (headless, paper port 4002) | the broker connection the scheduler talks to | **IBC** under Task Scheduler job **`IBC Gateway`** (`C:\IBC\StartGateway.bat /INLINE`, at log on + daily `AutoRestartTime` 23:50) |
+| **Ollama** (`scripts\run_ollama.bat`, loopback `127.0.0.1:11434`) | the LOCAL sentiment engine — primary on half the runs (`SENTIMENT_LOCAL_SHARE=0.5`) and the shadow scorer on the other half | Task Scheduler job **`LlmTraderOllama`** (`scripts\register_ollama_task.ps1`) — **not yet registered here**: the running server was started by hand from `run_ollama.bat`, so a reboot leaves the sentiment A/B silently 100% DeepSeek until it is relaunched |
 
 The scheduler tolerates a down broker (it skips the broker sync and alerts, internal
-sim unaffected), so strict start order isn't required — but in steady state both run 24/7.
+sim unaffected) and a down model server (a local-primary run falls through to the hosted
+engines; only if those are down too does the run record sentiment provider `none`, which
+reaches the email banner), so strict start order isn't required — but in steady state all
+three run 24/7. **The one supported way to bounce the trader stack is
+`scripts\restart_all.ps1`** (stops both `LlmTrader*` tasks, force-kills any straggler
+including a surviving `--supervise` parent, restarts the tasks); the model server is
+deliberately NOT part of that bounce (it holds a ~5 GB model resident in VRAM).
 
 ---
 
@@ -18,7 +25,9 @@ Always launch via **`scripts\run_scheduler.bat`** (never bare `python main.py --
 The launcher forces the repo root as the working directory and the **venv** python — the
 two things that broke us (wrong CWD → empty `.env`/DB; miniconda → no `ib_async`).
 
-### Option A — NSSM (recommended: a true service, restarts on crash, starts at boot)
+The LIVE setup is Option B via `scripts\register_scheduler_task.ps1` (task `LlmTraderScheduler`).
+
+### Option A — NSSM (a true service, restarts on crash, starts at boot — not what runs here)
 
 1. Download NSSM (`nssm.exe`) from https://nssm.cc/ and put it somewhere on PATH.
 2. Install the service (run as admin):
@@ -49,11 +58,29 @@ Create a task that runs `scripts\run_scheduler.bat`:
 
 ### Verify
 New lines appear in `logs\llm_trader_<date>.log` at the next :00/:30 tick, and a tick
-logs `[broker:ibkr] connected … (clientId=11)` (once TWS/IBC is up — see §2).
+logs `[broker:ibkr] connected … (clientId=11)` (once the gateway/IBC is up — see §2).
+A restart is only done when `Get-CimInstance Win32_Process` shows exactly ONE
+`--supervise` and ONE `--schedule` python — two schedulers ticking concurrently race the
+DuckDB writer and can double broker submissions.
+
+**Watchdogs, not just restart-on-failure.** A HUNG process never exits, so neither the
+supervisor nor Task Scheduler would ever see it; two watchdogs convert hangs into exits
+(`broker_sync_watchdog_seconds` 600 around the broker sync, `tick_watchdog_seconds` 2700
+around the whole tick) via `os._exit(1)`, which `--supervise` then relaunches.
 
 ---
 
-## 2 — Keep TWS logged in with IBC (auto-login + daily restart)
+## 2 — Keep the gateway logged in with IBC (auto-login + daily restart)
+
+**Live here:** headless **IB Gateway** on paper port **4002** (`.env`: `BROKER_MODE=ibkr_paper`,
+`IBKR_PORT=4002`), IBC config at **`C:\IBC\config.ini`** (`TradingMode=paper`,
+`OverrideTwsApiPort=4002`, `ReadOnlyApi=no`, `AcceptIncomingConnectionAction=accept`,
+`AutoRestartTime=11:50 PM`, plus `BypassOrderPrecautions=yes` +
+`BypassRedirectOrderWarning=yes` — the two API-precaution bypasses the overnight-venue
+orders need), launched by the `IBC Gateway` task. The scheduler also has a gateway
+auto-recovery (`broker_gateway_auto_restart`, paper-only): on a wedged-but-alive or dead
+gateway it kills the java process on the port and fires that task. The TWS walkthrough
+below is the original desktop setup and still works — only the port (7497) differs.
 
 IBC ([IbcAlpha/IBC](https://github.com/IbcAlpha/IBC)) logs into TWS for you and, via
 **`AutoRestartTime`**, restarts it daily **without re-authenticating** — so it runs the
@@ -87,8 +114,10 @@ whole week on one Monday login. This replaces the daily logoff that kept breakin
 
 ## 3 — Monitoring dashboard (optional, not trading-critical)
 
-The read-only dashboard (`main.py --dashboard`, http://127.0.0.1:8050) is kept always-on
-the same way as the scheduler — a Task Scheduler job pointed at a venv launcher:
+The read-only dashboard (`main.py --dashboard`, bound to loopback `127.0.0.1:8050` and
+published ONLY through Tailscale Funnel at `https://victushp.tail8e1bf1.ts.net`, HTTP Basic
+auth on one shared credential) is kept always-on the same way as the scheduler — a Task
+Scheduler job pointed at a venv launcher:
 
 ```
 powershell -ExecutionPolicy Bypass -File "C:\Users\mathi\PycharmProjects\llm_trader\scripts\register_dashboard_task.ps1"
@@ -101,6 +130,13 @@ manually-started dashboard first so port 8050 is free. The dashboard opens the D
 trading is unaffected — only monitoring is.
 
 Manage: `Start-ScheduledTask` / `Stop-ScheduledTask` / `Unregister-ScheduledTask -TaskName LlmTraderDashboard -Confirm:$false`.
+
+**Restarting the dashboard does not reliably replace it.** Two `--dashboard` processes can
+BOTH hold `LISTENING` on 8050 (waitress sets `SO_REUSEADDR` and Windows permits the double
+bind) and connections keep going to the OLD one while the new one logs a clean startup.
+`Get-NetTCPConnection -LocalPort 8050` hides this; `netstat -ano | Select-String ":8050"`
+shows both rows — confirm exactly one PID after every restart, and `Stop-Process` the
+survivor before `Start-ScheduledTask`.
 
 ---
 

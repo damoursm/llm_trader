@@ -47,7 +47,7 @@ from config.settings import settings
 from src.analysis.exit_conviction import exit_method_consensus
 from src.analysis.exit_methods import method_horizon_days
 from src.analysis.ml_dataset import _benchmark_series
-from src.analysis.ml_stacker import STACKER_LIVE_FEATURES
+from src.analysis.ml_stacker import STACKER_SIGNED_FEATURES
 
 # The method scores the exit model sees (oriented to the position) — ONE list
 # with the stacker's, so a feature decision propagates to the exit at its next
@@ -55,7 +55,13 @@ from src.analysis.ml_stacker import STACKER_LIVE_FEATURES
 # exit-only extension) and moved UPSTREAM into STACKER_LIVE_FEATURES on
 # 2026-08-24, collapsing the extension back into the shared derivation. It is
 # in `_CONSENSUS_SKIP`, so the `ex_consensus` baseline ignores it either way.
-EXIT_METHODS: List[str] = list(STACKER_LIVE_FEATURES)
+# The SIGNED stacker features only. Every exit feature is oriented by the
+# position's direction (`ex_<m>` = score x sign), and orienting an unsigned
+# column — an article count, a spread width, a catalyst one-hot — multiplies a
+# magnitude by a sign that means nothing there. So the exit model tracks the
+# stacker's signed set (one list, no fork) and the 2026-09-07 context features
+# stay out until they have an unoriented carrier of their own.
+EXIT_METHODS: List[str] = list(STACKER_SIGNED_FEATURES)
 
 # Position-state features — the exit-specific signal the consensus cannot see.
 EXIT_STATE_FEATURES: List[str] = [

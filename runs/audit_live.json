@@ -1,0 +1,2787 @@
+[
+ {
+  "ticker": "XLI",
+  "run_id": "2026-09-09_013008",
+  "n_articles": 8,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 57% of the digest mentions XLI only in passing, never in a headline.",
+  "heads": [
+   "[google_news/marketscreener.com] Financials, industrials drag TSX lower; Shopify hits one-month low - marketscreener.com",
+   "[google_news/Seeking Alpha] Ten industrials stocks combining strong revenue growth with attractive valuations (XLI:NYSEARCA) - Seeking Alpha",
+   "[Zacks Investment Research] Is State Street SPDR S&P Homebuilders ETF (XHB) a Strong ETF Right Now?",
+   "[Zacks Investment Research] Should You Invest in the First Trust NASDAQ Transportation ETF (FTXR)?",
+   "[Benzinga] Leading And Lagging Sectors For September 7, 2026",
+   "[The Motley Fool] There Are Only a Handful of S&P 500 Stocks That Yield Over 5%. Here's My Top Pick to Buy in September.",
+   "[The Motley Fool] Every Hyperscaler Raised Capex Again. These 3 Boring Industrials Get Paid No Matter Who Wins the AI Race.",
+   "[StockStory] 3 Industrials Stocks We Find Risky"
+  ]
+ },
+ {
+  "ticker": "NET",
+  "run_id": "2026-09-09_153000",
+  "n_articles": 2,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 50% of the digest mentions NET only in passing, never in a headline.",
+  "heads": [
+   "[Benzinga] What's Going On With Cloudflare Stock Tuesday?",
+   "[SeekingAlpha] Columbia Select Mid Cap Growth Fund Q2 2026 Portfolio Review"
+  ]
+ },
+ {
+  "ticker": "TRIP",
+  "run_id": "2026-09-10_052450",
+  "n_articles": 4,
+  "pm_share": 0.0,
+  "score": -0.3884,
+  "raw": -0.52,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "TripAdvisor reported a Q3 2026 EPS miss of -7.4% ($0.35 vs $0.38 consensus) with Seeking Alpha coverage citing waning bookings, SEO issues, OTA competition, falling revenue and weakening guidance \u2014 a fresh negative fundamental catalyst with estimate-revision drift still working. The 28% short float creates squeeze potential but that is a conditional setup, not a catalyst, and the bearish earnings/guidance read dominates; the miss is only 12h old so the negative drift is not yet fully priced.",
+  "heads": [
+   "[Earnings/EPS] TRIP modestly missed EPS estimate by 7.4% (Q3 2026 results)",
+   "[Short Interest] TRIP: 28% short float + 8.1-day cover \u2014 squeeze conditions present",
+   "[google_news/Seeking Alpha] TripAdvisor: Waning Bookings Aren't Likely To Get Solved Anytime Soon (NASDAQ:TRIP) - Seeking Alpha",
+   "[SeekingAlpha] TripAdvisor: Waning Bookings Aren't Likely To Get Solved Anytime Soon"
+  ]
+ },
+ {
+  "ticker": "GDX",
+  "run_id": "2026-09-09_183023",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": -0.1079,
+  "raw": -0.18,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "Gold prices dropped following U.S. strikes on five Iranian oil tankers, and Benzinga explicitly names gold miners as being on the wrong side of the oil spike, a direct negative read-through to GDX's holdings. The GuruFocus piece about a major buyer doubling down is stale (28h) and vague, while the oil-driven gold selloff is the dominant, more recent catalyst; some of the move is already priced in but the negative framing on miners persists.",
+  "heads": [
+   "[GuruFocus.com] Gold Prices Flash Strong Signal as Major Buyer Doubles Down",
+   "[yahoo_finance] Gold price today, Wednesday, September 9, 2026: Gold prices drop following U.S. strikes on five Iranian oil tankers",
+   "[Benzinga] Oil Hits $100: Which Stocks And ETFs Win Or Lose?"
+  ]
+ },
+ {
+  "ticker": "MS",
+  "run_id": "2026-09-09_120010",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": 0.0193,
+  "raw": 0.04,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "The only ticker-specific items are Morgan Stanley's own research notes on India (bullish Sensex target, overweight list) \u2014 these are the firm's output, not catalysts for its own stock, and carry no dated event or disclosed financial impact. The BeInCrypto piece mentions Goldman and Morgan Stanley in a passing framing about rating OpenAI/Anthropic investment grade, an indirect and speculative read-through with no terms or confirmation. With no fresh, hard, company-specific catalyst and only soft, stale commentary, the residual move is a minimal positive lean from the constructive framing.",
+  "heads": [
+   "[BeInCrypto] OpenAI and Anthropic Want What SpaceX Got After Its IPO Despite Billions in Losses",
+   "[Economictimes.com] Morgan Stanley\u2019s top picks: Adani Power, Trent, among 10 stocks rated \u2018overweight\u2019 by Wall Street giant",
+   "[The Times of India] India in multi quarter growth upcycle, says Morgan Stanley; sees Sensex at 89,000 by June 2027"
+  ]
+ },
+ {
+  "ticker": "IGV",
+  "run_id": "2026-09-09_200022",
+  "n_articles": 11,
+  "pm_share": 0.6363636363636364,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 64% of the digest mentions IGV only in passing, never in a headline.",
+  "heads": [
+   "[google_news/simplywall.st] 3 Software Stocks Tied To Rising AI Liability Demand - simplywall.st",
+   "[google_news/Investing.com Australia] Why is iShares Expanded Tech-Software Sector ETF stock sliding today? - Investing.com Australia",
+   "[Yahoo] UiPath and Pegasystems Sink 7% as Price Target Hikes Arrive Without a Single Buy Rating",
+   "[SeekingAlpha] Zeta: I See A Path To $60+/Share",
+   "[SeekingAlpha] Oracle Deserves One Last Chance",
+   "[SeekingAlpha] Ride The Bull Before The Market Comes To Its Senses",
+   "[24/7 Wall St.] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[Yahoo] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[The Motley Fool] A Once-in-a-Decade Opportunity: 1 Magnificent S&P 500 Stock Down 41% to Buy Right Now",
+   "[Yahoo] 1 Momentum Signal Suggests the Software Apocalypse Is Over. Don\u2019t Rush to Buy Just Yet."
+  ]
+ },
+ {
+  "ticker": "MS",
+  "run_id": "2026-09-09_023012",
+  "n_articles": 15,
+  "pm_share": 0.6,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 60% of the digest mentions MS only in passing, never in a headline.",
+  "heads": [
+   "[google_news/MarketBeat] Morgan Stanley Eyes Good Things Ahead for Meta After $18 Billion Legal Settlement - MarketBeat",
+   "[google_news/Yahoo Finance] Why Did Oracle Stock Pop Today? - Yahoo Finance",
+   "[google_news/Pluang] Oracle jumps 5% as Morgan Stanley raises price target, boosting AI cloud infrastructure stocks. - Pluang",
+   "[24/7 Wall St.] Oracle Rallies 5% as Morgan Stanley Lifts Its Price Target, CoreWeave Advances 3%",
+   "[google_news/24/7 Wall St.] Oracle Rallies 5% as Morgan Stanley Lifts Its Price Target, CoreWeave Advances 3% - 24/7 Wall St.",
+   "[Analyst Ratings] Analyst ratings: HTFL sees 6 price-target revision(s) from 6 firm(s)",
+   "[Analyst Ratings] Analyst ratings: ETN sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: NCNO sees 5 price-target revision(s) from 7 firm(s)",
+   "[Analyst Ratings] Analyst ratings: CHYM sees 1 new coverage initiation(s) from 5 firm(s)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)"
+  ]
+ },
+ {
+  "ticker": "CRL",
+  "run_id": "2026-09-10_130006",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": 0.0,
+  "raw": 0.0,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "The only article in the digest is a PRNewswire item about Simplicity Group acquiring Whitney and Associates, an insurance/financial-planning firm \u2014 it has no connection to Charles River Laboratories, its industry, peers, customers, suppliers or sector. No article about the company, no named peer or sector development with a read-through, so the abstention case (a) applies and not even a lean is possible.",
+  "heads": [
+   "[prnewswire_ma] Simplicity Group Acquires Whitney and Associates, Expanding Presence in Des Moines as it Welcomes Mitch Whitney and Charles Johnson as the Group's Newest "
+  ]
+ },
+ {
+  "ticker": "PINS",
+  "run_id": "2026-09-09_213245",
+  "n_articles": 18,
+  "pm_share": 0.0,
+  "score": -0.28,
+  "raw": -0.28,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "Pinterest's CEO Bill Ready, speaking at the Goldman Sachs Communacopia conference, declined to refresh guidance and flagged international headwinds, with a CFO resignation also cited \u2014 a soft negative fundamental signal that drove an 8% single-day drop and a 13% six-day losing streak. The stock has already absorbed most of the immediate shock, but negative guidance-adjacent commentary from management typically keeps drifting for several sessions, and the founder's continued share sale adds a mild supply overhang. Residual downside remains, though the magnitude is now modest given the move already taken.",
+  "heads": [
+   "[google_news/Stock Titan] Pinterest (NYSE: PINS) founder lines up another share sale - Stock Titan",
+   "[Yahoo] Pinterest shares tumble as CEO warns of international headwinds",
+   "[google_news/Stocktwits] PINS Stock Slides 7% After CEO Won\u2019t Refresh Guidance, Flags Overseas Headwinds - Stocktwits",
+   "[google_news/TradingView] PINS Stock Slides 7% After CEO Won\u2019t Refresh Guidance, Flags Overseas Headwinds - TradingView",
+   "[google_news/Pluang] Pinterest stock drops 8% amid CFO resignation and slower growth guidance, signaling a premium multiple reset. - Pluang",
+   "[google_news/Investing.com] Pinterest shares tumble as CEO warns of international headwinds - Investing.com",
+   "[24/7 Wall St.] Pinterest Tumbles 8%, Reddit and Snap Pull Back: Is the Premium Multiple Unwinding?",
+   "[Yahoo] Pinterest Tumbles 8%, Reddit and Snap Pull Back: Is the Premium Multiple Unwinding?",
+   "[google_news/AOL.com] Pinterest Tumbles 8%, Reddit and Snap Pull Back: Is the Premium Multiple Unwinding? - AOL.com",
+   "[google_news/24/7 Wall St.] Pinterest Tumbles 8%, Reddit and Snap Pull Back: Is the Premium Multiple Unwinding? - 24/7 Wall St."
+  ]
+ },
+ {
+  "ticker": "Z",
+  "run_id": "2026-09-10_160006",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": -0.0541,
+  "raw": -0.07,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The only connection to Zillow is a passing mention in a 24/7 Wall St. piece about Opendoor sinking 7% on a delayed profit timeline and a yield spike, with Zillow named only as a trailing peer. The read-through is mildly negative for the iBuying/residential real-estate complex (higher yields pressure transaction volumes and Zillow's Premier Agent and mortgage revenue), but it is indirect, stale in nature, and Zillow's own move is not the subject of the coverage. Score a small negative lean reflecting the sector read-through, not a company-specific catalyst.",
+  "heads": [
+   "[24/7 Wall St.] Opendoor Sinks 7% as Yield Spike Meets Delayed Profit Timeline, Offerpad and Zillow Group Trail",
+   "[Yahoo] Opendoor Sinks 7% as Yield Spike Meets Delayed Profit Timeline, Offerpad and Zillow Group Trail",
+   "[google_news/247wallst.com] Opendoor Sinks 7% as Yield Spike Meets Delayed Profit Timeline, Offerpad and Zillow Group Trail - 247wallst.com"
+  ]
+ },
+ {
+  "ticker": "YSS",
+  "run_id": "2026-09-10_145032",
+  "n_articles": 12,
+  "pm_share": 0.0,
+  "score": -0.7183,
+  "raw": -0.72,
+  "catalyst": "legal_regulatory",
+  "engine": "deepseek",
+  "rationale": "York Space Systems is engulfed in a negative legal/regulatory overhang: a securities class action alleging the company misled the SDA about its satellite software functionality, plus a fresh Robbins LLP investigation (21h ago) and a new 52-week low, compounded by a wave of analyst downgrades (Canaccord, JPM) and severe PT cuts (Wells Fargo -51%, Jefferies -53%, Truist -46%). The Q3 EPS beat (+52.5% surprise) and short-interest decline are positive but stale (12h) and dwarfed by the legal/contract-viability risk, which threatens the SDA contract \u2014 the core of the equity story. With the stock already at a 52-week low and the class action still developing, negative drift is likely to continue o",
+  "heads": [
+   "[google_news/GlobeNewswire] YORK SPACE SYSTEMS INC. INVESTORS WITH LOSSES HAVE UNTIL - GlobeNewswire",
+   "[google_news/businesswire.com] York Space Systems\u2019 Flight-Proven Platforms Selected by Tomorrow.io for DeepSky Early Warning Constellation - businesswire.com",
+   "[google_news/MarketBeat] 1,843,269 Shares in York Space Systems Inc. $YSS Purchased by Tidal Investments LLC - MarketBeat",
+   "[google_news/MarketBeat] Wellington Management Group LLP Buys Shares of 171,853 York Space Systems Inc. $YSS - MarketBeat",
+   "[google_news/MarketBeat] Bank of New York Mellon Corp Sells 1,623,432 Shares of York Space Systems Inc. $YSS - MarketBeat",
+   "[Earnings/EPS] YSS significantly beat EPS estimate by 52.5% (Q3 2026 results)",
+   "[Short Interest] YSS: short interest falls 29% MoM to 8% of float \u2014 covering provides price support",
+   "[Analyst Ratings] Analyst ratings: YSS sees 2 downgrade(s) from 6 firm(s)",
+   "[google_news/MarketBeat] YSS News Today | Why did York Space Systems stock drop today? $YSS - MarketBeat",
+   "[google_news/MarketBeat] York Space Systems (NYSE:YSS) Sets New 52-Week Low - Here's Why - MarketBeat"
+  ]
+ },
+ {
+  "ticker": "OXM",
+  "run_id": "2026-09-10_123011",
+  "n_articles": 6,
+  "pm_share": 0.0,
+  "score": -0.3663,
+  "raw": -0.42,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is a cluster of negative analyst actions \u2014 Zacks cut to Strong Sell and three firms (Telsey, Truist, Citigroup) slashed price targets by 8\u201320% \u2014 following a Q2 earnings call where Lilly Pulitzer weakness forced guidance cuts. The guidance cut is the fundamental driver and negative guidance cuts typically drift for several sessions, though the CEO's open-market purchase of $108k (~3,500 shares) provides a modest offsetting signal. Much of the initial reaction is likely priced after the earnings call, but the fresh analyst downgrades and the negative guidance revision keep the residual move negative.",
+  "heads": [
+   "[google_news/MarketBeat] Oxford Industries (NYSE:OXM) Cut to \"Strong Sell\" at Zacks Research - MarketBeat",
+   "[Analyst Ratings] Analyst ratings: OXM sees 3 price-target revision(s) from 3 firm(s)",
+   "[google_news/MarketBeat] Thomas Caldecot Chubb III Acquires 3,500 Shares of Oxford Industries (NYSE:OXM) Stock - MarketBeat",
+   "[google_news/Investing.com] Oxford Industries CEO Chubb acquires $108k in common stock - Investing.com",
+   "[google_news/Stock Titan] Oxford Industries (NYSE: OXM) CEO just bought shares on the open market - Stock Titan",
+   "[Motley Fool] Oxford Industries (OXM) Q2 2026 Earnings Call Transcript"
+  ]
+ },
+ {
+  "ticker": "XPEV",
+  "run_id": "2026-09-09_193719",
+  "n_articles": 8,
+  "pm_share": 0.125,
+  "score": -0.1467,
+  "raw": -0.18,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh catalyst is UBS initiating XPeng at Neutral (27-29h ago), explicitly citing robotics risks and auto weakness \u2014 a new analyst rating with a cautious framing that caps upside and leans negative. This is offset by the IRON humanoid robot production launch coverage, but that is a company-promotional product event with no disclosed terms and the coverage itself notes the stock is barely moving, so it is largely priced and promotional. Netting the fresh negative analyst initiation against the soft positive robot-launch framing, the residual short-term lean is slightly negative.",
+  "heads": [
+   "[google_news/AD HOC NEWS] XPeng's Robot Revolution Is Real \u2014 So Why Won't the Market Play Along? - AD HOC NEWS",
+   "[Benzinga] 10 Consumer Discretionary Stocks Whale Activity In Today\u2019s Session",
+   "[google_news/eletric-vehicles.com] UBS Initiates XPeng at \u2018Neutral\u2019 Citing Robotics Risks and Auto Weakness - eletric-vehicles.com",
+   "[google_news/simplywall.st] How Investors Are Reacting To XPeng (XPEV) IRON Robot Production Launch - simplywall.st",
+   "[google_news/Investing.com Canada] UBS initiates XPeng stock coverage at neutral on robotics value By Investing.com - Investing.com Canada",
+   "[google_news/AD HOC NEWS] XPeng's Robotics Windfall Can't Shake the Gloom Hanging Over Its EV Core - AD HOC NEWS",
+   "[google_news/Stock Traders Daily] (XPEV) Movement as an Input in Quant Signal Sets - Stock Traders Daily",
+   "[google_news/AD HOC NEWS] XPeng's Humanoid Robot Walks Off the Line, But the Stock Is Barely Stumbling Forward - AD HOC NEWS"
+  ]
+ },
+ {
+  "ticker": "WBD",
+  "run_id": "2026-09-10_070017",
+  "n_articles": 10,
+  "pm_share": 0.1,
+  "score": 0.3847,
+  "raw": 0.42,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh catalyst is WBD's Q3 2026 EPS beat of $0.06 vs -$0.11 consensus (+153.9% surprise, 12h old), which drives positive estimate revisions and near-term appreciation; partially offsetting are the escalating Paramount merger bond/lawsuit headlines (ticking-fee risk, ~20-23h old) that are pressuring the stock and Paramount shares. Institutional 13F adds (Maven, Squarepoint, Arizona State) and an officer's planned 2026 vesting-award sale are minor supporting/negative noise. Net lean is positive but tempered by the merger-litigation overhang and the fact that some EPS-beat reaction may already be in the tape.",
+  "heads": [
+   "[Earnings/EPS] WBD significantly beat EPS estimate by 153.9% (Q3 2026 results)",
+   "[google_news/TechStock\u00b2] Paramount Stock Drops 5.4% as $1.88 Billion WBD Bond Fight Escalates - TechStock\u00b2",
+   "[google_news/Stock Titan] Warner Bros. Discovery (NASDAQ: WBD) officer plans 2026 stock sale from vesting awards - Stock Titan",
+   "[google_news/ad-hoc-news.de] Warner Bros. Discovery stock edges lower as Paramount merger lawsuits raise ticking-fee stakes - ad-hoc-news.de",
+   "[The Motley Fool] Is Netflix a Good Buy? After 10 Years of Covering NFLX, Here's My Honest Answer.",
+   "[google_news/Stocktwits] PSKY, WBD Stocks Gain After-Hours As DOJ Greenlights Merger Deal - Stocktwits",
+   "[google_news/Kalkine Media] What's behind the renewed interest in Warner Bros. Discovery (NASDAQ:WBD) shares? - Kalkine Media",
+   "[google_news/MarketBeat] Maven Securities LTD Acquires 100,307 Shares of Warner Bros. Discovery, Inc. $WBD - MarketBeat",
+   "[google_news/MarketBeat] Squarepoint Ops LLC Purchases 726,437 Shares of Warner Bros. Discovery, Inc. $WBD - MarketBeat",
+   "[google_news/MarketBeat] Warner Bros. Discovery, Inc. $WBD Shares Purchased by Arizona State Retirement System - MarketBeat"
+  ]
+ },
+ {
+  "ticker": "IWM",
+  "run_id": "2026-09-09_050005",
+  "n_articles": 19,
+  "pm_share": 0.7368421052631579,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 82% of the digest mentions IWM only in passing, never in a headline.",
+  "heads": [
+   "[MT Newswires] Exchange-Traded Funds Mixed, US Equities Fall After Midday",
+   "[Yahoo] Exchange-Traded Funds Mixed, US Equities Fall After Midday",
+   "[google_news/Stock Traders Daily] Price-Driven Insight from (IWM) for Rule-Based Strategy - Stock Traders Daily",
+   "[SeekingAlpha] Markets Move To The Downside Amid Uptick In Oil Prices",
+   "[SeekingAlpha] The Broken Global: Trade Position Is Reshaping Inflation, Yields And Risk-Return Trade-Off",
+   "[Zacks Investment Research] Should You Invest in the ALPS Medical Breakthroughs ETF (SBIO)?",
+   "[SeekingAlpha] The Economy Appears To Be Heating Up - So Are The Headwinds",
+   "[SeekingAlpha] Risks Increased For A Stock Market Sell-Off",
+   "[SeekingAlpha] There Will Be No Fed Rate Hikes",
+   "[SeekingAlpha] Ride The Bull Before The Market Comes To Its Senses"
+  ]
+ },
+ {
+  "ticker": "APGE",
+  "run_id": "2026-09-09_230002",
+  "n_articles": 5,
+  "pm_share": 0.0,
+  "score": 0.0,
+  "raw": 0.0,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "Apogee is an all-cash acquisition target pinned at AbbVie's $135.11/share offer, with the average analyst PT at $135 and BTIG merely moving to Neutral \u2014 the deal spread is closed, so no directional move remains. The Q3 EPS miss and Fairmount's exit are noise against a fixed cash consideration, and the residual is genuinely nil.",
+  "heads": [
+   "[Insider Monkey] Is AbbVie (ABBV)\u2019s $10.9 Billion Apogee Therapeutics (APGE) Deal the Next Catalyst for Growth?",
+   "[google_news/Yahoo Finance] Is AbbVie (ABBV)\u2019s $10.9 Billion Apogee Therapeutics (APGE) Deal the Next Catalyst for Growth? - Yahoo Finance",
+   "[Earnings/EPS] APGE modestly missed EPS estimate by 12.4% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: APGE sees 1 downgrade(s) from 2 firm(s)",
+   "[google_news/GuruFocus] Fairmount Funds Management LLC Exits Apogee Therapeutics Inc (AP - GuruFocus"
+  ]
+ },
+ {
+  "ticker": "ALKT",
+  "run_id": "2026-09-09_060005",
+  "n_articles": 2,
+  "pm_share": 0.0,
+  "score": 0.1765,
+  "raw": 0.38,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "Two independent analyst PT raises (JP Morgan $19\u2192$24, Needham $22\u2192$25) with an explicitly positive tone are the dominant fresh catalyst, implying upward estimate/revision momentum into a stock trading well below the new average PT of $24. The Simply Wall St. piece on client rollouts reinforces the constructive narrative but is aggregator commentary, not a new event. With the raises ~36h old and no disclosed earnings or guidance change, the remaining move is a moderate positive lean rather than a full re-rating.",
+  "heads": [
+   "[Analyst Ratings] Analyst ratings: ALKT sees 2 price-target revision(s) from 2 firm(s)",
+   "[google_news/simplywall.st] Client Rollouts At Alkami Stock Have Changed Its Investment Story - simplywall.st"
+  ]
+ },
+ {
+  "ticker": "PANW",
+  "run_id": "2026-09-10_023007",
+  "n_articles": 8,
+  "pm_share": 0.875,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 88% of the digest mentions PANW only in passing, never in a headline.",
+  "heads": [
+   "[Trefis] Should You Get Paid To Wait For Palo Alto Networks To Slow Down?",
+   "[Yahoo] Navan Acquires Leading AI-Powered Events Platform BoomPop, Expanding Offerings for Meetings and Events",
+   "[Yahoo] Navan Announces Strong Second Quarter Fiscal Year 2027 Results",
+   "[24/7 Wall St.] Cloudflare Surges 9% on OpenAI Security Partnership, Zscaler Rises 3%",
+   "[Yahoo] Cloudflare Surges 9% on OpenAI Security Partnership, Zscaler Rises 3%",
+   "[MarketBeat] AI Is Making Cybersecurity Harder to Ignore\u2014These 3 ETFs Offer a Broad Bet",
+   "[Yahoo] AI Is Making Cybersecurity Harder to Ignore\u2014These 3 ETFs Offer a Broad Bet",
+   "[Yahoo] Navan and Engine Announce Strategic Technology Partnership to Power New Capabilities in Business Travel"
+  ]
+ },
+ {
+  "ticker": "CMPS",
+  "run_id": "2026-09-10_113010",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.08,
+  "raw": -0.08,
+  "catalyst": "fda_clinical",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the 52-week Phase 3 COMP005 Part C data showing durable ~13-point improvement in depression scores, which drove an 11% surge and a 52-week high; this is a positive clinical read-through but the move has already happened and the stock is extended. The Q3 EPS miss of 6.6% is a modest negative offset, and analyst reiterations (Oppenheimer, Jefferies) are supportive but not fresh catalysts. Netting the priced-in positive spike against the small EPS miss and extended positioning, the residual 1-5 day move is a small negative lean as the stock mean-reverts after the outsized one-day gain.",
+  "heads": [
+   "[google_news/Business Wire] Compass Pathways Announces U.S. Grant Program Recipients for the Development of Post-Approval COMP360 Provider Training - Business Wire",
+   "[Earnings/EPS] CMPS modestly missed EPS estimate by 6.6% (Q3 2026 results)",
+   "[google_news/Investing.com India] Oppenheimer reiterates Compass Pathways stock rating on trial data By Investing.com - Investing.com India",
+   "[google_news/finance.biggo.com] Compass Pathways Surges as One-Year Data Show Lasting Relief From Psilocybin Therapy - finance.biggo.com",
+   "[google_news/Investing.com Australia] Compass Pathways stock shows durable results in depression trial By Investing.com - Investing.com Australia",
+   "[google_news/Investing.com] Compass Pathways stock hits 52-week high at 15.4 USD - Investing.com",
+   "[google_news/Benzinga] Why Is Compass Pathways Stock Soaring Wednesday? - Compass Pathways (NASDAQ:CMPS) - Benzinga",
+   "[google_news/Pluang] Compass Pathways shares rise 4% on strong 52-we... - Pluang",
+   "[Proactive] Compass Pathways stock rises as 52-week data show lasting depression relief",
+   "[Yahoo] Compass Pathways stock rises as 52-week data show lasting depression relief"
+  ]
+ },
+ {
+  "ticker": "JPM",
+  "run_id": "2026-09-09_140026",
+  "n_articles": 11,
+  "pm_share": 0.8181818181818182,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 82% of the digest mentions JPM only in passing, never in a headline.",
+  "heads": [
+   "[Analyst Ratings] Analyst ratings: PVH sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: LITE sees 2 new coverage initiation(s) from 8 firm(s)",
+   "[Analyst Ratings] Analyst ratings: ALKT sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: FN sees 2 price-target revision(s) from 4 firm(s)",
+   "[Analyst Ratings] Analyst ratings: HWM sees 3 price-target revision(s) from 3 firm(s)",
+   "[Analyst Ratings] Analyst ratings: CASY sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: NVDA sees 1 new coverage initiation(s) from 20 firm(s)",
+   "[Barrons.com] Chime to Buy an Oklahoma Community Bank for $590 Million",
+   "[google_news/Benzinga] Healthcare ETFs Were Left Behind. JPMorgan Sees the Money Coming Back - Benzinga",
+   "[Benzinga] Healthcare ETFs Were Left Behind. JPMorgan Sees the Money Coming Back"
+  ]
+ },
+ {
+  "ticker": "BLTE",
+  "run_id": "2026-09-09_143028",
+  "n_articles": 12,
+  "pm_share": 0.0,
+  "score": 0.2278,
+  "raw": 0.28,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the Japan NDA submission for tinlarebant under Sakigake designation (2.3d old), reinforced by a cluster of analyst PT raises (H.C. Wainwright $214\u2192$245, Mizuho, Cantor, Morgan Stanley, Canaccord initiation at $303) and a modest Q3 EPS beat, with a golden-cross technical note adding momentum framing. The mechanism is estimate/PT revision and pipeline de-risking on top of the already-accepted FDA Priority Review (PDUFA Feb 12, 2027), which keeps a slow multi-day repricing bid alive. Much of the news is 1-3 days old and the stock has likely already reacted to the PT cluster, so the remaining move is a modest positive lean rather than a fresh high-impact catalyst.",
+  "heads": [
+   "[google_news/Yahoo Finance] Belite Bio, Inc. Sponsored ADR (BLTE)'s Technical Outlook is Bright After Key Golden Cross - Yahoo Finance",
+   "[google_news/Investing.com] Belite Bio stock price target raised to $245 by H.C. Wainwright on Japan NDA filing - Investing.com",
+   "[google_news/Investing.com] Mizuho raises Belite Bio stock price target on Japan drug filing - Investing.com",
+   "[google_news/Seeking Alpha] Belite Bio On Track For A Potential Blockbuster Launch In 2027 - Seeking Alpha",
+   "[SeekingAlpha] Belite Bio On Track For A Potential Blockbuster Launch In 2027",
+   "[Earnings/EPS] BLTE modestly beat EPS estimate by 9.9% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)",
+   "[Benzinga] HC Wainwright & Co. Maintains Buy on Belite Bio, Raises Price Target to $245",
+   "[Yahoo] Belite Bio Announces Submission of New Drug Application to the Ministry of Health, Labour, and Welfare in Japan under the Sakigake Designation System for Tinlareb",
+   "[Benzinga] Belite Bio Submits Japanese New Drug Application For Tinlarebant In Stargardt Disease Type 1"
+  ]
+ },
+ {
+  "ticker": "PHVS",
+  "run_id": "2026-09-09_080009",
+  "n_articles": 20,
+  "pm_share": 0.25,
+  "score": 0.1242,
+  "raw": 0.14,
+  "catalyst": "fda_clinical",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the CHAPTER-3 Phase 3 topline win for Pharvaris' oral HAE therapy (83% reduction in monthly swelling attacks), which drove a 14-17% surge to record highs roughly 2 days ago; analyst PT raises (RBC, Guggenheim, Citizens, Oppenheimer) and the BCRX competitive read-through confirm the positive fundamental repricing. However, the move is already largely priced in after the outsized one-day spike, and the modest Q3 EPS miss (-7.1%) plus a flagged insider stock sale add minor offsetting pressure, so only a small positive follow-through residual remains.",
+  "heads": [
+   "[Earnings/EPS] PHVS modestly missed EPS estimate by 7.1% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: PHVS sees 3 price-target revision(s) from 5 firm(s)",
+   "[Stocktwits] BCRX Stock Posts Worst Day In Over 6 Months After PHVS Trial Win In Rare Swelling Disease",
+   "[google_news/Stocktwits] BCRX Stock Posts Worst Day In Over 6 Months After PHVS Trial Win In Rare Swelling Disease - Stocktwits",
+   "[google_news/pluang.com] Pharvaris stock jumps after positive HAE drug t... - pluang.com",
+   "[google_news/Stock Titan] Insider at Pharvaris (PHVS) lines up new stock sale - Stock Titan",
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[google_news/Investing.com] Oppenheimer raises Pharvaris stock price target on trial results - Investing.com",
+   "[google_news/Endpoints News] Pharvaris\u2019 stock jumps on pivotal success in rare genetic disease - Endpoints News",
+   "[Stocktwits] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?"
+  ]
+ },
+ {
+  "ticker": "XLK",
+  "run_id": "2026-09-10_070017",
+  "n_articles": 18,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions XLK only in passing, never in a headline.",
+  "heads": [
+   "[MT Newswires] Sector Update: Tech Stocks Ease Late Afternoon",
+   "[Yahoo] Sector Update: Tech Stocks Ease Late Afternoon",
+   "[SeekingAlpha] How Autonomous Agent Risks Are Reshaping Cybersecurity Investing",
+   "[SeekingAlpha] Welcome Back, Balanced Portfolio",
+   "[SeekingAlpha] A Two-Story Market: AI Optimism And Iran Fear Power U.S. Stocks",
+   "[Benzinga] Oil Hits $100: Which Stocks And ETFs Win Or Lose?",
+   "[Benzinga] Leading And Lagging Sectors For September 9, 2026",
+   "[SeekingAlpha] Quality Control: When Profits Run Ahead Of Cash",
+   "[SeekingAlpha] ValuEngine Weekly Commentary: Advancing Nuclear Energy And Evaluating Its Current Place Within Dynamic Asset Strategies",
+   "[Yahoo] QQQ vs QQQM: Same Index, Same Stocks, Different Fee \u2013 and the Math Says One Leaves You Thousands Richer"
+  ]
+ },
+ {
+  "ticker": "BLTE",
+  "run_id": "2026-09-09_153000",
+  "n_articles": 8,
+  "pm_share": 0.0,
+  "score": 0.3292,
+  "raw": 0.42,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "Belite Bio is riding a cluster of fresh, hard, company-specific catalysts: a modest Q3 EPS beat (+9.9%), a wave of analyst PT raises (H.C. Wainwright $214\u2192$245, Mizuho, Morgan Stanley, Cantor) tied to a Japan NDA filing, and a new Buy initiation at $303 (Canaccord), plus a bullish Seeking Alpha thesis on a 2027 blockbuster launch. The mechanism is positive estimate/PT revision flow and momentum buying after a golden-cross technical signal, with the Japan regulatory filing as the fundamental driver. Much of the analyst action is 27\u201336h old and the golden-cross piece is aggregator commentary, so the residual move is a moderate positive lean rather than a full high-impact re-rating.",
+  "heads": [
+   "[Zacks] Belite Bio, Inc. Sponsored ADR (BLTE)'s Technical Outlook is Bright After Key Golden Cross",
+   "[google_news/Yahoo Finance] Belite Bio, Inc. Sponsored ADR (BLTE)'s Technical Outlook is Bright After Key Golden Cross - Yahoo Finance",
+   "[google_news/Investing.com] Belite Bio stock price target raised to $245 by H.C. Wainwright on Japan NDA filing - Investing.com",
+   "[google_news/Investing.com] Mizuho raises Belite Bio stock price target on Japan drug filing - Investing.com",
+   "[google_news/Seeking Alpha] Belite Bio On Track For A Potential Blockbuster Launch In 2027 - Seeking Alpha",
+   "[Earnings/EPS] BLTE modestly beat EPS estimate by 9.9% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)",
+   "[MarketBeat] Belite Bio Wins FDA Priority Review for Tinlarebant in Stargardt Disease"
+  ]
+ },
+ {
+  "ticker": "IBB",
+  "run_id": "2026-09-09_205526",
+  "n_articles": 13,
+  "pm_share": 0.7692307692307693,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 77% of the digest mentions IBB only in passing, never in a headline.",
+  "heads": [
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[Stocktwits] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Barrons.com] Roivant Sciences Stock Soars as Lung Disease Drug Hits Goals",
+   "[Benzinga] QUICK SPARK: Amgen Stock Eyes Worst Day Since October 2000",
+   "[Benzinga] Roivant Stock Surges on 'Robust' Data from Rare Lung Disease Candidate",
+   "[Benzinga] What's Going On With Amgen Stock Tuesday?",
+   "[24/7 Wall St.] IBB Just Beat the S&P 500 by 22 Points in Three Months. Are You Late to the Party?",
+   "[Zacks Investment Research] McDonald's Trades at 19.15X P/E: Is This a Discounted Opportunity?",
+   "[Zacks Investment Research] Brokers Suggest Investing in AppFolio (APPF): Read This Before Placing a Bet",
+   "[Zacks Investment Research] The Zacks Analyst Blog Highlights SpaceX, NASA, Rocket Lab, ARKX, UFO and WARP"
+  ]
+ },
+ {
+  "ticker": "OXM",
+  "run_id": "2026-09-10_090016",
+  "n_articles": 14,
+  "pm_share": 0.0,
+  "score": -0.1496,
+  "raw": -0.18,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the Q2 FY2026 earnings report from ~6 days ago, where Oxford Industries beat on EPS/revenue but cut full-year guidance due to Lilly Pulitzer weakness and soft consumer demand, sending shares down ~15-18%. That hard negative catalyst is now largely priced in after the sharp sell-off, but the fresh 12h-old analyst PT cuts (Telsey -20%, Truist -18%, Citigroup -8%) show estimate revisions are still working through the Street, keeping a modest negative drift. The CEO's open-market purchase of $108k (18h ago) is a small positive offset but too small to reverse the bearish guidance-driven tone.",
+  "heads": [
+   "[Analyst Ratings] Analyst ratings: OXM sees 3 price-target revision(s) from 3 firm(s)",
+   "[google_news/MarketBeat] Thomas Caldecot Chubb III Acquires 3,500 Shares of Oxford Industries (NYSE:OXM) Stock - MarketBeat",
+   "[google_news/Investing.com] Oxford Industries CEO Chubb acquires $108k in common stock - Investing.com",
+   "[google_news/Stock Titan] Oxford Industries (NYSE: OXM) CEO just bought shares on the open market - Stock Titan",
+   "[Motley Fool] Oxford Industries (OXM) Q2 2026 Earnings Call Transcript",
+   "[StockStory] Why Oxford Industries (OXM) Stock Is Falling Today",
+   "[StockStory] OXM Q2 Deep Dive: Guidance Cut as Lilly Pulitzer Weighs on Mixed Portfolio",
+   "[Moby] Oxford Industries, Inc. Q2 2026 Earnings Call Summary",
+   "[Benzinga] How To Earn $500 A Month From Oxford Industries Stock Ahead Of Q2 Earnings",
+   "[InvestorsHub] Oxford Industries Shares Fall 14.3% After Full-Year Guidance Cut"
+  ]
+ },
+ {
+  "ticker": "ATAI",
+  "run_id": "2026-09-09_060005",
+  "n_articles": 8,
+  "pm_share": 0.25,
+  "score": 0.0,
+  "raw": 0.0,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "ATAI is an acquisition target being absorbed by Eli Lilly \u2014 shareholders cleared the merger and the stock trades at $7.28 with a 53-cent CVR, effectively pinned to deal terms. The 59% after-hours spike and the EPS beat/short-covering items are stale or deal-related noise; the remaining move is nil because the all-cash/stock consideration fixes the price. This is the abstention case of a merger target pinned at a certain offer price.",
+  "heads": [
+   "[Earnings/EPS] ATAI significantly beat EPS estimate by 19.4% (Q3 2026 results)",
+   "[Short Interest] ATAI: short interest falls 55% MoM to 5% of float \u2014 covering provides price support",
+   "[Analyst Ratings] Analyst ratings: ATAI sees 1 downgrade(s) from 1 firm(s)",
+   "[google_news/ts2.tech] ATAI Stock at $7.28 After Lilly Vote\u2014What the 53-Cent CVR Price Means - ts2.tech",
+   "[google_news/Stocktwits] Why Is ATAI Stock Soaring 59% After-Hours? - Stocktwits",
+   "[google_news/Stock Titan] Shareholders clear Lilly merger for AtaiBeckley (ATAI), with closing still subject to conditions - Stock Titan",
+   "[Zacks Investment Research] Lilly Builds Neuroscience into a New Long-Term Growth Driver",
+   "[SEC 8-K Filing] ATAI SEC 8-K \u2014 Item 5.07"
+  ]
+ },
+ {
+  "ticker": "GDX",
+  "run_id": "2026-09-10_113010",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": 0.117,
+  "raw": 0.18,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "Coverage is uniformly bullish on gold and gold miners: August gold surged 9.67% (best month since January) on geopolitical hopes, Treasury buyback plans and central bank demand, with miners dramatically outperforming, and a second piece highlights a major buyer doubling down as a strong signal. The mechanism is straightforward \u2014 higher gold prices and central-bank buying lift the net asset value of GDX's miner holdings, with operating leverage amplifying the move. However, the rally is already realized (August performance, articles 10\u201328h old), so much of the move is priced in and only modest follow-through remains, keeping this a lean rather than a high-conviction call.",
+  "heads": [
+   "[SeekingAlpha] What August's Gold Rally Means For Gold Mining Equities",
+   "[GuruFocus.com] Gold Prices Flash Strong Signal as Major Buyer Doubles Down",
+   "[Yahoo] Gold Prices Flash Strong Signal as Major Buyer Doubles Down"
+  ]
+ },
+ {
+  "ticker": "CRNX",
+  "run_id": "2026-09-10_023007",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": 0.0469,
+  "raw": 0.12,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "The only item is a headline about Vertex Pharma stock falling as the market digests a Crinetics deal and valuation risks \u2014 a read-through that frames CRNX as the acquired/partnered party in a deal, which is bullish for CRNX (takeover premium) but the article is a stale, indirect aggregator piece with no terms, price, or confirmation disclosed. The mechanism is a possible M&A premium already being discussed, so the residual lean is small and positive; much of any deal reaction is likely already reflected in the framing.",
+  "heads": [
+   "[google_news/ad-hoc-news.de] Vertex Pharma stock falls as market digests Crinetics deal and valuation risks - ad-hoc-news.de"
+  ]
+ },
+ {
+  "ticker": "SNAP",
+  "run_id": "2026-09-09_200022",
+  "n_articles": 11,
+  "pm_share": 0.36363636363636365,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 36% of the digest mentions SNAP only in passing, never in a headline.",
+  "heads": [
+   "[google_news/Seeking Alpha] Snap: Don't Count On SPECS To Drive The Stock Higher (NYSE:SNAP) - Seeking Alpha",
+   "[google_news/Stocktwits] SNAP Stock Rises Premarket: CEO Sets 2027 Target To Move Beyond Ads Into Commerce, Retail Still Bearish - Stocktwits",
+   "[Stocktwits] SNAP Stock Rises Premarket: CEO Sets 2027 Target To Move Beyond Ads Into Commerce, Retail Still Bearish",
+   "[Stocktwits] Stock Rises Premarket: CEO Sets 2027 Target To Move Beyond Ads Into Commerce, Retail Still Bearish",
+   "[google_news/TradingView] SNAP Stock Rises Premarket: CEO Sets 2027 Target To Move Beyond Ads Into Commerce, Retail Still Bearish - TradingView",
+   "[Earnings/EPS] SNAP significantly beat EPS estimate by 18.3% (Q3 2026 results)",
+   "[google_news/Stock Titan] Snap Inc (SNAP) legal chief sells shares in preset trade - Stock Titan",
+   "[Axios] Exclusive: Snap names Ronan Harris chief commercial officer",
+   "[Wired] Apple and Google Miss Deadline to Block Child Nudity on Their Phones in the UK",
+   "[SEC 8-K Filing] SNAP SEC 8-K \u2014 Departure or Appointment of Principal Officers/Directors"
+  ]
+ },
+ {
+  "ticker": "XBI",
+  "run_id": "2026-09-09_003023",
+  "n_articles": 20,
+  "pm_share": 0.55,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 55% of the digest mentions XBI only in passing, never in a headline.",
+  "heads": [
+   "[Yahoo] Goldman Sachs Just Added Vertex Pharmaceuticals to Its Conviction List. Here's the Bull Case for the Big Biotech Stock",
+   "[Investor's Business Daily] How Novartis' Double-Stacked Failures Reverberated Through Biopharma",
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[google_news/Finimize] Novartis\u2019 Trial Miss Sent Shockwaves Through Biotech Stocks - Finimize",
+   "[Stocktwits] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Yahoo] How Novartis' Double-Stacked Failures Reverberated Through Biopharma",
+   "[google_news/Investor's Business Daily] How Novartis' Double-Stacked Failures Shook Biotech - Investor's Business Daily",
+   "[Barrons.com] Roivant Sciences Stock Soars as Lung Disease Drug Hits Goals",
+   "[google_news/Fierce Biotech] Pharvaris' latest phase 3 win builds case for HAE drug with FDA verdict pending - Fierce Biotech",
+   "[Yahoo] How Novartis And Ionis' High-Profile Failure Reverberated Through Biopharma"
+  ]
+ },
+ {
+  "ticker": "NET",
+  "run_id": "2026-09-10_060028",
+  "n_articles": 20,
+  "pm_share": 0.05,
+  "score": -0.12,
+  "raw": -0.12,
+  "catalyst": "product",
+  "engine": "deepseek",
+  "rationale": "Cloudflare already surged ~10.5% intraday on a combination of an upbeat CFO outlook at a Goldman conference, a new OpenAI-powered AI security product, and FedRAMP/government wins, with shares slipping after hours per Benzinga \u2014 the catalyst is largely priced in. The modest Q3 EPS beat (+7.5%) and short-interest decline to 3% of float are supportive but stale/secondary, and the after-hours fade signals exhaustion. Residual 1-5 day move is a small negative lean on mean-reversion of an extended one-day spike.",
+  "heads": [
+   "[Earnings/EPS] NET modestly beat EPS estimate by 7.5% (Q3 2026 results)",
+   "[Short Interest] NET: short interest falls 24% MoM to 3% of float \u2014 covering provides price support",
+   "[google_news/TechStock\u00b2] Cloudflare Stock Jumps 10.5%\u2014The OpenAI Product Faces a 41\u00d7 Sales Test - TechStock\u00b2",
+   "[google_news/Benzinga] Cloudflare Shares Slip After Hours Following Intraday Surge - Meta Platforms (NASDAQ:META), Cloudflare (N - Benzinga",
+   "[Insider Monkey] Cloudflare (NET) Soars 10.5% on Upbeat Outlook, Says Opportunities \u2018Larger\u2019 Than Business",
+   "[Yahoo] Cloudflare (NET) Soars 10.5% on Upbeat Outlook, Says Opportunities \u2018Larger\u2019 Than Business",
+   "[google_news/Yahoo Finance] Cloudflare (NET) Soars 10.5% on Upbeat Outlook, Says Opportunities \u2018Larger\u2019 Than Business - Yahoo Finance",
+   "[google_news/The Motley Fool] Why Cloudflare Rallied Today - The Motley Fool",
+   "[Motley Fool] Why Cloudflare Rallied Today",
+   "[Yahoo] Why Cloudflare Rallied Today"
+  ]
+ },
+ {
+  "ticker": "LRCX",
+  "run_id": "2026-09-10_150808",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": -0.0158,
+  "raw": -0.04,
+  "catalyst": "insider_activity",
+  "engine": "deepseek",
+  "rationale": "A single article reports a Lam Research director lining up a 2026 stock sale, a forward-looking 10b5-1 style plan disclosure rather than an open-market sale today. Insider selling leans slightly negative, but the distant 2026 timing and routine plan nature make this a very soft, low-conviction signal with no immediate supply hitting the market.",
+  "heads": [
+   "[google_news/stocktitan.net] Lam Research (NASDAQ: LRCX) director lines up 2026 stock sale - stocktitan.net"
+  ]
+ },
+ {
+  "ticker": "XLV",
+  "run_id": "2026-09-09_100001",
+  "n_articles": 19,
+  "pm_share": 0.6842105263157895,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 68% of the digest mentions XLV only in passing, never in a headline.",
+  "heads": [
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Late Afternoon",
+   "[Stocktwits] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Yahoo] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Tuesday Afternoon",
+   "[prnewswire_ma] Central Admixture Pharmacy Services Announces Sale of 503B Product Portfolio to Quva Pharma",
+   "[Yahoo] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[Barrons.com] Roivant Sciences Stock Soars as Lung Disease Drug Hits Goals",
+   "[Yahoo] Roivant Sciences Stock Soars as Lung Disease Drug Hits Goals",
+   "[Yahoo] Why These Two Hot Biotech Stocks Just Surged To Record Highs"
+  ]
+ },
+ {
+  "ticker": "XBI",
+  "run_id": "2026-09-09_113005",
+  "n_articles": 20,
+  "pm_share": 0.7,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 70% of the digest mentions XBI only in passing, never in a headline.",
+  "heads": [
+   "[globenewswire_pubco] Kane Biotech to Host Commercial Update Webcast on September 16",
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[Stocktwits] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Yahoo] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Yahoo] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[Barrons.com] Roivant Sciences Stock Soars as Lung Disease Drug Hits Goals",
+   "[Yahoo] Roivant Sciences Stock Soars as Lung Disease Drug Hits Goals",
+   "[Yahoo] Why These Two Hot Biotech Stocks Just Surged To Record Highs",
+   "[Benzinga] Roivant Stock Surges on 'Robust' Data from Rare Lung Disease Candidate",
+   "[Yahoo] Roivant Stock Surges on 'Robust' Data from Rare Lung Disease Candidate"
+  ]
+ },
+ {
+  "ticker": "GME",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": 0.14,
+  "raw": 0.14,
+  "catalyst": "insider_activity",
+  "engine": "deepseek",
+  "rationale": "GameStop's Q2 beat (collectibles sales +57%, most profitable Q2 ever) plus multiple director open-market buys (~$1M by Lawrence Cheng, $196K by James Grube) drove a ~4-5% move already taken, with retail traders now speculating on a Ryan Cohen follow-on. The hard catalyst is largely priced after the one-day pop, so the residual is a modest positive lean from insider-buy follow-through and bullish commentary, tempered by the fact that the earnings surprise and the buys are already reflected in the price.",
+  "heads": [
+   "[google_news/Stocktwits] GME Stock Ticks Higher Overnight: Retail Traders Buoyed By Another Insider Buy, Speculate Ryan Cohen To Be 'Next With Big One' - Stocktwits",
+   "[Stocktwits] GME Stock Ticks Higher Overnight: Retail Traders Buoyed By Another Insider Buy, Speculate Ryan Cohen To Be 'Next With Big One'",
+   "[google_news/simplywall.st] GameStop (GME) Stock Gains Spotlight As Profit Holds While Sales Shrink - simplywall.st",
+   "[google_news/Investing.com] GameStop director James Grube buys $196,075 in stock - Investing.com",
+   "[google_news/Stock Titan] GameStop (NYSE: GME) director adds to stake in fresh stock purchase - Stock Titan",
+   "[google_news/MarketBeat] Traders Purchase Large Volume of GameStop Call Options (NYSE:GME) - MarketBeat",
+   "[google_news/FXLeaders] GME Stock Surges Above $20 and Eyes $25 as GameStop Profit Rises Despite Decline in Quarterly Revenue - FXLeaders",
+   "[google_news/Benzinga] Why Is GameStop Stock Surging on Wednesday? - Benzinga",
+   "[google_news/foreignpolicyjournal.com] GameStop (NYSE: GME) Smashes Q2 Estimates As Collectibles Sales Surge 57% - foreignpolicyjournal.com",
+   "[24/7 Wall St.] GameStop Rises 4% as Collectibles Sales Jump 57% and a Director Buys $1M"
+  ]
+ },
+ {
+  "ticker": "SNAP",
+  "run_id": "2026-09-09_033027",
+  "n_articles": 4,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 50% of the digest mentions SNAP only in passing, never in a headline.",
+  "heads": [
+   "[google_news/Stock Titan] Snap Inc (SNAP) legal chief sells shares in preset trade - Stock Titan",
+   "[Axios Media] Exclusive: Snap names Ronan Harris chief commercial officer",
+   "[Yahoo] Snap Names Ronan Harris Chief Commercial Officer",
+   "[Earnings/EPS] SNAP significantly beat EPS estimate by 18.3% (Q3 2026 results)"
+  ]
+ },
+ {
+  "ticker": "GWRE",
+  "run_id": "2026-09-09_173010",
+  "n_articles": 19,
+  "pm_share": 0.05263157894736842,
+  "score": 0.1022,
+  "raw": 0.12,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the post-earnings selloff: GWRE beat Q4 EPS by 5.5% but issued soft FY2027/next-quarter revenue guidance (~3.3% below consensus), triggering a ~21% plunge 5-6 days ago that has already largely repriced the disappointment. The stock is now in a post-plunge consolidation with mixed-to-constructive analyst revisions (Piper Overweight $210, Citigroup PT hike to $181, average PT $212 vs ~$150 price) and a routine 10b5-1 CEO stock sale (only 1,200 shares, ~$245K, immaterial), so the residual 1-5 day move is a modest positive mean-reversion lean rather than a fresh directional catalyst.",
+  "heads": [
+   "[google_news/The Motley Fool] Guidewire CEO Michael Rosenbaum Sells 1,200 Shares for $245,328 - The Motley Fool",
+   "[Motley Fool] Guidewire CEO Michael Rosenbaum Sells 1,200 Shares for $245,328",
+   "[google_news/Investing.com UK] D.A. Davidson reiterates Guidewire stock rating on solid results By Investing.com - Investing.com UK",
+   "[Earnings/EPS] GWRE modestly beat EPS estimate by 5.5% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: GWRE sees 1 new coverage initiation(s) from 11 firm(s)",
+   "[google_news/GuruFocus] Guidewire Software (GWRE) CEO Michael Rosenbaum Sells 1,200 Shar - GuruFocus",
+   "[google_news/GuruFocus] A Look at Guidewire Software Inc (GWRE) After 7.8% Decline -- GF Value $209.45 vs Price $149.71 - GuruFocus",
+   "[google_news/GuruFocus] GWRE Looks 28.5% Undervalued on GF Value\u2122 as Shares Slide Amid G - GuruFocus",
+   "[google_news/Seeking Alpha] Guidewire Software falls 8% amid post-earnings selloff (GWRE:NYSE) - Seeking Alpha",
+   "[google_news/Stock Titan] Guidewire Software (GWRE) CEO stock sale runs on preset 10b5-1 plan - Stock Titan"
+  ]
+ },
+ {
+  "ticker": "SMH",
+  "run_id": "2026-09-09_230002",
+  "n_articles": 20,
+  "pm_share": 0.3,
+  "score": 0.18,
+  "raw": 0.18,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The digest is dominated by bullish AI-semiconductor commentary \u2014 Broadcom's $230B 2028 AI revenue forecast and $900 price target, Qualcomm's Amazon custom-silicon win, BofA flagging Micron/AMD as winners, Melius noting the Nvidia gap could narrow, and Asian chip names (SK Hynix, Samsung) rallying \u2014 all of which are direct read-throughs to SMH's top holdings (NVDA, TSM, AVGO, AMD, MU, QCOM). The mechanism is a sector-wide sentiment/estimate lift for AI compute and memory, with the fund's price tracking its holdings. However, these are mostly aggregator/commentary pieces (Motley Fool, GuruFocus, Seeking Alpha) rather than fresh hard catalysts, and the Broadcom forecast is a reiteration of prio",
+  "heads": [
+   "[google_news/The Motley Fool] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result. - The Motley Fool",
+   "[Motley Fool] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result.",
+   "[google_news/Yahoo Finance] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result. - Yahoo Finance",
+   "[google_news/The Globe and Mail] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom - The Globe and Mail",
+   "[google_news/The Motley Fool] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom - The Motley Fool",
+   "[Motley Fool] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom",
+   "[Yahoo] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom",
+   "[GuruFocus.com] Bank of America Spots a Major Semiconductor. Micron and AMD Are Big Winners",
+   "[google_news/Seeking Alpha] Nvidia gap with other chip stocks could narrow amid increased cash return: Melius (NVDA:NASDAQ) - Seeking Alpha",
+   "[Benzinga] Analog Devices to Buy Alif Semiconductor for $1.35 Billion"
+  ]
+ },
+ {
+  "ticker": "MS",
+  "run_id": "2026-09-09_200022",
+  "n_articles": 15,
+  "pm_share": 0.6666666666666666,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 67% of the digest mentions MS only in passing, never in a headline.",
+  "heads": [
+   "[Barrons.com] Meta\u2019s AI Agent for Consumers Has Arrived. Alphabet and Amazon Should Watch Out.",
+   "[google_news/Yahoo Finance] ORCL Stock Sees Price Target Cut Ahead Of Earnings: Analyst Says Bad News Is Priced In - Yahoo Finance",
+   "[Yahoo] Meta\u2019s AI Agent for Consumers Has Arrived. Alphabet and Amazon Should Watch Out.",
+   "[google_news/Barchart.com] Morgan Stanley Deems Apple's September 9 Event 'Most Consequential in a Decade': What AAPL Stock Investors Should Know - Barchart.com",
+   "[Analyst Ratings] Analyst ratings: PTON sees 1 downgrade(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: AVGO sees 1 upgrade(s) from 14 firm(s)",
+   "[Analyst Ratings] Analyst ratings: LITE sees 2 new coverage initiation(s) from 8 firm(s)",
+   "[Analyst Ratings] Analyst ratings: CHYM sees 1 new coverage initiation(s) from 5 firm(s)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)",
+   "[Analyst Ratings] Analyst ratings: AMGN sees 1 downgrade(s) from 9 firm(s)"
+  ]
+ },
+ {
+  "ticker": "ATAI",
+  "run_id": "2026-09-09_050005",
+  "n_articles": 7,
+  "pm_share": 0.14285714285714285,
+  "score": 0.0,
+  "raw": 0.0,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "ATAI is being acquired by Eli Lilly \u2014 shareholders cleared the merger and the stock is pinned near the deal/CVR value ($7.28, 53-cent CVR), with the 59% after-hours spike already reflecting the deal terms. The EPS beat, short covering, and Deutsche Bank downgrade are all secondary noise against a merger that fixes the price; the remaining move is essentially nil, so this is the all-cash/merger-pinned abstention case.",
+  "heads": [
+   "[Earnings/EPS] ATAI significantly beat EPS estimate by 19.4% (Q3 2026 results)",
+   "[Short Interest] ATAI: short interest falls 55% MoM to 5% of float \u2014 covering provides price support",
+   "[Analyst Ratings] Analyst ratings: ATAI sees 1 downgrade(s) from 1 firm(s)",
+   "[google_news/TechStock\u00b2] ATAI Stock at $7.28 After Lilly Vote\u2014What the 53-Cent CVR Price Means - TechStock\u00b2",
+   "[google_news/Stocktwits] Why Is ATAI Stock Soaring 59% After-Hours? - Stocktwits",
+   "[google_news/stocktitan.net] Shareholders clear Lilly merger for AtaiBeckley (ATAI), with closing still subject to conditions - stocktitan.net",
+   "[Zacks Investment Research] Lilly Builds Neuroscience into a New Long-Term Growth Driver"
+  ]
+ },
+ {
+  "ticker": "SUNE",
+  "run_id": "2026-09-10_080000",
+  "n_articles": 12,
+  "pm_share": 0.0,
+  "score": -0.0757,
+  "raw": -0.08,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "SUNation Energy spiked ~26-33% on news that its pending merger partner Suniva completed an $835M capital raise to fund U.S. solar cell manufacturing expansion, boosting merger optimism; the stock has already surged sharply on this catalyst, so most of the positive repricing is consumed. The residual follow-through is likely small and slightly negative as an extended mover mean-reverts, though short interest falling 59% MoM to 3% of float provides some support. Netting the already-priced spike against modest covering support, the remaining 1-5 day move is a small negative lean.",
+  "heads": [
+   "[Short Interest] SUNE: short interest falls 59% MoM to 3% of float \u2014 covering provides price support",
+   "[google_news/Benzinga] AAPL, META, AVAV, SUNE, SEO: 5 Trending Stocks Today - Apple (NASDAQ:AAPL) - Benzinga",
+   "[google_news/Quiver Quantitative] SUNation Energy Surges as Suniva Financing Boosts Merger Optimism - Quiver Quantitative",
+   "[google_news/StocksToTrade] SUNE Stock Pops As SUNation Hits 800-Battery Milestone - StocksToTrade",
+   "[google_news/StocksToTrade] SUNE Stock Gains Attention As SUNation Hits 800 Battery Installs - StocksToTrade",
+   "[google_news/Blockonomi] SUNation Energy (SUNE) Stock Soars 26% Following Suniva\u2019s $835M Funding Milestone - Blockonomi",
+   "[google_news/timothysykes.com] SUNE Stock Squeezes Higher As Battery Milestone Hits - timothysykes.com",
+   "[google_news/StocksToTrade] SUNE Stock Pops As SUNation Energy Hits 800 Battery Installs - StocksToTrade",
+   "[google_news/ts2.tech] SUNE Stock Jumps 33% on $835 Million Suniva Raise\u2014Why the 1.8% Stake Matters - ts2.tech",
+   "[google_news/Benzinga] Why Is SUNation Energy Stock Soaring Wednesday? - SUNation Energy (NASDAQ:SUNE) - Benzinga"
+  ]
+ },
+ {
+  "ticker": "SKHY",
+  "run_id": "2026-09-10_123011",
+  "n_articles": 20,
+  "pm_share": 0.1,
+  "score": 0.18,
+  "raw": 0.18,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "SKHY posted a massive Q3 2026 EPS beat (+86.1%, $9.06 vs $4.87) roughly 12h ago, and JPMorgan initiated at Overweight with a $245 PT (~9h ago), both hard bullish catalysts; however the ADR already jumped 7% and trades at a 44% premium to local shares, and pre-market memory names are falling ~3% on sector-wide weakness plus Bank of Korea volatility warnings. Netting the fresh earnings beat and analyst initiation against the already-priced spike and negative pre-market sector tape, the residual 1-5 day lean is modestly positive but heavily dampened.",
+  "heads": [
+   "[yahoo_finance] Here Are Thursday\u2019s Top Wall Street Analyst Research Calls: Advanced Micro Devices, Amgen, AngloGold Ashanti, Caterpillar, Chewy, Meta Platforms, Novartis",
+   "[google_news/24/7 Wall St.] Here Are Thursday\u2019s Top Wall Street Analyst Research Calls: Advanced Micro Devices, Amgen, AngloGold Ashanti, Caterpillar, Chewy, Meta Platfor",
+   "[google_news/TradingKey] \u3010US Pre-Market\u3011PPI Set for Release, Brent Crude Tops $102, Memory Chip Stocks Fall Broadly, SK Hynix Drops Over 3% - TradingKey",
+   "[google_news/StocksToTrade] SKHY Stock Climbs As Traders Focus On Breakout Momentum - StocksToTrade",
+   "[google_news/Benzinga] Why Is SK Hynix Stock Falling on Thursday? - Benzinga",
+   "[google_news/TipRanks] Why Are Memory Chip Stocks Micron, SanDisk, and SK Hynix Falling in Pre-Market Today, Sept. 10? - TipRanks",
+   "[The Wall Street Journal] Korea Central Bank Sounds Alarm About AI Trading Frenzy",
+   "[google_news/Seoul Economic Daily] Samsung, SK hynix Drove 99% of KOSPI's Climb to 9,000 - Seoul Economic Daily",
+   "[google_news/bloomingbit] Samsung, SK Hynix Swings Made South Korea\u2019s Stock Market the Most Volatile Among Major Markets - bloomingbit",
+   "[google_news/thelec.net] SK hynix Revises Bonus Plan to 50% Cash, 50% Stock - thelec.net"
+  ]
+ },
+ {
+  "ticker": "BAC",
+  "run_id": "2026-09-09_150012",
+  "n_articles": 7,
+  "pm_share": 0.14285714285714285,
+  "score": 0.0,
+  "raw": 0.0,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "The only items touching BAC are analyst-commentary pieces where Bank of America's research desk opines on Apple, Google and Meta \u2014 BAC is the author, not the subject, so there is no read-through to BAC's own earnings, capital or price. The remaining articles concern Amalgamated Bank of Chicago and Bank of New York Mellon stakes in UTZ/OXM, unrelated entities with no plausible link to BAC. With no catalyst, peer event or sector development connected to the target, this is a pure abstention.",
+  "heads": [
+   "[prnewswire_financial] ABOC RELOCATES HEADQUARTERS, OPENS NEW FULL-SERVICE BRANCH AT 101 N. WACKER DRIVE",
+   "[google_news/thestreet.com] Bank of America\u2019s unique take on Apple stock as Ternus takes reins - thestreet.com",
+   "[Yahoo] Bank of America Has a Stark Message for Google Stock as AI Rivals Surge",
+   "[google_news/TradingView] Bank of America Has a Stark Message for Google Stock as AI Rivals Surge - TradingView",
+   "[google_news/MarketBeat] 220,957 Shares in Utz Brands, Inc. $UTZ Purchased by Bank of New York Mellon Corp - MarketBeat",
+   "[google_news/MarketBeat] Bank of New York Mellon Corp Invests $2.05 Million in Oxford Industries, Inc. $OXM - MarketBeat",
+   "[google_news/thestreet.com] Bank of America sends wake-up call to Meta stock investors - thestreet.com"
+  ]
+ },
+ {
+  "ticker": "XLV",
+  "run_id": "2026-09-10_003023",
+  "n_articles": 10,
+  "pm_share": 0.9,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 90% of the digest mentions XLV only in passing, never in a headline.",
+  "heads": [
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Late Afternoon",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Tuesday Afternoon",
+   "[Yahoo] Amgen Falls 10% as Novartis Trial Failure Clouds a Cholesterol Drug Class; NVS Stock Drops 14%",
+   "[Yahoo] Cramer Says It\u2019s Time To Buy The Dip on JNJ",
+   "[Yahoo Entertainment] Twist Bioscience (TWST) Rallied as AI and Pharma Drive DNA Demand",
+   "[Benzinga] Healthcare ETFs Were Left Behind. JPMorgan Sees the Money Coming Back",
+   "[Zacks Investment Research] Should You Invest in the ALPS Medical Breakthroughs ETF (SBIO)?",
+   "[Benzinga] Why Is Eli Lilly Stock Falling Tuesday?",
+   "[SeekingAlpha] Health Care's Next Act: Tailwinds Emerging Across R&D Cycle",
+   "[24/7 Wall St.] IBB Just Beat the S&P 500 by 22 Points in Three Months. Are You Late to the Party?"
+  ]
+ },
+ {
+  "ticker": "PANW",
+  "run_id": "2026-09-09_160015",
+  "n_articles": 3,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions PANW only in passing, never in a headline.",
+  "heads": [
+   "[24/7 Wall St.] Cloudflare Surges 9% on OpenAI Security Partnership, Zscaler Rises 3%",
+   "[Yahoo] Databook Launches the GTM Decision System: Actionable Customer Context for Enterprise Revenue",
+   "[Zacks] Company News for Sep 3, 2026"
+  ]
+ },
+ {
+  "ticker": "XLV",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 19,
+  "pm_share": 0.6842105263157895,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 68% of the digest mentions XLV only in passing, never in a headline.",
+  "heads": [
+   "[Insider Monkey] Is AbbVie (ABBV)\u2019s $10.9 Billion Apogee Therapeutics (APGE) Deal the Next Catalyst for Growth?",
+   "[Yahoo] Sector Update: Healthcare Stocks Softer Late Afternoon",
+   "[google_news/ad-hoc-news.de] Vertex Pharma stock falls as market digests Crinetics deal and valuation risks - ad-hoc-news.de",
+   "[Yahoo] Sector Update: Healthcare Stocks Decline in Afternoon Trading",
+   "[google_news/Seeking Alpha] Ten healthcare stocks with A-rated valuations and strong revenue growth (XLV:NYSEARCA) - Seeking Alpha",
+   "[Yahoo] UnitedHealth Slips 3% as TPG Buys Into Florida WellMed Clinics Ahead of Guidance Reaffirmation",
+   "[FX Empire] XLE, XLF & XLV Forecast: Energy Eyes Breakout as XLV Slips",
+   "[Yahoo] XLE, XLF & XLV Forecast: Energy Eyes Breakout as XLV Slips",
+   "[google_news/Stock Traders Daily] (XLV) Risk Channels and Responsive Allocation - Stock Traders Daily",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Late Afternoon"
+  ]
+ },
+ {
+  "ticker": "SNOW",
+  "run_id": "2026-09-10_060028",
+  "n_articles": 5,
+  "pm_share": 0.4,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 40% of the digest mentions SNOW only in passing, never in a headline.",
+  "heads": [
+   "[Motley Fool] Meet the AI Software Stock That\u2019s Crushing Palantir (Hint: It\u2019s Significantly Cheaper)",
+   "[24/7 Wall St.] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[Yahoo] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[StockStory] Palantir Technologies, Workiva, Elastic, RingCentral, and 8x8 Shares Skyrocket, What You Need To Know",
+   "[Barrons.com] Snowflake Stock Is Soaring. How the Software Giant\u2019s Earnings Silenced AI Skeptics."
+  ]
+ },
+ {
+  "ticker": "IRD",
+  "run_id": "2026-09-10_143409",
+  "n_articles": 20,
+  "pm_share": 0.05,
+  "score": 0.18,
+  "raw": 0.18,
+  "catalyst": "fda_clinical",
+  "engine": "deepseek",
+  "rationale": "Opus Genetics reported positive low-dose Cohort 1 data from its Phase 1/2 BIRD-1 trial of OPGx-BEST1 (4 of 5 patients with structural retinal improvements, all 5 with visual function gains) plus FDA alignment on pivotal endpoints and a path to Phase 3 dosing in 2027, alongside a Q3 EPS beat of 49.3% and multiple analyst PT hikes (Oppenheimer $10\u2192$20, Chardan $13\u2192$16, Wedbush raise on FDA alignment). The stock has already jumped ~30-32% on this news, so most of the initial catalyst is priced in; the residual move is modestly positive as estimate revisions and analyst upgrades continue to work through, but the outsized one-day spike limits follow-through. Score reflects a small positive lean g",
+  "heads": [
+   "[SeekingAlpha] Opus Genetics, Inc. (IRD) Discusses Topline Results From Cohort 1 of BEST1 Phase I/II Gene Therapy Trial Transcript",
+   "[google_news/trefis.com] Market Movers | Winners: IRD, FTK, BAND | Losers: TTAN, TBBK, OCGN - trefis.com",
+   "[google_news/TechStock\u00b2] Opus Genetics Stock Jumps 32% on Five-Patient Eye-Therapy Data\u2014What IRD Must Prove Next - TechStock\u00b2",
+   "[Earnings/EPS] IRD significantly beat EPS estimate by 49.3% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: IRD sees 2 price-target revision(s) from 4 firm(s)",
+   "[google_news/finance.biggo.com] Opus Genetics Shares Jump 30% as Low-Dose Gene Therapy Shows Vision Gains in Retinal Disease Trial - finance.biggo.com",
+   "[google_news/marketscreener.com] Opus Genetics Shares Rise After Reporting Vision Improvement in Phase 1/2 OPGx-BEST1 Trial - marketscreener.com",
+   "[Stocktwits] IRD Stock Hits Over 5-Year Highs \u2013 Opus Genetics Experimental Therapy Shows Early Promise In Retinal Diseases Trial",
+   "[Yahoo] IRD Stock Hits Over 5-Year Highs \u2013 Opus Genetics Experimental Therapy Shows Early Promise In Retinal Diseases Trial",
+   "[google_news/Stocktwits] IRD Stock Hits Over 5-Year Highs \u2013 Opus Genetics Experimental Therapy Shows Early Promise In Retinal Diseases Trial - Stocktwits"
+  ]
+ },
+ {
+  "ticker": "HWM",
+  "run_id": "2026-09-09_033027",
+  "n_articles": 17,
+  "pm_share": 0.29411764705882354,
+  "score": -0.2334,
+  "raw": -0.28,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is GE Aerospace's $11.75B acquisition of Consolidated Precision Products, a direct competitor in blades and vanes, which threatens Howmet's gas-turbine share and drove an 11% single-day drop (worst in S&P 500). The stock has already absorbed most of the initial shock, but negative hard catalysts of this competitive-threat type tend to drift lower for several sessions as analysts reassess share-loss risk, so a modest residual negative lean remains. The Zacks 'buy now' piece and Musk rare-earth commentary are secondary and do not offset the competitive overhang.",
+  "heads": [
+   "[Zacks] Why Howmet (HWM) Dipped More Than Broader Market Today",
+   "[Yahoo] Why Howmet (HWM) Dipped More Than Broader Market Today",
+   "[google_news/Yahoo Finance] Why Howmet (HWM) Dipped More Than Broader Market Today - Yahoo Finance",
+   "[google_news/GuruFocus] A Look at Howmet Aerospace Inc (HWM) After 10.7% Decline -- GF Value $164.33 vs Price $231.53 - GuruFocus",
+   "[The Wall Street Journal] Canada\u2019s Tariffs Take Effect",
+   "[google_news/Investing.com] Why is Howmet Aerospace stock sliding today? - Investing.com",
+   "[google_news/AD HOC NEWS] Howmet Aerospace stock falls as GE Aerospace deal and SpaceX plans weigh on sentiment - AD HOC NEWS",
+   "[Yahoo] GE's CPP Deal Isn't About EPS Accretion, Says Jefferies \u2014 It's 'An Impactful Move In The Blades & Vanes War Games'",
+   "[Zacks] Howmet Rises 26.5% Year to Date: Should Investors Buy the Stock Now?",
+   "[Yahoo] Howmet Rises 26.5% Year to Date: Should Investors Buy the Stock Now?"
+  ]
+ },
+ {
+  "ticker": "SNOW",
+  "run_id": "2026-09-10_070017",
+  "n_articles": 1,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions SNOW only in passing, never in a headline.",
+  "heads": [
+   "[Motley Fool] Meet the AI Software Stock That\u2019s Crushing Palantir (Hint: It\u2019s Significantly Cheaper)"
+  ]
+ },
+ {
+  "ticker": "XBI",
+  "run_id": "2026-09-09_235019",
+  "n_articles": 2,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions XBI only in passing, never in a headline.",
+  "heads": [
+   "[Insider Monkey] Is AbbVie (ABBV)\u2019s $10.9 Billion Apogee Therapeutics (APGE) Deal the Next Catalyst for Growth?",
+   "[24/7 Wall St.] IBB Just Beat the S&P 500 by 22 Points in Three Months. Are You Late to the Party?"
+  ]
+ },
+ {
+  "ticker": "SMH",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 17,
+  "pm_share": 0.23529411764705882,
+  "score": 0.28,
+  "raw": 0.28,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The dominant read is a broad semiconductor-sector rally: memory chip stocks surging with SK Hynix at a record high and Goldman Sachs declaring the worst is over, plus bullish AI-chip commentary on Broadcom, Qualcomm, Micron/AMD (BofA) and Analog Devices' $1.35B Alif acquisition \u2014 all positive read-throughs to SMH's holdings. The mechanism is sector-wide multiple expansion and improving memory pricing sentiment lifting the ETF's top weights (NVDA, TSM, AVGO, MU, AMD). Much of the move is already reflected after the rally, so the residual is a modest positive lean rather than a full high-impact score.",
+  "heads": [
+   "[google_news/\u5bcc\u9014\u725b\u725b] Memory chip stocks rally! SK Hynix hits record high on U.S. market; Goldman Sachs declares the worst is over - \u5bcc\u9014\u725b\u725b",
+   "[google_news/The Motley Fool] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result. - The Motley Fool",
+   "[Yahoo] From Farmland to Fast Trading, ETFs Are Doing It All",
+   "[Motley Fool] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result.",
+   "[Yahoo] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result.",
+   "[google_news/Yahoo Finance] Broadcom Forecasts $230 Billion in AI Semiconductor Revenue in 2028. The Stock Could Reach $900 Per Share as a Result. - Yahoo Finance",
+   "[google_news/The Motley Fool] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom - The Motley Fool",
+   "[Motley Fool] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom",
+   "[google_news/Currently.com] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom - Currently.com",
+   "[google_news/The Globe and Mail] The Overlooked Chip Stock Poised to Outperform Nvidia, AMD, and Broadcom in the AI Semiconductor Boom - The Globe and Mail"
+  ]
+ },
+ {
+  "ticker": "TTAN",
+  "run_id": "2026-09-09_163003",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.2799,
+  "raw": -0.28,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "ServiceTitan beat on Q2 earnings but issued lackluster/soft guidance, triggering a ~17-30% single-day plunge and a wave of analyst price-target cuts (Stifel $100, BMO $90, TD Cowen, KeyBanc, Piper Sandler, Wells Fargo, Canaccord) alongside a few reiterations (BTIG $110, Needham Buy). The negative guidance reset is the dominant, freshest catalyst and negative hard catalysts of this type typically keep drifting for several sessions, but the bulk of the move has already been realized in the one-day 17-30% drop, so only a modest residual downside remains. The AI-strategy framing and analyst reiterations provide a partial offset, shrinking the magnitude.",
+  "heads": [
+   "[google_news/Finimize] ServiceTitan\u2019s Stock Drop Put Its AI Strategy Front And Center - Finimize",
+   "[google_news/Investing.com] ServiceTitan stock price target lowered to $100 by Stifel - Investing.com",
+   "[google_news/Barron's] Why ServiceTitan Stock Is Diving 30% After Earnings Beat - Barron's",
+   "[Barrons.com] Apple, Jersey Mike\u2019s, Casey\u2019s, Meta, ServiceTitan, and More Stocks That Explain Today\u2019s Market",
+   "[Yahoo] Apple, Jersey Mike\u2019s, Casey\u2019s, Meta, ServiceTitan, and More Stocks That Explain Today\u2019s Market",
+   "[google_news/Barron's] Apple, Jersey Mike\u2019s, Casey\u2019s, Meta, ServiceTitan, and More Stocks That Explain Today\u2019s Market - Barron's",
+   "[google_news/Seeking Alpha] Biggest stock movers Wednesday: META, LAC, TTAN, and more - Seeking Alpha",
+   "[google_news/Investing.com] TD Cowen lowers ServiceTitan stock price target on revenue headwinds - Investing.com",
+   "[google_news/Investing.com] ServiceTitan stock price target lowered to $90 by BMO on guidance - Investing.com",
+   "[google_news/Benzinga] ServiceTitan Analysts Slash Their Forecasts After Q2 Earnings - Benzinga"
+  ]
+ },
+ {
+  "ticker": "SNOW",
+  "run_id": "2026-09-09_143028",
+  "n_articles": 5,
+  "pm_share": 0.2,
+  "score": 0.0621,
+  "raw": 0.12,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is Snowflake's recent earnings report, which 'reignited software' and 'silenced AI skeptics' per Barron's, with the CEO also noting the stock is on track to break even next year. However, the earnings event is roughly 3 days old and the stock has already surged sharply ('Snowflake Stock Is Soaring'), so most of the positive repricing is consumed; the residual follow-through is a modest positive lean, tempered by the fact that the CEO's Yahoo interview 44h ago is largely promotional commentary on an already-moved stock. The IGV outflow story is a sector-flow curiosity, not a fresh catalyst for SNOW.",
+  "heads": [
+   "[Yahoo Finance Video] Snowflake CEO explains how software companies can survive in the AI era",
+   "[24/7 Wall St.] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[Yahoo] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[The Motley Fool] Breakfast News: Week in Review",
+   "[Barrons.com] Snowflake Stock Is Soaring. How the Software Giant\u2019s Earnings Silenced AI Skeptics."
+  ]
+ },
+ {
+  "ticker": "SLV",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 2,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 50% of the digest mentions SLV only in passing, never in a headline.",
+  "heads": [
+   "[yahoo_finance] Silver price today, Wednesday, September 9, 2026:  Silver prices hold in the $66 range as U.S.-Iranian attacks continue",
+   "[Benzinga] Dow Tumbles 350 Points; Signet Jewelers Shares Jump Following Upbeat Q2 Earnings"
+  ]
+ },
+ {
+  "ticker": "OPEN",
+  "run_id": "2026-09-10_153001",
+  "n_articles": 13,
+  "pm_share": 0.07692307692307693,
+  "score": -0.3795,
+  "raw": -0.38,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "CEO Kaz Nejatian publicly conceded on X that the adjusted net income break-even timeline is delayed by up to eight weeks, a negative guidance-type disclosure amplified by a yield spike hitting the rate-sensitive housing/iBuyer model; shares are already down 7% to $2.79 and at a fresh 52-week low, so much of the first-day reaction is consumed, but negative hard catalysts of this type tend to drift lower over subsequent sessions. The residual move is negative but moderate given the move already taken.",
+  "heads": [
+   "[24/7 Wall St.] Opendoor Sinks 7% as Yield Spike Meets Delayed Profit Timeline, Offerpad and Zillow Group Trail",
+   "[Yahoo] Opendoor Sinks 7% as Yield Spike Meets Delayed Profit Timeline, Offerpad and Zillow Group Trail",
+   "[google_news/24/7 Wall St.] Opendoor Sinks 7% as Yield Spike Meets Delayed Profit Timeline, Offerpad and Zillow Group Trail - 24/7 Wall St.",
+   "[google_news/simplywall.st] How Delayed Profitability Will Impact Opendoor Stock Investors - simplywall.st",
+   "[google_news/Stocktwits] OPEN: Opendoor Technologies Stock Price, News, Premarket and Aftermarket Price - Stocktwits",
+   "[Stocktwits] OPEN Stock Dips Overnight: Opendoor CEO Says 'Rebuilds Are Bumpy' As Housing Slump Delayed Profit Timeline By Up To Eight Weeks",
+   "[Yahoo] OPEN Stock Dips Overnight: Opendoor CEO Says 'Rebuilds Are Bumpy' As Housing Slump Delayed Profit Timeline By Up To Eight Weeks",
+   "[google_news/Stocktwits] OPEN Stock Dips Overnight: Opendoor CEO Says 'Rebuilds Are Bumpy' As Housing Slump Delayed Profit Timeline By Up To Eight Weeks - Stocktwits",
+   "[google_news/24/7 Wall St.] Opendoor Technologies Falls to $3, a Second 52-Week Low in Nine Days - 24/7 Wall St.",
+   "[google_news/Investing.com Australia] Opendoor Technologies stock hits 52-week low at $3.00 By Investing.com - Investing.com Australia"
+  ]
+ },
+ {
+  "ticker": "KRE",
+  "run_id": "2026-09-09_150012",
+  "n_articles": 2,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 50% of the digest mentions KRE only in passing, never in a headline.",
+  "heads": [
+   "[SeekingAlpha] Banking Risk Monthly Outlook: September 2026",
+   "[google_news/news.stocktradersdaily.com] Liquidity Mapping Around (KRE) Price Events - news.stocktradersdaily.com"
+  ]
+ },
+ {
+  "ticker": "XLP",
+  "run_id": "2026-09-09_170019",
+  "n_articles": 13,
+  "pm_share": 0.5384615384615384,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 54% of the digest mentions XLP only in passing, never in a headline.",
+  "heads": [
+   "[Proactive] Deutsche Bank expects European consumer staples to underperform as structural pressures mount",
+   "[Yahoo] Deutsche Bank expects European consumer staples to underperform as structural pressures mount",
+   "[SeekingAlpha] Kimberly-Clark Corporation (KMB) Presents at Barclays 19th Annual Global Consumer Staples Conference Transcript",
+   "[google_news/news.stocktradersdaily.com] How Consumer Staples Select Sector Spdr (XLP) Affects Rotational Strategy Timing - news.stocktradersdaily.com",
+   "[MT Newswires] Sector Update: Consumer Stocks Decline Late Afternoon",
+   "[Yahoo] Sector Update: Consumer Stocks Decline Late Afternoon",
+   "[The Motley Fool] 1 No-Brainer ETF I'm Loading Up on in 2026 and Beyond",
+   "[MT Newswires] Sector Update: Consumer Stocks Decline in Afternoon Trading",
+   "[Yahoo] Sector Update: Consumer Stocks Decline in Afternoon Trading",
+   "[Barchart] Altria Is Spending More on Capex Than Any Other Consumer Staples Name. It\u2019s a Calculated Sign of Strength."
+  ]
+ },
+ {
+  "ticker": "PINS",
+  "run_id": "2026-09-10_100332",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.42,
+  "raw": -0.42,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the CEO's Goldman Sachs conference remarks flagging 'near-term pain' abroad and declining to refresh guidance, compounded by a CFO resignation and a premium-multiple reset \u2014 a hard negative that drove an 8-9% single-day drop and a 7-session, 21% losing streak. Negative guidance/management news tends to drift for several sessions, and the CEO's refusal to reaffirm guidance leaves estimate-revision risk open, so residual downside remains despite the first sell-off; the EPS beat and short-interest decline are older/less relevant and only partially offset. Insider sales (Silbermann $1.88m, founder sale) add a mild negative overlay.",
+  "heads": [
+   "[google_news/Trefis] Pinterest Stock Extends A 7-Day Losing Streak To A 21% Loss - Trefis",
+   "[Earnings/EPS] PINS significantly beat EPS estimate by 20.4% (Q3 2026 results)",
+   "[Short Interest] PINS: short interest falls 24% MoM to 12% of float \u2014 covering provides price support",
+   "[google_news/TechStock\u00b2] Pinterest Stock Falls 9.2% as CEO Flags \u2018Near-Term Pain\u2019 Abroad - TechStock\u00b2",
+   "[google_news/Social Media Today] Pinterest shares insights into men\u2019s trends - Social Media Today",
+   "[google_news/Investing.com] Pinterest director Benjamin Silbermann disposes of $1.88m in stock - Investing.com",
+   "[google_news/GuruFocus] Pinterest Inc (PINS) Stock Down 9.2% -- Now Undervalued? GF Scor - GuruFocus",
+   "[Zacks] Pinterest (PINS) Suffers a Larger Drop Than the General Market: Key Insights",
+   "[Yahoo] Pinterest (PINS) Suffers a Larger Drop Than the General Market: Key Insights",
+   "[google_news/finance.yahoo.com] Pinterest (PINS) Suffers a Larger Drop Than the General Market: Key Insights - finance.yahoo.com"
+  ]
+ },
+ {
+  "ticker": "BLTE",
+  "run_id": "2026-09-09_123023",
+  "n_articles": 10,
+  "pm_share": 0.0,
+  "score": 0.254,
+  "raw": 0.34,
+  "catalyst": "fda_clinical",
+  "engine": "deepseek",
+  "rationale": "Belite Bio's tinlarebant received a Japanese NDA submission under Sakigake designation plus an FDA NDA acceptance with Priority Review (PDUFA Feb 12, 2027), and this was followed by a cluster of analyst PT raises (HC Wainwright $214\u2192$245, Canaccord Buy initiation at $303, Morgan Stanley, Cantor) and a modest Q3 EPS beat \u2014 a genuine multi-catalyst positive stack. The mechanism is de-risking of the regulatory path and upward estimate/PT revisions pulling the stock toward the $248 average PT. However, the news is 1.5\u20132.5 days old and the stock has likely already reacted to the NDA/PT news, so only residual follow-through remains, and the Seeking Alpha piece frames BLTE as a 'hold' with launch s",
+  "heads": [
+   "[google_news/Investing.com] Mizuho raises Belite Bio stock price target on Japan drug filing - Investing.com",
+   "[google_news/Seeking Alpha] Belite Bio On Track For A Potential Blockbuster Launch In 2027 - Seeking Alpha",
+   "[SeekingAlpha] Belite Bio On Track For A Potential Blockbuster Launch In 2027",
+   "[Earnings/EPS] BLTE modestly beat EPS estimate by 9.9% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)",
+   "[Benzinga] HC Wainwright & Co. Maintains Buy on Belite Bio, Raises Price Target to $245",
+   "[Yahoo] Belite Bio Announces Submission of New Drug Application to the Ministry of Health, Labour, and Welfare in Japan under the Sakigake Designation System for Tinlareb",
+   "[Benzinga] Belite Bio Submits Japanese New Drug Application For Tinlarebant In Stargardt Disease Type 1",
+   "[Quiver Dark Pool] BLTE off-exchange (dark-pool) accumulation: DPI 66% vs 59% baseline",
+   "[MarketBeat] Belite Bio Wins FDA Priority Review for Tinlarebant in Stargardt Disease"
+  ]
+ },
+ {
+  "ticker": "OXM",
+  "run_id": "2026-09-09_073005",
+  "n_articles": 14,
+  "pm_share": 0.0,
+  "score": -0.1202,
+  "raw": -0.18,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the Q2 FY2026 earnings report from ~6 days ago, where the company lowered full-year guidance on Lilly Pulitzer weakness and macro consumer pressure, sending shares down ~16-18%; the stock has already absorbed the initial shock, but the subsequent analyst PT cuts (Telsey $44\u2192$35, Truist $40\u2192$33, Citigroup $36\u2192$33, all within the last 36 hours) keep negative estimate-revision pressure alive. The residual drift mechanism is the post-guidance-cut analyst revision cycle, which typically keeps a weak consumer name under pressure for several sessions, though the bulk of the move is priced. The BNY Mellon and Allianz stake disclosures are routine 13F noise and do not offset ",
+  "heads": [
+   "[google_news/MarketBeat] Bank of New York Mellon Corp Invests $2.05 Million in Oxford Industries, Inc. $OXM - MarketBeat",
+   "[google_news/MarketBeat] Allianz Asset Management GmbH Acquires 42,242 Shares of Oxford Industries, Inc. $OXM - MarketBeat",
+   "[Analyst Ratings] Analyst ratings: OXM sees 3 price-target revision(s) from 3 firm(s)",
+   "[google_news/Pluang] Oxford Industries shares fall nearly 16% after weak Q2 earnings and brand struggles. - Pluang",
+   "[google_news/Seeking Alpha] Oxford Industries: Turnaround Progress Is Minimal (Rating Downgrade) (NYSE:OXM) - Seeking Alpha",
+   "[StockStory] Why Oxford Industries (OXM) Stock Is Falling Today",
+   "[StockStory] OXM Q2 Deep Dive: Guidance Cut as Lilly Pulitzer Weighs on Mixed Portfolio",
+   "[Moby] Oxford Industries, Inc. Q2 2026 Earnings Call Summary",
+   "[Benzinga] How To Earn $500 A Month From Oxford Industries Stock Ahead Of Q2 Earnings",
+   "[InvestorsHub] Oxford Industries Shares Fall 14.3% After Full-Year Guidance Cut"
+  ]
+ },
+ {
+  "ticker": "STX",
+  "run_id": "2026-09-09_153000",
+  "n_articles": 2,
+  "pm_share": 0.0,
+  "score": 0.0298,
+  "raw": 0.06,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "Two aggregator/commentary pieces: a Zacks Bull of the Day framing STX bullishly on AI-driven storage demand and rising estimates, and a Yahoo piece flagging a cyclical-peak concern. Both are recycled opinion with no fresh dated catalyst, so the net read is a soft positive lean from the more recent, more explicitly bullish Zacks framing, tempered by the cyclical-peak caution. No hard event, so magnitude stays in the LEAN band.",
+  "heads": [
+   "[Zacks] Seagate Technology and Western Union have been highlighted as Zacks Bull and Bear of the Day",
+   "[Yahoo] STX Stock: The Math Hidden In Its Price"
+  ]
+ },
+ {
+  "ticker": "NVTS",
+  "run_id": "2026-09-09_140026",
+  "n_articles": 7,
+  "pm_share": 0.2857142857142857,
+  "score": 0.1202,
+  "raw": 0.18,
+  "catalyst": "ma_deal",
+  "engine": "deepseek",
+  "rationale": "Navitas reported a modest Q3 EPS beat (+5.3% surprise) and announced a $232.8M deal with a two-year earnout to acquire Claros, both bullish catalysts, while the stock already exploded 27% on the AI data center boom narrative. With 17% short float and 2.7-day cover, squeeze dynamics may amplify follow-through, but the sharp move already prices in much of the positive news, leaving limited residual upside. The dominant catalyst is the M&A deal, with the earnings beat and short squeeze setup providing secondary support.",
+  "heads": [
+   "[google_news/simplywall.st] How Investors Are Reacting To Navitas Semiconductor (NVTS) U.S. Chip Shipments - simplywall.st",
+   "[Earnings/EPS] NVTS modestly beat EPS estimate by 5.3% (Q3 2026 results)",
+   "[Short Interest] NVTS: 17% short float + 2.7-day cover \u2014 squeeze conditions present",
+   "[google_news/Stock Titan] A $232.8M deal gives Navitas (Nasdaq: NVTS) a two-year earnout to buy Claros - Stock Titan",
+   "[google_news/Mshale] Navitas Stock EXPLODES 27% \ud83d\ude80 NVTS Breakout Explained | AI Data Center Boom Enfant (u8Xc5R1X12) - Mshale",
+   "[Simply Wall St.] GLOBALFOUNDRIES (GFS) Draws Focus As GaN Shipments Start And Valuation Debate Deepens",
+   "[Simply Wall St.] What Could GLOBALFOUNDRIES (GFS) First U.S. GaN Shipments Mean For AI Demand?"
+  ]
+ },
+ {
+  "ticker": "CMCSA",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.28,
+  "raw": -0.28,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "Comcast's CFO warned at a conference that broadband subscriber losses will not improve in Q3 and will exceed last year's pace, a fresh negative fundamental disclosure that drove a 6.6% single-day drop \u2014 the worst in over a month. The mechanism is estimate revision risk on the core broadband franchise, and while the first sell-off is largely priced, negative guidance-type catalysts in a structurally challenged cable business typically see residual drift over the following sessions. Some offset from value/dividend commentary and the iPhone launch PR is minor.",
+  "heads": [
+   "[google_news/Media Play News] Comcast CFO\u2019s Cauticous Outlook on Broadband Subs Drives Stock Down - Media Play News",
+   "[google_news/The Motley Fool] Why Comcast Stock Plummeted on Wednesday - The Motley Fool",
+   "[Motley Fool] Why Comcast Stock Plummeted on Wednesday",
+   "[google_news/The Globe and Mail] Why Comcast Stock Plummeted on Wednesday - The Globe and Mail",
+   "[Stocktwits] CMCSA Stock Drops To Worst Day In Over A Month After CFO Sees No Improvement In Broadband User Losses",
+   "[Yahoo] CMCSA Stock Drops To Worst Day In Over A Month After CFO Sees No Improvement In Broadband User Losses",
+   "[google_news/Stocktwits] CMCSA Stock Drops To Worst Day In Over A Month After CFO Sees No Improvement In Broadband User Losses - Stocktwits",
+   "[google_news/Business Wire] Xfinity Mobile, Comcast Business Mobile to Offer iPhone Duo, iPhone 18 Pro, and iPhone 18 Pro Max - Business Wire",
+   "[Yahoo] Xfinity Mobile, Comcast Business Mobile to Offer iPhone Duo, iPhone 18 Pro, and iPhone 18 Pro Max",
+   "[google_news/Broadband Breakfast] Comcast Expecting More Broadband Losses Than Last Year for Q3 - Broadband Breakfast"
+  ]
+ },
+ {
+  "ticker": "LRCX",
+  "run_id": "2026-09-09_023012",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": -0.0327,
+  "raw": -0.06,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The only coverage is a 39h-old StockStory/Barchart round-up noting LRCX 'skyrocketed' alongside AMAT, AMD, AVGO and MRVL on Qualcomm's AWS AI data-center collaboration and ASML/TSMC/Intel node milestones \u2014 a sector read-through, not a Lam-specific catalyst. The move has already happened (the piece is a recap of a spike), so the residual 1\u20135 day drift is small and, after an outsized one-day pop in a name with no company-specific news, mildly mean-reverting. Score is a small negative lean, not an abstention, because the digest does connect to LRCX via the named peer/sector development.",
+  "heads": [
+   "[StockStory] Applied Materials, AMD, Broadcom, Lam Research, and Marvell Technology Shares Skyrocket, What You Need To Know",
+   "[google_news/Yahoo Finance] Applied Materials, AMD, Broadcom, Lam Research, and Marvell Technology Shares Skyrocket, What You Need To Know - Yahoo Finance",
+   "[google_news/Barchart.com] Applied Materials, AMD, Broadcom, Lam Research, and Marvell Technology Shares Skyrocket, What You Need To Know - Barchart.com"
+  ]
+ },
+ {
+  "ticker": "PHVS",
+  "run_id": "2026-09-09_100001",
+  "n_articles": 20,
+  "pm_share": 0.25,
+  "score": 0.1623,
+  "raw": 0.18,
+  "catalyst": "fda_clinical",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the Phase 3 HAE trial win (83% reduction in monthly swelling attacks) reported ~2 days ago, which drove a 14%+ surge to record highs and triggered a wave of analyst PT raises (Oppenheimer, Citizens, RBC, Guggenheim). Most of the positive repricing is already consumed by the outsized one-day spike, so the residual 1-5 day move is modestly positive on estimate-revision follow-through, partly offset by the Q3 EPS miss (-7.1%) and an insider stock-sale notice. Net lean is small positive.",
+  "heads": [
+   "[google_news/Investing.com] Citizens raises Pharvaris stock price target to $79 on HAE therapy - Investing.com",
+   "[Earnings/EPS] PHVS modestly missed EPS estimate by 7.1% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: PHVS sees 3 price-target revision(s) from 5 firm(s)",
+   "[Stocktwits] BCRX Stock Posts Worst Day In Over 6 Months After PHVS Trial Win In Rare Swelling Disease",
+   "[Yahoo] BCRX Stock Posts Worst Day In Over 6 Months After PHVS Trial Win In Rare Swelling Disease",
+   "[google_news/Stocktwits] BCRX Stock Posts Worst Day In Over 6 Months After PHVS Trial Win In Rare Swelling Disease - Stocktwits",
+   "[google_news/Pluang] Pharvaris stock jumps after positive HAE drug t... - Pluang",
+   "[google_news/Stock Titan] Insider at Pharvaris (PHVS) lines up new stock sale - Stock Titan",
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[google_news/Investing.com] Oppenheimer raises Pharvaris stock price target on trial results - Investing.com"
+  ]
+ },
+ {
+  "ticker": "GM",
+  "run_id": "2026-09-09_090010",
+  "n_articles": 7,
+  "pm_share": 0.0,
+  "score": 0.0463,
+  "raw": 0.07,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant item is a preview of GM's earnings due tomorrow (consensus $3.13 EPS, 20% historical beat rate), with supporting color from institutional stake disclosures (CalSTRS $8.30B position, Virginia Retirement Systems new investment) and a Barchart/Yahoo piece noting GM has outpaced the consumer discretionary sector with reasonably upbeat analyst sentiment. The mechanism is positioning into the print plus modest institutional accumulation, but the earnings event itself is imminent and unquantified, so the read is a small favorable lean rather than a directional bet. Much of the positive framing is already reflected after a year of outperformance, keeping the magnitude in the LEAN band.",
+  "heads": [
+   "[google_news/MarketBeat] California State Teachers Retirement System Has $8.30 Billion Stock Position in General Motors Company $GM - MarketBeat",
+   "[google_news/Kalkine Media] General Motors' (NYSE:GM) Push to Defend Its Lead While Growing Abroad - Kalkine Media",
+   "[google_news/TradingKey] General Motors (GM) Earnings Tomorrow \u2014 20% Average Beat Rate, $3.13 EPS Expected - TradingKey",
+   "[Barchart] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector?",
+   "[Yahoo] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector?",
+   "[google_news/Yahoo Finance] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector? - Yahoo Finance",
+   "[google_news/MarketBeat] VIRGINIA RETIREMENT SYSTEMS ET Al Makes New Investment in General Motors Company $GM - MarketBeat"
+  ]
+ },
+ {
+  "ticker": "TBBK",
+  "run_id": "2026-09-09_170019",
+  "n_articles": 2,
+  "pm_share": null,
+  "score": -0.0416,
+  "raw": -0.08,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "TBBK plunged 23% to a 52-week low of $50.2, a violent one-day repricing with no disclosed fundamental catalyst in the digest \u2014 the coverage is a 'why is it down' recap and a 52-week-low note, both describing a move already taken. With no fresh hard catalyst identified and the drop already extreme, the residual 1-5 day move is a modest negative drift/mean-reversion lean rather than a fresh directional thesis; the magnitude is small because the bulk of the sell-off is priced and the driver is unknown.",
+  "heads": [
+   "[google_news/quiverquant.com] $TBBK stock is down 23% today. Here's what we see in our data. - quiverquant.com",
+   "[google_news/Investing.com] TBBK stock hits 52-week low at 50.2 USD - Investing.com"
+  ]
+ },
+ {
+  "ticker": "BLTE",
+  "run_id": "2026-09-09_180022",
+  "n_articles": 7,
+  "pm_share": 0.0,
+  "score": 0.3289,
+  "raw": 0.42,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "Belite Bio is riding a cluster of fresh, hard, positive catalysts: a modest Q3 EPS beat (+9.9%), a Japan NDA filing that triggered multiple analyst PT hikes (H.C. Wainwright $214\u2192$245, Mizuho raise, Cantor $266\u2192$270) plus a new Canaccord Buy initiation at $303, and a bullish Seeking Alpha piece on a potential 2027 blockbuster launch. The mechanism is estimate/PT revision and pipeline de-risking on the Japan regulatory filing, with the golden-cross technical note adding momentum color. Much of the move is likely already reflected after the 27\u201336h-old news cluster, so the remaining follow-through is moderate rather than full-magnitude.",
+  "heads": [
+   "[Zacks] Belite Bio, Inc. Sponsored ADR (BLTE)'s Technical Outlook is Bright After Key Golden Cross",
+   "[google_news/Yahoo Finance] Belite Bio, Inc. Sponsored ADR (BLTE)'s Technical Outlook is Bright After Key Golden Cross - Yahoo Finance",
+   "[google_news/Investing.com] Belite Bio stock price target raised to $245 by H.C. Wainwright on Japan NDA filing - Investing.com",
+   "[google_news/Investing.com] Mizuho raises Belite Bio stock price target on Japan drug filing - Investing.com",
+   "[google_news/Seeking Alpha] Belite Bio On Track For A Potential Blockbuster Launch In 2027 - Seeking Alpha",
+   "[Earnings/EPS] BLTE modestly beat EPS estimate by 9.9% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)"
+  ]
+ },
+ {
+  "ticker": "ENB",
+  "run_id": "2026-09-10_052450",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.28,
+  "raw": -0.28,
+  "catalyst": "capital_structure",
+  "engine": "deepseek",
+  "rationale": "Enbridge announced a $2.55B acquisition of Tallgrass Energy's crude business alongside a CA$2.6B bought-deal equity offering and a modest Q3 EPS beat (+5.6%), with a CEO transition (Greg Ebel retiring, Michele Harradence named) adding uncertainty. The bought deal is dilutive and the stock is already sliding on it, while the acquisition is a strategic positive but modest relative to ENB's ~$100B+ market cap; the EPS beat is small and largely priced. Net read is a modest negative, with the dilutive offering and CEO change outweighing the beat and deal, and much of the reaction already occurring.",
+  "heads": [
+   "[Earnings/EPS] ENB modestly beat EPS estimate by 5.6% (Q3 2026 results)",
+   "[Oilprice.com] Enbridge to Buy Tallgrass Crude Pipeline Business for $2.55 Billion",
+   "[google_news/Yahoo! Finance Canada] Enbridge Names New CEO Michele Harradence: What Investors Need to Know - Yahoo! Finance Canada",
+   "[google_news/The Motley Fool Canada] Enbridge Names New CEO Michele Harradence: What Investors Need to Know - The Motley Fool Canada",
+   "[google_news/Kalkine Media] Enbridge (TSX:ENB) Growth Stock A Complete Update For Today - Kalkine Media",
+   "[google_news/The Globe and Mail] Is Enbridge Stock Still a Buy With CEO Greg Ebel Retiring? - The Globe and Mail",
+   "[google_news/The Motley Fool Canada] Is Enbridge Stock Still a Buy With CEO Greg Ebel Retiring? - The Motley Fool Canada",
+   "[google_news/Investing.com] Why is Enbridge stock sliding today? - Investing.com",
+   "[google_news/Kalkine Media] Enbridge (TSX:ENB) Energy Stock A Complete Update For Today - Kalkine Media",
+   "[google_news/Stock Titan] Enbridge (NYSE: ENB) lines up multi-billion share sale to support acquisitions - Stock Titan"
+  ]
+ },
+ {
+  "ticker": "XLC",
+  "run_id": "2026-09-09_123023",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": 0.0226,
+  "raw": 0.04,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The only XLC-specific news is the launch of BMO/REX 3x leveraged and inverse ETNs tracking XLC \u2014 a product-creation event that marginally increases derivative/arbitrage flow into the underlying but has no fundamental read on the communication-services sector itself. The third item is a comparative telecom round-up (AT&T, Verizon, T-Mobile) with no explicit XLC mention and no fresh dated catalyst, only a mildly constructive framing of the sector's 2026 leadership. Net: a very small positive lean from the leveraged-product launch and sector framing, with no hard catalyst and nothing material already priced in.",
+  "heads": [
+   "[prnewswire_financial] BMO and REX Shares Launch MicroSectors\u2122 3\u00d7 Long and -3\u00d7 Short Communication Services (XLC) and Consumer Staples (XLP) ETNs (Cboe BZX: XLCU, XLCD, X",
+   "[google_news/Stock Titan] Starting tomorrow, new products offer 3x bets on or against communication services and everyday goods - Stock Titan",
+   "[Yahoo] Which Telecom Stock Has Dominated in 2026: AT&T, Verizon, or T-Mobile? (It\u2019s Not Even Close)"
+  ]
+ },
+ {
+  "ticker": "MS",
+  "run_id": "2026-09-09_150012",
+  "n_articles": 17,
+  "pm_share": 0.47058823529411764,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 47% of the digest mentions MS only in passing, never in a headline.",
+  "heads": [
+   "[globenewswire_pubco] Zealand Pharma to participate in the Morgan Stanley 24th Annual Global Healthcare Conference",
+   "[google_news/Barchart.com] Morgan Stanley Deems Apple's September 9 Event 'Most Consequential in a Decade': What AAPL Stock Investors Should Know - Barchart.com",
+   "[Analyst Ratings] Analyst ratings: PTON sees 1 downgrade(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: AVGO sees 1 upgrade(s) from 14 firm(s)",
+   "[Analyst Ratings] Analyst ratings: LITE sees 2 new coverage initiation(s) from 8 firm(s)",
+   "[Analyst Ratings] Analyst ratings: CHYM sees 1 new coverage initiation(s) from 5 firm(s)",
+   "[Analyst Ratings] Analyst ratings: BLTE sees 1 new coverage initiation(s) from 4 firm(s)",
+   "[Analyst Ratings] Analyst ratings: AMGN sees 1 downgrade(s) from 9 firm(s)",
+   "[google_news/scanx.trade] Morgan Stanley raises Chime Financial price target to $39 - scanx.trade",
+   "[StockStory] Peloton (PTON) Stock Trades Down, Here Is Why"
+  ]
+ },
+ {
+  "ticker": "HZO",
+  "run_id": "2026-09-09_050005",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": -0.181,
+  "raw": -0.32,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "Three analyst downgrades (Truist, Loop Capital, Benchmark, all Buy\u2192Hold) in the lookback window are the dominant, freshest hard catalyst, signaling deteriorating institutional sentiment and capping upside; a major investor trimming while still holding >6% adds a mild negative insider/13D read, while the 16% short float is only a conditional setup, not a catalyst. The downgrades are 36h old and largely reflected in the stock, so the residual drift is modestly negative rather than a full re-rating. Net: a clear but moderate bearish lean.",
+  "heads": [
+   "[Short Interest] HZO: 16% short float + 3.3-day cover \u2014 squeeze conditions present",
+   "[Analyst Ratings] Analyst ratings: HZO sees 3 downgrade(s) from 3 firm(s)",
+   "[google_news/stocktitan.net] Major MarineMax (HZO) investor sells shares but still holds over 6% - stocktitan.net"
+  ]
+ },
+ {
+  "ticker": "URGN",
+  "run_id": "2026-09-09_123023",
+  "n_articles": 1,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions URGN only in passing, never in a headline.",
+  "heads": [
+   "[Zacks Investment Research] Take the Zacks Approach to Beat the Markets: Oportun Financial, Uranium Royalty & Amgen in Focus"
+  ]
+ },
+ {
+  "ticker": "ZIM",
+  "run_id": "2026-09-09_133022",
+  "n_articles": 8,
+  "pm_share": 0.0,
+  "score": -0.459,
+  "raw": -0.62,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "ZIM reported a Q3 2026 EPS of $0.73 versus $2.44 consensus \u2014 a 69.9% miss \u2014 a hard, fresh (36h) negative catalyst that drives estimate revisions and multiple compression; the stock had already hit a 52-week high at $30.21 just before the print, so the miss lands into an extended tape and negative drift typically persists for several sessions. Insider option-exercise/sale notices (29h\u20132.1d) add a mild bearish overlay, while the Simply Wall St 'pricey on earnings' piece reinforces the negative framing; the residual move is still meaningfully negative but somewhat tempered by the pre-existing strength and the fact that some selling has already occurred.",
+  "heads": [
+   "[google_news/Stock Titan] Insider at ZIM (NYSE: ZIM) moves to sell more stock - Stock Titan",
+   "[google_news/Stock Titan] ZIM (NYSE: ZIM) officer moves to sell stock gained from options - Stock Titan",
+   "[Earnings/EPS] ZIM significantly missed EPS estimate by 69.9% (Q3 2026 results)",
+   "[google_news/simplywall.st] ZIM (ZIM) Stock Looks Pricey On Earnings While Returns Stay Strong - simplywall.st",
+   "[google_news/Benzinga] Johannes Birger MeyerGloeckner At ZIM Integrated Shipping Decides to Exercises Options Worth $77K - Benzinga",
+   "[google_news/Investing.com India] ZIM stock hits 52-week high at 30.21 USD - Investing.com India",
+   "[google_news/Investing.com] ZIM stock hits 52-week high at 30.21 USD - Investing.com",
+   "[google_news/Seeking Alpha] Biggest stock movers Tuesday: ZIM, NVS, quantum computing stocks, and more - Seeking Alpha"
+  ]
+ },
+ {
+  "ticker": "XBI",
+  "run_id": "2026-09-09_153000",
+  "n_articles": 2,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions XBI only in passing, never in a headline.",
+  "heads": [
+   "[Benzinga] Roivant Stock Surges on 'Robust' Data from Rare Lung Disease Candidate",
+   "[24/7 Wall St.] IBB Just Beat the S&P 500 by 22 Points in Three Months. Are You Late to the Party?"
+  ]
+ },
+ {
+  "ticker": "ATRC",
+  "run_id": "2026-09-09_013008",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": 0.0126,
+  "raw": 0.04,
+  "catalyst": "short_squeeze_social",
+  "engine": "deepseek",
+  "rationale": "The only item is a stale (6.7-day-old) dark-pool positioning signal showing off-exchange share at 63% vs a 54% baseline, which is a SOFT, corroborating indicator of possible institutional accumulation rather than a dated catalyst. With no fresh company-specific event, peer read-through, or hard news, the read is a weak positive lean on positioning alone, and any informational edge is largely decayed given the age.",
+  "heads": [
+   "[Quiver Dark Pool] ATRC off-exchange (dark-pool) accumulation: DPI 63% vs 54% baseline"
+  ]
+ },
+ {
+  "ticker": "AMC",
+  "run_id": "2026-09-10_100332",
+  "n_articles": 20,
+  "pm_share": 0.05,
+  "score": 0.42,
+  "raw": 0.42,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh catalyst is AMC's Q3 2026 EPS beat of $0.14 vs $0.03 consensus (+366.7% surprise), a hard earnings catalyst that drives near-term appreciation and estimate revisions; the Robinhood tokenization spat is a noisy, largely reputational/legal debate with no direct cash-flow impact and is mostly a distraction. The earnings beat is 12h old and not yet reported as fully priced, so the residual move is positive but moderated by the unresolved tokenization overhang and the MarketWatch underperformance note.",
+  "heads": [
+   "[google_news/Pluang] Robinhood defends tokenized stocks amid AMC CEO's harsh criticism and legal scrutiny. - Pluang",
+   "[google_news/Pluang] Robinhood defends AMC stock tokens amid legal t... - Pluang",
+   "[google_news/Crypto News] Robinhood CEO rejects AMC veto over stock tokens - Crypto News",
+   "[Earnings/EPS] AMC significantly beat EPS estimate by 366.7% (Q3 2026 results)",
+   "[google_news/Moomoo] Everyone arguing about @RobinhoodApp's tokenized AMC stock skipped a step. According to @austincampbell, a reverse ADR needs real shares locked up as",
+   "[BeInCrypto] Robinhood CEO Vlad Tenev Defends Stock Tokens After AMC Criticism",
+   "[google_news/finance.yahoo.com] Robinhood CEO Vlad Tenev Defends Stock Tokens After AMC Criticism - finance.yahoo.com",
+   "[google_news/BeInCrypto] Robinhood CEO Vlad Tenev Defends Stock Tokens After AMC Criticism - BeInCrypto",
+   "[google_news/MarketWatch] AMC Entertainment Holdings Inc. Cl A stock underperforms Wednesday when compared to competitors - MarketWatch",
+   "[google_news/The Cryptonomist] Robinhood Stock Tokens Legal Debate Over AMC Shares - The Cryptonomist"
+  ]
+ },
+ {
+  "ticker": "XLI",
+  "run_id": "2026-09-09_130019",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": 0.0326,
+  "raw": 0.06,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "Coverage is limited to aggregator/commentary pieces: a Stock Traders Daily liquidity-tactics note, a Benzinga after-market movers round-up, and a Seeking Alpha screen of industrials stocks with strong revenue growth and attractive valuations. The Seeking Alpha screen carries a mildly bullish framing on the industrials sector that XLI tracks, but it is a listicle with no fresh dated catalyst and no disclosed size, so the read-through is a soft positive lean only. Nothing here is a hard catalyst, and no material move is priced in.",
+  "heads": [
+   "[google_news/Stock Traders Daily] (XLI) as a Liquidity Pulse for Institutional Tactics - Stock Traders Daily",
+   "[google_news/Benzinga] 12 Industrials Stocks Moving In Tuesday's After-Market Session - Benzinga",
+   "[google_news/Seeking Alpha] Ten industrials stocks combining strong revenue growth with attractive valuations (XLI:NYSEARCA) - Seeking Alpha"
+  ]
+ },
+ {
+  "ticker": "SUNE",
+  "run_id": "2026-09-09_110017",
+  "n_articles": 6,
+  "pm_share": 0.16666666666666666,
+  "score": -0.051,
+  "raw": -0.08,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "SUNation Energy spiked ~33% on news that its minority stake (1.8%) in Suniva is worth more after Suniva completed an $835M capital raise to quadruple capacity to 5.5 GW \u2014 a mark-to-market uplift on a non-controlling holding, not an operating improvement at SUNE itself. The move is already largely priced (the 33% jump is reported in the digest), so the residual 1-5 day drift is small and, given the outsized one-day spike on a passive stake revaluation, slightly prone to mean-reversion; the 8-K material agreement and Reg FD filings are consistent with the same event and add no fresh catalyst.",
+  "heads": [
+   "[google_news/TechStock\u00b2] SUNE Stock Jumps 33% on $835 Million Suniva Raise\u2014Why the 1.8% Stake Matters - TechStock\u00b2",
+   "[google_news/Benzinga] Why Is SUNation Energy Stock Soaring Wednesday? - Benzinga",
+   "[Yahoo] Suniva Completes $835 Million Capital Raise to Build Second Major U.S. Solar Cell Manufacturing Facility and More Than Quadruple Capacity to 5.5 GW",
+   "[SEC 8-K Filing] SUNE SEC 8-K \u2014 Entry into Material Definitive Agreement",
+   "[SEC 8-K Filing] SUNE SEC 8-K \u2014 Regulation FD Disclosure",
+   "[Quiver Dark Pool] SUNE off-exchange (dark-pool) accumulation: DPI 53% vs 46% baseline"
+  ]
+ },
+ {
+  "ticker": "NEE",
+  "run_id": "2026-09-09_070001",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": 0.0626,
+  "raw": 0.18,
+  "catalyst": "capital_structure",
+  "engine": "deepseek",
+  "rationale": "NextEra secured a $1.9B DOE loan guarantee to restart the Duane Arnold nuclear plant, anchored by a 25-year Google power purchase agreement tied to AI data center demand \u2014 a concrete, sizeable capital-structure/financing catalyst with a visible long-term revenue mechanism. The news is ~2 days old and the article is aggregator commentary, so some of the positive read is already reflected, but the disclosed dollar size and named offtaker keep a modest favorable residual. Score is a lean-to-minor positive, tempered by staleness and the promotional/commentary source tier.",
+  "heads": [
+   "[The Motley Fool] NextEra Just Secured Up to $1.9 Billion to Restart Iowa's Only Nuclear Plant. Here's The Real Reason Why."
+  ]
+ },
+ {
+  "ticker": "PURR",
+  "run_id": "2026-09-10_130006",
+  "n_articles": 6,
+  "pm_share": 0.0,
+  "score": -0.6091,
+  "raw": -0.72,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "PURR reported a massive Q3 2026 EPS miss of -$0.86 vs $0.78 consensus (-210.3% surprise), a hard bearish catalyst that will drive estimate revisions and multiple compression. This is partially offset by a fresh Cantor Fitzgerald bullish note (4h ago) and a recent record-high spike tied to HYPE's all-time high, but the earnings miss is the dominant, most recent hard catalyst and negative earnings surprises typically drift lower over several sessions. The stock already gapped up and hit a record on the HYPE rally, so some positive is priced in, but the EPS miss is largely unpriced given it is only 12h old.",
+  "heads": [
+   "[google_news/MarketBeat] Hyperliquid Strategies (NASDAQ:PURR) Stock Price Expected to Rise, Cantor Fitzgerald Analyst Says - MarketBeat",
+   "[Earnings/EPS] PURR significantly missed EPS estimate by 210.3% (Q3 2026 results)",
+   "[google_news/MarketBeat] Top Hyperliquid Strategies (PURR) Competitors 2026 - MarketBeat",
+   "[google_news/Finviz] KATT - T-REX 2X Long PURR Daily Target ETF Stock Price and Quote - Finviz",
+   "[google_news/MarketBeat] Hyperliquid Strategies (NASDAQ:PURR) Shares Gap Up - Here's What Happened - MarketBeat",
+   "[google_news/Stocktwits] PURR Stock Price Rips To New Record As HYPE Hits All-Time High \u2013 CEO Calls Balance Sheet A \u2018Fortress\u2019 - Stocktwits"
+  ]
+ },
+ {
+  "ticker": "SFD",
+  "run_id": "2026-09-10_100332",
+  "n_articles": 15,
+  "pm_share": 0.06666666666666667,
+  "score": -0.4197,
+  "raw": -0.42,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "Smithfield pre-announced a Q3 loss in its fresh-pork arm (adjusted operating income $115-175M) on persistent processing-margin compression and lower hog prices, a negative guidance update that drove the stock to a 52-week low of $20.43 and prompted Barclays to cut its PT to $29. The negative hard catalyst is ~30h old and the stock has already sold off sharply, but negative guidance events typically keep drifting for several sessions; the 36% MoM short-interest decline to 8% of float provides only modest covering support, and the small Core Capital stake is a minor offset. Residual downside remains, so a moderate negative lean.",
+  "heads": [
+   "[google_news/MarketBeat] Core Capital Management & Research inc. Acquires Shares of 299,005 Smithfield Foods, Inc. $SFD - MarketBeat",
+   "[Short Interest] SFD: short interest falls 36% MoM to 8% of float \u2014 covering provides price support",
+   "[Analyst Ratings] Analyst ratings: SFD sees 2 price-target revision(s) from 1 firm(s)",
+   "[google_news/simplywall.st] Is Smithfield Foods (SFD) Undervalued After Its Fresh Pork Loss Warning? - simplywall.st",
+   "[Benzinga] Kenvue shares are trading lower after a U.S. appeals court questioned the exclusion of expert testimony in lawsuits alleging a link between Tylenol and autism.",
+   "[google_news/MarketBeat] Smithfield Foods (NASDAQ:SFD) Reaches New 12-Month Low - Should You Sell? - MarketBeat",
+   "[google_news/Investing.com] Smithfield Foods stock hits 52-week low at 20.43 USD - Investing.com",
+   "[Yahoo] Smithfield\u00ae Expands Commonwealth Clash Presenting Sponsorship with New Fan and Community Initiatives",
+   "[google_news/Seeking Alpha] Smithfield Foods falls after guidance update (SFD:NASDAQ) - Seeking Alpha",
+   "[Just Food] Smithfield Foods forecasts Q3 loss for fresh-pork arm"
+  ]
+ },
+ {
+  "ticker": "RBRK",
+  "run_id": "2026-09-09_033027",
+  "n_articles": 2,
+  "pm_share": 0.0,
+  "score": 0.0262,
+  "raw": 0.06,
+  "catalyst": "product",
+  "engine": "deepseek",
+  "rationale": "Two soft, company-issued/commentary items: a product launch (Lakehouse Protection with Apache Iceberg on AWS) and a Simply Wall St. piece on the CrowdStrike alliance's impact. Neither discloses binding dollar amounts or a dated hard catalyst, so the read is a small positive lean from favorable product/partnership framing, with no material price mechanism beyond sentiment.",
+  "heads": [
+   "[google_news/businesswire.com] Rubrik Launches Lakehouse Protection with Apache Iceberg Data on AWS - businesswire.com",
+   "[google_news/simplywall.st] How CrowdStrike Alliance Will Impact Rubrik Stock - simplywall.st"
+  ]
+ },
+ {
+  "ticker": "ZIM",
+  "run_id": "2026-09-09_080009",
+  "n_articles": 17,
+  "pm_share": 0.0,
+  "score": -0.2302,
+  "raw": -0.28,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the Hapag-Lloyd/FIMI revised $4.2B takeover proposal, which lifted ZIM to a 52-week high of $30.21 about 2.2 days ago; that positive M&A news is now largely priced in, and the stock has already given back some gains as deal doubts grow (TipRanks). The fresh Q3 2026 EPS miss of -69.9% ($0.73 vs $2.44) is a hard negative that will drive estimate revisions and multiple compression, and negative hard catalysts tend to drift for several sessions; the insider option-exercise/sale and 'pricey on earnings' commentary add minor bearish color. Netting the stale, mostly-consumed M&A pop against the fresh earnings miss, the residual 1-5 day move is modestly negative.",
+  "heads": [
+   "[Earnings/EPS] ZIM significantly missed EPS estimate by 69.9% (Q3 2026 results)",
+   "[google_news/simplywall.st] ZIM (ZIM) Stock Looks Pricey On Earnings While Returns Stay Strong - simplywall.st",
+   "[google_news/simplywall.st] ZIM (ZIM) Stock Looks Pricey On Earnings While Returns Stay Strong - simplywall.st",
+   "[google_news/Benzinga] Johannes Birger MeyerGloeckner At ZIM Integrated Shipping Decides to Exercises Options Worth $77K - Benzinga",
+   "[google_news/Investing.com India] ZIM stock hits 52-week high at 30.21 USD - Investing.com India",
+   "[google_news/Seeking Alpha] Biggest stock movers Tuesday: ZIM, NVS, quantum computing stocks, and more - Seeking Alpha",
+   "[google_news/Investing.com] Why is ZIM Integrated Shipping stock surging today? - Investing.com",
+   "[google_news/Marine News Magazine] Hapag-Lloyd Revising $4.2B ZIM Offer to Address Israeli Concerns - Marine News Magazine",
+   "[google_news/Quiver Quantitative] Insider Sale: Director at $ZIM Sells 1,531 Shares - Quiver Quantitative",
+   "[google_news/Stock Titan] ZIM Integrated (NYSE: ZIM) director exits stake after exercising options - Stock Titan"
+  ]
+ },
+ {
+  "ticker": "IBIT",
+  "run_id": "2026-09-09_130019",
+  "n_articles": 1,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions IBIT only in passing, never in a headline.",
+  "heads": [
+   "[Zacks Investment Research] 3 Crypto-Exposed Stocks Riding the Institutional Crypto Wave"
+  ]
+ },
+ {
+  "ticker": "CBRS",
+  "run_id": "2026-09-10_070017",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": 0.0879,
+  "raw": 0.14,
+  "catalyst": "insider_activity",
+  "engine": "deepseek",
+  "rationale": "Cathie Wood's ARK funds bought roughly $6.5M\u2013$17M of CBRS while exiting Palantir and trimming AMD, a fresh (22\u201328h old) high-profile institutional endorsement. The mechanism is sentiment/follow-on buying from ARK's visibility, though the disclosed dollar size is modest relative to a newly public AI semiconductor name and much of the headline reaction is likely already reflected. Net lean positive but small.",
+  "heads": [
+   "[google_news/finance.biggo.com] Cathie Wood Swaps Palantir for Cerebras, Trims AMD in $6.5 Million AI Reshuffle - finance.biggo.com",
+   "[google_news/Dealroom] ARK pours $17M into Cerebras, exits AMD and Palantir - Dealroom",
+   "[google_news/TipRanks] CBRS or PLTR: Cathie Wood Buys $6.5M of One AI Stock and Sells $6.5M of the Other. Here\u2019s Why - TipRanks"
+  ]
+ },
+ {
+  "ticker": "AEO",
+  "run_id": "2026-09-10_073003",
+  "n_articles": 20,
+  "pm_share": 0.1,
+  "score": -0.22,
+  "raw": -0.22,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "AEO's Q2 headline EPS beat (+259-276%) was entirely driven by a one-time $161-179M tariff refund, while same-store sales missed and merchandise margins shrank \u2014 the stock already sank ~10% on the print. With the beat revealed as low-quality and the negative comp/margin read already being traded, the residual 1-5 day drift is modestly negative as estimate quality gets discounted and the core-brand weakness stays in focus.",
+  "heads": [
+   "[Earnings/EPS] AEO significantly beat EPS estimate by 259.1% (Q3 2026 results)",
+   "[SeekingAlpha] American Eagle Outfitters, Inc. (AEO) Q2 2026 Earnings Call Transcript",
+   "[Yahoo] American Eagle Drops Big Ad Campaigns, Chases the Checkout",
+   "[SeekingAlpha] American Eagle Outfitters, Inc. 2026 Q2 - Results - Earnings Call Presentation",
+   "[google_news/Investing.com South Africa] American Eagle Outfitters earnings beat by $0.57, revenue topped estimates By Investing.com - Investing.com South Africa",
+   "[Barrons.com] American Eagle Outfitters Stock Slumps on Same-Store Sales Miss",
+   "[Yahoo] American Eagle Outfitters Stock Slumps on Same-Store Sales Miss",
+   "[google_news/Barron's] American Eagle Outfitters Stock Slumps on Same-Store Sales Miss - Barron's",
+   "[google_news/TechStock\u00b2] AEO Stock Sinks 10% as $161 Million Tariff Refund Masks Margin Pressure - TechStock\u00b2",
+   "[The Wall Street Journal] American Eagle Says Still \u2018Work to Do\u2019 on Core Brand as Sales Rise"
+  ]
+ },
+ {
+  "ticker": "XLV",
+  "run_id": "2026-09-10_123011",
+  "n_articles": 11,
+  "pm_share": 0.36363636363636365,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 36% of the digest mentions XLV only in passing, never in a headline.",
+  "heads": [
+   "[globenewswire_pubco] Oncolytics Biotech\u00ae Announces Positive Preclinical Results Combining Pelareorep with a Pan-RAS Inhibitor in Colorectal Cancer",
+   "[globenewswire_pubco] NKGen Biotech to Present on Potential of Troculeucel in Neurodegenerative Diseases at Biologics Manufacturing Korea 2026",
+   "[google_news/Business Standard] Novartis India zooms 51% in 3 days; what's driving the pharma stock? - Business Standard",
+   "[Insider Monkey] Is AbbVie (ABBV)\u2019s $10.9 Billion Apogee Therapeutics (APGE) Deal the Next Catalyst for Growth?",
+   "[Yahoo] Sector Update: Healthcare Stocks Softer Late Afternoon",
+   "[google_news/ad-hoc-news.de] Vertex Pharma stock falls as market digests Crinetics deal and valuation risks - ad-hoc-news.de",
+   "[Yahoo] Sector Update: Healthcare Stocks Decline in Afternoon Trading",
+   "[google_news/Seeking Alpha] Ten healthcare stocks with A-rated valuations and strong revenue growth (XLV:NYSEARCA) - Seeking Alpha",
+   "[Yahoo] UnitedHealth Slips 3% as TPG Buys Into Florida WellMed Clinics Ahead of Guidance Reaffirmation",
+   "[FX Empire] XLE, XLF & XLV Forecast: Energy Eyes Breakout as XLV Slips"
+  ]
+ },
+ {
+  "ticker": "RDDT",
+  "run_id": "2026-09-09_180022",
+  "n_articles": 3,
+  "pm_share": 0.6666666666666666,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 67% of the digest mentions RDDT only in passing, never in a headline.",
+  "heads": [
+   "[Zacks] Reddit Leans Into AI: Can Innovation Accelerate Revenue Growth?",
+   "[MT Newswires] Social Buzz: Wallstreetbets Stocks Mostly Lower Premarket Wednesday; Meta Platforms to Advance, Intel to Decline",
+   "[Yahoo] Social Buzz: Wallstreetbets Stocks Mostly Lower Premarket Wednesday; Meta Platforms to Advance, Intel to Decline"
+  ]
+ },
+ {
+  "ticker": "XLK",
+  "run_id": "2026-09-09_193719",
+  "n_articles": 9,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions XLK only in passing, never in a headline.",
+  "heads": [
+   "[MT Newswires] Sector Update: Tech Stocks Gain Tuesday Afternoon",
+   "[Yahoo] Sector Update: Tech Stocks Gain Tuesday Afternoon",
+   "[Yahoo] Exchange-Traded Funds Mixed, US Equities Fall After Midday",
+   "[Benzinga] Microsoft Breaks Out Azure Sales at $100 Billion Annualized Pace, Reorganizes AI Segments",
+   "[Benzinga] Leading And Lagging Sectors For September 8, 2026",
+   "[SeekingAlpha] Ride The Bull Before The Market Comes To Its Senses",
+   "[Yahoo] How a 64-Year-Old\u2019s $1.2 Million in VOO Turned Into a $456,000 Bet on a Single Sector",
+   "[Yahoo] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[Benzinga] Leading And Lagging Sectors For September 7, 2026"
+  ]
+ },
+ {
+  "ticker": "IGV",
+  "run_id": "2026-09-10_060028",
+  "n_articles": 4,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 50% of the digest mentions IGV only in passing, never in a headline.",
+  "heads": [
+   "[24/7 Wall St.] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[Yahoo] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[The Motley Fool] A Once-in-a-Decade Opportunity: 1 Magnificent S&P 500 Stock Down 41% to Buy Right Now",
+   "[Barrons.com] Why Nebius Group Should Find A Floor at Current Levels"
+  ]
+ },
+ {
+  "ticker": "AVAH",
+  "run_id": "2026-09-10_140002",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": 0.0223,
+  "raw": 0.07,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "All three items are stale (5.6\u20135.8 days old) Simply Wall St. aggregator/commentary pieces recycling the same Q2-driven analyst fair-value lift (US$9.95 to US$13.90) and a generic 'undervalued on paper' value framing; no fresh dated catalyst, no independent corroboration, and the stock has already had a very large three-year run that the coverage itself flags as a pricing question. The residual read is a mild positive lean from the higher fair-value/price-target framing, but the age, aggregator tier, and already-extended move cap it deep in the LEAN band.",
+  "heads": [
+   "[Simply Wall St.] Aveanna Healthcare Holdings (AVAH) Looks Undervalued On Paper, Is The Earnings Outlook Enough?",
+   "[Simply Wall St.] Aveanna Healthcare Holdings (AVAH) Stock Sees Fair Value Lift After Q2 And Analyst Revisions",
+   "[Simply Wall St.] Aveanna (AVAH) Stock Looks Reasonable On Its Very Large Three Year Run"
+  ]
+ },
+ {
+  "ticker": "XLV",
+  "run_id": "2026-09-10_052450",
+  "n_articles": 20,
+  "pm_share": 0.65,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 65% of the digest mentions XLV only in passing, never in a headline.",
+  "heads": [
+   "[Insider Monkey] Is AbbVie (ABBV)\u2019s $10.9 Billion Apogee Therapeutics (APGE) Deal the Next Catalyst for Growth?",
+   "[Yahoo] Sector Update: Healthcare Stocks Softer Late Afternoon",
+   "[google_news/ad-hoc-news.de] Vertex Pharma stock falls as market digests Crinetics deal and valuation risks - ad-hoc-news.de",
+   "[Yahoo] Sector Update: Healthcare Stocks Decline in Afternoon Trading",
+   "[google_news/Seeking Alpha] Ten healthcare stocks with A-rated valuations and strong revenue growth (XLV:NYSEARCA) - Seeking Alpha",
+   "[Yahoo] UnitedHealth Slips 3% as TPG Buys Into Florida WellMed Clinics Ahead of Guidance Reaffirmation",
+   "[FX Empire] XLE, XLF & XLV Forecast: Energy Eyes Breakout as XLV Slips",
+   "[Yahoo] XLE, XLF & XLV Forecast: Energy Eyes Breakout as XLV Slips",
+   "[google_news/Stock Traders Daily] (XLV) Risk Channels and Responsive Allocation - Stock Traders Daily",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Late Afternoon"
+  ]
+ },
+ {
+  "ticker": "XOM",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 2,
+  "pm_share": 0.0,
+  "score": 0.0324,
+  "raw": 0.06,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "Only coverage is a syndicated 24/7 Wall St. commentary piece noting XOM is already up 40% YTD and framing further upside as dependent on oil prices and earnings; no fresh dated catalyst, and the article itself flags the move as largely made, so the residual is a small positive lean from the bullish framing rather than a new thesis.",
+  "heads": [
+   "[24/7 Wall St.] ExxonMobil Is Up 40% in 2026: Can Rising Oil Prices and Strong Earnings Boost XOM Stock to $200?",
+   "[Yahoo] ExxonMobil Is Up 40% in 2026: Can Rising Oil Prices and Strong Earnings Boost XOM Stock to $200?"
+  ]
+ },
+ {
+  "ticker": "XLY",
+  "run_id": "2026-09-09_133022",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": 0.0271,
+  "raw": 0.06,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The digest contains only aggregator commentary on two XLY holdings \u2014 GM (outperforming the sector, analysts upbeat) and O'Reilly (lagging peers but strongly optimistic analyst view) \u2014 both stale at 2-3 days old and neither a fresh dated catalyst. The net read-through is mildly favourable for the consumer discretionary sector, but the pieces are recycled performance comparisons with no new event, so the lean is small and partly offset by O'Reilly's underperformance framing.",
+  "heads": [
+   "[Barchart] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector?",
+   "[Yahoo] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector?",
+   "[Yahoo] How Is O'Reilly Automotive's Stock Performance Compared to Other Consumer Cyclical Stocks?"
+  ]
+ },
+ {
+  "ticker": "GLD",
+  "run_id": "2026-09-09_153000",
+  "n_articles": 6,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions GLD only in passing, never in a headline.",
+  "heads": [
+   "[SeekingAlpha] Gold And Silver Take A Hit - Then Fight Back",
+   "[Yahoo] Investing in Gold or the S&P 500: What's the Best Move for Investors in the Final Quarter of 2026?",
+   "[SeekingAlpha] Collect Monthly Income To Wait For Silver's Next Run",
+   "[SeekingAlpha] Gold And Its Miners: Stronger Balance Sheets, Higher Margins, More Upside",
+   "[SeekingAlpha] Not The Bottom Yet For Gold",
+   "[Benzinga] Jeff Currie Calls Scott Bessent\u2019s Treasury Buybacks 'Financial Repression' \u2014 And the Ultimate Buy Signal for Gold"
+  ]
+ },
+ {
+  "ticker": "XOM",
+  "run_id": "2026-09-10_160006",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": 0.0381,
+  "raw": 0.06,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "The only XOM-specific coverage is a 24/7 Wall St. commentary piece noting the stock is already up 40% in 2026 and framing further upside as dependent on oil prices and earnings, syndicated on Yahoo; the other item is a bare ticker mention in a company-news round-up. This is aggregator commentary with no fresh dated catalyst, and the framing is cautiously constructive but explicitly conditions the move on external forces, so the residual read is a small positive lean rather than a thesis. Much of the rally is already priced in, keeping the magnitude in the LEAN band.",
+  "heads": [
+   "[Yahoo] Company News for Sep 10, 2026",
+   "[24/7 Wall St.] ExxonMobil Is Up 40% in 2026: Can Rising Oil Prices and Strong Earnings Boost XOM Stock to $200?",
+   "[Yahoo] ExxonMobil Is Up 40% in 2026: Can Rising Oil Prices and Strong Earnings Boost XOM Stock to $200?"
+  ]
+ },
+ {
+  "ticker": "BYD",
+  "run_id": "2026-09-10_023007",
+  "n_articles": 19,
+  "pm_share": 0.05263157894736842,
+  "score": -0.0299,
+  "raw": -0.03,
+  "catalyst": "insider_activity",
+  "engine": "deepseek",
+  "rationale": "The digest is dominated by articles about BYD Company Limited, the Chinese EV maker, not Boyd Gaming Corp (NYSE: BYD) \u2014 a ticker collision. The only genuine Boyd Gaming items are a MarketBeat piece noting a new 12-month low (no fresh catalyst, just a price recap) and a routine 13F disclosure that Ohio's public pension bought a $1.28M stake, which is immaterial relative to Boyd's ~$7B market cap. The EV-maker coverage has no read-through to a US regional casino operator, so the net is a very small negative lean from the 52-week-low framing, not an abstention.",
+  "heads": [
+   "[google_news/ad-hoc-news.de] BYD Bets Big on Blue-Water Logistics as Pakistan Plant Slips and Margins Face a Reckoning - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD's Political Exposure Grows Just as Its Financial Cushion Thins - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD Faces a Three-Front Squeeze as Tariff Threats Mount and Home-Market Profits Erode - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD's $90,000-Station Bet: Can Infrastructure Spending Bridge the Gap Between Export Glory and Domes - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD's Overseas Engine Is Revving \u2014 But the Share Price Remains Stuck in Neutral - ad-hoc-news.de",
+   "[google_news/MarketBeat] Boyd Gaming (NYSE:BYD) Sets New 12-Month Low - Here's Why - MarketBeat",
+   "[Yahoo] Here's Exactly What Drove BYD's 30% Spike in Profits -- Is It Still a Smart Buy?",
+   "[google_news/ad-hoc-news.de] BYD's Export Machine Hits Full Stride, Yet Investors Keep Their Distance - ad-hoc-news.de",
+   "[google_news/Investing.com] Boyd Gaming stock hits 52-week low at 75.82 USD - Investing.com",
+   "[google_news/CnEVPost] China NEV export share in August: BYD leads with 35.4%, Tesla slips to fourth - CnEVPost"
+  ]
+ },
+ {
+  "ticker": "ASST",
+  "run_id": "2026-09-09_050005",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.3672,
+  "raw": -0.42,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh catalyst is a massive Q3 EPS miss of -$3.65 vs -$0.24 consensus (36h old), which is a hard negative that typically drives estimate revisions and multi-day drift lower; the offsetting positives are the routine weekly BTC purchase (1,375 BTC for $109M, ~2 days old and largely a recurring, well-telegraphed event) and a short-squeeze setup that only activates on a positive trigger, which the miss removes. Netting the hard negative against the stale/promotional BTC accumulation news, the residual move is bearish but moderated by the elevated short interest and the fact that some of the miss may already be reflected after 36 hours.",
+  "heads": [
+   "[Earnings/EPS] ASST significantly missed EPS estimate by 1389.8% (Q3 2026 results)",
+   "[Short Interest] ASST: 24% short float + 6.8-day cover \u2014 squeeze conditions present",
+   "[google_news/\ub514\uc9c0\ud138\ud22c\ub370\uc774] Strive buys another 1,375 bitcoins, holdings rise to 24,531 BTC - \ub514\uc9c0\ud138\ud22c\ub370\uc774",
+   "[google_news/CoinMarketCap] Strive Buys 1,375 BTC for $109M, SATA Nears $1B Milestone - CoinMarketCap",
+   "[google_news/The Coin Republic] Strategy Doubles STRC Buyback to $2B as Strive Adds 1,375 BTC - The Coin Republic",
+   "[google_news/Pluang] Strive buys 1,375 Bitcoin, boosting its holdings and stock by over 100% in 30 days. - Pluang",
+   "[google_news/Pluang] Strive buys $109M in Bitcoin, nears $1B in pref... - Pluang",
+   "[decrypt] Strive Buys $109 Million in Bitcoin, Pushes Preferred Stock Toward $1 Billion",
+   "[google_news/Decrypt] Strive Buys $109 Million in Bitcoin, Pushes Preferred Stock Toward $1 Billion - Decrypt",
+   "[google_news/Yahoo Finance] Strive Buys $109 Million in Bitcoin, Pushes Preferred Stock Toward $1 Billion - Yahoo Finance"
+  ]
+ },
+ {
+  "ticker": "TTAN",
+  "run_id": "2026-09-09_070001",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.1672,
+  "raw": -0.18,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "ServiceTitan beat Q2 EPS (+11-14%) and revenue (+2.7%) but issued Q3 revenue guidance of $285-287M vs $287.9M consensus and disclosed a CRO exit, triggering a ~20% single-day selloff 36-43h ago. The negative guidance and management departure dominate; with the stock already down ~20%, the residual drift is modestly negative as estimate revisions work through and the CRO exit raises execution concerns, though the 15% short float and 5.3-day cover add squeeze risk that partially offsets further downside.",
+  "heads": [
+   "[Earnings/EPS] TTAN modestly beat EPS estimate by 14.2% (Q3 2026 results)",
+   "[Short Interest] TTAN: 15% short float + 5.3-day cover \u2014 squeeze conditions present",
+   "[GuruFocus.com] ServiceTitan Inc (TTAN) (Q2 2027) Earnings Call Highlights: Record Free Cash Flow and AI-Driven ...",
+   "[google_news/EBC Financial Group] ServiceTitan Stock Falls Nearly 20% After Earnings: Why Q2 Beat Wasn\u2019t Enough - EBC Financial Group",
+   "[google_news/TechStock\u00b2] ServiceTitan Stock Drops 20% After Earnings; Q3 Guidance and CRO Exit Bite - TechStock\u00b2",
+   "[google_news/scanx.trade] ServiceTitan Q3 Sales $285M-$287M vs $287.874M Est - scanx.trade",
+   "[MarketBeat] ServiceTitan Q2 Earnings Call Highlights",
+   "[Yahoo] ServiceTitan Q2 Earnings Call Highlights",
+   "[google_news/Yahoo Finance] ServiceTitan Q2 Earnings Call Highlights - Yahoo Finance",
+   "[google_news/Investing.com India] ServiceTitan Q2 FY27 slides: 21% growth amid strategic AI pivot By Investing.com - Investing.com India"
+  ]
+ },
+ {
+  "ticker": "CVX",
+  "run_id": "2026-09-09_150012",
+  "n_articles": 3,
+  "pm_share": 0.3333333333333333,
+  "score": 0.0818,
+  "raw": 0.14,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "Chevron shares are reported moving past a buy point amid surging oil prices, a technical/momentum read-through from the crude rally that supports a modest positive lean; the Venezuela 600,000 bbl/d by 2031 story is a longer-dated growth aspiration with acknowledged timeline risk, not a near-term catalyst, and the SCHD ETF mention is only a passing dividend-equity reference. The oil-price surge is the freshest and most tradeable driver, though the IBD piece already reports the move past the buy point, so much of the immediate reaction is priced and the residual is a small positive follow-through.",
+  "heads": [
+   "[Investor's Business Daily] Stock Market Today: Dow Off 350 Points As Oil Surges; Chevron Shares Move Past A Buy Point (Live Coverage)",
+   "[Yahoo] Chevron Wants 600,000 Barrels a Day From Venezuela by 2031. Here's Why That Timeline Is a Real Risk.",
+   "[The Motley Fool] 1 No-Brainer ETF I'm Loading Up on in 2026 and Beyond"
+  ]
+ },
+ {
+  "ticker": "XLK",
+  "run_id": "2026-09-10_100332",
+  "n_articles": 19,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions XLK only in passing, never in a headline.",
+  "heads": [
+   "[MT Newswires] Sector Update: Tech Stocks Ease Late Afternoon",
+   "[Yahoo] Sector Update: Tech Stocks Ease Late Afternoon",
+   "[SeekingAlpha] How Autonomous Agent Risks Are Reshaping Cybersecurity Investing",
+   "[SeekingAlpha] ARTY: Right Theme But Wrong Companies",
+   "[SeekingAlpha] Welcome Back, Balanced Portfolio",
+   "[SeekingAlpha] A Two-Story Market: AI Optimism And Iran Fear Power U.S. Stocks",
+   "[Benzinga] Oil Hits $100: Which Stocks And ETFs Win Or Lose?",
+   "[Benzinga] Leading And Lagging Sectors For September 9, 2026",
+   "[SeekingAlpha] Quality Control: When Profits Run Ahead Of Cash",
+   "[SeekingAlpha] ValuEngine Weekly Commentary: Advancing Nuclear Energy And Evaluating Its Current Place Within Dynamic Asset Strategies"
+  ]
+ },
+ {
+  "ticker": "SNAP",
+  "run_id": "2026-09-10_100332",
+  "n_articles": 11,
+  "pm_share": 0.36363636363636365,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 36% of the digest mentions SNAP only in passing, never in a headline.",
+  "heads": [
+   "[Earnings/EPS] SNAP significantly beat EPS estimate by 18.3% (Q3 2026 results)",
+   "[StockStory] Social Networking Stocks Q2 Results: Benchmarking Snap (NYSE:SNAP)",
+   "[google_news/MarketWatch] Snap Inc. stock underperforms Wednesday when compared to competitors - MarketWatch",
+   "[The Motley Fool] Stock Market Today, Sept. 9: Meta Surges Over 6.5% on Muse AI Agent Launch",
+   "[google_news/Stock Titan] Snap (NYSE: SNAP) officer plans new stock sale after earlier August trade - Stock Titan",
+   "[google_news/Seeking Alpha] Snap: Don't Count On SPECS To Drive The Stock Higher (NYSE:SNAP) - Seeking Alpha",
+   "[Social Media Today] Snap CEO discusses ad development and AI",
+   "[Stocktwits] SNAP Stock Rises Premarket: CEO Sets 2027 Target To Move Beyond Ads Into Commerce, Retail Still Bearish",
+   "[Stocktwits] Stock Rises Premarket: CEO Sets 2027 Target To Move Beyond Ads Into Commerce, Retail Still Bearish",
+   "[Axios Media] Exclusive: Snap names Ronan Harris chief commercial officer"
+  ]
+ },
+ {
+  "ticker": "YSS",
+  "run_id": "2026-09-09_213245",
+  "n_articles": 5,
+  "pm_share": 0.0,
+  "score": -0.2534,
+  "raw": -0.38,
+  "catalyst": "legal_regulatory",
+  "engine": "deepseek",
+  "rationale": "York Space Systems is the target of multiple securities class actions alleging its satellite mission and payload software was not fully functional before launch and that it misled the Space Development Agency to win contracts \u2014 a legal/regulatory overhang that pressures the stock via litigation risk, potential contract scrutiny and reputational damage. The catalyst is 1-4 days old and the 'why did YSS drop today' recap indicates a sell-off has already begun, but negative legal catalysts tend to drift for several sessions, so a residual bearish lean remains. No offsetting positive catalyst appears in the digest.",
+  "heads": [
+   "[google_news/MarketBeat] YSS News Today | Why did York Space Systems stock drop today? $YSS - MarketBeat",
+   "[google_news/MarketBeat] Top York Space Systems (YSS) Competitors 2026 - MarketBeat",
+   "[google_news/globenewswire.com] YSS Legal Notice: BFA Law Notifies York Space Systems - globenewswire.com",
+   "[google_news/TMX Newsfile] INVESTOR NOTICE: York Space Systems Inc. (YSS) Investors with Substantial Losses Have Opportunity to Lead the York Space Class Action Lawsuit, ",
+   "[GlobeNewswire Inc.] Bronstein, Gewirtz & Grossman LLC Urges York Space Systems, Inc. Investors to Act: Class Action Filed Alleging Investor Harm"
+  ]
+ },
+ {
+  "ticker": "NET",
+  "run_id": "2026-09-10_033028",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": -0.08,
+  "raw": -0.08,
+  "catalyst": "product",
+  "engine": "deepseek",
+  "rationale": "Cloudflare surged ~10.5% intraday on a combination of an upbeat CFO outlook at the Goldman Communacopia conference (opportunity 'larger' than current business), a new OpenAI-powered AI security service, and SpaceX/FedRAMP government wins \u2014 a genuine multi-catalyst positive day. However, the move is already fully realized (shares up 10.5%, and Benzinga notes shares slipping after hours following the intraday surge), so the remaining 1-5 day drift is likely modestly negative as the extended mover mean-reverts. The dominant fresh catalyst is the product/partnership news (OpenAI security integration) layered on the CFO's bullish commentary, but with the spike already priced, only a small negativ",
+  "heads": [
+   "[google_news/Benzinga] Cloudflare Shares Slip After Hours Following Intraday Surge - Meta Platforms (NASDAQ:META), Cloudflare (N - Benzinga",
+   "[Insider Monkey] Cloudflare (NET) Soars 10.5% on Upbeat Outlook, Says Opportunities \u2018Larger\u2019 Than Business",
+   "[google_news/Yahoo Finance] Cloudflare (NET) Soars 10.5% on Upbeat Outlook, Says Opportunities \u2018Larger\u2019 Than Business - Yahoo Finance",
+   "[google_news/The Motley Fool] Why Cloudflare Rallied Today - The Motley Fool",
+   "[Motley Fool] Why Cloudflare Rallied Today",
+   "[Yahoo] Why Cloudflare Rallied Today",
+   "[google_news/Yahoo Finance] Why Cloudflare Rallied Today - Yahoo Finance",
+   "[google_news/GuruFocus] Cloudflare Inc (NET) Shares Surge 10.5% -- What GF Score of 75 T - GuruFocus",
+   "[google_news/Stocks Down Under] Cloudflare (NYSE:NET) Stock Soars 10% as OpenAI-Powered Cybersecurity Push Fuels Rally - Stocks Down Under",
+   "[google_news/timothysykes.com] Cloudflare NET Stock Climbs As AI Security And Government Wins Pile Up - timothysykes.com"
+  ]
+ },
+ {
+  "ticker": "WFC",
+  "run_id": "2026-09-09_023012",
+  "n_articles": 7,
+  "pm_share": 0.7142857142857143,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 71% of the digest mentions WFC only in passing, never in a headline.",
+  "heads": [
+   "[google_news/Investing.com UK] Relay Therapeutics at Wells Fargo conference: pipeline nears key tests By Investing.com - Investing.com UK",
+   "[Earnings/EPS] WFC significantly beat EPS estimate by 16.4% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: DK sees 3 price-target revision(s) from 3 firm(s)",
+   "[Analyst Ratings] Analyst ratings: CHYM sees 1 new coverage initiation(s) from 5 firm(s)",
+   "[Analyst Ratings] Analyst ratings: GWRE sees 1 new coverage initiation(s) from 11 firm(s)",
+   "[Analyst Ratings] Analyst ratings: SNDK sees 1 upgrade(s) from 6 firm(s)",
+   "[Analyst Ratings] Analyst ratings: MSFT sees 3 price-target revision(s) from 3 firm(s)"
+  ]
+ },
+ {
+  "ticker": "GM",
+  "run_id": "2026-09-09_023012",
+  "n_articles": 7,
+  "pm_share": 0.0,
+  "score": 0.0444,
+  "raw": 0.07,
+  "catalyst": "insider_activity",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh item is a stale recap of GM's strong Q2 earnings (2.2d old) plus a Barchart/Yahoo piece noting GM has outpaced the consumer discretionary sector with analysts reasonably upbeat; the only dated events are routine 13F-type stake disclosures (Virginia Retirement Systems new position, Amundi adding ~199k shares), which lean mildly positive. With the earnings catalyst already traded and the coverage being aggregator/commentary framing rather than a new hard event, the remaining move is a small positive lean. No negative catalyst offsets it.",
+  "heads": [
+   "[google_news/Kalkine Media] General Motors' (NYSE:GM) Push to Defend Its Lead While Growing Abroad - Kalkine Media",
+   "[Barchart] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector?",
+   "[Yahoo] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector?",
+   "[google_news/Yahoo Finance] General Motors\u2019 Stock: Is GM Outperforming the Consumer Discretionary Sector? - Yahoo Finance",
+   "[google_news/AD HOC NEWS] General Motors stock rises on strong Q2 earnings - AD HOC NEWS",
+   "[google_news/MarketBeat] VIRGINIA RETIREMENT SYSTEMS ET Al Makes New Investment in General Motors Company $GM - MarketBeat",
+   "[google_news/MarketBeat] Amundi Acquires 198,859 Shares of General Motors Company $GM - MarketBeat"
+  ]
+ },
+ {
+  "ticker": "ASO",
+  "run_id": "2026-09-09_220015",
+  "n_articles": 20,
+  "pm_share": 0.4,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 40% of the digest mentions ASO only in passing, never in a headline.",
+  "heads": [
+   "[google_news/kalkinemedia.com] Is Academy Sports (NASDAQ:ASO) Facing A Demand Test? - kalkinemedia.com",
+   "[GuruFocus.com] Academy Sports and Outdoors Inc (ASO) (Q2 2026) Earnings Call Highlights: E-Commerce Surge and ...",
+   "[SeekingAlpha] Academy Sports and Outdoors, Inc. 2027 Q2 - Results - Earnings Call Presentation",
+   "[MarketBeat] Academy Sports and Outdoors Q2 Earnings Call Highlights",
+   "[google_news/Yahoo Finance] Academy Sports and Outdoors Q2 Earnings Call Highlights - Yahoo Finance",
+   "[MT Newswires] Academy Sports Lifts Earnings Outlook Despite Pressure on Consumer Spending",
+   "[Proactive] Academy Sports + Outdoors raises annual profit forecast on cost discipline, e-commerce growth",
+   "[google_news/Yahoo Finance] Academy Sports + Outdoors raises annual profit forecast on cost discipline, e-commerce growth - Yahoo Finance",
+   "[google_news/AOL.com] Why Academy Sports and Outdoors Stock Just Popped - AOL.com",
+   "[google_news/quiverquant.com] $ASO stock is up 7% today. Here's what we see in our data. - quiverquant.com"
+  ]
+ },
+ {
+  "ticker": "BRK-B",
+  "run_id": "2026-09-10_023007",
+  "n_articles": 20,
+  "pm_share": 0.3,
+  "score": 0.1538,
+  "raw": 0.18,
+  "catalyst": "capital_structure",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh, ticker-specific item is the disclosure that Greg Abel resumed aggressive Berkshire buybacks \u2014 $4.53B in Q2 2026 after a 21-month hiatus, with at least $3.3B more this quarter \u2014 a genuine capital-structure catalyst that supports the stock via shrinking share count and a visible bid, though the buyback news is 1-2 days old and largely reflected in the recent coverage. The remaining articles are recycled Motley Fool/Zacks commentary, listicle mentions (defensive-stock round-up, MGV ETF holding), and Buffett-philosophy pieces with no new dated event, so they add only a soft positive lean. Net read is a modest bullish residual, not a high-conviction catalyst.",
+  "heads": [
+   "[google_news/Yahoo Finance] Investors Heavily Search Berkshire Hathaway Inc. (BRK.B): Here is What You Need to Know - Yahoo Finance",
+   "[google_news/24/7 Wall St.] Warren Buffett\u2019s Portfolio Has Half Its Stock Money in Just 3 Names. Here Is What They Are - 24/7 Wall St.",
+   "[google_news/Kalkine Media] What's behind the renewed interest in Berkshire Hathaway (NYSE:BRK-B) shares? - Kalkine Media",
+   "[google_news/The Motley Fool] Warren Buffett and His Successor, Greg Abel, Have Piled More Than $82 Billion Into This Perennial Winner (No, Not Alphabet!) - The Motley Fo",
+   "[google_news/The Globe and Mail] Warren Buffett and His Successor, Greg Abel, Have Piled More Than $82 Billion Into This Perennial Winner (No, Not Alphabet!) - The Globe ",
+   "[google_news/AOL.com] Warren Buffett and His Successor, Greg Abel, Have Piled More Than $82 Billion Into This Perennial Winner (No, Not Alphabet!) - AOL.com",
+   "[The Motley Fool] Warren Buffett and His Successor, Greg Abel, Have Piled More Than $82 Billion Into This Perennial Winner (No, Not Alphabet!)",
+   "[google_news/ad-hoc-news.de] Berkshire Hathaway stock heads into the open after a 0.4 percent dip - ad-hoc-news.de",
+   "[The Motley Fool] History Shows the Investors Who Make This 1 Move During Bear Markets Build the Most Wealth",
+   "[MarketBeat] 5 Defensive Stocks to Watch as CPI and the Fed Put the Rally to the Test"
+  ]
+ },
+ {
+  "ticker": "TV",
+  "run_id": "2026-09-09_235019",
+  "n_articles": 2,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions TV only in passing, never in a headline.",
+  "heads": [
+   "[Quiver Dark Pool] TV off-exchange (dark-pool) accumulation: DPI 46% vs 39% baseline",
+   "[The Motley Fool] Liberty Latin America Director De Angoitia Buys $10 Million Shares. What Does This Large Purchase Mean for Investors?"
+  ]
+ },
+ {
+  "ticker": "SUNB",
+  "run_id": "2026-09-09_180022",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": 0.42,
+  "raw": 0.42,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "Sunbelt Rentals delivered a record fiscal Q1 2027 with adjusted EPS of $1.18 vs. $1.05 FactSet estimate (a ~12% beat), raised full-year FY2027 guidance, and declared a new quarterly dividend, sending shares up roughly 3-9% on the day. The guidance raise is the key multi-day repricing mechanism, as analysts revise estimates upward, but much of the initial pop is already reflected in the 3-9% move reported across outlets. The Bloomberg 500 index inclusion adds a secondary demand tailwind, though it is largely a one-time flow effect.",
+  "heads": [
+   "[google_news/StocksToTrade] SUNB Stock Climbs As Bloomberg 500 Inclusion Fuels Demand - StocksToTrade",
+   "[google_news/AlphaStreet] Sunbelt Rentals Holdings Crushes Q1 2027 Profit Estimates by 14.6% - AlphaStreet",
+   "[google_news/24/7 Wall St.] Sunbelt Rentals beats Q1 2027 estimates and raises its full-year outlook - 24/7 Wall St.",
+   "[google_news/quiverquant.com] $SUNB stock is up 9% today. Here's what we see in our data. - quiverquant.com",
+   "[google_news/quiverquant.com] SUNB jumps after record Q1 results, higher FY2027 outlook, and new quarterly dividend - quiverquant.com",
+   "[google_news/Investing.com Australia] Sunbelt Rentals stock rises 3% on raised guidance, strong Q1 beat By Investing.com - Investing.com Australia",
+   "[google_news/Investing.com Australia] Sunbelt Rentals Q1 FY27 slides: specialty surge drives guidance raise By Investing.com - Investing.com Australia",
+   "[google_news/Investing.com Canada] Earnings call transcript: Sunbelt Rentals tops Q1 2026 with record EPS, shares jump - Investing.com Canada",
+   "[google_news/marketscreener.com] Sunbelt Rentals Shares Rise After Fiscal Q1 Beat, Higher Fiscal 2027 Revenue Growth Outlook - marketscreener.com",
+   "[InvestorsHub] Sunbelt Rentals shares rise 3% after Q1 results and higher fiscal 2027 guidance"
+  ]
+ },
+ {
+  "ticker": "BYD",
+  "run_id": "2026-09-10_090016",
+  "n_articles": 18,
+  "pm_share": 0.05555555555555555,
+  "score": -0.0798,
+  "raw": -0.08,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The digest is dominated by articles about BYD Company Limited (the Chinese EV maker), not Boyd Gaming Corp \u2014 the ticker collision means most items are irrelevant to the target. The only genuine Boyd Gaming items are a 52-week low at $75.82 (Investing.com, 21h ago), a MarketBeat piece on the new 12-month low, and a routine 13F stake disclosure ($1.28M Ohio pension investment, 32h ago); the stock is already at a 52-week low with no fresh hard catalyst, so the residual is a small negative lean from the weak price action and negative framing, partly offset by the minor institutional stake.",
+  "heads": [
+   "[google_news/ad-hoc-news.de] BYD's September 29 Vote Is the Real Test \u2014 Not the Export Headlines - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD's September Reckoning: Governance Vote Looms as Battery Bottlenecks and Washington Pressure Test - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD Bets Big on Blue-Water Logistics as Pakistan Plant Slips and Margins Face a Reckoning - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD's Political Exposure Grows Just as Its Financial Cushion Thins - ad-hoc-news.de",
+   "[google_news/The Globe and Mail] BYD Co (BYDDF) Receives a Buy from UBS - The Globe and Mail",
+   "[google_news/ad-hoc-news.de] BYD Faces a Three-Front Squeeze as Tariff Threats Mount and Home-Market Profits Erode - ad-hoc-news.de",
+   "[google_news/Investing.com South Africa] Boyd Gaming stock hits 52-week low at 75.82 USD By Investing.com - Investing.com South Africa",
+   "[google_news/ad-hoc-news.de] BYD's $90,000-Station Bet: Can Infrastructure Spending Bridge the Gap Between Export Glory and Domes - ad-hoc-news.de",
+   "[google_news/ad-hoc-news.de] BYD's Overseas Engine Is Revving \u2014 But the Share Price Remains Stuck in Neutral - ad-hoc-news.de",
+   "[google_news/MarketBeat] Boyd Gaming (NYSE:BYD) Sets New 12-Month Low - Here's Why - MarketBeat"
+  ]
+ },
+ {
+  "ticker": "XLK",
+  "run_id": "2026-09-09_193719",
+  "n_articles": 9,
+  "pm_share": 0.8888888888888888,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 89% of the digest mentions XLK only in passing, never in a headline.",
+  "heads": [
+   "[SeekingAlpha] ARTY: Right Theme But Wrong Companies",
+   "[SeekingAlpha] Welcome Back, Balanced Portfolio",
+   "[SeekingAlpha] A Two-Story Market: AI Optimism And Iran Fear Power U.S. Stocks",
+   "[Benzinga] Oil Hits $100: Which Stocks And ETFs Win Or Lose?",
+   "[Benzinga] Leading And Lagging Sectors For September 9, 2026",
+   "[SeekingAlpha] Quality Control: When Profits Run Ahead Of Cash",
+   "[google_news/Stock Traders Daily] Avoiding Lag: Real-Time Signals in (XLK) Movement - Stock Traders Daily",
+   "[Yahoo] QQQ vs QQQM: Same Index, Same Stocks, Different Fee \u2013 and the Math Says One Leaves You Thousands Richer",
+   "[MT Newswires] Sector Update: Tech Stocks Rise Late Afternoon"
+  ]
+ },
+ {
+  "ticker": "SIG",
+  "run_id": "2026-09-09_170019",
+  "n_articles": 4,
+  "pm_share": 0.0,
+  "score": -0.053,
+  "raw": -0.08,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "Signet posted its sixth straight earnings beat with a raised profit outlook, but flat full-year sales guidance and a 14% surge already logged mean the positive catalyst is largely priced in; the residual follow-through after an outsized one-day spike is small and slightly negative as extended movers mean-revert.",
+  "heads": [
+   "[24/7 Wall St.] Signet Jewelers Surges 14% as Raised Profit Outlook Overrides Flat Sales Guidance, Tapestry Holds Steady",
+   "[google_news/CNBC] Stocks making the biggest moves premarket: Apple, Casey's General Store, Signet Jewelers & more - CNBC",
+   "[Benzinga] Dow Tumbles 350 Points; Signet Jewelers Shares Jump Following Upbeat Q2 Earnings",
+   "[google_news/Benzinga] Signet Jewelers, Casey's General Stores and 3 Stocks to Watch Heading Into Wednesday - Benzinga"
+  ]
+ },
+ {
+  "ticker": "IWM",
+  "run_id": "2026-09-10_013020",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": -0.0095,
+  "raw": -0.03,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The only item is a 6-day-old StockStory commentary expressing skepticism about three unnamed small-cap stocks, with no specific ticker, no dated event, and no disclosed catalyst. As a fund whose holdings are small-caps, this is a soft, stale, negative-framing piece with only the faintest read-through to IWM's sector, so the lean is minimal.",
+  "heads": [
+   "[StockStory] 3 Small-Cap Stocks We\u2019re Skeptical Of"
+  ]
+ },
+ {
+  "ticker": "PTON",
+  "run_id": "2026-09-09_160015",
+  "n_articles": 11,
+  "pm_share": 0.0,
+  "score": -0.2093,
+  "raw": -0.28,
+  "catalyst": "analyst",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is Morgan Stanley's downgrade to Underweight with a cut price target ($4.50 from $5.50), citing structural headwinds and a 78% decline in new subscriber additions \u2014 a hard, dated, ticker-specific negative that outweighs the modest 7.1% EPS beat. The negative catalyst is ~36-46h old and the stock already fell 6.8% on it, but negative analyst actions on structural concerns tend to drift for several sessions, so a residual bearish lean remains. The EPS beat is largely priced and insufficient to offset the downgrade.",
+  "heads": [
+   "[Earnings/EPS] PTON modestly beat EPS estimate by 7.1% (Q3 2026 results)",
+   "[Analyst Ratings] Analyst ratings: PTON sees 1 downgrade(s) from 2 firm(s)",
+   "[StockStory] Peloton (PTON) Stock Trades Down, Here Is Why",
+   "[google_news/finance.yahoo.com] Peloton (PTON) Stock Trades Down, Here Is Why - finance.yahoo.com",
+   "[google_news/MarketWatch] Peloton Interactive Inc. stock underperforms Tuesday when compared to competitors - MarketWatch",
+   "[Barchart] Morgan Stanley Just Downgraded Peloton Stock. Here's Why.",
+   "[google_news/TradingView] Peloton (PTON) Stock Trades Down, Here Is Why - TradingView",
+   "[MT Newswires] Peloton Subscriber Growth Weighed Down by Structural Headwinds, Morgan Stanley Says",
+   "[Investing.com] Morgan Stanley cuts Peloton rating on structural fitness headwinds",
+   "[Motley Fool] Why Peloton Stock Plummeted by 16% Last Month"
+  ]
+ },
+ {
+  "ticker": "GME",
+  "run_id": "2026-09-10_003023",
+  "n_articles": 20,
+  "pm_share": 0.0,
+  "score": 0.28,
+  "raw": 0.28,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "GameStop's Q2 earnings beat estimates with collectibles sales surging 57% and the most profitable quarter ever, plus a director buying ~$1M in stock the same morning \u2014 a fresh, hard, positive catalyst. The stock already rose ~4-5% on the news, so much of the initial reaction is priced, but the earnings beat plus insider conviction and bullish follow-through commentary (100% upside calls) support modest residual upside over 1-5 days. Score reflects a real but largely-priced positive catalyst.",
+  "heads": [
+   "[google_news/Investing.com] GameStop director James Grube buys $196,075 in stock - Investing.com",
+   "[google_news/Investing.com UK] GameStop director James Grube buys $196,075 in stock By Investing.com - Investing.com UK",
+   "[google_news/stocktitan.net] GameStop (NYSE: GME) director adds to stake in fresh stock purchase - stocktitan.net",
+   "[google_news/MarketBeat] Traders Purchase Large Volume of GameStop Call Options (NYSE:GME) - MarketBeat",
+   "[google_news/FXLeaders] GME Stock Surges Above $20 and Eyes $25 as GameStop Profit Rises Despite Decline in Quarterly Revenue - FXLeaders",
+   "[google_news/Benzinga] Why Is GameStop Stock Surging on Wednesday? - Benzinga",
+   "[google_news/foreignpolicyjournal.com] GameStop (NYSE: GME) Smashes Q2 Estimates As Collectibles Sales Surge 57% - foreignpolicyjournal.com",
+   "[24/7 Wall St.] GameStop Rises 4% as Collectibles Sales Jump 57% and a Director Buys $1M",
+   "[google_news/24/7 Wall St.] GameStop Rises 4% as Collectibles Sales Jump 57% and a Director Buys $1M - 24/7 Wall St.",
+   "[google_news/MarketBeat] GameStop (NYSE:GME) Trading Up 4.9% After Insider Buying Activity - MarketBeat"
+  ]
+ },
+ {
+  "ticker": "XLI",
+  "run_id": "2026-09-09_050005",
+  "n_articles": 7,
+  "pm_share": 0.5714285714285714,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 57% of the digest mentions XLI only in passing, never in a headline.",
+  "heads": [
+   "[google_news/marketscreener.com] Financials, industrials drag TSX lower; Shopify hits one-month low - marketscreener.com",
+   "[google_news/Seeking Alpha] Ten industrials stocks combining strong revenue growth with attractive valuations (XLI:NYSEARCA) - Seeking Alpha",
+   "[Zacks Investment Research] Is State Street SPDR S&P Homebuilders ETF (XHB) a Strong ETF Right Now?",
+   "[Zacks Investment Research] Should You Invest in the First Trust NASDAQ Transportation ETF (FTXR)?",
+   "[Benzinga] Leading And Lagging Sectors For September 7, 2026",
+   "[The Motley Fool] There Are Only a Handful of S&P 500 Stocks That Yield Over 5%. Here's My Top Pick to Buy in September.",
+   "[The Motley Fool] Every Hyperscaler Raised Capex Again. These 3 Boring Industrials Get Paid No Matter Who Wins the AI Race."
+  ]
+ },
+ {
+  "ticker": "FCX",
+  "run_id": "2026-09-10_153001",
+  "n_articles": 17,
+  "pm_share": 0.058823529411764705,
+  "score": -0.42,
+  "raw": -0.42,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is a Reuters exclusive (via Benzinga/IBD) that the White House copper tariff plan has stalled on affordability concerns, which reversed a record copper rally and sent FCX down ~7-8% intraday \u2014 a sector-wide repricing of the tariff premium that had been built into copper prices. The negative hard catalyst is fresh (2-4h old) and the tariff-premium unwind is a multi-day repricing mechanism, so residual downside drift is likely even after the first sell-off; the stale Bernstein PT cut and minor 13F stake trim are noise by comparison. Some of the move is already priced (the 7-8% drop), so the remaining follow-through is moderate rather than full magnitude.",
+  "heads": [
+   "[google_news/TradingKey] Freeport-McMoRan Inc Stock (FCX) Moved Down by 7.21% on Sep 10: Key Drivers Unveiled - TradingKey",
+   "[24/7 Wall St.] Copper Stocks Tumble as Tariff Doubt Reverses Record Rally: Freeport-McMoRan Sinks 8%, Teck Resources and Southern Copper Drop 7%",
+   "[google_news/aol.com] Copper Stocks Tumble as Tariff Doubt Reverses Record Rally: Freeport-McMoRan Sinks 8%, Teck Resources and Southern Copper Drop 7% - aol.com",
+   "[google_news/24/7 Wall St.] Copper Stocks Tumble as Tariff Doubt Reverses Record Rally: Freeport-McMoRan Sinks 8%, Teck Resources and Southern Copper Drop 7% - 24/7 Wall ",
+   "[InvestorsHub] Freeport-McMoRan Shares Fall More Than 5% as Copper Retreats From Record High",
+   "[google_news/finance.yahoo.com] Freeport-McMoRan Shares Fall More Than 5% as Copper Retreats From Record High - finance.yahoo.com",
+   "[Investor's Business Daily] Copper, FCX Stock Plunge On Tariff Report, Surging Yields; Silver, Gold Also Fall",
+   "[Yahoo] Copper, FCX Stock Plunge On Tariff Report, Surging Yields; Silver, Gold Also Fall",
+   "[google_news/Seeking Alpha] Copper stocks slump as White House tariff plan reportedly stalls (FCX:NYSE) - Seeking Alpha",
+   "[google_news/Investing.com] Why Freeport-McMoRan stock is down today - Investing.com"
+  ]
+ },
+ {
+  "ticker": "PANW",
+  "run_id": "2026-09-09_183023",
+  "n_articles": 3,
+  "pm_share": 1.0,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 100% of the digest mentions PANW only in passing, never in a headline.",
+  "heads": [
+   "[24/7 Wall St.] Cloudflare Surges 9% on OpenAI Security Partnership, Zscaler Rises 3%",
+   "[MarketBeat] AI Is Making Cybersecurity Harder to Ignore\u2014These 3 ETFs Offer a Broad Bet",
+   "[Zacks] Company News for Sep 3, 2026"
+  ]
+ },
+ {
+  "ticker": "XPEV",
+  "run_id": "2026-09-09_180022",
+  "n_articles": 10,
+  "pm_share": 0.0,
+  "score": 0.0944,
+  "raw": 0.14,
+  "catalyst": "product",
+  "engine": "deepseek",
+  "rationale": "XPeng's commissioning of its IRON humanoid robot production line and first unit rolling off is a genuine company-issued milestone, but it is a promotional release with no disclosed dollar terms and the news is 2-3 days old, with the stock already having jumped in Hong Kong on the announcement. The residual short-term move is a modest positive lean from continued humanoid-robot narrative momentum and the margin-beat commentary, tempered by the Zacks downgrade to #4 (Sell) on a 70.1% consensus EPS estimate cut over the past month, which is a real negative offset. Netting the fresh positive robot catalyst against the negative estimate-revision signal and the already-priced spike leaves a small ",
+  "heads": [
+   "[Investor's Business Daily] XPeng Beats Tesla With This Humanoid Robot Milestone",
+   "[Yahoo] XPeng Beats Tesla With This Humanoid Robot Milestone",
+   "[Zacks] Wall Street Bulls Look Optimistic About XPeng (XPEV): Should You Buy?",
+   "[Zacks Investment Research] Wall Street Bulls Look Optimistic About XPeng (XPEV): Should You Buy?",
+   "[Benzinga] Tesla, XPENG Push Humanoid Robots Toward Mass Production",
+   "[Benzinga] Tesla's Chinese Rival XPEV Just Took Its Humanoid Robot From Prototype to Production \u2014 Mass Production Targeted By Year-End",
+   "[Stocktwits] XPEV Jumps In Hong Kong: Xpeng Flips The Switch On Humanoid Robot Mass Production \u2014 And Says Margins Could Beat EVs",
+   "[Yahoo] XPEV Jumps In Hong Kong: Xpeng Flips The Switch On Humanoid Robot Mass Production \u2014 And Says Margins Could Beat EVs",
+   "[Benzinga] Reported Earlier, XPeng Starts Humanoid Robot Production As First Unit Walks Off Assembly Line",
+   "[Yahoo] IRON, the World's First Advanced General-Purpose Humanoid Robot, Walks off the Production Lines as XPENG's Humanoid Robot Manufacturing Facility Is Officially Com"
+  ]
+ },
+ {
+  "ticker": "XLE",
+  "run_id": "2026-09-09_123023",
+  "n_articles": 20,
+  "pm_share": 0.5,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 50% of the digest mentions XLE only in passing, never in a headline.",
+  "heads": [
+   "[google_news/Investor's Business Daily] Stock Market Today: Dow Falls Amid Rising Oil Prices; Apple Shares Drop Ahead Of iPhone Event (Live Coverage) - Investor's Busines",
+   "[Investing.com] Premarket movers: Meta Jumps on AI agent launch, NETGEAR surges",
+   "[Investor's Business Daily] Dow Jones Futures Fall As Oil Prices Push Stocks Toward Breaking Point; Apple iPhone Event Due",
+   "[Motley Fool] Chevron Wants 600,000 Barrels a Day From Venezuela by 2031. Here's Why That Timeline Is a Real Risk.",
+   "[Yahoo] Chevron Wants 600,000 Barrels a Day From Venezuela by 2031. Here's Why That Timeline Is a Real Risk.",
+   "[yahoo_finance] Mortgage & refinance rates today, Wednesday, September 9, 2026: Fixed rates inch upward, 5/1 ARM breaks past 7% as oil prices rise",
+   "[yahoo_finance] Stock market today: Dow, S&P 500, Nasdaq futures hold steady as oil prices near $100",
+   "[google_news/Stock Traders Daily] Trading Systems Reacting to (XLE) Volatility - Stock Traders Daily",
+   "[Stocktwits] Dow Futures Slip, S&P 500, Nasdaq Futures Climb As Oil Nears $100 A Barrel: RKLB, AMD, ORCL, SMR Stocks In Focus",
+   "[google_news/Stocktwits] How Are Dow, S&P 500, Nasdaq Futures Reacting To Oil Prices Nearing $100 A Barrel? - Stocktwits"
+  ]
+ },
+ {
+  "ticker": "JPM",
+  "run_id": "2026-09-09_180022",
+  "n_articles": 9,
+  "pm_share": 0.8888888888888888,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 89% of the digest mentions JPM only in passing, never in a headline.",
+  "heads": [
+   "[Analyst Ratings] Analyst ratings: PVH sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: LITE sees 2 new coverage initiation(s) from 8 firm(s)",
+   "[Analyst Ratings] Analyst ratings: ALKT sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: FN sees 2 price-target revision(s) from 4 firm(s)",
+   "[Analyst Ratings] Analyst ratings: HWM sees 3 price-target revision(s) from 3 firm(s)",
+   "[Analyst Ratings] Analyst ratings: CASY sees 2 price-target revision(s) from 2 firm(s)",
+   "[Analyst Ratings] Analyst ratings: NVDA sees 1 new coverage initiation(s) from 20 firm(s)",
+   "[Benzinga] Healthcare ETFs Were Left Behind. JPMorgan Sees the Money Coming Back",
+   "[Zacks Investment Research] Should Vanguard Morningstar Mega Cap Value ETF (MGV) Be on Your Investing Radar?"
+  ]
+ },
+ {
+  "ticker": "BLSH",
+  "run_id": "2026-09-10_090016",
+  "n_articles": 20,
+  "pm_share": 0.95,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 95% of the digest mentions BLSH only in passing, never in a headline.",
+  "heads": [
+   "[google_news/The Cryptonomist] Nvidia Stock Analysis: Bullish Uptrend and Short-Term Pullback Insights - The Cryptonomist",
+   "[Earnings/EPS] PLTR significantly beat EPS estimate by 18.5% (Q3 2026 results)",
+   "[Earnings/EPS] CLOV significantly beat EPS estimate by 48.0% (Q3 2026 results)",
+   "[Earnings/EPS] BB significantly beat EPS estimate by 50.0% (Q2 2026 results)",
+   "[Earnings/EPS] HOOD significantly beat EPS estimate by 43.7% (Q3 2026 results)",
+   "[Earnings/EPS] AMC significantly beat EPS estimate by 366.7% (Q3 2026 results)",
+   "[Earnings/EPS] SHOO significantly beat EPS estimate by 34.3% (Q3 2026 results)",
+   "[Earnings/EPS] GIL modestly beat EPS estimate by 14.4% (Q3 2026 results)",
+   "[Earnings/EPS] SNAP significantly beat EPS estimate by 18.3% (Q3 2026 results)",
+   "[Earnings/EPS] WMT modestly beat EPS estimate by 9.3% (Q3 2026 results)"
+  ]
+ },
+ {
+  "ticker": "NAVN",
+  "run_id": "2026-09-10_023007",
+  "n_articles": 19,
+  "pm_share": 0.0,
+  "score": -0.18,
+  "raw": -0.18,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "Navan beat Q2 estimates and raised FY2027 revenue guidance, but the stock tumbled ~11% on cost concerns and a guidance that failed to impress, with the BoomPop acquisition adding integration-spend worries. The negative reaction is already largely realized in the 11% drop, so the residual 1-5 day drift is modestly negative on continued cost/margin digestion, though the beat and raised forecast limit further downside. Net: a small negative lean reflecting post-earnings follow-through rather than a fresh hard catalyst.",
+  "heads": [
+   "[google_news/Reuters] Navan beats quarterly estimates, raises forecast; shares tumble on cost concerns - Reuters",
+   "[MarketBeat] Navan Q2 Earnings Call Highlights",
+   "[Yahoo] Navan Q2 Earnings Call Highlights",
+   "[google_news/Yahoo Finance] Navan Q2 Earnings Call Highlights - Yahoo Finance",
+   "[google_news/Investing.com Canada] Earnings call transcript: Navan tops Q2 2026 estimates but shares sink after hours - Investing.com Canada",
+   "[Zacks] Compared to Estimates, Navan (NAVN) Q2 Earnings: A Look at Key Metrics",
+   "[Yahoo] Compared to Estimates, Navan (NAVN) Q2 Earnings: A Look at Key Metrics",
+   "[google_news/Yahoo Finance] Compared to Estimates, Navan (NAVN) Q2 Earnings: A Look at Key Metrics - Yahoo Finance",
+   "[google_news/marketscreener.com] Navan Acquires AI-Powered Events Platform BoomPop; Shares Fall - marketscreener.com",
+   "[google_news/ChartMill] Navan (NASDAQ:NAVN) Drops 11% After Q2 Beat as Guidance Fails to Impress - ChartMill"
+  ]
+ },
+ {
+  "ticker": "IGV",
+  "run_id": "2026-09-09_173010",
+  "n_articles": 12,
+  "pm_share": 0.5833333333333334,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 58% of the digest mentions IGV only in passing, never in a headline.",
+  "heads": [
+   "[google_news/simplywall.st] 3 Software Stocks Tied To Rising AI Liability Demand - simplywall.st",
+   "[google_news/Investing.com Australia] Why is iShares Expanded Tech-Software Sector ETF stock sliding today? - Investing.com Australia",
+   "[google_news/Investing.com] Why is iShares Expanded Tech-Software Sector ETF stock sliding today? - Investing.com",
+   "[Yahoo] UiPath and Pegasystems Sink 7% as Price Target Hikes Arrive Without a Single Buy Rating",
+   "[SeekingAlpha] Zeta: I See A Path To $60+/Share",
+   "[SeekingAlpha] Oracle Deserves One Last Chance",
+   "[SeekingAlpha] Ride The Bull Before The Market Comes To Its Senses",
+   "[24/7 Wall St.] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[Yahoo] Investors Pulled $700 Million From IGV Hours Before Snowflake Reignited Software",
+   "[The Motley Fool] A Once-in-a-Decade Opportunity: 1 Magnificent S&P 500 Stock Down 41% to Buy Right Now"
+  ]
+ },
+ {
+  "ticker": "NAVN",
+  "run_id": "2026-09-09_213245",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": 0.0095,
+  "raw": 0.03,
+  "catalyst": "short_squeeze_social",
+  "engine": "deepseek",
+  "rationale": "The only item is a 6.7-day-old dark-pool share statistic (54% vs 46% baseline) \u2014 a SOFT positioning signal with no dated event, no disclosed size, and no corroborating hard catalyst; it is stale and weak, so it earns only the smallest bullish lean rather than an abstention.",
+  "heads": [
+   "[Quiver Dark Pool] NAVN off-exchange (dark-pool) accumulation: DPI 54% vs 46% baseline"
+  ]
+ },
+ {
+  "ticker": "CME",
+  "run_id": "2026-09-09_110017",
+  "n_articles": 2,
+  "pm_share": null,
+  "score": 0.0316,
+  "raw": 0.07,
+  "catalyst": "contract_partnership",
+  "engine": "deepseek",
+  "rationale": "Two modest, company-specific items: a prop firm routing single-stock-futures flow through CME's feed (incremental volume, no disclosed size) and CME's agreement to take over EEX's European dairy contracts (small product-line expansion, terms undisclosed). Both are mildly volume/revenue accretive but immaterial to CME's ~$80B market cap and neither is a dated hard catalyst; the news is 2-3 days old and largely symbolic, so the residual lean is small and positive.",
+  "heads": [
+   "[Yahoo] Prop Industry Leader The5ers Brings Single Stock Futures via CME Feed",
+   "[PRNewswire] CME Group to Enter European Dairy Market with Transition of EEX Dairy Products"
+  ]
+ },
+ {
+  "ticker": "XLV",
+  "run_id": "2026-09-09_033027",
+  "n_articles": 20,
+  "pm_share": 0.55,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 55% of the digest mentions XLV only in passing, never in a headline.",
+  "heads": [
+   "[Yahoo] Goldman Sachs Just Added Vertex Pharmaceuticals to Its Conviction List. Here's the Bull Case for the Big Biotech Stock",
+   "[Investor's Business Daily] How Novartis' Double-Stacked Failures Reverberated Through Biopharma",
+   "[Yahoo] How Novartis' Double-Stacked Failures Reverberated Through Biopharma",
+   "[google_news/Investor's Business Daily] How Novartis' Double-Stacked Failures Shook Biotech - Investor's Business Daily",
+   "[Investor's Business Daily] Biotech Stocks, With 'Blowout' And 'Bull Case' Results, Rocket To Record Highs",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Late Afternoon",
+   "[google_news/Finimize] Novartis\u2019 Trial Miss Sent Shockwaves Through Biotech Stocks - Finimize",
+   "[Stocktwits] These 2 Biotech Stocks Hit Record Highs Today \u2013 What\u2019s Driving The Rallies?",
+   "[Yahoo] Sector Update: Healthcare Stocks Fall Tuesday Afternoon",
+   "[prnewswire_ma] Central Admixture Pharmacy Services Announces Sale of 503B Product Portfolio to Quva Pharma"
+  ]
+ },
+ {
+  "ticker": "SMH",
+  "run_id": "2026-09-09_123023",
+  "n_articles": 20,
+  "pm_share": 0.25,
+  "score": 0.1342,
+  "raw": 0.14,
+  "catalyst": "macro_sector",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh catalyst is Analog Devices' $1.35B all-cash acquisition of Alif Semiconductor (ADI is a top SMH holding), a modest but real positive for the semiconductor complex, reinforced by a broad chip-sector rally (Intel, AMD, Qualcomm, Broadcom, ASML, TSM all advancing) and bullish AI-chip commentary from Motley Fool/Seeking Alpha pieces. The read-through to SMH is a mild upward lean, but the sector move is already 1-2 days old and largely reflected in prices, and the ADI deal is small relative to ADI's size, so the remaining move is limited. Net lean up, small magnitude.",
+  "heads": [
+   "[seeking_alpha] Analog Devices to Buy Alif Semiconductor for $1.35B cash",
+   "[prnewswire_ma] Analog Devices to Acquire Alif Semiconductor, Adding an AI-Native Processing Platform to Advance Physical Intelligence for the Next Generation of Real-Wor",
+   "[Motley Fool] Billionaire Stanley Druckenmiller Dumped 2 Chip Stocks to Load Up On These 2 Robotics-Focused AI Plays",
+   "[The Motley Fool] This AI Chipmaker Looks Like a Bargain With AI Revenue Set to Double Again Next Year",
+   "[Motley Fool] Amazon CEO Andy Jassy Explained Why Semiconductor Sales Could Keep Climbing for Years to Come. Here's My Favorite AI Chipmaker Right Now.",
+   "[Yahoo] Amazon CEO Andy Jassy Explained Why Semiconductor Sales Could Keep Climbing for Years to Come. Here's My Favorite AI Chipmaker Right Now.",
+   "[Yahoo] Semiconductor Design Market to Grow from USD 25.23 Billion in 2025 to USD 69.43 Billion by 2035, at a CAGR of 10.67%",
+   "[google_news/simplywall.st] How Investors Are Reacting To Navitas Semiconductor (NVTS) U.S. Chip Shipments - simplywall.st",
+   "[google_news/Moomoo] VanEck Semiconductor ETF (SMH) Stock Price | Quotes & News - Moomoo",
+   "[google_news/GuruFocus] US Markets Decline, Chip Stocks Like INTC and AMD Show Resilienc - GuruFocus"
+  ]
+ },
+ {
+  "ticker": "PURR",
+  "run_id": "2026-09-10_003023",
+  "n_articles": 2,
+  "pm_share": 0.0,
+  "score": -0.0239,
+  "raw": -0.06,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "Only coverage is stale commentary: a Motley Fool piece noting PURR soared 94% in August (a move already taken, so residual is a mean-reversion lean) and a Zacks momentum-stock promotion with no fresh dated catalyst. Both are aggregator/commentary framing, so the read is a small negative lean on the extended, already-priced spike rather than a fresh bullish driver.",
+  "heads": [
+   "[Motley Fool] Hyperliquid Strategies Soared by 94% in August. Should Investors Forget Bitcoin and Buy This Stock Instead?",
+   "[Zacks] What Makes Hyperliquid Strategies Inc (PURR) a Strong Momentum Stock: Buy Now?"
+  ]
+ },
+ {
+  "ticker": "GDX",
+  "run_id": "2026-09-10_113010",
+  "n_articles": 3,
+  "pm_share": 0.6666666666666666,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 67% of the digest mentions GDX only in passing, never in a headline.",
+  "heads": [
+   "[Benzinga] Oil Hits $100: Which Stocks And ETFs Win Or Lose?",
+   "[The Times of India] Gold prices soar, Indians swap old jewellery for new as advance purchase schemes lose shine",
+   "[SeekingAlpha] Gold And Its Miners: Stronger Balance Sheets, Higher Margins, More Upside"
+  ]
+ },
+ {
+  "ticker": "XOM",
+  "run_id": "2026-09-09_143028",
+  "n_articles": 3,
+  "pm_share": 0.0,
+  "score": 0.0363,
+  "raw": 0.06,
+  "catalyst": "company_pr",
+  "engine": "deepseek",
+  "rationale": "ExxonMobil presented at the Barclays conference, touting Permian synergies, Guyana cash flow and LNG growth \u2014 a routine management appearance with no new hard numbers or guidance change, so the read is a soft positive lean on the reaffirmed operational narrative. The Motley Fool/Yahoo piece is a comparative dividend listicle that frames XOM as being surpassed by AI names, a mildly unfavorable but recycled commentary with no dated event. Netting the two, the dominant fresh item is the conference appearance with a modest favorable framing, but it is largely promotional and already known, keeping the score in the LEAN band.",
+  "heads": [
+   "[yahoo_finance] ExxonMobil Touts Permian Synergies, Guyana Cash Flow and LNG Growth at Barclays Conference",
+   "[Motley Fool] Step Aside, ExxonMobil: 2 Foundational AI Stocks Now Pay Larger Dividends",
+   "[Yahoo] Step Aside, ExxonMobil: 2 Foundational AI Stocks Now Pay Larger Dividends"
+  ]
+ },
+ {
+  "ticker": "GWRE",
+  "run_id": "2026-09-09_003023",
+  "n_articles": 20,
+  "pm_share": 0.1,
+  "score": -0.0924,
+  "raw": -0.12,
+  "catalyst": "guidance",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the post-earnings selloff: GWRE beat Q4 EPS by 5.5% but issued soft FY27/next-quarter revenue guidance (~3.3% below consensus), triggering a ~20% plunge 2.5\u20136 days ago that is now largely priced in. The residual drift is modestly negative \u2014 negative guidance shocks typically keep bleeding for several sessions, and the only fresh items are a routine 10b5-1 insider sale (1,200 shares, immaterial) and GuruFocus 'undervalued' commentary that is aggregator framing, not a catalyst. With the hard move already taken and no new positive catalyst, the remaining 1\u20135 day move is a small negative lean.",
+  "heads": [
+   "[google_news/GuruFocus] Guidewire Software (GWRE) CEO Michael Rosenbaum Sells 1,200 Shar - GuruFocus",
+   "[google_news/GuruFocus] A Look at Guidewire Software Inc (GWRE) After 7.8% Decline -- GF Value $209.45 vs Price $149.71 - GuruFocus",
+   "[google_news/GuruFocus] GWRE Looks 28.5% Undervalued on GF Value\u2122 as Shares Slide Amid G - GuruFocus",
+   "[google_news/Seeking Alpha] Guidewire Software falls 8% amid post-earnings selloff (GWRE:NYSE) - Seeking Alpha",
+   "[google_news/Stock Titan] Guidewire Software (GWRE) CEO stock sale runs on preset 10b5-1 plan - Stock Titan",
+   "[google_news/Stock Titan] Guidewire Software (NYSE: GWRE) insider to sell 1,200 shares - Stock Titan",
+   "[google_news/scanx.trade] Guidewire stock falls 20% after Q4 beat, weak FY27 guide - scanx.trade",
+   "[google_news/Benzinga] Guidewire Stock Drop: Why GWRE Fell 20% - Guidewire Software (NYSE:GWRE) - Benzinga",
+   "[google_news/Trefis] Market Movers | Winners: NX, BBCP, TYRA | Losers: ALTI, GWRE, LULU - Trefis",
+   "[Earnings/EPS] GWRE modestly beat EPS estimate by 5.5% (Q3 2026 results)"
+  ]
+ },
+ {
+  "ticker": "CRL",
+  "run_id": "2026-09-09_190013",
+  "n_articles": 1,
+  "pm_share": 0.0,
+  "score": 0.0,
+  "raw": 0.0,
+  "catalyst": "none",
+  "engine": "deepseek",
+  "rationale": "The only digest item is a Barron's piece on Charles Schwab client trading behavior turning more selective in August \u2014 a broad market-risk-appetite read with no mention of Charles River Laboratories, its peers, customers, or the CRO sector. There is no company-specific catalyst, no named peer or supplier read-through, and no directional framing that plausibly transmits to CRL's price, so this is the no-connection abstention case rather than a soft lean.",
+  "heads": [
+   "[Barrons.com] Charles Schwab\u2019s Trading Data Shows Investors Dialing Back on Risk"
+  ]
+ },
+ {
+  "ticker": "LEN-B",
+  "run_id": "2026-09-09_190013",
+  "n_articles": 14,
+  "pm_share": 0.0,
+  "score": -0.1544,
+  "raw": -0.18,
+  "catalyst": "earnings",
+  "engine": "deepseek",
+  "rationale": "The dominant catalyst is the pre-earnings setup: Lennar hit a 52-week low at $79.82 after a 3.8% single-day drop, with Zacks flagging an expected earnings decline and analysts trimming fair value/price targets ahead of the Sept. 16 report. The mechanism is negative pre-earnings positioning and estimate-revision drift, with the stock already down ~37% over the past year and the recent 3.8% drop partly pricing the weak setup. Residual downside remains but is modest given how much has already been sold off, so the lean is small negative rather than a full bearish call.",
+  "heads": [
+   "[google_news/Investing.com India] Lennar Corporation stock hits 52-week low at $79.82 By Investing.com - Investing.com India",
+   "[google_news/Investing.com] Lennar stock may move 5.2% on Sept. 16 earnings report - Investing.com",
+   "[google_news/Investing.com Nigeria] Lennar stock may move 5.2% on Sept. 16 earnings report By Investing.com - Investing.com Nigeria",
+   "[google_news/Barchart.com] Is Lennar Stock Underperforming the S&P 500? - Barchart.com",
+   "[Zacks] Analysts Estimate Lennar (LEN) to Report a Decline in Earnings: What to Look Out for",
+   "[google_news/Yahoo Finance] Analysts Estimate Lennar (LEN) to Report a Decline in Earnings: What to Look Out for - Yahoo Finance",
+   "[google_news/AD HOC NEWS] Lennar stock heads into the open after a 3.8% drop - AD HOC NEWS",
+   "[Zacks] Lennar (LEN) Registers a Bigger Fall Than the Market: Important Facts to Note",
+   "[google_news/Yahoo Finance] Lennar (LEN) Registers a Bigger Fall Than the Market: Important Facts to Note - Yahoo Finance",
+   "[google_news/MarketWatch] Lennar Corp. Cl A stock underperforms Tuesday when compared to competitors - MarketWatch"
+  ]
+ },
+ {
+  "ticker": "BRK-B",
+  "run_id": "2026-09-10_160006",
+  "n_articles": 16,
+  "pm_share": 0.25,
+  "score": 0.0652,
+  "raw": 0.07,
+  "catalyst": "capital_structure",
+  "engine": "deepseek",
+  "rationale": "The dominant fresh item is the Motley Fool report (33h ago) that Greg Abel resumed aggressive buybacks \u2014 $4.53B in Q2 2026 after a 21-month hiatus \u2014 corroborated by a 3.7d and 5.0d piece on the same buyback and $31B cash deployment; a large, ongoing repurchase program is a genuine but already-disclosed capital-return positive, and the Zacks note (3.1d) shows the stock is down 3% since earnings despite raised estimates, so the residual drift is mildly negative. Netting the buyback support against the post-earnings weakness and the heavy recycled Buffett-commentary/listicle flow (no new hard catalyst), the read is a small positive lean.",
+  "heads": [
+   "[google_news/Business Insider] GM's Mary Barra shares Warren Buffett's 'phenomenal advice' to her - Business Insider",
+   "[google_news/ad-hoc-news.de] Berkshire Hathaway stock holds steady as cash pile and portfolio shifts draw focus - ad-hoc-news.de",
+   "[Yahoo] The Stock Market Is Triggering a Warning That Warren Buffett Calls \"Playing With Fire.\" Here's What History Says Comes Next.",
+   "[google_news/ad-hoc-news.de] Berkshire Hathaway stock heads into the open after a marginal loss - ad-hoc-news.de",
+   "[google_news/Business Wire] Berkshire Residential Investments to Acquire Full Ownership of MF1, the Leading Private-Label Multifamily Mortgage Lender - Business Wire",
+   "[The Motley Fool] Warren Buffett and His Successor, Greg Abel, Have Piled More Than $82 Billion Into This Perennial Winner (No, Not Alphabet!)",
+   "[The Motley Fool] History Shows the Investors Who Make This 1 Move During Bear Markets Build the Most Wealth",
+   "[The Motley Fool] Warren Buffett's Hand-Picked Successor, Greg Abel, has 68% of Berkshire Hathaway's Portfolio Invested in Just 5 Stocks. Here's My Top Pick for September",
+   "[Zacks Investment Research] Berkshire Hathaway B (BRK.B) Down 3% Since Last Earnings Report: Can It Rebound?",
+   "[Zacks Investment Research] Should Vanguard Morningstar Mega Cap Value ETF (MGV) Be on Your Investing Radar?"
+  ]
+ },
+ {
+  "ticker": "CRL",
+  "run_id": "2026-09-09_023012",
+  "n_articles": 3,
+  "pm_share": 0.6666666666666666,
+  "score": 0.0,
+  "raw": null,
+  "catalyst": null,
+  "engine": null,
+  "rationale": "No usable read: 67% of the digest mentions CRL only in passing, never in a headline.",
+  "heads": [
+   "[Barrons.com] Review & Preview: A Slippery Start to Fall",
+   "[Yahoo] Review & Preview: A Slippery Start to Fall",
+   "[prnewswire_ma] SOUTHERLAND COMMUNITIES ACQUIRES THE RESERVE AT ST. CHARLES BAY"
+  ]
+ }
+]

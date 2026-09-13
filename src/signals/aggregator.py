@@ -273,6 +273,44 @@ def _insider_role_weight(role: str) -> float:
 _BASE_WEIGHTS = {
     "news":      0.40,
     "sent_velocity": 0.12,  # Δsentiment (rate of change of news tone) — short-horizon timing overlay
+    # The same news verdict, but only once the story has gone QUIET (freshest
+    # cluster >= news_quiet_min_age_hours). Measured +1.90 pp/decision at 48h
+    # (t +2.65) against -0.23 pp under it; SHORT +2.90 (t +3.10), LONG +0.90
+    # (t +0.86, below the bar — shipped on the user's call, and the per-side
+    # machinery re-judges each camp from its own ledger). Modest weight because
+    # the finding is EXPLORATORY, not pre-registered: see the module docstring
+    # and memory/volume-priced-in-2026-09.md. It abstains on ~68% of names, so
+    # it dilutes nothing when the story is still in flow.
+    "news_quiet": 0.10,
+    # news_bull_fresh (2026-09-10, user request): the bull news read BOOSTED by
+    # the move the tape has already made in its direction. 0.08 — the smallest
+    # weight in the book, and deliberately below `news_quiet`'s 0.10 because
+    # news_quiet CLEARED the house bar (t +2.65) and this did not (+0.0556
+    # paired IC within bull events, t +1.63). It is also the same information as
+    # `news` on bull rows, so the Sentiment family keeps it from voting twice.
+    "news_bull_fresh": 0.08,
+    # 2026-09-11 (user request), promoted for ONE stated effect: a weight-0
+    # method is excluded from coherence, `sources_agreeing` and the family vote
+    # entirely, and these three are meant to shake those. Be clear about what a
+    # base weight can and cannot do here — with `ml_combine_arm_share` at 1.0
+    # the STACKERS are the combine (`combine_source` reads "ml" on 100% of live
+    # rows), so this reaches CONFIDENCE, and therefore position SIZE, and never
+    # the direction the rank rule selects on. All three are already in
+    # `STACKER_SIGNED_FEATURES`, which is the path that reaches direction, and
+    # it activates at the next retrain.
+    #
+    # Sized BELOW `news_bull_fresh`'s 0.08 because their measurements, unlike
+    # its, cannot currently be confirmed: the news-family epoch leaves ZERO
+    # labelled non-masked rows for any of them, so the numbers below were all
+    # produced by the v4/v5/v6-era scorer, four categorical changes ago.
+    #
+    #   news_bear_fresh  bear-event daily IC +0.095 (t +2.96) — cleared the bar
+    #   catalyst_tilt    LOMO held-out IC +0.039 (t +2.22) — cleared the bar
+    #   news_shock       NO measurement exists; it gets the smallest weight in
+    #                    the book for exactly that reason
+    "news_bear_fresh": 0.06,
+    "catalyst_tilt":   0.06,
+    "news_shock":      0.04,
     "tech":      0.30,
     "massive":   0.15,   # Massive/Polygon server-side RSI+MACD composite — overlaps `tech`, so kept modest
     "insider":   0.30,
@@ -1582,6 +1620,28 @@ def _raw_confidence_scale(combine_source: str = "weighted") -> float:
     return 0.5
 
 
+def _f_or_nan(x) -> float:
+    """A float the model can impute, never a fabricated 0.0 — missing market
+    state must look missing (the panel's own convention for an absent column)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+    return v if v == v else float("nan")
+
+
+def _news_raw_feature(news_meta) -> float:
+    """The PRE-SCALER sentiment verdict as the stacker feature.
+
+    NaN when the run captured no raw verdict (a provider-scored read, an engine
+    failure, or a pre-v4 cached verdict): the panel column is NULL on exactly
+    those rows, so serving must not substitute a 0.0 — that is a real verdict
+    meaning "read it, nothing there"."""
+    if not isinstance(news_meta, dict):
+        return float("nan")
+    return _f_or_nan(news_meta.get("raw_score"))
+
+
 def _direction_bands(combine_source: str = "weighted") -> tuple:
     """``(long_band, short_band)`` for the Direction step, per combine + basis.
 
@@ -1603,6 +1663,69 @@ def _direction_bands(combine_source: str = "weighted") -> tuple:
 
 
 # ── Within-run rank transform (2026-08-13 user directive) ────────────────────
+
+# Short labels for the per-run weight log. A method with no entry here is
+# printed under its own name rather than being dropped — the whole point of
+# generating this line is that a WEIGHTED method can never go missing from it.
+_WEIGHT_LOG_LABELS: dict = {
+    "news": "news", "news_quiet": "nq", "news_bull_fresh": "nbf",
+    "news_bear_fresh": "nbear", "catalyst_tilt": "ctilt", "news_shock": "nshock",
+    "sent_velocity": "sv", "sector_momentum": "sector_mom",
+    "market_momentum": "market_mom", "trend_strength": "trend",
+    "mom_12_1": "m12-1", "st_reversal": "strev", "ml_ohlcv": "mlo",
+    "rsi2_rev": "rsi2", "dloc_rev": "dloc",
+}
+
+
+def _format_weight_log(weights: dict) -> str:
+    """Every method carrying weight this run, generated from the weights dict.
+
+    This used to be a hand-written f-string naming ~29 methods, i.e. a second
+    copy of the method book — and it drifted: the three methods promoted off
+    weight 0 on 2026-09-11 carried real weight and appeared nowhere in it. That
+    matters because this log line is the monitoring surface that caught
+    `news_quiet` contributing ZERO two days earlier; a weighted method invisible
+    here is the same silent-failure exposure the promotion was meant to close.
+
+    Zero-weight entries are omitted (the book has ~30 of them and the line has to
+    stay readable); everything non-zero is printed, in descending weight, so the
+    heaviest contributors read first."""
+    live = [(m, w) for m, w in weights.items() if w]
+    live.sort(key=lambda kv: (-abs(kv[1]), kv[0]))
+    return "  ".join(f"{_WEIGHT_LOG_LABELS.get(m, m)}={w:.0%}" for m, w in live) or "none"
+
+
+def _rank_min_view_overrides() -> dict:
+    """`method_rank_min_views_overrides` parsed to ``{method: n}``.
+
+    Per-method because the global floor answers a question that is right for
+    most methods and wrong for one shape of method: `method_rank_min_views` (5)
+    protects against calling a 3-name ranking a signal, but a method whose
+    ABSTENTION IS THE MECHANISM has a small cross-section by design rather than
+    by data failure. See the setting for the measurement.
+
+    Unparseable entries are skipped and logged once — a malformed override must
+    not silently become "no override", which is the same observable as a working
+    one."""
+    raw = str(getattr(settings, "method_rank_min_views_overrides", "") or "")
+    out: dict = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, val = part.partition("=")
+        try:
+            out[name.strip()] = int(val)
+        except ValueError:
+            if part not in _BAD_MIN_VIEW_OVERRIDES:
+                _BAD_MIN_VIEW_OVERRIDES.add(part)
+                logger.warning(f"[aggregator] ignoring unparseable "
+                               f"method_rank_min_views_overrides entry: {part!r}")
+    return out
+
+
+_BAD_MIN_VIEW_OVERRIDES: set = set()
+
 
 def _rank_transform_run(raw_maps: dict, tradeable=None, shapes=None) -> tuple:
     """Replace every method's scores with their CENTERED WITHIN-RUN rank.
@@ -1652,6 +1775,7 @@ def _rank_transform_run(raw_maps: dict, tradeable=None, shapes=None) -> tuple:
         min_views = max(2, int(getattr(settings, "method_rank_min_views", 5)))
     except Exception:
         min_views = 5
+    _min_overrides = _rank_min_view_overrides()
     # ``shapes`` (2026-08-21): an explicit curve set overrides the live TTL
     # lookup — the walk-forward backtest passes each date's own as-of curves so
     # history is never scored through curves fitted on it. None = live lookup
@@ -1665,6 +1789,7 @@ def _rank_transform_run(raw_maps: dict, tradeable=None, shapes=None) -> tuple:
             _shapes = {}
     out = {tk: dict(m) for tk, m in raw_maps.items()}
     abstained: set = set()
+    _thin_counts: dict = {}
     methods = set()
     for m in raw_maps.values():
         methods.update(m.keys())
@@ -1678,7 +1803,8 @@ def _rank_transform_run(raw_maps: dict, tradeable=None, shapes=None) -> tuple:
         else:
             views, observe = all_views, []
         n = len(views)
-        if n < min_views:
+        _thin_counts[method] = n
+        if n < max(2, _min_overrides.get(method, min_views)):
             # Too thin to rank -> WEIGHT 0 this run (scores left untouched;
             # the caller zeroes the weight and excludes the method from
             # coherence / agreement / family votes, the win-rate-filter idiom).
@@ -1715,6 +1841,16 @@ def _rank_transform_run(raw_maps: dict, tradeable=None, shapes=None) -> tuple:
             else:
                 val = 2.0 * pct - 1.0
             out[tk][method] = (True, round(float(val), 4))
+    if abstained:
+        # A method dropped for thinness contributes NOTHING — no weight, no
+        # coherence, no family vote — and until 2026-09-11 that transition was
+        # invisible: `news_quiet` sat at weight 0 for a third of its runs and it
+        # took a database query to notice. A method that stops participating
+        # must say so.
+        logger.info("[aggregator] rank-thin this run (WEIGHT 0): "
+                    + ", ".join(f"{m}({_thin_counts.get(m, 0)}<"
+                                f"{max(2, _min_overrides.get(m, min_views))})"
+                                for m in sorted(abstained)))
     return out, frozenset(abstained)
 
 
@@ -2060,6 +2196,13 @@ def build_signals(
         {s.ticker: float(s.price) for s in (snapshots or []) if getattr(s, "price", None)}
         if use_ext_gap else {}
     )
+    # The same snapshot prices, UNCONDITIONALLY: `news_unpriced` measures the
+    # move since the news landed and the daily frame is completed-bars-only,
+    # so without a live mark the freshest cluster would read "nothing has
+    # happened yet" all session. Not look-ahead — it is the current price.
+    live_price_by_ticker = {
+        s.ticker: float(s.price) for s in (snapshots or []) if getattr(s, "price", None)
+    }
     # Broker advisor — IBKR short-borrow tilt. Needs the borrow context (fetched by
     # the pipeline from the live broker); inactive otherwise → method scores 0.
     use_broker_advisor = settings.enable_broker_advisor and borrow_context is not None
@@ -2145,6 +2288,17 @@ def build_signals(
 
     _raw_active = {
         "news":       use_news,
+        # news_quiet rides the same feed as `news` (it IS the news verdict,
+        # gated on the story having gone quiet), so it is active exactly when
+        # news is — and it MUST be listed here: `_normalised_weights` iterates
+        # `active_flags`, not `_BASE_WEIGHTS`, so a method missing from this
+        # dict scores, persists and ranks normally while contributing weight
+        # ZERO. `test_every_weighted_method_has_an_active_flag` pins it.
+        "news_quiet": use_news and bool(getattr(settings, "enable_news_quiet", True)),
+        "news_bull_fresh": use_news and bool(getattr(settings, "enable_news_bull_fresh", True)),
+        "news_bear_fresh": use_news and bool(getattr(settings, "enable_news_bear_fresh", True)),
+        "catalyst_tilt": use_news and bool(getattr(settings, "enable_catalyst_tilt", True)),
+        "news_shock": use_news and bool(getattr(settings, "enable_news_shock", True)),
         "sent_velocity": use_sent_velocity,
         "tech":       use_tech,
         "massive":    use_massive,
@@ -2271,21 +2425,7 @@ def build_signals(
 
     mode_label = f" [{market_mode_context.mode}]" if market_mode_context else ""
     logger.info(
-        f"Signal weights{mode_label} — "
-        f"news={weights['news']:.0%}  sv={weights['sent_velocity']:.0%}  tech={weights['tech']:.0%}  "
-        f"massive={weights['massive']:.0%}  "
-        f"insider={weights['insider']:.0%}  put_call={weights['put_call']:.0%}  "
-        f"max_pain={weights['max_pain']:.0%}  oi_skew={weights['oi_skew']:.0%}  "
-        f"vwap={weights['vwap']:.0%}  pattern={weights['pattern']:.0%}  "
-        f"momentum={weights['momentum']:.0%}  "
-        f"sector_mom={weights['sector_momentum']:.0%}  market_mom={weights['market_momentum']:.0%}  money_flow={weights['money_flow']:.0%}  "
-        f"trend={weights['trend_strength']:.0%}  "
-        f"pead={weights['pead']:.0%}  iv_rank={weights['iv_rank']:.0%}  iv_expr={weights['iv_expr']:.0%}  "
-        f"coint={weights['coint']:.0%}  ext_gap={weights['ext_gap']:.0%}  "
-        f"broker_advisor={weights['broker_advisor']:.0%}  "
-        f"m12-1={weights['mom_12_1']:.0%}  hi52={weights['hi52']:.0%}  "
-        f"strev={weights['st_reversal']:.0%}  mlo={weights['ml_ohlcv']:.0%}  "
-        f"rsi2={weights['rsi2_rev']:.0%}  dloc={weights['dloc_rev']:.0%}"
+        f"Signal weights{mode_label} — " + _format_weight_log(weights)
     )
 
     signals        = []
@@ -2573,6 +2713,49 @@ def build_signals(
             news_bear_fresh_v, _nbf_z3 = compute_news_bear_fresh(
                 ticker, sentiment_score, df=_shared_df)
 
+        # news_bull_fresh (2026-09-10, PANEL-FIRST weight 0, user request):
+        # the bull-side mirror of news_bear_fresh. Shipped at weight 0 with two
+        # priors pointing the wrong way — the bull hypotheses measured as
+        # repackaged momentum on 2026-08-15, and the priced-in premise the guard
+        # encodes measured BACKWARDS on 2026-09-09 — so the panel adjudicates it
+        # (and its `news_bull_fresh_invert` twin) rather than an argument.
+        news_bull_fresh_v, _nbuf_z3 = 0.0, 0.0
+        if settings.enable_news_bull_fresh and use_news:
+            from src.signals.news_bull_fresh import compute_news_bull_fresh
+            news_bull_fresh_v, _nbuf_z3 = compute_news_bull_fresh(
+                ticker, sentiment_score, df=_shared_df)
+
+        # news_unpriced / news_unpriced_all (2026-09-07, PANEL-FIRST weight 0):
+        # the news read net of the move the tape has ALREADY made since the
+        # story began — anchored on the news cluster's own first article, both
+        # sides, so "good news nobody bought" and "good news already chased"
+        # separate. Like news_shock and news_bear_fresh it stays OUT of
+        # method_score_map (no combine, coherence or family votes) and reaches
+        # the panel and the stackers through the TickerSignal field.
+        news_unpriced_v = news_unpriced_all_v = 0.0
+        if settings.enable_news_priced_in and use_news:
+            from src.signals.news_priced_in import compute_news_priced_in
+            news_unpriced_v, news_unpriced_all_v, _nup_diag = compute_news_priced_in(
+                ticker, sentiment_score, relevant_articles,
+                price_now=live_price_by_ticker.get(ticker), df=_shared_df)
+
+        # news_quiet (2026-09-09, WEIGHTED 0.10): the SAME news verdict, taken
+        # only once the story has stopped moving — the freshest cluster is at
+        # least `news_quiet_min_age_hours` old. While a story is fresh and loud
+        # the tape is crowded and the read measured worth ~0; once the flow goes
+        # quiet the residual read predicts the next pivot. Deliberately reads
+        # the RAW verdict, not `sentiment_score`: the mass x diversity scaler
+        # shrinks thin digests, and the quiet cohort is thin BY CONSTRUCTION
+        # (median 6 articles vs 12), so the scaled score would shrink exactly
+        # the names this method exists to express. Abstains (0.0) on a loud
+        # story rather than inverting — a fresh read measured worth ~0, not
+        # reliably wrong.
+        news_quiet_v, news_quiet_age_v = 0.0, None
+        if settings.enable_news_quiet and use_news:
+            from src.signals.news_quiet import compute_news_quiet
+            news_quiet_v, news_quiet_age_v = compute_news_quiet(
+                ticker, (news_meta or {}).get("raw_score"), relevant_articles)
+
         # ── Method 10e: Tier-2 panel-first methods (weight 0, same contract) ──
         # TTM squeeze (vol coil/release, momentum-signed), IV term-structure
         # slope (front vs back ATM IV from the GEX chains — backwardation
@@ -2753,7 +2936,8 @@ def build_signals(
         # All other locals (raw *_score values, stacker feature dict, the
         # TickerSignal fields) resolve through this closure and stay RAW —
         # ranking is a consumption-time transform exactly like inversion.
-        def _finish(method_score_map, _rank_abstained=frozenset(), _raw_map=None):
+        def _finish(method_score_map, _rank_abstained=frozenset(), _raw_map=None,
+                    _news_ranks=None):
             # ABSOLUTE-basis SHADOW combine (2026-08-14): the weighted combine
             # over the RAW scores with the UNMODIFIED weights (no thin-rank
             # abstention — that concept belongs to the rank basis). Persisted
@@ -2821,7 +3005,9 @@ def build_signals(
             # consumes. Fail-soft: a None conviction (no artifact / lightgbm) keeps
             # the weighted combine — the swap can never silently break the combine.
             if ml_combine_arm_active():
-                from src.analysis.ml_stacker import compute_buy_conviction, compute_sell_conviction
+                from src.analysis.ml_stacker import (catalyst_onehot,
+                                                     compute_buy_conviction,
+                                                     compute_sell_conviction)
                 _daily_scores = {
                     "news": sentiment_score, "sent_velocity": sent_velocity_score,
                     "tech": technical_score, "massive": massive_score, "insider": insider_sc,
@@ -2845,14 +3031,41 @@ def build_signals(
                     # convention; the model imputes its train median.
                     "tape_score": (float(tape_check.score) if tape_check is not None
                                    else float("nan")),
+                    # 2026-09-07 (user directive): the rest of the news family +
+                    # the pre-combine market state. Every key here must exist in
+                    # the panel column of the same name, or the model sees one
+                    # distribution in training and another live — the failure
+                    # mode that made the 2026-08-11 six-pack measure harmful.
+                    # The three panel-first news methods are already scored
+                    # above at weight 0; the raw verdict and the catalyst come
+                    # off the sentiment meta; the counts are the same values
+                    # persisted to `signals`.
+                    "news_shock": news_shock_score_v,
+                    "news_bear_fresh": news_bear_fresh_v,
+                    "news_unpriced": news_unpriced_v,
+                    "news_unpriced_all": news_unpriced_all_v,
+                    "news_quiet": news_quiet_v,
+                    "news_bull_fresh": news_bull_fresh_v,
+                    "catalyst_tilt": catalyst_tilt_v,
+                    "news_raw_score": _news_raw_feature(news_meta),
+                    "news_recency_mass": float(news_recency_mass_v),
+                    "news_article_count": float(news_article_count_v),
+                    # Pre-combine market state. NOT the confidence factors built
+                    # from it: those are computed downstream of the combine this
+                    # model produces, so at this point in the run they do not
+                    # exist yet (and would be circular if they did).
+                    "atr_pct": _f_or_nan(atr_pct),
+                    "bb_width_pct": _f_or_nan(bb_width_pct),
+                    "vol_ratio": _f_or_nan(vol_ratio),
+                    **catalyst_onehot((news_meta or {}).get("catalyst")),
                 }
-                _conv = compute_buy_conviction(_daily_scores)
+                _conv = compute_buy_conviction(_daily_scores, ranked=_news_ranks)
                 if _conv is not None:
                     combined_buy = float(_conv)
                 # Sell side is symmetric — the sell stacker replaces the weighted
                 # combined_sell_score (validated to beat it at 5d). Fail-soft to the
                 # weighted sell camp.
-                _sconv = compute_sell_conviction(_daily_scores)
+                _sconv = compute_sell_conviction(_daily_scores, ranked=_news_ranks)
                 if _sconv is not None:
                     combined_sell = float(_sconv)
                 # PROVENANCE (2026-08-02): record which combine actually produced this
@@ -3084,6 +3297,13 @@ def build_signals(
                 sentiment_prior=round(sent_prior, 3),
                 news_shock_score=round(news_shock_score_v, 4),
                 news_bear_fresh_score=round(news_bear_fresh_v, 4),
+                news_unpriced_score=round(news_unpriced_v, 4),
+                news_unpriced_all_score=round(news_unpriced_all_v, 4),
+                news_bull_fresh_score=round(news_bull_fresh_v, 6),
+                news_bull_fresh_z3=round(float(_nbuf_z3 or 0.0), 3),
+                news_quiet_score=round(news_quiet_v, 6),
+                news_quiet_age_h=(None if news_quiet_age_v is None
+                                  else round(float(news_quiet_age_v), 2)),
                 catalyst_tilt_score=round(catalyst_tilt_v, 4),
                 news_article_count=int(news_article_count_v),
                 news_recency_mass=round(news_recency_mass_v, 4),
@@ -3092,8 +3312,13 @@ def build_signals(
                 # `python -m src.analysis.news_events` can associate event type
                 # and magnitude with the pivot forward return.
                 news_catalyst=news_meta.get("catalyst"),
+                news_expected_score=(None if news_meta.get("expected_score") is None
+                                     else round(float(news_meta["expected_score"]), 6)),
+                news_argmax_score=(None if news_meta.get("argmax_score") is None
+                                   else round(float(news_meta["argmax_score"]), 6)),
                 news_raw_score=(None if news_meta.get("raw_score") is None
                                 else round(float(news_meta["raw_score"]), 4)),
+                news_digest_id=news_meta.get("digest_id"),
                 technical_score=round(technical_score, 3),
                 massive_score=round(massive_score, 3),
                 insider_score=round(insider_sc, 6),   # see sentiment_score above
@@ -3254,6 +3479,22 @@ def build_signals(
     # within-run rank (`_rank_transform_run`), and the serial continuation loop
     # (pure arithmetic, ~µs/ticker) runs the combine on the transformed maps.
     # "absolute" bypasses the transform — byte-identical to the old single pass.
+    # Story clustering needs document frequencies from a CORPUS, and the only
+    # honest corpus is this tick's whole article pool: within-digest IDF zeroes
+    # exactly the terms that identify a shared story (see news_clustering).
+    # Installed once per run, BEFORE any scoring; without it the module falls
+    # back to flat term weights rather than to the wrong ones.
+    try:
+        from src.analysis.news_clustering import cluster_mode, set_corpus
+        # BOTH content-aware modes need it. Gating this on "content" alone was
+        # a live defect the moment `hybrid` shipped: the module would fall back
+        # to FLAT term weights and merge on the wrong evidence, silently.
+        if cluster_mode() in ("content", "hybrid"):
+            logger.debug(f"[aggregator] story-clustering corpus: "
+                         f"{set_corpus(articles)} documents")
+    except Exception as _e:                                 # noqa: BLE001
+        logger.warning(f"[aggregator] clustering corpus failed ({_e}) — flat term weights")
+
     _workers = max(1, int(getattr(settings, "signal_scoring_max_workers", 8) or 1))
     if _workers > 1 and len(tickers) > 1:
         from concurrent.futures import ThreadPoolExecutor
@@ -3263,6 +3504,9 @@ def build_signals(
     else:
         _phase1 = [_score_ticker(t) for t in tickers]
     _raw_maps = {_tk: _msm for _tk, _msm, _fin in _phase1}
+    # Hoisted out of the rank branch: the stacker's news-feature ranking below
+    # uses the SAME pool, and needs it defined under either combine basis.
+    _tradeable = None
     if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
         # Tradeable rank pool (2026-08-14 directive): Gate-4 floors, CACHE-ONLY
         # (budget n=0 — never spends API calls; an uncached name fails closed
@@ -3270,7 +3514,6 @@ def build_signals(
         # tradeable distribution). Fail-soft to the full universe when the gate
         # is off or the pool is implausibly thin (a liquidity-data outage must
         # never zero the whole book).
-        _tradeable = None
         if (bool(getattr(settings, "rank_tradeable_only", True))
                 and getattr(settings, "enable_trade_liquidity_gate", False)):
             try:
@@ -3279,6 +3522,23 @@ def build_signals(
                 _t = {tk for tk in _raw_maps
                       if is_liquid(tk, _budget, settings.trade_min_price,
                                    settings.trade_min_dollar_volume)}
+                # Universe-wide Gate-4 guard (2026-09-03 audit): this is the
+                # ONE place every scored name's `is_liquid` verdict exists per
+                # run (the actionable cascade sees at most `gate1_rank_cap`
+                # names, so no guard there could ever trip). is_liquid fails
+                # CLOSED, so a systematic breakage (pandas API, corrupt OHLCV
+                # cache) reads exactly like "no liquid names today" — and the
+                # same verdict gates every actionable trade at Gate 4.
+                # Production clears ~85-90% of a ~950-name universe.
+                _share = len(_t) / max(1, len(_raw_maps))
+                if len(_raw_maps) >= 100 and _share < 0.25:
+                    logger.critical(
+                        f"[aggregator] Gate-4 liquidity verdicts COLLAPSED: "
+                        f"{len(_t)}/{len(_raw_maps)} ({_share:.0%}) of the scored "
+                        f"universe clears the trade floor (production ~85-90%) — "
+                        f"suspect a liquidity-data / OHLCV-cache breakage, not a "
+                        f"thin market; every actionable trade is gated on the "
+                        f"same verdict")
                 if len(_t) >= 30:
                     _tradeable = _t
                     logger.info(f"[aggregator] rank pool: {len(_t)}/{len(_raw_maps)} "
@@ -3296,7 +3556,33 @@ def build_signals(
                         f"-> weight 0 this run: {sorted(_rank_abstained)}")
     else:
         _maps, _rank_abstained = _raw_maps, frozenset()
-    _results = [_fin(_maps[_tk], _rank_abstained, _raw_maps[_tk])
+    # News-family features for the STACKERS, as their WITHIN-RUN centered rank
+    # (2026-09-07 user directive). Computed here because this is the only place
+    # the run's cross-section exists — serving is per-ticker below. It is the
+    # PLAIN centered rank, not `_rank_transform_run`'s shaped one: payoff
+    # shaping is fitted on the same forward returns the stacker trains against
+    # and has no business inside a model feature. Every persisted surface still
+    # keeps the RAW score; this is consumption-time only, exactly like the
+    # combine's own rank basis, and the models dispatch on their OWN stamp so an
+    # absolute-trained artifact keeps receiving absolute values. Ranked over the
+    # SAME Gate-4 tradeable pool the combine uses (2026-09-09 directive), with
+    # observe-only names interpolated against it.
+    _news_rank_map = {}
+    if ml_combine_arm_active():
+        try:
+            from src.analysis.ml_stacker import STACKER_RANKED_FEATURES, rank_news_features
+            _rows = {}
+            for _tk, _msm, _fin in _phase1:
+                _raw = _raw_maps.get(_tk) or {}
+                _rows[_tk] = {f: (_raw.get(f) or (None, None))[1]
+                              for f in STACKER_RANKED_FEATURES}
+            _news_rank_map = rank_news_features(_rows, tradeable=_tradeable)
+        except Exception as _e:                     # noqa: BLE001 - fail-soft to absolute
+            logger.warning(f"[aggregator] news rank map failed ({_e}) — stackers keep "
+                           f"absolute news features this run")
+            _news_rank_map = {}
+    _results = [_fin(_maps[_tk], _rank_abstained, _raw_maps[_tk],
+                     _news_rank_map.get(_tk))
                 for _tk, _msm, _fin in _phase1]
     for _tk, _combined, _sig in _results:
         combined_scores[_tk] = _combined

@@ -51,6 +51,13 @@ def _base(monkeypatch):
     for _f in ("enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
                "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv"):
         monkeypatch.setattr(settings, _f, False)
+    # news_quiet and news_bull_fresh ride `use_news`, so they join every method
+    # world these tests
+    # build - and being unproven it is EXEMPT from the per-side filter, which
+    # would silently disarm the empty-camp guard exercised below. Not the
+    # subject here; it has its own coverage in tests/test_news_quiet.py.
+    monkeypatch.setattr(settings, "enable_news_quiet", False)
+    monkeypatch.setattr(settings, "enable_news_bull_fresh", False)
     agg.reset_winrate_filter_cache()
 
 

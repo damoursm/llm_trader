@@ -9,10 +9,11 @@ just against yesterday's strategy — so each is pinned mechanically:
   2. every entry method reaches the exit re-score: a method added to
      `_ALL_METHODS` that never appears on the exit side would silently be
      entry-only;
-  3. the ML exit model's feature set IS the stacker's
-     (`EXIT_METHODS is STACKER_LIVE_FEATURES`) — one list, so a stacker feature
-     decision propagates to the exit model at its next retrain rather than
-     forking;
+  3. the ML exit model's feature set IS the stacker's SIGNED set
+     (`EXIT_METHODS is STACKER_SIGNED_FEATURES`) — one list, so a stacker
+     feature decision propagates to the exit model at its next retrain rather
+     than forking, while the unsigned context features stay out because every
+     exit feature is multiplied by the position's direction;
   4. the ml_exit artifact's stamped bases match what serving feeds it
      (label = pivot, combine = absolute), and BOTH feeders (dataset builder and
      live twin) prefer the abs shadow — the documented basis-invariance that
@@ -66,22 +67,29 @@ def test_every_entry_method_reaches_the_exit_rescore():
     assert set(got) == set(_ALL_METHODS)
 
 
-def test_exit_model_features_are_the_stackers_by_identity():
-    """One list again (2026-08-24): `ml_ohlcv` moved upstream into
-    STACKER_LIVE_FEATURES, collapsing the brief exit-only extension. Equality +
-    source-derivation are asserted so the two feature sets can never fork —
-    also guards the duplicate-column bug an additive derivation would create
-    now that the upstream list carries ml_ohlcv itself."""
+def test_exit_model_features_are_the_stackers_signed_set_by_identity():
+    """Still ONE list, narrowed 2026-09-07: the exit model derives from
+    STACKER_SIGNED_FEATURES, not from the full live set.
+
+    Every exit feature is oriented by the position's direction (`ex_<m>` =
+    score x sign), so the unsigned context features added on 2026-09-07 — the
+    article count, the recency mass, the market-state widths and the catalyst
+    one-hot — cannot ride along: orienting a magnitude by a sign that means
+    nothing there is not a feature, it is noise with a plausible name. Equality
+    + source-derivation are asserted so the two sets can never fork, and the
+    duplicate check still guards the additive-derivation bug."""
     import inspect
 
     from src.analysis.ml_exit_dataset import EXIT_METHODS
-    from src.analysis.ml_stacker import STACKER_LIVE_FEATURES
-    assert list(EXIT_METHODS) == list(STACKER_LIVE_FEATURES)
+    from src.analysis.ml_stacker import (STACKER_CONTEXT_FEATURES,
+                                         STACKER_SIGNED_FEATURES)
+    assert list(EXIT_METHODS) == list(STACKER_SIGNED_FEATURES)
     assert len(set(EXIT_METHODS)) == len(EXIT_METHODS), "duplicate feature"
+    assert not (set(EXIT_METHODS) & set(STACKER_CONTEXT_FEATURES))
     src = inspect.getsource(__import__("src.analysis.ml_exit_dataset",
                                        fromlist=["x"]))
-    assert "EXIT_METHODS: List[str] = list(STACKER_LIVE_FEATURES)" in src, (
-        "EXIT_METHODS must be DERIVED from STACKER_LIVE_FEATURES, not a copy "
+    assert "EXIT_METHODS: List[str] = list(STACKER_SIGNED_FEATURES)" in src, (
+        "EXIT_METHODS must be DERIVED from STACKER_SIGNED_FEATURES, not a copy "
         "that can drift")
 
 

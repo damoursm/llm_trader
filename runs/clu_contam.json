@@ -1,0 +1,2562 @@
+[
+ {
+  "date": "2026-06-17",
+  "tk": "ADPT",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-17",
+  "tk": "ADPT",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-17",
+  "tk": "ADPT",
+  "idx": 2,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-18",
+  "tk": "AMKR",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-18",
+  "tk": "AMKR",
+  "idx": 1,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-22",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-22",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 19,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 20,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "ASTS",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "ASTS",
+  "idx": 1,
+  "n": 18,
+  "tag_only": 0,
+  "weak": 2,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "BEN",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "BEN",
+  "idx": 1,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 2,
+  "tiers": [
+   "symbol_word",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 15,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "BE",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "BE",
+  "idx": 1,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "BE",
+  "idx": 2,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ARM",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 2,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ARM",
+  "idx": 1,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 4,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ARM",
+  "idx": 2,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ASTS",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ASTS",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-26",
+  "tk": "AVAV",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-26",
+  "tk": "AVAV",
+  "idx": 1,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-06-26",
+  "tk": "AVAV",
+  "idx": 2,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-01",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-01",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-01",
+  "tk": "ABBV",
+  "idx": 2,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AA",
+  "idx": 0,
+  "n": 8,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AA",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AMBA",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AMBA",
+  "idx": 1,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-03",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 10,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-03",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 10,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-05",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-05",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 17,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "AVGO",
+  "idx": 2,
+  "n": 10,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-07",
+  "tk": "AMAT",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-07",
+  "tk": "AMAT",
+  "idx": 1,
+  "n": 15,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-08",
+  "tk": "AMAT",
+  "idx": 0,
+  "n": 8,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-08",
+  "tk": "AMAT",
+  "idx": 1,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-08",
+  "tk": "AMAT",
+  "idx": 2,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-09",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 20,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_word",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-09",
+  "tk": "AMD",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-09",
+  "tk": "AMD",
+  "idx": 1,
+  "n": 16,
+  "tag_only": 0,
+  "weak": 11,
+  "tiers": [
+   "symbol_word",
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "symbol_word",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AGIO",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AGIO",
+  "idx": 1,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMAT",
+  "idx": 0,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMAT",
+  "idx": 1,
+  "n": 13,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 13,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 20,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 17,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AMD",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 3,
+  "tiers": [
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AMD",
+  "idx": 1,
+  "n": 16,
+  "tag_only": 0,
+  "weak": 8,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "symbol_word",
+   "name_phrase",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "APP",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "APP",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 16,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 15,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "ANET",
+  "idx": 0,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-14",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 20,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-14",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-14",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-15",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-15",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AA",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AA",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AEHR",
+  "idx": 0,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AEHR",
+  "idx": 1,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AEHR",
+  "idx": 2,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "ACGL",
+  "idx": 0,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "ACGL",
+  "idx": 1,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "AEHR",
+  "idx": 0,
+  "n": 14,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 17,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-21",
+  "tk": "AAOI",
+  "idx": 0,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_word",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-21",
+  "tk": "ALK",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 10,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 10,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "APP",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "APP",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 9,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 11,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "ACI",
+  "idx": 0,
+  "n": 20,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "AMC",
+  "idx": 0,
+  "n": 20,
+  "tag_only": 0,
+  "weak": 9,
+  "tiers": [
+   "symbol_word",
+   "name_phrase",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ABG",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ABG",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ADP",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 2,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ADP",
+  "idx": 1,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "AGX",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "AGX",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ABBV",
+  "idx": 2,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ACN",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ACN",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 10,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "ABBV",
+  "idx": 2,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "AER",
+  "idx": 0,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "AER",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "APLD",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "APLD",
+  "idx": 1,
+  "n": 9,
+  "tag_only": 0,
+  "weak": 3,
+  "tiers": [
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_word",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "APLD",
+  "idx": 2,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 9,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 11,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "ALG",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "ALG",
+  "idx": 1,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 16,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADM",
+  "idx": 0,
+  "n": 9,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADM",
+  "idx": 1,
+  "n": 4,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADM",
+  "idx": 2,
+  "n": 1,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 3,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADMA",
+  "idx": 2,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "AEIS",
+  "idx": 0,
+  "n": 7,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "AEIS",
+  "idx": 1,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-07",
+  "tk": "AMD",
+  "idx": 0,
+  "n": 15,
+  "tag_only": 0,
+  "weak": 7,
+  "tiers": [
+   "symbol_word",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_word",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_word",
+   "symbol_explicit",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-07",
+  "tk": "AMD",
+  "idx": 1,
+  "n": 5,
+  "tag_only": 0,
+  "weak": 5,
+  "tiers": [
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-12",
+  "tk": "AMN",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-12",
+  "tk": "AMN",
+  "idx": 1,
+  "n": 8,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-13",
+  "tk": "ACM",
+  "idx": 0,
+  "n": 8,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-13",
+  "tk": "ACM",
+  "idx": 1,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 2,
+  "tiers": [
+   "symbol_word",
+   "symbol_word"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-14",
+  "tk": "AMBQ",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase",
+   "symbol_explicit",
+   "symbol_explicit",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-14",
+  "tk": "APOS",
+  "idx": 0,
+  "n": 8,
+  "tag_only": 1,
+  "weak": 0,
+  "tiers": [
+   "TAG_ONLY",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": [
+   "[The Motley Fool] Nvidia Just Recruited Wall Street to Help Fund $500 Billion in AI Infrastructure. Here\u2019s the Catch."
+  ]
+ },
+ {
+  "date": "2026-08-16",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 6,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-17",
+  "tk": "ABCL",
+  "idx": 0,
+  "n": 2,
+  "tag_only": 0,
+  "weak": 0,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit"
+  ],
+  "offtarget": []
+ },
+ {
+  "date": "2026-08-17",
+  "tk": "ABCL",
+  "idx": 1,
+  "n": 14,
+  "tag_only": 0,
+  "weak": 1,
+  "tiers": [
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_explicit",
+   "symbol_word",
+   "name_phrase",
+   "symbol_explicit",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase",
+   "name_phrase"
+  ],
+  "offtarget": []
+ }
+]

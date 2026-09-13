@@ -1,0 +1,794 @@
+[
+ {
+  "pop": "flagged",
+  "ticker": "SLV",
+  "raw": 0.051178,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights a mixed sentiment around silver prices, with some articles noting stability in the $66 range amid geopolitical tensions, while others suggest broader market weakness affecting commodities. The SLV fund is indirectly impacted by the broader market and commodity trends, but no direct catalyst is present. The sentiment is neutral with a slight lean up due to the geopolitical tensi"
+ },
+ {
+  "pop": "flagged",
+  "ticker": "XLI",
+  "raw": -0.150361,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights the industrials sector as a drag on the TSX and mentions XLI in a list of industrials stocks with strong revenue growth and attractive valuations. The sector is underperforming, which is a negative for XLI as it tracks the industrials sector. However, the article also suggests XLI could be a good investment due to its fundamentals, creating a mixed sentiment. The overall sentim"
+ },
+ {
+  "pop": "flagged",
+  "ticker": "RH",
+  "raw": -0.227949,
+  "judge": "UP",
+  "emitted": "DOWN",
+  "contradiction": true,
+  "rationale": "The dominant catalyst is RH's upcoming Q2 earnings report on September 10, with analysts showing increased optimism and recent estimate revisions. The coverage frames the earnings as a potential upside catalyst, though the stock has underperformed recently. However, the move is already partially priced in due to the recent decline and the anticipation of the earnings report."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "BRZE",
+  "raw": -0.559531,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Braze (BRZE) reported Q2 earnings that beat estimates, raised full-year guidance, and saw revenue growth of 26%. However, the stock fell sharply after issuing weak Q3 earnings guidance, which disappointed investors despite the positive Q2 results. The mixed sentiment reflects both the positive earnings beat and the negative guidance, with the latter dominating recent price action."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "SMH",
+  "raw": 0.382388,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The semiconductor sector is experiencing strong momentum driven by AI demand, with Intel and other chipmakers leading the rally. However, the broader market is mixed, and there are concerns about political risks and potential tax-loss selling. The fund's holdings are heavily weighted toward AI-driven semiconductors, which are currently in favor, but the sector is also facing overvaluation concerns"
+ },
+ {
+  "pop": "flagged",
+  "ticker": "SMCIP",
+  "raw": -0.051472,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a broad AI server sector rally, with Super Micro Computer (SMCI) seeing a 4% gain. However, the margin beat is already guided away, suggesting the move is largely priced in. The coverage frames the stock as part of a broader tech rally, but the catalyst is stale and the move is already reflected in the price."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GIL",
+  "raw": -0.061323,
+  "judge": "UP",
+  "emitted": "DOWN",
+  "contradiction": true,
+  "rationale": "GIL modestly beat EPS estimates, which is a bullish catalyst, but the stock already reacted to the earnings beat. The legal investigation into financial engineering adds a bearish counterweight, though the impact is less immediate. The overall sentiment is mixed, with the earnings beat partially priced in."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GLD",
+  "raw": -0.26195,
+  "judge": "UP",
+  "emitted": "DOWN",
+  "contradiction": true,
+  "rationale": "The news highlights a mixed sentiment around GLD, with one article indicating strong buyer activity and another showing a drop in gold prices due to U.S. strikes on Iranian oil tankers. The dominant catalyst is the macro-sector dynamics affecting gold prices, which directly impact GLD as it holds gold. The recent price drop is already partially priced in, but the strong buyer activity suggests pot"
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GME",
+  "raw": -0.140659,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "GameStop reported strong Q2 2026 earnings with a significant rise in profit and an upward revision to its full-year outlook, driven by strong collectibles sales. The news is largely priced in, with limited follow-through expected in the short-term."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "CHYM",
+  "raw": -0.128158,
+  "judge": "UP",
+  "emitted": "DOWN",
+  "contradiction": true,
+  "rationale": "The stock rallied due to strong Q2 earnings that exceeded expectations, with revenue growing 27% to $670M and a significant profitability inflection showing 12+ percentage point EBITDA margin improvement. The company also raised full-year guidance and credited AI efficiency gains. However, the recent earnings beat and positive analyst upgrades are already largely priced in, with the stock having s"
+ },
+ {
+  "pop": "flagged",
+  "ticker": "ASST",
+  "raw": 0.452398,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Strive's recent Bitcoin purchases, totaling $109M and nearing a $1B SATA balance, are driving positive sentiment and increasing market cap. However, the recent earnings miss of -1389.8% and the short float conditions present a mixed backdrop. The positive news on Bitcoin holdings is the dominant catalyst, but the earnings miss has already priced in a bearish reaction."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "CXW",
+  "raw": -0.35,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "CXW reported a modest earnings beat in Q3 2026, which is a bullish catalyst, but the short interest surged 615% MoM to 19% of float, indicating bearish institutional positioning. The earnings beat is partially priced in, but the short interest increase introduces bearish pressure."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "OXM",
+  "raw": -0.432222,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Oxford Industries (OXM) reported Q2 2026 results that met revenue expectations but fell short on year-over-year growth, with a significant downward revision to full-year guidance due to challenges at Lilly Pulitzer and macroeconomic pressures. The stock reacted sharply, with a 17.7% drop, indicating most of the catalyst is already priced in."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "ENB",
+  "raw": -0.469393,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Enbridge (ENB) is facing a mixed catalyst environment. The company announced a $2.55 billion acquisition of Tallgrass crude oil transport assets, which is a positive catalyst, but this was overshadowed by a large equity raise that caused the stock to fall. Additionally, the stock moved down by 3.25% on Sep 10, and there is a dilution of 1.8% from the deal. The recent earnings beat by 5.6% is also "
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GWRE",
+  "raw": -0.406004,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Guidewire Software's recent earnings beat and strong product momentum are overshadowed by cautious near-term revenue guidance and tempered fiscal 2027 growth expectations, leading to a pullback. The stock has already reacted to these mixed signals, with the primary catalyst being the cautious guidance and mixed analyst sentiment."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GM",
+  "raw": -0.16975,
+  "judge": "UP",
+  "emitted": "DOWN",
+  "contradiction": true,
+  "rationale": "General Motors (GM) stock fell -2.37% in the latest trading session, but the dominant catalyst is the recent strong Q2 earnings and upbeat EV strategy, which were already priced in. The recent labor deal and investment commitments in Canada are positive but are not new enough to drive further short-term movement."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GME",
+  "raw": -0.133953,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "GameStop reported strong Q2 2026 earnings with a significant rise in net income and operating income, driven by surging collectibles sales. The positive earnings beat and raised full-year outlook have already been priced into the stock, with limited follow-through expected in the short-term."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "BRK-B",
+  "raw": -0.038715,
+  "judge": "UP",
+  "emitted": "DOWN",
+  "contradiction": true,
+  "rationale": "The recent news highlights defensive positioning and strategic investments by Berkshire Hathaway, with a focus on its strong earnings and portfolio allocations. However, the stock has underperformed the S&P 500, and the coverage leans slightly bullish due to its diversified growth and management's strategic moves, though the move is already partially priced in."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "EGAN",
+  "raw": -0.404005,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The recent news highlights a mix of positive AI-driven growth plans and a downgrade due to weak guidance, with the stock already down significantly on the fiscal 2027 outlook. The earnings beat in Q3 2026 is partially priced in, but the market remains skeptical about the sustainability of growth."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "SPY",
+  "raw": -0.062258,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights mixed sentiment around the S&P 500, with some articles suggesting strong earnings growth and others pointing to risks of a market sell-off. The SPY ETF is mentioned in several pieces, but the overall tone is neutral with no clear directional catalyst. The market is reacting to broader macroeconomic factors and sector-specific news, which are indirect but relevant to SPY's perfo"
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GDX",
+  "raw": -0.158797,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a mixed sentiment with a bullish note on gold and gold miners due to central bank accumulation, but also mentions a sell-off in gold miners and crypto due to strong jobs data and higher Fed hike odds. The dominant catalyst is macroeconomic and sectoral, with a slight bearish lean from the recent sell-off and higher interest rate expectations."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "SEDG",
+  "raw": -0.299086,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The recent news highlights a mixed sentiment with a Q2 earnings beat and return to profitability, but a softer Q3 outlook. The fair value estimate has decreased, indicating a cautious outlook from analysts. The stock has shown short-term momentum, but the overall sentiment is mixed with a focus on potential demand issues and softer guidance."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GIII",
+  "raw": -0.231802,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The recent news highlights a mix of technical oversold conditions, analyst optimism about earnings revisions, and the Marc Jacobs acquisition, which is seen as a strategic move to boost revenue. However, the stock has already experienced a significant pullback, and the catalysts are partially priced in."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "IBIT",
+  "raw": -0.057852,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights mixed sentiment around Bitcoin and related assets. While some reports indicate institutional buying and positive technical signals, others note Bitcoin's retreat and a shift toward altcoins. The fund's holdings in Bitcoin are indirectly affected by these dynamics, with a lean toward uncertainty due to the lack of direct news about IBIT itself."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "RDDT",
+  "raw": -0.007777,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The coverage highlights Reddit's AI initiatives and their potential to drive revenue growth, but also notes that the stock's recent move may have already priced in some of the optimism. The broader sector sentiment is mixed, with peers like Pinterest and Snap underperforming, which indirectly affects Reddit's valuation."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "GWRE",
+  "raw": -0.496644,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Guidewire Software (GWRE) experienced a 20% drop due to soft near-term revenue guidance and a disappointing fiscal 2027 outlook, despite strong Q4 results and ARR growth. The stock has already reacted to these catalysts, with most of the immediate move priced in."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "NFLX",
+  "raw": -0.150025,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The coverage highlights Netflix's valuation premium relative to Disney and its stronger growth and profitability metrics, but also notes rate repricing pressures. The sentiment is mixed, with some analysts seeing upside potential while others highlight macro risks. The price mechanism is speculative with limited new catalysts, and the move is already partially priced in."
+ },
+ {
+  "pop": "flagged",
+  "ticker": "EGAN",
+  "raw": -0.449724,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The recent earnings beat in Q3 2026 with a +166.7% EPS surprise and strong AI-driven revenue growth highlights positive momentum, but the stock has already reacted negatively to weak guidance and lower revenue expectations. The market has largely priced in the earnings beat, and the recent downgrades and revenue outlook concerns dominate the short-term narrative."
+ },
+ {
+  "pop": "control",
+  "ticker": "IWM",
+  "raw": -0.009472,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights IWM as a small-cap ETF that could be affected by shifting rate expectations, positioning it for potential movement ahead of the Fed's September meeting. The coverage frames IWM as a vehicle for investors to position for rate hikes, which is a macro-sector catalyst. However, the move is already partially priced in as the ETF is being discussed in the context of broader market po"
+ },
+ {
+  "pop": "control",
+  "ticker": "PVH",
+  "raw": -0.31157,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "PVH's Q2 results showed a revenue decline but a profit beat due to tariff refunds, with reaffirmed full-year guidance. However, the core business recovery without the one-off benefit is under scrutiny. The analyst downgrades and negative tone suggest some pricing in, but the core business performance and guidance remain key factors."
+ },
+ {
+  "pop": "control",
+  "ticker": "NAVN",
+  "raw": -0.24442,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Navan's stock is down 19% today due to higher operating costs and widening losses reported post-earnings, but Wall Street is buying the selloff. Additionally, multiple analysts have lowered price targets, including TD Cowen lowering it to $31 and others adjusting forecasts. However, the stock has already reacted to these catalysts, and the remaining move is likely to be a minor lean down."
+ },
+ {
+  "pop": "control",
+  "ticker": "GM",
+  "raw": 0.782732,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "General Motors (GM) shares gained on strong Q2 earnings and an upbeat EV strategy, with additional positive momentum from a major labor deal and institutional stake increases. The recent earnings report and EV strategy are the dominant catalysts, and the stock has already reacted positively to these developments."
+ },
+ {
+  "pop": "control",
+  "ticker": "IVZ",
+  "raw": -0.158346,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The insider activity of an officer planning a new share sale after a recent $1.4M liquidation suggests a potential bearish signal, as insider selling often indicates pessimism about future performance. However, the stock has already partially reacted to this catalyst, and the impact is likely to be limited given the relatively small size of the transaction."
+ },
+ {
+  "pop": "control",
+  "ticker": "AMC",
+  "raw": 0.362143,
+  "judge": "DOWN",
+  "emitted": "UP",
+  "contradiction": true,
+  "rationale": "AMC reported a significant earnings beat with a +366.7% surprise, which is a strong bullish catalyst. However, the stock has already reacted to this news, and the recent focus has shifted to the legal and regulatory debate around Robinhood's tokenized stocks. The market is now assessing the long-term implications of this controversy, which may temper the initial positive reaction."
+ },
+ {
+  "pop": "control",
+  "ticker": "BYD",
+  "raw": -0.350399,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a mix of short-term pressures and governance-related uncertainty, including a drop in first-half 2026 profits, a shareholder vote on governance, and political exposure concerns. These factors suggest a bearish lean, though some positive sentiment from a UBS buy rating provides a minor counterbalance. The stock has already fallen to a 52-week low, indicating much of the negative"
+ },
+ {
+  "pop": "control",
+  "ticker": "XLE",
+  "raw": 0.421472,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The recent news highlights rising oil prices and geopolitical tensions in the Middle East, which are driving energy sector gains. These factors are positively impacting XLE, as energy stocks have risen significantly. However, the move is already partially priced in, as the energy sector has already shown strong performance in recent days."
+ },
+ {
+  "pop": "control",
+  "ticker": "IBIT",
+  "raw": -0.235086,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a rotation from Bitcoin into altcoins due to rising rate risks, which is a macro-sector catalyst. This shift implies reduced demand for Bitcoin, which directly impacts the underlying asset of IBIT. However, the move is already partially priced in as Bitcoin prices have been sliding, and the sentiment is mixed with some positive signals from institutional buyers."
+ },
+ {
+  "pop": "control",
+  "ticker": "LLY",
+  "raw": -0.245416,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a broader healthcare sector sell-off, with Eli Lilly (LLY) falling 2% amid the trend. While there is no direct catalyst specific to LLY, the sector-wide decline and negative sentiment in the healthcare space suggest a moderate bearish lean. The move is already partially priced in, as the stock has already fallen 2%."
+ },
+ {
+  "pop": "control",
+  "ticker": "QCOM",
+  "raw": 0.217678,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Qualcomm's stock has risen sharply due to a major AI chip deal with Amazon, which includes a $4 billion stock warrant and potential $60 billion in related business. The move has already been largely priced in, with shares up 4.5% on the news, so the remaining move is expected to be limited."
+ },
+ {
+  "pop": "control",
+  "ticker": "CMPS",
+  "raw": -0.153533,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Compass Pathways reported a Q3 2026 earnings miss, missing estimates by 6.3% and triggering a bearish reaction. The stock has already reacted to this news, and the catalyst is largely priced in. The score reflects the residual move after the initial reaction."
+ },
+ {
+  "pop": "control",
+  "ticker": "GM",
+  "raw": 0.150358,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The dominant catalyst is the recent institutional stake increase by Engineers Gate Manager LP and the California State Teachers Retirement System's significant stock position, both of which lean bullish. These are company-specific events with a clear directional impact. However, the stock has already reacted positively to these developments, so the remaining move is a minor lean."
+ },
+ {
+  "pop": "control",
+  "ticker": "SNAP",
+  "raw": 0.57201,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Snap Inc. reported a significant earnings beat for Q3 2026, surprising on the upside with a +18.3% EPS surprise. This is a strong bullish catalyst, though the stock has already reacted positively to the news. The remaining move is expected to be modest as much of the reaction has already occurred."
+ },
+ {
+  "pop": "control",
+  "ticker": "NKE",
+  "raw": -0.153876,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Nike shares are near a 52-week low due to weak Sportswear demand, regional challenges in China and EMEA, and a soft outlook. However, the company's Running division shows strong momentum with double-digit growth, and new product launches are planned. The recent analyst upgrades/downgrades and mixed sentiment in the coverage suggest a minor lean, but the stock is already heavily priced in on the ne"
+ },
+ {
+  "pop": "control",
+  "ticker": "AMAT",
+  "raw": -0.033692,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a broad sector rally driven by Qualcomm's AI collaboration with AWS and progress in chip manufacturing by ASML, TSMC, and Intel. Applied Materials is mentioned in a group of stocks that surged, but there is no specific news about AMAT itself. The move is likely priced in, and the coverage is a sector-wide recap with no direct catalyst for AMAT."
+ },
+ {
+  "pop": "control",
+  "ticker": "RBLX",
+  "raw": -0.292353,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The article discusses Roblox's recent guidance cuts and the potential for a growth reset, which signals negative sentiment and a possible downward revision in expectations. The coverage frames the situation as a challenge to the long-term story, indicating a bearish lean. However, the move is already partially priced in as the stock has likely reacted to the guidance cuts."
+ },
+ {
+  "pop": "control",
+  "ticker": "GPI",
+  "raw": -0.162971,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Group 1 Automotive announced a $1.25 billion offering of senior notes, which is a capital structure event. The issuance of new debt typically signals financial stress or a need for liquidity, which leans bearish. However, the market may have already priced in the news due to its recent announcement."
+ },
+ {
+  "pop": "control",
+  "ticker": "ADI",
+  "raw": 0.764754,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Analog Devices is acquiring Alif Semiconductor for $1.35 billion, a major M&A event that is likely to drive short-term bullish momentum. The acquisition is a hard catalyst with significant financial implications, and the stock is expected to react positively. However, the move has already been partially priced in as the stock has already reacted to the news."
+ },
+ {
+  "pop": "control",
+  "ticker": "PURR",
+  "raw": -0.849708,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The stock price dropped 6.4% in the last 3 hours, and the company significantly missed its EPS estimate by 210.3%, which is a strong bearish catalyst. The recent earnings miss has already triggered a sell-off and downward revisions, so the remaining move is likely to be a continuation of the negative trend."
+ },
+ {
+  "pop": "control",
+  "ticker": "COIN",
+  "raw": 0.091215,
+  "judge": "NONE",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights Coinbase's strategic move to integrate ION's real-time trading technology into its Kalshi platform, which is expected to enhance functionality and user experience. This is a positive development for Coinbase's product offerings, but the impact is likely minor as the technology integration is not a new or groundbreaking announcement. The move is more of a routine enhancement rat"
+ },
+ {
+  "pop": "control",
+  "ticker": "ZIM",
+  "raw": -0.736922,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "ZIM's Q3 2026 earnings significantly missed expectations, triggering a bearish catalyst. The stock also surged pre-market due to revised takeover offers from Hapag-Lloyd, creating a conflicting positive catalyst. However, the earnings miss dominates due to its recent and impactful nature, while the takeover news is already partially priced in."
+ },
+ {
+  "pop": "control",
+  "ticker": "IBIT",
+  "raw": 0.34214,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Strive's recent purchase of $109 million in Bitcoin (1,375 BTC) is a significant event that directly impacts the underlying asset of IBIT. The news is corroborated across multiple sources and highlights a material increase in Bitcoin demand, which should drive the price of Bitcoin higher, thereby positively affecting IBIT. However, the move is already partially priced in as the news is not new and"
+ },
+ {
+  "pop": "control",
+  "ticker": "UNH",
+  "raw": -0.302631,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights TPG's investment in Optum clinics, which previously impacted UnitedHealth's profits, and the upcoming guidance reaffirmation. The coverage suggests uncertainty around the deal's impact on earnings guidance, which could either validate the investment or re-open concerns. The stock has already slipped 3%, indicating some pricing in."
+ },
+ {
+  "pop": "control",
+  "ticker": "SUNE",
+  "raw": 0.694524,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "SUNation Energy's stock surged following Suniva's $835M capital raise, which is tied to the company's pending merger and U.S. solar manufacturing expansion. The move is primarily driven by positive sentiment around the merger and the capital raise, though some of the initial move has already been priced in."
+ },
+ {
+  "pop": "control",
+  "ticker": "AEO",
+  "raw": -0.209889,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The stock experienced a sharp decline despite beating earnings and revenue estimates, primarily due to a same-store sales miss and the impact of tariff refunds masking margin pressure. The move is largely priced in, with the residual lean being slightly negative."
+ },
+ {
+  "pop": "control",
+  "ticker": "AVAV",
+  "raw": 0.222387,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "AVAV significantly beat EPS estimates by 25.0% in Q2 2026, which is a strong bullish catalyst. However, the stock has already reacted to this news, and the remaining move is expected to be minimal. The recent news about NASA contracts and Air Force deals adds further positive momentum, but the majority of the catalysts are already priced in."
+ },
+ {
+  "pop": "control",
+  "ticker": "TTAN",
+  "raw": -0.22906,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "ServiceTitan's stock dropped sharply after the company provided weak Q2 2027 guidance, which overshadowed its results. The guidance cut and management shakeup are the primary catalysts, and the stock has already reacted significantly to this news, with a 19% decline. The remaining move is likely to be a small negative follow-through."
+ },
+ {
+  "pop": "control",
+  "ticker": "SPY",
+  "raw": -0.168623,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The S&P 500 is under pressure due to rising oil prices and geopolitical tensions, which are causing investors to reconsider their exposure to the index. The coverage frames the S&P 500 as a safer haven, suggesting a potential shift in investor sentiment toward the fund. However, the market is already pricing in much of this sentiment, with futures indicating a mixed open."
+ },
+ {
+  "pop": "control",
+  "ticker": "GME",
+  "raw": 0.746848,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "GameStop's Q2 earnings exceeded estimates, with collectibles sales surging 57%, and a director buying $1M in shares. The stock has already surged 4% on the news, but the positive momentum is still ongoing with further upside potential."
+ },
+ {
+  "pop": "control",
+  "ticker": "XLI",
+  "raw": 0.050112,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights XLI as part of the Industrials sector, with a focus on institutional liquidity and sector performance. However, there is no direct news about XLI itself, only indirect mentions in a broader sector context. The coverage leans slightly bullish due to the positive framing of the Industrials sector and the performance of related ETFs, but the impact is minor due to the lack of a sp"
+ },
+ {
+  "pop": "control",
+  "ticker": "SNOW",
+  "raw": -0.060274,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a selloff of $700 million from the IGV ETF before Snowflake's potential earnings report, suggesting market uncertainty around AI disruption and the company's position. The coverage frames the selloff as a potential misstep or a warning sign, leaning slightly bearish. However, the catalyst is indirect and already partially priced in."
+ },
+ {
+  "pop": "control",
+  "ticker": "XLY",
+  "raw": -0.151587,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news highlights a decline in consumer stocks, specifically mentioning the State Street Consumer Staples Select Sector SPDR ETF (XLY) as part of the broader consumer sector weakness. The coverage frames the sector as underperforming, which indirectly affects XLY as it tracks the consumer discretionary sector. However, the move is already partially priced in as the sector has been declining, and"
+ },
+ {
+  "pop": "control",
+  "ticker": "SWKS",
+  "raw": 0.204714,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights a surge in SWKS stock due to merger momentum with Qorvo, with multiple articles noting the divergence from the broader chip sector. The market is pricing in the potential clearing of the merger, which is a positive catalyst. However, the move has already been largely reflected in the stock price, so the remaining move is limited."
+ },
+ {
+  "pop": "control",
+  "ticker": "NVTS",
+  "raw": 0.293114,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Navitas Semiconductor (NVTS) experienced a sharp 27% surge following news of a $232.8M deal with Claros, which includes a two-year earnout. The move is primarily driven by the positive sentiment around the AI data center boom and the potential for revenue growth. However, the stock has already reacted strongly to the catalyst, so the remaining move is likely to be smaller."
+ },
+ {
+  "pop": "control",
+  "ticker": "RDDT",
+  "raw": 0.150425,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The article discusses that Reddit's stock price has already factored in the worst-case scenario for its data licensing contracts, suggesting that the negative catalyst is already priced in. The coverage implies a potential upside if the remaining uncertainty is resolved, but the move is already partially reflected."
+ },
+ {
+  "pop": "control",
+  "ticker": "ATRC",
+  "raw": 0.420356,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "AtriCure (ATRC) significantly beat EPS estimates by 650.3% in Q3 2026, which is a strong earnings beat that historically drives price appreciation. The positive analyst sentiment with multiple price-target revisions further supports the bullish case. However, the stock already traded up sharply on the earnings report, so the remaining move is limited."
+ },
+ {
+  "pop": "control",
+  "ticker": "IGV",
+  "raw": -0.447802,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The fund's price is being pressured by a large outflow of $700 million from IGV, likely due to broader sector concerns and AI disruption fears, with the selloff occurring before Snowflake's earnings report. The move is also influenced by negative sentiment around software stocks, including UiPath and Pegasystems, and a broader market debate on AI disruption. The catalyst is a macro-sector shift, n"
+ },
+ {
+  "pop": "control",
+  "ticker": "VICI",
+  "raw": 0.05,
+  "judge": "NONE",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The dominant catalyst is the SEC 8-K filing announcing a director appointment, which is a routine corporate governance event with a slight positive lean due to the addition of an independent director. However, the stock has already reacted to this news, and the remaining move is minimal."
+ },
+ {
+  "pop": "control",
+  "ticker": "MS",
+  "raw": 0.050105,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Morgan Stanley's positive analyst actions on multiple stocks, including Chime Financial (CHYM), indicate a bullish sentiment towards certain sectors, but there is no direct news about Morgan Stanley itself. The coverage is indirect and leans slightly bullish due to the firm's positive analyst ratings, though the impact is minor as it does not involve a dated event specific to MS."
+ },
+ {
+  "pop": "control",
+  "ticker": "BYD",
+  "raw": -0.125234,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Boyd Gaming's stock has hit a 52-week low and set a new 12-month low, driven by weak fundamentals and negative sentiment. The news highlights deteriorating financials and a lack of investor confidence, with no positive catalysts to offset this. The move appears fully priced in, with no further upside expected in the short term."
+ },
+ {
+  "pop": "control",
+  "ticker": "TBBK",
+  "raw": -0.793312,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The stock has dropped 23% today and hit a 52-week low, indicating strong negative sentiment. The recent SEC 8-K filing regarding restructuring and layoffs adds to the bearish narrative, though the impact is already largely priced in."
+ },
+ {
+  "pop": "control",
+  "ticker": "JPM",
+  "raw": 0.050261,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news mentions JPMorgan Chase as a traditional bank that Chime, a fintech challenger, is now competing against. This framing positions JPMorgan as a dominant player in the banking sector, potentially benefiting from renewed sector rotation and healthcare ETF flows. However, there is no direct news about JPMorgan itself, only indirect sector commentary. The coverage is positive but lacks a speci"
+ },
+ {
+  "pop": "control",
+  "ticker": "GME",
+  "raw": 0.452619,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Multiple news sources report that GameStop's second-quarter results exceeded expectations, with a significant surge in collectibles sales. Additionally, insiders and directors have made substantial purchases of shares, including a director buying $1M in stock. These actions, combined with positive analyst commentary, suggest a strong short-term bullish momentum. However, the stock has already move"
+ },
+ {
+  "pop": "control",
+  "ticker": "GME",
+  "raw": 0.576157,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Multiple recent insider buys and positive earnings reports have driven short-term bullish sentiment, with the latest insider purchases and earnings beat reinforcing the upward trend. However, the stock has already partially priced in the positive catalysts, leaving a smaller follow-through potential."
+ },
+ {
+  "pop": "control",
+  "ticker": "WT",
+  "raw": -0.05003,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news indicates insider activity with an officer preparing to sell shares, which typically leans slightly bearish. However, the event is routine and not materially sized relative to the company's market cap, so the impact is minor."
+ },
+ {
+  "pop": "control",
+  "ticker": "ZS",
+  "raw": -0.277592,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Zscaler rose 3% following Cloudflare's surge due to its security partnership with OpenAI, indicating some investor sentiment towards AI security narratives. However, the coverage also highlights slowing ARR growth and weak net new ARR in FY27 guidance, which introduces a bearish tone. The move is partially priced in, with the positive catalyst already reflected in the share price."
+ },
+ {
+  "pop": "control",
+  "ticker": "ZS",
+  "raw": 0.038204,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights a broad software sector rally driven by improved macro conditions and positive earnings from Snowflake, which has already priced in much of the positive sentiment. Zscaler's stock is included in this rally, but there is no specific catalyst directly tied to ZS beyond the sector-wide movement. The coverage is indirect and lacks a dated event, resulting in a minor lean."
+ },
+ {
+  "pop": "control",
+  "ticker": "STX",
+  "raw": 0.254445,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The Zacks highlight positions Seagate Technology as a bullish catalyst due to AI-driven storage demand and rising earnings estimates, while the Yahoo analysis frames it as a cyclical-peak with a focus on cloud data center demand. The bullish sentiment from Zacks is the dominant catalyst, though the cyclical-peak framing introduces a minor caution. The score reflects the bullish lean from the Zacks"
+ },
+ {
+  "pop": "control",
+  "ticker": "BAC",
+  "raw": 0.140328,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights Bank of America's positive outlook on semiconductor stocks like Micron and AMD, as well as its bullish stance on Apple and SK hynix. These are indirect but relevant signals for BAC's own stock, as they reflect the bank's research and investment strategy. However, the coverage does not directly mention BAC's financials, earnings, or other catalysts that would directly impact its"
+ },
+ {
+  "pop": "control",
+  "ticker": "MS",
+  "raw": -0.40443,
+  "judge": "DOWN",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "Morgan Stanley's recent analyst actions on Peloton (PTON) and Chime Financial (CHYM) indicate a mixed sentiment, with downgrades and price target reductions for PTON and upgrades for CHYM. However, the dominant catalyst is the downgrade of Peloton, which is a direct company-specific event with a clear negative impact on MS's own stock due to its influence on market perception and investor sentimen"
+ },
+ {
+  "pop": "control",
+  "ticker": "BRK-B",
+  "raw": 0.373993,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "Berkshire Hathaway's recent strategic investments, including $17 billion in Alphabet and increased positions in Delta Air Lines and Macy's, along with resumed share buybacks, signal continued confidence in its portfolio. However, the stock has underperformed the S&P 500, and the recent news about AI investments and portfolio allocation may not have fully priced in yet. The move is partially priced"
+ },
+ {
+  "pop": "control",
+  "ticker": "CRCL",
+  "raw": -0.050001,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news mentions Circle Internet Group (CRCL) in a list of analyst research calls, but provides no specific directional insight or event. The second article notes a pullback in crypto equities, including CRCL, following Bitcoin's rejection at $82K, which implies a negative sentiment but no concrete catalyst. The move is likely priced in, and the coverage is indirect and routine."
+ },
+ {
+  "pop": "control",
+  "ticker": "XOM",
+  "raw": 0.287086,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "ExxonMobil reported a modest earnings beat in Q3 2026, surprising on the upside with a +13.3% EPS surprise. This is a bullish catalyst, though the move has already been partially priced in as the stock reacted positively to the results. The recent analyst price-target revisions further reinforce the positive sentiment, but the initial reaction to the earnings beat has largely been captured."
+ },
+ {
+  "pop": "control",
+  "ticker": "CRL",
+  "raw": -0.052362,
+  "judge": "NONE",
+  "emitted": "DOWN",
+  "contradiction": false,
+  "rationale": "The news indicates a broader market sentiment shift towards risk aversion, which could indirectly impact CRL as a research services provider. The coverage frames a general market pullback, which may pressure demand for research services. However, the move is already partially priced in as the article is a market recap."
+ },
+ {
+  "pop": "control",
+  "ticker": "PHVS",
+  "raw": 0.150941,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "PHVS experienced a strong positive reaction to its Phase 3 trial success in treating hereditary angioedema, with multiple news sources highlighting the pivotal success and positive results. The stock has already surged significantly, so the remaining move is a minor lean up. The catalyst is the trial success, and the move is already largely priced in."
+ },
+ {
+  "pop": "control",
+  "ticker": "ZIM",
+  "raw": 0.840847,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The catalyst is the revised takeover proposal from Hapag-Lloyd and FIMI, which has led to a positive price reaction. The mechanism is a direct catalyst from a major shareholder, and the move is already partially priced in as the stock has risen 5.5% pre-market."
+ },
+ {
+  "pop": "control",
+  "ticker": "SEI",
+  "raw": 0.229631,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "SEI's stock surged 16% due to a combination of strong Q3 2026 earnings beat, raised EBITDA guidance, and the completion of a significant acquisition of Omega Foundation Services. These catalysts have already driven a sharp price move, and the short float and days-to-cover ratio suggest a potential short squeeze. However, the majority of the move is already priced in, leaving a minor positive follo"
+ },
+ {
+  "pop": "control",
+  "ticker": "IBB",
+  "raw": 0.22313,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The news highlights a mixed sentiment in the biotech sector, with Novartis' trial failures causing a drop in biotech stocks, while Roivant and Pharvaris reported positive results leading to record highs. The IBB ETF, which holds biotech stocks, is likely to benefit from the positive momentum in Roivant and Pharvaris, though the broader sector is under pressure from Novartis' setbacks. The positive"
+ },
+ {
+  "pop": "control",
+  "ticker": "SEI",
+  "raw": 0.54652,
+  "judge": "UP",
+  "emitted": "UP",
+  "contradiction": false,
+  "rationale": "The dominant catalyst is the earnings beat with a +25.7% surprise, which historically drives price appreciation. Additionally, the stock has already surged 16% on upbeat guidance and an acquisition, with a short squeeze setup in place. However, the recent insider selling of $4.15M by Ryan Hicke introduces a bearish counterbalance. The move is partially priced in due to the recent surge and the sho"
+ }
+]

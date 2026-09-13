@@ -1,4 +1,4 @@
-"""The actionable filter — Gates 1, 1b, 2, 3, 4, 5 (2026-07-25).
+"""The actionable filter — Gates 1, 1c, 1b, 2, 3, 4, 4b, 5 (2026-07-25).
 
 This is the code that decides what actually TRADES, and coverage showed it had
 **zero** test coverage: 0 of 31 statements. The individual gate helpers
@@ -22,6 +22,10 @@ import pytest
 
 import src.pipeline as pl
 
+# The autouse fixture below stubs the gate helpers, so the tests that exercise
+# a HELPER itself must restore the real one first.
+_REAL_IS_WIDE_BOOK = pl._is_wide_book
+
 
 class _Rec:
     def __init__(self, ticker, action="BUY", confidence=0.99, direction=None):
@@ -35,8 +39,8 @@ def _diag():
     return {k: 0 for k in ("buy_sell_candidates", "dropped_below_threshold",
                            "dropped_rank_cap", "dropped_low_agreement",
                            "dropped_buy_blocked", "dropped_earnings_blackout",
-                           "dropped_untradeable", "dropped_overextended",
-                           "actionable_survivors")}
+                           "dropped_untradeable", "dropped_wide_book",
+                           "dropped_overextended", "actionable_survivors")}
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +48,8 @@ def _all_gates_open(monkeypatch):
     """Every gate passes by default; each test closes exactly one."""
     from config.settings import settings
     monkeypatch.setattr(pl, "_passes_agreement_gate", lambda direction, sig: True)
-    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b: True)
+    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b, price=None: True)
+    monkeypatch.setattr(pl, "_is_wide_book", lambda t, session=None: False)
     monkeypatch.setattr(pl, "_is_overextended", lambda t: False)
     # Gate 1c off by default here so each single-gate test stays single-gate;
     # the cap has its own tests below.
@@ -263,7 +268,7 @@ def test_gate3_earnings_blackout():
 
 
 def test_gate4_liquidity_floor(monkeypatch):
-    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b: t != "PENNY")
+    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b, price=None: t != "PENNY")
     out, diag, outcomes = _run([_Rec("PENNY"), _Rec("OK")])
     assert [r.ticker for r in out] == ["OK"]
     assert diag["dropped_untradeable"] == 1
@@ -287,7 +292,8 @@ def test_a_drop_is_attributed_to_the_FIRST_failing_gate(monkeypatch):
     compute_stage_eval's funnel reads these stamps, so mis-attribution corrupts
     the "which gate filters losers" analysis even when the trade decision is
     right."""
-    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b: False)
+    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b, price=None: False)
+    monkeypatch.setattr(pl, "_is_wide_book", lambda t, session=None: True)
     monkeypatch.setattr(pl, "_is_overextended", lambda t: True)
     out, diag, outcomes = _run([_Rec("BAD", "BUY", confidence=0.10)],
                                earnings_blackout={"BAD"}, allow_buys=False)
@@ -296,7 +302,7 @@ def test_a_drop_is_attributed_to_the_FIRST_failing_gate(monkeypatch):
     # And ONLY that counter moves.
     assert diag["dropped_below_threshold"] == 1
     for k in ("dropped_buy_blocked", "dropped_earnings_blackout",
-              "dropped_untradeable", "dropped_overextended"):
+              "dropped_untradeable", "dropped_wide_book", "dropped_overextended"):
         assert diag[k] == 0, f"{k} also fired — gates are not short-circuiting"
 
 
@@ -304,27 +310,34 @@ def test_expensive_gates_are_not_consulted_after_an_early_drop(monkeypatch):
     """Gate order is load-bearing for COST too: the liquidity gate can trigger a
     network fetch, so it must never run for an already-rejected candidate."""
     calls = []
-    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b: calls.append(t) or True)
+    monkeypatch.setattr(pl, "_is_tradeable",
+                        lambda t, b, price=None: calls.append(t) or True)
+    monkeypatch.setattr(pl, "_is_wide_book",
+                        lambda t, session=None: calls.append(t) or False)
     _run([_Rec("LOW", confidence=0.10)])
-    assert calls == [], "_is_tradeable ran on a candidate Gate 1 had rejected"
+    assert calls == [], "_is_tradeable/_is_wide_book ran on a candidate Gate 1 had rejected"
 
 
 def test_counters_and_outcomes_accumulate_across_a_mixed_batch(monkeypatch):
-    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b: t != "THIN")
+    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b, price=None: t != "THIN")
+    monkeypatch.setattr(pl, "_is_wide_book", lambda t, session=None: t == "WIDE")
     monkeypatch.setattr(pl, "_is_overextended", lambda t: t == "HOT")
     recs = [_Rec("PASS1"), _Rec("LOW", confidence=0.5), _Rec("THIN"),
-            _Rec("HOT"), _Rec("ERN"), _Rec("PASS2", "SELL"), _Rec("IGN", "HOLD")]
+            _Rec("HOT"), _Rec("ERN"), _Rec("PASS2", "SELL"), _Rec("IGN", "HOLD"),
+            _Rec("WIDE", "SELL")]
     out, diag, outcomes = _run(recs, earnings_blackout={"ERN"})
     assert [r.ticker for r in out] == ["PASS1", "PASS2"]
-    assert diag["buy_sell_candidates"] == 6          # HOLD excluded
+    assert diag["buy_sell_candidates"] == 7          # HOLD excluded
     assert diag["actionable_survivors"] == 2
     assert diag["dropped_below_threshold"] == 1
     assert diag["dropped_untradeable"] == 1
+    assert diag["dropped_wide_book"] == 1
     assert diag["dropped_overextended"] == 1
     assert diag["dropped_earnings_blackout"] == 1
     assert outcomes == {"PASS1": "pass", "LOW": "below_threshold",
                         "THIN": "untradeable", "HOT": "overextended",
-                        "ERN": "earnings_blackout", "PASS2": "pass"}
+                        "ERN": "earnings_blackout", "PASS2": "pass",
+                        "WIDE": "wide_book"}
     # Every candidate is accounted for exactly once.
     assert sum(v for k, v in diag.items()
                if k.startswith("dropped_")) + diag["actionable_survivors"] \
@@ -340,3 +353,84 @@ def test_empty_recommendations_is_a_clean_noop():
     out, diag, outcomes = _run([])
     assert out == [] and outcomes == {}
     assert diag["buy_sell_candidates"] == 0
+
+
+# ── Gate 4b — the live-book width cap (2026-09-03) ─────────────────────────
+
+def test_gate4b_wide_book_is_deferred_on_both_sides(monkeypatch):
+    """The cap is a COST cap, so unlike Gate 5 it applies to SELLs too — the
+    measured improvement was on both sides (LONG net −240 → +235, SHORT −165
+    → +260)."""
+    monkeypatch.setattr(pl, "_is_wide_book", lambda t, session=None: t.startswith("WIDE"))
+    out, diag, outcomes = _run([_Rec("WIDE_L", "BUY"), _Rec("WIDE_S", "SELL"),
+                                _Rec("TIGHT", "BUY")])
+    assert [r.ticker for r in out] == ["TIGHT"]
+    assert diag["dropped_wide_book"] == 2
+    assert outcomes["WIDE_L"] == "wide_book" and outcomes["WIDE_S"] == "wide_book"
+
+
+def test_gate4b_runs_AFTER_gate4_and_BEFORE_gate5(monkeypatch):
+    """Attribution order: a thin AND wide name is Gate 4's; a wide AND
+    overextended BUY is Gate 4b's (never Gate 5's)."""
+    monkeypatch.setattr(pl, "_is_tradeable", lambda t, b, price=None: t != "THINWIDE")
+    monkeypatch.setattr(pl, "_is_wide_book", lambda t, session=None: t in ("THINWIDE", "WIDEHOT"))
+    monkeypatch.setattr(pl, "_is_overextended", lambda t: t == "WIDEHOT")
+    out, diag, outcomes = _run([_Rec("THINWIDE"), _Rec("WIDEHOT")])
+    assert out == []
+    assert outcomes == {"THINWIDE": "untradeable", "WIDEHOT": "wide_book"}
+    assert diag["dropped_untradeable"] == 1 and diag["dropped_wide_book"] == 1
+    assert diag["dropped_overextended"] == 0
+
+
+def test_gate4b_receives_the_run_session_and_gate4_the_live_price(monkeypatch):
+    """The cap is on the RTH basis (the session's widening divided out) and
+    Gate 4 judges the LIVE price — both plumbed through the cascade's kwargs."""
+    seen = {}
+    monkeypatch.setattr(pl, "_is_tradeable",
+                        lambda t, b, price=None: seen.setdefault("price", price) or True)
+    monkeypatch.setattr(pl, "_is_wide_book",
+                        lambda t, session=None: seen.setdefault("session", session) and False)
+    _run([_Rec("AAA")], live_prices={"AAA": 12.5}, session="overnight")
+    assert seen == {"price": 12.5, "session": "overnight"}
+
+
+def test_gate4b_helper_reads_the_quoted_book_not_the_mapped_deviation(monkeypatch):
+    """`_is_wide_book` must read `quoted_halfspread_bps` (the raw NBBO on the
+    RTH basis) — the thresholds were measured on quoted books; the power-law
+    `exp_halfspread_bps` maps a 20 bp book to ~16 bp of deviation. Fail-open on
+    no book, on a NaN, and when the cap is disabled."""
+    from config.settings import settings
+    import src.performance.liquidity_forecast as lf
+    monkeypatch.setattr(pl, "_is_wide_book", _REAL_IS_WIDE_BOOK)
+    monkeypatch.setattr(settings, "gate4_nbbo_max_halfspread_bps", 12.0)
+    calls = []
+
+    def fake(ticker, session=None):
+        calls.append((ticker, session))
+        return {"WIDE": {"bps": 12.0, "raw_bps": 120.0, "estimator": "nbbo"},
+                "TIGHT": {"bps": 11.99, "raw_bps": 11.99, "estimator": "nbbo"},
+                "NAN": {"bps": float("nan"), "raw_bps": 1.0, "estimator": "nbbo"},
+                "NOBOOK": None}[ticker]
+
+    monkeypatch.setattr(lf, "quoted_halfspread_bps", fake)
+    assert pl._is_wide_book("WIDE", session="overnight") is True      # at the cap → wide
+    assert pl._is_wide_book("TIGHT") is False
+    assert pl._is_wide_book("NAN") is False
+    assert pl._is_wide_book("NOBOOK") is False
+    assert calls[0] == ("WIDE", "overnight")                         # RTH-basis division
+    monkeypatch.setattr(settings, "gate4_nbbo_max_halfspread_bps", 0.0)
+    calls.clear()
+    assert pl._is_wide_book("WIDE") is False and calls == []          # disabled: never asks
+
+
+def test_gate4b_fails_open_on_an_exception(monkeypatch):
+    from config.settings import settings
+    import src.performance.liquidity_forecast as lf
+    monkeypatch.setattr(pl, "_is_wide_book", _REAL_IS_WIDE_BOOK)
+    monkeypatch.setattr(settings, "gate4_nbbo_max_halfspread_bps", 12.0)
+
+    def boom(ticker, session=None):
+        raise RuntimeError("quote store unavailable")
+
+    monkeypatch.setattr(lf, "quoted_halfspread_bps", boom)
+    assert pl._is_wide_book("AAA") is False

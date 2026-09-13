@@ -23,7 +23,7 @@ import math
 import re
 from datetime import datetime, timezone
 from statistics import mean
-from typing import List, Tuple
+from typing import Optional, List, Tuple
 
 from src.models import NewsArticle
 
@@ -82,6 +82,7 @@ def compute_sentiment_velocity(
     articles: List[NewsArticle],
     recent_hours: int = 24,
     prior_hours: int = 96,
+    as_of: Optional[datetime] = None,
 ) -> Tuple[float, float, float, int]:
     """Compute the sentiment velocity for ``ticker`` from already-filtered articles.
 
@@ -98,7 +99,12 @@ def compute_sentiment_velocity(
     if not articles or prior_hours <= recent_hours:
         return 0.0, 0.0, 0.0, 0
 
-    now = datetime.now(timezone.utc)
+    # ``as_of`` = the instant the windows are measured from. None is NOW (live);
+    # a replay passes its own tick, or every historical article falls outside
+    # both windows and the velocity reads 0.0.
+    now = as_of or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     recent: List[float] = []
     prior: List[float] = []
     for a in articles:

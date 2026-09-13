@@ -261,8 +261,39 @@ def test_ml_exit_closes_arm_trade(tmp_path, monkeypatch):
 def test_ml_exit_does_not_touch_non_arm_trade(tmp_path, monkeypatch):
     # Same strong exit conviction, but the trade was NOT opened under the arm →
     # ml_exit must not close it (the consensus is skipped for ml_exit, so nothing fires).
+    # This is the ARM-COUPLED behaviour, which `ml_exit_all_positions` (off in the
+    # suite via conftest, ON in production since 2026-09-05) removes.
     t = _seed_and_monitor(tmp_path, monkeypatch, _arm_open_trade(ml_arm=False, days_ago=30),
                           ml_exit_score=-0.9)
+    assert t["status"] == "OPEN"
+
+
+def test_ml_exit_all_positions_drops_the_arm_coupling(tmp_path, monkeypatch):
+    """2026-09-05 user directive: route the ML exit 100%.
+
+    The `ml_arm` stamp existed to keep ONE experiment coherent — stacker entry
+    ⇔ ML exit. With the entry combine at `ml_combine_arm_share` 1.0 that
+    coupling covers new trades anyway, but positions opened BEFORE the switch,
+    and any row where the stacker fail-softed to the weighted combine on one
+    side, carry no stamp and would keep the ML exit switched off for the rest of
+    their life.
+    """
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "ml_exit_all_positions", True)
+    t = _seed_and_monitor(tmp_path, monkeypatch, _arm_open_trade(ml_arm=False, days_ago=30),
+                          ml_exit_score=-0.9)
+    assert t["status"] == "CLOSED"
+    assert t["exit_reason"] == "ml_exit"
+
+
+def test_ml_exit_all_positions_still_respects_its_threshold(tmp_path, monkeypatch):
+    """100% routing widens WHO the rule can close, not WHEN it fires."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "ml_exit_all_positions", True)
+    t = _seed_and_monitor(tmp_path, monkeypatch, _arm_open_trade(ml_arm=False, days_ago=30),
+                          ml_exit_score=-0.10)          # well inside the 0.35 band
     assert t["status"] == "OPEN"
 
 

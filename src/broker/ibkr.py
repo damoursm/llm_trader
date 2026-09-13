@@ -11,8 +11,10 @@ IBKRBroker requires it.
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -26,6 +28,49 @@ from src.broker.base import (
 # Non-USD base currencies already flagged this process — the account config is
 # static, so warn once instead of every get_account() call (29×/day in one log).
 _WARNED_NON_USD_CCY: set = set()
+
+# Repeated-wedge history, PERSISTED across process restarts (2026-09-03). The
+# broker-sync watchdog answers a wedged gateway with ``os._exit(1)`` and
+# ``--supervise`` relaunches a fresh process — which used to start with an EMPTY
+# recycle list, so under a 30-min tick cadence a gateway wedged for hours never
+# reached ``broker_wedge_recycle_limit`` inside one process (2026-09-03: four
+# force-recycles in 19 minutes, zero restarts). Wall-clock stamps, not monotonic,
+# because they must mean the same thing after a relaunch. Fail-soft everywhere.
+WEDGE_HISTORY_PATH = Path("cache") / "broker_wedge_recycles.json"
+
+
+def _install_ib_log_bridge() -> None:
+    """Route ib_async's stdlib-logging WARNING+/ERROR records into loguru.
+
+    ib_async reports API errors (e.g. 10089 "market data requires additional
+    subscription") through ``logging.getLogger("ib_async.*")`` — a channel this
+    project gives NO handler, so every such error was invisible in the loguru
+    log file (found 2026-08-31: overnight quote refusals left zero trace while
+    ``get_quote``/``get_market_price`` silently returned None). This bridge is
+    the sink: WARNING+ records re-emit through loguru with an ``[ib_async]``
+    prefix. Idempotent; never raises out of ``emit`` (a logging handler that
+    throws kills the caller's request, not the log line)."""
+    import logging as _logging
+
+    class _LoguruBridge(_logging.Handler):
+        def emit(self, record: "_logging.LogRecord") -> None:  # noqa: D102
+            try:
+                level = ("CRITICAL" if record.levelno >= _logging.CRITICAL
+                         else "ERROR" if record.levelno >= _logging.ERROR
+                         else "WARNING")
+                logger.log(level, f"[ib_async] {record.getMessage()}")
+            except Exception:
+                pass
+
+    for name in ("ib_async", "ib_insync"):
+        lg = _logging.getLogger(name)
+        if any(type(h).__name__ == "_LoguruBridge" for h in lg.handlers):
+            continue
+        h = _LoguruBridge(level=_logging.WARNING)
+        lg.addHandler(h)
+
+
+_install_ib_log_bridge()
 
 
 def to_ib_symbol(ticker: str) -> str:
@@ -113,7 +158,7 @@ class IBKRBroker(Broker):
         self._ever_connected = False         # "reconnected" vs "connected" log wording
         self._expected_disconnect = False    # deliberate disconnects don't warn
         self._consecutive_timeouts = 0       # wedge detection: request timeouts since last success
-        self._wedge_recycle_times: list = []  # monotonic stamps of recent force-recycles
+        self._wedge_recycle_times: list = self._load_wedge_history()  # wall-clock stamps of recent force-recycles
 
     # ── connection ────────────────────────────────────────────────────────
     def _get_ib(self):
@@ -150,18 +195,47 @@ class IBKRBroker(Broker):
             f"auto-reconnect runs at the next broker call"
         )
 
+    # ── repeated-wedge history (persisted) ────────────────────────────────
+    @staticmethod
+    def _load_wedge_history() -> list:
+        """Recent force-recycle stamps from the previous process, or []. Only
+        stamps inside the window are kept, so a stale file can't escalate."""
+        try:
+            if not WEDGE_HISTORY_PATH.exists():
+                return []
+            raw = json.loads(WEDGE_HISTORY_PATH.read_text(encoding="utf-8"))
+            window = max(60.0, float(settings.broker_wedge_recycle_window_seconds))
+            now = time.time()
+            return sorted(float(t) for t in (raw or []) if 0 <= now - float(t) <= window)
+        except Exception as e:
+            logger.debug(f"[broker:ibkr] wedge history unreadable ({e}) — starting empty")
+            return []
+
+    def _save_wedge_history(self) -> None:
+        try:
+            WEDGE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = WEDGE_HISTORY_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps([round(t, 3) for t in self._wedge_recycle_times]),
+                           encoding="utf-8")
+            tmp.replace(WEDGE_HISTORY_PATH)
+        except Exception as e:
+            logger.debug(f"[broker:ibkr] wedge history not saved: {e}")
+
     def _note_request(self, exc: Optional[BaseException]) -> None:
         """Track consecutive request TIMEOUTS so an alive-but-wedged gateway
         (socket open → isConnected() True, but every request times out) is
         detected. Any success resets the counter; a non-timeout error (a real
-        reject) leaves it unchanged (it is not evidence of a wedge)."""
+        reject) leaves it unchanged (it is not evidence of a wedge).
+
+        A success does NOT clear the repeated-wedge history: a gateway that keeps
+        needing force-recycles IS the pattern being counted, and every recycle
+        cycle ends with a redial that "succeeds" (observed 2026-08-04 and again
+        2026-09-03). Staleness is bounded by the window prune in
+        ``_ensure_connected`` instead. Only call this from a method that made a
+        real ROUND-TRIP — a local cache read (``accountValues()``,
+        ``positions()``) proves nothing about the gateway."""
         if exc is None:
             self._consecutive_timeouts = 0
-            # A request that actually SUCCEEDED is the only proof the gateway is
-            # really back, so it also clears the repeated-wedge history — otherwise
-            # recycles from an old, since-resolved episode would accumulate toward
-            # a spurious restart hours later.
-            self._wedge_recycle_times.clear()
         elif _is_timeout_exc(exc):
             self._consecutive_timeouts += 1
 
@@ -271,15 +345,18 @@ class IBKRBroker(Broker):
             # auto-restart enabled and did nothing. A gateway that has to be
             # force-recycled REPEATEDLY is the corpse regardless of whether it
             # answers the dial, so count the recycles and act on the pattern.
-            now = time.monotonic()
+            # Wall-clock stamps persisted to WEDGE_HISTORY_PATH so the count
+            # survives the watchdog's os._exit(1) + --supervise relaunch.
+            now = time.time()
             window = max(60.0, float(settings.broker_wedge_recycle_window_seconds))
-            self._wedge_recycle_times = [t for t in self._wedge_recycle_times if now - t <= window]
+            self._wedge_recycle_times = [t for t in self._wedge_recycle_times if 0 <= now - t <= window]
             self._wedge_recycle_times.append(now)
             limit = max(2, int(settings.broker_wedge_recycle_limit))
             if len(self._wedge_recycle_times) >= limit:
                 recovery_reason = (f"gateway force-recycled {len(self._wedge_recycle_times)}x in "
                                    f"{int(window)}s despite successful redials — wedged-but-alive")
                 self._wedge_recycle_times.clear()   # don't re-fire on every later touchpoint
+            self._save_wedge_history()
         if recovery_reason:
             # Fire-and-forget: this path runs from every broker touchpoint, so the
             # recovery's own cooldown keeps it cheap and the next touchpoint
@@ -342,7 +419,12 @@ class IBKRBroker(Broker):
                     "assumes USD. Set your IBKR paper account base currency to USD to avoid FX skew. "
                     "(warned once per run)"
                 )
-            self._note_request(None)
+            # accountValues() is a LOCAL cache read (populated by the account-update
+            # subscription at connect) — NOT a round-trip, so it is not evidence
+            # the gateway answered and must not reset the wedge counter. It used
+            # to: every sync's get_account() "succeeded" against a wedged gateway
+            # and wiped the recycle history, so the repeated-wedge escalation could
+            # never reach its limit (2026-09-03, four recycles, zero restarts).
             return AccountSnapshot(
                 equity=num("NetLiquidation"), cash=num("TotalCashValue"),
                 buying_power=num("BuyingPower"), account_id=acct, currency=currency,
@@ -615,11 +697,13 @@ class IBKRBroker(Broker):
     def get_market_price(self, ticker: str) -> Optional[float]:
         """Real-time last/mark price via a blocking ``reqTickers`` snapshot.
 
-        Uses IBKR's free Cboe One + IEX real-time feed (the same data that fills
-        the orders), so the tracker's mark/decision price matches the execution
-        venue. Returns None if not connected or no usable quote arrives — the
-        caller then falls back to yfinance/Polygon. Prefers last trade, then the
-        bid/ask midpoint (``marketPrice``), then the prior close; all NaN-filtered.
+        ⚠ Requires an API market-data entitlement the account currently LACKS
+        (verified 2026-08-31: error 10089 at every session hour — the free
+        Cboe One + IEX data exists in TWS desktop, NOT over the API). Until the
+        US data lines are subscribed in Client Portal this returns None and the
+        caller falls back to yfinance/Polygon; it self-heals the moment the
+        entitlement exists. Prefers last trade, then the bid/ask midpoint
+        (``marketPrice``), then the prior close; all NaN-filtered.
         """
         if not self._ensure_connected():
             return None
@@ -661,11 +745,12 @@ class IBKRBroker(Broker):
     def get_quote(self, ticker: str) -> Optional["Quote"]:
         """Live bid/ask snapshot — what a marketable limit actually has to cross.
 
-        Same ``reqTickers`` snapshot as ``get_market_price`` (Cboe One + IEX, the
-        feed that fills the orders) but reading the two sides of the book instead
-        of collapsing them to a last/mid. Bounded by the same short timeout, for
-        the same reason: a thin pre-market name never resolves and would
-        otherwise burn the full request timeout on every priced leg.
+        Same ``reqTickers`` snapshot as ``get_market_price`` and the SAME
+        entitlement caveat: without the API market-data subscription (absent as
+        of 2026-08-31) this always returns None — the spread-aware cap then
+        stays mid-based, which was the shipped behaviour. Bounded by a short
+        timeout: a thin pre-market name never resolves and would otherwise burn
+        the full request timeout on every priced leg.
 
         Returns None unless BOTH sides are present and sane (ask ≥ bid > 0) —
         a one-sided book cannot tell us what crossing costs, and the caller's

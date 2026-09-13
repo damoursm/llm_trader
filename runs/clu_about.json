@@ -1,0 +1,1439 @@
+[
+ {
+  "date": "2026-06-17",
+  "tk": "ADPT",
+  "idx": 0,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-17",
+  "tk": "ADPT",
+  "idx": 1,
+  "n": 4,
+  "body_only": 2,
+  "examples": [
+   "[Motley Fool] What Does an Adaptive Biotech Insider's Sale of Nearly 40,000 Shares Mean for Investors?",
+   "[The Motley Fool] What Does an Adaptive Biotech Insider's Sale of Nearly 40,000 Shares Mean for Investors?"
+  ]
+ },
+ {
+  "date": "2026-06-17",
+  "tk": "ADPT",
+  "idx": 2,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-18",
+  "tk": "AMKR",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-18",
+  "tk": "AMKR",
+  "idx": 1,
+  "n": 7,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-22",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-22",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 19,
+  "body_only": 5,
+  "examples": [
+   "[The Motley Fool] Why the AI Infrastructure Wave Will Mint More Millionaires Than the Chatbot Phase: 3 Stocks to Own",
+   "[The Motley Fool] Stock Market Today, June 18: Marvell Technology Surges on Price Target Hike",
+   "[The Motley Fool] Tech Stocks Just Did Something That Should Only Happen Once Every 4 Million Years",
+   "[The Motley Fool] The SpaceX IPO Could Trigger a Massive Rotation Across AI Stocks. Here's Why."
+  ]
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 20,
+  "body_only": 7,
+  "examples": [
+   "[AFP] Seoul's Kospi stock index tanks 10% to lead tech-fuelled Asia rout",
+   "[TheStreet] Walmart slashed the prices of expensive electronics by up to 88% off",
+   "[24/7 Wall St.] Experts Warn: Companies Cutting Headcount to Boost Efficiency May Be Betting on the Wrong Future",
+   "[Barrons.com] The Magnificent 7 Selloff Is a Rare Buying Opportunity"
+  ]
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "ASTS",
+  "idx": 0,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "ASTS",
+  "idx": 1,
+  "n": 18,
+  "body_only": 4,
+  "examples": [
+   "[Motley Fool] 3 Growth Stocks Worth Buying Through the Volatility and Holding for a Lifetime",
+   "[The Motley Fool] 5 Stocks Poised to Benefit Now That SpaceX Is Public",
+   "[Barchart] The Biggest IPO in History Just Put Space Stocks on the Map. Here Are the Ones Built to Win.",
+   "[Investor's Business Daily] SpaceX Shares Rise As Fresh Launch Boosts This Space Stock"
+  ]
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "BEN",
+  "idx": 0,
+  "n": 5,
+  "body_only": 1,
+  "examples": [
+   "[TheStreet] $1.7T Wall Street giant eyes turning dividends into Bitcoin"
+  ]
+ },
+ {
+  "date": "2026-06-23",
+  "tk": "BEN",
+  "idx": 1,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[Zacks] Franklin Climbs to a New 52-Week High: How to Play the Stock Now?"
+  ]
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 15,
+  "body_only": 8,
+  "examples": [
+   "[Motley Fool] 1 Striking Reason This Trillion-Dollar Cloud Pioneer Is a Better Artificial Intelligence (AI) Buy Than Apple Ri",
+   "[Reuters] GameStop CEO Cohen spurns $35 billion pay plan to focus on plan to buy eBay",
+   "[The Motley Fool] The AI Trade Is Wobbling. Berkshire Hathaway Was Built for a Market Like This.",
+   "[Associated Press] AI stock slump raises the question if investors are just taking profits or getting very nervous"
+  ]
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 5,
+  "body_only": 2,
+  "examples": [
+   "[Reuters Videos] US stocks end mostly lower, dragged by megacap tech; focus on Iran",
+   "[TheStreet] Walmart slashed the prices of expensive electronics by up to 88% off"
+  ]
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "BE",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "BE",
+  "idx": 1,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[MarketBeat] 5 Stocks Solving the AI Power Crisis"
+  ]
+ },
+ {
+  "date": "2026-06-24",
+  "tk": "BE",
+  "idx": 2,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 4,
+  "body_only": 1,
+  "examples": [
+   "[GlobeNewswire Inc.] INVESTOR ALERT: Pomerantz Law Firm Reminds Investors with Losses on their Investment in Helen of Troy Li"
+  ]
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ARM",
+  "idx": 0,
+  "n": 5,
+  "body_only": 2,
+  "examples": [
+   "[24/7 Wall St.] Arm Holdings vs Advanced Micro Devices: One Winner of The AI Data Center Showdown",
+   "[Yahoo Personal Finance] Mortgage and refinance interest rates today, Wednesday, June 24, 2026: Rates are rising today"
+  ]
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ARM",
+  "idx": 1,
+  "n": 7,
+  "body_only": 6,
+  "examples": [
+   "[24/7 Wall St.] Arm Stock Is Up 235% in 2026: Is Today\u2019s 10% Drawdown a Take-Profits Signal?",
+   "[The Motley Fool] Wall Street Tuesday: Dow Green, Nasdaq Bleeding, SpaceX Wild",
+   "[24/7 Wall St.] Stanley Druckenmiller Backs These 3 Chip and Tech Stocks: Should You Follow?",
+   "[Yahoo Personal Finance] Mortgage and refinance interest rates today, Tuesday, June 23, 2026: Rates are mixed this morning"
+  ]
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ARM",
+  "idx": 2,
+  "n": 1,
+  "body_only": 1,
+  "examples": [
+   "[Barchart] Why Bernstein Just Raised Its Price Target on Arm Stock by Nearly 70%"
+  ]
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ASTS",
+  "idx": 0,
+  "n": 6,
+  "body_only": 1,
+  "examples": [
+   "[The Motley Fool] SpaceX Is Pulling Back. These 3 Stocks Are the Biggest Beneficiaries."
+  ]
+ },
+ {
+  "date": "2026-06-25",
+  "tk": "ASTS",
+  "idx": 1,
+  "n": 4,
+  "body_only": 1,
+  "examples": [
+   "[Motley Fool] 3 Growth Stocks Worth Buying Through the Volatility and Holding for a Lifetime"
+  ]
+ },
+ {
+  "date": "2026-06-26",
+  "tk": "AVAV",
+  "idx": 0,
+  "n": 5,
+  "body_only": 2,
+  "examples": [
+   "[GlobeNewswire Inc.] DEADLINE ALERT for CALX, AVAV, ZTS, LCID: Law Offices of Howard G. Smith Reminds Investors of Opportunit",
+   "[Investing.com] 2 Space and Defense Stocks Turning Backlogs Into Revenue Growth"
+  ]
+ },
+ {
+  "date": "2026-06-26",
+  "tk": "AVAV",
+  "idx": 1,
+  "n": 7,
+  "body_only": 1,
+  "examples": [
+   "[Insider Monkey] Redditors Say This Is The Best Defense Stock To Buy After Iran War"
+  ]
+ },
+ {
+  "date": "2026-06-26",
+  "tk": "AVAV",
+  "idx": 2,
+  "n": 6,
+  "body_only": 2,
+  "examples": [
+   "[GlobeNewswire Inc.] CVLT DEADLINE NOTICE: ROSEN, A LEADING LAW FIRM, Encourages Commvault Systems, Inc. Investors with Losse",
+   "[GlobeNewswire Inc.] CALX DEADLINE ALERT: ROSEN, LEADING INVESTOR COUNSEL, Encourages Calix, Inc. Investors with Losses in Ex"
+  ]
+ },
+ {
+  "date": "2026-07-01",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-01",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-01",
+  "tk": "ABBV",
+  "idx": 2,
+  "n": 5,
+  "body_only": 1,
+  "examples": [
+   "[24/7 Wall St.] Why I Can\u2019t Stop Buying This Unstoppable Dividend Juggernaut"
+  ]
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AA",
+  "idx": 0,
+  "n": 8,
+  "body_only": 1,
+  "examples": [
+   "[Stocktwits] Why Is AA Stock Falling Nearly 5% In Premarket Trading Today?"
+  ]
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AA",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AMBA",
+  "idx": 0,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-02",
+  "tk": "AMBA",
+  "idx": 1,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-03",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 10,
+  "body_only": 3,
+  "examples": [
+   "[Motley Fool] 3 AI Stocks to Still Buy If Inflation Stays Sticky",
+   "[The Motley Fool] 3 AI Stocks to Still Buy If Inflation Stays Sticky",
+   "[24/7 Wall St.] 3 Top AI Stocks to Buy in July"
+  ]
+ },
+ {
+  "date": "2026-07-03",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 10,
+  "body_only": 2,
+  "examples": [
+   "[Barrons.com] Amazon, 1 Other Big Winner as U.S. Lifts Ban on Anthropic\u2019s Powerful AI Model",
+   "[24/7 Wall St.] This Semiconductor ETF\u2019s 96% Gain Hinges on a Single $1 Trillion Question"
+  ]
+ },
+ {
+  "date": "2026-07-05",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[The Motley Fool] If You'd Parked $1,000 in the iShares Semiconductor ETF 5 Years Ago, Here's What You'd Have Today"
+  ]
+ },
+ {
+  "date": "2026-07-05",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 17,
+  "body_only": 4,
+  "examples": [
+   "[MarketBeat] MarketBeat Week in Review \u2013 06/29 - 07/03",
+   "[Motley Fool] 3 AI Stocks to Still Buy If Inflation Stays Sticky",
+   "[The Motley Fool] 3 AI Stocks to Still Buy If Inflation Stays Sticky",
+   "[24/7 Wall St.] 3 Top AI Stocks to Buy in July"
+  ]
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[GlobeNewswire Inc.] ROSEN, A TRUSTED AND LEADING LAW FIRM, Encourages First Solar, Inc. Investors to Secure Counsel Before I"
+  ]
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 4,
+  "body_only": 1,
+  "examples": [
+   "[GlobeNewswire Inc.] ROSEN, NATIONALLY REGARDED INVESTOR COUNSEL, Encourages Nano-X Imaging Ltd. Investors to Secure Counsel "
+  ]
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 5,
+  "body_only": 2,
+  "examples": [
+   "[The Motley Fool] Here's Why This Semiconductor ETF Rewarded Investors in June",
+   "[The Motley Fool] If You'd Parked $1,000 in the iShares Semiconductor ETF 5 Years Ago, Here's What You'd Have Today"
+  ]
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "AVGO",
+  "idx": 1,
+  "n": 5,
+  "body_only": 1,
+  "examples": [
+   "[MarketBeat] MarketBeat Week in Review \u2013 06/29 - 07/03"
+  ]
+ },
+ {
+  "date": "2026-07-06",
+  "tk": "AVGO",
+  "idx": 2,
+  "n": 10,
+  "body_only": 3,
+  "examples": [
+   "[Motley Fool] 3 AI Stocks to Still Buy If Inflation Stays Sticky",
+   "[The Motley Fool] 3 AI Stocks to Still Buy If Inflation Stays Sticky",
+   "[24/7 Wall St.] 3 Top AI Stocks to Buy in July"
+  ]
+ },
+ {
+  "date": "2026-07-07",
+  "tk": "AMAT",
+  "idx": 0,
+  "n": 5,
+  "body_only": 1,
+  "examples": [
+   "[The Motley Fool] Here's Why This Semiconductor ETF Rewarded Investors in June"
+  ]
+ },
+ {
+  "date": "2026-07-07",
+  "tk": "AMAT",
+  "idx": 1,
+  "n": 15,
+  "body_only": 3,
+  "examples": [
+   "[TheStreet] Michael Burry's newest short reveals what really worries him about AI",
+   "[The Wall Street Journal] Michael Burry Cites \u2018Beginning of the End\u2019 With New AI Short Bets",
+   "[Zacks] Company News for July 1, 2026"
+  ]
+ },
+ {
+  "date": "2026-07-08",
+  "tk": "AMAT",
+  "idx": 0,
+  "n": 8,
+  "body_only": 3,
+  "examples": [
+   "[The Wall Street Journal] Stocks to Watch: Micron, Chevron, Levi Strauss",
+   "[The Wall Street Journal] Samsung Fails To Impress",
+   "[Zacks] Best Momentum Stock to Buy for July 7th"
+  ]
+ },
+ {
+  "date": "2026-07-08",
+  "tk": "AMAT",
+  "idx": 1,
+  "n": 6,
+  "body_only": 2,
+  "examples": [
+   "[The Wall Street Journal] \ud83d\udcc9Global AI Stocks Tumble",
+   "[The Motley Fool] Here's Why This Semiconductor ETF Rewarded Investors in June"
+  ]
+ },
+ {
+  "date": "2026-07-08",
+  "tk": "AMAT",
+  "idx": 2,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-09",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 20,
+  "body_only": 3,
+  "examples": [
+   "[StockStory] Why Broadcom (AVGO) Stock Is Trading Up Today",
+   "[The Wall Street Journal] Stocks to Watch Wednesday Recap: Broadcom, Alibaba, Chevron, Levi Strauss",
+   "[The Motley Fool] The S&P 500 Is Nearing Record Highs, but This 1 Unstoppable ETF Could Be the Smarter Buy Right Now"
+  ]
+ },
+ {
+  "date": "2026-07-09",
+  "tk": "AMD",
+  "idx": 0,
+  "n": 4,
+  "body_only": 1,
+  "examples": [
+   "[Trefis] Micron Stock: A Different Cycle, For Better Or For Worse"
+  ]
+ },
+ {
+  "date": "2026-07-09",
+  "tk": "AMD",
+  "idx": 1,
+  "n": 16,
+  "body_only": 2,
+  "examples": [
+   "[Reuters] South Korean chip stocks slide after overnight US selloff on AI boom concerns",
+   "[Insider Monkey] RBC Capital Raises PT on Rackspace Technology (RXT), Here\u2019s Why"
+  ]
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AGIO",
+  "idx": 0,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AGIO",
+  "idx": 1,
+  "n": 5,
+  "body_only": 1,
+  "examples": [
+   "[Investor's Business Daily] Why This Novo Nordisk Rival Just Soared To A Profit-Taking Zone"
+  ]
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMAT",
+  "idx": 0,
+  "n": 7,
+  "body_only": 1,
+  "examples": [
+   "[Barrons.com] Why Meta\u2019s In-House AI Chip Plans Sent Chip-Equipment Stocks Soaring"
+  ]
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMAT",
+  "idx": 1,
+  "n": 13,
+  "body_only": 4,
+  "examples": [
+   "[The Wall Street Journal] Stocks to Watch: Micron, Chevron, Levi Strauss",
+   "[The Wall Street Journal] Samsung Fails To Impress",
+   "[Zacks] Best Momentum Stock to Buy for July 7th",
+   "[The Wall Street Journal] \ud83d\udcc9Global AI Stocks Tumble"
+  ]
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 13,
+  "body_only": 3,
+  "examples": [
+   "[GlobeNewswire Inc.] Icelandirect Earns SSCI Certification, Strengthening Its Ability to Serve Brands Selling Across Major Re",
+   "[The Motley Fool] Nobody Is Talking About These Mispriced Stocks. That's the Opportunity",
+   "[The Motley Fool] Anthropic's IPO Will Lead to Windfall Profits for These 3 Early Investors"
+  ]
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 7,
+  "body_only": 5,
+  "examples": [
+   "[Yahoo Finance Video] Jeff Bezos's Blue Origin is looking to fuel growth. What does that mean for rival SpaceX?",
+   "[Insider Monkey] Corning Incorporated (GLW) Announces Quarterly Dividend",
+   "[The Motley Fool] Here Are the First Three Stocks I'm Buying if the Stock Market Enters a Bear Market",
+   "[The Motley Fool] Why The Trade Desk Fell 16% in June"
+  ]
+ },
+ {
+  "date": "2026-07-10",
+  "tk": "AVGO",
+  "idx": 0,
+  "n": 20,
+  "body_only": 8,
+  "examples": [
+   "[Reuters Videos] Meta to produce AI chips in September, memo shows",
+   "[The Motley Fool] Direxion Daily Semiconductor Bull 3X ETF Explodes",
+   "[24/7 Wall St.] My Bold Prediction for This Stock Through 2030",
+   "[The Motley Fool] Why Meta Stock Dropped -- Then Bounced Back"
+  ]
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 3,
+  "body_only": 3,
+  "examples": [
+   "[The Motley Fool] Meet the Vanguard ETF That Has Crushed the S&P 500 Over the Last 10 Years",
+   "[The Motley Fool] Is the Vanguard Growth ETF the Best Growth ETF You Can Buy Right Now? Here's What the Data Says.",
+   "[The Motley Fool] 3 Reasons SoundHound AI Stock Could Keep Climbing"
+  ]
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 17,
+  "body_only": 7,
+  "examples": [
+   "[The Motley Fool] Which Tech ETF Wins for Your Portfolio, Fidelity's FTEC or Vanguard's VGT?",
+   "[The Motley Fool] Broadcom Just Gave Investors Another $30 Billion Reason to Buy the Stock",
+   "[TheStreet] Has Meta ever had a stock split? What sets this \u2018Mag 7\u2019 stock apart",
+   "[Investing.com] Investing.com\u2019s stocks of the week"
+  ]
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AMD",
+  "idx": 0,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "AMD",
+  "idx": 1,
+  "n": 16,
+  "body_only": 3,
+  "examples": [
+   "[The Motley Fool] The S&P 500 Could Jump 18% Over the Next 1 Year. Here Are My Top Growth Stocks to Buy Before That Happens",
+   "[GlobeNewswire Inc.] Silicon Interposer Market Size to Hit USD 14.04 Billion by 2035 | SNS Insider",
+   "[Reuters Videos] Meta to produce AI chips in September, memo shows"
+  ]
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "APP",
+  "idx": 0,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-12",
+  "tk": "APP",
+  "idx": 1,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 4,
+  "body_only": 3,
+  "examples": [
+   "[The Motley Fool] Meet the Vanguard ETF That Has Crushed the S&P 500 Over the Last 10 Years",
+   "[The Motley Fool] Is the Vanguard Growth ETF the Best Growth ETF You Can Buy Right Now? Here's What the Data Says.",
+   "[The Motley Fool] 3 Reasons SoundHound AI Stock Could Keep Climbing"
+  ]
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 16,
+  "body_only": 7,
+  "examples": [
+   "[The Motley Fool] Which Tech ETF Wins for Your Portfolio, Fidelity's FTEC or Vanguard's VGT?",
+   "[The Motley Fool] Broadcom Just Gave Investors Another $30 Billion Reason to Buy the Stock",
+   "[TheStreet] Has Meta ever had a stock split? What sets this \u2018Mag 7\u2019 stock apart",
+   "[Investing.com] Investing.com\u2019s stocks of the week"
+  ]
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 5,
+  "body_only": 3,
+  "examples": [
+   "[The Wall Street Journal] The Quarter-Trillion-Dollar Onslaught of AI Bonds Is Testing Investors\u2019 Limits",
+   "[The Motley Fool] The 1 AI Stock I'd Buy and Hold for the Next Decade",
+   "[The Motley Fool] 3 Reasons SoundHound AI Stock Could Keep Climbing"
+  ]
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 15,
+  "body_only": 5,
+  "examples": [
+   "[The Motley Fool] Is the AI Data Center Boom Creating a Debt Bubble? Here's What Investors Need to Know.",
+   "[TheStreet] Has Meta ever had a stock split? What sets this \u2018Mag 7\u2019 stock apart",
+   "[The Motley Fool] 3 Reasons I Think Meta Platforms is a Screaming Buy Right Now",
+   "[GuruFocus.com] AI Giants Add $350 Billion Debt as $725 Billion Spending Surges"
+  ]
+ },
+ {
+  "date": "2026-07-13",
+  "tk": "ANET",
+  "idx": 0,
+  "n": 7,
+  "body_only": 1,
+  "examples": [
+   "[Investor's Business Daily] Three Enticing Clues Put This Broadcom Partner, Nvidia Rival In Focus"
+  ]
+ },
+ {
+  "date": "2026-07-14",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 20,
+  "body_only": 5,
+  "examples": [
+   "[TheStreet] The whole chip trade is waiting on one report",
+   "[The Motley Fool] Here's Why Oracle Stock Slumped Today",
+   "[GuruFocus.com] Broadcom Insiders Dump $10 Million in Stock -- Here's Why",
+   "[decrypt] Robinhood Chain's Early Momentum Is Being Driven By Meme Coins, Not Tokenized Stocks"
+  ]
+ },
+ {
+  "date": "2026-07-14",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-14",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-15",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-15",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 5,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AA",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AA",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AEHR",
+  "idx": 0,
+  "n": 7,
+  "body_only": 1,
+  "examples": [
+   "[Investor's Business Daily] Stock Market Today: Nasdaq Rises Despite Tumble Among Chip Leaders; Apple Paces Mag 7 Rally"
+  ]
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AEHR",
+  "idx": 1,
+  "n": 7,
+  "body_only": 1,
+  "examples": [
+   "[Barrons.com] This Chip Test Maker\u2019s Stock Is Soaring on Record Bookings, Robust Outlook"
+  ]
+ },
+ {
+  "date": "2026-07-16",
+  "tk": "AEHR",
+  "idx": 2,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "ACGL",
+  "idx": 0,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "ACGL",
+  "idx": 1,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "AEHR",
+  "idx": 0,
+  "n": 14,
+  "body_only": 2,
+  "examples": [
+   "[Investor's Business Daily] Stock Market Today: Nasdaq Rises Despite Tumble Among Chip Leaders; Apple Paces Mag 7 Rally",
+   "[Barrons.com] This Chip Test Maker\u2019s Stock Is Soaring on Record Bookings, Robust Outlook"
+  ]
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 17,
+  "body_only": 6,
+  "examples": [
+   "[Motley Fool] The \"Magnificent Seven\" Are at Their Lowest Relative Valuations in a Decade. My 3 Favorite Mag 7 Stocks to Buy.",
+   "[The Motley Fool] The \"Magnificent Seven\" Are at Their Lowest Relative Valuations in a Decade. My 3 Favorite Mag 7 Stocks to ",
+   "[TheStreet] Anthropic just made a move that changes the AI investing story",
+   "[GlobeNewswire Inc.] Thirty Years in the Waiting: Landon Hail Press Announces the Debut Book From LA Author and Mystic Leon A"
+  ]
+ },
+ {
+  "date": "2026-07-17",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-21",
+  "tk": "AAOI",
+  "idx": 0,
+  "n": 7,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-21",
+  "tk": "ALK",
+  "idx": 0,
+  "n": 5,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 10,
+  "body_only": 4,
+  "examples": [
+   "[The Motley Fool] 59% of Berkshire Hathaway's Portfolio Sits in 5 Dow Stocks. This Is My Top Pick to Buy Now.",
+   "[Motley Fool] 3 Things Investors Can Expect When Tim Cook Steps Down as CEO in September After 15 Years and Hands the Reins t",
+   "[The Motley Fool] 3 Things Investors Can Expect When Tim Cook Steps Down as CEO in September After 15 Years and Hands the Rei",
+   "[The Wall Street Journal] SpaceX Supplier STMicroelectronics Lifts AI Data-Center Sales Goal Again"
+  ]
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 10,
+  "body_only": 3,
+  "examples": [
+   "[The Motley Fool] Mega IPOs Like SpaceX Reshape Major Index Funds and ETFs",
+   "[Barrons.com] Tech Earnings Will Put a Fragile Stock Market to the Test",
+   "[Reuters] Samsung unveils wider foldable phone, hikes prices as chip costs rise"
+  ]
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "APP",
+  "idx": 0,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-24",
+  "tk": "APP",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 4,
+  "body_only": 3,
+  "examples": [
+   "[Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] I'd Double a Position in These 3 Dividend Stocks Right Now Without Any Hesitation"
+  ]
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 4,
+  "body_only": 1,
+  "examples": [
+   "[Stocktwits] SLS Stock Jumps Ahead Of CEO\u2019s Fox Appearance: Retail Bets AML Readout Could Spark Big Pharma Bidding War"
+  ]
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "AMZN",
+  "idx": 0,
+  "n": 9,
+  "body_only": 4,
+  "examples": [
+   "[Investor's Business Daily] Dow Jones Futures Rise, Oil Prices Dive On Iran Hopes; Apple Leads Earnings Wave, Fed Meeting Ahe",
+   "[The Motley Fool] Neocloud Stocks vs. the Hyperscalers -- Who Actually Wins AI Capex Boom?",
+   "[Investor's Business Daily] Stock Market Week Ahead: Mag 7 And The Fed \u2014 But It's All About The Cash",
+   "[The Motley Fool] My 3 Favorite AI Stocks to Buy During the Chip Sell-Off, and Why Nvidia Isn't the Top Pick."
+  ]
+ },
+ {
+  "date": "2026-07-26",
+  "tk": "AMZN",
+  "idx": 1,
+  "n": 11,
+  "body_only": 6,
+  "examples": [
+   "[The Motley Fool] Why UPS Is Betting $48 Million on Temperature-Controlled Logistics Growth",
+   "[Insider Monkey] GE Vernova (GEV): $176 Billion Backlog and AI Power Demand Outweigh Short-Term EPS Miss",
+   "[Reuters Videos] Nasdaq lags on angst over AI spending ahead of earnings reports",
+   "[Yahoo Finance Video] What to watch next week: Big Tech earnings, the Fed, and Consumer Confidence"
+  ]
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 5,
+  "body_only": 3,
+  "examples": [
+   "[Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] I'd Double a Position in These 3 Dividend Stocks Right Now Without Any Hesitation"
+  ]
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "ACI",
+  "idx": 0,
+  "n": 20,
+  "body_only": 3,
+  "examples": [
+   "[Yahoo Finance Video] Amazon, Walmart, & cautious consumers are major headwinds for Albertson's: A closer look",
+   "[StockStory] Why Kohl's (KSS) Shares Are Plunging Today",
+   "[MT Newswires] Top Midday Decliners"
+  ]
+ },
+ {
+  "date": "2026-07-27",
+  "tk": "AMC",
+  "idx": 0,
+  "n": 20,
+  "body_only": 3,
+  "examples": [
+   "[Investor's Business Daily] IMAX Stock Crests Buy Point On Pre-'Odyssey' Earnings Surge",
+   "[Zacks] New Strong Buy Stocks for July 21st",
+   "[MT Newswires] Top Midday Gainers"
+  ]
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ABG",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ABG",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ADP",
+  "idx": 0,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "ADP",
+  "idx": 1,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "AGX",
+  "idx": 0,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-29",
+  "tk": "AGX",
+  "idx": 1,
+  "n": 1,
+  "body_only": 1,
+  "examples": [
+   "[Zacks] 4 Top-Performing Liquid Stocks to Boost Portfolio Returns"
+  ]
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 6,
+  "body_only": 1,
+  "examples": [
+   "[Investor's Business Daily] Botox Maker Tops Buy Point, But Here Comes The Earnings Report"
+  ]
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ABBV",
+  "idx": 2,
+  "n": 4,
+  "body_only": 3,
+  "examples": [
+   "[Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] I'd Double a Position in These 3 Dividend Stocks Right Now Without Any Hesitation"
+  ]
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ACN",
+  "idx": 0,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-30",
+  "tk": "ACN",
+  "idx": 1,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[Yahoo Finance Video] Friday's market movers: Oil earnings and consumer sentiment data"
+  ]
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 10,
+  "body_only": 1,
+  "examples": [
+   "[Investor's Business Daily] Botox Maker Tops Buy Point, But Here Comes The Earnings Report"
+  ]
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "ABBV",
+  "idx": 2,
+  "n": 2,
+  "body_only": 2,
+  "examples": [
+   "[Motley Fool] Why Wall Street Can't Get Enough of This Dividend King",
+   "[The Motley Fool] Why Wall Street Can't Get Enough of This Dividend King"
+  ]
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "AER",
+  "idx": 0,
+  "n": 5,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "AER",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "APLD",
+  "idx": 0,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "APLD",
+  "idx": 1,
+  "n": 9,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-07-31",
+  "tk": "APLD",
+  "idx": 2,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "AAPL",
+  "idx": 0,
+  "n": 9,
+  "body_only": 2,
+  "examples": [
+   "[TechCrunch] The global memory shortage hits the MacBook Air",
+   "[The Motley Fool] SpaceX vs. the \"Magnificent Seven\": How the New Nasdaq-100 Member Stacks Up"
+  ]
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "AAPL",
+  "idx": 1,
+  "n": 11,
+  "body_only": 2,
+  "examples": [
+   "[The Motley Fool] Nvidia Isn't the Most Valuable Company in the World Anymore. Is More Bad News Coming?",
+   "[Reuters Videos] Wall Street ends higher as Amazon soothes AI jitters"
+  ]
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "ALG",
+  "idx": 0,
+  "n": 3,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-02",
+  "tk": "ALG",
+  "idx": 1,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 4,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ABBV",
+  "idx": 1,
+  "n": 16,
+  "body_only": 1,
+  "examples": [
+   "[The Wall Street Journal] Health Care Roundup: Market Talk"
+  ]
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[GlobeNewswire Inc.] VIA TRANSPORTATION DEADLINE: ROSEN, TRUSTED INVESTOR COUNSEL, Encourages Via Transportation, Inc. Invest"
+  ]
+ },
+ {
+  "date": "2026-08-04",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADM",
+  "idx": 0,
+  "n": 9,
+  "body_only": 2,
+  "examples": [
+   "[Zacks] Archer Daniels Q2 Earnings Beat on Crushing and Ethanol Strength",
+   "[The Wall Street Journal] SpaceX Earnings, Jobs Numbers: What to Watch This Week"
+  ]
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADM",
+  "idx": 1,
+  "n": 4,
+  "body_only": 1,
+  "examples": [
+   "[Zacks] Archer Daniels to Post Q2 Earnings: What Should Investors Expect?"
+  ]
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADM",
+  "idx": 2,
+  "n": 1,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADMA",
+  "idx": 0,
+  "n": 2,
+  "body_only": 1,
+  "examples": [
+   "[GlobeNewswire Inc.] Avis Budget Group, Inc. Notice of September 29, 2026 Application Deadline for Class Action Lawsuit - Con"
+  ]
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADMA",
+  "idx": 1,
+  "n": 3,
+  "body_only": 1,
+  "examples": [
+   "[GlobeNewswire Inc.] VIA TRANSPORTATION DEADLINE: ROSEN, TRUSTED INVESTOR COUNSEL, Encourages Via Transportation, Inc. Invest"
+  ]
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "ADMA",
+  "idx": 2,
+  "n": 7,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "AEIS",
+  "idx": 0,
+  "n": 7,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-05",
+  "tk": "AEIS",
+  "idx": 1,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-07",
+  "tk": "AMD",
+  "idx": 0,
+  "n": 15,
+  "body_only": 2,
+  "examples": [
+   "[Investor's Business Daily] Nvidia, Microsoft Partner Tests Breakout. Three Clues Bode Well.",
+   "[Investing.com] AI momentum stocks tumble as earnings season shakes the tech sector"
+  ]
+ },
+ {
+  "date": "2026-08-07",
+  "tk": "AMD",
+  "idx": 1,
+  "n": 5,
+  "body_only": 1,
+  "examples": [
+   "[Investor's Business Daily] Dow Jones Futures: Nvidia Lifts Dow, But Google, SpaceX Skid; Sandisk, Western Digital Lead Earni"
+  ]
+ },
+ {
+  "date": "2026-08-12",
+  "tk": "AMN",
+  "idx": 0,
+  "n": 2,
+  "body_only": 1,
+  "examples": [
+   "[Zacks] 5 Broker-Loved Stocks to Watch as September Rate Hike Seems Unlikely"
+  ]
+ },
+ {
+  "date": "2026-08-12",
+  "tk": "AMN",
+  "idx": 1,
+  "n": 8,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-13",
+  "tk": "ACM",
+  "idx": 0,
+  "n": 8,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-13",
+  "tk": "ACM",
+  "idx": 1,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-14",
+  "tk": "AMBQ",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-14",
+  "tk": "APOS",
+  "idx": 0,
+  "n": 8,
+  "body_only": 8,
+  "examples": [
+   "[The Motley Fool] Nvidia Just Recruited Wall Street to Help Fund $500 Billion in AI Infrastructure. Here\u2019s the Catch.",
+   "[Bloomberg] Nvidia Taps Wall Street for $500 Billion Funding Commitment",
+   "[Investor's Business Daily] Nvidia Confirms Huge AI Funding Deal. These Financial Stocks Jump.",
+   "[Insider Monkey] Nvidia (NVDA) Is Going Beyond GPUs in the $500 Billion AI Boom, Wells Fargo Says"
+  ]
+ },
+ {
+  "date": "2026-08-16",
+  "tk": "ABBV",
+  "idx": 0,
+  "n": 6,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-17",
+  "tk": "ABCL",
+  "idx": 0,
+  "n": 2,
+  "body_only": 0,
+  "examples": []
+ },
+ {
+  "date": "2026-08-17",
+  "tk": "ABCL",
+  "idx": 1,
+  "n": 14,
+  "body_only": 3,
+  "examples": [
+   "[Zacks] Company News for Aug 11, 2026",
+   "[Simply Wall St.] Vertex Pharmaceuticals (VRTX) Is Up 5.4% After Raising 2026 Revenue Guidance And Expanding Its Pipeline - H",
+   "[Barrons.com] This Biotech\u2019s Drug Could Treat Hot Flashes. The Stock Is Up 36% on Good News."
+  ]
+ }
+]

@@ -137,8 +137,9 @@ def _screen_one(ticker: str, df: pd.DataFrame, spy_ret: Optional[float]) -> Opti
     # ── Liquidity gate ───────────────────────────────────────────────────────
     if last_close < settings.screen_min_price:
         return None
-    avg20_vol = float(vol.iloc[-20:].mean())
-    if avg20_vol * last_close < settings.screen_min_dollar_volume:
+    from src.data.liquidity import dollar_volume    # the shared 20d mean(close×volume)
+    dv = dollar_volume(df)
+    if dv is None or dv < settings.screen_min_dollar_volume:
         return None
 
     screens: List[str] = []

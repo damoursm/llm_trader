@@ -16,7 +16,10 @@ cache/
 dist/
 build/
 .env
-.env.bak.*
+# Covers BOTH separators: .env.bak.20260725 and .env.bak-2026-08-31. The old
+# ".env.bak.*" required the trailing dot, so a hyphen-dated backup of the live
+# .env (real API keys) sat untracked-but-committable.
+.env.bak*
 .env.backup
 logs/
 # Coverage artifacts (dev only)

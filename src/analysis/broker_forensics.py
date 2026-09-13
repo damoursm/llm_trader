@@ -271,6 +271,74 @@ def drift_frequency(reconciles: Optional[pd.DataFrame]) -> dict:
     }
 
 
+# Order events whose code path actually asks for a two-sided book
+# (``reconcile._quote_for`` → the LMT cap). Everything else — fill repairs,
+# kills, cancels — never prices a book, so counting them would understate the
+# quote feed by diluting the denominator with events that never asked.
+QUOTE_PRICED_EVENTS = ("SUBMIT", "SETTLE_REANCHOR", "DRIFT_FLATTEN")
+
+
+def quote_capture(orders: pd.DataFrame) -> dict:
+    """Live-NBBO capture rate — did we hold a real two-sided book when we
+    priced each order?
+
+    ``bid_at_submit`` is written by ``reconcile._record_order`` from whatever
+    ``_quote_for`` returned (IBKR first — entitlement-dead on this account as of
+    2026-08-31 — then the Polygon consolidated NBBO). So this rate IS the live
+    quote feed's success rate as the ORDER PATH experiences it, and a fall-off
+    is the tell that the feed stopped serving.
+
+    **The denominator is epoch-gated, self-calibrating.** The columns landed
+    2026-08-31, so every earlier row is NULL for a structural reason, not a
+    failure; counting them would peg the rate near 0% forever. Eligibility
+    therefore starts at the FIRST order that ever carried a book — derived from
+    the data rather than a hardcoded instant, so it stays correct across
+    redeploys. No captured book anywhere ⇒ ``accruing=False`` ("not measuring
+    yet"), which is a different statement from 0% and must not be shown as one.
+
+    Returns ``{accruing, since, n_eligible, n_captured, rate, by_session,
+    median_half_bps}``. Rates are percentages.
+    """
+    blank = {"accruing": False, "since": None, "n_eligible": 0,
+             "n_captured": 0, "rate": None, "by_session": [],
+             "median_half_bps": None}
+    if orders is None or orders.empty or "bid_at_submit" not in orders.columns:
+        return blank
+    df = orders[orders["event"].astype(str).isin(QUOTE_PRICED_EVENTS)].copy()
+    if df.empty or "submitted_at" not in df.columns:
+        return blank
+    bid = pd.to_numeric(df["bid_at_submit"], errors="coerce")
+    ask = pd.to_numeric(df.get("ask_at_submit"), errors="coerce")
+    got = bid.notna() & (bid > 0)
+    if not got.any():
+        return blank
+    since = df.loc[got, "submitted_at"].astype(str).min()
+    elig = df[df["submitted_at"].astype(str) >= since].copy()
+    elig["_got"] = (pd.to_numeric(elig["bid_at_submit"], errors="coerce").notna()
+                    & (pd.to_numeric(elig["bid_at_submit"], errors="coerce") > 0))
+    elig["_sess"] = elig["submitted_at"].map(_session_of)
+
+    by_session = []
+    for sess, g in elig.groupby("_sess"):
+        by_session.append({"session": sess, "orders": int(len(g)),
+                           "captured": int(g["_got"].sum()),
+                           "rate": round(float(g["_got"].mean() * 100.0), 1)})
+    by_session.sort(key=lambda r: -r["orders"])
+
+    mid = (bid + ask) / 2.0
+    half = ((ask - bid) / 2.0 / mid * 1e4)[got & ask.notna() & (mid > 0)]
+    return {
+        "accruing": True,
+        "since": since,
+        "n_eligible": int(len(elig)),
+        "n_captured": int(elig["_got"].sum()),
+        "rate": round(float(elig["_got"].mean() * 100.0), 1),
+        "by_session": by_session,
+        "median_half_bps": (round(float(half.median()), 2)
+                            if not half.empty else None),
+    }
+
+
 def compute_forensics(orders: pd.DataFrame, reconciles: Optional[pd.DataFrame] = None,
                       days: Optional[int] = None, session: Optional[str] = None,
                       direction: Optional[str] = None) -> dict:
@@ -291,6 +359,10 @@ def compute_forensics(orders: pd.DataFrame, reconciles: Optional[pd.DataFrame] =
         # mix is genuinely useful for seeing WHERE orders die.
         "fill_rate":         fill_rate_by_attempt(orders),
         "reject_reasons":    reject_reasons(orders),
+        # Live-NBBO capture rate — the quote feed's health as the ORDER PATH
+        # sees it (2026-08-31). Epoch-gated inside, so pre-feature rows never
+        # dilute it.
+        "quote_capture":     quote_capture(orders),
         "drift":             drift_frequency(reconciles),
     }
 

@@ -185,19 +185,163 @@ def test_diversity_scale_smooth():
 
 def test_sentiment_cache_key_salted_by_prompt_version(monkeypatch):
     """A prompt edit must invalidate cached raw verdicts — before the salt, the
-    cache kept serving old-prompt verdicts for the TTL after a prompt change."""
+    cache kept serving old-prompt verdicts for the TTL after a prompt change.
+
+    Salted on the ACTIVE version, not on `_SENT_PROMPT_VERSION` specifically:
+    once a variant is live (v7dir since 2026-09-11) editing the v6 constant no
+    longer changes what is sent, so a test pinned to that constant would pass
+    while the real invariant was broken. Patching `_prompt_pair` checks the
+    property whichever prompt is in force."""
     import src.analysis.sentiment as sent
     arts = [_art(1)]
     k1 = sent._sentiment_cache_key("AAA", "deepseek", arts)
-    monkeypatch.setattr(sent, "_SENT_PROMPT_VERSION", "test-bump")
+    prefix, version = sent._prompt_pair()
+    monkeypatch.setattr(sent, "_prompt_pair", lambda: (prefix, version + "-bump"))
     k2 = sent._sentiment_cache_key("AAA", "deepseek", arts)
     assert k1 != k2
+    # and the LIVE prompt must be the one whose version is salted in
+    monkeypatch.undo()
+    assert sent._prompt_pair()[1] == version
 
 
 def test_sentiment_prompt_has_precision_mandate():
     from src.analysis.sentiment import _SENTIMENT_PREFIX
     assert "TWO-decimal" in _SENTIMENT_PREFIX
     assert "CROSS-SECTIONALLY" in _SENTIMENT_PREFIX
+
+
+def test_sentiment_prompt_v5_zero_is_abstention():
+    """v5 (2026-09-04) changed what 0.0 MEANS. v4's mandate ("when in doubt,
+    output 0.0") made zero the modal verdict on 73-79% of calls, and a zero is
+    an ABSTENTION in the rank-consumed combine — so every soft read silently
+    removed its ticker from the 0.40-weight method. The prompt must (1) say
+    so, (2) reserve 0.0 for the two abstention cases, (3) give uncertainty a
+    MAGNITUDE home (the LEAN band) and (4) carry no worked example, because a
+    number written into a prompt becomes a favourite answer (v2 sentiment,
+    v1 confidence placement, the local model's 0.15 pile-up under v4)."""
+    import re
+    from src.analysis.sentiment import _SENTIMENT_PREFIX as P, _SENT_PROMPT_VERSION
+    assert _SENT_PROMPT_VERSION >= "v6-"                    # v5 semantics kept by v6+
+    assert "ABSTENTION" in P and "0.0 is reserved" in P
+    assert "LEAN" in P and "0.01" in P                      # the soft band exists
+    # No worked example: the only JSON object in the prompt is the skeleton,
+    # and its score slot is a placeholder rather than a number.
+    objs = re.findall(r"\{[^{}]*\}", P)
+    assert len(objs) == 1, objs
+    assert '"score": <' in objs[0] and not re.search(r'"score":\s*-?\d', objs[0])
+    # The catalyst taxonomy still interpolates (the skeleton is not the only
+    # thing the news-event dataset depends on).
+    assert "__CATALYST_TYPES__" not in P and '"catalyst"' in P
+
+
+def test_sentiment_prompt_v6_routine_indirect_and_funds_are_leans():
+    """v6 (2026-09-04) NARROWED the abstention cases. Paired on the v5 zeros,
+    three legitimate-looking families remained — routine company-specific
+    items (stakes, insider sales, dividend declarations, index changes),
+    sector/index FUNDS whose digest is "about the sector", and peer/customer
+    read-throughs — each sent to 0.0 by v5's "score ONLY the company itself"
+    clause. v6 makes each a signed LEAN (typed, so `catalyst_tilt` can learn
+    its orientation) and keeps 0.0 for "nothing connects" / "nil move"."""
+    from src.analysis.sentiment import _SENTIMENT_PREFIX as P
+    assert "ROUTINE" in P and "never 0.0" in P
+    assert "INDIRECT" in P and "read-through" in P
+    assert "FUNDS:" in P and "what it holds" in P
+    # v5's blanket exclusion is gone.
+    assert "Score ONLY information about the target ticker itself" not in P
+    # Routine items keep their class even at LEAN size.
+    assert '"insider_activity"' in P and '"capital_structure"' in P and '"index_membership"' in P
+
+
+def test_sentiment_target_header_names_the_company_and_flags_funds():
+    """v6's per-ticker header: articles say "Antero", not "AR", and a symbol →
+    company mapping is what a small local model cannot be trusted to know for
+    a mid-cap; a FUND gets told its holdings ARE the company. No name ⇒ the
+    bare v5 header (fail-soft)."""
+    from src.data import company_names
+    from src.analysis import sentiment as sent
+    company_names._seed_for_tests({"AR": "Antero Resources Corp",
+                                   "XLE": "Energy Select Sector SPDR Fund"})
+    assert sent._target_header("AR") == "TARGET TICKER: AR — Antero Resources Corp"
+    fund = sent._target_header("XLE")
+    assert fund.startswith("TARGET TICKER: XLE — Energy Select Sector SPDR Fund")
+    assert "FUND" in fund and "what it holds" in fund
+    assert sent._target_header("ZQZX") == "TARGET TICKER: ZQZX"
+    assert sent._target_header("ar") == "TARGET TICKER: AR — Antero Resources Corp"
+
+
+def test_sentiment_target_header_carries_the_industry_line_and_polygon_fund_type():
+    """2026-09-06: the header renders the cached Polygon industry line — the
+    hook that lets a model notice "EQT AB" is not "EQT Corp" — and a target
+    whose registrant name has no fund word is still flagged as a FUND when
+    Polygon types it as one (``SPDR Gold Shares``). The override reads the
+    SAME identity as the header, so the two cannot disagree; an unknown
+    industry (the 7-day negative record) leaves the line out, fail-soft."""
+    from src.data import company_names
+    from src.analysis import sentiment as sent
+    company_names._seed_for_tests(
+        {"AR": "Antero Resources Corp", "GLD": "SPDR Gold Shares",
+         "XLE": "Energy Select Sector SPDR Fund", "EQT": "EQT Corp"},
+        industries={"AR": "Crude Petroleum & Natural Gas",
+                    "GLD": "exchange-traded fund",
+                    "EQT": "Natural Gas Transmission"})
+    assert sent._target_header("AR") == (
+        "TARGET TICKER: AR — Antero Resources Corp (industry: Crude Petroleum & Natural Gas)")
+    assert sent._target_header("eqt").startswith(
+        "TARGET TICKER: EQT — EQT Corp (industry: Natural Gas Transmission)")
+    assert "FUND" not in sent._target_header("EQT")
+    gld = sent._target_header("GLD")
+    assert gld.startswith("TARGET TICKER: GLD — SPDR Gold Shares (industry: exchange-traded fund)")
+    assert "FUND" in gld and "what it holds" in gld
+    # Name-word fund with no industry record: flagged, no industry parenthesis.
+    xle = sent._target_header("XLE")
+    assert xle.startswith("TARGET TICKER: XLE — Energy Select Sector SPDR Fund\n")
+    assert "(industry:" not in xle
+    # The override sees exactly what the header rendered.
+    assert sent._is_fund_target("GLD") and sent._is_fund_target("XLE")
+    assert not sent._is_fund_target("AR") and not sent._is_fund_target("ZQZX")
+    # The industry line is part of the salt: resolving it re-scores the ticker once.
+    arts = [_art(1)]
+    k_bare = sent._sentiment_cache_key("AR", "deepseek", arts,
+                                       extra="TARGET TICKER: AR — Antero Resources Corp")
+    k_ind = sent._sentiment_cache_key("AR", "deepseek", arts, extra=sent._target_header("AR"))
+    assert k_bare != k_ind
+
+
+def test_fund_catalyst_override_retypes_company_events_on_fund_targets(monkeypatch):
+    """A fund has no earnings, insiders, trials or offerings of its own, so a
+    company-event class on a fund target is a read-through of its holdings —
+    ``macro_sector`` by the taxonomy's own rule. Label-only, deterministic,
+    inert on ``none``/``macro_sector``/missing labels, on non-funds, and with
+    the flag off."""
+    from config.settings import settings
+    from src.data import company_names
+    from src.analysis import sentiment as sent
+    company_names._seed_for_tests({"XLV": "Health Care Select Sector SPDR Fund",
+                                   "GLD": "SPDR Gold Shares", "LLY": "Eli Lilly & Co"},
+                                  industries={"GLD": "exchange-traded fund"})
+    monkeypatch.setattr(settings, "enable_catalyst_fund_override", True, raising=False)
+    assert sent.fund_catalyst_override("XLV", "fda_clinical") == "macro_sector"
+    assert sent.fund_catalyst_override("GLD", "earnings") == "macro_sector"
+    assert sent.fund_catalyst_override("xlv", "insider_activity") == "macro_sector"
+    assert sent.fund_catalyst_override("XLV", "none") == "none"
+    assert sent.fund_catalyst_override("XLV", "macro_sector") == "macro_sector"
+    assert sent.fund_catalyst_override("XLV", None) is None
+    assert sent.fund_catalyst_override("LLY", "fda_clinical") == "fda_clinical"
+    assert sent.fund_catalyst_override("ZQZX", "earnings") == "earnings"
+    monkeypatch.setattr(settings, "enable_catalyst_fund_override", False, raising=False)
+    assert sent.fund_catalyst_override("XLV", "fda_clinical") == "fda_clinical"
+
+
+def test_sentiment_cache_key_salted_by_target_header():
+    """The header is part of the prompt, so a name resolving later (or a fund
+    flag appearing) must re-score rather than serve the bare-header verdict."""
+    import src.analysis.sentiment as sent
+    arts = [_art(1)]
+    k0 = sent._sentiment_cache_key("AR", "deepseek", arts)
+    k1 = sent._sentiment_cache_key("AR", "deepseek", arts, extra="TARGET TICKER: AR")
+    k2 = sent._sentiment_cache_key("AR", "deepseek", arts,
+                                   extra="TARGET TICKER: AR — Antero Resources Corp")
+    assert len({k0, k1, k2}) == 3
 
 
 # ── news_shock ──────────────────────────────────────────────────────────────
@@ -252,5 +396,207 @@ def test_news_shock_wiring_complete():
         assert c in TickerSignal.model_fields
     assert "news_shock_score" in TickerSignal.model_fields
     # PANEL-FIRST: not weighted, not a family voter — mirrors squeeze.
-    assert "news_shock" not in _BASE_WEIGHTS
-    assert "news_shock" not in FAMILY_OF
+    # Promoted 2026-09-11 (user request) to the SMALLEST weight in the book.
+    # It reaches coherence / `sources_agreeing` / the Sentiment family vote —
+    # i.e. confidence and position size — and not direction, which the stackers
+    # decide. Smallest because, unlike news_bear_fresh (t +2.96) and
+    # catalyst_tilt (t +2.22), it has NO measured IC at all.
+    assert 0 < _BASE_WEIGHTS["news_shock"] <= 0.05
+    # Joined the Sentiment family on 2026-09-11 with its weight: a weight-0
+    # method is excluded from the family vote entirely, and participating in it
+    # is the stated reason for the promotion. Sentiment rather than a family of
+    # its own — it is a function of the same verdict as `news`, and the family
+    # layer exists so correlated methods are ONE voter (the family COUNT is
+    # unchanged at 7).
+    assert FAMILY_OF["news_shock"] == "Sentiment"
+
+
+# ── source-tier filter (2026-09-08) ─────────────────────────────────────────
+
+def test_source_tier_drops_aggregators_but_never_empties_a_digest(monkeypatch):
+    """The mechanism is kept and tested even though it ships OFF: it failed its
+    12-day paired re-test (t -0.55, opposite-sign halves) after a one-day read
+    of +0.256, so the code stays one flag from live and repeatable.
+
+    The FALLBACK is the load-bearing half. An empty digest is an ABSTENTION that
+    removes the ticker from the cross-section — a bigger change than a thinner
+    digest, and the failure the 2026-09-04 relevance rework ended."""
+    from datetime import datetime, timezone
+    from config.settings import Settings, settings
+    from src.analysis.sentiment import apply_source_tier
+    from src.models import NewsArticle
+    now = datetime.now(timezone.utc)
+
+    def art(src, i):
+        return NewsArticle(title="t", summary="s" * 40, url=f"u{i}", source=src,
+                           published_at=now)
+
+    # ships off — a fresh environment must not inherit a rejected filter
+    assert Settings.model_fields["enable_source_tier_filter"].default is False
+    monkeypatch.setattr(settings, "enable_source_tier_filter", True, raising=False)
+    mixed = [art("Motley Fool", 1), art("Reuters", 2), art("Zacks", 3)]
+    assert [a.source for a in apply_source_tier(mixed)] == ["Reuters"]
+    # every article is an aggregator -> keep them all rather than abstain
+    only_agg = [art("Motley Fool", 1), art("Zacks", 2)]
+    assert len(apply_source_tier(only_agg)) == 2
+    assert apply_source_tier([]) == []
+
+
+def test_source_tier_runs_before_the_top_20_cut():
+    """Filtering after the cut would let listicles consume the 20 slots and then
+    be removed, leaving a digest thinner than it needed to be."""
+    import inspect
+    from src.analysis import sentiment as sent
+    src = inspect.getsource(sent.analyse_sentiment)
+    assert "digest_articles(apply_source_tier(fresh_articles), as_of)" in src
+
+
+def test_the_news_family_shares_one_boundary():
+    """The derived methods consume the verdict, so they move together
+    (CLAUDE.md's news-family rule) — whatever the boundary is.
+
+    It sat at 2026-09-08 briefly for the source-tier filter; that filter failed
+    its 12-day paired re-test and was defaulted off, so the boundary went back
+    to the v6 deploy. What is pinned is the SHARING, not the date."""
+    from src.signals.method_epochs import METHOD_SCORER_EPOCH as E
+    fam = ("news", "sent_velocity", "news_shock", "news_bear_fresh", "catalyst_tilt")
+    assert len({E[m] for m in fam}) == 1, {m: E[m].isoformat() for m in fam}
+
+
+# ── passing-mention abstention (2026-09-10) ─────────────────────────────────
+
+def test_a_digest_of_passing_mentions_abstains_without_an_llm_call(monkeypatch):
+    """An article naming the target only in its BODY is a round-up or an
+    ETF-holdings piece — it MENTIONS the company without being ABOUT it.
+
+    Measured over 655 ticker-days: by passing-mention share, oriented pivot
+    return goes +0.903 pp (hit 54.5%) below 20%, -0.573 pp (48.1%) at 20-50%,
+    and -2.223 pp (41.9%) at >=50%. The high cohort is ANTI-predictive, not
+    merely weak, which is why this abstains instead of capping the magnitude:
+    capping would preserve a sign the data says is wrong.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import src.analysis.sentiment as sent
+    from src.models import NewsArticle
+    now = datetime.now(timezone.utc)
+
+    def art(title):
+        return NewsArticle(title=title, summary="AbbVie is among them.",
+                           source="Motley Fool", url=title[:12],
+                           published_at=now - timedelta(hours=2))
+
+    from config.settings import settings
+    monkeypatch.setattr(settings, "enable_passing_mention_abstention", True, raising=False)
+    called = []
+    monkeypatch.setattr(sent, "_provider_sentiment_score",
+                        lambda *a, **k: called.append("provider") or None)
+    arts = [art("Why Wall Street Cannot Get Enough of This Dividend King"),
+            art("3 Dividend Stocks I Would Buy Right Now"),
+            art("Meet the Vanguard ETF That Crushed the S&P 500")]
+    score, rationale, meta = sent.analyse_sentiment("ABBV", arts)
+    assert score == 0.0 and "passing" in rationale.lower()
+    assert not called, "the abstention must short-circuit BEFORE any scoring path"
+
+
+def test_a_headline_digest_is_untouched():
+    """The other ~98% of digests must be byte-identical — this is a narrow
+    relevance refinement, not a change to what a verdict means."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.analysis.sentiment as sent
+    from src.models import NewsArticle
+    now = datetime.now(timezone.utc)
+    arts = [NewsArticle(title=f"AbbVie wins FDA approval {i}", summary="s",
+                        source="Reuters", url=f"u{i}",
+                        published_at=now - timedelta(hours=2))
+            for i in range(3)]
+    assert sent._passing_mention_share("ABBV", arts) == 0.0
+
+
+def test_the_share_helper_fails_soft():
+    """A broken name lookup must never trigger an abstention: a silent zero
+    inside the 0.40-weight `news` method is exactly what the 2026-09-04
+    relevance rework existed to end."""
+    import src.analysis.sentiment as sent
+    assert sent._passing_mention_share("ABBV", []) is None
+    assert sent._passing_mention_share("ABBV", None) is None
+
+
+def test_a_ticker_the_name_matcher_cannot_see_is_SKIPPED(monkeypatch):
+    """THE bug this nearly shipped with. `mention_evidence` is blind to a
+    company whose registrant name is an ordinary word (ARM -> phrases [],
+    tokens []), so every one of its headlines reads as a passing mention, the
+    share reads 1.00, and the rule would abstain on that ticker ALWAYS — not
+    because its coverage is round-ups but because the matcher cannot see it.
+
+    Measured: 6 of 130 tickers, 21 of 655 rows, and abstaining on them wholesale
+    scores -0.0048 IC. Guarding them out drops the shipped effect from +0.0093
+    (t +2.09) to +0.0075 (t +1.81) — the honest number."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.analysis.sentiment as sent
+    from src.models import NewsArticle
+    now = datetime.now(timezone.utc)
+    arts = [NewsArticle(title=f"Some market story {i}", summary="s", source="Zacks",
+                        url=f"u{i}", published_at=now - timedelta(hours=2))
+            for i in range(3)]
+    monkeypatch.setattr("src.data.company_names.name_keywords", lambda t: {})
+    assert sent._passing_mention_share("ARM", arts) is None
+    monkeypatch.setattr("src.data.company_names.name_keywords",
+                        lambda t: {"phrases": ["acme corp"], "tokens": ["acme"],
+                                   "symbol_word": True, "name": "Acme Corp",
+                                   "fund": False})
+    assert sent._passing_mention_share("ACME", arts) == 1.0
+
+
+def test_the_shipped_threshold_fires_at_the_measured_RATE():
+    """The measured effect is "gate the ~13% of digests with the highest
+    passing-mention share" (+0.0242 IC, t +1.31, same-sign halves). The
+    THRESHOLD that produces that rate depends on the digest population, and the
+    tuning population (replayed 7-day union pools) is not the live one: 0.35
+    fires on 13% there and 35.4% in production. What must be pinned is the RATE,
+    so the constant is checked against the live-calibrated value."""
+    from config.settings import Settings
+    assert Settings.model_fields["passing_mention_abstain_share"].default == 0.75
+
+
+def test_a_wide_abstention_carries_a_news_family_EPOCH():
+    """At 0.65 the filter touched ~2% of digests and needed no boundary: a weak
+    read becoming an ABSTENTION is a state the panel already treats as "no
+    view", and the other 98% of scores were byte-identical.
+
+    At 0.35 it touches 13% — an eighth of the cross-section stops entering the
+    news rank — so a calibration pooling both sides of the deploy would be
+    fitting two different populations. Below 0.5 the epoch is MANDATORY, and the
+    whole news family shares ONE boundary (CLAUDE.md's news-family rule)."""
+    from config.settings import settings
+    from src.signals.method_epochs import METHOD_SCORER_EPOCH
+    share = float(getattr(settings, "passing_mention_abstain_share", 0.65))
+    if share >= 0.5:
+        return
+    fam = ["news", "sent_velocity", "news_shock", "news_bear_fresh", "catalyst_tilt"]
+    stamps = {m: METHOD_SCORER_EPOCH.get(m) for m in fam}
+    assert all(stamps.values()), f"news family missing an epoch: {stamps}"
+    assert len({str(v) for v in stamps.values()}) == 1,         f"the news family must share ONE boundary, got {stamps}"
+    assert str(stamps["news"])[:10] >= "2026-09-10",         "the epoch predates the abstention widening it exists for"
+
+
+
+def test_the_abstain_threshold_is_calibrated_on_LIVE_digest_shape():
+    """The 0.35 threshold was tuned on REPLAYED digests (7-day union pools, a
+    deliberately unfaithful reconstruction) and over-fired 2.7x in production:
+    35.4% of live digests against the 13% the +0.0242 IC was measured at.
+
+    The live fire rate by threshold, from 3,316 rows of `sentiment_digests`:
+        >= 0.35  35.4% | >= 0.50  29.0% | >= 0.65  17.2%
+        >= 0.75  12.3% | >= 0.85   7.7% | >= 1.00   6.0%
+
+    0.75 is the constant whose LIVE rate matches the measured cohort. This test
+    pins the lower bound so the threshold cannot drift back into over-reach
+    without someone re-deriving it from live digests."""
+    from config.settings import settings
+    share = float(getattr(settings, "passing_mention_abstain_share", 0.75))
+    assert share >= 0.65, (
+        f"{share} fires on far more than the ~13% of live digests the effect was "
+        f"measured at — re-derive the rate from `sentiment_digests` before lowering it")

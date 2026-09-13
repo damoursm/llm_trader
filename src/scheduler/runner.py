@@ -569,6 +569,31 @@ def _eod_work() -> None:
         except Exception as exc:
             logger.warning(f"[scheduler] EOD backtest refresh failed: {exc}")
 
+    # IBKR BID_ASK spread sweep (2026-08-31): measure each Gate-4 name's
+    # time-avg quoted half-spread into cache/ibkr_spread.json — the liquidity
+    # forecast's primary structural layer. A SUBPROCESS, not an in-thread call:
+    # ib_async needs an event loop this background thread doesn't own, and a
+    # second in-process gateway session would contend with the tick's broker
+    # connection. Own clientId (ibkr_client_id+50); budget-capped; the rotation
+    # makes a cut-short run resume next night.
+    if settings.enable_eod_spread_sweep and str(settings.broker_mode or "off").startswith("ibkr"):
+        try:
+            import subprocess as _sp
+            import sys as _sys
+            _budget = float(settings.spread_sweep_budget_seconds)
+            _res = _sp.run(
+                [_sys.executable, "-m", "src.performance.spread_sweep"],
+                capture_output=True, text=True, timeout=_budget + 300,
+                encoding="utf-8", errors="replace",
+            )
+            _tail = (_res.stdout or "").strip().splitlines()[-8:]
+            logger.info("[scheduler] EOD spread sweep: " + (" ".join(_tail) or f"rc={_res.returncode}"))
+            if _res.returncode != 0:
+                logger.warning(f"[scheduler] EOD spread sweep rc={_res.returncode}: "
+                               f"{(_res.stderr or '').strip()[-400:]}")
+        except Exception as exc:
+            logger.warning(f"[scheduler] EOD spread sweep failed: {exc}")
+
     # NOTE the automatic refactor is deliberately NOT here — it runs on its own
     # nightly slot (`_maybe_start_nightly_rescore`, 02:00 ET by default) in a
     # background thread. It is a ~40-minute job, and this function runs INLINE

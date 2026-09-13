@@ -50,8 +50,23 @@ def test_claude_never_scores_sentiment_when_disabled():
         assert order, "order must never be empty"
 
 
-def test_anthropic_pin_coerces_to_deepseek_when_disabled():
+def test_anthropic_pin_coerces_to_deepseek_when_disabled(monkeypatch):
+    # Pin the engine FLAGS: this asserts the exact chain, so it must not change
+    # verdict with the operator's .env (it did, the moment ENABLE_LOCAL_LLM
+    # landed there). The coercion itself is what is under test.
+    monkeypatch.setattr(settings, "enable_local_llm", False)
     assert sent._sentiment_engine_order("anthropic") == ["deepseek", "qwen"]
+
+
+def test_local_joins_the_chain_only_when_enabled(monkeypatch):
+    """The local engine must be invisible while switched off and present as the
+    LAST resort when on - it is the tier that survives an unfunded account."""
+    monkeypatch.setattr(settings, "enable_claude_sentiment", False)
+    monkeypatch.setattr(settings, "enable_local_llm", False)
+    monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "deepseek")
+    assert sent._sentiment_engine_order(None) == ["deepseek", "qwen"]
+    monkeypatch.setattr(settings, "enable_local_llm", True)
+    assert sent._sentiment_engine_order(None) == ["deepseek", "qwen", "local"]
 
 
 def test_claude_allowed_only_when_enabled(monkeypatch):

@@ -593,3 +593,70 @@ def test_review_timeline_section_renders_graph_with_data():
 
     walk(out)
     assert len(graphs) == 1                            # the confidence-over-time chart rendered
+
+
+# ── shadow-only aggregator exits (2026-09-05 directive) ──────────────────────
+
+def _flip_only():
+    """Hostile COMBINE, healthy confidence — so only 3a/3b can fire and the
+    third trigger of the same block (`confidence_loss`, deliberately NOT part of
+    the directive) stays out of the way."""
+    return SimpleNamespace(combined_score=-0.6, confidence=0.95)
+
+
+def _shadow_trade():
+    return {"ticker": "XLE", "type": "ETF", "action": "BUY", "status": "OPEN",
+            "confidence": 0.85, "entry_price": 57.0, "current_price": 57.5,
+            "signal_at_entry": {"combined_score": 0.5, "confidence": 0.85}}
+
+
+def test_signal_flipped_and_decay_are_shadow_only_when_switched_off(monkeypatch):
+    """`signal_flipped` / `signal_decay` are COMPUTED and stamped, never closed.
+
+    Measured on the pivot basis over 50,256 simulated held position-days
+    (first-fire, hold-matched within position): signal_flipped +0.04 (t +0.13),
+    signal_decay +0.30 (t +1.14) — no timing skill, mildly wrong-signed. They
+    sat FIRST in the exit chain, so every time they fired they pre-empted the
+    two rules that do measure (trailing_stop -2.16, t -2.51; ml_exit). Switched
+    off they must still leave a trace, or the decision becomes unreviewable.
+    """
+    monkeypatch.setattr(settings, "enable_signal_decay_exits", True)
+    monkeypatch.setattr(settings, "signal_decay_exits_shadow_only", True)
+    trade = _shadow_trade()
+
+    assert tracker._evaluate_decay(
+        trade, today_signal=_flip_only(), macro_regime_context=None,
+        hold_review=None) is None
+    assert trade["shadow_exit_reason"] == "signal_flipped"
+    assert trade["shadow_exit_first_date"]
+    assert trade["shadow_exit_count"] == 1
+
+
+def test_the_shadow_stamp_keeps_the_FIRST_firing_day(monkeypatch):
+    """An exit closes once, so the first-fire date is the one a later evaluation
+    needs; the count says how persistent the signal was."""
+    monkeypatch.setattr(settings, "enable_signal_decay_exits", True)
+    monkeypatch.setattr(settings, "signal_decay_exits_shadow_only", True)
+    trade = _shadow_trade()
+
+    tracker._evaluate_decay(trade, today_signal=_flip_only(),
+                            macro_regime_context=None, hold_review=None)
+    first = trade["shadow_exit_first_date"]
+    for _ in range(3):
+        tracker._evaluate_decay(trade, today_signal=_flip_only(),
+                                macro_regime_context=None, hold_review=None)
+    assert trade["shadow_exit_first_date"] == first
+    assert trade["shadow_exit_count"] == 4
+
+
+def test_shadow_only_does_not_suppress_the_other_exits(monkeypatch):
+    """Only these two rules are downgraded. The macro-regime exit — a SAFETY
+    rule that sits ahead of them — must be untouched, or switching off a
+    measured-useless rule would quietly disarm a risk control."""
+    monkeypatch.setattr(settings, "enable_signal_decay_exits", True)
+    monkeypatch.setattr(settings, "signal_decay_exits_shadow_only", True)
+    monkeypatch.setattr(settings, "enable_macro_regime_filter", True)
+    assert tracker._evaluate_decay(
+        _shadow_trade(), today_signal=_flip_only(),
+        macro_regime_context=SimpleNamespace(regime="PANIC"),
+        hold_review=None) == "macro_regime_exit"

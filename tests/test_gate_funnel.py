@@ -109,7 +109,7 @@ def test_gate_stages_match_the_pipeline_order():
     order pipeline._apply_actionable_gates applies the gates."""
     keys = [k for k, _ in gf.GATE_STAGES]
     assert keys == ["below_threshold", "low_agreement", "buy_blocked",
-                    "earnings_blackout", "untradeable", "overextended"]
+                    "earnings_blackout", "untradeable", "wide_book", "overextended"]
 
 
 def test_gate_ic_needs_contrast():
@@ -163,6 +163,10 @@ def test_unsimulable_gates_are_declared_not_faked():
     must be reported as unsimulable -- a gate that always passes is
     indistinguishable from one that never rejects anything."""
     assert "earnings_blackout" in gf._SIM_UNSIMULATED
+    # Gate 4b's input is the point-in-time book at the tick; the NBBO store is
+    # instant-keyed, not a per-signal-day feature — declared, not faked.
+    assert "wide_book" in gf._SIM_UNSIMULATED
+    assert {k for k, _ in gf.GATE_STAGES} >= set(gf._SIM_UNSIMULATED)
 
 
 def test_regime_thresholds_match_the_documented_table():

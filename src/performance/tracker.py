@@ -184,15 +184,17 @@ def _fetch_price(ticker: str) -> Optional[float]:
     extended-session entry/mark is booked at a stale price (observed 2026-06-15:
     CRDO entered at Friday's 250.81 close while the live pre-market print — and
     the analysis snapshot — was ~262). The source order mirrors the snapshot
-    path in ``market_data.get_snapshots``:
+    path in ``market_data.get_snapshots`` (see the dispatch below for the
+    2026-08-31 reliability measurement that put Polygon first):
 
-    * **RTH** — yfinance ``fast_info.last_price`` first (fast, no API key), then
-      Polygon ``lastTrade`` as the fallback (unchanged behaviour).
-    * **Extended / overnight** — yfinance 1-min ``prepost`` bars first (the
-      genuine extended print, available on the free data plan), then Polygon's
-      single-ticker ``lastTrade`` (a secondary — it 403s without the snapshot
-      entitlement that this plan lacks), and only then stale ``fast_info`` as a
-      last resort so we still return *something* rather than ``None``.
+    * **RTH** — IBKR (currently OFF: no API market-data entitlement), then
+      Polygon ``lastTrade`` — consolidated, 99.876% reliable and ~2.7x faster
+      than yfinance, and the same feed as the snapshot and the order-pricing
+      NBBO — then yfinance ``fast_info.last_price`` as the fallback.
+    * **Extended / overnight** — IBKR, then yfinance 1-min ``prepost`` bars (the
+      genuine extended print), then Polygon's single-ticker ``lastTrade``, and
+      only then stale ``fast_info`` as a last resort so we still return
+      *something* rather than ``None``.
 
     The success source and any total failure are recorded in ``_PRICE_HEALTH``
     so a broken feed surfaces in the dashboard and email.
@@ -257,12 +259,20 @@ def _fetch_price(ticker: str) -> Optional[float]:
         return None
 
     from src.performance.market_calendar import current_session
-    # IBKR real-time first (when enabled) in BOTH sessions — its feed includes
-    # extended prints and matches the fill venue; then the existing chain.
+    # Source order (2026-08-31 measurement): IBKR first when enabled — its feed
+    # matches the fill venue — but it is entitlement-dead on this account, so
+    # `enable_ibkr_price_feed` is OFF and the chain effectively starts at
+    # Polygon. Polygon now leads yfinance in RTH: measured 99.876% reliable
+    # over 88k requests, ~2.7x faster (373 ms vs 992 ms) and CONSOLIDATED —
+    # the same feed as the analysis snapshot and the NBBO that prices orders,
+    # so the booked entry, the mark and the spread all share one provenance.
+    # yfinance is KEPT as the fallback: Polygon's residual 0.12% transient
+    # failure rate is small but not zero, and off-RTH its 1-min prepost bars
+    # remain the better extended print.
     if current_session() != "rth":
         px = _ibkr() or _yf_prepost() or _polygon() or _yf_fast()
     else:
-        px = _ibkr() or _yf_fast() or _polygon()
+        px = _ibkr() or _polygon() or _yf_fast()
 
     if px is not None and px > 0:
         return px
@@ -418,13 +428,19 @@ def _filter_by_split(trades: List[dict], split: Optional[str]) -> List[dict]:
 
 
 # The real LLM engines (a stamped synthesis/sentiment provider that is one of
-# these = an LLM ran; None/'rule-based' = no LLM). 'qwen' added 2026-07-11.
+# these = an LLM ran; None/'rule-based' = no LLM). 'qwen' added 2026-07-11,
+# 'local' (the self-hosted sentiment engine) 2026-09-03 — omitting it would have
+# made a HEALTHY local-only sentiment run read as sentiment DOWN in
+# `pipeline._assess_llm_health` (CRITICAL log + email banner + the 🔔 subject
+# tag) and as a non-LLM run in the hold-review grouping. A self-hosted model is
+# no less "an LLM ran" than a billed one; this list is about whether a model
+# answered, not about who invoiced for it.
 # Single source of truth — pipeline imports this.
-_LLM_ENGINES = ("anthropic", "deepseek", "qwen")
+_LLM_ENGINES = ("anthropic", "deepseek", "qwen", "local")
 
 
 # ── Method attribution ────────────────────────────────────────────────────────
-_ALL_METHODS = ("news", "sent_velocity", "news_shock", "news_bear_fresh", "catalyst_tilt", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
+_ALL_METHODS = ("news", "sent_velocity", "news_shock", "news_bear_fresh", "news_bull_fresh", "catalyst_tilt", "news_unpriced", "news_unpriced_all", "news_quiet", "tech", "massive", "insider", "put_call", "max_pain", "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum", "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional", "ext_gap", "broker_advisor", "f_value", "f_quality", "f_growth", "f_short_squeeze", "f_split", "f_dividend", "kaufman_long", "kaufman_short", "adx_long", "adx_short", "hi52", "mom_12_1", "st_reversal", "rsi2_rev", "dloc_rev", "squeeze", "iv_term", "avwap", "resid_mom", "vol_profile", "ml_ohlcv")
 _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (was 0.10)
 
 # Category groupings: how methods map to higher-level signal families. Every
@@ -433,7 +449,9 @@ _METHOD_AGREE_THRESHOLD = 0.0    # any non-zero method score counts as a view (w
 # out of compute_macro_eval's bundle view and _compute_category_stats' rollup (it
 # contributes to NO category, not an "uncategorized" one).
 METHOD_CATEGORIES: Dict[str, List[str]] = {
-    "Sentiment":   ["news", "sent_velocity", "news_shock", "news_bear_fresh", "catalyst_tilt"],
+    "Sentiment":   ["news", "sent_velocity", "news_shock", "news_bear_fresh",
+                    "news_bull_fresh", "catalyst_tilt",
+                    "news_unpriced", "news_unpriced_all", "news_quiet"],
     "Technical":   ["tech", "massive", "vwap", "pattern", "momentum", "sector_momentum",
                     "market_momentum", "money_flow", "trend_strength", "iv_rank", "ext_gap",
                     "kaufman_long", "kaufman_short", "adx_long", "adx_short",
@@ -526,6 +544,14 @@ METHOD_LABELS.update({
 # Bear-news freshness guard (2026-08-15, panel-first, weight 0).
 METHOD_LABELS.update({
     "news_bear_fresh": "News Bear Fresh (bear news × un-priced tape guard)",
+    "news_bull_fresh": "News Bull Fresh (bull news × un-priced tape guard)",
+    "news_unpriced": "News Unpriced (move left since the newest cluster)",
+    "news_unpriced_all": "News Unpriced · all clusters",
+})
+
+# The news read once the story has gone QUIET (2026-09-09, WEIGHTED 0.10).
+METHOD_LABELS.update({
+    "news_quiet": "News Quiet (news read, freshest cluster >= 48h old)",
 })
 
 # Catalyst-class-conditioned news orientation (2026-08-15, panel-first, weight 0).
@@ -562,6 +588,15 @@ def _method_scores_from_signal(ticker: str, direction: str, signals_by_ticker: O
         # news_bear_fresh (2026-08-15, panel-first at weight 0): bearish news
         # scaled by tape freshness; bull/zero news abstains.
         "news_bear_fresh": getattr(sig, "news_bear_fresh_score", 0.0),
+        # news_unpriced / news_unpriced_all (2026-09-07, panel-first weight 0):
+        # the news read net of the move the tape has already made since the
+        # story began.
+        "news_unpriced": getattr(sig, "news_unpriced_score", 0.0),
+        "news_unpriced_all": getattr(sig, "news_unpriced_all_score", 0.0),
+        # news_quiet (2026-09-09, weighted 0.10)
+        "news_quiet": getattr(sig, "news_quiet_score", 0.0),
+        # news_bull_fresh (2026-09-10, panel-first weight 0)
+        "news_bull_fresh": getattr(sig, "news_bull_fresh_score", 0.0),
         # catalyst_tilt (2026-08-15, panel-first at weight 0): news × learned
         # per-(catalyst, side) orientation; abstains without a catalyst capture.
         "catalyst_tilt": getattr(sig, "catalyst_tilt_score", 0.0),
@@ -774,6 +809,9 @@ def _synthesis_model_for_provider(provider: Optional[str]) -> Optional[str]:
         return "deepseek-v4-flash"
     if p == "qwen":
         return settings.qwen_model
+    if p == "local":
+        # Self-hosted engine: its own namespace, never the hosted qwen id.
+        return f"local/{settings.local_sentiment_model}"
     if p == "rule-based":
         return "rule-based (no LLM)"
     return None
@@ -783,7 +821,7 @@ def _sentiment_model_for_summary(summary: Optional[str]) -> Optional[str]:
     """'deepseek×40, anthropic×2' → exact model id of the majority provider."""
     if not summary:
         return None
-    from src.analysis.sentiment import SENTIMENT_PROVIDER_MODELS
+    from src.analysis.sentiment import SENTIMENT_PROVIDER_MODELS, sentiment_model_for
     counts: Dict[str, int] = {}
     for tok in str(summary).split(","):
         name, sep, cnt = tok.strip().partition("×")
@@ -796,7 +834,7 @@ def _sentiment_model_for_summary(summary: Optional[str]) -> Optional[str]:
     if not counted:
         return None
     top = max(counted.items(), key=lambda kv: kv[1])[0]
-    return SENTIMENT_PROVIDER_MODELS[top]
+    return sentiment_model_for(top)
 
 
 def _llm_models_for_trade(trade: dict, run_map: Dict[str, dict]) -> tuple:
@@ -1300,6 +1338,7 @@ _STAGE_OUTCOME_G1B = "low_agreement"
 _STAGE_OUTCOME_G2 = "buy_blocked"
 _STAGE_OUTCOME_G3 = "earnings_blackout"
 _STAGE_OUTCOME_G4 = "untradeable"
+_STAGE_OUTCOME_G4B = "wide_book"       # live-book width cap (2026-09-03 on) — stamp-only
 _STAGE_OUTCOME_G5 = "overextended"     # anti-chase gate (2026-07-22 on) — stamp-only, like Gate 1b
 
 _STAGE_EMPTY_STATS = {"trades": 0, "win_rate": None, "compound_return": None,
@@ -1341,7 +1380,7 @@ def _classify_stage_outcome(call: dict, ctx: dict) -> str:
     stamp = ctx.get("outcomes", {}).get(call["ticker"])
     if stamp in (_STAGE_OUTCOME_PASS, _STAGE_OUTCOME_G1, _STAGE_OUTCOME_G1C,
                  _STAGE_OUTCOME_G1B, _STAGE_OUTCOME_G2, _STAGE_OUTCOME_G3,
-                 _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G5):
+                 _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G4B, _STAGE_OUTCOME_G5):
         return stamp
     if call["confidence"] < ctx["threshold"]:
         return _STAGE_OUTCOME_G1
@@ -1445,8 +1484,8 @@ def compute_stage_eval(window_days: Optional[int] = None,
 
     _emit("LLM Synthesis (all BUY/SELL)", "stage", calls)
     surviving = {_STAGE_OUTCOME_G1C, _STAGE_OUTCOME_G1B, _STAGE_OUTCOME_G2,
-                 _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G5,
-                 _STAGE_OUTCOME_PASS}
+                 _STAGE_OUTCOME_G3, _STAGE_OUTCOME_G4, _STAGE_OUTCOME_G4B,
+                 _STAGE_OUTCOME_G5, _STAGE_OUTCOME_PASS}
     _emit("→ past Gate 1 · regime confidence threshold", "stage", _sub(surviving))
     _emit("✂ Gate 1 drops (confidence below threshold)", "dropped", _sub({_STAGE_OUTCOME_G1}))
     surviving -= {_STAGE_OUTCOME_G1C}
@@ -1465,6 +1504,10 @@ def compute_stage_eval(window_days: Optional[int] = None,
     surviving -= {_STAGE_OUTCOME_G4}
     _emit("→ past Gate 4 · liquidity floor", "stage", _sub(surviving))
     _emit("✂ Gate 4 drops (untradeable / penny-thin)", "dropped", _sub({_STAGE_OUTCOME_G4}))
+    surviving -= {_STAGE_OUTCOME_G4B}
+    _emit("→ past Gate 4b · live-book width cap", "stage", _sub(surviving))
+    _emit("✂ Gate 4b drops (deferred: NBBO half-spread at/above the cap)", "dropped",
+          _sub({_STAGE_OUTCOME_G4B}))
     _emit("→ past Gate 5 · overextension (anti-chase) = ACTIONABLE", "stage",
           _sub({_STAGE_OUTCOME_PASS}))
     _emit("✂ Gate 5 drops (BUY chased a recent run-up)", "dropped",
@@ -2011,6 +2054,7 @@ def record_new_trades(
         "edge_blend_applied":   0,   # informational — learned-model size adjustment
         "predictability_tilt_applied": 0,  # informational — sized on trend-predictability
         "confidence_recal_applied": 0,     # informational — sized on the band's EMPIRICAL win rate
+        "nbbo_sizing_applied":  0,   # informational — sized on the quoted book at entry
         "deferred_intraday_timing": 0,
         "opened":               0,
     }
@@ -2046,6 +2090,9 @@ def record_new_trades(
         calibrate_confidence_sizing, confidence_sizing_multiplier)
     conf_recal_cal = (calibrate_confidence_sizing(trades)
                       if settings.enable_confidence_recal_sizing else None)
+    # NBBO liquidity tilt (2026-09-02) — per-entry, no batch calibration: it
+    # reads the tick's own quoted book, which is already primed.
+    from src.performance.nbbo_sizing import nbbo_size_multiplier
 
     cooldown_h = float(settings.reentry_cooldown_hours or 0.0)
     recent_exits: Dict[tuple, datetime] = {}
@@ -2211,6 +2258,17 @@ def record_new_trades(
                 f"→ {multiplier:.2f}×"
             )
 
+        # Expected-liquidity forecast for the entry stamp (2026-08-30). Memo
+        # hit when the pipeline primed this tick; fail-soft None otherwise.
+        # PANEL-FIRST: recorded for the forecast-vs-realized-drift join, never
+        # a gate or a sizing input yet.
+        _liq_f = None
+        try:
+            from src.performance.liquidity_forecast import forecast_for
+            _liq_f = forecast_for(rec.ticker)
+        except Exception:
+            _liq_f = None
+
         # ── Step 3d: confidence-recalibration tilt ────────────────────────
         # Size by what the trade's stated-confidence BAND has actually earned
         # in the ledger (shrunk win rate vs the pooled win rate) — not by the
@@ -2228,6 +2286,25 @@ def record_new_trades(
                 f"(band {_band['label'] if _band else '?'} win {_band['p_shrunk'] if _band else '?'} "
                 f"vs pool {conf_recal_cal.get('pool_win') if conf_recal_cal else '?'}, "
                 f"n={_band['n'] if _band else 0}) → {multiplier:.2f}×"
+            )
+
+        # ── Step 3e: NBBO liquidity sizing (2026-09-02) ───────────────────
+        # Size by the QUOTED book this entry has to cross, per side: longs are
+        # cut hard only past the wide threshold (their spread problem is COST,
+        # not direction), shorts are boosted on a tight book and monotonically
+        # de-weighted as it widens (their DIRECTION measurably improves as the
+        # book tightens). RTH basis — the session's own widening is already
+        # charged at Step 3, so it is divided back out here rather than counted
+        # twice. No measured book ⇒ exactly 1.0. See nbbo_sizing's docstring.
+        nbbo_mult, nbbo_diag = nbbo_size_multiplier(rec.ticker, rec.action,
+                                                    session=entry_session)
+        if abs(nbbo_mult - 1.0) >= 0.005:
+            multiplier = round(multiplier * nbbo_mult, 3)
+            diag["nbbo_sizing_applied"] = diag.get("nbbo_sizing_applied", 0) + 1
+            logger.info(
+                f"[tracker] {rec.ticker}: NBBO sizing ×{nbbo_mult:g} "
+                f"({nbbo_diag['side']}, {nbbo_diag['bps']:.1f} bp quoted "
+                f"[{nbbo_diag['estimator']}]) → {multiplier:.2f}×"
             )
 
         price = _fetch_price(rec.ticker)
@@ -2382,6 +2459,17 @@ def record_new_trades(
             # rate that sized this trade, and the multiplier it produced.
             "confidence_recal_multiplier": conf_recal_mult,
             "confidence_recal_band_win": (_band.get("p_shrunk") if _band else None),
+            # Expected-liquidity forecast at entry (2026-08-30, panel-first):
+            # ex-ante one-way execution-deviation forecast + its risk class, so
+            # realized fill drift can be judged against what was predicted.
+            "exp_halfspread_bps_at_entry": _liq_f["exp_halfspread_bps"] if _liq_f else None,
+            "liq_risk_at_entry": _liq_f["risk"] if _liq_f else None,
+            # NBBO sizing audit (2026-09-02): the tilt applied, the QUOTED
+            # half-spread it read (RTH basis) and which measured source served
+            # it — so the tilt is judged on its own record, not re-argued.
+            "nbbo_size_multiplier": nbbo_mult,
+            "nbbo_half_bps_at_entry": nbbo_diag.get("bps"),
+            "nbbo_estimator_at_entry": nbbo_diag.get("estimator"),
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,
@@ -2662,7 +2750,11 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
     Fix #2 — when ``enable_llm_hold_review`` is on this path SKIPS LLM-opened
     positions entirely: they are owned by the opener-pinned hold-review in
     ``monitor_open_positions`` (which runs first and detects flips via the opening
-    engine every tick). This path serves only legacy / rule-based-opened trades.
+    engine every tick), and it serves only legacy / rule-based-opened trades.
+    With the review OFF (production since 2026-09-04, rank-rule entries) the skip
+    clause never matches and this path serves EVERY open trade: a reversal then
+    means the ticker made the opposite side's top-``gate1_rank_cap`` this run and
+    cleared the gates.
     """
     trades = _load_trades()
     today = date.today().isoformat()
@@ -2746,12 +2838,31 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
 # ---------------------------------------------------------------------------
 
 def _provider_of_synth_model(model: Optional[str]) -> Optional[str]:
-    """Inverse of ``_synthesis_model_for_provider``: a stored synthesis model id
-    → its engine ('anthropic' | 'deepseek' | 'qwen' | 'rule-based'). ``None`` for a
-    blank/unknown value (treated as "no LLM engine" → aggregator backstop)."""
+    """Inverse of ``_synthesis_model_for_provider``: a stored synthesis OR
+    sentiment model id → its engine ('anthropic' | 'deepseek' | 'qwen' | 'local'
+    | 'rule-based'). ``None`` for a blank/unknown value (treated as "no LLM
+    engine" → aggregator backstop).
+
+    ORDER IS LOAD-BEARING (2026-09-03): the matching is substring-based, and the
+    self-hosted ids are ``local/<model>`` — so ``local/qwen3:8b`` matched the
+    ``qwen`` branch and resolved to the HOSTED engine. That would have pinned
+    every locally-opened position's hold review to hosted Qwen (Fix #2 re-judges
+    with the OPENING engines) and mislabelled the cohort — the exact provenance
+    collapse the separate `local` provider exists to prevent, reappearing here.
+    The ``local/`` prefix is checked FIRST and is guaranteed by
+    ``sentiment.sentiment_model_for``."""
     m = (model or "").strip().lower()
     if not m:
         return None
+    if m.startswith("local/"):
+        return "local"
+    if m.startswith("rank"):
+        # The MECHANICAL entry selector (2026-09-04) — no LLM at all. Named
+        # rather than left to fall through to None so provenance reads
+        # "decided by the rank rule", not "unknown engine"; it is deliberately
+        # NOT in _LLM_ENGINES, so a rank-opened position is never pinned to an
+        # LLM hold review.
+        return "rank"
     if "deepseek" in m:
         return "deepseek"
     if "qwen" in m:
@@ -2761,6 +2872,33 @@ def _provider_of_synth_model(model: Optional[str]) -> Optional[str]:
     if "rule" in m:
         return "rule-based"
     return None
+
+
+def _stamp_shadow_exit(trade: dict, reason: str) -> None:
+    """Record that a SHADOW-ONLY exit rule would have closed this position, and
+    when it FIRST would have.
+
+    The rule is switched off, not deleted, so it has to stay measurable: the
+    first-fire date is what a later evaluation needs to compare "closed here"
+    against what the position actually went on to do. Only the FIRST rule and
+    its first date are kept (an exit closes once, on the earliest firing rule);
+    the count says how many ticks that rule went on firing.
+    Mutating the trade dict is enough — `update_open_trades` rewrites the row
+    every tick."""
+    first = trade.get("shadow_exit_reason")
+    if not first:
+        trade["shadow_exit_reason"] = reason
+        trade["shadow_exit_first_date"] = _now_iso()
+        trade["shadow_exit_count"] = 1
+        logger.info(f"[monitor] SHADOW {reason} on {trade.get('action')} "
+                    f"{trade.get('ticker')} — recorded, position stays open")
+        return
+    if reason == first:
+        # Count ticks of the FIRST rule only. Both 3a and 3b can be true in the
+        # same evaluation (a flip usually IS a large drop from entry), and
+        # counting each would make "how persistent was it" mean "how many rules
+        # happened to agree".
+        trade["shadow_exit_count"] = int(trade.get("shadow_exit_count") or 0) + 1
 
 
 def _confidence_floor(entry_conf) -> float:
@@ -2969,9 +3107,13 @@ def _evaluate_decay(
     direction_sign = 1 if action == "BUY" else -1
     today_oriented = today_combined * direction_sign
 
+    _shadow_only = bool(getattr(settings, "signal_decay_exits_shadow_only", False))
+
     # 3a. Signal flipped — today's combined crossed against the trade
     if today_oriented < settings.signal_decay_flip_threshold:
-        return "signal_flipped"
+        if not _shadow_only:
+            return "signal_flipped"
+        _stamp_shadow_exit(trade, "signal_flipped")
 
     # 3b. Signal decay — needs entry baseline
     entry = trade.get("signal_at_entry") or {}
@@ -2979,7 +3121,9 @@ def _evaluate_decay(
     if entry_combined is not None:
         entry_oriented = float(entry_combined) * direction_sign
         if entry_oriented - today_oriented > settings.signal_decay_drop_threshold:
-            return "signal_decay"
+            if not _shadow_only:
+                return "signal_decay"
+            _stamp_shadow_exit(trade, "signal_decay")
 
     # 3c. Confidence loss — entry-relative floor with absolute backstop.
     entry_conf_raw = (entry or {}).get("confidence")
@@ -3540,6 +3684,7 @@ def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict]
     Flows to the broker through the ordinary reconcile like any ledger trade."""
     if not (getattr(settings, "enable_follow_through_trading", False) and ft_map):
         return 0
+    from src.performance.nbbo_sizing import nbbo_size_multiplier
     cands = sorted((t for t, r in ft_map.items() if r.get("selected")),
                    key=lambda t: ft_map[t]["score"])
     if not cands:
@@ -3574,6 +3719,14 @@ def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict]
         multiplier = float(settings.ft_size_multiplier)
         if entry_session != "rth" and ext_mult < 0.999:
             multiplier = round(multiplier * ext_mult, 3)
+        # Same NBBO tilt as the funnel path — a follow-through entry crosses the
+        # same book. (Its SHORT side already ran 69% ungated vs the funnel's
+        # 55%, so it gains less from the tight-book boost; the audit stamp keeps
+        # the two mechanisms separable.)
+        nbbo_mult, nbbo_diag = nbbo_size_multiplier(ticker, "BUY" if ds > 0 else "SELL",
+                                                    session=entry_session)
+        if abs(nbbo_mult - 1.0) >= 0.005:
+            multiplier = round(multiplier * nbbo_mult, 3)
         ref = _reference_close(ticker)
         trade = {
             "ticker": ticker, "run_id": run_id,
@@ -3591,6 +3744,9 @@ def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict]
             "entry_session": entry_session,
             "ml_arm": False, "combine_source": None,
             "extended_size_multiplier": ext_mult if entry_session != "rth" else 1.0,
+            "nbbo_size_multiplier": nbbo_mult,
+            "nbbo_half_bps_at_entry": nbbo_diag.get("bps"),
+            "nbbo_estimator_at_entry": nbbo_diag.get("estimator"),
             "decision_datetime": decision_at,
             "entry_price": float(price),
             "entry_ref_close": ref["close"] if ref else None,
@@ -3830,8 +3986,8 @@ def monitor_open_positions(
         # Persisted as _escores["ml_exit"] in build_exit_scores (+ = keep, − = exit);
         # a confident exit closes. Suppressed inside the min-hold window by
         # _arm_suppresses_exit below, so it can only fire once past it.
-        if reason is None and settings.enable_ml_exit_model and trade.get("ml_arm") \
-                and _escores is not None:
+        if reason is None and settings.enable_ml_exit_model and _escores is not None \
+                and (settings.ml_exit_all_positions or trade.get("ml_arm")):
             _mx = _escores.get("ml_exit")
             if _mx is not None and _mx <= -abs(float(settings.ml_exit_threshold)):
                 reason = "ml_exit"

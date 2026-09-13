@@ -67,6 +67,12 @@ METHOD_SOURCES: Dict[str, Tuple[str, ...]] = {
     # news_bear_fresh multiplies the news verdict, so the sentiment module moves
     # its output exactly as it moves news_shock's.
     "news_bear_fresh": ("src.signals.news_bear_fresh", "src.analysis.sentiment"),
+    # news_unpriced multiplies the news verdict by a price-path term, so it
+    # moves with the sentiment module as well as its own.
+    "news_unpriced": ("src.signals.news_priced_in", "src.analysis.sentiment"),
+    "news_unpriced_all": ("src.signals.news_priced_in", "src.analysis.sentiment"),
+    "news_quiet": ("src.signals.news_quiet", "src.analysis.sentiment"),
+    "news_bull_fresh": ("src.signals.news_bull_fresh", "src.analysis.sentiment"),
     # catalyst_tilt multiplies the news verdict by a map calibrated from the
     # news-event dataset — all three modules move its output.
     "catalyst_tilt": ("src.signals.catalyst_tilt", "src.analysis.news_events",

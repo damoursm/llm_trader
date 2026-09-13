@@ -83,6 +83,18 @@ from typing import Optional
 # mid-session, so this is a UTC datetime, not a date: on 2026-07-24 five trades
 # were entered earlier the same day under the OLD money_flow and a date-granular
 # cutoff would have admitted them as evidence for the NEW one.
+# Every method whose score is a function of the sentiment VERDICT. They share
+# ONE epoch boundary by rule (CLAUDE.md, "news-family continuity"): the derived
+# methods consume the verdict, so a prompt or parser change that moves the
+# verdict moves all of them at once. Exported so the tests that assert the
+# shared boundary read one list instead of three copies — three copies is how
+# the confidence rubric drifted.
+NEWS_FAMILY: tuple[str, ...] = (
+    "news", "sent_velocity", "news_shock", "news_bear_fresh", "news_bull_fresh",
+    "catalyst_tilt", "news_quiet", "news_unpriced", "news_unpriced_all",
+)
+
+
 METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # 2026-07-24 20:01 UTC (scheduler restart): the MFI term now abstains inside
     # a 35-65 neutral band (it used to apply a contrarian reading linearly across
@@ -198,7 +210,141 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # at pipeline.py:1375). Supersedes the 08-14 instant (any pre-v3 row is
     # already pre-this-epoch). All eight instants registered this weekend share
     # this boundary for the same reason.
-    "news": datetime(2026, 8, 17, 1, 40, tzinfo=timezone.utc),
+    #
+    # 2026-09-04 21:40 UTC — SUPERSEDES the 08-17 instant. Three changes landed
+    # in one restart and every one of them changes the verdict for the same
+    # ticker-day, so the histories must not pool:
+    #   • NEWS RELEVANCE by company name (`data/company_names.py`,
+    #     `enable_name_relevance`). The per-ticker digest was cut from the pool
+    #     by a lowercase SUBSTRING test on the SYMBOL — `"ar" in text` matched
+    #     nearly every article ever written, so a short symbol was handed the
+    #     whole pool capped to 20 random headlines and correctly answered
+    #     "about other companies": 73-79% of calls returned 0.0.
+    #   • the GOOGLE NEWS company-NAME query + `google_news_max_tickers`
+    #     50 → 150, which changes WHICH articles exist to be scored.
+    #   • sentiment prompt v6 (`_SENT_PROMPT_VERSION`): 0.0 is reserved for two
+    #     named cases, uncertainty routes into a ±0.01-0.10 LEAN band, routine
+    #     company-specific items and named-peer read-throughs are scored, and
+    #     every call carries a company-name header.
+    # Measured paired on one shared 120-ticker article pool: per-call abstention
+    # DeepSeek 75.0% → 4.0%, local 8.1%; previously-nonzero verdicts KEPT their
+    # order (Spearman +0.895, 88.5% sign agreement) — i.e. the zeros filled in
+    # without the tails inflating. A verdict is therefore a different quantity
+    # on any row where the digest or the abstention rule moved, which is most
+    # of them.
+    #
+    # BOUNDARY — placed by the RUNS, per the standing convention and the 08-17
+    # precedent. The restart landed 2026-09-04 21:41-21:43 UTC (17:41-17:43 ET).
+    # Last OLD-code run persisted: 2026-09-04_210009 (started 21:00:09Z). The
+    # 21:34Z tick was killed mid-run by the restart and persisted NOTHING (no
+    # `runs` row, no signals) — verified in the DB, not assumed. First NEW-code
+    # run started 21:43:38Z (log, pipeline Step 0). 21:40Z is strictly inside
+    # that gap: strictly after every old-code row, strictly before the first
+    # new-code one.
+    # A 2026-09-08 boundary was registered here for the source-tier filter and
+    # REMOVED on 2026-09-09 when that filter failed its 12-day paired re-test
+    # (t -0.55, opposite-sign halves) and was defaulted OFF. With the filter
+    # off, nothing categorical changed: the two-sided priced-in check of the
+    # same date touches only `news_unpriced` / `news_unpriced_all`, which are
+    # panel-first at weight 0 and carry no history worth masking. Removing the
+    # boundary PRESERVES the news history accrued since 2026-09-04 instead of
+    # discarding it for a change that was reverted.
+    # 2026-09-11 21:50 UTC: the catalyst-class cap TIGHTENED 0.10 -> 0.03 after
+    # a sweep (see `catalyst_cap_limit`). It changes the OUTPUT magnitude for
+    # ~12% of typed rows, so the boundary moves with it. Deliberately done NOW
+    # rather than batched with the ~09-25 re-checks: post-epoch accrual was only
+    # ~1 day old, so this is the cheapest moment an epoch can ever cost, and
+    # waiting would have meant resetting two weeks of it instead.
+    # Placed strictly after the last OLD-code run (2026-09-11_214420, all 374
+    # of its rows stamped 21:44:20Z) and before the deploying restart —
+    # verified in the DB, not assumed: zero rows carry a generated_at at or
+    # after 21:50Z.
+    #
+    # 2026-09-11 06:30 UTC (superseded by the line above): the CATALYST-CLASS CAP — `analyst` verdicts held to
+    # the LEAN band (`enable_catalyst_class_cap`, `sentiment.apply_catalyst_cap`).
+    # It changes what the scorer OUTPUTS for a subset of rows, so a calibration
+    # pooling either side would fit two magnitude regimes for that class.
+    # Measured +0.0121 per-day pivot IC (t +2.46, same-sign halves) over 67 days
+    # — the only one of eight class interventions to clear the bar, and note it
+    # improves a signal whose own baseline IC over that window is -0.0339.
+    # Placed strictly after the last old-code run (2026-09-11_050015,
+    # generated_at 05:00:15Z) and before the restart.
+    #
+    # The 02:40 boundary it replaces was set for prompt **v7dir** — the model now NAMES the direction
+    # between the rationale and the score, and the number is forced to follow it
+    # (`enable_direction_field`, `sentiment.apply_direction`). This one is
+    # categorical rather than a refinement: it changes the SIGN of ~11% of
+    # verdicts (10 of 90 measured) and lifts mean |score| 15%, so history either
+    # side is two different scorers and no calibration may pool them.
+    # Shipped on the user's directive; the measured drop it buys (blind-judge
+    # contradiction 7.8% -> 3.3%) is NOT significant, McNemar one-sided exact
+    # p = 0.109 on 6 discordant pairs. Placed strictly after the last old-code
+    # run (2026-09-11_013007, generated_at 01:30:07Z) and before the restart.
+    #
+    # The 19:50 boundary it replaces was set hours earlier, when the verdict
+    # became the EXPECTATION under
+    # the model's own token distribution rather than its argmax
+    # (`enable_logprob_expected_score`, live as THE verdict on the user's
+    # directive that improvements go 100% into production). The value MEANS the
+    # same thing and the ordering barely moves (rank correlation +0.9955, zero
+    # sign flips, mean shift 0.021), which by the "categorical changes only"
+    # rule argues for no boundary — but the DISTRIBUTION changes shape
+    # completely, 17 distinct values on a 0.05 grid becoming 75 off it, and the
+    # layers that fit on a score's distribution (rank shaping above all) would
+    # be pooling two shapes across the instant. It cost ~5 hours of accrual, so
+    # the insurance was nearly free. Placed strictly after the last old-code run
+    # (2026-09-10_194138, generated_at 19:41:38Z) and before the restart.
+    #
+    # The 14:30 boundary it replaces was registered hours earlier for the
+    # PASSING-MENTION ABSTENTION moving from 0.65 to 0.35
+    # (`passing_mention_abstain_share`). At 0.65 it touched ~2% of digests and
+    # no boundary was registered — a weak read becoming an ABSTENTION is a state
+    # the panel already treats as "no view", and the other 98% of scores were
+    # byte-identical. At 0.35 it touches **13%**, which is no longer a
+    # refinement: an eighth of the cross-section stops entering the news rank,
+    # so a calibration pooling both sides of this instant would be fitting two
+    # different populations. Placed strictly after the last old-code run
+    # (2026-09-10_140002, generated_at 14:00:02Z) and before the restart that
+    # deploys it.
+    "news": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    # The DERIVED news methods consume the same verdict, so they share the
+    # boundary (CLAUDE.md's news-family rule). They were absent from this
+    # registry until now — an omission, not a decision: `sent_velocity` is a
+    # 0.12-weight consumer of the verdict's rate of change, and the other three
+    # are panel-first at weight 0 but their panel history is exactly what would
+    # be used to promote them, so pooling two verdict eras there would decide a
+    # promotion on mixed evidence.
+    "sent_velocity": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    "news_shock": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    "news_bear_fresh": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    # news_bull_fresh was CREATED after this instant, so the boundary masks
+    # nothing of its own — it is registered to keep the family on ONE shared
+    # boundary (CLAUDE.md's news-family rule) rather than to discard history.
+    "news_bull_fresh": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    "catalyst_tilt": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    # 2026-09-11: `news_quiet`, `news_unpriced` and `news_unpriced_all` JOIN the
+    # family boundary. They were left off it because news_quiet was new enough
+    # to have no history worth masking (2026-09-09) and the other two are
+    # panel-first at weight 0 — but all three are FUNCTIONS OF THE VERDICT
+    # (news_quiet carries the RAW verdict on quiet names; the unpriced pair is
+    # `news x clip(1 - z/2)`), and the verdict has since changed categorically
+    # four times: the passing-mention abstention (09-10 14:30), the logprob
+    # expectation replacing the argmax (09-10 19:50), prompt v7dir flipping 11%
+    # of signs (09-11 02:40) and the catalyst-class cap (09-11 06:30).
+    #
+    # This matters MOST for news_quiet, which is not panel-first: it is a
+    # WEIGHTED 0.10 method, so with no epoch registered `score_is_comparable`
+    # failed OPEN and its win-rate filter and per-side adaptive tilt were
+    # pooling four scorer eras of a two-day history. The unpriced pair rides the
+    # stacker feature set (`STACKER_RANKED_FEATURES`), where an unmasked column
+    # would train one weight across the same four eras.
+    #
+    # Registering it costs news_quiet its ~2 days of accrual and drops it below
+    # `winrate_filter_min_trades`, which means FULL weight as "unproven" — the
+    # safe direction, and the documented consequence of a fresh epoch.
+    "news_quiet": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    "news_unpriced": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
+    "news_unpriced_all": datetime(2026, 9, 11, 21, 50, tzinfo=timezone.utc),
     # 2026-08-17 01:40 UTC (shared deploy boundary): f_dividend reworked from a
     # stale trailing-year tilt (latest cash vs ~1yr ago, scored EVERY day for a
     # quarter, specials/frequency-mixes included — 18 of its 24 deep-cut panel

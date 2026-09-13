@@ -1,6 +1,6 @@
 # LLM Trader
 
-An AI-powered stock analysis system that aggregates dozens of free data sources — news, technicals, insider trades, options flow, SEC filings, macro indicators, breadth signals, and alternative data — weights them with a configurable signal aggregator, and feeds the combined picture to Claude for final BUY/SELL/HOLD/WATCH recommendations with explicit time horizons.
+An AI-powered stock analysis system that aggregates dozens of free data sources — news, technicals, insider trades, options flow, SEC filings, macro indicators, breadth signals, and alternative data — weights them with a configurable signal aggregator (the learned ML stackers are the live combine), selects BUY/SELL entries by a measured cross-sectional RANK rule, and runs an LLM synthesis of the same picture as an unacted shadow so the two decision paths can be compared ticker for ticker.
 
 ---
 
@@ -68,7 +68,7 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │  3N. Extended-Session Gap — live pre/after-market print vs last completed │
 │                             close in ATR units (off-hours runs only)     │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
-│  5.  Recommendations      — Claude: BUY / SELL / HOLD / WATCH           │
+│  5.  Recommendations      — rank rule BUY / SELL (LLM = unacted shadow) │
 │  6.  Performance Tracking — paper trades, P&L, method attribution        │
 │  7.  Charts + Email       — HTML report + inline-chart email             │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -174,7 +174,7 @@ Pulls articles from several layers and deduplicates by URL, filtered to the last
 
 **Layer B — per-ticker Google News (no key required, fetched fresh every tick)**
 
-`fetch_google_news` runs a per-ticker Google News RSS query (`"<TICKER>" stock`) plus a `site:businesswire.com` query, so each article is ticker-tagged and coverage widens to Reuters/Bloomberg/Barron's/FT/Investing.com **and** Business Wire. Bounded by `GOOGLE_NEWS_MAX_TICKERS`.
+`fetch_google_news` runs **two** per-ticker Google News RSS queries — by SYMBOL (`"<TICKER>" stock`) and by COMPANY NAME (`"antero resources" stock`) — plus a `site:businesswire.com` query, so each article is ticker-tagged and coverage widens to Reuters/Bloomberg/Barron's/FT/Investing.com **and** Business Wire. The name query is not redundant: Google treats a quoted symbol as a literal word, so the symbol query finds only pieces that actually print the ticker (measured over 24h on 120 names: symbol 347 confirmed articles / 81 tickers, name 617 / 83, either 92). Bounded by `GOOGLE_NEWS_MAX_TICKERS` (**150**).
 
 **Layer C — NewsAPI targeted queries (requires `NEWSAPI_KEY`)**
 
@@ -251,7 +251,7 @@ Beat/miss records are surfaced as `NewsArticle` objects. A beat of >10% is a str
 
 When `ENABLE_FUNDAMENTALS=true` (default), fetches trailing-twelve-month valuation, profitability, and leverage ratios — P/E, P/B, P/S, EV/EBITDA, ROE, ROA, debt/equity, dividend yield, current ratio, free cash flow, market cap, enterprise value — from the **Massive/Polygon financials & ratios** endpoint (`/stocks/financials/v1/ratios`, multi-ticker batched via `ticker.any_of`, cached daily). Requires the **Stocks Advanced** plan (or the ratios add-on); the free tier 403s and the feature degrades to a no-op.
 
-Unlike the per-ticker scorers, fundamentals are **not** combined into the aggregator score. They are passed into the Claude synthesis prompt as a `<fundamentals_context>` block (instruction §28) — a slow-moving **quality/valuation overlay** that shapes conviction and holding horizon (a cheap, profitable name supports a POSITION-length hold; a richly-valued, leveraged one argues for caution), never a standalone BUY/SELL trigger. Surfaced in the email's **Fundamentals** section.
+Unlike the per-ticker scorers, fundamentals are **not** combined into the aggregator score. They are passed into the (shadow) LLM synthesis prompt as a `<fundamentals_context>` block (instruction §28) — a slow-moving **quality/valuation overlay** that shapes conviction and holding horizon (a cheap, profitable name supports a POSITION-length hold; a richly-valued, leveraged one argues for caution), never a standalone BUY/SELL trigger. Surfaced in the email's **Fundamentals** section.
 
 The first `FUNDAMENTALS_ENRICH_MAX_TICKERS` (50) names also get a **positioning + growth enrichment**: short interest (% of shares + days-to-cover), short-volume ratio, latest-quarter net margin, and YoY revenue growth — appended to each ticker's line (e.g. a high short %/days-to-cover flags squeeze candidates). The dedicated float endpoint isn't on the plan, so shares are derived from `market_cap/price`.
 
@@ -263,7 +263,7 @@ The first `FUNDAMENTALS_ENRICH_MAX_TICKERS` (50) names also get a **positioning 
 
 When `ENABLE_CORPORATE_ACTIONS=true` (default), pulls upcoming **ex-dividend dates** (next `CORP_ACTIONS_DIV_LOOKAHEAD_DAYS`, default 14) and recent/upcoming **stock splits** (± `CORP_ACTIONS_SPLIT_WINDOW_DAYS`, default 30) from the **Massive/Polygon** dividends & splits calendars — two market-wide date-filtered calls, filtered to the scored universe, cached daily.
 
-Passed into the Claude synthesis prompt as a `<corporate_actions_context>` block (instruction §29) — a **mechanics/timing overlay**, never a directional trigger: on an ex-dividend date the price drops by ~the dividend (not real weakness), and price / share count rescale around a split (so OHLCV-derived signals near the date can mislead). Surfaced in the email's **Corporate Actions** section.
+Passed into the (shadow) LLM synthesis prompt as a `<corporate_actions_context>` block (instruction §29) — a **mechanics/timing overlay**, never a directional trigger: on an ex-dividend date the price drops by ~the dividend (not real weakness), and price / share count rescale around a split (so OHLCV-derived signals near the date can mislead). Surfaced in the email's **Corporate Actions** section.
 
 ---
 
@@ -370,7 +370,7 @@ When `ENABLE_FRED=true`, fetches macro regime indicators from the St. Louis Fed 
 | `SLOWDOWN` | Normal curve + elevated credit or rising unemployment |
 | `EXPANSION` | Normal/steep curve + normal/tight credit + stable employment |
 
-The macro regime is injected into the Claude prompt as a `<macro_context>` block. Claude uses it to calibrate conviction on all recommendations — e.g., RECESSION → avoid POSITION-horizon longs; EXPANSION → macro tailwind raises BUY conviction.
+The macro regime is injected into the (shadow) LLM synthesis prompt as a `<macro_context>` block, which the model uses to calibrate conviction on all recommendations — e.g., RECESSION → avoid POSITION-horizon longs; EXPANSION → macro tailwind raises BUY conviction.
 
 ---
 
@@ -658,7 +658,7 @@ When `ENABLE_OPEX=true`, computes options expiration week context from pure date
 
 **Triple Witching** occurs in March, June, September, and December when stock options, stock index futures, and stock index options all expire simultaneously. This produces significantly higher volume, larger intraday moves, and stronger pinning toward max pain than a standard monthly expiry.
 
-**How it affects recommendations:** The OpEx context is a *timing and magnitude modifier* — it tells Claude how much to trust the `max_pain_score` signal that day, not which direction to trade:
+**How it affects recommendations:** The OpEx context is a *timing and magnitude modifier* — it tells the synthesis model how much to trust the `max_pain_score` signal that day, not which direction to trade:
 - OPEX_WEEK / OPEX_IMMINENT → upgrade max_pain_score weight by +0.03–0.05
 - POST_OPEX → discount max_pain_score (new OI cycle just starting, max pain not yet meaningful)
 - NEUTRAL → standard weighting
@@ -948,7 +948,7 @@ When `ENABLE_SEASONALITY=true`, computes seasonal calendar context from pure dat
 | `HEADWIND` | Total score = −1: net seasonal disadvantage |
 | `STRONG_HEADWIND` | Total score ≤ −2: monthly bias + multiple active bearish windows |
 
-**How it affects recommendations:** Seasonality is a *weak secondary overlay* — it shifts probability but never overrides strong company-level catalysts. Claude instruction #24 uses it as a tie-breaker and notes seasonal headwinds/tailwinds explicitly in rationale when applicable.
+**How it affects recommendations:** Seasonality is a *weak secondary overlay* — it shifts probability but never overrides strong company-level catalysts. Synthesis-prompt instruction #24 uses it as a tie-breaker and notes seasonal headwinds/tailwinds explicitly in rationale when applicable.
 
 ---
 
@@ -1555,11 +1555,13 @@ confidence = raw_confidence × coherence_factor × movement_factor × volume_fac
 
 ---
 
-### Step 5 — Final Recommendations (`src/analysis/claude_analyst.py`)
+### Step 5 — Final Recommendations (`src/signals/rank_entry.py`; LLM shadow in `src/analysis/claude_analyst.py`)
 
-All ticker signals plus every macro/breadth/volatility context block are passed in a single structured prompt to the configured **analyst model** (default: `claude-haiku-4-5-20251001`, configurable via `ANALYST_MODEL`).
+**Since 2026-09-04 the trades are decided MECHANICALLY** (`enable_llm_synthesis=false`). `rank_entry.build_rank_recommendations` selects, per run and per side, the top-K BUY / bottom-K SELL names by within-run rank of `combined_score` over the tradeable (Gate-4) cross-section, but only among the names whose direction BAND fired (`rank_diff_threshold_long/_short`, roughly the top 10% / bottom 5%) — so a run where nothing clears the band trades nothing. K = `gate1_rank_cap` (3) per side. The rows are ordinary `Recommendation` objects, so everything downstream (Gates 2/3/4/4b/5, the earnings blackout, the PANIC BUY block, sizing, the ledger, the broker sync, the email and the panel) is unchanged; Gate 1's absolute confidence floor and Gate 1c's cap no longer apply, since the rule produces no stated confidence. Measured pre-registered on the H/L pivot label over 2026-08-13 → 09-04 (1,245 actionable decisions, per-run and per-side count-matched): the LLM funnel +0.19 %/decision (indistinguishable from random, t +0.56), the rank rule +1.56 % (beats random by +1.60, t +2.11). The run stamps `llm_synthesis_provider='rank'` / model `rank-v1`.
 
-**Context blocks injected into the prompt:**
+**The LLM synthesis still runs on every tick as a SHADOW** (`enable_synthesis_shadow`, engine `deepseek` in production): all ticker signals plus every macro/breadth/volatility context block are passed in one structured prompt, and every engine's per-ticker decision — the acting rank rule and the shadow LLM alike — lands in the `engine_recommendations` table (`live` flag) for a ticker-by-ticker comparison. The shadow verdict never opens, closes or sizes a trade. The context-block descriptions throughout this README ("passed into the synthesis prompt", "tells the model how much to trust…") describe that shadow prompt — where a section says "Claude uses this…" read it as the synthesis model, which has been DeepSeek since the engine bake-off; `enable_llm_synthesis=true` makes it the decider again.
+
+**Context blocks injected into the (shadow) synthesis prompt:**
 
 | Block | Source |
 |---|---|
@@ -1580,9 +1582,9 @@ All ticker signals plus every macro/breadth/volatility context block are passed 
 | `<earnings_calendar>` | Upcoming earnings dates |
 | `<gex_context>` | Gamma exposure + max pain |
 
-Claude acts as an elite portfolio manager with 22 numbered decision rules covering: conviction thresholds, smart money weighting, macro overlays, cluster handling, volatility regimes, breadth conditions, earnings event caution, and more. When no ticker clears the bar, it outputs HOLD/WATCH for all.
+The synthesis model acts as a portfolio manager with numbered decision rules covering: conviction thresholds, smart money weighting, macro overlays, cluster handling, volatility regimes, breadth conditions, earnings event caution, and more. When no ticker clears the bar, it outputs HOLD/WATCH for all.
 
-**Automatic fallback chain:** If the Claude API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to **DeepSeek V4-Flash** (`deepseek-v4-flash`, non-thinking) via the OpenAI-compatible streaming API. If DeepSeek also fails, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The active analyst model is logged at INFO level.
+**Automatic fallback chain (when the LLM is the decider):** if the chosen synthesis engine's API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to the other provider via the OpenAI-compatible streaming API; if that fails too, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The engine that answered is logged at INFO level and recorded per run, per recommendation and per trade. In the current shadow role a failed call simply costs one comparison row.
 
 ---
 
@@ -1597,16 +1599,16 @@ Every actionable signal is recorded in the **DuckDB** trade ledger (`data/llm_tr
 | `current_price`, `current_price_datetime` | Live M2M mark + timestamp; refreshed each pipeline tick. |
 | `exit_date`, `exit_datetime`, `exit_price` | Same datetime/price pairing when the trade closes (auto-close or signal reversal). |
 | `return_pct` | Spread-adjusted buy-and-hold percent return (see formula below). |
-| `position_size_multiplier`, `sector_key` | Confidence-tier sizing and the bucket used for the 3× per-sector cap. |
+| `position_size_multiplier`, `sector_key` | The product of the sizing chain (continuous confidence ramp × agreement breadth × expected-edge blend × predictability tilt × NBBO liquidity tilt × regime / session haircuts) and the bucket used for the 3× per-sector cap. |
 | `method_scores`, `methods_agreeing`, `dominant_method` | Per-method attribution captured at entry. |
 | `status` | `OPEN` or `CLOSED`. |
 
 Lifecycle:
 
-1. **Open** (`record_new_trades`) — entry price fetched **live** at recommendation time and stamped together with `entry_datetime`; position-size multiplier set from confidence tier; correlation haircut applied. The **intraday timing gate** (`enable_intraday_timing`, default on) defers an entry whose 30-min momentum is strongly against it — the next 30-min tick re-checks, so the position waits for a less hostile entry.
+1. **Open** (`record_new_trades`) — entry price fetched **live** at recommendation time and stamped together with `entry_datetime`; position-size multiplier set by the sizing chain above; correlation haircut applied. The **intraday timing gate** (`enable_intraday_timing`, default on) defers an entry whose 30-min momentum is strongly against it — the next 30-min tick re-checks, so the position waits for a less hostile entry.
 2. **Refresh / mark** (`update_open_trades`) — every tick re-fetches the live price and updates `current_price`/`current_price_datetime`/`return_pct`/`weighted_return_pct`/`days_held` for every open trade. **There is no time cap** — a position is held as long as its thesis holds (`days_held` is observability only).
-3. **Thesis-decay close** (`monitor_open_positions`) — closes a position when its rationale deteriorates, checked in priority order: `macro_regime_exit` (holding a long while macro = PANIC/RISK_OFF), `signal_flipped` (today's oriented combined score crosses against the trade), `signal_decay` (entry strength minus today's strength exceeds the drop threshold), `confidence_loss` (today's aggregator confidence below `max(absolute_floor, relative_factor × entry_confidence)`). Toggle with `enable_signal_decay_exits` (default on). With `enable_intraday_exit` (opt-in) it also closes on a hard 30-min reversal against the position (`intraday_reversal`).
-4. **Reversal close** (`close_trades_on_signal_reversal`) — if today's actionable signal flips the direction of an open position, it closes with `exit_datetime = current_price_datetime` (re-uses the most recent live mark, no extra fetch) and the new leg is opened immediately after.
+3. **Monitor close** (`monitor_open_positions`) — the live reasons, in priority order (production since 2026-09-05, LLM hold review off): `macro_regime_exit` (holding a long while macro = PANIC), `confidence_loss` (today's aggregator confidence below `max(absolute_floor, relative_factor × entry_confidence)`), `trailing_stop` (give-back of half the peak once MFE armed past 3%), `adverse_stop` (long 8% / short 20% on the cost-adjusted mark), and `ml_exit` (the learned exit-timer, on every position, closes at hold-conviction ≤ −0.35). `signal_flipped` (today's oriented combined score crosses against the trade) and `signal_decay` (entry strength minus today's strength exceeds the drop threshold) are computed and stamped as SHADOW exits but no longer close anything (`signal_decay_exits_shadow_only`) — measured ~0 timing skill on the pivot basis. There is no time-based exit. With `enable_intraday_exit` (opt-in) it also closes on a hard 30-min reversal against the position (`intraday_reversal`).
+4. **Reversal close** (`close_trades_on_signal_reversal`) — if today's actionable signal flips the direction of an open position (in rank mode: the ticker made the opposite side's top-K and cleared the gates this run), it closes with `exit_datetime = current_price_datetime` (re-uses the most recent live mark, no extra fetch) and the new leg is opened immediately after.
 
 Before either refresh runs, `update_open_trades` does two preparatory passes that make every downstream metric deterministic and current:
 
@@ -1825,15 +1827,16 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 
 | Task | Model | Fallback |
 |---|---|---|
-| Per-ticker sentiment scoring | DeepSeek V4-Flash (`deepseek-v4-flash`, non-thinking) | Claude Haiku 4.5 |
+| Per-ticker sentiment scoring | **100% LOCAL** (`SENTIMENT_LOCAL_SHARE=1.0`): the self-hosted Qwen3-8B (Ollama, `local/<model>`) scores every digest | Per-call fallback local -> deepseek -> qwen. DeepSeek is now SHADOW-ONLY and scores 100% of digests without driving anything (`sentiment_shadow` table), so every call carries a paired verdict |
 | Technical analysis scoring | Computed locally (RSI, MACD, SMA, BB) | — |
-| Final synthesis / BUY/SELL/HOLD/WATCH | Configurable via `ANALYST_MODEL` (default: `claude-haiku-4-5-20251001`) | DeepSeek V4-Flash (`deepseek-v4-flash`) → rule-based fallback |
+| Entry selection / exit timing | MECHANICAL: the rank rule over the ML-stacker combine (`ML_COMBINE_ARM_SHARE=1.0`) decides entries; `ml_exit` + the mechanical stops decide exits | The weighted combine per side when a stacker artifact is missing (`combine_source`) |
+| LLM synthesis (BUY/SELL/HOLD/WATCH) | Runs as an UNACTED SHADOW: DeepSeek V4-Flash (`SYNTHESIS_SHADOW_ENGINE=deepseek`), persisted to `engine_recommendations` | — (a failed shadow call costs one comparison row) |
 
-To use Sonnet for higher quality: set `ANALYST_MODEL=claude-sonnet-4-6` in `.env`.
+`ENABLE_LLM_SYNTHESIS=true` makes the LLM the decider again; then `ANALYST_MODEL` / `LLM_AB_SYNTHESIS_MODELS` choose the engine (the live pool is the single id `deepseek-v4-flash`; the Anthropic leg is unfunded).
 
 **Synthesis A/B bake-off (`LLM_AB_SYNTHESIS_MODELS`):** instead of always using `ANALYST_MODEL`, set a comma-separated pool and each run picks one model UNIFORMLY (equal split), so every model accumulates comparable samples and shows as its own row in the dashboard's per-LLM evaluation (keyed by exact model id). Current pool: `claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking,deepseek-v4-pro-thinking` (≈¼ each). **DeepSeek arms encode reasoning mode via a `-thinking` suffix** — a logical id decoded by `_deepseek_spec` into (API model, thinking flag); thinking is the synthesis quality lever and is free on flash, while pro is ~3× flash on cache-miss tokens. The logical id is recorded for provenance so flash-thinking and pro-thinking are distinct rows. Empty pool → legacy binary `ANALYST_MODEL` ⇄ DeepSeek behavior. **Sentiment is unaffected** (stays flash non-thinking, the high-volume cost driver).
 
-**DeepSeek analyst fallback:** When the chosen analyst engine raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through the OTHER provider's default model (the cross-engine fallback stays cheap flash non-thinking) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If both fail, the pipeline falls back to a rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
+**Cross-engine synthesis fallback (LLM-decider mode):** When the chosen analyst engine raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through the OTHER provider's default model (the cross-engine fallback stays cheap flash non-thinking) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If both fail, the pipeline falls back to a rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
 
 ---
 
@@ -1867,7 +1870,7 @@ Six tabs:
 
 | Tab | Shows |
 |---|---|
-| Recommendations & Rationale | Per-run data sources used (✓/✗) and the run's recommendations with rationale; click a row for a per-ticker hold-review confidence-over-time chart |
+| Recommendations & Rationale | Per-run data sources used (✓/✗) and the run's recommendations with rationale; click a row for a per-ticker hold-review confidence-over-time chart (historical — `trade_reviews` stopped accruing when the LLM hold review was switched off on 2026-09-04) |
 | Entry Performance | Solo win-rate per signal method (bar chart + table), the Signal-IC table (per-method Spearman IC / Sim win% / Sim ret% across 30-min · daily · weekly · fundamentals), a Monte Carlo luck-vs-skill check, a confidence-formula component-isolation pair of tables (does each of the 6 confidence multipliers — coherence / movement / volume / family / tape — actually predict outcomes, isolated one at a time against raw), predictability-by-feature and price/dollar-volume breakdowns, discovery-source performance, and an *LLM models used* table — the exact synthesis & sentiment models that ran (including DeepSeek / rule-based fallbacks) |
 | Exit Performance | The exit-side mirror of Entry Performance — per-exit-method IC/win/ret (held ledger or simulated over all scored tickers), exit-reason outcomes, post-exit "what if we'd held longer", exit-timing-vs-random Monte Carlo, the same confidence-component isolation applied to held positions mid-hold, the edge-decay curve, and a close-rule counterfactual comparison |
 | Returns | KPI tiles (compound, win rate, best/worst), equity curve, open/closed trades, and a Simulated ⇄ IBKR (actual fills) toggle |
@@ -1918,8 +1921,9 @@ Each tab's content is embedded directly in the tab, so switching is instant and 
 ## Prerequisites
 
 - Python 3.11+
-- [Anthropic API key](https://console.anthropic.com/) — analyst model (synthesis) + Haiku (sentiment fallback)
-- [DeepSeek API key](https://platform.deepseek.com/) — V3 for per-ticker sentiment scoring
+- [DeepSeek API key](https://platform.deepseek.com/) — V4-Flash for per-ticker sentiment scoring and the shadow synthesis
+- A local [Ollama](https://ollama.com/) server with `qwen3:8b` (`scripts/run_ollama.bat`) — the other half of the sentiment A/B and its shadow engine (`ENABLE_LOCAL_LLM=true`)
+- [Anthropic API key](https://console.anthropic.com/) — optional: only used when `ENABLE_LLM_SYNTHESIS=true` routes synthesis to an Anthropic model
 
 Optional (extend coverage):
 - [NewsAPI key](https://newsapi.org/) — targeted ticker/sector queries + trending detection
@@ -1940,10 +1944,11 @@ Configure `.env`:
 
 ```env
 # Required
-ANTHROPIC_API_KEY=your_key
 DEEPSEEK_API_KEY=your_key
+ENABLE_LOCAL_LLM=true              # local Ollama sentiment engine (scripts/run_ollama.bat)
 
-# Model selection (default: Haiku; use Sonnet for higher quality)
+# Optional — only consulted when the LLM is the decider (ENABLE_LLM_SYNTHESIS=true)
+ANTHROPIC_API_KEY=your_key
 ANALYST_MODEL=claude-haiku-4-5-20251001
 
 # Recommended
@@ -2084,11 +2089,12 @@ llm_trader/
     │   ├── business_cycle_rotation.py # Fidelity-style economic phase → sector leadership biases
     │   └── cache.py                  # Hourly cache + incremental OHLCV
     ├── analysis/
-    │   ├── sentiment.py              # DeepSeek V4-Flash / Haiku sentiment scoring
+    │   ├── sentiment.py              # DeepSeek V4-Flash / local Qwen sentiment scoring (+ shadow pairing)
     │   ├── technical.py              # RSI, MACD, SMA, Bollinger Bands
-    │   └── claude_analyst.py         # Final recommendations (22 decision rules)
+    │   └── claude_analyst.py         # LLM synthesis (unacted shadow; decider when ENABLE_LLM_SYNTHESIS=true)
     ├── signals/
     │   ├── aggregator.py             # Weighted combination + coherence + cluster
+    │   ├── rank_entry.py             # The LIVE entry decider: band + top-K per side by combined_score rank
     │   └── vwap.py                   # Rolling 20-day VWAP distance score
     ├── performance/
     │   ├── tracker.py                # Paper trades, P&L, auto-close

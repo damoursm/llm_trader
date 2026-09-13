@@ -3861,6 +3861,7 @@ def _broker_forensics_section(days=None, session=None, direction=None):
                          "intended trade, which is exactly why the fill rate above is computed per "
                          "TRADE and not per event. The 'Fill outcomes' table below breaks these "
                          "events down — read it to see WHERE orders die, not as a fill rate."),
+            _quote_capture_kpi(rep.get("quote_capture") or {}),
             _kpi("Drift runs", f"{d.get('runs_with_drift', 0)}/{d.get('n_runs', 0)}",
                  tooltip="⚠ NOT affected by the filters above — this counts reconcile RUNS, not orders, "
                          "so there is nothing coherent to slice it by (a run either found an unexplained "
@@ -3901,8 +3902,76 @@ def _broker_forensics_section(days=None, session=None, direction=None):
             "re-anchor events belonging to intents that were later killed. Use this to see WHERE "
             "orders die; use the Fill rate tile above for how often a trade actually got on."),
         outcomes_table,
+        _quote_capture_section(rep.get("quote_capture") or {}),
         _h3("Reject reasons", "Failed / rejected orders grouped by the broker error message."),
         reject_table,
+    ])
+
+
+_QUOTE_CAPTURE_TOOLTIP = (
+    "LIVE-QUOTE FEED HEALTH, as the order path experiences it: the share of "
+    "orders that were priced holding a real two-sided book (bid_at_submit is "
+    "written from whatever reconcile._quote_for returned — IBKR first, then "
+    "the Polygon consolidated NBBO). This is the number that says whether the "
+    "spread-aware LMT cap and the spread-vs-drift slippage decomposition are "
+    "actually getting data, so a fall-off here is the tell that the feed "
+    "stopped serving. Denominator counts only the events that ASK for a book "
+    "(SUBMIT / SETTLE_REANCHOR / DRIFT_FLATTEN) — fill repairs, kills and "
+    "cancels never price one. It is also epoch-gated: the columns landed "
+    "2026-08-31, so measurement starts at the first order that ever carried a "
+    "book, and earlier rows (structurally NULL) are excluded rather than "
+    "counted as failures. Expect RTH to lead: IBKR has no API market-data "
+    "entitlement on this account, and Polygon's NBBO is refused past 120 s of "
+    "age, so overnight — when the last NBBO is the prior 20:00 close book — a "
+    "LOW rate is correct behaviour, not a fault.")
+
+
+def _quote_capture_kpi(qc: dict):
+    """KPI tile for the live-NBBO capture rate. 'Not accruing yet' is rendered
+    as its own state — it means we are not MEASURING, which is a different
+    statement from 0% and must never be shown as one."""
+    if not qc.get("accruing"):
+        return _kpi("NBBO capture", "—",
+                    tooltip="Not accruing yet — no order has carried a live book. "
+                            "The bid/ask-at-submit columns landed 2026-08-31 and "
+                            "populate from the scheduler's next restart onward. "
+                            "This is 'not measuring', NOT 0%. " + _QUOTE_CAPTURE_TOOLTIP)
+    rate = qc.get("rate")
+    colour = (figures.POS if (rate or 0) >= 95
+              else "#92400e" if (rate or 0) >= 50 else figures.NEG)
+    return _kpi("NBBO capture", _pct(rate), colour,
+                tooltip=f"{qc.get('n_captured', 0):,} of {qc.get('n_eligible', 0):,} "
+                        f"book-priced orders since {str(qc.get('since'))[:16]}. "
+                        + _QUOTE_CAPTURE_TOOLTIP)
+
+
+def _quote_capture_section(qc: dict):
+    """Per-session capture breakdown + the median quoted half-spread we saw."""
+    heading = _h3("Live-NBBO capture by session", _QUOTE_CAPTURE_TOOLTIP)
+    if not qc.get("accruing"):
+        return html.Div([heading, html.Div(
+            "Not accruing yet — no order has carried a live book. The "
+            "bid_at_submit / ask_at_submit columns landed 2026-08-31 and populate "
+            "from the scheduler's next restart. Until then this is 'not measuring', "
+            "not 0%.", style={"color": "#6b7280"})])
+    rows = list(qc.get("by_session") or [])
+    med = qc.get("median_half_bps")
+    note = (f"Median quoted half-spread on the books we captured: {med:.2f} bp."
+            if med is not None else
+            "No usable two-sided book captured yet for a spread reading.")
+    return html.Div([
+        heading,
+        dash_table.DataTable(
+            data=rows,
+            columns=[{"name": "Session", "id": "session"},
+                     {"name": "Book-priced orders", "id": "orders",
+                      "type": "numeric", "format": _INT},
+                     {"name": "Captured", "id": "captured",
+                      "type": "numeric", "format": _INT},
+                     {"name": "Capture %", "id": "rate",
+                      "type": "numeric", "format": _NUM2}],
+            **_TABLE_KW) if rows else html.Div(),
+        html.Div(note, style={"color": "#6b7280", "marginTop": 8}),
     ])
 
 

@@ -32,6 +32,39 @@ simulated_trades    — the LONG-format reshape of `signals`: one row per
                       other way. Outcomes (forward returns at 30m/1d/3d/1w/2w/1m)
                       are computed on demand from cache/ohlcv (they are future
                       data, never knowable at write time).
+sentiment_shadow    — paired sentiment verdicts: the engine that scored the run
+                      and the OTHER engine's read of the SAME article digest.
+news_articles       — THE FULL per-tick article pool, URL-deduped and stored
+                      once per unique article. This is the archive a future
+                      backfill reads: `sentiment_digests` keeps only the top-20
+                      cut that reached a scorer, `cache/news_*.json` keeps only
+                      the yfinance/NewsAPI leg (~600 of a ~2,433-article pool),
+                      and everything else — RSS wires, FDA, per-ticker Google
+                      News, Polygon/Benzinga, 8-K, Reddit, Quiver — is fetched
+                      fresh every tick and was discarded. `first_seen_at` is
+                      what makes a point-in-time reconstruction honest: an
+                      article is visible to a replayed tick only from the run
+                      that first saw it.
+sentiment_digests   — the article digest each sentiment verdict was scored on,
+                      keyed by an ENGINE-FREE digest_id (ticker + article set),
+                      so a repair or a human judgment attaches to the exact
+                      text the model saw. A bounded store (retention days).
+catalyst_repairs    — the catalyst-label REPAIR pass: per digest, the first-pass
+                      class, why it was re-examined (trigger), the specialist's
+                      votes and the resolved class + quality. The consumer
+                      resolution (repair → live → backfill in
+                      news_events.load_news_events, catalyst_tilt dropping the
+                      unresolved events) is BUILT but held behind
+                      enable_catalyst_repair_resolution until the pass clears
+                      its measurement bar; until then this is pure accrual.
+catalyst_judgments  — human verdicts on model catalyst labels (ok / ambiguous /
+                      error + the correct class), the gold set the repair eval
+                      grades against.
+engine_recommendations — every synthesis engine's per-ticker decision on the
+                      SAME signal cross-section, one row per (run, engine,
+                      ticker); `live` marks the engine whose decision the
+                      pipeline acted on. The paired dataset for the
+                      local-vs-remote synthesis A/B.
 """
 
 from __future__ import annotations
@@ -51,9 +84,22 @@ SIGNAL_BASE_METHOD_COLUMNS = (
     # news_bear_fresh (2026-08-15, panel-first at weight 0 —
     # signals/news_bear_fresh.py): bearish news × un-priced-tape guard.
     "news_bear_fresh",
+    # news_bull_fresh (2026-09-10, panel-first at weight 0 —
+    # signals/news_bull_fresh.py): the bull-side mirror.
+    "news_bull_fresh",
     # catalyst_tilt (2026-08-15, panel-first at weight 0 —
     # signals/catalyst_tilt.py): news × learned per-(catalyst, side) orientation.
     "catalyst_tilt",
+    # news_unpriced / news_unpriced_all (2026-09-07, panel-first at weight 0
+    # — signals/news_priced_in.py): the unpriced share of the news move,
+    # anchored on the news cluster's first article. Order mirrors
+    # tracker._ALL_METHODS exactly (a drift test asserts tuple equality).
+    "news_unpriced",
+    "news_unpriced_all",
+    # news_quiet (2026-09-09, WEIGHTED 0.10): the news read on a story whose
+    # freshest cluster is >= `news_quiet_min_age_hours` old; abstains (0.0) on
+    # a story still in flow.
+    "news_quiet",
     "tech", "massive", "insider", "put_call", "max_pain",
     "oi_skew", "vwap", "pattern", "momentum", "sector_momentum", "market_momentum",
     "money_flow", "trend_strength", "pead", "iv_rank", "iv_expr", "coint", "cross_sectional",
@@ -118,6 +164,24 @@ SIGNAL_TIMEFRAME_COLUMNS = tuple(
 # attention covariate for panel analyses. NOT method scores (no direction).
 SIGNAL_NEWS_ATTENTION_COLUMNS = ("news_article_count", "news_recency_mass")
 
+# The age `news_quiet` judged on (hours since the freshest news cluster's first
+# article). Not a score and not a `news_shock` baseline input, hence its own
+# group: it is kept so the 48h threshold stays re-testable from the panel alone,
+# without re-deriving clusters from a pool that may no longer be reconstructible
+# (see memory/news-backfill-fidelity-2026-09.md).
+SIGNAL_NEWS_QUIET_COLUMNS = ("news_quiet_age_h",)
+
+# The logprob-derived continuous verdict (2026-09-10). NOT a method score — it
+# is the same verdict as `news_raw_score` read more precisely — so it sits
+# beside it rather than in SIGNAL_METHOD_COLUMNS, and nothing consumes it yet.
+SIGNAL_LOGPROB_COLUMNS = ("news_expected_score", "news_argmax_score")
+
+# Expected-liquidity forecast (2026-08-30): the run's ex-ante expected one-way
+# execution deviation in bp (RTH basis) from src/performance/liquidity_forecast
+# — CONTEXT, not a method score (predicts execution drift, not direction).
+# NULL on rows written before the column existed or when the run had no view.
+SIGNAL_LIQUIDITY_COLUMNS = ("exp_halfspread_bps",)
+
 # News-event dataset columns (2026-08-15): the sentiment LLM's dominant catalyst
 # class (sentiment.NEWS_CATALYST_TYPES) + its RAW verdict before the evidence/
 # diversity scalers — typed (name, sql_type) pairs because catalyst is VARCHAR.
@@ -125,7 +189,11 @@ SIGNAL_NEWS_ATTENTION_COLUMNS = ("news_article_count", "news_recency_mass")
 # learn "what kind of news → what kind of move". Historical rows predate the
 # capture (NULL); the backfill table below covers them.
 SIGNAL_NEWS_EVENT_COLUMNS = (("news_catalyst", "VARCHAR"),
-                             ("news_raw_score", "DOUBLE"))
+                             ("news_raw_score", "DOUBLE"),
+                             # Engine-free id of the digest the verdict was scored
+                             # on (2026-09-06) — the join key into
+                             # sentiment_digests / catalyst_repairs.
+                             ("news_digest_id", "VARCHAR"))
 
 SIGNAL_FUNDAMENTAL_COLUMNS = ("f_value", "f_quality", "f_growth", "f_short_squeeze",
                               "f_split", "f_dividend")
@@ -359,7 +427,13 @@ SCHEMA_STATEMENTS = [
         error         VARCHAR,
         order_id      VARCHAR,
         client_ref    VARCHAR,
-        submitted_at  VARCHAR
+        submitted_at  VARCHAR,
+        -- Book at submit (2026-08-31): the two-sided quote _quote_for fetched
+        -- for the LMT cap, persisted instead of discarded — lets slippage
+        -- decompose into spread-crossing vs adverse drift. NULL when no fresh
+        -- quote existed (feed down, spread-aware limits off, older rows).
+        bid_at_submit DOUBLE,
+        ask_at_submit DOUBLE
     );
     """,
     f"""
@@ -379,9 +453,31 @@ SCHEMA_STATEMENTS = [
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_CONFIDENCE_COMPONENT_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_COMBINED_SIDE_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_NEWS_ATTENTION_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_NEWS_QUIET_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_LOGPROB_COLUMNS)},
         {", ".join(f"{c} {t}" for c, t in SIGNAL_NEWS_EVENT_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_LIQUIDITY_COLUMNS)},
         combine_source      VARCHAR,
         scores              VARCHAR
+    );
+    """,
+    """
+    -- Books RECOVERED after the fact for orders that predate the live
+    -- bid_at_submit capture (2026-08-31), from Polygon /v3/quotes at each
+    -- order's own submit instant. A SEPARATE table on purpose, mirroring
+    -- news_event_backfill: `broker_orders.bid_at_submit` records what the run
+    -- ACTUALLY SAW at submit, this records a later reconstruction — pooling
+    -- them in one column would destroy that provenance. The spread
+    -- calibration reads both (it only needs the true book); anything auditing
+    -- what the order path had available must read broker_orders alone.
+    CREATE TABLE IF NOT EXISTS broker_order_quotes (
+        ticker        VARCHAR,
+        submitted_at  VARCHAR,
+        bid           DOUBLE,
+        ask           DOUBLE,
+        quote_age_s   DOUBLE,
+        source        VARCHAR,
+        recovered_at  VARCHAR
     );
     """,
     # Historical catalyst classifications for panel rows that predate the live
@@ -574,6 +670,49 @@ SCHEMA_STATEMENTS = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS sentiment_shadow (
+        run_id           VARCHAR,
+        generated_at     VARCHAR,
+        ticker           VARCHAR,
+        digest_hash      VARCHAR,
+        n_articles       INTEGER,
+        primary_engine   VARCHAR,
+        primary_model    VARCHAR,
+        primary_raw      DOUBLE,
+        primary_score    DOUBLE,
+        primary_catalyst VARCHAR,
+        shadow_engine    VARCHAR,
+        shadow_model     VARCHAR,
+        shadow_raw       DOUBLE,
+        shadow_score     DOUBLE,
+        shadow_catalyst  VARCHAR,
+        shadow_latency_s DOUBLE,
+        digest_id        VARCHAR
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS engine_recommendations (
+        run_id         VARCHAR,
+        generated_at   VARCHAR,
+        signal_date    VARCHAR,
+        engine         VARCHAR,
+        model          VARCHAR,
+        prompt_variant VARCHAR,
+        live           BOOLEAN,
+        ticker         VARCHAR,
+        action         VARCHAR,
+        direction      VARCHAR,
+        confidence     DOUBLE,
+        time_horizon   VARCHAR,
+        rationale      VARCHAR,
+        snap_price     DOUBLE,
+        rule_filled    BOOLEAN,
+        latency_s      DOUBLE,
+        n_signals      INTEGER,
+        n_recs         INTEGER
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS exit_signals (
         run_id          VARCHAR,
         reviewed_at     VARCHAR,
@@ -584,6 +723,121 @@ SCHEMA_STATEMENTS = [
         method          VARCHAR,
         score           DOUBLE,
         price           DOUBLE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS news_articles (
+        url_hash      VARCHAR,
+        url           VARCHAR,
+        title         VARCHAR,
+        source        VARCHAR,
+        published_at  VARCHAR,
+        summary       VARCHAR,
+        tickers_json  VARCHAR,
+        first_seen_at VARCHAR,
+        first_run_id  VARCHAR,
+        last_seen_at  VARCHAR,
+        n_sightings   INTEGER
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sentiment_digests (
+        digest_id     VARCHAR,
+        ticker        VARCHAR,
+        run_id        VARCHAR,
+        generated_at  VARCHAR,
+        n_articles    INTEGER,
+        digest_text   VARCHAR,
+        articles_json VARCHAR
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS catalyst_repairs (
+        digest_id          VARCHAR,
+        run_id             VARCHAR,
+        generated_at       VARCHAR,
+        ticker             VARCHAR,
+        engine             VARCHAR,
+        model              VARCHAR,
+        first_pass         VARCHAR,
+        trigger            VARCHAR,
+        specialist_model   VARCHAR,
+        specialist_version VARCHAR,
+        votes              VARCHAR,
+        n_calls            INTEGER,
+        final              VARCHAR,
+        quality            VARCHAR,
+        about_target       VARCHAR,
+        latency_s          DOUBLE,
+        error              VARCHAR,
+        arm                VARCHAR,
+        rationale          VARCHAR
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS news_replay (
+        run_id             VARCHAR,
+        ticker             VARCHAR,
+        signal_date        VARCHAR,
+        generated_at       VARCHAR,
+        replayed_at        VARCHAR,
+        replay_version     VARCHAR,
+        engine             VARCHAR,
+        n_articles         INTEGER,
+        n_relevant         INTEGER,
+        n_pool             INTEGER,
+        bundle_file        VARCHAR,
+        pool_spec          VARCHAR,
+        news               DOUBLE,
+        news_raw_score     DOUBLE,
+        sent_velocity      DOUBLE,
+        news_shock         DOUBLE,
+        news_quiet         DOUBLE,
+        news_bull_fresh    DOUBLE,
+        news_bear_fresh    DOUBLE,
+        catalyst_tilt      DOUBLE,
+        news_unpriced      DOUBLE,
+        news_unpriced_all  DOUBLE,
+        news_catalyst      VARCHAR,
+        news_recency_mass  DOUBLE,
+        news_article_count INTEGER
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sentiment_cluster_arm (
+        run_id          VARCHAR,
+        generated_at    VARCHAR,
+        ticker          VARCHAR,
+        digest_id       VARCHAR,
+        engine          VARCHAR,
+        model           VARCHAR,
+        n_articles      INTEGER,
+        n_clusters      INTEGER,
+        cluster_scores  VARCHAR,
+        cluster_sizes   VARCHAR,
+        arm_raw         DOUBLE,
+        arm_score       DOUBLE,
+        primary_raw     DOUBLE,
+        primary_score   DOUBLE,
+        latency_s       DOUBLE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS catalyst_judgments (
+        judgment_id      VARCHAR,
+        judged_at        VARCHAR,
+        source           VARCHAR,
+        engine           VARCHAR,
+        model            VARCHAR,
+        ticker           VARCHAR,
+        run_id           VARCHAR,
+        digest_id        VARCHAR,
+        model_catalyst   VARCHAR,
+        verdict          VARCHAR,
+        correct_catalyst VARCHAR,
+        entity_error     BOOLEAN,
+        reason           VARCHAR,
+        rationale        VARCHAR
     );
     """,
 ]
@@ -662,12 +916,39 @@ _ADD_COLUMNS = (
     # news_shock method column + its attention-input columns (2026-08-14).
     ("signals", "news_shock", "DOUBLE"),
     *(("signals", col, "DOUBLE") for col in SIGNAL_NEWS_ATTENTION_COLUMNS),
+    ("signals", "news_bull_fresh", "DOUBLE"),
+    # news_quiet (2026-09-09): the SCORE needs its own ALTER — the CREATE
+    # expands SIGNAL_METHOD_COLUMNS but only ever runs on a NEW database.
+    ("signals", "news_quiet", "DOUBLE"),
+    *(("signals", col, "DOUBLE") for col in SIGNAL_NEWS_QUIET_COLUMNS),
+    *(("signals", col, "DOUBLE") for col in SIGNAL_LOGPROB_COLUMNS),
     # News-event dataset columns (2026-08-15): catalyst class + raw LLM verdict.
     *(("signals", col, coltype) for col, coltype in SIGNAL_NEWS_EVENT_COLUMNS),
     # news_bear_fresh method column (2026-08-15, panel-first).
     ("signals", "news_bear_fresh", "DOUBLE"),
+    # news_unpriced / news_unpriced_all method columns (2026-09-07).
+    ("signals", "news_unpriced", "DOUBLE"),
+    ("signals", "news_unpriced_all", "DOUBLE"),
     # catalyst_tilt method column (2026-08-15, panel-first).
     ("signals", "catalyst_tilt", "DOUBLE"),
+    # Expected-liquidity forecast context column (2026-08-30) on an existing DB.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_LIQUIDITY_COLUMNS),
+    # Book-at-submit columns (2026-08-31) on an existing broker_orders table.
+    ("broker_orders", "bid_at_submit", "DOUBLE"),
+    ("broker_orders", "ask_at_submit", "DOUBLE"),
+    # Engine-free digest id on an existing sentiment_shadow table (2026-09-06).
+    ("sentiment_shadow", "digest_id", "VARCHAR"),
+    # Specialist arm ('live' | 'think') + the first-pass rationale the specialist read,
+    # so an offline arm can replay the exact input (2026-09-07).
+    # news_replay pool shape (2026-09-07): the table shipped without it, and a
+    # CREATE TABLE IF NOT EXISTS cannot add a column to an existing DB.
+    ("news_replay", "pool_spec", "VARCHAR"),
+    ("news_replay", "n_relevant", "INTEGER"),
+    # 2026-09-12: the two weighted news methods that shipped after the table did.
+    ("news_replay", "news_quiet", "DOUBLE"),
+    ("news_replay", "news_bull_fresh", "DOUBLE"),
+    ("catalyst_repairs", "arm", "VARCHAR"),
+    ("catalyst_repairs", "rationale", "VARCHAR"),
 )
 
 

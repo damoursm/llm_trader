@@ -86,14 +86,49 @@ def _cost_bps(side: str, model: float, fill: float) -> Optional[float]:
 def _quote_for(broker, ticker: str) -> Optional["Quote"]:
     """Live two-sided quote, or None. Never raises and never blocks the caller:
     a broker without ``get_quote`` (or any failure) degrades to the mid-based
-    cap, which is the behaviour that shipped before spread-aware limits."""
+    cap, which is the behaviour that shipped before spread-aware limits.
+
+    A successful quote is also STASHED (``_LAST_QUOTE``) so ``_record_order``
+    can persist the book seen at submit — the quote was fetched anyway for the
+    LMT cap and was previously discarded, which threw away the one number that
+    lets realized slippage decompose into spread-crossing vs adverse drift
+    (2026-08-31 user directive)."""
     if not getattr(settings, "broker_spread_aware_limits", False):
         return None
+    q = None
     try:
-        return broker.get_quote(ticker)
+        q = broker.get_quote(ticker)
     except Exception as e:
         logger.debug(f"[broker] quote fetch failed for {ticker}: {e}")
-        return None
+    # Polygon consolidated NBBO fallback (2026-08-31): the IBKR account has no
+    # API top-of-book entitlement (error 10089 at every hour probed), so the
+    # broker path returns None until that is subscribed — this fallback is what
+    # actually serves the book today. Broker first on purpose: venue-true, and
+    # it wins automatically the day the entitlement exists. The freshness gate
+    # matters: overnight the "last NBBO" is the prior 20:00 close book, and a
+    # stale level must never price a cap or be persisted as the submit book.
+    if q is None and getattr(settings, "enable_polygon_quotes", True):
+        try:
+            from src.data.polygon_client import get_last_nbbo
+            n = get_last_nbbo(ticker)
+            if n and n.get("age_s") is not None and n["age_s"] <= _NBBO_FRESH_SECONDS:
+                q = Quote(ticker=ticker, bid=n["bid"], ask=n["ask"])
+        except Exception as e:
+            logger.debug(f"[broker] polygon NBBO fallback failed for {ticker}: {e}")
+    if q is not None:
+        _LAST_QUOTE[str(ticker).upper()] = (
+            float(q.bid), float(q.ask), time.time())
+    return q
+
+
+# ticker → (bid, ask, monotonic-ish ts) of the most recent successful quote.
+# Read by _record_order within _QUOTE_FRESH_SECONDS so every order-event row
+# carries the book that priced it; cleared at each sync() so a stale tick's
+# book can never be attributed to a later order.
+_LAST_QUOTE: dict = {}
+_QUOTE_FRESH_SECONDS = 120.0
+# Max age of a Polygon last-NBBO before it is refused as an order-pricing book.
+_NBBO_FRESH_SECONDS = 120.0
 
 
 def _session_cap_bps(outside_rth: bool) -> float:
@@ -244,6 +279,14 @@ def _record_order(report: dict, *, event: str, intent: str, ticker: str, side: s
                   order_id: Optional[str], client_ref: Optional[str],
                   submitted_at: Optional[str]) -> None:
     """Append one order event row (SUBMIT or FILL_REFRESH) for DuckDB persistence."""
+    # Book at submit: the quote _quote_for fetched for this ticker moments ago
+    # (LMT-cap sizing) — persisted so slippage can be decomposed into
+    # spread-crossing vs adverse drift. None when no fresh quote exists (quote
+    # feed down, spread-aware limits off, or an event that never priced a book).
+    bid_at, ask_at = None, None
+    q = _LAST_QUOTE.get(str(ticker).upper())
+    if q and (time.time() - q[2]) <= _QUOTE_FRESH_SECONDS:
+        bid_at, ask_at = q[0], q[1]
     report["orders"].append({
         "event": event, "intent": intent, "ticker": ticker, "side": side,
         "order_type": order_type, "requested_qty": requested_qty,
@@ -253,6 +296,7 @@ def _record_order(report: dict, *, event: str, intent: str, ticker: str, side: s
         "commission": commission, "status": status, "ok": ok, "error": error,
         "order_id": order_id, "client_ref": client_ref,
         "submitted_at": submitted_at or _utcnow_iso(),
+        "bid_at_submit": bid_at, "ask_at_submit": ask_at,
     })
 
 
@@ -1398,6 +1442,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
     """
     report = _new_report()
     report["run_id"] = run_id
+    _LAST_QUOTE.clear()   # a prior tick's book must never price this tick's rows
     # Boundary for tick-scoped order lifetime: anything submitted before this
     # instant belongs to a previous tick and must not keep working the book.
     sync_started = datetime.now(timezone.utc)

@@ -1,0 +1,2608 @@
+{
+  "report": {
+    "engine": "local",
+    "n_scored_both": 89,
+    "n_digest_differs": 47,
+    "share_digest_differs": 0.5280898876404494,
+    "abstain_full": 0.056179775280898875,
+    "abstain_trunc": 0.0898876404494382,
+    "spearman_raw": 0.6715617803876351,
+    "sign_flips": 17,
+    "share_sign_flips": 0.19101123595505617,
+    "mean_abs_delta_on_differs": 0.2478723404255319,
+    "max_abs_delta": 1.0,
+    "n_conflict_clusters": 12,
+    "conflict_tickers": [
+      "AR",
+      "BRK-B",
+      "BRK.A",
+      "MELI",
+      "META",
+      "NXPI",
+      "PFE",
+      "PSX",
+      "RIVN",
+      "SPCX",
+      "TDG",
+      "XLV"
+    ],
+    "mean_articles_full": 6.235955056179775,
+    "mean_articles_trunc": 3.550561797752809,
+    "mean_latency_full": 2.7300959719100373,
+    "mean_latency_trunc": 2.4534316966316685,
+    "H0_cut_changes_nothing": false
+  },
+  "stats": {
+    "AAP": {
+      "n_full": 3,
+      "n_trunc": 2,
+      "n_dropped": 1,
+      "freshest_h": 5.65,
+      "oldest_h": 114.78,
+      "dropped_ages_h": [
+        114.78
+      ]
+    },
+    "AAUC": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 2.38,
+      "oldest_h": 3.08,
+      "dropped_ages_h": []
+    },
+    "ADBE": {
+      "n_full": 20,
+      "n_trunc": 12,
+      "n_dropped": 8,
+      "freshest_h": 2.59,
+      "oldest_h": 66.59,
+      "dropped_ages_h": [
+        60.13,
+        60.78,
+        60.92,
+        62.35,
+        63.63,
+        64.61,
+        65.6,
+        66.59
+      ]
+    },
+    "AEP": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 0.8,
+      "oldest_h": 0.8,
+      "dropped_ages_h": []
+    },
+    "AEVA": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 17.9,
+      "oldest_h": 17.9,
+      "dropped_ages_h": []
+    },
+    "AMPL": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 13.9,
+      "oldest_h": 13.9,
+      "dropped_ages_h": []
+    },
+    "ANF": {
+      "n_full": 4,
+      "n_trunc": 3,
+      "n_dropped": 1,
+      "freshest_h": 1.2,
+      "oldest_h": 67.33,
+      "dropped_ages_h": [
+        67.33
+      ]
+    },
+    "AR": {
+      "n_full": 4,
+      "n_trunc": 3,
+      "n_dropped": 1,
+      "freshest_h": 0.99,
+      "oldest_h": 67.49,
+      "dropped_ages_h": [
+        67.49
+      ]
+    },
+    "AVGO": {
+      "n_full": 20,
+      "n_trunc": 6,
+      "n_dropped": 14,
+      "freshest_h": 5.23,
+      "oldest_h": 90.43,
+      "dropped_ages_h": [
+        46.75,
+        60.14,
+        60.67,
+        60.67,
+        61.73,
+        61.73,
+        62.88,
+        68.67,
+        71.45,
+        72.4,
+        73.75,
+        84.97,
+        85.69,
+        90.43
+      ]
+    },
+    "AXP": {
+      "n_full": 14,
+      "n_trunc": 6,
+      "n_dropped": 8,
+      "freshest_h": 0.38,
+      "oldest_h": 145.86,
+      "dropped_ages_h": [
+        70.63,
+        73.9,
+        79.52,
+        81.17,
+        83.28,
+        114.75,
+        133.25,
+        145.86
+      ]
+    },
+    "BILL": {
+      "n_full": 15,
+      "n_trunc": 3,
+      "n_dropped": 12,
+      "freshest_h": 0.57,
+      "oldest_h": 162.34,
+      "dropped_ages_h": [
+        35.5,
+        60.95,
+        62.35,
+        62.65,
+        63.2,
+        65.75,
+        66.72,
+        67.88,
+        69.77,
+        77.5,
+        80.29,
+        162.34
+      ]
+    },
+    "BLTE": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 102.97,
+      "oldest_h": 102.97,
+      "dropped_ages_h": []
+    },
+    "BRK-B": {
+      "n_full": 20,
+      "n_trunc": 9,
+      "n_dropped": 11,
+      "freshest_h": 0.0,
+      "oldest_h": 137.1,
+      "dropped_ages_h": [
+        26.83,
+        37.9,
+        42.5,
+        43.75,
+        44.75,
+        71.83,
+        73.9,
+        88.75,
+        117.78,
+        120.3,
+        137.1
+      ]
+    },
+    "BRK.A": {
+      "n_full": 16,
+      "n_trunc": 5,
+      "n_dropped": 11,
+      "freshest_h": 10.17,
+      "oldest_h": 120.3,
+      "dropped_ages_h": [
+        37.9,
+        42.5,
+        43.75,
+        44.75,
+        71.83,
+        73.9,
+        87.47,
+        88.75,
+        97.9,
+        117.78,
+        120.3
+      ]
+    },
+    "CCAP": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 2.48,
+      "oldest_h": 3.08,
+      "dropped_ages_h": []
+    },
+    "CME": {
+      "n_full": 8,
+      "n_trunc": 4,
+      "n_dropped": 4,
+      "freshest_h": 0.0,
+      "oldest_h": 90.32,
+      "dropped_ages_h": [
+        27.8,
+        51.55,
+        67.47,
+        90.32
+      ]
+    },
+    "COP": {
+      "n_full": 5,
+      "n_trunc": 2,
+      "n_dropped": 3,
+      "freshest_h": 15.75,
+      "oldest_h": 163.03,
+      "dropped_ages_h": [
+        63.46,
+        141.98,
+        163.03
+      ]
+    },
+    "CRC": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 116.95,
+      "oldest_h": 116.95,
+      "dropped_ages_h": []
+    },
+    "CTEV": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 11.8,
+      "oldest_h": 11.8,
+      "dropped_ages_h": []
+    },
+    "DAL": {
+      "n_full": 6,
+      "n_trunc": 4,
+      "n_dropped": 2,
+      "freshest_h": 0.0,
+      "oldest_h": 109.25,
+      "dropped_ages_h": [
+        89.92,
+        109.25
+      ]
+    },
+    "DDOG": {
+      "n_full": 4,
+      "n_trunc": 2,
+      "n_dropped": 2,
+      "freshest_h": 1.4,
+      "oldest_h": 114.31,
+      "dropped_ages_h": [
+        63.95,
+        114.31
+      ]
+    },
+    "DOCU": {
+      "n_full": 13,
+      "n_trunc": 2,
+      "n_dropped": 11,
+      "freshest_h": 18.59,
+      "oldest_h": 109.58,
+      "dropped_ages_h": [
+        61.5,
+        61.7,
+        63.29,
+        67.04,
+        67.57,
+        68.07,
+        69.79,
+        76.6,
+        77.98,
+        85.67,
+        109.58
+      ]
+    },
+    "DRAM": {
+      "n_full": 4,
+      "n_trunc": 2,
+      "n_dropped": 2,
+      "freshest_h": 10.77,
+      "oldest_h": 166.92,
+      "dropped_ages_h": [
+        67.99,
+        166.92
+      ]
+    },
+    "EAT": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 94.58,
+      "oldest_h": 94.58,
+      "dropped_ages_h": []
+    },
+    "EOSE": {
+      "n_full": 11,
+      "n_trunc": 1,
+      "n_dropped": 10,
+      "freshest_h": 19.56,
+      "oldest_h": 117.11,
+      "dropped_ages_h": [
+        66.76,
+        79.0,
+        83.84,
+        88.74,
+        89.89,
+        104.39,
+        104.72,
+        109.08,
+        112.1,
+        117.11
+      ]
+    },
+    "EQT": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 18.8,
+      "oldest_h": 18.8,
+      "dropped_ages_h": []
+    },
+    "ETOR": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 0.0,
+      "oldest_h": 1.16,
+      "dropped_ages_h": []
+    },
+    "FIVE": {
+      "n_full": 6,
+      "n_trunc": 4,
+      "n_dropped": 2,
+      "freshest_h": 1.16,
+      "oldest_h": 139.15,
+      "dropped_ages_h": [
+        109.83,
+        139.15
+      ]
+    },
+    "FLR": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 93.33,
+      "oldest_h": 93.33,
+      "dropped_ages_h": []
+    },
+    "GLD": {
+      "n_full": 4,
+      "n_trunc": 1,
+      "n_dropped": 3,
+      "freshest_h": 0.0,
+      "oldest_h": 163.6,
+      "dropped_ages_h": [
+        73.17,
+        110.0,
+        163.6
+      ]
+    },
+    "GOOG": {
+      "n_full": 20,
+      "n_trunc": 20,
+      "n_dropped": 0,
+      "freshest_h": 0.0,
+      "oldest_h": 0.79,
+      "dropped_ages_h": []
+    },
+    "HLT": {
+      "n_full": 3,
+      "n_trunc": 3,
+      "n_dropped": 0,
+      "freshest_h": 1.58,
+      "oldest_h": 21.52,
+      "dropped_ages_h": []
+    },
+    "HUT": {
+      "n_full": 7,
+      "n_trunc": 6,
+      "n_dropped": 1,
+      "freshest_h": 2.48,
+      "oldest_h": 70.37,
+      "dropped_ages_h": [
+        70.37
+      ]
+    },
+    "HZO": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 2.28,
+      "oldest_h": 2.28,
+      "dropped_ages_h": []
+    },
+    "IGV": {
+      "n_full": 6,
+      "n_trunc": 2,
+      "n_dropped": 4,
+      "freshest_h": 1.92,
+      "oldest_h": 135.17,
+      "dropped_ages_h": [
+        68.33,
+        89.27,
+        96.67,
+        135.17
+      ]
+    },
+    "IMPP": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 4.6,
+      "oldest_h": 4.6,
+      "dropped_ages_h": []
+    },
+    "INTC": {
+      "n_full": 20,
+      "n_trunc": 20,
+      "n_dropped": 0,
+      "freshest_h": 0.0,
+      "oldest_h": 8.05,
+      "dropped_ages_h": []
+    },
+    "IWM": {
+      "n_full": 7,
+      "n_trunc": 1,
+      "n_dropped": 6,
+      "freshest_h": 6.0,
+      "oldest_h": 113.59,
+      "dropped_ages_h": [
+        61.3,
+        65.84,
+        89.86,
+        94.21,
+        111.19,
+        113.59
+      ]
+    },
+    "KLAR": {
+      "n_full": 3,
+      "n_trunc": 3,
+      "n_dropped": 0,
+      "freshest_h": 14.15,
+      "oldest_h": 22.47,
+      "dropped_ages_h": []
+    },
+    "KRE": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 142.11,
+      "oldest_h": 142.11,
+      "dropped_ages_h": []
+    },
+    "LAZ": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 6.0,
+      "oldest_h": 14.18,
+      "dropped_ages_h": []
+    },
+    "LRCX": {
+      "n_full": 10,
+      "n_trunc": 9,
+      "n_dropped": 1,
+      "freshest_h": 0.59,
+      "oldest_h": 85.25,
+      "dropped_ages_h": [
+        85.25
+      ]
+    },
+    "LSCC": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 91.5,
+      "oldest_h": 91.5,
+      "dropped_ages_h": []
+    },
+    "MA": {
+      "n_full": 4,
+      "n_trunc": 4,
+      "n_dropped": 0,
+      "freshest_h": 67.49,
+      "oldest_h": 114.75,
+      "dropped_ages_h": []
+    },
+    "MELI": {
+      "n_full": 7,
+      "n_trunc": 6,
+      "n_dropped": 1,
+      "freshest_h": 0.9,
+      "oldest_h": 113.67,
+      "dropped_ages_h": [
+        113.67
+      ]
+    },
+    "META": {
+      "n_full": 20,
+      "n_trunc": 9,
+      "n_dropped": 11,
+      "freshest_h": 4.83,
+      "oldest_h": 77.5,
+      "dropped_ages_h": [
+        46.0,
+        48.92,
+        60.19,
+        60.67,
+        61.87,
+        62.87,
+        63.37,
+        65.47,
+        71.0,
+        71.5,
+        77.5
+      ]
+    },
+    "MPC": {
+      "n_full": 6,
+      "n_trunc": 5,
+      "n_dropped": 1,
+      "freshest_h": 0.0,
+      "oldest_h": 91.49,
+      "dropped_ages_h": [
+        91.49
+      ]
+    },
+    "MRK": {
+      "n_full": 14,
+      "n_trunc": 5,
+      "n_dropped": 9,
+      "freshest_h": 0.9,
+      "oldest_h": 140.55,
+      "dropped_ages_h": [
+        46.75,
+        73.63,
+        85.5,
+        90.0,
+        90.6,
+        91.49,
+        111.83,
+        112.92,
+        140.55
+      ]
+    },
+    "NCLH": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 16.93,
+      "oldest_h": 19.04,
+      "dropped_ages_h": []
+    },
+    "NUE": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 0.21,
+      "oldest_h": 22.54,
+      "dropped_ages_h": []
+    },
+    "NXPI": {
+      "n_full": 3,
+      "n_trunc": 2,
+      "n_dropped": 1,
+      "freshest_h": 14.12,
+      "oldest_h": 108.75,
+      "dropped_ages_h": [
+        108.75
+      ]
+    },
+    "OPCH": {
+      "n_full": 3,
+      "n_trunc": 2,
+      "n_dropped": 1,
+      "freshest_h": 1.2,
+      "oldest_h": 63.4,
+      "dropped_ages_h": [
+        63.4
+      ]
+    },
+    "P": {
+      "n_full": 6,
+      "n_trunc": 1,
+      "n_dropped": 5,
+      "freshest_h": 10.43,
+      "oldest_h": 165.17,
+      "dropped_ages_h": [
+        60.35,
+        60.85,
+        66.98,
+        140.53,
+        165.17
+      ]
+    },
+    "PANW": {
+      "n_full": 9,
+      "n_trunc": 5,
+      "n_dropped": 4,
+      "freshest_h": 2.4,
+      "oldest_h": 114.57,
+      "dropped_ages_h": [
+        88.85,
+        94.23,
+        96.93,
+        114.57
+      ]
+    },
+    "PCVX": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 18.94,
+      "oldest_h": 18.94,
+      "dropped_ages_h": []
+    },
+    "PFE": {
+      "n_full": 9,
+      "n_trunc": 2,
+      "n_dropped": 7,
+      "freshest_h": 0.13,
+      "oldest_h": 114.5,
+      "dropped_ages_h": [
+        58.5,
+        64.5,
+        69.92,
+        90.0,
+        91.49,
+        111.83,
+        114.5
+      ]
+    },
+    "PL": {
+      "n_full": 10,
+      "n_trunc": 2,
+      "n_dropped": 8,
+      "freshest_h": 13.14,
+      "oldest_h": 85.67,
+      "dropped_ages_h": [
+        61.42,
+        67.79,
+        69.0,
+        69.39,
+        69.72,
+        71.07,
+        73.35,
+        85.67
+      ]
+    },
+    "PSX": {
+      "n_full": 2,
+      "n_trunc": 1,
+      "n_dropped": 1,
+      "freshest_h": 1.51,
+      "oldest_h": 67.49,
+      "dropped_ages_h": [
+        67.49
+      ]
+    },
+    "QUAL": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 9.62,
+      "oldest_h": 9.62,
+      "dropped_ages_h": []
+    },
+    "RARE": {
+      "n_full": 11,
+      "n_trunc": 1,
+      "n_dropped": 10,
+      "freshest_h": 22.67,
+      "oldest_h": 91.58,
+      "dropped_ages_h": [
+        75.59,
+        78.62,
+        85.68,
+        85.69,
+        86.12,
+        86.83,
+        90.53,
+        91.49,
+        91.49,
+        91.58
+      ]
+    },
+    "REGN": {
+      "n_full": 6,
+      "n_trunc": 2,
+      "n_dropped": 4,
+      "freshest_h": 0.74,
+      "oldest_h": 115.0,
+      "dropped_ages_h": [
+        58.5,
+        64.5,
+        108.4,
+        115.0
+      ]
+    },
+    "RGEN": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 112.52,
+      "oldest_h": 112.52,
+      "dropped_ages_h": []
+    },
+    "RIVN": {
+      "n_full": 11,
+      "n_trunc": 4,
+      "n_dropped": 7,
+      "freshest_h": 12.42,
+      "oldest_h": 94.17,
+      "dropped_ages_h": [
+        65.62,
+        65.95,
+        87.91,
+        90.66,
+        92.5,
+        92.92,
+        94.17
+      ]
+    },
+    "ROKU": {
+      "n_full": 4,
+      "n_trunc": 2,
+      "n_dropped": 2,
+      "freshest_h": 1.03,
+      "oldest_h": 96.55,
+      "dropped_ages_h": [
+        84.63,
+        96.55
+      ]
+    },
+    "SBUX": {
+      "n_full": 5,
+      "n_trunc": 5,
+      "n_dropped": 0,
+      "freshest_h": 0.16,
+      "oldest_h": 1.33,
+      "dropped_ages_h": []
+    },
+    "SCSC": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 21.87,
+      "oldest_h": 21.87,
+      "dropped_ages_h": []
+    },
+    "SHAK": {
+      "n_full": 5,
+      "n_trunc": 5,
+      "n_dropped": 0,
+      "freshest_h": 67.5,
+      "oldest_h": 143.0,
+      "dropped_ages_h": []
+    },
+    "SPCX": {
+      "n_full": 20,
+      "n_trunc": 11,
+      "n_dropped": 9,
+      "freshest_h": 0.4,
+      "oldest_h": 74.75,
+      "dropped_ages_h": [
+        47.5,
+        48.92,
+        50.95,
+        63.52,
+        64.95,
+        67.43,
+        69.5,
+        69.73,
+        74.75
+      ]
+    },
+    "SPOT": {
+      "n_full": 4,
+      "n_trunc": 4,
+      "n_dropped": 0,
+      "freshest_h": 65.67,
+      "oldest_h": 117.44,
+      "dropped_ages_h": []
+    },
+    "STLA": {
+      "n_full": 4,
+      "n_trunc": 3,
+      "n_dropped": 1,
+      "freshest_h": 2.78,
+      "oldest_h": 89.92,
+      "dropped_ages_h": [
+        89.92
+      ]
+    },
+    "STX": {
+      "n_full": 3,
+      "n_trunc": 2,
+      "n_dropped": 1,
+      "freshest_h": 17.92,
+      "oldest_h": 63.88,
+      "dropped_ages_h": [
+        63.88
+      ]
+    },
+    "SUI": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 1.34,
+      "oldest_h": 1.34,
+      "dropped_ages_h": []
+    },
+    "TDG": {
+      "n_full": 5,
+      "n_trunc": 3,
+      "n_dropped": 2,
+      "freshest_h": 2.13,
+      "oldest_h": 91.49,
+      "dropped_ages_h": [
+        91.45,
+        91.49
+      ]
+    },
+    "TFX": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 18.51,
+      "oldest_h": 18.51,
+      "dropped_ages_h": []
+    },
+    "TSLA": {
+      "n_full": 20,
+      "n_trunc": 20,
+      "n_dropped": 0,
+      "freshest_h": 0.0,
+      "oldest_h": 10.85,
+      "dropped_ages_h": []
+    },
+    "TWST": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 4.05,
+      "oldest_h": 8.23,
+      "dropped_ages_h": []
+    },
+    "V": {
+      "n_full": 12,
+      "n_trunc": 10,
+      "n_dropped": 2,
+      "freshest_h": 1.33,
+      "oldest_h": 114.75,
+      "dropped_ages_h": [
+        109.25,
+        114.75
+      ]
+    },
+    "VCYT": {
+      "n_full": 4,
+      "n_trunc": 2,
+      "n_dropped": 2,
+      "freshest_h": 22.52,
+      "oldest_h": 112.5,
+      "dropped_ages_h": [
+        94.63,
+        112.5
+      ]
+    },
+    "WCC": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 4.45,
+      "oldest_h": 4.45,
+      "dropped_ages_h": []
+    },
+    "WING": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 94.58,
+      "oldest_h": 117.5,
+      "dropped_ages_h": []
+    },
+    "WLK": {
+      "n_full": 1,
+      "n_trunc": 1,
+      "n_dropped": 0,
+      "freshest_h": 91.49,
+      "oldest_h": 91.49,
+      "dropped_ages_h": []
+    },
+    "WOLF": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 13.7,
+      "oldest_h": 18.77,
+      "dropped_ages_h": []
+    },
+    "XLB": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 73.85,
+      "oldest_h": 166.2,
+      "dropped_ages_h": []
+    },
+    "XLC": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 73.85,
+      "oldest_h": 142.46,
+      "dropped_ages_h": []
+    },
+    "XLE": {
+      "n_full": 20,
+      "n_trunc": 4,
+      "n_dropped": 16,
+      "freshest_h": 8.95,
+      "oldest_h": 93.58,
+      "dropped_ages_h": [
+        27.8,
+        62.25,
+        63.04,
+        63.46,
+        65.08,
+        66.85,
+        67.49,
+        67.96,
+        69.39,
+        69.56,
+        70.7,
+        80.71,
+        81.5,
+        87.1,
+        89.02,
+        93.58
+      ]
+    },
+    "XLF": {
+      "n_full": 7,
+      "n_trunc": 3,
+      "n_dropped": 4,
+      "freshest_h": 3.57,
+      "oldest_h": 148.74,
+      "dropped_ages_h": [
+        98.68,
+        120.3,
+        142.11,
+        148.74
+      ]
+    },
+    "XLI": {
+      "n_full": 2,
+      "n_trunc": 2,
+      "n_dropped": 0,
+      "freshest_h": 71.5,
+      "oldest_h": 90.43,
+      "dropped_ages_h": []
+    },
+    "XLV": {
+      "n_full": 10,
+      "n_trunc": 2,
+      "n_dropped": 8,
+      "freshest_h": 0.0,
+      "oldest_h": 165.0,
+      "dropped_ages_h": [
+        64.5,
+        69.5,
+        69.73,
+        75.59,
+        91.34,
+        116.0,
+        134.3,
+        165.0
+      ]
+    },
+    "XOM": {
+      "n_full": 13,
+      "n_trunc": 9,
+      "n_dropped": 4,
+      "freshest_h": 0.55,
+      "oldest_h": 163.47,
+      "dropped_ages_h": [
+        63.46,
+        138.61,
+        152.87,
+        163.47
+      ]
+    }
+  },
+  "rows": {
+    "full": {
+      "AAP": {
+        "raw": -0.25,
+        "score": -0.1622,
+        "catalyst": "analyst",
+        "rationale": "The primary catalyst is the reduction in Q2 EPS estimates by an analyst, which suggests downward pressure on earnings expectations. The coverage frames the stock as a potential bargain due to profitability hopes, but the analyst downgrade i",
+        "lat": 3.3540990000474267,
+        "n_arts": 3
+      },
+      "AAUC": {
+        "raw": -0.15,
+        "score": -0.0785,
+        "catalyst": "insider_activity",
+        "rationale": "Groupe la Francaise's purchase of 124,443 shares of Allied Gold Corp indicates positive institutional interest, which typically leans bullish. However, the recent insider sale by Absolute Gestao de Investimentos Ltda. introduces some short-",
+        "lat": 2.4154184999642894,
+        "n_arts": 2
+      },
+      "ADBE": {
+        "raw": -0.35,
+        "score": -0.35,
+        "catalyst": "macro_sector",
+        "rationale": "Adobe's leadership change, with Anil Chakravarthy replacing Shantanu Narayen as CEO, has triggered mixed reactions. While some analysts and investors are optimistic about the new leadership's potential to drive innovation and address AI cha",
+        "lat": 5.292650400020648,
+        "n_arts": 20
+      },
+      "AEP": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news mentions that American Electric Power stock is holding steady as investors focus on earnings and dividend, indicating no new catalysts or directional movement. There is no specific event or news that directly impacts the stock pric",
+        "lat": 1.8064519999898039,
+        "n_arts": 1
+      },
+      "AEVA": {
+        "raw": 0.05,
+        "score": 0.0199,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses real-time signals in AEVA's stock movement, framing the stock as having potential for short-term directional movement based on technical analysis. The coverage is speculative and lacks concrete news about the company's",
+        "lat": 2.109050200029742,
+        "n_arts": 1
+      },
+      "AMPL": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The article discusses Amplitude's recent price drop and explores potential factors driving market attention, but it does not provide any specific news catalyst or directional insight about the company. The coverage is speculative and lacks ",
+        "lat": 1.8484019000316039,
+        "n_arts": 1
+      },
+      "ANF": {
+        "raw": 0.15,
+        "score": 0.112,
+        "catalyst": "insider_activity",
+        "rationale": "Paralel Advisors LLC's new investment in ANF and the 'Moderate Buy' analyst recommendation suggest positive sentiment, though the 'Strong Q2' performance and Jefferies' 18% upside call add further bullish momentum. However, the stock has al",
+        "lat": 2.6903005999629386,
+        "n_arts": 4
+      },
+      "AR": {
+        "raw": 0.15,
+        "score": 0.112,
+        "catalyst": "insider_activity",
+        "rationale": "The news highlights recent institutional investments in Antero Resources, which lean bullish due to the inflow of capital. However, the broader market context and the fact that these are routine institutional purchases suggest a minor posit",
+        "lat": 2.985840800043661,
+        "n_arts": 4
+      },
+      "AVGO": {
+        "raw": -0.65,
+        "score": -0.6225,
+        "catalyst": "earnings",
+        "rationale": "The dominant catalyst is Broadcom's strong Q3 earnings report with 85% revenue growth and AI semiconductor revenue surging 221%, but the stock fell due to slightly missing Q4 guidance. The coverage highlights the strong fundamentals and AI ",
+        "lat": 3.917350100004114,
+        "n_arts": 20
+      },
+      "AXP": {
+        "raw": -0.15,
+        "score": -0.1428,
+        "catalyst": "insider_activity",
+        "rationale": "American Express shares experienced a 1.1% drop pre-market, likely due to institutional selling and mixed sentiment from recent news. The stock is also being compared to Visa in analyst reports, which may have contributed to the negative se",
+        "lat": 4.078942399995867,
+        "n_arts": 14
+      },
+      "BILL": {
+        "raw": 0.25,
+        "score": 0.2266,
+        "catalyst": "macro_sector",
+        "rationale": "Bill Ackman's recent actions of exiting Alphabet and investing in a mega-cap stock down 42% from its high signal a shift in confidence towards undervalued assets. This is a macro-sector read-through, as Ackman's move could influence market ",
+        "lat": 3.700455999991391,
+        "n_arts": 15
+      },
+      "BLTE": {
+        "raw": 0.65,
+        "score": 0.2072,
+        "catalyst": "fda_clinical",
+        "rationale": "Belite Bio received FDA priority review for tinlarebant in Stargardt disease, which is a positive catalyst for the company's pipeline. The FDA's acceptance and priority review signal regulatory confidence, which can drive investor sentiment",
+        "lat": 2.245465099986177,
+        "n_arts": 1
+      },
+      "BRK-B": {
+        "raw": -0.15,
+        "score": -0.1497,
+        "catalyst": "capital_structure",
+        "rationale": "Berkshire Hathaway deployed $31 billion in Q2 2026, including $17 billion in Alphabet, $4.5 billion in buybacks, and increased positions in Delta and Macy's. While the cash balance fell from $397B to $366B, the move is largely priced in, wi",
+        "lat": 4.509782399982214,
+        "n_arts": 20
+      },
+      "BRK.A": {
+        "raw": -0.25,
+        "score": -0.2235,
+        "catalyst": "capital_structure",
+        "rationale": "Berkshire Hathaway's significant deployment of cash in Q2 2026, including major investments in Alphabet, Delta Air Lines, Macy's, and resuming share buybacks, indicates a shift in strategic positioning. However, the market has already price",
+        "lat": 3.6671575999935158,
+        "n_arts": 16
+      },
+      "CCAP": {
+        "raw": 0.35,
+        "score": 0.183,
+        "catalyst": "capital_structure",
+        "rationale": "BlackRock's purchase of 124,618 shares in Crescent Capital BDC, Inc. (CCAP) signals institutional confidence, leaning bullish. The move is a capital structure event with a material size relative to the company's market cap, and the source i",
+        "lat": 3.011576100019738,
+        "n_arts": 2
+      },
+      "CME": {
+        "raw": 0.35,
+        "score": 0.2971,
+        "catalyst": "product",
+        "rationale": "CME Group's new FX open interest record is a positive catalyst, indicating strong demand for its derivatives products. The price mechanism is bullish as increased open interest often signals investor confidence. However, the move is already",
+        "lat": 2.3899459000094794,
+        "n_arts": 8
+      },
+      "COP": {
+        "raw": 0.15,
+        "score": 0.0968,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights ConocoPhillips' strategic expansion in Venezuela, where it is doubling output with significant investment, positioning it ahead of competitors. However, the stock is currently holding steady, with no clear directional mo",
+        "lat": 1.9083684000070207,
+        "n_arts": 5
+      },
+      "CRC": {
+        "raw": 0.75,
+        "score": 0.2379,
+        "catalyst": "ma_deal",
+        "rationale": "CRC's $63M acquisition of Crimson Midstream is a clear positive catalyst, expanding its pipeline network and opening CO2 infrastructure opportunities. The move is likely to boost investor sentiment and operational flexibility, though some o",
+        "lat": 1.8085865000030026,
+        "n_arts": 1
+      },
+      "CTEV": {
+        "raw": 0.05,
+        "score": 0.0207,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses CTEV as a liquidity pulse for institutional tactics, suggesting it may be a focus for large investors. The coverage is framed positively, indicating potential short-term bullish interest without a specific event. Howev",
+        "lat": 2.082990599970799,
+        "n_arts": 1
+      },
+      "DAL": {
+        "raw": 0.45,
+        "score": 0.3596,
+        "catalyst": "macro_sector",
+        "rationale": "Delta Air Lines (DAL) received a short-term positive catalyst from the reopening of LaGuardia Airport following an incident involving Air Canada, which led to a jump in its stock price. The move is primarily driven by renewed optimism about",
+        "lat": 2.5567526999511756,
+        "n_arts": 6
+      },
+      "DDOG": {
+        "raw": -0.05,
+        "score": -0.0325,
+        "catalyst": "macro_sector",
+        "rationale": "The Saudi Central Bank and Groupe la Francaise have significant stakes in Datadog, which could signal institutional confidence. However, the news is indirect and lacks a direct price mechanism. The broader market context shows Datadog holdi",
+        "lat": 2.2150611000251956,
+        "n_arts": 4
+      },
+      "DOCU": {
+        "raw": 0.75,
+        "score": 0.551,
+        "catalyst": "earnings",
+        "rationale": "DocuSign's Q2 results exceeded expectations, with strong revenue growth and positive commentary on its AI platform's impact on growth. The coverage highlights improved IAM adoption and raised full-year revenue guidance, which is already par",
+        "lat": 2.369657000002917,
+        "n_arts": 13
+      },
+      "DRAM": {
+        "raw": 0.75,
+        "score": 0.4925,
+        "catalyst": "macro_sector",
+        "rationale": "The recent price action and social media commentary highlight a strong short-term bullish sentiment for DRAM, driven by the rally in related stocks like WDC, MU, STX, and SNDK. The ETF is seen as a beneficiary of the NAND pricing cycle and ",
+        "lat": 2.5024970999802463,
+        "n_arts": 4
+      },
+      "EAT": {
+        "raw": 0.25,
+        "score": 0.0801,
+        "catalyst": "product",
+        "rationale": "The stock has surged 69% over three months due to strong performance at Chili's, including comparable-sales growth and menu innovations. The positive momentum and EPS guidance suggest continued upside, but much of the move is already priced",
+        "lat": 1.6950283999904059,
+        "n_arts": 1
+      },
+      "EOSE": {
+        "raw": 0.25,
+        "score": 0.1531,
+        "catalyst": "contract_partnership",
+        "rationale": "The recent news highlights a series of positive catalysts, including a Google-backed long-duration storage deal and a collaboration with MN8 Energy for a PJM grid project in West Virginia. These developments validate Eos Energy's Z3 technol",
+        "lat": 3.202270299952943,
+        "n_arts": 11
+      },
+      "EQT": {
+        "raw": 0.35,
+        "score": 0.1382,
+        "catalyst": "capital_structure",
+        "rationale": "EQT stock gains as private capital assets under management grow, indicating positive sentiment from increased private capital inflows. The price mechanism is driven by improved investor confidence in the company's growth prospects. The move",
+        "lat": 2.053851799981203,
+        "n_arts": 1
+      },
+      "ETOR": {
+        "raw": 0.15,
+        "score": 0.0976,
+        "catalyst": "capital_structure",
+        "rationale": "Wellington Management Group LLP's new institutional stake in eToro Group Ltd. signals positive institutional interest, which typically leans bullish. The move is a capital_structure catalyst and is likely to have a minor positive impact in ",
+        "lat": 1.852542100008577,
+        "n_arts": 2
+      },
+      "FIVE": {
+        "raw": 0.15,
+        "score": 0.1249,
+        "catalyst": "capital_structure",
+        "rationale": "Varenne Capital Partners' $25.30 million investment in Five Below is a positive catalyst, while the Wall Street Zen downgrade introduces a bearish counterpoint. The investment is a significant capital injection, but the downgrade suggests g",
+        "lat": 2.8541661000344902,
+        "n_arts": 6
+      },
+      "FLR": {
+        "raw": 0.05,
+        "score": 0.016,
+        "catalyst": "macro_sector",
+        "rationale": "The article compares Fluor's performance to its construction peers, suggesting relative outperformance, which leans slightly bullish. However, there is no specific event or catalyst tied directly to Fluor, and the coverage is a sector round",
+        "lat": 1.8514343000133522,
+        "n_arts": 1
+      },
+      "GLD": {
+        "raw": 0.25,
+        "score": 0.1599,
+        "catalyst": "macro_sector",
+        "rationale": "The recent news highlights increased investor interest in GLD due to gold's August price rebound, with positive commentary and inflows into the ETF. The coverage frames GLD as a favorable investment in the current market environment, sugges",
+        "lat": 1.8553250000113621,
+        "n_arts": 4
+      },
+      "GOOG": {
+        "raw": -0.45,
+        "score": -0.4497,
+        "catalyst": "management",
+        "rationale": "The key catalyst is the news that Bill Ackman has exited Alphabet, betting on Netflix after a 42% plunge, which introduces negative sentiment toward Alphabet. This is corroborated by the mention of Berkshire Hathaway's stake in Alphabet Cla",
+        "lat": 5.080386399989948,
+        "n_arts": 20
+      },
+      "HLT": {
+        "raw": 0.65,
+        "score": 0.4383,
+        "catalyst": "insider_activity",
+        "rationale": "Institutional buying of HLT shares by Saudi Central Bank and Formuepleje A S, combined with the stock trading above $310 as investors focus on dividend and growth, indicates positive sentiment. The catalyst is institutional buying and inves",
+        "lat": 2.453743099991698,
+        "n_arts": 3
+      },
+      "HUT": {
+        "raw": 0.75,
+        "score": 0.6787,
+        "catalyst": "ma_deal",
+        "rationale": "Hut 8 Corp. (HUT) received a significant boost from the $35 billion Anthropic deal, which is a major catalyst for its AI pivot. The stock has already risen nearly 5% in overnight trading, suggesting much of the positive reaction is already ",
+        "lat": 3.0809393000090495,
+        "n_arts": 7
+      },
+      "HZO": {
+        "raw": 0.25,
+        "score": 0.1116,
+        "catalyst": "insider_activity",
+        "rationale": "Legal & General Group Plc's new $1.58 million investment in MarineMax Inc. is a positive catalyst, signaling confidence in the company's prospects. The investment is likely to support the stock price through increased demand and potential i",
+        "lat": 2.241089800023474,
+        "n_arts": 1
+      },
+      "IGV": {
+        "raw": 0.75,
+        "score": 0.5272,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights a rotation in favor of software stocks, with software ETFs like IGV outperforming semiconductors. This shift is supported by improved sentiment and performance in the software sector, which IGV tracks. The move is alread",
+        "lat": 2.4858713999856263,
+        "n_arts": 6
+      },
+      "IMPP": {
+        "raw": 0.05,
+        "score": 0.0219,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses institutional flows and behavioral patterns related to IMPP, suggesting a potential short-term bullish tilt due to increased institutional interest, though the information is indirect and lacks specific catalysts.",
+        "lat": 1.5843779999995604,
+        "n_arts": 1
+      },
+      "INTC": {
+        "raw": 0.15,
+        "score": 0.15,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have increased their holdings in Intel, indicating positive sentiment and potential short-term bullish momentum. Additionally, Trump's AI-related posts have amplified market attention, though the impact is s",
+        "lat": 4.37681759998668,
+        "n_arts": 20
+      },
+      "IWM": {
+        "raw": -0.05,
+        "score": -0.0304,
+        "catalyst": "macro_sector",
+        "rationale": "The news mentions the Russell 2000 (^RUT) and small-cap stocks multiple times, with mixed sentiment about their growth potential and risks. The ETF IWM, which tracks the Russell 2000, is noted in several articles, but the coverage is mixed ",
+        "lat": 3.359160599997267,
+        "n_arts": 7
+      },
+      "KLAR": {
+        "raw": 0.35,
+        "score": 0.1749,
+        "catalyst": "macro_sector",
+        "rationale": "The stock is rising due to positive sentiment from retail investors and management's optimism about US growth, despite mixed analyst reactions. The catalyst is primarily retail-driven bullish sentiment and management commentary, with some r",
+        "lat": 2.0288516000146046,
+        "n_arts": 3
+      },
+      "KRE": {
+        "raw": -0.15,
+        "score": -0.0474,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses KRE's composition of regional banks and highlights the trade-off between diversification and dividend growth, suggesting a negative outlook for the fund's holdings. The coverage frames the fund as less attractive for i",
+        "lat": 1.802145899971947,
+        "n_arts": 1
+      },
+      "LAZ": {
+        "raw": -0.25,
+        "score": -0.1486,
+        "catalyst": "management",
+        "rationale": "The departure of a senior executive (Binsted) from Lazard is a management catalyst that could negatively impact investor sentiment and confidence in the firm's leadership continuity. The move is likely to be viewed as a signal of internal i",
+        "lat": 2.7281870000297204,
+        "n_arts": 2
+      },
+      "LRCX": {
+        "raw": 0.45,
+        "score": 0.4163,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have increased or decreased their holdings in LRCX, with some notable activity from Virginia Retirement Systems, HighTower Advisors, and California State Teachers Retirement System. The stock has already jum",
+        "lat": 3.800040200003423,
+        "n_arts": 10
+      },
+      "LSCC": {
+        "raw": -0.15,
+        "score": -0.0481,
+        "catalyst": "earnings",
+        "rationale": "Lattice Semiconductor (LSCC) reported strong Q2 2026 results with non-GAAP earnings of 53 cents per share (up 120% YoY) and record revenues of $201.1 million (up 62.2% YoY), driven by robust AI data center demand for its low-power FPGAs. Th",
+        "lat": 3.237160499964375,
+        "n_arts": 1
+      },
+      "MA": {
+        "raw": 0.15,
+        "score": 0.0681,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights Mastercard's strong VAS revenue growth and expansion in cybersecurity and AI, which is positive for the stock. However, the coverage also notes competitive pressure from Visa and American Express, which could temper the ",
+        "lat": 2.6150854000006802,
+        "n_arts": 4
+      },
+      "MELI": {
+        "raw": -0.05,
+        "score": -0.0422,
+        "catalyst": "insider_activity",
+        "rationale": "The news highlights a mix of insider activity and institutional buying/selling, with no clear directional bias. The positive and negative actions are balanced, and the coverage is routine. The Motley Fool's recommendation is a minor positiv",
+        "lat": 2.6909710000036284,
+        "n_arts": 7
+      },
+      "META": {
+        "raw": 0.65,
+        "score": 0.6499,
+        "catalyst": "macro_sector",
+        "rationale": "The Motley Fool articles highlight Meta's strategic position in AI infrastructure, with major customers like OpenAI and Anthropic deploying AMD's GPUs and Meta's own AI initiatives. The recent news about Meta cutting AI output prices and th",
+        "lat": 4.301466400036588,
+        "n_arts": 20
+      },
+      "MPC": {
+        "raw": -0.25,
+        "score": -0.2333,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights Hormuz tensions potentially shifting MPC's focus, with Saudi Central Bank and Amundi holding significant positions, and a strong recent performance following Q2 2026 earnings. The stock has already gained 30% since the e",
+        "lat": 2.7208100000279956,
+        "n_arts": 6
+      },
+      "MRK": {
+        "raw": 0.65,
+        "score": 0.6016,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have increased their holdings in Merck & Co., Inc. (MRK), including Virginia Retirement Systems, Groupe la Francaise, HighTower Advisors LLC, and Amundi, signaling strong institutional confidence. These acti",
+        "lat": 3.5154039000044577,
+        "n_arts": 14
+      },
+      "NCLH": {
+        "raw": -0.35,
+        "score": -0.1934,
+        "catalyst": "macro_sector",
+        "rationale": "The stock is trading near its 52-week low as investors weigh a negative EBITDA outlook, indicating a bearish sentiment due to deteriorating earnings expectations. The coverage frames the stock as under pressure from weak financial guidance,",
+        "lat": 2.1323537999996915,
+        "n_arts": 2
+      },
+      "NUE": {
+        "raw": 0.65,
+        "score": 0.3203,
+        "catalyst": "insider_activity",
+        "rationale": "Nucor Corp stock gains after Saudi Central Bank boosts holdings, indicating increased institutional confidence and potential demand for steel products. The price mechanism is driven by institutional buying, and the move is already partially",
+        "lat": 2.0790876999963075,
+        "n_arts": 2
+      },
+      "NXPI": {
+        "raw": -0.25,
+        "score": -0.141,
+        "catalyst": "earnings",
+        "rationale": "The news highlights NXP's 2025 net income and EPS guidance, which are down compared to prior periods, indicating a potential earnings miss or weaker-than-expected growth. However, the Zacks report notes recent outperformance and strong forw",
+        "lat": 2.6087161999894306,
+        "n_arts": 3
+      },
+      "OPCH": {
+        "raw": 0.25,
+        "score": 0.177,
+        "catalyst": "insider_activity",
+        "rationale": "Paralel Advisors LLC's new stake in OPCH signals institutional confidence, leaning bullish with a minor magnitude due to the routine nature of the stake purchase. The coverage from DirectorsTalk Interviews highlights an 18% potential upside",
+        "lat": 2.5459577000001445,
+        "n_arts": 3
+      },
+      "P": {
+        "raw": 0.45,
+        "score": 0.2862,
+        "catalyst": "index_membership",
+        "rationale": "Everpure's stock surged on news of its inclusion in the S&P 500 index, which is a strong positive catalyst. The inclusion is a clear signal of increased institutional interest and market confidence. However, much of the move has already bee",
+        "lat": 2.407125600031577,
+        "n_arts": 6
+      },
+      "PANW": {
+        "raw": -0.25,
+        "score": -0.211,
+        "catalyst": "earnings",
+        "rationale": "Palo Alto Networks received a downgrade from PhillipCapital, which is a negative catalyst, but the stock also gained from S&P 100 inclusion and strong growth outlook. However, recent news highlights a recent pullback due to disappointing Q4",
+        "lat": 3.5147864999598823,
+        "n_arts": 9
+      },
+      "PCVX": {
+        "raw": 0.25,
+        "score": 0.0986,
+        "catalyst": "product",
+        "rationale": "The news indicates Vaxcyte has narrowed the timing for pivotal VAX-31 data to late October, which is a positive catalyst for the stock as it suggests progress in the development timeline. The price mechanism is likely to be driven by invest",
+        "lat": 2.594154199992772,
+        "n_arts": 1
+      },
+      "PFE": {
+        "raw": 0.15,
+        "score": 0.115,
+        "catalyst": "earnings",
+        "rationale": "Pfizer's stock gained on the Minipress XL exit and strong Q2 2026 figures, with the recent earnings report beating estimates and shares up 12.4% since. However, the positive move is already largely priced in, and the broader market sentimen",
+        "lat": 2.998580299958121,
+        "n_arts": 9
+      },
+      "PL": {
+        "raw": 0.65,
+        "score": 0.469,
+        "catalyst": "earnings",
+        "rationale": "Planet Labs (PL) reported a strong Q2 earnings beat and raised full-year revenue guidance, driven by robust military demand. The positive earnings surprise and guidance uplift have already been partially priced in, with the stock rallying o",
+        "lat": 2.7181210000417195,
+        "n_arts": 10
+      },
+      "PSX": {
+        "raw": -0.15,
+        "score": -0.0832,
+        "catalyst": "earnings",
+        "rationale": "Phillips 66's Q2 2026 earnings beat expectations, driving a 23.9% price increase, but the Zacks Rank #3 (Hold) suggests limited further upside. The move is largely priced in, with the primary catalyst already reflected in the stock's recent",
+        "lat": 2.224183499987703,
+        "n_arts": 2
+      },
+      "QUAL": {
+        "raw": 0.25,
+        "score": 0.1053,
+        "catalyst": "macro_sector",
+        "rationale": "The article highlights a renewed focus on quality global stocks amid returning market volatility, which is likely to benefit QUAL ETF as it tracks quality stocks. The coverage frames the ETF as a beneficiary of the trend, suggesting a posit",
+        "lat": 2.1860197000205517,
+        "n_arts": 1
+      },
+      "RARE": {
+        "raw": -0.05,
+        "score": -0.0307,
+        "catalyst": "legal_regulatory",
+        "rationale": "The dominant catalyst is the failure of Ultragenyx's Phase III Angelman syndrome study, which triggered a sharp sell-off and significant downside pressure. The stock has already reacted heavily to this news, with a 46% drop, and the remaini",
+        "lat": 2.6164796999655664,
+        "n_arts": 11
+      },
+      "REGN": {
+        "raw": -0.15,
+        "score": -0.101,
+        "catalyst": "legal_regulatory",
+        "rationale": "The dominant catalyst is the class action lawsuit against Regeneron, which introduces legal risk and potential negative sentiment. The stock has already partially reacted to this news, with a recent slip in value, so the remaining move is a",
+        "lat": 2.2015971999499016,
+        "n_arts": 6
+      },
+      "RGEN": {
+        "raw": 0.15,
+        "score": 0.0476,
+        "catalyst": "macro_sector",
+        "rationale": "The positive results from Novartis' REMODEL-1/-2 studies for remibrutinib, a BTK inhibitor, are relevant to RGEN as a competitor in the biological products space. The coverage highlights favorable safety and efficacy data, which could indir",
+        "lat": 2.5720627000555396,
+        "n_arts": 1
+      },
+      "RIVN": {
+        "raw": 0.15,
+        "score": 0.1209,
+        "catalyst": "macro_sector",
+        "rationale": "Rivian's stock surged on positive sentiment from high-profile endorsements and CEO comments about self-driving technology, but faced a class-action lawsuit. The positive news about the CEO's remarks and Governor Pritzker's praise is fresh a",
+        "lat": 3.301405199978035,
+        "n_arts": 11
+      },
+      "ROKU": {
+        "raw": 0.25,
+        "score": 0.1749,
+        "catalyst": "insider_activity",
+        "rationale": "Readystate Asset Management LP and Absolute Gestao de Investimentos Ltda. have taken significant institutional stakes in Roku, indicating positive sentiment and potential demand. These are routine institutional activity events, but the size",
+        "lat": 2.895504100015387,
+        "n_arts": 4
+      },
+      "SBUX": {
+        "raw": 0.05,
+        "score": 0.0444,
+        "catalyst": "macro_sector",
+        "rationale": "Starbucks experienced mixed institutional activity with both a reduction and new investment in its shares, but the overall sentiment is neutral. The news about the QSR market growth is indirect and leans bullish, but it is not specific to S",
+        "lat": 3.0924768000259064,
+        "n_arts": 5
+      },
+      "SCSC": {
+        "raw": -0.15,
+        "score": -0.0581,
+        "catalyst": "insider_activity",
+        "rationale": "Insider selling at ScanSource could signal negative sentiment among management, potentially leading to short-term downside pressure. However, the move is already partially priced in as the stock has not shown a significant reaction to the n",
+        "lat": 1.7244614000082947,
+        "n_arts": 1
+      },
+      "SHAK": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news primarily discusses Shake Shack's mixed recent performance and valuation concerns, with no specific catalyst or event directly impacting the stock. The coverage is speculative and does not provide new information or a clear directi",
+        "lat": 1.7012425999855623,
+        "n_arts": 5
+      },
+      "SPCX": {
+        "raw": 0.15,
+        "score": 0.1497,
+        "catalyst": "company_pr",
+        "rationale": "The news highlights mixed sentiment around SPCX, with some articles suggesting potential volatility due to insider selling and index fund buying, while others question the stock's valuation and growth prospects. However, the most recent new",
+        "lat": 4.067118700011633,
+        "n_arts": 20
+      },
+      "SPOT": {
+        "raw": -0.15,
+        "score": -0.068,
+        "catalyst": "earnings",
+        "rationale": "The recent news highlights Spotify's strong premium revenue growth and subscriber base, but also notes a miss on EPS and downward estimate revisions. The coverage is mixed, with positive fundamentals but a Hold rating and negative estimate ",
+        "lat": 2.0191016999888234,
+        "n_arts": 4
+      },
+      "STLA": {
+        "raw": -0.05,
+        "score": -0.0369,
+        "catalyst": "insider_activity",
+        "rationale": "The news highlights insider activity with Groupe la Francaise selling a significant number of shares, which leans slightly bearish. The sale is a minor catalyst with limited price impact, as it is a routine insider transaction. The stock ha",
+        "lat": 2.4885512000182644,
+        "n_arts": 4
+      },
+      "STX": {
+        "raw": 0.45,
+        "score": 0.2742,
+        "catalyst": "macro_sector",
+        "rationale": "The recent news highlights a broad memory bid that has lifted Seagate's stock, driven by strong fiscal 2026 results and a sector-wide rally. The move is primarily due to increased demand for storage solutions and a positive outlook for the ",
+        "lat": 2.534637400007341,
+        "n_arts": 3
+      },
+      "SUI": {
+        "raw": 0.15,
+        "score": 0.0675,
+        "catalyst": "capital_structure",
+        "rationale": "Nykredit A S has purchased 37,733 shares of Sun Communities, Inc., signaling positive institutional interest. The purchase is a capital structure event that leans bullish, though the size is modest relative to the company's market cap. The ",
+        "lat": 2.2703808000078425,
+        "n_arts": 1
+      },
+      "TDG": {
+        "raw": 0.15,
+        "score": 0.1103,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights that TransDigm Group's stock has edged higher as its valuation remains below the 52-week peak, indicating a slight positive sentiment. However, the stock has declined 8.1% since the last earnings report, despite strong e",
+        "lat": 3.265513699967414,
+        "n_arts": 5
+      },
+      "TFX": {
+        "raw": 0.05,
+        "score": 0.0198,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses Teleflex's Dynetic 35 showcase plans, suggesting potential interest in its products, which could lead to short-term positive momentum. The coverage is framed as a bullish outlook, but there is no specific event or fina",
+        "lat": 2.1913695999537595,
+        "n_arts": 1
+      },
+      "TSLA": {
+        "raw": 0.15,
+        "score": 0.1499,
+        "catalyst": "capital_structure",
+        "rationale": "The news highlights mixed sentiment with institutional buying activity and a disappointing Cybercab launch, which led to a short-term sell-off. The institutional buying is a minor bullish catalyst, while the Cybercab disappointment is a mod",
+        "lat": 4.955419400008395,
+        "n_arts": 20
+      },
+      "TWST": {
+        "raw": -0.05,
+        "score": -0.0308,
+        "catalyst": "none",
+        "rationale": "The stock has experienced 6 consecutive down days, down 19%, indicating a strong negative sentiment without any specific catalyst mentioned in the news digest. The coverage is a recap of the existing move, not a new catalyst, so the remaini",
+        "lat": 2.121252299984917,
+        "n_arts": 2
+      },
+      "V": {
+        "raw": 0.15,
+        "score": 0.1275,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have recently changed their positions in Visa Inc., with some buying shares and others selling. The positive activity includes purchases by HighTower Advisors LLC, Blacksheep Fund Management Ltd, and Amundi,",
+        "lat": 4.587964900012594,
+        "n_arts": 12
+      },
+      "VCYT": {
+        "raw": -0.35,
+        "score": -0.1713,
+        "catalyst": "insider_activity",
+        "rationale": "The news mentions insider activity at Veracyte with the Chief Scientific & Medical Officer selling 33% of their shares, which is a significant insider transaction leaning bearish. However, the move is already partially priced in as the stoc",
+        "lat": 2.2032668000319973,
+        "n_arts": 4
+      },
+      "WCC": {
+        "raw": 0.15,
+        "score": 0.0658,
+        "catalyst": "analyst",
+        "rationale": "MarketBeat has upgraded WESCO International to an average 'Buy' recommendation, which is a positive sentiment shift but lacks specific price-moving catalysts. The recommendation is a routine analyst action with no disclosed price target or ",
+        "lat": 2.030432600004133,
+        "n_arts": 1
+      },
+      "WING": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news mentions EAT's strong performance and positive momentum, but there is no direct connection to WING. The coverage is focused on a peer (EAT) and does not provide any specific catalyst or directional signal for WING. No event or news",
+        "lat": 1.971767799986992,
+        "n_arts": 2
+      },
+      "WLK": {
+        "raw": -0.25,
+        "score": -0.0802,
+        "catalyst": "earnings",
+        "rationale": "Westlake's Q2 2026 earnings beat expectations with strong segment performance, but shares have underperformed the S&P 50 despite the positive results, suggesting some pricing in and potential for follow-through.",
+        "lat": 1.6843103999854065,
+        "n_arts": 1
+      },
+      "WOLF": {
+        "raw": -0.05,
+        "score": -0.0281,
+        "catalyst": "none",
+        "rationale": "The stock is sliding premarket due to short-term volatility and trading system reactions, with no specific catalyst or directional news about WOLFSPEED, Inc. The coverage is speculative and lacks concrete information about the company's fun",
+        "lat": 2.426866699999664,
+        "n_arts": 2
+      },
+      "XLB": {
+        "raw": -0.25,
+        "score": -0.0992,
+        "catalyst": "macro_sector",
+        "rationale": "The VanEck Steel ETF and State Street Materials Select Sector SPDR swung sharply last week due to U.S.-Canada trade war tensions, which directly impacts XLB's sector. The move was already partially priced in, but the ongoing trade war could",
+        "lat": 2.0633680000319146,
+        "n_arts": 2
+      },
+      "XLC": {
+        "raw": -0.05,
+        "score": -0.0199,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights that XLC, despite its name, holds minimal telecom assets and is more aligned with broader tech holdings. This indirectly suggests a potential underperformance relative to pure telecom ETFs, but the coverage is a general ",
+        "lat": 2.637644700007513,
+        "n_arts": 2
+      },
+      "XLE": {
+        "raw": -0.25,
+        "score": -0.2249,
+        "catalyst": "macro_sector",
+        "rationale": "The energy sector is experiencing mixed sentiment with recent news highlighting both positive developments and volatility. Chevron's expansion in Venezuela and strong performance in oil prices are bullish, while energy stocks have shown dec",
+        "lat": 3.4214530999888666,
+        "n_arts": 20
+      },
+      "XLF": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news contains no direct or indirect information about XLF's holdings, sector, index, or underlying assets. The articles focus on Ping An and other unrelated stocks, with no mention of XLF or its components. No catalyst is priced in or e",
+        "lat": 2.344053899985738,
+        "n_arts": 7
+      },
+      "XLI": {
+        "raw": 0.25,
+        "score": 0.0833,
+        "catalyst": "macro_sector",
+        "rationale": "The Motley Fool article highlights increased capex by hyperscalers and the importance of industrial infrastructure for the AI boom, which is favorable for XLI's underlying industrial holdings. The broader market rally and industrials leadin",
+        "lat": 2.427903099975083,
+        "n_arts": 2
+      },
+      "XLV": {
+        "raw": -0.25,
+        "score": -0.1976,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights a mixed sentiment in the healthcare sector, with some positive developments like Vertex's competitive advantage and Lilly's Merida deal, but also negative news such as the crash of RARE stock and downgrades. These factor",
+        "lat": 2.746775900013745,
+        "n_arts": 10
+      },
+      "XOM": {
+        "raw": 0.05,
+        "score": 0.0499,
+        "catalyst": "macro_sector",
+        "rationale": "The recent news highlights mixed insider activity with both purchases and sales of ExxonMobil shares, along with a peer (Chevron) expanding operations in Venezuela, which indirectly suggests potential upside for XOM. However, the overall se",
+        "lat": 3.471144400013145,
+        "n_arts": 13
+      }
+    },
+    "trunc": {
+      "AAP": {
+        "raw": -0.25,
+        "score": -0.1487,
+        "catalyst": "analyst",
+        "rationale": "The analyst downgraded the Q2 EPS estimate for Advance Auto Parts, signaling a negative outlook for earnings, which could pressure the stock in the short-term. The coverage is framed as a cautionary note on profitability, with no significan",
+        "lat": 2.046352199977264,
+        "n_arts": 2
+      },
+      "AAUC": {
+        "raw": -0.15,
+        "score": -0.0785,
+        "catalyst": "insider_activity",
+        "rationale": "Groupe la Francaise's purchase of 124,443 shares of Allied Gold Corp indicates positive institutional interest, which typically leans bullish. However, the recent insider sale by Absolute Gestao de Investimentos Ltda. introduces some short-",
+        "lat": 2.414100000052713,
+        "n_arts": 2
+      },
+      "ADBE": {
+        "raw": -0.25,
+        "score": -0.2494,
+        "catalyst": "management",
+        "rationale": "Adobe's leadership shift with Anil Chakravarthy replacing Shantanu Narayen as CEO is a key catalyst, likely to influence investor sentiment and stock performance. The move is framed positively by some analysts and media, but the stock dippe",
+        "lat": 3.992178199987393,
+        "n_arts": 12
+      },
+      "AEP": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news mentions that American Electric Power stock is holding steady as investors focus on earnings and dividend, indicating no new catalysts or directional movement. There is no specific event or news that directly impacts the stock pric",
+        "lat": 1.7664415999897756,
+        "n_arts": 1
+      },
+      "AEVA": {
+        "raw": 0.05,
+        "score": 0.0199,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses real-time signals in AEVA's stock movement, framing the stock as having potential for short-term directional movement based on technical analysis. The coverage is speculative and lacks concrete news about the company's",
+        "lat": 2.0794331000070088,
+        "n_arts": 1
+      },
+      "AMPL": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The article discusses Amplitude's recent price drop and explores potential factors driving market attention, but it does not provide any specific news catalyst or directional insight about the company. The coverage is speculative and lacks ",
+        "lat": 1.820792300044559,
+        "n_arts": 1
+      },
+      "ANF": {
+        "raw": 0.35,
+        "score": 0.2383,
+        "catalyst": "insider_activity",
+        "rationale": "Paralel Advisors LLC's new investment in ANF signals positive institutional interest, while the 'Moderate Buy' analyst recommendation and Jefferies' 18% upside potential reinforce bullish sentiment. However, the stock has already reacted to",
+        "lat": 2.415388100023847,
+        "n_arts": 3
+      },
+      "AR": {
+        "raw": 0.65,
+        "score": 0.4424,
+        "catalyst": "insider_activity",
+        "rationale": "Readystate Asset Management LP and VELA Investment Management LLC made significant investments in Antero Resources Corporation, signaling institutional confidence. These are positive catalysts for the short-term direction. The news is recen",
+        "lat": 2.0582775000366382,
+        "n_arts": 3
+      },
+      "AVGO": {
+        "raw": 0.35,
+        "score": 0.3028,
+        "catalyst": "product",
+        "rationale": "The coverage highlights Broadcom's strong AI chip revenue growth and its undervaluation, with multiple articles noting its discount relative to peers and positive outlook for AI-driven demand. The sentiment is bullish, but much of the posit",
+        "lat": 2.20032619999256,
+        "n_arts": 6
+      },
+      "AXP": {
+        "raw": -0.15,
+        "score": -0.1354,
+        "catalyst": "macro_sector",
+        "rationale": "American Express shares closed lower after a 1.1% drop, indicating some negative sentiment, while recent institutional activity shows mixed signals with both a large investment and a sale. The stock is already priced in the recent decline, ",
+        "lat": 2.4734997000196017,
+        "n_arts": 6
+      },
+      "BILL": {
+        "raw": -0.15,
+        "score": -0.1164,
+        "catalyst": "macro_sector",
+        "rationale": "Bill Ackman's decision to sell Alphabet stock and buy a mega-cap stock down 42% from its high signals a shift in his investment focus, potentially impacting market sentiment toward the sectors involved. However, since the news does not dire",
+        "lat": 2.3974405999761075,
+        "n_arts": 3
+      },
+      "BLTE": {
+        "raw": 0.65,
+        "score": 0.2072,
+        "catalyst": "fda_clinical",
+        "rationale": "Belite Bio received FDA priority review for tinlarebant in Stargardt disease, which is a positive catalyst for the company's pipeline. The FDA's acceptance and priority review signal regulatory confidence, which can drive investor sentiment",
+        "lat": 2.2142840000451542,
+        "n_arts": 1
+      },
+      "BRK-B": {
+        "raw": -0.25,
+        "score": -0.2453,
+        "catalyst": "capital_structure",
+        "rationale": "Berkshire Hathaway deployed $31 billion of its cash in Q2 2026, including $17 billion in Alphabet, increased positions in Delta and Macy's, and resumed buybacks. These actions signal active investment and confidence in these assets, but the",
+        "lat": 3.4422171999467537,
+        "n_arts": 9
+      },
+      "BRK.A": {
+        "raw": 0.65,
+        "score": 0.5077,
+        "catalyst": "capital_structure",
+        "rationale": "Berkshire Hathaway's significant deployment of cash in Q2 2026, including major investments in Alphabet, Delta Air Lines, Macy's, and share buybacks, signals active capital allocation and confidence in these assets. The move is a clear posi",
+        "lat": 2.715718300023582,
+        "n_arts": 5
+      },
+      "CCAP": {
+        "raw": 0.35,
+        "score": 0.183,
+        "catalyst": "capital_structure",
+        "rationale": "BlackRock's purchase of 124,618 shares in Crescent Capital BDC, Inc. (CCAP) signals institutional confidence, leaning bullish. The move is a capital structure event with a material size relative to the company's market cap, and the source i",
+        "lat": 2.920956899994053,
+        "n_arts": 2
+      },
+      "CME": {
+        "raw": 0.35,
+        "score": 0.2769,
+        "catalyst": "product",
+        "rationale": "CME Group's new FX open interest record is a positive catalyst, indicating strong demand for its derivatives products. The move is primarily driven by the record open interest, which suggests increased market participation and confidence. H",
+        "lat": 2.4254542000126094,
+        "n_arts": 4
+      },
+      "COP": {
+        "raw": -0.05,
+        "score": -0.0279,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights Chevron's expansion in Venezuela, which indirectly suggests ConocoPhillips may face competitive pressure or strategic shifts in the region. However, ConocoPhillips' stock is holding steady with no direct catalyst, and th",
+        "lat": 1.9728475000010803,
+        "n_arts": 2
+      },
+      "CRC": {
+        "raw": 0.75,
+        "score": 0.2379,
+        "catalyst": "ma_deal",
+        "rationale": "CRC's $63M acquisition of Crimson Midstream is a clear positive catalyst, expanding its pipeline network and opening CO2 infrastructure opportunities. The move is likely to boost investor sentiment and operational flexibility, though some o",
+        "lat": 1.7845051000476815,
+        "n_arts": 1
+      },
+      "CTEV": {
+        "raw": 0.05,
+        "score": 0.0207,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses CTEV as a liquidity pulse for institutional tactics, suggesting it may be a focus for large investors. The coverage is framed positively, indicating potential short-term bullish interest without a specific event. Howev",
+        "lat": 2.054189899994526,
+        "n_arts": 1
+      },
+      "DAL": {
+        "raw": 0.25,
+        "score": 0.1911,
+        "catalyst": "macro_sector",
+        "rationale": "Delta Air Lines (DAL) received a short-term positive catalyst from the reopening of LaGuardia Airport following an Air Canada crash, which is expected to boost travel demand and, by extension, DAL's performance. The news is corroborated by ",
+        "lat": 2.5295873999712057,
+        "n_arts": 4
+      },
+      "DDOG": {
+        "raw": 0.15,
+        "score": 0.0792,
+        "catalyst": "insider_activity",
+        "rationale": "The Saudi Central Bank and Groupe la Francaise have significant stakes in Datadog, which could signal institutional confidence. However, these holdings are relatively small compared to Datadog's market cap and may not immediately impact the",
+        "lat": 2.3710872000083327,
+        "n_arts": 2
+      },
+      "DOCU": {
+        "raw": 0.65,
+        "score": 0.2939,
+        "catalyst": "earnings",
+        "rationale": "DocuSign's Q2 beat and the positive commentary on its AI platform as a new growth engine suggest a bullish short-term catalyst. The coverage highlights improved performance and a growth driver, which could push the stock higher. However, th",
+        "lat": 2.181167800037656,
+        "n_arts": 2
+      },
+      "DRAM": {
+        "raw": 0.35,
+        "score": 0.2001,
+        "catalyst": "macro_sector",
+        "rationale": "The recent social media sentiment and short-term price action suggest a positive directional move for DRAM due to the strong performance of its underlying holdings (WDC, MU, STX, SNDK). The coverage frames DRAM as benefiting from the breako",
+        "lat": 2.690286200027913,
+        "n_arts": 2
+      },
+      "EAT": {
+        "raw": 0.25,
+        "score": 0.0801,
+        "catalyst": "product",
+        "rationale": "The stock has surged 69% over three months due to strong performance at Chili's, including comparable-sales growth and menu innovations. The positive momentum and EPS guidance suggest continued upside, but much of the move is already priced",
+        "lat": 1.6759649000014178,
+        "n_arts": 1
+      },
+      "EOSE": {
+        "raw": 0.15,
+        "score": 0.0589,
+        "catalyst": "contract_partnership",
+        "rationale": "Eos Energy (EOSE) saw a 19.0% surge following a Google-backed long-duration storage deal, indicating strong market sentiment. The catalyst is a partnership that could drive growth, but much of the move is already priced in, leaving a minor ",
+        "lat": 2.052770700014662,
+        "n_arts": 1
+      },
+      "EQT": {
+        "raw": 0.35,
+        "score": 0.1382,
+        "catalyst": "capital_structure",
+        "rationale": "EQT stock gains as private capital assets under management grow, indicating positive sentiment from increased private capital inflows. The price mechanism is driven by improved investor confidence in the company's growth prospects. The move",
+        "lat": 2.0322485999786295,
+        "n_arts": 1
+      },
+      "ETOR": {
+        "raw": 0.15,
+        "score": 0.0976,
+        "catalyst": "capital_structure",
+        "rationale": "Wellington Management Group LLP's new institutional stake in eToro Group Ltd. signals positive institutional interest, which typically leans bullish. The move is a capital_structure catalyst and is likely to have a minor positive impact in ",
+        "lat": 1.8266901000170037,
+        "n_arts": 2
+      },
+      "FIVE": {
+        "raw": -0.25,
+        "score": -0.1836,
+        "catalyst": "capital_structure",
+        "rationale": "Varenne Capital Partners' $25.30 million investment in Five Below is a positive catalyst, but it is offset by the recent downgrade from Wall Street Zen. The investment is a minor positive, while the downgrade is a moderate negative. The inv",
+        "lat": 3.1862137999851257,
+        "n_arts": 4
+      },
+      "FLR": {
+        "raw": 0.05,
+        "score": 0.016,
+        "catalyst": "macro_sector",
+        "rationale": "The article compares Fluor's performance to its construction peers, suggesting relative outperformance, which leans slightly bullish. However, there is no specific event or catalyst tied directly to Fluor, and the coverage is a sector round",
+        "lat": 1.8074520000373013,
+        "n_arts": 1
+      },
+      "GLD": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news item is a price chart for gold, but it does not provide any new or actionable information about GLD or its underlying asset. There is no catalyst or directional signal in the digest that connects to GLD's price movement.",
+        "lat": 1.6789850000059232,
+        "n_arts": 1
+      },
+      "GOOG": {
+        "raw": -0.25,
+        "score": -0.2498,
+        "catalyst": "insider_activity",
+        "rationale": "The key catalyst is the news that Bill Ackman has exited Alphabet, betting on Netflix after a 42% plunge, which is a negative sentiment for Alphabet. This is a major insider activity and a significant shift in investor confidence, though it",
+        "lat": 4.707426199980546,
+        "n_arts": 20
+      },
+      "HLT": {
+        "raw": 0.65,
+        "score": 0.4383,
+        "catalyst": "insider_activity",
+        "rationale": "Institutional buying of HLT shares by Saudi Central Bank and Formuepleje A S, combined with the stock trading above $310 as investors focus on dividend and growth, indicates positive sentiment. The catalyst is institutional buying and inves",
+        "lat": 2.408603700052481,
+        "n_arts": 3
+      },
+      "HUT": {
+        "raw": 0.75,
+        "score": 0.6631,
+        "catalyst": "ma_deal",
+        "rationale": "Hut 8 Corp. (HUT) is seeing a strong short-term bullish push due to its strategic pivot towards AI infrastructure, bolstered by the $35 billion Anthropic deal. The news is driving positive sentiment and is already reflected in the overnight",
+        "lat": 3.2003628999809735,
+        "n_arts": 6
+      },
+      "HZO": {
+        "raw": 0.25,
+        "score": 0.1116,
+        "catalyst": "insider_activity",
+        "rationale": "Legal & General Group Plc's new $1.58 million investment in MarineMax Inc. is a positive catalyst, signaling confidence in the company's prospects. The investment is likely to support the stock price through increased demand and potential i",
+        "lat": 2.213712500000838,
+        "n_arts": 1
+      },
+      "IGV": {
+        "raw": -0.15,
+        "score": -0.0893,
+        "catalyst": "macro_sector",
+        "rationale": "The coverage highlights a broader sectoral shift in software stocks, with IBM warning about spending migration to servers and cybersecurity, which indirectly affects the tech-software sector ETF (IGV). The tone is bearish, suggesting a pote",
+        "lat": 2.6020702000241727,
+        "n_arts": 2
+      },
+      "IMPP": {
+        "raw": 0.05,
+        "score": 0.0219,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses institutional flows and behavioral patterns related to IMPP, suggesting a potential short-term bullish tilt due to increased institutional interest, though the information is indirect and lacks specific catalysts.",
+        "lat": 1.5246195999789052,
+        "n_arts": 1
+      },
+      "INTC": {
+        "raw": 0.15,
+        "score": 0.15,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have increased their holdings in Intel, indicating positive sentiment and potential near-term support. However, the stock has already reacted strongly to the AI-driven rally, and the remaining move is likely",
+        "lat": 4.183394699997734,
+        "n_arts": 20
+      },
+      "IWM": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses the Lazard US Small Cap Equity Select Portfolio (LZCOX), which is a fund that holds small-cap equities. Since IWM is an ETF that tracks the Russell 2000 index, which is heavily weighted toward small-cap stocks, the com",
+        "lat": 3.2027078000246547,
+        "n_arts": 1
+      },
+      "KLAR": {
+        "raw": 0.35,
+        "score": 0.1749,
+        "catalyst": "macro_sector",
+        "rationale": "The stock is rising due to positive sentiment from retail investors and management's optimism about US growth, despite mixed analyst reactions. The catalyst is primarily retail-driven bullish sentiment and management commentary, with some r",
+        "lat": 1.9913674000417814,
+        "n_arts": 3
+      },
+      "KRE": {
+        "raw": -0.15,
+        "score": -0.0474,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses KRE's composition of regional banks and highlights the trade-off between diversification and dividend growth, suggesting a negative outlook for the fund's holdings. The coverage frames the fund as less attractive for i",
+        "lat": 1.7839371000300162,
+        "n_arts": 1
+      },
+      "LAZ": {
+        "raw": -0.25,
+        "score": -0.1486,
+        "catalyst": "management",
+        "rationale": "The departure of a senior executive (Binsted) from Lazard is a management catalyst that could negatively impact investor sentiment and confidence in the firm's leadership continuity. The move is likely to be viewed as a signal of internal i",
+        "lat": 2.7024429999873973,
+        "n_arts": 2
+      },
+      "LRCX": {
+        "raw": 0.45,
+        "score": 0.3825,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have increased or decreased their holdings in LRCX, with some notable activity from Virginia Retirement Systems, HighTower Advisors, and California State Teachers Retirement System. The stock has already jum",
+        "lat": 3.5648112999624573,
+        "n_arts": 9
+      },
+      "LSCC": {
+        "raw": -0.15,
+        "score": -0.0481,
+        "catalyst": "earnings",
+        "rationale": "Lattice Semiconductor (LSCC) reported strong Q2 2026 results with non-GAAP earnings of 53 cents per share (up 120% YoY) and record revenues of $201.1 million (up 62.2% YoY), driven by robust AI data center demand for its low-power FPGAs. Th",
+        "lat": 3.2099732999922708,
+        "n_arts": 1
+      },
+      "MA": {
+        "raw": 0.15,
+        "score": 0.0681,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights Mastercard's strong VAS revenue growth and expansion in cybersecurity and AI, which is positive for the stock. However, the coverage also notes competitive pressure from Visa and American Express, which could temper the ",
+        "lat": 2.5788804999901913,
+        "n_arts": 4
+      },
+      "MELI": {
+        "raw": -0.05,
+        "score": -0.0347,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have recently changed their positions in MercadoLibre, with some reducing holdings and others increasing them. These actions suggest mixed sentiment, but the overall impact is minor due to the small size of ",
+        "lat": 2.7909258999861777,
+        "n_arts": 6
+      },
+      "META": {
+        "raw": 0.45,
+        "score": 0.4458,
+        "catalyst": "macro_sector",
+        "rationale": "The news includes a positive sentiment from The Motley Fool highlighting Meta's role in AMD's data center growth, which is a macro-sector read-through. The stock is also showing technical strength with a breakout above resistance, indicatin",
+        "lat": 3.099610599980224,
+        "n_arts": 9
+      },
+      "MPC": {
+        "raw": 0.05,
+        "score": 0.0457,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights Saudi Central Bank and Amundi's significant stock positions in MPC, which lean bullish due to institutional interest. However, the coverage is framed as commentary rather than a catalyst, and the move is already partiall",
+        "lat": 2.575377099972684,
+        "n_arts": 5
+      },
+      "MRK": {
+        "raw": 0.65,
+        "score": 0.5097,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have increased their holdings in Merck & Co., Inc. ($MRK), including Virginia Retirement Systems, Groupe la Francaise, HighTower Advisors LLC, and Amundi. These are all positive signs of institutional confid",
+        "lat": 2.9968530000187457,
+        "n_arts": 5
+      },
+      "NCLH": {
+        "raw": -0.35,
+        "score": -0.1934,
+        "catalyst": "macro_sector",
+        "rationale": "The stock is trading near its 52-week low as investors weigh a negative EBITDA outlook, indicating a bearish sentiment due to deteriorating earnings expectations. The coverage frames the stock as under pressure from weak financial guidance,",
+        "lat": 2.0486768999835476,
+        "n_arts": 2
+      },
+      "NUE": {
+        "raw": 0.65,
+        "score": 0.3203,
+        "catalyst": "insider_activity",
+        "rationale": "Nucor Corp stock gains after Saudi Central Bank boosts holdings, indicating increased institutional confidence and potential demand for steel products. The price mechanism is driven by institutional buying, and the move is already partially",
+        "lat": 2.0495336000458337,
+        "n_arts": 2
+      },
+      "NXPI": {
+        "raw": -0.65,
+        "score": -0.3009,
+        "catalyst": "guidance",
+        "rationale": "The news highlights a significant decline in NXP Semiconductors' projected 2025 net income and EPS, both down by 19.5% and 18.3% respectively. This is a forward-looking guidance update that signals weaker-than-expected performance, which is",
+        "lat": 2.7237438000156544,
+        "n_arts": 2
+      },
+      "OPCH": {
+        "raw": 0.25,
+        "score": 0.1608,
+        "catalyst": "insider_activity",
+        "rationale": "Paralel Advisors LLC's new stake in OPCH signals institutional interest, leaning bullish with a minor magnitude due to the lack of disclosed size or binding terms. The coverage from DirectorsTalk Interviews highlights an 18% potential upsid",
+        "lat": 2.136676600028295,
+        "n_arts": 2
+      },
+      "P": {
+        "raw": 0.25,
+        "score": 0.1046,
+        "catalyst": "macro_sector",
+        "rationale": "The stock surged 6.5% on news of a raised 2027 revenue outlook tied to AI storage demand, indicating strong investor sentiment toward the company's positioning in the growing AI storage sector. The move suggests the narrative is already par",
+        "lat": 2.0731708999956027,
+        "n_arts": 1
+      },
+      "PANW": {
+        "raw": -0.25,
+        "score": -0.2063,
+        "catalyst": "macro_sector",
+        "rationale": "Palo Alto Networks received mixed news: a downgrade from PhillipCapital and a positive earnings report with upbeat guidance, while also being included in the S&P 100. However, the stock already reacted to the S&P 100 inclusion and strong gr",
+        "lat": 3.3968012999976054,
+        "n_arts": 5
+      },
+      "PCVX": {
+        "raw": 0.25,
+        "score": 0.0986,
+        "catalyst": "product",
+        "rationale": "The news indicates Vaxcyte has narrowed the timing for pivotal VAX-31 data to late October, which is a positive catalyst for the stock as it suggests progress in the development timeline. The price mechanism is likely to be driven by invest",
+        "lat": 2.5732938000001013,
+        "n_arts": 1
+      },
+      "PFE": {
+        "raw": 0.65,
+        "score": 0.4226,
+        "catalyst": "contract_partnership",
+        "rationale": "The news highlights Pfizer's positive reaction to the Minipress XL exit and solid Q2 2026 figures, indicating strong short-term momentum. The coverage frames the stock movement as a result of these factors, with limited pricing already refl",
+        "lat": 1.9444211999652907,
+        "n_arts": 2
+      },
+      "PL": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news highlights retail sentiment and a recent rebound in Planet Labs' stock following a prior decline, with Stocktwits users praising the company's 'consistent demand' ahead of earnings. The coverage frames the stock as recovering, but ",
+        "lat": 2.209974500001408,
+        "n_arts": 2
+      },
+      "PSX": {
+        "raw": -0.25,
+        "score": -0.1123,
+        "catalyst": "macro_sector",
+        "rationale": "The stock is under selling pressure with a midday decline of 1,003.40 points, indicating short-term bearish sentiment. The move appears to be a reaction to broader market conditions or sector-specific weakness, with no specific catalyst dir",
+        "lat": 2.35972689994378,
+        "n_arts": 1
+      },
+      "QUAL": {
+        "raw": 0.25,
+        "score": 0.1053,
+        "catalyst": "macro_sector",
+        "rationale": "The article highlights a renewed focus on quality global stocks amid returning market volatility, which is likely to benefit QUAL ETF as it tracks quality stocks. The coverage frames the ETF as a beneficiary of the trend, suggesting a posit",
+        "lat": 2.1654787000152282,
+        "n_arts": 1
+      },
+      "RARE": {
+        "raw": 0.15,
+        "score": 0.0578,
+        "catalyst": "product",
+        "rationale": "The stock edged up due to a priority review for a gene therapy in a rare metabolic disorder, which is a positive catalyst. The move is likely a reaction to the news rather than a full repricing, so the remaining move is a minor lean up.",
+        "lat": 1.8408437999896705,
+        "n_arts": 1
+      },
+      "REGN": {
+        "raw": -0.15,
+        "score": -0.0739,
+        "catalyst": "capital_structure",
+        "rationale": "The news mentions Regeneron's stock slipping on its $85.2 billion market value, which suggests a potential overvaluation concern. However, the stock is holding near lofty levels, indicating some support. The class action risk mentioned is a",
+        "lat": 2.661449500010349,
+        "n_arts": 2
+      },
+      "RGEN": {
+        "raw": 0.15,
+        "score": 0.0476,
+        "catalyst": "macro_sector",
+        "rationale": "The positive results from Novartis' REMODEL-1/-2 studies for remibrutinib, a BTK inhibitor, are relevant to RGEN as a competitor in the biological products space. The coverage highlights favorable safety and efficacy data, which could indir",
+        "lat": 2.539860500022769,
+        "n_arts": 1
+      },
+      "RIVN": {
+        "raw": 0.75,
+        "score": 0.4135,
+        "catalyst": "macro_sector",
+        "rationale": "Rivian's stock experienced a sharp short-term rally due to positive sentiment around its R2 vehicle and CEO comments on self-driving technology, despite a lawsuit and discount reversal. The positive news about the R2 and FSD system is fresh",
+        "lat": 2.5965026000048965,
+        "n_arts": 4
+      },
+      "ROKU": {
+        "raw": 0.15,
+        "score": 0.0787,
+        "catalyst": "insider_activity",
+        "rationale": "Readystate Asset Management LP and Absolute Gestao de Investimentos Ltda. have taken positions in Roku, Inc., indicating institutional interest. The coverage highlights new institutional stakes, which typically lean bullish. However, the im",
+        "lat": 2.264156199991703,
+        "n_arts": 2
+      },
+      "SBUX": {
+        "raw": 0.05,
+        "score": 0.0444,
+        "catalyst": "macro_sector",
+        "rationale": "Starbucks experienced mixed institutional activity with both a reduction and new investment in its shares, but the overall sentiment is neutral. The news about the QSR market growth is indirect and leans bullish, but it is not specific to S",
+        "lat": 3.0534496000036597,
+        "n_arts": 5
+      },
+      "SCSC": {
+        "raw": -0.15,
+        "score": -0.0581,
+        "catalyst": "insider_activity",
+        "rationale": "Insider selling at ScanSource could signal negative sentiment among management, potentially leading to short-term downside pressure. However, the move is already partially priced in as the stock has not shown a significant reaction to the n",
+        "lat": 1.7090466999798082,
+        "n_arts": 1
+      },
+      "SHAK": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news primarily discusses Shake Shack's mixed recent performance and valuation concerns, with no specific catalyst or event directly impacting the stock. The coverage is speculative and does not provide new information or a clear directi",
+        "lat": 1.6805559999775141,
+        "n_arts": 5
+      },
+      "SPCX": {
+        "raw": -0.25,
+        "score": -0.2488,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights mixed sentiment with a focus on SpaceX's valuation concerns, potential dilution from early investor unlock, and negative commentary on its financials and valuation. However, there is a positive catalyst from a new invest",
+        "lat": 3.6026511000236496,
+        "n_arts": 11
+      },
+      "SPOT": {
+        "raw": -0.15,
+        "score": -0.068,
+        "catalyst": "earnings",
+        "rationale": "The recent news highlights Spotify's strong premium revenue growth and subscriber base, but also notes a miss on EPS and downward estimate revisions. The coverage is mixed, with positive fundamentals but a Hold rating and negative estimate ",
+        "lat": 1.992309599998407,
+        "n_arts": 4
+      },
+      "STLA": {
+        "raw": -0.15,
+        "score": -0.1059,
+        "catalyst": "insider_activity",
+        "rationale": "The news highlights insider activity with a significant sale of shares by Groupe la Francaise, which typically leans slightly bearish. However, the stock has already reacted positively to the broader strategic shifts and dealer changes, sug",
+        "lat": 2.2090941999922507,
+        "n_arts": 3
+      },
+      "STX": {
+        "raw": 0.65,
+        "score": 0.3572,
+        "catalyst": "earnings",
+        "rationale": "The stock gained due to strong fiscal 2026 results that boosted the outlook, indicating positive earnings performance and improved expectations. The price mechanism is driven by improved earnings and forward guidance, with the move already ",
+        "lat": 1.8665286999894306,
+        "n_arts": 2
+      },
+      "SUI": {
+        "raw": 0.15,
+        "score": 0.0675,
+        "catalyst": "capital_structure",
+        "rationale": "Nykredit A S has purchased 37,733 shares of Sun Communities, Inc., signaling positive institutional interest. The purchase is a capital structure event that leans bullish, though the size is modest relative to the company's market cap. The ",
+        "lat": 2.2435463999863714,
+        "n_arts": 1
+      },
+      "TDG": {
+        "raw": 0.15,
+        "score": 0.1007,
+        "catalyst": "insider_activity",
+        "rationale": "The news highlights institutional investors like the California State Teachers Retirement System and Crow's Nest Holdings LP increasing their positions in TDG, which leans bullish due to the significance of large institutional stakes. Howev",
+        "lat": 2.2267508000368252,
+        "n_arts": 3
+      },
+      "TFX": {
+        "raw": 0.05,
+        "score": 0.0198,
+        "catalyst": "macro_sector",
+        "rationale": "The article discusses Teleflex's Dynetic 35 showcase plans, suggesting potential interest in its products, which could lead to short-term positive momentum. The coverage is framed as a bullish outlook, but there is no specific event or fina",
+        "lat": 2.154731999966316,
+        "n_arts": 1
+      },
+      "TSLA": {
+        "raw": -0.35,
+        "score": -0.3498,
+        "catalyst": "management",
+        "rationale": "The news highlights mixed sentiment with institutional buying activity and a disappointing Cybercab launch, which has led to a short-term negative lean. However, the recent institutional purchases and positive commentary on AI integration p",
+        "lat": 4.614663099986501,
+        "n_arts": 20
+      },
+      "TWST": {
+        "raw": -0.05,
+        "score": -0.0308,
+        "catalyst": "none",
+        "rationale": "The stock has experienced 6 consecutive down days, down 19%, indicating a strong negative sentiment without any specific catalyst mentioned in the news digest. The coverage is a recap of the existing move, not a new catalyst, so the remaini",
+        "lat": 2.101858199981507,
+        "n_arts": 2
+      },
+      "V": {
+        "raw": -0.25,
+        "score": -0.175,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional transactions occurred within the last 5 hours, including both buying and selling activity. The dominant catalyst is the mixed insider activity, with some institutions increasing holdings while others are reducing or s",
+        "lat": 3.407046900014393,
+        "n_arts": 10
+      },
+      "VCYT": {
+        "raw": -0.75,
+        "score": -0.3624,
+        "catalyst": "insider_activity",
+        "rationale": "The insider sale of 33% of shares by Veracyte's Chief Scientific & Medical Officer is a significant negative catalyst, indicating potential loss of confidence in the company's direction. This insider activity typically signals a bearish lea",
+        "lat": 2.8118765000253916,
+        "n_arts": 2
+      },
+      "WCC": {
+        "raw": 0.15,
+        "score": 0.0658,
+        "catalyst": "analyst",
+        "rationale": "MarketBeat has upgraded WESCO International to an average 'Buy' recommendation, which is a positive sentiment shift but lacks specific price-moving catalysts. The recommendation is a routine analyst action with no disclosed price target or ",
+        "lat": 2.0039096000255086,
+        "n_arts": 1
+      },
+      "WING": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news mentions EAT's strong performance and positive momentum, but there is no direct connection to WING. The coverage is focused on a peer (EAT) and does not provide any specific catalyst or directional signal for WING. No event or news",
+        "lat": 1.951822799979709,
+        "n_arts": 2
+      },
+      "WLK": {
+        "raw": -0.25,
+        "score": -0.0802,
+        "catalyst": "earnings",
+        "rationale": "Westlake's Q2 2026 earnings beat expectations with strong segment performance, but shares have underperformed the S&P 50 despite the positive results, suggesting some pricing in and potential for follow-through.",
+        "lat": 1.6549209000077099,
+        "n_arts": 1
+      },
+      "WOLF": {
+        "raw": -0.05,
+        "score": -0.0281,
+        "catalyst": "none",
+        "rationale": "The stock is sliding premarket due to negative sentiment and volatility, with no specific catalyst disclosed. The coverage is speculative and lacks concrete information, resulting in a minor lean down.",
+        "lat": 1.5656935999868438,
+        "n_arts": 2
+      },
+      "XLB": {
+        "raw": -0.25,
+        "score": -0.0992,
+        "catalyst": "macro_sector",
+        "rationale": "The VanEck Steel ETF and State Street Materials Select Sector SPDR swung sharply last week due to U.S.-Canada trade war tensions, which directly impacts XLB's sector. The move was already partially priced in, but the ongoing trade war could",
+        "lat": 2.04327209998155,
+        "n_arts": 2
+      },
+      "XLC": {
+        "raw": -0.05,
+        "score": -0.0199,
+        "catalyst": "macro_sector",
+        "rationale": "The news highlights that XLC, despite its name, holds minimal telecom assets and is more aligned with broader tech holdings. This indirectly suggests a potential underperformance relative to pure telecom ETFs, but the coverage is a general ",
+        "lat": 2.616022099973634,
+        "n_arts": 2
+      },
+      "XLE": {
+        "raw": 0.15,
+        "score": 0.1166,
+        "catalyst": "macro_sector",
+        "rationale": "The Motley Fool article highlights Chevron's expansion in Venezuela, which is a key player in the energy sector and a significant holding of XLE. This positive news about Chevron's operations and investment in Venezuela could indirectly ben",
+        "lat": 2.735175199981313,
+        "n_arts": 4
+      },
+      "XLF": {
+        "raw": 0.0,
+        "score": 0.0,
+        "catalyst": "none",
+        "rationale": "The news contains no direct or indirect information about XLF or its holdings, sector, or underlying assets. The articles are solely about Ping An's sustainability rating and do not provide any catalyst relevant to XLF.",
+        "lat": 1.730800800025463,
+        "n_arts": 3
+      },
+      "XLI": {
+        "raw": 0.25,
+        "score": 0.0833,
+        "catalyst": "macro_sector",
+        "rationale": "The Motley Fool article highlights increased capex by hyperscalers and the importance of industrial infrastructure for the AI boom, which is favorable for XLI's underlying industrial holdings. The broader market rally and industrials leadin",
+        "lat": 2.410000400035642,
+        "n_arts": 2
+      },
+      "XLV": {
+        "raw": 0.05,
+        "score": 0.0323,
+        "catalyst": "macro_sector",
+        "rationale": "The news mentions Option Care Health (OPCH), a peer of XLV's healthcare sector holdings, with a positive outlook on potential upside in the healthcare sector. This is a macro-sector catalyst that indirectly affects XLV's fund, which holds h",
+        "lat": 2.4315514999907464,
+        "n_arts": 2
+      },
+      "XOM": {
+        "raw": -0.15,
+        "score": -0.1444,
+        "catalyst": "insider_activity",
+        "rationale": "Multiple institutional investors have recently bought or sold shares of ExxonMobil, indicating mixed sentiment. The positive activity includes purchases by Planning Project LLC, California State Teachers Retirement System, and others, while",
+        "lat": 3.3898982999962755,
+        "n_arts": 9
+      }
+    }
+  },
+  "dropped_only": {
+    "AAP": {
+      "raw": -0.15
+    },
+    "ADBE": {
+      "raw": -0.25
+    },
+    "ANF": {
+      "raw": 0.15
+    },
+    "AR": {
+      "raw": -0.15
+    },
+    "AVGO": {
+      "raw": -0.15
+    },
+    "AXP": {
+      "raw": 0.0
+    },
+    "BILL": {
+      "raw": 0.05
+    },
+    "BRK-B": {
+      "raw": 0.75
+    },
+    "BRK.A": {
+      "raw": 0.65
+    },
+    "CME": {
+      "raw": 0.0
+    },
+    "COP": {
+      "raw": 0.15
+    },
+    "DAL": {
+      "raw": 0.25
+    },
+    "DDOG": {
+      "raw": -0.05
+    },
+    "DOCU": {
+      "raw": 0.45
+    },
+    "DRAM": {
+      "raw": 0.15
+    },
+    "EOSE": {
+      "raw": 0.15
+    },
+    "FIVE": {
+      "raw": 0.75
+    },
+    "GLD": {
+      "raw": 0.15
+    },
+    "HUT": {
+      "raw": 0.45
+    },
+    "IGV": {
+      "raw": 0.45
+    },
+    "IWM": {
+      "raw": -0.15
+    },
+    "LRCX": {
+      "raw": 0.45
+    },
+    "MELI": {
+      "raw": 0.15
+    },
+    "META": {
+      "raw": -0.15
+    },
+    "MPC": {
+      "raw": -0.15
+    },
+    "MRK": {
+      "raw": 0.15
+    },
+    "NXPI": {
+      "raw": 0.25
+    },
+    "OPCH": {
+      "raw": 0.0
+    },
+    "P": {
+      "raw": 0.35
+    },
+    "PANW": {
+      "raw": -0.65
+    },
+    "PFE": {
+      "raw": -0.25
+    },
+    "PL": {
+      "raw": 0.65
+    },
+    "PSX": {
+      "raw": 0.65
+    },
+    "RARE": {
+      "raw": -0.85
+    },
+    "REGN": {
+      "raw": -0.65
+    },
+    "RIVN": {
+      "raw": -0.25
+    },
+    "ROKU": {
+      "raw": 0.25
+    },
+    "SPCX": {
+      "raw": -0.25
+    },
+    "STLA": {
+      "raw": 0.0
+    },
+    "STX": {
+      "raw": 0.35
+    },
+    "TDG": {
+      "raw": -0.25
+    },
+    "V": {
+      "raw": 0.25
+    },
+    "VCYT": {
+      "raw": 0.0
+    },
+    "XLE": {
+      "raw": -0.25
+    },
+    "XLF": {
+      "raw": -0.15
+    },
+    "XLV": {
+      "raw": 0.25
+    },
+    "XOM": {
+      "raw": 0.25
+    }
+  }
+}

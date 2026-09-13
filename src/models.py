@@ -37,6 +37,15 @@ class TickerSnapshot(BaseModel):
     # available). Lets the price-provenance check skip non-live anchors so it
     # never flags a live fill against a prior-session close.
     price_source: str = "live"
+    # Live NBBO from the Polygon batch snapshot's lastQuote (2026-08-31) — the
+    # whole universe's real-time two-sided book was already in the Step-2
+    # response and previously discarded. None on the yfinance/prev_close paths,
+    # on pre-NBBO cached snapshots (the date-keyed cache freezes shape), and
+    # when the quote was stale/crossed at capture. quote_age_s = seconds
+    # between the exchange quote timestamp and the fetch.
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    quote_age_s: Optional[float] = None
 
 
 _BULLISH_TX_TYPES: frozenset = frozenset({
@@ -1252,6 +1261,25 @@ class TickerSignal(BaseModel):
     # bearish news scaled by tape freshness (0 at a 2σ aligned decline; ≤1.5x
     # when un-fallen). Always ≤ 0; bull/zero news abstains at 0.0.
     news_bear_fresh_score: float = 0.0
+    # news_unpriced / news_unpriced_all (2026-09-07, panel-first weight 0 —
+    # signals/news_priced_in.py): the news read scaled by how much of its
+    # implied move the tape has NOT made yet, measured from the news
+    # cluster's own start. `_all` averages every cluster in the digest.
+    news_unpriced_score: float = 0.0
+    news_unpriced_all_score: float = 0.0
+    # news_quiet (2026-09-09, WEIGHTED 0.10): the raw news verdict on a story
+    # whose freshest cluster is >= `news_quiet_min_age_hours` old, 0.0 (an
+    # ABSTENTION) while the story is still in flow. `news_quiet_age_h` is the
+    # age it judged on, kept for the panel so the threshold stays re-testable
+    # without re-deriving clusters.
+    # news_bull_fresh (2026-09-10, PANEL-FIRST weight 0): the bull-side
+    # mirror of news_bear_fresh. `news_bull_fresh_z3` is the 3-session move in
+    # prior-vol units the guard read, kept so the constants stay re-testable
+    # from the panel without re-deriving price history.
+    news_bull_fresh_score: float = 0.0
+    news_bull_fresh_z3: float = 0.0
+    news_quiet_score: float = 0.0
+    news_quiet_age_h: Optional[float] = None
     # catalyst_tilt (2026-08-15, panel-first weight 0 — signals/catalyst_tilt.py):
     # news × learned per-(catalyst, side) orientation (may FLIP a read); 0.0 =
     # abstain (no catalyst captured, thin/flat cell, or calibration unavailable).
@@ -1265,6 +1293,18 @@ class TickerSignal(BaseModel):
     # `python -m src.analysis.news_events`.
     news_catalyst: Optional[str] = None
     news_raw_score: Optional[float] = None
+    # The logprob-derived CONTINUOUS reading of the same verdict (local engine
+    # only). ACCRUAL — nothing consumes it. See analysis/logprob_score.py: the
+    # 0.05 grid qwen3:8b emits is an argmax artifact, and this is the
+    # expectation under its own token distribution.
+    news_expected_score: Optional[float] = None
+    # The GREEDY value the model emitted, kept for provenance only. When the
+    # expectation is available it is what `news_raw_score` carries, so this is
+    # the only record of what argmax decoding would have said.
+    news_argmax_score: Optional[float] = None
+    # Engine-free id of the article digest the verdict was scored on
+    # (2026-09-06): the join key into `sentiment_digests` / `catalyst_repairs`.
+    news_digest_id: Optional[str] = None
     technical_score: float      # -1.0 to +1.0
     massive_score: float = 0.0  # -1.0 to +1.0  (Massive/Polygon server-side RSI+MACD composite — compared vs `tech`)
     insider_score: float = 0.0  # -1.0 to +1.0  (smart money: insider trades, options flow, SEC)

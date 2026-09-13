@@ -9,9 +9,13 @@ the full connect timeout — while EXPLICIT connect() calls (the reconciler's
 sync-start retry loop) bypass it, and any successful dial clears it.
 """
 
+import pytest
+
 from config.settings import settings
 from src.broker.base import OrderRequest
+from src.broker import ibkr as ibkr_mod
 from src.broker.ibkr import IBKRBroker
+
 
 
 class FakeIB:
@@ -46,6 +50,15 @@ class FakeIB:
 
     def positions(self, account=""):
         return []
+
+    def accountValues(self, account=""):
+        # A LOCAL cache read in ib_async — served from the subscription cache
+        # even when the gateway's API backend is dead.
+        from types import SimpleNamespace
+        return [SimpleNamespace(tag="NetLiquidation", value="1000000", currency="USD")]
+
+    def managedAccounts(self):
+        return ["DU000000"]
 
 
 def _broker(fake: FakeIB) -> IBKRBroker:
@@ -171,15 +184,17 @@ def test_repeated_wedge_fires_recovery_even_when_the_redial_SUCCEEDS(monkeypatch
     assert "wedged-but-alive" in calls[0]
 
 
-def test_successful_request_clears_the_wedge_history(monkeypatch):
-    # Only a real response proves the gateway is back, so it resets the counter —
-    # otherwise recycles from a since-resolved episode accumulate toward a
-    # spurious restart hours later.
+def test_successful_request_does_NOT_clear_the_wedge_history(monkeypatch):
+    """The 2026-09-03 hole, half one. Every recycle cycle ends with a redial that
+    "succeeds" and a sync whose first read "succeeds", so clearing the history on
+    success meant the count could never reach the limit. The window prune bounds
+    staleness instead."""
     import src.broker.gateway_recovery as gr
     calls = []
     monkeypatch.setattr(gr, "maybe_restart_gateway",
                         lambda reason, wait=True: calls.append(reason) or True)
     monkeypatch.setattr(settings, "broker_wedge_recycle_limit", 3)
+    monkeypatch.setattr(settings, "broker_wedge_recycle_window_seconds", 3600.0)
     monkeypatch.setattr(settings, "broker_reconnect_cooldown_seconds", 0.0)
     fake = FakeIB()
     b = _broker(fake)
@@ -187,10 +202,72 @@ def test_successful_request_clears_the_wedge_history(monkeypatch):
         _wedge(b, fake)
         b._ensure_connected()
     b._note_request(None)                    # a request actually SUCCEEDED
-    assert b._wedge_recycle_times == []
-    _wedge(b, fake)                          # would have been the 3rd without the reset
+    assert b._consecutive_timeouts == 0      # the timeout counter resets ...
+    assert len(b._wedge_recycle_times) == 2  # ... the recycle history does not
+    _wedge(b, fake)                          # the third recycle inside the window
     b._ensure_connected()
+    assert len(calls) == 1 and "wedged-but-alive" in calls[0]
+
+
+def test_get_account_is_not_evidence_the_gateway_answered(monkeypatch):
+    """The 2026-09-03 hole, half two. ``accountValues()`` is a local cache read,
+    so get_account() "succeeding" against a wedged gateway must move neither the
+    timeout counter nor the recycle history (get_positions' reqPositions() is
+    the real round-trip and keeps that role)."""
+    monkeypatch.setattr(settings, "broker_wedge_timeout_threshold", 5)
+    fake = FakeIB()
+    fake.connected = True
+    b = _broker(fake)
+    b._consecutive_timeouts = 3              # mid-wedge, below the threshold
+    b._wedge_recycle_times = [1.0, 2.0]
+    snap = b.get_account()
+    assert snap is not None and snap.equity == 1000000.0
+    assert b._consecutive_timeouts == 3
+    assert b._wedge_recycle_times == [1.0, 2.0]
+
+
+def test_wedge_history_survives_a_process_restart(monkeypatch):
+    """The watchdog's os._exit(1) + --supervise relaunch used to reset the count
+    every ~4.5-min wedge cycle. A FRESH broker instance (the relaunched process)
+    must pick the earlier recycles up from disk and fire on the third."""
+    import src.broker.gateway_recovery as gr
+    calls = []
+    monkeypatch.setattr(gr, "maybe_restart_gateway",
+                        lambda reason, wait=True: calls.append(reason) or True)
+    monkeypatch.setattr(settings, "broker_wedge_recycle_limit", 3)
+    monkeypatch.setattr(settings, "broker_wedge_recycle_window_seconds", 3600.0)
+    monkeypatch.setattr(settings, "broker_reconnect_cooldown_seconds", 0.0)
+    fake = FakeIB()
+    b = _broker(fake)
+    for _ in range(2):
+        _wedge(b, fake)
+        b._ensure_connected()
     assert calls == []
+    assert ibkr_mod.WEDGE_HISTORY_PATH.exists()
+    # "process restart": a brand-new broker object over a brand-new client
+    fake2 = FakeIB()
+    b2 = _broker(fake2)
+    assert len(b2._wedge_recycle_times) == 2
+    _wedge(b2, fake2)
+    b2._ensure_connected()
+    assert len(calls) == 1 and "wedged-but-alive" in calls[0]
+    assert b2._wedge_recycle_times == []      # cleared after firing ...
+    assert IBKRBroker._load_wedge_history() == []   # ... on disk too
+
+
+def test_stale_wedge_history_is_pruned_on_load(monkeypatch):
+    """Recycles older than the window (or from a clock that went backwards)
+    must not be inherited by a relaunch — a wedge last Tuesday is not evidence
+    today."""
+    import json
+    monkeypatch.setattr(settings, "broker_wedge_recycle_window_seconds", 3600.0)
+    import time as _t
+    now = _t.time()
+    ibkr_mod.WEDGE_HISTORY_PATH.write_text(
+        json.dumps([now - 7200.0, now - 100.0, now + 999.0]), encoding="utf-8")
+    assert IBKRBroker._load_wedge_history() == [now - 100.0]
+    ibkr_mod.WEDGE_HISTORY_PATH.write_text("not json", encoding="utf-8")
+    assert IBKRBroker._load_wedge_history() == []     # fail-soft
 
 
 def test_failed_redial_still_fires_recovery_immediately(monkeypatch):

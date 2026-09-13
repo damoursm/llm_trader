@@ -11,6 +11,7 @@ from typing import List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
 from src.utils import now_et, fmt_et
 from config import settings
+from src.analysis import local_llm
 from src.models import TickerSignal, Recommendation, InsiderTrade, MacroContext, COTContext, IPOContext, VIXContext, PutCallContext, EarningsContext, BreadthContext, HighsLowsContext, McClellanContext, MacroSurpriseContext, FedWatchContext, RevisionMomentumContext, WhisperContext, OpExContext, SeasonalityContext, BondInternalsContext, MOVEContext, GlobalMacroContext, DIXContext
 from src.data.insider_trades import build_insider_summary
 
@@ -90,6 +91,24 @@ SYNTHESIS_PROMPT_VERSION = "2026-08-19-confidence-placement"
 # ONE definition shared by all three arm variants (dual-case / blind / sighted).
 # Duplicating it three times is how the original drifted, and this repo has been
 # bitten by a constant living at two sites more than once.
+# The process block the synthesis prompt opens with (after the persona): what
+# the system does with the recommendations it is about to receive. ONE constant
+# shared by the FULL prompt and the COMPACT prompt (local engine), so the two
+# variants cannot drift apart on the part that frames every decision. Static
+# and brace-free — it sits before the cache sentinel in the full prompt.
+_SELECTION_PROCESS_BLOCK = """HOW THIS SYSTEM PICKS STOCKS — the process your recommendations feed (every claim below is MEASURED on this system's own trade history, not assumed):
+<selection_process>
+- CROSS-SECTIONAL, NOT ABSOLUTE. Each run scores hundreds of names and consumes every method's WITHIN-RUN RANK against the tradeable universe (price ≥ $5, dollar volume ≥ $5M/day), mapped through that method's own measured rank→payoff curve. A stock is bought for being among today's strongest setups, not for clearing a fixed bar. Judge candidates against each other, not against an abstract standard.
+- THE TARGET IS THE NEXT SWING, NOT A FIXED HORIZON. The optimization objective is the signed move from entry to the next swing extreme (pivot high/low). The median realized pivot horizon is ~1-3 sessions, and the measured edge of actionable calls peaks around day 2 and decays toward zero by day 5. Prefer the name with the largest IMMINENT move; a thesis that needs weeks to pay is usually the wrong pick here.
+- EXITS ARE MECHANICAL AND FAST. Every open position is re-judged EVERY run by the same engine that opened it, and closed on direction flips, trailing/adverse stops, measured per-method horizon expiry, or a learned exit signal. Most holds last 1-5 sessions. You do not need to time the exit — pick the entry with the strongest near-term move and the system manages the close.
+- SELECTIVITY IS ASYMMETRIC (measured). Bullish calls are drawn from roughly the top decile of the tradeable cross-section; bearish calls from roughly the bottom 5%. Sell-heavy books were measured to LOSE. A SELL should be rarer than a BUY and reserved for the extreme of bearish evidence.
+- DO NOT CHASE (measured + mechanically enforced). A BUY on a name already up more than ~12% over the last 5 completed sessions is DEFERRED by a gate: recent big gainers mean-revert at this system's horizon, and extreme momentum readings are among the LEAST reliable bullish evidence here — the strongest-looking chart is often the worst entry. Prefer names EARLY in a repricing, where the catalyst is fresh and the move has not already paid out. (Extreme OFF-HOURS GAP readings, by contrast, are among the MOST informative signals in this system.)
+- EARNINGS BLACKOUT. Actionable calls within 2 days of a scheduled report are removed mechanically (exception: a fresh post-release drift setup ≤1 day after the report).
+- YOUR ROLE IN THE CHAIN. The quantitative layer supplies cross-sectional standing; you supply what it cannot: reading the news, judging whether a catalyst is real, already priced, or noise, spotting incoherence between evidence layers, and vetoing setups the numbers like but the story contradicts. Your calls are then gated mechanically (regime-dependent confidence threshold, ≥2 independent sources, liquidity floor, anti-chase, earnings blackout) and sized by measured calibrations — so a PRECISE, honest confidence is worth more than a bold one.
+</selection_process>
+"""
+
+
 _CONFIDENCE_PLACEMENT = (
     "   - PLACING THE NUMBER — the bands above choose the ACTION, and this chooses "
     "the number INSIDE the band you already chose. THE TWO MUST AGREE: emitting "
@@ -152,9 +171,11 @@ def _qwen_spec(model_id: Optional[str]) -> tuple[str, bool]:
 _client = None
 _deepseek_analyst_client = None
 _qwen_analyst_client = None
+_local_analyst_client = None
 
 # Records which engine produced the most recent synthesis, for run metadata.
-# provider ∈ {"anthropic", "deepseek", "rule-based", None}; model is the exact id.
+# provider ∈ {"anthropic", "deepseek", "qwen", "local", "rule-based", None};
+# model is the exact id.
 _LAST_SYNTHESIS_META: dict = {"provider": None, "model": None}
 
 
@@ -202,6 +223,88 @@ def _get_qwen_analyst_client():
             base_url=settings.qwen_base_url,
         )
     return _qwen_analyst_client
+
+
+def _local_synthesis_base_url() -> str:
+    """The endpoint the SYNTHESIS route calls, which need not be the sentiment
+    one. Ollama's context, parallelism and KV type are SERVER-WIDE (the
+    OpenAI-compatible endpoint ignores per-request ``num_ctx``), and the two
+    jobs want opposite settings — ~68 short sentiment calls a tick want parallel
+    slots, one very long synthesis call a tick wants context. Pointing synthesis
+    at its own server (or its own model, below) is the only way to tune them
+    apart. Inherits the sentiment endpoint while unset, which is the
+    single-server default in force today."""
+    return settings.local_synthesis_base_url or settings.local_sentiment_base_url
+
+
+def _local_synthesis_context_tokens() -> int:
+    """The per-request context of whichever server synthesis talks to."""
+    return int(settings.local_synthesis_context_tokens
+               or settings.local_sentiment_context_tokens or 0)
+
+
+def _local_synthesis_extra_body() -> dict:
+    """That server's own no-reasoning dialect. Inherits the sentiment route's
+    (`sentiment._local_extra_body`) while unset — a second server is usually
+    the same software — but a different backend wants something else, and the
+    hosted dialects (`enable_thinking` / `reasoning`) are silently ignored,
+    which looks exactly like working."""
+    raw = (settings.local_synthesis_extra_body or "").strip()
+    if not raw:
+        from src.analysis.sentiment import _local_extra_body
+        return _local_extra_body()
+    try:
+        body = json.loads(raw)
+        return body if isinstance(body, dict) else {}
+    except Exception as e:                       # a malformed knob must not kill the engine
+        logger.warning(f"[claude] local_synthesis_extra_body is not valid JSON ({e}) — ignored")
+        return {}
+
+
+def _local_synthesis_available() -> bool:
+    """Settings-only check (no client construction) so the attempt-list
+    builder stays pure: the LOCAL engine takes part in synthesis only when the
+    local LLM is enabled and has a base URL."""
+    return bool(settings.enable_local_llm and _local_synthesis_base_url())
+
+
+def _local_synthesis_model() -> str:
+    """The LOCAL engine's LOGICAL synthesis model id, ``local/<model>`` — the
+    same namespace the sentiment side stamps (``sentiment.sentiment_model_for``),
+    so provenance (``runs.llm_synthesis_provider``, the per-rec engine stamp,
+    the trade stamp) never confuses a self-hosted checkpoint with a hosted one.
+    ``_engine_of`` resolves the prefix FIRST because the id contains 'qwen'.
+
+    ``local_synthesis_model`` overrides the sentiment model, which is how one
+    server can still serve both jobs: an Ollama model name carries its own
+    ``PARAMETER num_ctx``, so a synthesis-sized context can be pinned to its own
+    name without touching the sentiment runner. The id flows into
+    ``runs.llm_synthesis_provider`` and the per-trade stamp, so the two jobs
+    stay separable in the ledger even when they share a box."""
+    return f"local/{settings.local_synthesis_model or settings.local_sentiment_model}"
+
+
+def _get_local_analyst_client():
+    """OpenAI-compatible client for the LOCAL synthesis engine (Ollama,
+    loopback). None when the local LLM is disabled — the engine is then filtered
+    out of every attempt list, so a pinned local call cannot dead-end on a
+    permanently absent client. Its own client object (not the sentiment
+    module's): the synthesis call needs a far longer timeout than a sentiment
+    verdict — 24k tokens of prefill + up to 6k of decode on an 8B Q4 model runs
+    minutes on this GPU, and the sentiment timeout would kill it."""
+    global _local_analyst_client
+    if not _local_synthesis_available():
+        return None
+    if _local_analyst_client is None:
+        from openai import OpenAI
+        _local_analyst_client = OpenAI(
+            api_key=(settings.local_synthesis_api_key
+                     or settings.local_sentiment_api_key or "local"),
+            base_url=_local_synthesis_base_url(),
+            timeout=settings.local_synthesis_timeout_seconds,
+            max_retries=0,
+        )
+    return _local_analyst_client
 
 
 def _anthropic_sampling_kwargs(model: str) -> dict:
@@ -263,14 +366,33 @@ def _anthropic_thinking_kwargs(model: str) -> dict:
 
 
 def _engine_of(model: str) -> str:
-    """Which provider a synthesis model id belongs to: 'deepseek' for DeepSeek
-    ids, 'qwen' for Qwen ids, 'anthropic' for Claude ids."""
+    """Which provider a synthesis model id belongs to: 'local' for the
+    self-hosted ``local/<model>`` namespace (checked FIRST — a local id such as
+    ``local/qwen3:8b`` contains 'qwen'), 'deepseek' for DeepSeek ids, 'qwen' for
+    Qwen ids, 'anthropic' for Claude ids."""
     m = (model or "").lower()
+    if m.startswith("local/"):
+        return "local"
     if "deepseek" in m:
         return "deepseek"
     if "qwen" in m:
         return "qwen"
     return "anthropic"
+
+
+def forced_synthesis_model(engine: str) -> str:
+    """The LOGICAL model id a PINNED (``force_engine``) synthesis call uses.
+
+    One mapping shared by the pinned branch of `generate_recommendations` and
+    the engine-shadow branch (`src/analysis/engine_shadow.py`), which stamps
+    it on every shadow decision — a second copy would drift the moment a
+    default model changes. Qwen pins the SAME thinking-on arm as the entry
+    synthesis pool so a hold-review is an apples-to-apples re-judgment;
+    deepseek/anthropic keep their cheap defaults; local is its own namespace."""
+    return {"anthropic": settings.analyst_model,
+            "deepseek": _DEEPSEEK_ANALYST_MODEL,
+            "qwen": _qwen_default_model() + _THINKING_SUFFIX,
+            "local": _local_synthesis_model()}[engine]
 
 
 def _synthesis_attempts_for(chosen_model: str, anthropic_fallback: str,
@@ -291,11 +413,24 @@ def _synthesis_attempts_for(chosen_model: str, anthropic_fallback: str,
     even with DeepSeek itself fully funded and Qwen possibly available —
     because the chain never reached a 3rd engine. Observed 2026-07-22: a
     DeepSeek ReadTimeout fell to a broke Anthropic account and gave up, in the
-    same tick DeepSeek had already answered two dozen other calls."""
+    same tick DeepSeek had already answered two dozen other calls.
+
+    2026-09-04: the LOCAL engine (``local/<model>``) joins the chain in two
+    ways. As the CHOSEN engine (the per-run ``synthesis_local_share`` flip, or
+    a pinned hold-review) it leads and the three hosted engines follow as its
+    fallbacks. As a FALLBACK it is appended LAST — after every hosted engine,
+    before rule-based — whenever the local LLM is enabled: exactly the tier
+    whose absence produced the 2026-09-01 outage, when both hosted accounts ran
+    unfunded together and synthesis fell through to ``_fallback_recommendations``
+    for a day. With ``enable_local_llm`` off (the default) the list is
+    byte-identical to before the engine existed."""
     eng = _engine_of(chosen_model)
     fallback_model = {"anthropic": anthropic_fallback, "deepseek": deepseek_fallback, "qwen": qwen_fallback}
     rest = [e for e in ("deepseek", "qwen", "anthropic") if e != eng]
-    return [(eng, chosen_model)] + [(e, fallback_model[e]) for e in rest]
+    attempts = [(eng, chosen_model)] + [(e, fallback_model[e]) for e in rest]
+    if eng != "local" and _local_synthesis_available():
+        attempts.append(("local", _local_synthesis_model()))
+    return attempts
 
 
 # Message/type markers for a TRANSIENT-looking LLM failure that a plain httpx
@@ -339,6 +474,8 @@ def _call_engine(engine: str, model: str, prompt: str) -> str:
     if engine == "qwen":
         api_model, thinking = _qwen_spec(model)
         return _call_qwen_analyst(prompt, model=api_model, thinking=thinking)
+    if engine == "local":
+        return _call_local_analyst(prompt, model=model)
     api_model, thinking = _deepseek_spec(model)
     return _call_deepseek_analyst(prompt, model=api_model, thinking=thinking)
 
@@ -548,6 +685,72 @@ def _call_deepseek_analyst(prompt: str, model: Optional[str] = None,
     return "".join(raw_parts).strip()
 
 
+# The prompt-size estimate and the two truncation guards are SHARED with the
+# sentiment route (`src.analysis.local_llm`): both talk to the same class of
+# server, both are exposed to its silent oldest-token truncation, and a constant
+# copied into two call sites is how the two drift apart.
+_estimate_local_tokens = local_llm.estimate_tokens
+
+
+def _call_local_analyst(prompt: str, model: Optional[str] = None) -> str:
+    """Call the LOCAL synthesis engine (Ollama's OpenAI-compatible endpoint,
+    NON-streaming). Returns raw response text; raises on failure so the caller's
+    engine fallback takes over — a dead, cold-loading or wedged local box must
+    fall through to a hosted engine, never fabricate a rule-based answer while
+    a hosted one was available.
+
+    ``model`` is the LOGICAL id (``local/<model>``); the ``local/`` prefix is
+    stripped for the API. Three deliberate differences from the hosted calls:
+    no reasoning/thinking ``extra_body`` — that is a hosted-route dialect
+    (DeepSeek ``thinking``, DashScope ``enable_thinking``) a local server 400s
+    on or, worse, ignores silently; reasoning is switched off with the server's
+    OWN dialect (``sentiment._local_extra_body``, shared with the sentiment
+    call) and any leaked ``<think>`` block is stripped; and the reported
+    ``prompt_tokens`` is checked against the estimate, because Ollama TRUNCATES
+    THE OLDEST TOKENS without error when a request exceeds the server context
+    (the persona and process block go first) and reports the truncated count —
+    a response produced that way is REFUSED (raised, so the fallback engine
+    answers and nothing is recorded), because a verdict the model gave without
+    ever seeing its instructions is not this engine's decision and must not
+    enter the paired dataset as one."""
+    client = _get_local_analyst_client()
+    if client is None:
+        raise RuntimeError("local LLM disabled (enable_local_llm) — no local synthesis engine")
+    logical = model or _local_synthesis_model()
+    api_model = logical[len("local/"):] if logical.startswith("local/") else logical
+    prompt = prompt.replace(_CACHE_SENTINEL, "")
+    budget = int(settings.local_synthesis_max_prompt_tokens)
+    # PRE-FLIGHT: refuse a prompt this server cannot hold before spending the
+    # GPU on it. Ollama accepts an over-long request, truncates the OLDEST
+    # tokens without an error and answers anyway — the post-call check below
+    # catches that, but only after minutes of prefill+decode, once per tick, for
+    # a row that is then discarded.
+    label = f"local analyst {api_model}"
+    est = local_llm.check_fits(prompt, context_tokens=_local_synthesis_context_tokens(),
+                               label=label)
+    logger.info(f"[claude] LOCAL analyst: {api_model} (~{est} prompt tok est., budget {budget}, "
+                f"server ctx {_local_synthesis_context_tokens() or 'unknown'})")
+    resp = client.chat.completions.create(
+        model=api_model,
+        max_tokens=int(settings.local_synthesis_max_output_tokens),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        seed=_DEEPSEEK_ANALYST_SEED,
+        extra_body=_local_synthesis_extra_body(),
+    )
+    usage = getattr(resp, "usage", None)
+    _log_openai_cache_usage(f"local {api_model}", usage)
+    local_llm.check_reported(getattr(usage, "prompt_tokens", None), estimate=est,
+                             label=label, budget=budget,
+                             context_tokens=_local_synthesis_context_tokens())
+    choices = getattr(resp, "choices", None) or []
+    raw = (choices[0].message.content or "") if choices else ""
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    if not raw:
+        raise RuntimeError(f"local analyst {api_model} returned an empty response")
+    return raw
+
+
 def _call_qwen_analyst(prompt: str, model: Optional[str] = None,
                        thinking: bool = True) -> str:
     """Call Qwen (DashScope compatible-mode, streaming). Returns raw response text.
@@ -714,6 +917,99 @@ def _warn_on_degenerate_confidence(recs: List["Recommendation"], source: str) ->
         pass
 
 
+_COMPACT_PERSONA = (
+    "You are an elite portfolio manager with a 30-year record of market-beating returns and a "
+    "quant's precision. Your defining edge is discipline about false positives: you output HOLD "
+    "or WATCH whenever the evidence is mixed, incomplete or single-source, and issue BUY or SELL "
+    "only when independent evidence layers converge — and you say precisely why."
+)
+
+
+def _compact_synthesis_prompt(*, methods_desc: str, session_block: str, date_line: str,
+                              open_positions_block: str, open_positions_instructions: str,
+                              signal_lines: List[str], skipped: int,
+                              agreement_instruction: str, conviction_rules: str,
+                              tech_instructions: str, commodity_tickers: str,
+                              max_tokens: Optional[int] = None) -> tuple:
+    """The COMPACT synthesis prompt — what the LOCAL engine is sent (2026-09-04).
+
+    Same decision framing as the full prompt (the ``<selection_process>`` block,
+    the task, the horizon labels, the conviction rules with the confidence
+    PLACEMENT procedure, the short-selling discipline, the held-position review,
+    the identical JSON output spec), same per-ticker signal blocks in the same
+    ranked order — minus what cannot fit an 8B model's context on this GPU: the
+    28 macro-context blocks, the fundamentals / corporate-actions overlays and
+    the ~45 per-method instruction blocks. The rationale is capped at one
+    sentence so 40 tickers of JSON fit the output budget.
+
+    ``max_tokens`` is the prompt budget (``local_synthesis_max_prompt_tokens``):
+    when the estimate exceeds it, the LOWEST-RANKED ticker blocks are dropped
+    from the tail of ``signal_lines`` (the list is in shortlist-key order, so
+    what goes is what the full prompt would have listed last), never the
+    framing — Ollama would otherwise truncate the OLDEST tokens itself, which is
+    the persona and the process block. Returns ``(prompt, n_dropped)``.
+    """
+    lines = list(signal_lines)
+
+    def build(kept: List[str], dropped: int) -> str:
+        signals_text = "\n\n".join(kept)
+        omitted = skipped + dropped
+        if omitted:
+            signals_text += (f"\n\n[{omitted} additional tickers omitted — lower-ranked or "
+                             f"near-zero signals]")
+        return f"""{_COMPACT_PERSONA}
+
+{_SELECTION_PROCESS_BLOCK}
+Signal sources available today: {methods_desc}
+{session_block}{date_line}
+{open_positions_block}INPUT — multi-method ticker signals:
+<signals>
+{signals_text}
+</signals>
+
+YOUR TASK:
+1. Identify the BEST opportunities across the full list — both longs (BUY) and shorts (SELL).
+   - Only act when multiple independent layers of evidence converge. A genuine BUY/SELL signal is rare and valuable — treat it as such.
+   - If no ticker clears the bar today, output HOLD/WATCH for all. Patience is the highest-conviction trade.
+{agreement_instruction}   - A single strong news print or a single options sweep is NEVER sufficient for BUY/SELL. Require corroboration.
+
+2. Distinguish time horizons — label when your THESIS resolves, knowing this book runs SHORT (see <selection_process>: most holds close within 1-5 sessions and the measured edge decays by day 5):
+   - "SWING" (2-10 days): catalyst-driven move not yet priced in. This is the book's natural horizon and should be your default for actionable calls.
+   - "SHORT-TERM" (1-4 weeks): sector rotation, earnings run-up/fade, macro shift — use only when the catalyst path genuinely needs weeks.
+   - "POSITION" (1-3 months): structural change — regulatory, competitive, macro theme. RARE by construction: the exit layer re-judges every position each run and will close it long before months pass unless the evidence keeps re-confirming.
+{tech_instructions}
+{conviction_rules}
+4. Short-selling discipline:
+   - SELL means initiating a short position (or buying an inverse ETF).
+   - Only short when: (a) clearly negative catalyst, (b) no counter-narrative, (c) broad market not in capitulation.
+{open_positions_instructions}
+Commodity tickers always present in the list: {commodity_tickers} — label these as type "COMMODITY" and give each a standalone macro-grounded BUY/HOLD/SELL view (do not default to HOLD).
+
+Output a JSON object of the form {{"recommendations": [ ... ]}} where each array element has:
+- "ticker": string
+- "type": "STOCK" | "ETF" | "COMMODITY"
+- "direction": "BULLISH" | "BEARISH" | "NEUTRAL"
+- "action": "BUY" | "SELL" | "HOLD" | "WATCH"
+- "time_horizon": "SWING" | "SHORT-TERM" | "POSITION" | "N/A"
+- "rationale": ONE sentence, at most 30 words — the decisive catalysts, the price mechanism, the key risk.
+- "confidence": two-decimal float, strictly below 1.00 — placed by the procedure in the conviction rules. Emit it LAST, after the rationale that justifies it.
+
+Return ALL tickers from the input. No markdown, JSON only."""
+
+    dropped = 0
+    text = build(lines, dropped)
+    if max_tokens:
+        while lines and _estimate_local_tokens(text) > int(max_tokens):
+            lines.pop()
+            dropped += 1
+            text = build(lines, dropped)
+        if dropped:
+            logger.warning(f"[claude] compact prompt: dropped {dropped} lowest-ranked ticker "
+                           f"block(s) to fit {int(max_tokens)} tokens "
+                           f"({len(lines)} kept, ~{_estimate_local_tokens(text)} tok)")
+    return text, dropped
+
+
 def generate_recommendations(
     signals: List[TickerSignal],
     insider_trades: Optional[List["InsiderTrade"]] = None,
@@ -749,9 +1045,10 @@ def generate_recommendations(
     corporate_actions_context=None, # Optional[CorporateActionsContext]
     open_positions=None,            # Optional[List[dict]] — held-position review block (A/B'd per run)
     session: Optional[str] = None,  # "rth" | "extended" | "overnight" | None (=rth)
-    force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' | 'qwen' — pin synthesis (hold-review)
+    force_engine: Optional[str] = None,  # 'anthropic' | 'deepseek' | 'qwen' | 'local' — pin synthesis (hold-review / engine shadow)
     blind_synthesis: bool = False,  # A/B arm: hide the aggregator's verdict (see settings.blind_synthesis_share)
     dual_case: bool = False,        # A/B arm: BULL/BEAR cases side by side (see settings.dual_case_synthesis_share)
+    prompt_variant: str = "auto",   # "auto" (compact for the local engine, full otherwise) | "full" | "compact"
 ) -> List[Recommendation]:
     """
     Feed all ticker signals to Claude and get final actionable recommendations.
@@ -760,11 +1057,23 @@ def generate_recommendations(
     ``session`` != "rth" prepends an extended-session context block to the
     prompt: thin books, frozen options data, news/gap as the live signals.
 
-    ``force_engine`` ('anthropic' | 'deepseek') pins synthesis to exactly that
-    engine, skipping the per-run A/B flip, with NO cross-engine OR rule-based
-    fallback — used by the opener-pinned hold-review so a position is always
-    re-judged by the engine that opened it. On a forced-engine failure this
-    returns ``[]`` (the caller treats it as "no review this tick").
+    ``force_engine`` ('anthropic' | 'deepseek' | 'qwen' | 'local') pins
+    synthesis to exactly that engine, skipping the per-run A/B flip, with NO
+    cross-engine OR rule-based fallback — used by the opener-pinned hold-review
+    so a position is always re-judged by the engine that opened it, and by the
+    engine-shadow branch so the non-live engine's decision accrues. On a
+    forced-engine failure this returns ``[]`` (the caller treats it as "no
+    review this tick").
+
+    ``prompt_variant`` picks the prompt an attempt is sent. The FULL prompt
+    (persona, 28 macro-context blocks, ~45 per-method instruction blocks, 40
+    ticker blocks; measured p50 60k / p90 81k input tokens) cannot fit the
+    LOCAL engine's context, so ``"auto"`` sends the local engine the COMPACT
+    variant (``_compact_synthesis_prompt``) and every hosted engine the full
+    one; ``"compact"`` forces the compact variant on a hosted engine too (the
+    engine-vs-prompt decomposition arm, ``synthesis_shadow_extra``); ``"full"``
+    forces the full prompt everywhere (a local attempt is then truncated by the
+    server — only for experiments).
     """
     if not signals:
         return []
@@ -3831,17 +4140,7 @@ Regime guide:
 
 Your defining edge: you are ruthlessly disciplined about false positives. You understand that a wrong BUY or SELL costs capital that cannot be recovered. You output HOLD or WATCH whenever the evidence is mixed, incomplete, or driven by a single source. When you do issue a BUY or SELL, it is because the convergence of evidence makes the directional call highly reliable — and you explain precisely why.
 
-HOW THIS SYSTEM PICKS STOCKS — the process your recommendations feed (every claim below is MEASURED on this system's own trade history, not assumed):
-<selection_process>
-- CROSS-SECTIONAL, NOT ABSOLUTE. Each run scores hundreds of names and consumes every method's WITHIN-RUN RANK against the tradeable universe (price ≥ $5, dollar volume ≥ $5M/day), mapped through that method's own measured rank→payoff curve. A stock is bought for being among today's strongest setups, not for clearing a fixed bar. Judge candidates against each other, not against an abstract standard.
-- THE TARGET IS THE NEXT SWING, NOT A FIXED HORIZON. The optimization objective is the signed move from entry to the next swing extreme (pivot high/low). The median realized pivot horizon is ~1-3 sessions, and the measured edge of actionable calls peaks around day 2 and decays toward zero by day 5. Prefer the name with the largest IMMINENT move; a thesis that needs weeks to pay is usually the wrong pick here.
-- EXITS ARE MECHANICAL AND FAST. Every open position is re-judged EVERY run by the same engine that opened it, and closed on direction flips, trailing/adverse stops, measured per-method horizon expiry, or a learned exit signal. Most holds last 1-5 sessions. You do not need to time the exit — pick the entry with the strongest near-term move and the system manages the close.
-- SELECTIVITY IS ASYMMETRIC (measured). Bullish calls are drawn from roughly the top decile of the tradeable cross-section; bearish calls from roughly the bottom 5%. Sell-heavy books were measured to LOSE. A SELL should be rarer than a BUY and reserved for the extreme of bearish evidence.
-- DO NOT CHASE (measured + mechanically enforced). A BUY on a name already up more than ~12% over the last 5 completed sessions is DEFERRED by a gate: recent big gainers mean-revert at this system's horizon, and extreme momentum readings are among the LEAST reliable bullish evidence here — the strongest-looking chart is often the worst entry. Prefer names EARLY in a repricing, where the catalyst is fresh and the move has not already paid out. (Extreme OFF-HOURS GAP readings, by contrast, are among the MOST informative signals in this system.)
-- EARNINGS BLACKOUT. Actionable calls within 2 days of a scheduled report are removed mechanically (exception: a fresh post-release drift setup ≤1 day after the report).
-- YOUR ROLE IN THE CHAIN. The quantitative layer supplies cross-sectional standing; you supply what it cannot: reading the news, judging whether a catalyst is real, already priced, or noise, spotting incoherence between evidence layers, and vetoing setups the numbers like but the story contradicts. Your calls are then gated mechanically (regime-dependent confidence threshold, ≥2 independent sources, liquidity floor, anti-chase, earnings blackout) and sized by measured calibrations — so a PRECISE, honest confidence is worth more than a bold one.
-</selection_process>
-
+{_SELECTION_PROCESS_BLOCK}
 Signal sources available today: {methods_desc}
 {session_block}{macro_block}{macro_surprise_block}{fedwatch_block}{bond_block}{revision_block}{cot_block}{ipo_block}{vix_block}{move_block}{dix_block}{global_macro_block}{sector_rotation_block}{rotation_drivers_block}{business_cycle_block}{intermarket_block}{macro_news_block}{credit_block}{pc_block}{tick_block}{breadth_block}{highs_lows_block}{mcclellan_block}{whisper_block}{earnings_block}{gex_block}{opex_block}{seasonality_block}{catalyst_block}{_CACHE_SENTINEL}Today's date: {fmt_et(now_et())}
 {fundamentals_block}{corporate_actions_block}{open_positions_block}INPUT — multi-method ticker signals:
@@ -3883,6 +4182,33 @@ Output a JSON object of the form {{"recommendations": [ ... ]}} where each array
 
 Return ALL tickers from the input. No markdown, JSON only."""
 
+    # The COMPACT variant is built lazily — only an attempt that needs it (the
+    # local engine, or a hosted engine under prompt_variant="compact") pays for
+    # it, and a run that never reaches such an attempt never logs its drops.
+    _compact_cache: dict = {}
+
+    def _compact_prompt() -> str:
+        if "text" not in _compact_cache:
+            _compact_cache["text"], _ = _compact_synthesis_prompt(
+                methods_desc=methods_desc, session_block=session_block,
+                date_line=f"Today's date: {fmt_et(now_et())}",
+                open_positions_block=open_positions_block,
+                open_positions_instructions=open_positions_instructions,
+                signal_lines=signal_lines, skipped=skipped,
+                agreement_instruction=agreement_instruction,
+                conviction_rules=conviction_rules, tech_instructions=tech_instructions,
+                commodity_tickers=commodity_tickers,
+                max_tokens=settings.local_synthesis_max_prompt_tokens,
+            )
+        return _compact_cache["text"]
+
+    def _prompt_for(engine: str) -> str:
+        if prompt_variant == "full":
+            return prompt
+        if prompt_variant == "compact" or engine == "local":
+            return _compact_prompt()
+        return prompt
+
     # ── Step 1+2: A/B-routed analyst call ──────────────────────────────────
     # A per-run coin flip (settings.llm_ab_anthropic_share, default 50/50)
     # picks which engine synthesises first, so both providers accumulate
@@ -3899,7 +4225,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
     # Each attempt is an (engine, model) pair; the non-chosen provider is the
     # error fallback, rule-based the last resort.
     pool = [m.strip() for m in (settings.llm_ab_synthesis_models or "").split(",") if m.strip()]
-    if force_engine in ("anthropic", "deepseek", "qwen"):
+    if force_engine in ("anthropic", "deepseek", "qwen", "local"):
         # Opener-pinned hold-review: this engine ONLY (its default model) — no
         # A/B, no cross-engine fallback, no rule-based fallback (see below).
         # Under llm_primary_provider=="deepseek" (2026-07-13) the pin is HONORED —
@@ -3907,17 +4233,37 @@ Return ALL tickers from the input. No markdown, JSON only."""
         # invariant), which the 50/50 DeepSeek/Qwen synthesis split relies on. The
         # legacy "coerce every pin to qwen" behavior only re-arms if the provider
         # is set back to "qwen".
-        eng = "qwen" if settings.llm_primary_provider == "qwen" else force_engine
+        # A LOCAL pin is never coerced: the coercion exists to fold the hosted
+        # Qwen route under one provider name, and the local engine is its own
+        # provider by design (see _local_synthesis_model).
+        eng = ("qwen" if settings.llm_primary_provider == "qwen" and force_engine != "local"
+               else force_engine)
         # Qwen review uses the SAME thinking-on arm as the entry synthesis pool
         # (qwen3.7-max-thinking) so the hold-review is a true apples-to-apples
         # re-judgment of the exit decision. Deepseek/anthropic pins keep their
         # existing cheap defaults.
-        forced_model = {"anthropic": settings.analyst_model,
-                        "deepseek": _DEEPSEEK_ANALYST_MODEL,
-                        "qwen": _qwen_default_model() + _THINKING_SUFFIX}[eng]
+        forced_model = forced_synthesis_model(eng)
         attempts = [(eng, forced_model)]
-        logger.info(f"[claude] FORCED synthesis engine={eng} (pinned hold-review"
+        # The pin has two callers now: the opener-pinned hold review and the
+        # engine-shadow arm (2026-09-04). Naming only the first made a shadow
+        # call read as an exit re-judgment in the log — which matters because
+        # the two have opposite consequences (one can close a position, the
+        # other touches nothing).
+        logger.info(f"[claude] FORCED synthesis engine={eng} (pinned call"
                     f"{', coerced from ' + force_engine if eng != force_engine else ''})")
+    elif (force_engine is None and _local_synthesis_available()
+          and random.random() < settings.synthesis_local_share):
+        # 2026-09-04 A/B: this run's LIVE decision comes from the LOCAL engine
+        # (compact prompt); the hosted engines are its error fallbacks (full
+        # prompt). A per-RUN flip, like the sentiment split, so each engine
+        # accrues whole-run samples; the engine-shadow branch asks the other
+        # engine for its decision on the same signals regardless of which way
+        # the coin landed (src/analysis/engine_shadow.py).
+        chosen = _local_synthesis_model()
+        attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL,
+                                            _qwen_default_model())
+        logger.info(f"[claude] A/B synthesis this run: LIVE engine=local model={chosen} "
+                    f"(share={settings.synthesis_local_share:.0%}, compact prompt)")
     elif pool:
         chosen = random.choice(pool)               # uniform → equal split over the pool
         attempts = _synthesis_attempts_for(chosen, settings.analyst_model, _DEEPSEEK_ANALYST_MODEL,
@@ -3937,7 +4283,7 @@ Return ALL tickers from the input. No markdown, JSON only."""
     analyst_source = settings.analyst_model
     for engine, model in attempts:
         try:
-            raw = _call_with_retry(engine, model, prompt)
+            raw = _call_with_retry(engine, model, _prompt_for(engine))
             analyst_source = model      # LOGICAL id (e.g. deepseek-v4-pro-thinking) for provenance
             break
         except Exception as e:

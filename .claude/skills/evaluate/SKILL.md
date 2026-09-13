@@ -1,6 +1,6 @@
 ---
 name: evaluate
-description: House standard for evaluating any signal, model, gate or exit rule in llm_trader — H/L pivot targets with last-price resolution for unresolved pivots, simulated trades, split long and short.
+description: House standard for evaluating any signal, model, gate or exit rule in llm_trader — H/L pivot targets with last-price resolution for unresolved pivots, simulated trades, split long and short; headline metrics = per-day pivot IC for rankers, counterfactual excess return per decision for gates/exits.
 argument-hint: "[what to evaluate, e.g. 'the ml_exit upgrade' or 'Gate 1c']"
 ---
 
@@ -45,7 +45,63 @@ live trades — they keep extending until confirmation, so fitting on them fits 
 moving target. Training always uses settled labels plus each row's own settle
 date (`end_date_pivot` / `end_date_pv`) as the walk-forward embargo.
 
-## 2. The population — simulated trades, not the ledger
+## 2. The metric — two functionals of one quantity (decided 2026-08-29)
+
+Every layer of the system is one of two shapes, and each shape has ONE headline
+metric. Both are functionals of the same quantity — the oriented pivot move — so
+the layers' objectives telescope instead of fighting.
+
+**RANKERS** (anything emitting a cross-sectional score: methods, ML models, the
+combine, confidence) → **mean per-day Spearman IC vs the signed pivot label**,
+with its day-clustered t. This is the number a model or method change must move.
+
+- Not AUC: on a binarized label AUC IS a rank statistic minus the label's
+  magnitude — measured day-level corr with IC +0.905 (1,988 method-days) — and
+  it replicated worse in every split tested. It adds nothing and discards the
+  magnitudes that sizing and rank-shaping consume.
+- Not precision@k / hit%: the weakest future-money predictors measured, and hit%
+  can replicate WITHOUT predicting money — side composition and drift persist
+  (the ~48.6% market-relative baseline problem), which is skill-shaped noise.
+- Measured 2026-08-29 (49 days, 61 methods, Gate-4 pool, live labels).
+  Method-ranking self-replication across contiguous / odd-even / well-covered
+  splits: IC .48/.65/.59 · tail spread .47/.64/.52 · AUC .37/.60/.58 ·
+  hit .38/.22/.63 · mean oriented return .32/.48/.37. IC is the only candidate
+  stable across all three designs, and its half-1 reading predicted half-2
+  realized return nearly as well as the return-unit metrics predicted
+  themselves.
+
+**DECIDERS** (anything binary: gates, exits, sizing tilts, the LLM layer,
+follow-through selection, whole-algorithm A/Bs) → **mean oriented pivot return
+per decision vs the matched counterfactual**, day-clustered t, NET of the
+calibrated costs whenever the compared branches trade different amounts or
+sessions.
+
+- The counterfactual is not optional: kept-vs-dropped with the side-mix
+  benchmark (`gate_funnel`'s `value` = keep_exc − drop_exc), hold-matched
+  control (`exit_policy_sim`'s EXCESS), paired same-day arm difference
+  (`arm_eval`, the Tier-2 wf backtest). Raw oriented means are incomparable
+  across side mixes, and an exit rule's raw return mostly measures its holding
+  period.
+- IC is a category error here: a binary decision has no cross-section, so its
+  "IC" degenerates to a rescaled mean difference (the funnel's gate-IC column
+  reads ±0.01 noise while the excess column carries the same information in
+  %-per-decision units that ADD UP and compare directly to the cost stack).
+
+A model is evaluated as a ranker even when it serves a decision: ml_exit's
+conviction → ranker IC on the oriented remaining move; the CLOSE RULE built on
+it → decider excess. When one number must summarize the whole algorithm, it is
+the decider metric on the end-to-end book vs its counterfactual; compound NAV is
+the monitor, not the target (at ~1.0%/day NAV sd, detecting a 0.10%/day
+improvement needs ~410 days — nothing is decidable there).
+
+Demoted to diagnostics, never optimization targets: decile/payoff curves (the
+SHAPE input to rank_shaping — a U or hump is invisible to IC and must be fixed
+by transforming the score, after which IC applies again), Brier/calibration (a
+repair step via isotonic, needed because conviction feeds sizing), fixed-horizon
+ICs (monitoring + holding-period machinery), gross win rate (the reporting
+convention).
+
+## 3. The population — simulated trades, not the ledger
 
 Use the simulated/panel surfaces, because the real trade ledger only contains
 what the gates let through (selection bias) and is far smaller:
@@ -62,7 +118,16 @@ Restrict to the **Gate-4 tradeable population** (price ≥ $5, 20-day dollar vol
 ≥ $5M from the OHLCV cache) unless the question is explicitly about observe-only
 names — otherwise the result is dominated by names the system would never trade.
 
-## 3. Split long and short — always
+The real ledger is structurally unusable for both metric families: a gate's
+dropped cohort never exists there (no counterfactual), and its power is hopeless
+for rankers — measured 2026-08-29: median 9,176 panel views per method vs median
+11 attributed real trades per method, and at per-trade gross return sd 7.04%
+even a 0.5%/trade edge needs ~800 closed trades pooled. The ledger's roles are
+execution-cost calibration (the constants inside the decider metric's NET
+adjustment), broker reconciliation, and the NAV monitor — never the evaluation
+sample.
+
+## 4. Split long and short — always
 
 Report ALL, LONG and SHORT for every headline number. The sides behave
 differently in this system (the funnel repeatedly measures the SELL side as the
@@ -75,7 +140,7 @@ Also split by side any time you change selection or sizing: a change can be
 side-neutral on scale and still bias side COMPOSITION (that is what the Gate 1c
 side floor exists to fix).
 
-## 4. Statistics that count as evidence here
+## 5. Statistics that count as evidence here
 
 - **Per-day Spearman IC** with a **day-clustered t** (mean over days ÷ SE of the
   daily series). Pooled IC across days is not the statistic — the system ranks
@@ -92,7 +157,7 @@ side floor exists to fix).
 - State n, day count, and the settled/provisional mix. Thin day counts (< ~10)
   are a sanity read, not a verdict.
 
-## 5. Traps that have produced wrong answers here
+## 6. Traps that have produced wrong answers here
 
 - `combine_source` resolves **per ticker** — an "ML run" contains weighted
   fail-soft rows. Filter on the row's own `combine_source`, never group by run.
@@ -108,7 +173,7 @@ side floor exists to fix).
 - Absolute IC levels are **not** comparable across different harnesses; paired
   contrasts within one harness are. Don't compare across scripts.
 
-## 6. Output
+## 7. Output
 
 Lead with the verdict and the number that supports it. Give the per-side table,
 then the caveats that would change the reading (day count, provisional share,

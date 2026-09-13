@@ -6,7 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 from loguru import logger
-from typing import List
+from typing import List, Optional
+from collections import Counter
 from src.models import NewsArticle
 from config import settings
 
@@ -130,6 +131,34 @@ def fetch_newsapi(query: str, max_age_hours: int = 24) -> List[NewsArticle]:
         return []
 
 
+def _confirmed_tags(ticker: str, title: str, summary: str) -> List[str]:
+    """Symbol tag for an article a SEARCH-derived feed returned for *ticker*.
+
+    yfinance ``Ticker.news`` is Yahoo's *related* feed — measured 2026-09-03,
+    only ~32% of its items mention the symbol's company at all (the rest are
+    peers, the sector, the index) — and a Google News query for ``"AR" stock``
+    returns whatever contains those letters. Tagging every result with the
+    queried symbol is what put ~14 unrelated headlines in a typical digest.
+    So the tag is kept only when the article's own text mentions the company
+    (``company_names.mention_evidence``, the single-token tier allowed because
+    the feed already vouched for the association); otherwise the article stays
+    in the pool UNTAGGED, where the relevance filter can still attach it to
+    whichever universe name it does mention. ``enable_name_relevance=False``
+    restores the unconditional tag.
+    """
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return []
+    if not settings.enable_name_relevance:
+        return [tk]
+    try:
+        from src.data.company_names import mention_evidence
+        return [tk] if mention_evidence(tk, f"{title or ''} {summary or ''}", allow_token=True) else []
+    except Exception as exc:                          # never lose the article
+        logger.debug(f"[news] tag confirmation failed for {tk}: {exc}")
+        return [tk]
+
+
 def fetch_ticker_news(tickers: List[str], max_age_hours: int = 168) -> List[NewsArticle]:
     """Per-ticker news via yfinance ``Ticker.news`` — the core per-symbol feed.
 
@@ -152,6 +181,7 @@ def fetch_ticker_news(tickers: List[str], max_age_hours: int = 168) -> List[News
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     out: List[NewsArticle] = []
     covered = 0
+    n_tagged = 0
     for tk in tickers:
         try:
             items = yf.Ticker(tk).news or []
@@ -174,13 +204,17 @@ def fetch_ticker_news(tickers: List[str], max_age_hours: int = 168) -> List[News
                                    or it.get("providerPublishTime"))
             if pub and pub < cutoff:
                 continue
+            tags = _confirmed_tags(tk, title, summary)
             out.append(NewsArticle(
                 title=title, summary=summary, url=url, source=str(provider),
-                published_at=pub or datetime.now(timezone.utc), tickers=[tk.upper()],
+                published_at=pub or datetime.now(timezone.utc), tickers=tags,
             ))
+            if tags:
+                n_tagged += 1
         if len(out) > n_before:
             covered += 1
-    logger.info(f"yfinance per-ticker news: {len(out)} articles across {covered}/{len(tickers)} tickers")
+    logger.info(f"yfinance per-ticker news: {len(out)} articles across {covered}/{len(tickers)} tickers "
+                f"({n_tagged} confirmed about the queried symbol)")
     return out
 
 
@@ -190,7 +224,39 @@ def fetch_ticker_news(tickers: List[str], max_age_hours: int = 168) -> List[News
 # article is tied to its ticker by the query, so it maps directly — no fuzzy
 # title matching (the same reason fetch_ticker_news beats the keyword pools).
 _GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-_GOOGLE_NEWS_WORKERS = 6   # modest fan-out so a 40-name universe doesn't burst-trip Google
+# Fan-out: measured 2026-09-04, 236 feeds at 6 workers ran 34 s (p50 0.75 s, p90
+# 0.93 s, every response HTTP 200), and the whole Step-1 fetch pool runs ~84 s
+# with Google News finishing ~14 s in — so a full-universe sweep (~135 names x 3
+# queries) at 8 workers stays well inside the pool wall instead of lengthening it.
+_GOOGLE_NEWS_WORKERS = 8
+
+
+def _google_name_query(ticker: str) -> Optional[str]:
+    """The COMPANY-NAME query for *ticker* (``"antero resources" stock``), or
+    None when no name is known.
+
+    Articles name the company, not the symbol, and Google's search treats a
+    quoted symbol as a literal word — so ``"AR" stock`` finds the handful of
+    pieces that print the ticker while ``"antero resources" stock`` finds the
+    coverage. Measured 2026-09-04 on the 120-name seeded sample (24 h): the
+    symbol query confirmed 347 articles about their company across 81 tickers,
+    the name query 617 across 83, and EITHER 92 — so both are kept (each finds
+    names the other misses). Uses the first name phrase (the SEC registrant
+    title minus its generic suffix, or the curated alias); fail-soft.
+    """
+    tk = (ticker or "").strip()
+    if not tk:
+        return None
+    try:
+        from src.data.company_names import name_keywords
+        phrases = name_keywords(tk).get("phrases") or []
+    except Exception as exc:
+        logger.debug(f"[google_news] name lookup failed for {tk}: {exc}")
+        return None
+    phrase = (phrases[0] or "").strip() if phrases else ""
+    if not phrase or phrase.lower() == tk.lower():
+        return None
+    return f'"{phrase}" stock'
 
 
 def _google_entry_source(entry) -> str:
@@ -206,10 +272,17 @@ def _google_entry_source(entry) -> str:
     return "google_news"
 
 
-def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool) -> List[NewsArticle]:
-    """Per-ticker Google News: a general query + (optionally) a Business Wire
-    site-query. Fails soft so one bad symbol never aborts the batch."""
+def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool,
+                                  statuses: Optional[Counter] = None) -> List[NewsArticle]:
+    """Per-ticker Google News: the symbol query + the company-NAME query (when a
+    name is known) + (optionally) a Business Wire site-query. Fails soft so one
+    bad symbol never aborts the batch. Non-200 feed statuses are tallied into
+    *statuses* (feedparser never raises on a 429 — it hands back an empty feed,
+    which is indistinguishable from a quiet news day unless the status is read)."""
     queries = [f'"{ticker}" stock']
+    name_q = _google_name_query(ticker)
+    if name_q:
+        queries.append(name_q)
     if with_bw:
         queries.append(f'"{ticker}" site:businesswire.com')
     out: List[NewsArticle] = []
@@ -219,6 +292,9 @@ def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool) 
         except Exception as e:
             logger.debug(f"[google_news] {ticker} query failed: {e}")
             continue
+        status = getattr(feed, "status", None)
+        if statuses is not None and status is not None and int(status) != 200:
+            statuses[int(status)] += 1
         for entry in feed.entries:
             pub = _parse_feed_date(entry)
             if pub and pub < cutoff:
@@ -226,25 +302,29 @@ def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool) 
             title = (entry.get("title") or "").strip()
             if not title:
                 continue
+            summary = entry.get("summary", "") or ""
             out.append(NewsArticle(
                 title=title,
-                summary=entry.get("summary", ""),
+                summary=summary,
                 url=entry.get("link", ""),
                 source=_google_entry_source(entry),
                 published_at=pub or datetime.now(timezone.utc),
-                tickers=[ticker.upper()],
+                tickers=_confirmed_tags(ticker, title, summary),
             ))
     return out
 
 
 def fetch_google_news(tickers: List[str], max_age_hours: int = 24) -> List[NewsArticle]:
-    """Per-ticker Google News RSS (general + Business Wire), ticker-tagged.
+    """Per-ticker Google News RSS (symbol + company name + Business Wire),
+    ticker-tagged.
 
     Free and near-real-time, so the pipeline fetches it FRESH every tick (the
     reactivity fast-lane). Bounded by ``google_news_max_tickers`` and fanned out
     over a small thread pool to keep the per-tick request burst reasonable;
     fail-soft per ticker. Skips non-equity symbols (futures ``=``, indices ``^``)
-    that produce junk queries. Deduped by URL within this source.
+    that produce junk queries. Deduped by URL within this source. A non-200
+    feed status (a 429 throttle above all) is WARNED once per fetch with its
+    count, because feedparser reports it only as an empty feed.
     """
     if not settings.enable_google_news:
         return []
@@ -257,15 +337,21 @@ def fetch_google_news(tickers: List[str], max_age_hours: int = 24) -> List[NewsA
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     with_bw = bool(settings.google_news_business_wire)
     out: List[NewsArticle] = []
+    statuses: Counter = Counter()
     workers = max(1, min(_GOOGLE_NEWS_WORKERS, len(eligible)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gnews") as ex:
-        futs = [ex.submit(_fetch_google_news_for_ticker, t, cutoff, with_bw) for t in eligible]
+        futs = [ex.submit(_fetch_google_news_for_ticker, t, cutoff, with_bw, statuses)
+                for t in eligible]
         for f in as_completed(futs):
             try:
                 out.extend(f.result() or [])
             except Exception as e:
                 logger.debug(f"[google_news] worker failed: {e}")
     out = _dedupe_by_url(out)
+    if statuses:
+        logger.warning(f"Google News: {sum(statuses.values())} feed(s) returned a non-200 "
+                       f"status {dict(statuses)} — throttled or blocked queries read as "
+                       f"empty feeds, so this tick's per-ticker coverage is understated")
     logger.info(f"Google News: {len(out)} articles across {len(eligible)} tickers (BW={with_bw})")
     return out
 
@@ -333,12 +419,25 @@ def _parse_feed_date(entry) -> datetime | None:
 
 
 def _parse_iso(s: str | None) -> datetime:
+    """Always returns an AWARE UTC datetime.
+
+    `fromisoformat` handles the trailing `Z` only after the replace above; an
+    offset-LESS string ("2026-09-11T12:00:00") parses fine and comes back NAIVE.
+    One naive `published_at` in a digest is not a cosmetic problem: every
+    consumer subtracts it from an aware "now" — `_recency_weight` on every
+    article of every digest, the clustering time partition, `news_quiet`'s age —
+    and a naive/aware subtraction raises TypeError, which inside
+    `analyse_sentiment` reads as the ticker simply failing to score: a silent
+    0.0 in the 0.40-weight `news` method.
+
+    `_parse_news_time` below already normalises; this is the same idiom."""
     if not s:
         return datetime.now(timezone.utc)
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return datetime.now(timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _parse_news_time(v) -> datetime | None:

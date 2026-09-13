@@ -46,7 +46,19 @@ from loguru import logger
 # therefore co-move (agreeing together is one confirmation, not two).
 # tests/test_family_agreement.py drift-tests this against _BASE_WEIGHTS.
 METHOD_FAMILIES: Dict[str, Tuple[str, ...]] = {
-    "Sentiment":    ("news", "sent_velocity"),                    # article flow (level + Δ)
+    # news_quiet is the same INFORMATION as news (the same verdict, gated on
+    # the story having gone quiet), so it joins the Sentiment family rather
+    # than voting a second time — the whole point of the family layer.
+    # Every one of these is a function of the SAME sentiment verdict, so they
+    # join Sentiment rather than voting a second time — the whole point of the
+    # family layer is that correlated methods are one voter. Concretely that
+    # means the promotion of 2026-09-11 adds three voters to COHERENCE and
+    # `sources_agreeing` (which count methods) and changes the MAGNITUDE of the
+    # Sentiment family's single vote (families count families), which is the
+    # honest placement for information that is already represented.
+    "Sentiment":    ("news", "sent_velocity", "news_quiet",
+                    "news_bull_fresh", "news_bear_fresh",
+                    "catalyst_tilt", "news_shock"),              # article flow (level + Δ)
     "Price/Trend":  ("tech", "massive", "momentum",               # the ticker's own OHLCV tape
                      "trend_strength", "pattern", "vwap", "ext_gap",
                      # 2026-08-11 promotions — all six read the ticker's own

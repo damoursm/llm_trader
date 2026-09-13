@@ -366,10 +366,12 @@ def run_backtest(days: Optional[int] = None,
     rank_basis = arch.startswith("rank")
     stamped = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    # Cache-only 20d ADV per ticker for the tradeable rank pool (Gate-4 floors,
-    # same numbers `rank_tradeable_only` judges against; the stored per-row
-    # `price` is as-of, the ADV is the cache's current tail — the same mild
-    # anachronism the live cache-only pool carries, stated rather than hidden).
+    # Cache-only 20d ADV per ticker for the tradeable rank pool (Gate-4 floors
+    # through the SAME `liquidity.dollar_volume` the live pool judges on since
+    # 2026-09-03 — before that this comment claimed a parity the code didn't
+    # have; the stored per-row `price` is as-of, the ADV is the cache's current
+    # tail — the same mild anachronism the live cache-only pool carries, stated
+    # rather than hidden).
     _adv_memo: Dict[str, float] = {}
 
     def _adv(tk: str) -> float:
@@ -377,12 +379,9 @@ def run_backtest(days: Optional[int] = None,
             val = 0.0
             try:
                 from src.data.cache import load_ohlcv
-                d = load_ohlcv(tk)
-                if d is not None and not d.empty and "Volume" in d.columns:
-                    c = pd.to_numeric(d["Close"], errors="coerce")
-                    v = pd.to_numeric(d["Volume"], errors="coerce")
-                    dv = (c * v).tail(20).mean()
-                    val = float(dv) if dv == dv else 0.0
+                from src.data.liquidity import dollar_volume
+                dv = dollar_volume(load_ohlcv(tk))
+                val = float(dv) if dv is not None else 0.0
             except Exception:
                 val = 0.0
             _adv_memo[tk] = val

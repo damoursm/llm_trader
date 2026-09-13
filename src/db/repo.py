@@ -16,11 +16,13 @@ import pandas as pd
 
 from src.db.connection import connect
 from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_NEWS_ATTENTION_COLUMNS,
+                           SIGNAL_NEWS_QUIET_COLUMNS, SIGNAL_LOGPROB_COLUMNS,
                            SIGNAL_CONFIDENCE_COMPONENT_COLUMNS,
                            SIGNAL_ABS_SHADOW_COLUMNS,
                            SIGNAL_COMBINED_SIDE_COLUMNS,
                            SIGNAL_NEWS_EVENT_COLUMNS,
-                           SIGNAL_FT_COLUMNS)
+                           SIGNAL_FT_COLUMNS,
+                           SIGNAL_LIQUIDITY_COLUMNS)
 
 
 # When True, read paths open read-only connections. The dashboard sets this so it
@@ -320,9 +322,12 @@ _SIGNAL_COLS = (_SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS)
                + list(SIGNAL_COMBINED_SIDE_COLUMNS)
                + list(SIGNAL_ABS_SHADOW_COLUMNS)
                + list(SIGNAL_NEWS_ATTENTION_COLUMNS)
+               + list(SIGNAL_NEWS_QUIET_COLUMNS)
+               + list(SIGNAL_LOGPROB_COLUMNS)
                + [c for c, _t in SIGNAL_NEWS_EVENT_COLUMNS]
                + ["combine_source"]
                + list(SIGNAL_FT_COLUMNS)
+               + list(SIGNAL_LIQUIDITY_COLUMNS)
                + ["scores"])
 
 
@@ -358,9 +363,13 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             + [_f(r.get(c)) for c in SIGNAL_COMBINED_SIDE_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_ABS_SHADOW_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_NEWS_ATTENTION_COLUMNS]
-            + [r.get("news_catalyst"), _f(r.get("news_raw_score"))]
+            + [_f(r.get(c)) for c in SIGNAL_NEWS_QUIET_COLUMNS]
+            + [_f(r.get(c)) for c in SIGNAL_LOGPROB_COLUMNS]
+            + [r.get("news_catalyst"), _f(r.get("news_raw_score")),
+               r.get("news_digest_id")]
             + [r.get("combine_source")]
             + [_f(r.get(c)) for c in SIGNAL_FT_COLUMNS]
+            + [_f(r.get(c)) for c in SIGNAL_LIQUIDITY_COLUMNS]
             + [_json(scores)]
         ))
     placeholders = ", ".join(["?"] * len(_SIGNAL_COLS))
@@ -371,6 +380,29 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             f"INSERT INTO signals ({', '.join(_SIGNAL_COLS)}) VALUES ({placeholders})",
             out,
         )
+        conn.execute("COMMIT")
+
+
+_ORDER_QUOTE_COLS = ["ticker", "submitted_at", "bid", "ask", "quote_age_s",
+                     "source", "recovered_at"]
+
+
+def insert_order_quotes(rows: List[dict]) -> None:
+    """Upsert recovered books keyed (ticker, submitted_at). Written by the
+    NBBO backfill for orders that predate the live capture; the live path never
+    touches this table (see the schema comment on provenance)."""
+    if not rows:
+        return
+    vals = [tuple(r.get(c) for c in _ORDER_QUOTE_COLS) for r in rows]
+    keys = [(r.get("ticker"), r.get("submitted_at")) for r in rows]
+    ph = ", ".join(["?"] * len(_ORDER_QUOTE_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM broker_order_quotes WHERE ticker = ? AND submitted_at = ?", keys)
+        conn.executemany(
+            f"INSERT INTO broker_order_quotes ({', '.join(_ORDER_QUOTE_COLS)}) "
+            f"VALUES ({ph})", vals)
         conn.execute("COMMIT")
 
 
@@ -488,6 +520,349 @@ _EXIT_SIGNAL_COLS = [
 ]
 
 
+_SENTIMENT_SHADOW_COLS = (
+    "run_id", "generated_at", "ticker", "digest_hash", "n_articles",
+    "primary_engine", "primary_model", "primary_raw", "primary_score",
+    "primary_catalyst", "shadow_engine", "shadow_model", "shadow_raw",
+    "shadow_score", "shadow_catalyst", "shadow_latency_s", "digest_id",
+)
+
+
+def insert_sentiment_shadow(rows: List[dict]) -> None:
+    """Persist paired sentiment verdicts: the engine that scored the run and the
+    OTHER engine's read of the SAME article digest, one row per (run, ticker).
+
+    Unlike the other per-run writers this does NOT delete by ``run_id`` — the
+    shadow pass runs in the background and can outlive its own tick, so a batch
+    may carry rows from the previous run alongside this one and a run-wide
+    delete would erase what an earlier drain already wrote. Idempotency is per
+    (run_id, ticker) instead."""
+    if not rows:
+        return
+    out = [(
+        r.get("run_id"), r.get("generated_at"), r.get("ticker"), r.get("digest_hash"),
+        int(r.get("n_articles") or 0),
+        r.get("primary_engine"), r.get("primary_model"),
+        _f(r.get("primary_raw")), _f(r.get("primary_score")), r.get("primary_catalyst"),
+        r.get("shadow_engine"), r.get("shadow_model"),
+        _f(r.get("shadow_raw")), _f(r.get("shadow_score")), r.get("shadow_catalyst"),
+        _f(r.get("shadow_latency_s")), r.get("digest_id"),
+    ) for r in rows]
+    keys = [(r.get("run_id"), r.get("ticker")) for r in rows]
+    placeholders = ", ".join(["?"] * len(_SENTIMENT_SHADOW_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM sentiment_shadow WHERE run_id IS NOT DISTINCT FROM ? "
+            "AND ticker IS NOT DISTINCT FROM ?", keys)
+        conn.executemany(
+            f"INSERT INTO sentiment_shadow ({', '.join(_SENTIMENT_SHADOW_COLS)}) "
+            f"VALUES ({placeholders})", out)
+        conn.execute("COMMIT")
+
+
+_SENTIMENT_DIGEST_COLS = (
+    "digest_id", "ticker", "run_id", "generated_at", "n_articles",
+    "digest_text", "articles_json",
+)
+
+
+def insert_news_articles(run_id: str, generated_at: str, articles: List) -> dict:
+    """Archive the tick's FULL merged article pool, URL-deduped.
+
+    One row per unique article for all time: a repeat sighting bumps
+    ``last_seen_at`` / ``n_sightings`` and leaves ``first_seen_at`` alone, which
+    is the field a point-in-time replay has to key on — an article must not be
+    visible to a tick that ran before anything had fetched it.
+
+    Why this exists: `sentiment_digests` stores only the top-20 cut that reached
+    a scorer, and only for tickers that were not abstained; `cache/news_*.json`
+    stores only the yfinance/NewsAPI leg. Measured 2026-09-11, that is ~600 of a
+    ~2,433-article pool, so ~75% of every tick was being discarded — which is
+    exactly why `memory/news-backfill-fidelity-2026-09` concluded historical news
+    could not be faithfully regenerated.
+
+    Returns ``{"new": n, "seen": n}``. Fail-soft by the caller's `_safe`.
+    """
+    if not articles:
+        return {"new": 0, "seen": 0}
+    seen: dict = {}
+    for a in articles:
+        url = str(getattr(a, "url", "") or "").strip()
+        title = str(getattr(a, "title", "") or "").strip()
+        if not url and not title:
+            continue
+        key = hashlib.sha1((url or title).encode("utf-8", errors="replace")).hexdigest()
+        if key in seen:
+            continue
+        pub = getattr(a, "published_at", None)
+        tks = getattr(a, "tickers", None)
+        seen[key] = (key, url, title[:1000],
+                     str(getattr(a, "source", "") or "")[:200],
+                     pub.isoformat() if hasattr(pub, "isoformat") else None,
+                     str(getattr(a, "summary", "") or "")[:4000],
+                     json.dumps(list(tks)) if tks else None,
+                     generated_at, str(run_id), generated_at, 1)
+    if not seen:
+        return {"new": 0, "seen": 0}
+    with connect() as conn:
+        conn.execute("CREATE TEMP TABLE _na_in AS SELECT * FROM news_articles WHERE 1=0")
+        conn.executemany(
+            "INSERT INTO _na_in VALUES (?,?,?,?,?,?,?,?,?,?,?)", list(seen.values()))
+        n_new = conn.execute(
+            "SELECT count(*) FROM _na_in i WHERE NOT EXISTS "
+            "(SELECT 1 FROM news_articles a WHERE a.url_hash = i.url_hash)").fetchone()[0]
+        # repeat sighting: bump the tail, never the head
+        conn.execute(
+            "UPDATE news_articles SET last_seen_at = ?, n_sightings = n_sightings + 1 "
+            "WHERE url_hash IN (SELECT url_hash FROM _na_in)", [generated_at])
+        conn.execute(
+            "INSERT INTO news_articles SELECT * FROM _na_in i WHERE NOT EXISTS "
+            "(SELECT 1 FROM news_articles a WHERE a.url_hash = i.url_hash)")
+        conn.execute("DROP TABLE _na_in")
+    return {"new": int(n_new), "seen": len(seen) - int(n_new)}
+
+
+def insert_sentiment_digests(rows: List[dict]) -> None:
+    """Persist the article digests the sentiment scorer actually saw, keyed by
+    the ENGINE-FREE ``digest_id`` (2026-09-06).
+
+    The verdict cache stores only a hash, so a past verdict's exact input
+    could never be replayed; this store keeps the text so a catalyst label can
+    be re-judged later on the SAME digest the model scored. Idempotent per
+    ``digest_id``: the first writer wins (the text is identical by
+    construction — the id is a hash of it), so a redundant row from the
+    other engine or a cache hit on a later tick never duplicates."""
+    if not rows:
+        return
+    out = [(
+        r.get("digest_id"), r.get("ticker"), r.get("run_id"), r.get("generated_at"),
+        int(r.get("n_articles") or 0), r.get("digest_text"), r.get("articles_json"),
+        r.get("digest_id"),
+    ) for r in rows if r.get("digest_id")]
+    if not out:
+        return
+    placeholders = ", ".join(["?"] * len(_SENTIMENT_DIGEST_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            f"INSERT INTO sentiment_digests ({', '.join(_SENTIMENT_DIGEST_COLS)}) "
+            f"SELECT {placeholders} WHERE NOT EXISTS "
+            f"(SELECT 1 FROM sentiment_digests WHERE digest_id = ?)", out)
+        conn.execute("COMMIT")
+
+
+_CATALYST_REPAIR_COLS = (
+    "digest_id", "run_id", "generated_at", "ticker", "engine", "model",
+    "first_pass", "trigger", "specialist_model", "specialist_version", "votes",
+    "n_calls", "final", "quality", "about_target", "latency_s", "error",
+    "arm", "rationale",
+)
+
+
+def insert_catalyst_repairs(rows: List[dict]) -> None:
+    """Persist catalyst-repair outcomes (specialist re-typing of a first-pass
+    catalyst label), one row per ``(digest_id, engine, arm)`` — the engine is
+    the one whose FIRST-PASS label was judged, so a DeepSeek-primary digest and
+    its local shadow verdict each keep their own row, and the arm is the
+    specialist configuration that judged it (``live`` for the tick-time pass,
+    ``think`` for the offline thinking-on arm), so an offline arm can never
+    overwrite the live row it is meant to be compared against.
+
+    Like the sentiment shadow this is drained from a background pass that can
+    outlive its tick, so there is no run-wide delete; idempotency is per
+    ``(digest_id, engine, arm)`` (the LAST outcome wins — a later, resolved
+    repair replaces an earlier failed one). A missing ``arm`` reads as
+    ``live``."""
+    if not rows:
+        return
+    out = [(
+        r.get("digest_id"), r.get("run_id"), r.get("generated_at"), r.get("ticker"),
+        r.get("engine"), r.get("model"), r.get("first_pass"), r.get("trigger"),
+        r.get("specialist_model"), r.get("specialist_version"),
+        (r.get("votes") if isinstance(r.get("votes"), str) else _json(r.get("votes"))),
+        int(r.get("n_calls") or 0), r.get("final"), r.get("quality"),
+        r.get("about_target"), _f(r.get("latency_s")), r.get("error"),
+        str(r.get("arm") or "live"), r.get("rationale"),
+    ) for r in rows if r.get("digest_id")]
+    if not out:
+        return
+    keys = [(row[0], row[4], row[17]) for row in out]
+    placeholders = ", ".join(["?"] * len(_CATALYST_REPAIR_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM catalyst_repairs WHERE digest_id = ? "
+            "AND coalesce(engine, '') = coalesce(?, '') "
+            "AND coalesce(arm, 'live') = ?", keys)
+        conn.executemany(
+            f"INSERT INTO catalyst_repairs ({', '.join(_CATALYST_REPAIR_COLS)}) "
+            f"VALUES ({placeholders})", out)
+        conn.execute("COMMIT")
+
+
+_CLUSTER_ARM_COLS = (
+    "run_id", "generated_at", "ticker", "digest_id", "engine", "model",
+    "n_articles", "n_clusters", "cluster_scores", "cluster_sizes",
+    "arm_raw", "arm_score", "primary_raw", "primary_score", "latency_s",
+)
+
+
+def insert_sentiment_cluster_arm(rows: List[dict]) -> None:
+    """Per-ticker CLUSTER-ARM verdicts paired with the live single-call one.
+
+    Idempotent per ``(run_id, ticker)`` and deliberately NOT run-wide DELETEd:
+    like the shadow rows, a call still in flight lands on a later tick's drain
+    carrying its own ``run_id``.
+    """
+    if not rows:
+        return
+    out = [tuple(r.get(c) for c in _CLUSTER_ARM_COLS) for r in rows if r.get("ticker")]
+    if not out:
+        return
+    keys = [(r[0], r[2]) for r in out]
+    placeholders = ", ".join(["?"] * len(_CLUSTER_ARM_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM sentiment_cluster_arm WHERE run_id = ? AND ticker = ?", keys)
+        conn.executemany(
+            f"INSERT INTO sentiment_cluster_arm ({', '.join(_CLUSTER_ARM_COLS)}) "
+            f"VALUES ({placeholders})", out)
+        conn.execute("COMMIT")
+
+
+_NEWS_REPLAY_COLS = (
+    "run_id", "ticker", "signal_date", "generated_at", "replayed_at",
+    "replay_version", "engine", "n_articles", "n_relevant", "n_pool",
+    "bundle_file", "pool_spec",
+    "news", "news_raw_score", "sent_velocity", "news_shock", "news_bear_fresh",
+    "catalyst_tilt", "news_unpriced", "news_unpriced_all", "news_catalyst",
+    "news_recency_mass", "news_article_count",
+    # 2026-09-12: `news_quiet` and `news_bull_fresh` were added to
+    # `news_replay.NEWS_REPLAY_COLUMNS` and to the SCHEMA but not here — and
+    # this tuple is what the INSERT actually names, so both were computed on
+    # every row and silently dropped by the writer. The symptom was 0.0%
+    # coverage on two methods that read ~1% and ~18% live; nothing errored.
+    # A second copy of a column list is the failure this repo tests for
+    # mechanically (`tests/test_db_signals.py` pins the same relationship for
+    # `SIGNAL_METHOD_COLUMNS`), so a drift test now pins this one too.
+    "news_quiet", "news_bull_fresh",
+)
+
+
+def insert_news_replay(rows: List[dict]) -> None:
+    """Per-tick regenerated news features (`src/analysis/news_replay.py`).
+
+    Its OWN table, deliberately not `signals_replay`: these values are produced
+    from a POOL that is only partly recoverable (the RSS and Google legs were
+    never persisted), so they are not interchangeable with a stored score until
+    the fidelity report says so. Idempotent per (run_id, ticker) so a resumed
+    or re-run tick replaces its rows rather than duplicating them.
+    """
+    if not rows:
+        return
+    out = [tuple(r.get(c) for c in _NEWS_REPLAY_COLS) for r in rows if r.get("ticker")]
+    if not out:
+        return
+    # Keyed by POOL SHAPE too, so a faithful row and an experimental one for the
+    # same ticker-run coexist instead of overwriting each other — the whole
+    # point is comparing them.
+    spec = _NEWS_REPLAY_COLS.index("pool_spec")
+    keys = [(r[0], r[1], r[spec] or "faithful") for r in out]
+    placeholders = ", ".join(["?"] * len(_NEWS_REPLAY_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM news_replay WHERE run_id = ? AND ticker = ? "
+            "AND coalesce(pool_spec, 'faithful') = ?", keys)
+        conn.executemany(
+            f"INSERT INTO news_replay ({', '.join(_NEWS_REPLAY_COLS)}) "
+            f"VALUES ({placeholders})", out)
+        conn.execute("COMMIT")
+
+
+_CATALYST_JUDGMENT_COLS = (
+    "judgment_id", "judged_at", "source", "engine", "model", "ticker", "run_id",
+    "digest_id", "model_catalyst", "verdict", "correct_catalyst", "entity_error",
+    "reason", "rationale",
+)
+
+
+def insert_catalyst_judgments(rows: List[dict]) -> None:
+    """Persist human/audit judgments of catalyst labels (the gold set the
+    repair evaluation and the voter scaffold train against). Idempotent per
+    ``judgment_id``."""
+    if not rows:
+        return
+    out = [(
+        r.get("judgment_id"), r.get("judged_at"), r.get("source"), r.get("engine"),
+        r.get("model"), r.get("ticker"), r.get("run_id"), r.get("digest_id"),
+        r.get("model_catalyst"), r.get("verdict"), r.get("correct_catalyst"),
+        (None if r.get("entity_error") is None else bool(r.get("entity_error"))),
+        r.get("reason"), r.get("rationale"),
+    ) for r in rows if r.get("judgment_id")]
+    if not out:
+        return
+    keys = [(row[0],) for row in out]
+    placeholders = ", ".join(["?"] * len(_CATALYST_JUDGMENT_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany("DELETE FROM catalyst_judgments WHERE judgment_id = ?", keys)
+        conn.executemany(
+            f"INSERT INTO catalyst_judgments ({', '.join(_CATALYST_JUDGMENT_COLS)}) "
+            f"VALUES ({placeholders})", out)
+        conn.execute("COMMIT")
+
+
+_ENGINE_REC_COLS = (
+    "run_id", "generated_at", "signal_date", "engine", "model", "prompt_variant",
+    "live", "ticker", "action", "direction", "confidence", "time_horizon",
+    "rationale", "snap_price", "rule_filled", "latency_s", "n_signals", "n_recs",
+)
+
+
+def insert_engine_recommendations(rows: List[dict]) -> None:
+    """Persist every synthesis engine's per-ticker decision on the same signal
+    cross-section, one row per (run, engine, prompt variant, ticker); ``live``
+    marks the engine whose decision the pipeline acted on this run.
+
+    Same discipline as `insert_sentiment_shadow`: NO run-wide delete. The
+    shadow synthesis runs in the background and can outlive its own tick, so
+    a drain may carry the previous run's rows alongside this run's live ones,
+    and a run-wide delete would erase what an earlier drain already wrote.
+    Idempotency is per (run_id, engine, prompt_variant, ticker) — the variant
+    is part of the key because the decomposition arm runs the SAME engine on
+    the other prompt (``deepseek:compact`` beside the live ``deepseek:full``),
+    and keying on the engine alone would let the later drain erase the live
+    row."""
+    if not rows:
+        return
+    out = [(
+        r.get("run_id"), r.get("generated_at"), r.get("signal_date"),
+        r.get("engine"), r.get("model"), r.get("prompt_variant"),
+        bool(r.get("live")), r.get("ticker"), r.get("action"), r.get("direction"),
+        _f(r.get("confidence")), r.get("time_horizon"), r.get("rationale"),
+        _f(r.get("snap_price")), bool(r.get("rule_filled")),
+        _f(r.get("latency_s")),
+        int(r["n_signals"]) if r.get("n_signals") is not None else None,
+        int(r["n_recs"]) if r.get("n_recs") is not None else None,
+    ) for r in rows]
+    keys = [(r.get("run_id"), r.get("engine"), r.get("prompt_variant"), r.get("ticker"))
+            for r in rows]
+    placeholders = ", ".join(["?"] * len(_ENGINE_REC_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(
+            "DELETE FROM engine_recommendations WHERE run_id IS NOT DISTINCT FROM ? "
+            "AND engine IS NOT DISTINCT FROM ? AND prompt_variant IS NOT DISTINCT FROM ? "
+            "AND ticker IS NOT DISTINCT FROM ?", keys)
+        conn.executemany(
+            f"INSERT INTO engine_recommendations ({', '.join(_ENGINE_REC_COLS)}) "
+            f"VALUES ({placeholders})", out)
+        conn.execute("COMMIT")
+
+
 def insert_exit_signals(run_id: str, rows: List[dict]) -> None:
     """Persist one row per (held position, exit method) re-scored this tick.
 
@@ -531,6 +906,7 @@ _BROKER_ORDER_COLS = [
     "run_id", "event", "intent", "ticker", "side", "order_type", "requested_qty",
     "filled_qty", "model_price", "limit_price", "fill_price", "slippage_bps",
     "commission", "status", "ok", "error", "order_id", "client_ref", "submitted_at",
+    "bid_at_submit", "ask_at_submit",
 ]
 
 
@@ -617,6 +993,8 @@ def insert_broker_report(run_id: str, report: dict) -> None:
             o.get("order_id"),
             o.get("client_ref"),
             o.get("submitted_at"),
+            _f(o.get("bid_at_submit")),
+            _f(o.get("ask_at_submit")),
         )
         for o in (report.get("orders") or [])
     ]

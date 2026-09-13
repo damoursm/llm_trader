@@ -1,0 +1,1532 @@
+[
+ {
+  "ticker": "MS",
+  "A": {
+   "score": 0.147378,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.168581,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "MOBX",
+  "A": {
+   "score": 0.649829,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.150764,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "TXG",
+  "A": {
+   "score": -0.111304,
+   "emitted": "DOWN",
+   "judge": "UP",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": -0.329572,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLE",
+  "A": {
+   "score": 0.175852,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.646257,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "IBB",
+  "A": {
+   "score": 0.513386,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.620559,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "UTZ",
+  "A": {
+   "score": -0.291453,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.24498,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "BYD",
+  "A": {
+   "score": -0.554522,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.317947,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SMCIP",
+  "A": {
+   "score": -0.063952,
+   "emitted": "DOWN",
+   "judge": "UP",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": -0.147206,
+   "emitted": "DOWN",
+   "judge": "UP",
+   "direction": "NONE",
+   "contra": true
+  }
+ },
+ {
+  "ticker": "YSS",
+  "A": {
+   "score": 0.608322,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.682494,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "PHVS",
+  "A": {
+   "score": 0.748737,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.696394,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "PHVS",
+  "A": {
+   "score": 0.260262,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.750494,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "LEN-B",
+  "A": {
+   "score": -0.355973,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.316472,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "GME",
+  "A": {
+   "score": 0.521837,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.597488,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SLV",
+  "A": {
+   "score": -0.023584,
+   "emitted": "DOWN",
+   "judge": "UP",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": 0.150165,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SG",
+  "A": {
+   "score": 0.050029,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.150111,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "RDDT",
+  "A": {
+   "score": 0.338881,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.378551,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "LITE",
+  "A": {
+   "score": 0.194111,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.545733,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "RDDT",
+  "A": {
+   "score": 0.149742,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.25913,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "YSS",
+  "A": {
+   "score": 0.577225,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.450737,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SMH",
+  "A": {
+   "score": 0.45873,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.520603,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "MS",
+  "A": {
+   "score": 0.14598,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.229344,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "BRK-B",
+  "A": {
+   "score": -0.042624,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.633823,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "NAVN",
+  "A": {
+   "score": -0.461052,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.513967,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "ONEW",
+  "A": {
+   "score": -0.715738,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.616937,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "GME",
+  "A": {
+   "score": 0.664602,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.598468,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "IBB",
+  "A": {
+   "score": 0.444705,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.594348,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "IBB",
+  "A": {
+   "score": -0.474849,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.491112,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "PL",
+  "A": {
+   "score": 0.401903,
+   "emitted": "UP",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": 0.521698,
+   "emitted": "UP",
+   "judge": "DOWN",
+   "direction": "UP",
+   "contra": true
+  }
+ },
+ {
+  "ticker": "CME",
+  "A": {
+   "score": 0.14991,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.149991,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "AVAV",
+  "A": {
+   "score": 0.592782,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.665208,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "LITE",
+  "A": {
+   "score": 0.63307,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.529594,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "CCC",
+  "A": {
+   "score": 0.329038,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.078891,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SPY",
+  "A": {
+   "score": -0.24176,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.252675,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SGI",
+  "A": {
+   "score": 0.541758,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.332982,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "ZS",
+  "A": {
+   "score": -0.474187,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.118704,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "WFC",
+  "A": {
+   "score": 0.786866,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.688456,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "DOCU",
+  "A": {
+   "score": 0.502871,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.735065,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "BRK-B",
+  "A": {
+   "score": 0.151843,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.154824,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLV",
+  "A": {
+   "score": 0.159383,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.466276,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLRE",
+  "A": {
+   "score": 0.536566,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.348938,
+   "emitted": "DOWN",
+   "judge": "UP",
+   "direction": "DOWN",
+   "contra": true
+  }
+ },
+ {
+  "ticker": "ECHO",
+  "A": {
+   "score": 0.149958,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.150282,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "AMAT",
+  "A": {
+   "score": 0.054204,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.149992,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLV",
+  "A": {
+   "score": -0.390019,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.404068,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "WBD",
+  "A": {
+   "score": 0.688114,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.658146,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "WFC",
+  "A": {
+   "score": 0.729185,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.644931,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SMH",
+  "A": {
+   "score": 0.583349,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.630791,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "WFC",
+  "A": {
+   "score": 0.174079,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.730997,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "ASST",
+  "A": {
+   "score": 0.533119,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.664083,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SNAP",
+  "A": {
+   "score": 0.524149,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.622496,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLU",
+  "A": {
+   "score": -0.718703,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.656301,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SMH",
+  "A": {
+   "score": 0.597419,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.585111,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "NAVN",
+  "A": {
+   "score": 0.437984,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.463577,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SMH",
+  "A": {
+   "score": 0.538521,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.375083,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "LIT",
+  "A": {
+   "score": 0.150031,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.258753,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "ONEW",
+  "A": {
+   "score": -0.751593,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.678451,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "IGV",
+  "A": {
+   "score": -0.086282,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.176336,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SIG",
+  "A": {
+   "score": 0.291428,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.545144,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XOM",
+  "A": {
+   "score": -0.017428,
+   "emitted": "DOWN",
+   "judge": "UP",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": 0.180811,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "LCID",
+  "A": {
+   "score": -0.488754,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.682558,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "ASST",
+  "A": {
+   "score": 0.509796,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.678814,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "BIVI",
+  "A": {
+   "score": 0.255493,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.263579,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "AEO",
+  "A": {
+   "score": -0.35,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.473843,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "FBRX",
+  "A": {
+   "score": 0.1932,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.141458,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "GLD",
+  "A": {
+   "score": 0.426593,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.559323,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "QBTS",
+  "A": {
+   "score": 0.149778,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.48946,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLE",
+  "A": {
+   "score": 0.690409,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.664485,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLE",
+  "A": {
+   "score": 0.252543,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.583678,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "VZ",
+  "A": {
+   "score": 0.233297,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.249476,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "CVX",
+  "A": {
+   "score": 0.204011,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.150197,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "BRK-B",
+  "A": {
+   "score": -0.049959,
+   "emitted": "DOWN",
+   "judge": "NONE",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.129068,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "SMH",
+  "A": {
+   "score": 0.591252,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.615933,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "TENB",
+  "A": {
+   "score": 0.152915,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.150016,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "BLTE",
+  "A": {
+   "score": 0.14993,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.349171,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "TTAN",
+  "A": {
+   "score": -0.532866,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.582599,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "QBTS",
+  "A": {
+   "score": 0.43776,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.316521,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "PTON",
+  "A": {
+   "score": -0.427086,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.436236,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "IBB",
+  "A": {
+   "score": 0.15784,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.599772,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "IRD",
+  "A": {
+   "score": 0.15051,
+   "emitted": "UP",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": 0.150271,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "GDX",
+  "A": {
+   "score": 0.150342,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.566554,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "GDX",
+  "A": {
+   "score": -0.306938,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.244166,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "OPEN",
+  "A": {
+   "score": -0.669451,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.329972,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLRE",
+  "A": {
+   "score": 0.445535,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.50389,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "AVAV",
+  "A": {
+   "score": 0.671552,
+   "emitted": "UP",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": true
+  },
+  "B": {
+   "score": 0.648552,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XBI",
+  "A": {
+   "score": 0.453505,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.481637,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "QBTS",
+  "A": {
+   "score": 0.397674,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.335628,
+   "emitted": "UP",
+   "judge": "UP",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "LEN-B",
+  "A": {
+   "score": -0.056233,
+   "emitted": "DOWN",
+   "judge": "NONE",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.150005,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "XLI",
+  "A": {
+   "score": -0.080038,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.203957,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "RDDT",
+  "A": {
+   "score": -0.117246,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.278994,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "AAOI",
+  "A": {
+   "score": -0.050008,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": 0.050001,
+   "emitted": "UP",
+   "judge": "NONE",
+   "direction": "UP",
+   "contra": false
+  }
+ },
+ {
+  "ticker": "TBBK",
+  "A": {
+   "score": -0.550294,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": null,
+   "contra": false
+  },
+  "B": {
+   "score": -0.489849,
+   "emitted": "DOWN",
+   "judge": "DOWN",
+   "direction": "DOWN",
+   "contra": false
+  }
+ }
+]

@@ -41,6 +41,14 @@ def _base(monkeypatch):
     for _f in ("enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
                "enable_rsi2_rev", "enable_dloc_rev", "enable_ml_ohlcv"):
         monkeypatch.setattr(settings, _f, False)
+    # news_quiet and news_bull_fresh ride `use_news`, so they join every method
+    # world these tests
+    # build - and being unproven it is EXEMPT from the win-rate filter, which
+    # would silently disarm the empty-book guard the tests below exercise. It
+    # is not the subject here; the guard itself is covered by
+    # tests/test_news_quiet.py.
+    monkeypatch.setattr(settings, "enable_news_quiet", False)
+    monkeypatch.setattr(settings, "enable_news_bull_fresh", False)
     agg.reset_winrate_filter_cache()
 
 
@@ -185,6 +193,13 @@ _OFF = [
     "enable_high_52w", "enable_momentum_12_1", "enable_st_reversal",
     "enable_ttm_squeeze", "enable_iv_term_structure", "enable_anchored_vwap",
     "enable_residual_momentum", "enable_volume_profile",
+    # 2026-09-11: promoted off weight 0 so they reach coherence / the family
+    # vote. They score on the fixture caches, so without this the camps these
+    # tests hand-build gain members the scenario never intended — which is how
+    # the empty-camp guard stopped being exercised (the filter dropped `news`
+    # and `massive` and the camp was still non-empty, so the guard never fired
+    # and the test passed on a premise that had quietly become false).
+    "enable_news_bear_fresh", "enable_catalyst_tilt", "enable_news_shock",
 ]
 
 

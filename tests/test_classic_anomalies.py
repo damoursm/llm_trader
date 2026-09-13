@@ -312,3 +312,23 @@ def test_dloc_below_liquidity_floor_is_no_view(monkeypatch):
     score, _ = compute_dloc_rev_score("THIN2", df=_mr_frame(closes, highs=highs, lows=lows,
                                                             volume=1_000.0))
     assert score == 0.0
+
+
+def test_st_reversal_uses_the_shared_floor_helper(monkeypatch):
+    """st_reversal used to INLINE a second copy of the dollar-volume floor; the
+    helper's docstring claimed it was shared by every MR scorer. One copy now,
+    on `liquidity.dollar_volume` — pinned so the floors cannot drift apart."""
+    import src.signals.classic_anomalies as ca
+    calls = []
+    real = ca._dollar_volume_ok
+
+    def spy(df, floor):
+        calls.append(float(floor))
+        return real(df, floor)
+
+    monkeypatch.setattr(ca, "_dollar_volume_ok", spy)
+    monkeypatch.setattr(settings, "st_reversal_min_dollar_volume", 1e12)
+    df = _frame([100.0] * 60 + [120.0] * 5)
+    score, _ = compute_st_reversal_score("AAA", df=df)
+    assert score == 0.0
+    assert calls == [1e12]

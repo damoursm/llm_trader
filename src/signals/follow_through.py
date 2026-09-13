@@ -42,23 +42,21 @@ from config.settings import settings
 
 
 def _gate4_ok(ticker: str, price: Optional[float], dfc=None) -> bool:
-    """Cache-only Gate-4: price floor from the tick's own snapshot, dollar-volume
-    floor from cached OHLCV (median close×volume, trailing 60 bars). Mirrors the
-    validation studies' population; fail-CLOSED on missing data. Pass ``dfc``
-    (the already-loaded OHLCV frame) to avoid a second cache copy per ticker."""
+    """Cache-only Gate-4 — THE SAME gate the LLM funnel applies
+    (``liquidity.is_liquid``, budget n=0): price floor on the tick's own snapshot
+    AND the cached close, dollar-volume floor on the shared 20-day mean of
+    close×volume. Until 2026-09-03 this carried its own median-60 formula, so
+    the two entry paths traded two different liquidity populations under one
+    NBBO sizing rule. Fail-CLOSED on missing data (a missing snapshot price is
+    a refusal, not a pass-through). Pass ``dfc`` (the already-loaded OHLCV
+    frame) to avoid a second cache copy per ticker."""
     try:
-        if price is None or float(price) < float(settings.trade_min_price):
+        if price is None:
             return False
-        if dfc is None:
-            from src.data.cache import load_ohlcv
-            dfc = load_ohlcv(ticker)
-        if dfc is None or dfc.empty or "Volume" not in dfc.columns:
-            return False
-        import pandas as pd
-        c = pd.to_numeric(dfc["Close"], errors="coerce")
-        v = pd.to_numeric(dfc["Volume"], errors="coerce")
-        m = (c * v).tail(60).median()
-        return bool(m == m and m >= float(settings.trade_min_dollar_volume))
+        from src.data.liquidity import is_liquid
+        return bool(is_liquid(ticker, {"n": 0}, float(settings.trade_min_price),
+                              float(settings.trade_min_dollar_volume),
+                              price=float(price), df=dfc))
     except Exception:
         return False
 

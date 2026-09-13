@@ -32,6 +32,12 @@ plateau-stable across prior 20-80 x scale 1.5-3 (all nine configs positive,
 t +1.8..+2.6); the large cells' signs are fold-stable. Config pinned at the
 pre-registered mid-plateau (prior 40, scale 2.0).
 
+The label the fit consumes is the RESOLVED one (repair → live → backfill,
+`news_events`), and events whose repair came back `unresolved` — checked by the
+score-free specialist, no majority formed — are DROPPED rather than relabeled:
+a calibration excludes noise, it never converts it. Both are inert until
+`enable_catalyst_repair_resolution` is on and repairs have accrued.
+
 ABSTAINS (0.0) when: news is 0/None, the run captured no catalyst (provider
 path, engine failure, pre-v4 cache), the cell is thin/flat, the calibration
 found < 300 labeled events, or the refresh failed (fail-soft {} — a DB hiccup
@@ -92,6 +98,20 @@ def calibrate_catalyst_tilt(force: bool = False) -> Dict[Tuple[str, str], float]
             ev = load_news_events()
             ev = ev[(ev.news.notna()) & (ev.news != 0.0)
                     & ev.catalyst.notna() & ev.fwd_ret_pivot.notna()]
+            # The catalyst REPAIR pass resolves repair → live → backfill in
+            # `load_news_events`; here the fit additionally DROPS every event
+            # whose label was checked by the specialist and stayed doubtful
+            # (`unresolved`). That is the standing calibration rule — exclude
+            # the noise, never convert it — and it is deliberately narrower
+            # than "keep only repaired rows": an UNCHECKED label was never
+            # flagged as suspect, and dropping the ~85% of events no trigger
+            # ever fired on would starve the fit instead of cleaning it.
+            if "catalyst_quality" in ev.columns:
+                doubtful = (ev.catalyst_quality == "unresolved")
+                if doubtful.any():
+                    logger.info(f"[catalyst_tilt] dropping {int(doubtful.sum())} "
+                                f"unresolved-repair events from the fit")
+                    ev = ev[~doubtful]
             # Gate 4-equivalent floor per event date (memory: every pivot number
             # is meaningful only GATED — ungated events inflate the tilts with
             # microcap bounce).

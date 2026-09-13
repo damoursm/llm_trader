@@ -334,6 +334,11 @@ def get_snapshots(tickers: List[str]) -> List[TickerSnapshot]:
                 pct_change_5d=data["pct_change_5d"],
                 volume=data["volume"],
                 market_cap=None,  # Polygon free tier does not expose market cap
+                # Live NBBO riding the same snapshot response (2026-08-31) —
+                # None on plans/paths without it; consumers gate on quote_age_s.
+                bid=data.get("bid"),
+                ask=data.get("ask"),
+                quote_age_s=data.get("quote_age_s"),
             ))
             covered.add(ticker)
             logger.debug(

@@ -232,3 +232,36 @@ def test_monitor_branch_closes_and_skips_llm(monkeypatch):
     assert trade["status"] == "CLOSED"
     assert trade["exit_reason"] == "ft_horizon"
     assert trade["return_pct"] != 0.0
+
+
+# ── Gate 4 parity with the LLM funnel (2026-09-03) ──────────────────────────
+
+def test_ft_gate4_is_the_funnel_gate4(monkeypatch):
+    """`_gate4_ok` must delegate to `liquidity.is_liquid` with the TRADE floors,
+    the tick's live price and the already-loaded frame — until 2026-09-03 it
+    carried its own median-60 formula, so the two entry paths traded two
+    different liquidity populations under one NBBO sizing rule. A missing
+    snapshot price is a refusal, and any exception fails CLOSED."""
+    import src.data.liquidity as liq
+    monkeypatch.setattr(settings, "trade_min_price", 5.0)
+    monkeypatch.setattr(settings, "trade_min_dollar_volume", 5e6)
+    seen = []
+    sentinel = object()
+
+    def fake(ticker, budget, mp, mdv, price=None, df=None):
+        seen.append((ticker, dict(budget), mp, mdv, price, df is sentinel))
+        return ticker == "OK"
+
+    monkeypatch.setattr(liq, "is_liquid", fake)
+    assert ft._gate4_ok("OK", 10.0, sentinel) is True
+    assert ft._gate4_ok("THIN", 10.0, sentinel) is False
+    assert seen == [("OK", {"n": 0}, 5.0, 5e6, 10.0, True),
+                    ("THIN", {"n": 0}, 5.0, 5e6, 10.0, True)]
+    assert ft._gate4_ok("OK", None, sentinel) is False          # no snapshot price → refuse
+    assert len(seen) == 2                                        # ...without consulting the gate
+
+    def boom(*a, **k):
+        raise RuntimeError("cache unreadable")
+
+    monkeypatch.setattr(liq, "is_liquid", boom)
+    assert ft._gate4_ok("OK", 10.0, sentinel) is False

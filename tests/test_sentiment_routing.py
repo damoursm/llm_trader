@@ -10,12 +10,32 @@ follow as fallbacks, because the alternative when the pinned engine is down is a
 to close the position. See tests/test_llm_fallback_chains.py.
 """
 
+import pytest
+
 import src.analysis.sentiment as sent
+
+
+@pytest.fixture(autouse=True)
+def _hosted_routing_only(monkeypatch):
+    """This file is about the HOSTED engine routing, so the self-hosted engine is
+    switched off for every test in it.
+
+    Not defensive tidiness: `reset_sentiment_providers` samples the shares
+    SEQUENTIALLY, so an ambient `SENTIMENT_LOCAL_SHARE` (0.30 in .env since
+    2026-09-03) steals that fraction of runs from the qwen/deepseek branches and
+    makes every assertion about the resulting engine PROBABILISTIC. Four tests
+    here went flaky the moment that landed, and they had been passing on luck
+    before anyone noticed. Scoped once here rather than pinned per test, so the
+    next engine added ahead of these branches cannot silently reintroduce it.
+    """
+    monkeypatch.setattr(sent.settings, "enable_local_llm", False)
+    monkeypatch.setattr(sent.settings, "sentiment_local_share", 0.0)
 
 
 def test_order_deepseek_primary_qwen_fallback(monkeypatch):
     """DeepSeek primary, Claude disabled → Qwen is the error fallback (not stripped)."""
     monkeypatch.setattr(sent.settings, "enable_claude_sentiment", False)
+    monkeypatch.setattr(sent.settings, "enable_local_llm", False)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "deepseek")
     assert sent._sentiment_engine_order(None) == ["deepseek", "qwen"]
     # pins lead (Fix #2 — the opener engine re-judges its own position FIRST)…
@@ -30,6 +50,7 @@ def test_order_deepseek_primary_qwen_fallback(monkeypatch):
 def test_order_qwen_primary_run(monkeypatch):
     """A Qwen-primary run (the ~10%) tries Qwen first, DeepSeek as the fallback."""
     monkeypatch.setattr(sent.settings, "enable_claude_sentiment", False)
+    monkeypatch.setattr(sent.settings, "enable_local_llm", False)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "qwen")
     assert sent._sentiment_engine_order(None) == ["qwen", "deepseek"]
     # pins still lead — a deepseek-opened position is re-judged by deepseek first
@@ -39,6 +60,7 @@ def test_order_qwen_primary_run(monkeypatch):
 
 def test_order_ab_when_claude_enabled(monkeypatch):
     monkeypatch.setattr(sent.settings, "enable_claude_sentiment", True)
+    monkeypatch.setattr(sent.settings, "enable_local_llm", False)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "anthropic")
     assert sent._sentiment_engine_order(None) == ["anthropic", "deepseek", "qwen"]
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "deepseek")

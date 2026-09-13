@@ -14,11 +14,14 @@ from src.utils import now_et, fmt_et
 from src.data.news_fetcher import fetch_all_news, fetch_cached_news, fetch_rss_news, fetch_google_news, _dedupe_by_url
 from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
+from src.data import company_names
 from src.data.trending import get_trending_tickers
 from src.signals.aggregator import build_signals, set_ml_combine_arm
 from src.analysis.claude_analyst import (SYNTHESIS_PROMPT_VERSION,
                                          generate_recommendations,
-                                         get_last_synthesis_meta)
+                                         get_last_synthesis_meta,
+                                         _set_synthesis_meta,
+                                         _local_synthesis_available)
 from src.data.insider_trades import fetch_insider_trades, get_tickers_from_smart_money
 from src.data.eight_k import fetch_8k_articles
 from src.data.google_trends import fetch_google_trends
@@ -72,9 +75,12 @@ from src.data.cluster_watchlist import (
 )
 from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
-from src.analysis.sentiment import reset_sentiment_providers, get_sentiment_provider_summary, get_dominant_sentiment_model
+from src.analysis.sentiment import (reset_sentiment_providers, get_sentiment_provider_summary,
+                                    get_dominant_sentiment_model, set_current_run,
+                                    pop_sentiment_shadow_rows, sentiment_shadow_pending,
+                                    pop_sentiment_digest_rows, pop_cluster_arm_rows)
 from src.analysis.data_quality import EXPECTED_SPARSE_SOURCES, KNOWN_DEAD_SOURCES, is_context_populated
-from src.analysis import arm_shadow
+from src.analysis import arm_shadow, engine_shadow, catalyst_repair
 from src.notifications.email_sender import send_recommendations
 from src.performance.market_calendar import current_session
 from src.performance.tracker import record_new_trades, update_open_trades, close_trades_on_signal_reversal, log_performance_summary, get_performance_for_email, get_open_trade_tickers, get_open_position_summaries, get_open_trades, monitor_open_positions, calibrate_sim_costs, reset_price_health, get_price_health, _method_scores_from_signal, _methods_agreeing, _dominant_method, _provider_of_synth_model, _confidence_floor, _LLM_ENGINES, RULE_FILL_MODEL as _RULE_FILL_MODEL, set_ml_arm
@@ -364,6 +370,15 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         # reconstructed historically; a run not persisted is data lost).
         # Analyse with `python -m src.analysis.signal_panel`.
         price_by_ticker = {s.ticker: s.price for s in (snapshots or []) if getattr(s, "price", None)}
+
+        def _liq_bps(tk):
+            """Memo-only expected-halfspread read (never computes here)."""
+            try:
+                from src.performance.liquidity_forecast import cached_bps
+                return cached_bps(tk)
+            except Exception:
+                return None
+
         sig_rows = []
         for tk, s in (signals_by_ticker or {}).items():
             # Base 19-method scores drive agreement / dominance (the trade-
@@ -412,11 +427,20 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 # baseline series the news_shock method judges today against.
                 "news_article_count": float(getattr(s, "news_article_count", 0) or 0),
                 "news_recency_mass": float(getattr(s, "news_recency_mass", 0.0) or 0.0),
+                # news_quiet's input (2026-09-09): hours since the freshest news
+                # cluster's first article. Persisted so the 48h threshold stays
+                # re-testable from the panel alone — the article pool it was
+                # derived from is only partly reconstructible.
+                "news_quiet_age_h": getattr(s, "news_quiet_age_h", None),
                 # news-event dataset (2026-08-15): the LLM's catalyst class +
                 # raw pre-scaler verdict — src/analysis/news_events.py joins
                 # them against the pivot forward return.
                 "news_catalyst": getattr(s, "news_catalyst", None),
                 "news_raw_score": getattr(s, "news_raw_score", None),
+                # continuous reading of the same verdict (accrual only)
+                "news_expected_score": getattr(s, "news_expected_score", None),
+                "news_argmax_score": getattr(s, "news_argmax_score", None),
+                "news_digest_id": getattr(s, "news_digest_id", None),
                 # Buy/sell split sides (2026-07-22): the two camp-conviction
                 # aggregates whose difference is combined_score — persisted so
                 # each side's forward IC is monitored (Signal IC → Buy/Sell side).
@@ -431,6 +455,10 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 "ft_score": getattr(s, "ft_score", None),
                 "ft_dir": float(getattr(s, "ft_dir", 0.0) or 0.0),
                 "ft_selected": (1.0 if getattr(s, "ft_selected", False) else 0.0),
+                # Expected-liquidity forecast (2026-08-30): memo-only read, so
+                # the panel records what THIS run computed (NULL when the prime
+                # was disabled/failed) — the forecast-vs-realized-drift join.
+                "exp_halfspread_bps": _liq_bps(tk),
                 "scores": all_scores,
             })
         if sig_rows:
@@ -469,6 +497,78 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                     rows=sim_rows,
                 )
 
+        # Paired sentiment verdicts (the run's engine + the other engine on the
+        # SAME digest). Drained NON-BLOCKING: the shadow pass runs in the
+        # background and a slow local server must never hold up the persist, so
+        # whatever is still in flight carries its own run_id and lands on the
+        # next tick's drain.
+        n_shadow = 0
+        try:
+            shadow_rows = pop_sentiment_shadow_rows()
+            if shadow_rows:
+                repo.insert_sentiment_shadow(shadow_rows)
+                n_shadow = len(shadow_rows)
+            pending = sentiment_shadow_pending()
+            if pending:
+                logger.info(f"[db] sentiment shadow: {n_shadow} row(s) written, "
+                            f"{pending} still in flight (they persist next tick)")
+        except Exception as e:
+            logger.warning(f"[db] sentiment-shadow persist skipped: {e}")
+
+        # The article digests the sentiment scorer saw this tick, keyed by the
+        # engine-free digest id (the join key for `sentiment_shadow` pairs and
+        # `catalyst_repairs`). Idempotent per id, so a digest re-scored on a
+        # later tick (or by the shadow engine) never duplicates.
+        try:
+            arm_rows = pop_cluster_arm_rows()
+            if arm_rows:
+                # Non-blocking like the shadow drain: an arm still in flight
+                # carries its own run_id onto the next tick's write.
+                repo.insert_sentiment_cluster_arm(arm_rows)
+                logger.info(f"[cluster-arm] persisted {len(arm_rows)} paired row(s)")
+            digest_rows = pop_sentiment_digest_rows()
+            if digest_rows:
+                repo.insert_sentiment_digests(digest_rows)
+        except Exception as e:
+            logger.warning(f"[db] sentiment-digest persist skipped: {e}")
+
+        # Catalyst-label repairs (the score-free specialist's re-typing of a
+        # first-pass label). Same non-blocking contract as the sentiment
+        # shadow: a repair still in flight carries its own run_id onto the
+        # next tick's write; idempotency is per (digest_id, engine) in repo.
+        n_repair = 0
+        try:
+            repair_rows = catalyst_repair.pop_catalyst_repair_rows()
+            if repair_rows:
+                repo.insert_catalyst_repairs(repair_rows)
+                n_repair = len(repair_rows)
+            pending = catalyst_repair.catalyst_repair_pending()
+            # The per-tick trigger tally: the "~15-20% of calls" estimate is
+            # MEASURED here, not inferred from the table later.
+            counts = catalyst_repair.pop_trigger_counts()
+            if counts or n_repair or pending:
+                logger.info("[catalyst-repair] tick: "
+                            + catalyst_repair.format_tick_summary(counts, n_repair, pending))
+        except Exception as e:
+            logger.warning(f"[db] catalyst-repair persist skipped: {e}")
+
+        # Paired synthesis ENGINE decisions (the live engine's rows were queued
+        # synchronously; the shadow engine's arrive whenever its call finishes).
+        # Same non-blocking contract as the sentiment shadow above.
+        n_engine = 0
+        try:
+            engine_rows = engine_shadow.pop_engine_shadow_rows()
+            if engine_rows:
+                repo.insert_engine_recommendations(engine_rows)
+                n_engine = len(engine_rows)
+            pending = engine_shadow.engine_shadow_pending()
+            if pending:
+                logger.info(f"[db] engine shadow: {n_engine} decision row(s) written, "
+                            f"{pending} synthesis branch(es) still in flight "
+                            f"(they persist next tick)")
+        except Exception as e:
+            logger.warning(f"[db] engine-shadow persist skipped: {e}")
+
         # Per-arm synthesis calls (live + shadow). Joined HERE, at the very end
         # of the run, so the shadow arms had the whole pipeline to finish in and
         # nothing on the order path ever blocked on them.
@@ -488,7 +588,8 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         logger.info(
             f"[db] Persisted run {run_id}: {len(rec_rows)} recommendation(s), "
             f"{len(sources)} source(s), {n_orders} broker order event(s), "
-            f"{len(sig_rows)} signal row(s), {n_arm} arm call(s) → DuckDB"
+            f"{len(sig_rows)} signal row(s), {n_arm} arm call(s), "
+            f"{n_shadow} shadow verdict(s), {n_engine} engine decision(s) → DuckDB"
         )
     except Exception as e:
         logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
@@ -737,6 +838,53 @@ def _fetch_news(tickers, sectors):
     return articles
 
 
+def _archive_articles(run_id, start, articles):
+    """Write the tick's whole pool to `news_articles` (URL-deduped, all-time).
+
+    Takes the run's `start` datetime and renders it HERE. `_safe` wraps the
+    CALL, not the evaluation of its arguments — an expression that raises while
+    building the argument list takes the whole tick down before the guard is
+    ever entered, which is exactly how the first version of this shipped
+    (`generated_at` does not exist in `run_pipeline`; two ticks crashed)."""
+    from src.db import repo
+    ts = start.isoformat() if hasattr(start, "isoformat") else str(start)
+    out = repo.insert_news_articles(run_id, ts, articles)
+    logger.info(f"[news-archive] {out['new']} new / {out['seen']} already archived "
+                f"({len(articles)} in this tick's pool)")
+    return out
+
+
+def _prime_company_names(all_tickers):
+    """Resolve every universe symbol's registrant name up front (SEC bulk list,
+    Polygon reference for the rest; disk-cached, so a warm tick costs ~0.4 s for
+    ~400 names). The per-ticker news relevance filter and the search-feed tag
+    confirmation both read these names — priming here means the first scorer
+    thread does not pay the SEC download inside the scoring pool. The named
+    symbols' INDUSTRY lines are primed next (Polygon reference, cached 180
+    days, cold fetches pooled): the sentiment target header reads them and its
+    text salts the verdict cache key, so resolving one lazily inside a scorer
+    thread would both spend a Polygon call there and re-key that ticker's
+    verdict mid-run. Returns the LIST of resolved symbols (not a count) so
+    ``_safe`` can flag an empty result as a dark source: zero names for a
+    populated universe is an outage, not "nothing to say"."""
+    if not settings.enable_name_relevance:
+        return None
+    resolved = [t for t in all_tickers if company_names.company_name(t)]
+    missing = len(all_tickers) - len(resolved)
+    logger.info(f"[company_names] {len(resolved)}/{len(all_tickers)} universe symbols named"
+                + (f" ({missing} unnamed — symbol/alias evidence only)" if missing else ""))
+    try:
+        # Cheap and unconditional at its TTL (14 pages, ~6 s): it makes the
+        # fund verdict authoritative and lets `prime_industries` skip the
+        # per-ticker detail call for every wrapper type.
+        company_names.prime_security_types()
+        n_ind = company_names.prime_industries(resolved)
+        logger.info(f"[company_names] {n_ind}/{len(resolved)} named symbols carry an industry line")
+    except Exception as exc:                        # noqa: BLE001 - header is fail-soft without it
+        logger.warning(f"[company_names] industry prime failed: {exc}")
+    return resolved
+
+
 def _fetch_snapshots(all_tickers):
     snapshots = load_snapshots()
     if snapshots is not None:
@@ -805,6 +953,9 @@ def _hold_review_groups(open_trades, run_sent=None, run_synth=None):
 # Cross-engine order tried when an opener-PINNED hold-review engine can't answer.
 # DeepSeek leads: it is the cheap, funded workhorse the rest of the system falls
 # back to (synthesis `_synthesis_attempts_for`, sentiment `_sentiment_engine_order`).
+# The self-hosted engine is appended LAST at call time (`hold_review_fallbacks`)
+# and only when it is enabled: it is the outage tier — the one engine with no
+# billing relationship — not a peer of the hosted ones.
 _HOLD_REVIEW_FALLBACK_ORDER = ("deepseek", "qwen", "anthropic")
 
 
@@ -815,8 +966,13 @@ def hold_review_fallbacks(pinned: str) -> list:
     single fixed alternate (``"anthropic" if pinned == "deepseek" else "deepseek"``),
     so a DeepSeek pin dead-ended on an Anthropic account that was out of credits
     and never reached Qwen — leaving the position with no exit gate for the tick.
+    The local engine joins the tail only while `enable_local_llm` is on — a
+    disabled engine must not cost a dead attempt on the exit path.
     """
-    return [e for e in _HOLD_REVIEW_FALLBACK_ORDER if e != pinned]
+    order = list(_HOLD_REVIEW_FALLBACK_ORDER)
+    if _local_synthesis_available():
+        order.append("local")
+    return [e for e in order if e != pinned]
 
 
 def _run_hold_reviews(groups, legacy_tickers, sectors, build_kwargs, session,
@@ -1208,8 +1364,27 @@ def _email_decision(*, observe_only: bool, send_email: bool,
 def _apply_actionable_gates(recommendations, *, confidence_threshold,
                             side_threshold_adj, signals_by_ticker, allow_buys,
                             earnings_blackout, trade_gate_budget,
-                            gate_diag, gate_outcomes):
-    """Run the actionable filter (Gates 1, 1b, 2, 3, 4, 5) over ``recommendations``.
+                            gate_diag, gate_outcomes,
+                            live_prices=None, session=None, rank_mode=False):
+    """Run the actionable filter (Gates 1, 1c, 1b, 2, 3, 4, 4b, 5) over
+    ``recommendations``.
+
+    ``live_prices`` (``{ticker: price}`` from this tick's snapshots) lets Gate 4
+    test the price floor on the LIVE price as well as the cached close;
+    ``session`` puts Gate 4b's book width on the RTH basis. Both optional —
+    None keeps the cached-close / raw-book behaviour.
+
+    ``rank_mode`` (2026-09-04) marks a run whose candidates came from the
+    MECHANICAL selector rather than the LLM. Gates 1 and 1c are then NOT
+    APPLICABLE and are skipped: both are thresholds on the LLM's STATED
+    confidence — Gate 1 an absolute floor on it, Gate 1c a within-run rank of
+    it — and `rank_entry` already did that job on the quantity it does have
+    (the band decides IF, the combined-score rank decides WHICH, capped per
+    side). Running them anyway would silently re-filter on the AGGREGATOR's
+    confidence, a different scale that was never calibrated for a floor. They
+    are recorded as `gate1_mode="rank"` in ``gate_diag`` rather than left to
+    pass everything: a gate that always passes is indistinguishable from one
+    that never rejects, so it must SAY which it is.
 
     Extracted from ``run_pipeline`` on 2026-07-25 for ONE reason: coverage showed
     this block -- the code that decides what actually trades -- had **zero** test
@@ -1238,8 +1413,9 @@ def _apply_actionable_gates(recommendations, *, confidence_threshold,
     # information (per-run rank IC -0.023), so dropping the lowest passers on
     # hot runs costs nothing. Deterministic tie-break (confidence, then
     # ticker) so reruns cannot reshuffle the boundary. 0 disables.
-    _cap = int(getattr(settings, "gate1_rank_cap", 0) or 0)
+    _cap = 0 if rank_mode else int(getattr(settings, "gate1_rank_cap", 0) or 0)
     _cap_keep: set = set()
+    gate_diag["gate1_mode"] = "rank" if rank_mode else "llm_confidence"
     if _cap > 0:
         _floor_passers = [
             r for r in recommendations
@@ -1280,7 +1456,7 @@ def _apply_actionable_gates(recommendations, *, confidence_threshold,
         # gets none, because cutting its low-confidence calls would only remove
         # volume at random. See tracker.calibrate_side_threshold.
         _side_thr = confidence_threshold + side_threshold_adj.get(r.action, 0.0)
-        if r.confidence < _side_thr:
+        if not rank_mode and r.confidence < _side_thr:
             gate_diag["dropped_below_threshold"] += 1
             gate_outcomes[r.ticker] = "below_threshold"
             continue
@@ -1313,10 +1489,23 @@ def _apply_actionable_gates(recommendations, *, confidence_threshold,
         # or < trade_min_dollar_volume 20d ADV) are OBSERVE-ONLY — still scored +
         # persisted to the signals panel (penny-stock performance keeps accruing)
         # but never actionable (no sim trade / broker order). Fail-closed via
-        # is_liquid; discovery admits them at the LOWER observation floor.
-        if not _is_tradeable(r.ticker, trade_gate_budget):
+        # is_liquid; discovery admits them at the LOWER observation floor. The
+        # price floor is judged on the tick's LIVE price too (2026-09-03): the
+        # cached close alone is up to a session stale.
+        if not _is_tradeable(r.ticker, trade_gate_budget,
+                             price=(live_prices or {}).get(r.ticker)):
             gate_diag["dropped_untradeable"] += 1
             gate_outcomes[r.ticker] = "untradeable"
+            continue
+        # Gate 4b — live-book WIDTH cap (2026-09-03): a name whose quoted NBBO
+        # half-spread is at/above `gate4_nbbo_max_halfspread_bps` (12 bp, RTH
+        # basis) is DEFERRED, not condemned — it re-qualifies at any later tick
+        # its book is tighter. Measured on the real funnel: the Gate-4 passers
+        # the cap removes ran win 47.0% / net −860 while the survivors ran
+        # 53.9% / net +495 (both sides improve). No live book ⇒ pass.
+        if _is_wide_book(r.ticker, session=session):
+            gate_diag["dropped_wide_book"] += 1
+            gate_outcomes[r.ticker] = "wide_book"
             continue
         # Gate 5 — overextension (anti-chase, BUY-only): a BUY whose ticker
         # already ran > overextension_runup_pct over the trailing 5 completed
@@ -1336,18 +1525,64 @@ def _apply_actionable_gates(recommendations, *, confidence_threshold,
     return actionable
 
 
-def _is_tradeable(ticker: str, budget: dict) -> bool:
+def _is_tradeable(ticker: str, budget: dict, price=None) -> bool:
     """Tradeable-liquidity gate (Gate 4 of the actionable filter): True iff
     ``ticker`` clears the higher TRADE price + 20-day dollar-volume floor
-    (``trade_min_price`` / ``trade_min_dollar_volume``). False → OBSERVE-ONLY: the
-    name is still scored + persisted to the signals panel (so penny / thin-volume
-    performance keeps accruing) but never opens a trade. Fail-closed (``is_liquid``
-    returns False when liquidity can't be verified). Gate off → always tradeable."""
+    (``trade_min_price`` / ``trade_min_dollar_volume``) and is not an exotic
+    security type. False → OBSERVE-ONLY: the name is still scored + persisted
+    to the signals panel (so penny / thin-volume performance keeps accruing)
+    but never opens a trade. Fail-closed (``is_liquid`` returns False when
+    liquidity can't be verified). Gate off → always tradeable.
+
+    ``price`` is the tick's live snapshot price: the floor is tested on it AND
+    on the cached close (2026-09-03 — the cached close alone straddled the $5
+    floor in the dangerous direction for 10 of 16 measured straddles). The
+    exotic check (preferred/warrant/unit/OTC-foreign, ``is_exotic_security``)
+    used to live ONLY at the discovery gate, so a warrant entering the universe
+    by a path that skips discovery was tradeable — ARQQW traded 2026-06-17."""
     if not getattr(settings, "enable_trade_liquidity_gate", False):
         return True
+    if getattr(settings, "enable_security_type_filter", False):
+        from src.data.market_data import is_exotic_security
+        if is_exotic_security(ticker):
+            return False
     from src.data.liquidity import is_liquid
     return is_liquid(ticker, budget, settings.trade_min_price,
-                     settings.trade_min_dollar_volume)
+                     settings.trade_min_dollar_volume, price=price)
+
+
+def _is_wide_book(ticker: str, session=None) -> bool:
+    """Gate 4b of the actionable filter (2026-09-03): True when the ticker's
+    LIVE quoted NBBO half-spread, on the RTH basis (the session's own widening
+    divided out — already charged by the session size haircut and cost model),
+    is at/above ``gate4_nbbo_max_halfspread_bps``. Reads the SAME input as the
+    NBBO sizing tilt (``liquidity_forecast.quoted_halfspread_bps`` — the raw
+    quoted book, never the power-law-mapped ``exp_halfspread_bps``, and never
+    the level-biased IBKR sweep). No live book (off-hours, a fresh listing, the
+    forecast disabled) → False: the cap judges a book, not its absence. Cap
+    ≤ 0 → never blocks. Fail-open on any error."""
+    try:
+        cap = float(getattr(settings, "gate4_nbbo_max_halfspread_bps", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if cap <= 0:
+        return False
+    try:
+        from src.performance.liquidity_forecast import quoted_halfspread_bps
+        q = quoted_halfspread_bps(ticker, session=session)
+        if not q or q.get("bps") is None:
+            return False
+        bps = float(q["bps"])
+        if bps != bps:
+            return False
+        if bps >= cap:
+            logger.info(f"[gate4b] {ticker}: live book {bps:.1f} bp half-spread "
+                        f"(RTH basis) ≥ cap {cap:.0f} bp — deferred (wide_book)")
+            return True
+        return False
+    except Exception as e:
+        logger.debug(f"[gate4b] {ticker}: book width unavailable ({e}) — passing")
+        return False
 
 
 def _recent_runup_pct(ticker: str):
@@ -1433,6 +1668,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     run_id = start.strftime("%Y-%m-%d_%H%M%S")
     _reset_source_log()
     reset_sentiment_providers()
+    set_current_run(run_id)
     reset_price_health()
     # Per-run health counters for the silent-default sites surfaced via
     # _collect_sources (FX sizing rate, correlation-pair compute, regime/mode
@@ -1668,6 +1904,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:
 
         # Group A: non-yfinance-options — submit all at once, run concurrently
+        # Company names first: the news fetchers' tag confirmation and the
+        # relevance filter read them (lock-guarded, so a fetcher that gets there
+        # first simply does the one-time load itself).
+        f_names        = (pool.submit(_safe, "company_names", _prime_company_names, all_tickers)
+                          if settings.enable_name_relevance else None)
         f_news         = pool.submit(_safe, "news", _fetch_news, tickers, sectors)
         f_snapshots    = pool.submit(_safe, "snapshots", _fetch_snapshots, all_tickers)
 
@@ -1819,6 +2060,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         return fut.result() if fut is not None else None
 
     edgar = get(f_edgar) or {}
+    get(f_names)                      # joined for its source-health row only
 
     # Merge all article sources into a single list
     articles = get(f_news) or []
@@ -1848,6 +2090,15 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # feeds) — first occurrence wins, preserving source ordering.
     articles = _dedupe_by_url(articles)
     logger.info(f"Steps 1–3: {len(articles)} total articles assembled")
+
+    # Archive the FULL pool before anything cuts it. `sentiment_digests` keeps
+    # only the top-20 slice that reached a scorer (and nothing at all for an
+    # abstained ticker), and `cache/news_*.json` keeps only the yfinance/NewsAPI
+    # leg — ~600 of ~2,433 — so without this ~75% of every tick is gone the
+    # moment the tick ends. That is the gap that made historical news
+    # unrecoverable (memory/news-backfill-fidelity-2026-09).
+    if bool(getattr(settings, "enable_news_archive", True)):
+        _safe("news_archive", _archive_articles, run_id, start, articles)
 
     # Macro-news scan — derives a geopolitical / oil / tariff / policy regime
     # read from the SAME article flow (no extra fetch cost). Caches hourly to
@@ -2047,6 +2298,36 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                     save_snapshots(snapshots)
                 except Exception as e:
                     logger.debug(f"[snapshots] top-up cache save failed: {e}")
+
+    # ── Expected-liquidity / drift-risk forecast (2026-08-30) ──────────────
+    # Right after the data fetch, before anything scores: per-ticker expected
+    # one-way execution deviation (bp) from cached OHLCV (Corwin–Schultz /
+    # Abdi–Ranaldo), level-calibrated onto our own realized fills. Predicts
+    # whether an order's fill is likely to drift from the decision price.
+    # Cache-only + fail-soft; persists via signals.exp_halfspread_bps and the
+    # entry stamp. PANEL-FIRST — no gate or sizing consumes it yet.
+    if settings.enable_liquidity_forecast:
+        try:
+            from src.performance.liquidity_forecast import (
+                prime_liquidity_forecast, set_live_spreads)
+            # Live NBBO layer (2026-08-31): the Polygon batch snapshot already
+            # carries each name's real-time two-sided book — hand the CURRENT
+            # half-spreads to the forecast before priming, so drift risk sees
+            # the book as it is NOW (a fresh quote only; an off-hours snapshot
+            # carries the stale close book and is dropped by the age gate).
+            _live = {}
+            for _s in (snapshots or []):
+                _b, _a, _age = (getattr(_s, "bid", None), getattr(_s, "ask", None),
+                                getattr(_s, "quote_age_s", None))
+                if _b and _a and 0 < _b <= _a and _age is not None and _age <= 120.0:
+                    _live[_s.ticker] = (_a - _b) / 2.0 / ((_a + _b) / 2.0) * 1e4
+            _n_live = set_live_spreads(_live)
+            _liq_summary = prime_liquidity_forecast(all_tickers)
+            if _liq_summary:
+                logger.info(f"[liquidity] expected-spread forecast: {_liq_summary} "
+                            f"(live NBBO for {_n_live} name(s))")
+        except Exception as e:
+            logger.warning(f"[liquidity] forecast unavailable: {e}")
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
     logger.info("Step 4: Building signals...")
@@ -2316,14 +2597,33 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     logger.info(f"[synth_prompt] {_arm} this run "
                 f"(dual share={settings.dual_case_synthesis_share:g}, "
                 f"blind share={settings.blind_synthesis_share:g})")
-    recommendations = generate_recommendations(
-        signals,
-        open_positions=open_position_summaries if hold_prompt_active else None,
-        session=run_session,
-        blind_synthesis=blind_synthesis,
-        dual_case=dual_case,
-        **synth_kwargs,
-    )
+    _synth_t0 = time.monotonic()
+    if settings.enable_llm_synthesis:
+        recommendations = generate_recommendations(
+            signals,
+            open_positions=open_position_summaries if hold_prompt_active else None,
+            session=run_session,
+            blind_synthesis=blind_synthesis,
+            dual_case=dual_case,
+            **synth_kwargs,
+        )
+    else:
+        # MECHANICAL entry selection (2026-09-04). The LLM's selection measured
+        # indistinguishable from random on the pivot basis while the rank rule
+        # beat random at the house bar, so the rank rule decides and the LLM is
+        # demoted to a shadow arm (see rank_entry.py for the numbers). The call
+        # signature downstream is unchanged: these are ordinary Recommendations
+        # and every gate, the sizing chain, the ledger and the broker see what
+        # they always saw.
+        from src.data.liquidity import tradeable_pool
+        from src.signals import rank_entry
+        recommendations = rank_entry.build_rank_recommendations(
+            signals, tradeable=tradeable_pool([s.ticker for s in signals]))
+        # Provenance: the run, every recommendation row and every new trade
+        # stamp "rank"/"rank-v1", so an eval can split this era from the LLM one
+        # exactly as it splits engines.
+        _set_synthesis_meta(rank_entry.RANK_PROVIDER, rank_entry.RANK_MODEL)
+    _synth_latency_s = time.monotonic() - _synth_t0
 
     # ── Fix #2: capture this run's engines for the opener-pinned hold-review ──
     # Captured here BEFORE the top-10 truncation: this run's synthesis +
@@ -2361,6 +2661,35 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         open_positions=open_position_summaries if hold_prompt_active else None,
         session=run_session,
     )
+
+    # ── Paired synthesis ENGINES (2026-09-04): the OTHER engine answers the
+    # same question on the same cross-section in the background. The engine
+    # this run's per-run flip picked is LIVE (its decisions run the gate
+    # cascade, the ledger and the broker sync); the shadow engine's decisions
+    # are recorded and acted on by nobody. Drained non-blocking at persist
+    # time — a local synthesis is minutes of work, so late rows land on the
+    # next tick's write under their own run_id. Read with
+    # `python -m src.analysis.engine_eval`.
+    try:
+        from src.utils import ET as _ET
+        engine_shadow.maybe_start(
+            signals=signals,
+            live_engine=run_synthesis_provider,
+            live_model=_synth_meta.get("model"),
+            live_recs=_full_recs,
+            live_latency_s=_synth_latency_s,
+            synth_kwargs=synth_kwargs,
+            generate=generate_recommendations,
+            run_id=run_id,
+            generated_at=start.isoformat(),
+            signal_date=start.astimezone(_ET).date().isoformat(),
+            open_positions=open_position_summaries if hold_prompt_active else None,
+            session=run_session,
+            arm_kwargs={"dual_case": dual_case, "blind_synthesis": blind_synthesis},
+            wait_for=sentiment_shadow_pending,
+        )
+    except Exception as _e:                              # never let a shadow break a run
+        logger.warning(f"[engine_shadow] not started: {_e}")
 
     # Keep only the top 10 recommendations by conviction:
     # BUY/SELL first (sorted by confidence desc), then HOLD/WATCH to fill up to 10.
@@ -2461,6 +2790,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         "dropped_buy_blocked":          0,
         "dropped_earnings_blackout":    0,
         "dropped_untradeable":          0,
+        "dropped_wide_book":            0,
         "dropped_overextended":         0,
         "actionable_survivors":         0,
         "confidence_threshold":         round(_confidence_threshold, 2),
@@ -2535,8 +2865,18 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         trade_gate_budget=_trade_gate_budget,
         gate_diag=gate_diag,
         gate_outcomes=_gate_outcomes,
+        live_prices={s.ticker: float(s.price) for s in (snapshots or [])
+                     if getattr(s, "price", None)},
+        session=run_session,
+        rank_mode=not settings.enable_llm_synthesis,
     )
 
+    if gate_diag["dropped_wide_book"]:
+        logger.info(
+            f"[gate4b] deferred {gate_diag['dropped_wide_book']} call(s) whose live "
+            f"NBBO half-spread is ≥ {settings.gate4_nbbo_max_halfspread_bps:.0f} bp "
+            f"(RTH basis) — they re-qualify at any tick the book tightens"
+        )
     if gate_diag["dropped_overextended"]:
         logger.info(
             f"[overextension] Gate 5 deferred {gate_diag['dropped_overextended']} "
@@ -2594,9 +2934,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # persist them (exit_signals panel) for the Exit Performance IC table.
         _persist_exit_signals(run_id, hold_reviews, _open_trades_now,
                               signals_by_ticker, macro_regime_context)
-        # Open-position monitor: opener-pinned LLM exits (+ macro-regime, + the
-        # aggregator backstop for legacy trades) BEFORE the counter-recommendation
-        # exit path.
+        # Open-position monitor BEFORE the counter-recommendation exit path. With
+        # the LLM hold review off (2026-09-04) the live reasons are macro-regime,
+        # the aggregator backstop's confidence_loss (signal_flipped/signal_decay
+        # are shadow-only), trailing_stop, adverse_stop and ml_exit; the
+        # opener-pinned LLM exits below fire only when a review exists.
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
@@ -2604,7 +2946,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             hold_reviews=hold_reviews,
             run_synthesis_provider=run_synthesis_provider,
         )
-        close_trades_on_signal_reversal(               # legacy/rule-based only (LLM-opened owned by monitor)
+        close_trades_on_signal_reversal(               # every open trade unless the LLM review owns it
             actionable, hold_prompt_active=hold_prompt_active)
         # Stamp each new trade with the exact LLM engines in use this run (final-call
         # synthesis model + run-dominant sentiment scorer) for per-LLM attribution.
@@ -2720,6 +3062,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f"BUY-block={gate_diag['dropped_buy_blocked']}, "
         f"earnings-blackout={gate_diag['dropped_earnings_blackout']}, "
         f"untradeable={gate_diag['dropped_untradeable']}, "
+        f"wide-book={gate_diag['dropped_wide_book']}, "
         f"overextended={gate_diag['dropped_overextended']}) | "
         f"trade entry: {gate_diag['trade_considered']} considered → "
         f"opened={gate_diag['trade_opened']} "

@@ -3,12 +3,19 @@ pivot-basis return.
 
 The dataset is one row per (ticker, signal_date) news EVENT:
 
-  - catalyst   — the fixed-taxonomy class (`sentiment.NEWS_CATALYST_TYPES`).
-                 LIVE rows carry the sentiment LLM's own classification
-                 (`signals.news_catalyst`, captured since prompt v4 2026-08-15);
-                 HISTORICAL rows fall back to `news_event_backfill`
-                 (`python -m src.analysis.news_backfill` — a later classifier
-                 over re-fetched Polygon headlines, provenance kept separate).
+  - catalyst   — the fixed-taxonomy class (`sentiment.NEWS_CATALYST_TYPES`),
+                 resolved REPAIR → LIVE → BACKFILL. The repair is the
+                 score-free specialist's verdict on the same digest
+                 (`catalyst_repairs`, live arm, resolved/override only, and
+                 only while `enable_catalyst_repair_resolution` is on); LIVE is
+                 the sentiment LLM's own classification (`signals.news_catalyst`,
+                 captured since prompt v4 2026-08-15); HISTORICAL rows fall back
+                 to `news_event_backfill` (`python -m src.analysis.news_backfill`
+                 — a later classifier over re-fetched Polygon headlines,
+                 provenance kept separate). `catalyst_source` records which one
+                 won and `catalyst_quality` carries the repair's verdict, so a
+                 calibration can drop the labels that were checked and stayed
+                 doubtful (`unresolved`) without dropping the unchecked ones.
   - direction / magnitude — sign and size of the news read: the RAW LLM verdict
                  (`news_raw_score`) when captured, else the adjusted `news`
                  score (historical rows; scaler-shrunk, so magnitude bands
@@ -43,6 +50,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from config.settings import settings
+
 # Magnitude bands on |verdict| — mirrors the prompt's band rubric.
 MAGNITUDE_BINS = (0.0, 0.25, 0.60, 1.0001)
 MAGNITUDE_LABELS = ("minor", "moderate", "major")
@@ -67,9 +76,10 @@ def _events_sql(days: Optional[int]) -> tuple[str, list]:
     except Exception:
         pass
     sql = f"""
-        SELECT ticker, signal_date, news, news_catalyst, news_raw_score
+        SELECT ticker, signal_date, news, news_catalyst, news_raw_score, news_digest_id
         FROM (
             SELECT s.ticker, s.signal_date, s.news, s.news_catalyst, s.news_raw_score,
+                   s.news_digest_id,
                    row_number() OVER (PARTITION BY s.ticker, s.signal_date
                                       ORDER BY s.generated_at) AS _rn
             FROM signals s
@@ -79,10 +89,61 @@ def _events_sql(days: Optional[int]) -> tuple[str, list]:
     return sql, params
 
 
+def _apply_repairs(ev: pd.DataFrame) -> pd.DataFrame:
+    """Overlay the catalyst REPAIR on the live/backfill label.
+
+    A repair is matched on (digest, the label the repair started from), so the
+    right one of a digest's two rows — the primary engine's and the shadow
+    engine's, which disagree routinely — lands on the event. `resolved` and
+    `override` rows replace the label; an `unresolved` row leaves it alone and
+    only stamps `catalyst_quality`, because "checked and still doubtful" is
+    information a calibration should EXCLUDE, not overwrite.
+
+    Fail-soft and inert by default: with `enable_catalyst_repair_resolution`
+    off (or with nothing accrued) the frame is byte-identical to the
+    live → backfill resolution, with the extra column all-None.
+    """
+    ev["catalyst_quality"] = None
+    if not getattr(settings, "enable_catalyst_repair_resolution", False):
+        return ev
+    if "news_digest_id" not in ev.columns or ev["news_digest_id"].isna().all():
+        return ev
+    try:
+        from src.analysis.catalyst_repair import repair_lookup
+        lookup = repair_lookup()
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning(f"[news-events] repair overlay skipped ({exc}) — live labels kept")
+        return ev
+    if not lookup:
+        return ev
+    cats, quals, srcs = [], [], []
+    for digest, cat, src in zip(ev["news_digest_id"], ev["catalyst"], ev["catalyst_source"]):
+        hit = lookup.get((str(digest), "" if cat is None or pd.isna(cat) else str(cat)))             if digest is not None and not pd.isna(digest) else None
+        if hit is None:
+            cats.append(cat)
+            quals.append(None)
+            srcs.append(src)
+            continue
+        quals.append(hit["quality"])
+        if hit["quality"] == "unresolved" or not hit["catalyst"]:
+            cats.append(cat)
+            srcs.append(src)
+        else:
+            cats.append(hit["catalyst"])
+            srcs.append("repair")
+    ev["catalyst"], ev["catalyst_quality"], ev["catalyst_source"] = cats, quals, srcs
+    n_rep = sum(1 for x in srcs if x == "repair")
+    n_unres = sum(1 for q in quals if q == "unresolved")
+    logger.info(f"[news-events] catalyst repairs applied: {n_rep} relabeled, "
+                f"{n_unres} left unresolved of {len(ev)} events")
+    return ev
+
+
 def load_news_events(days: Optional[int] = None) -> pd.DataFrame:
     """One row per (ticker, signal_date) news event, labeled with the pivot
     forward return. Columns: ticker, signal_date, news, news_raw_score,
-    catalyst, catalyst_source ('live'|'backfill'|None), direction
+    catalyst, catalyst_source ('repair'|'live'|'backfill'|None),
+    catalyst_quality ('resolved'|'override'|'unresolved'|None), direction
     ('bull'|'bear'|'zero'), magnitude, era, fwd_ret_pivot, end_date_pivot,
     fwd_ret_5d."""
     from src.db import repo
@@ -108,6 +169,7 @@ def load_news_events(days: Optional[int] = None) -> pd.DataFrame:
     ev["catalyst_source"] = np.where(live, "live",
                                      np.where(ev["bf_catalyst"].notna(), "backfill", None))
     ev = ev.drop(columns=["bf_catalyst"])
+    ev = _apply_repairs(ev)
 
     news = pd.to_numeric(ev["news"], errors="coerce").fillna(0.0)
     ev["direction"] = np.where(news > 0, "bull", np.where(news < 0, "bear", "zero"))

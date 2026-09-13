@@ -1,0 +1,17 @@
+  20 pairs in 172s
+  40 pairs in 539s
+  60 pairs in 708s
+[32m2026-09-10 17:13:15.913[0m | [34m[1mDEBUG   [0m | [36msrc.analysis.logprob_score[0m:[36mexpected_score[0m:[36m139[0m - [34m[1m[logprob_score] correction +0.325 beyond 0.25 — keeping the argmax[0m
+  80 pairs in 882s
+
+90 paired digests
+
+| arm | TRUE contradiction | judge NONE | distinct scores | mean abs |
+|---|---|---|---|---|
+| A  v6 (live) |  7.8% |  5.6% | 87 | 0.367 |
+| B  + direction field |  3.3% |  7.8% | 87 | 0.422 |
+
+B: emitted a usable direction on 99% of rows; its own direction agrees with its own score 100.0% of the time
+   (the gap is what mechanical enforcement would fix for free)
+
+rank corr A vs B scores: +0.7680 | sign flips 10/90

@@ -179,6 +179,623 @@ class Settings(BaseSettings):
     # Synthesis routing is independent (llm_ab_synthesis_models — currently 50/50).
     llm_primary_provider: str = "deepseek"
 
+    # ── LOCAL open-source LLM (2026-09-03, user directive; src/analysis/sentiment.py)
+    # A self-hosted OpenAI-compatible server (Ollama / llama.cpp / vLLM) as a FULL
+    # sentiment engine — its own provider name, its own model id in the ledger.
+    # It is deliberately NOT the qwen route repointed: `llm_sentiment_provider`,
+    # the per-rec engine stamp and the per-LLM eval all key on the provider name,
+    # so borrowing "qwen" would label local verdicts as an API engine forever and
+    # silently pool two scorers in every per-engine comparison.
+    # Sized for this box (RTX 4070 Laptop, 8 GB VRAM): an 8B-class model at Q4
+    # handles the sentiment prompt (~1.6k shared prefix + <=20 headlines, <=4k tok,
+    # ~150 tok out) with room for context. The FULL synthesis prompt does not
+    # fit beside the weights (measured 2026-09-04 on DeepSeek's usage logs,
+    # n=200: p50 60k / p90 81k / max 85k input tokens; qwen3:8b's KV cache costs
+    # ~72 KB/token at q8_0, so 32k of context is the most this box holds even
+    # at ONE server slot). Synthesis therefore reaches the local engine only
+    # through the COMPACT prompt variant (claude_analyst.prompt_variant) — see
+    # `synthesis_local_share` / `enable_synthesis_shadow` below.
+    # ── WHO DECIDES THE TRADES (2026-09-04, user directive) ─────────────────
+    # False = the MECHANICAL rank rule selects entries (src/signals/rank_entry.py):
+    # the direction band decides IF, the within-run rank of combined_score decides
+    # WHICH, capped at `gate1_rank_cap` per side. True = the LLM synthesis call
+    # decides, as it did until 2026-09-04.
+    #
+    # Measured before flipping it (pre-registered, `/evaluate`, 1,245 actionable
+    # LLM decisions over 16 days, per-run per-side count-matched, H/L pivot label,
+    # Gate-4 pool): LLM +0.19%/decision, rank rule +1.56%, RANDOM control -0.04%.
+    # The LLM's selection was NOT distinguishable from random (+0.23, t +0.56);
+    # the rank rule beat random (+1.60, t +2.11, same-sign halves) and beat the
+    # LLM on the LONG side (-1.51 pp, t -2.20). Not a tail or volatility artifact.
+    #
+    # The LLM machinery is KEPT and tested, not deleted — the standing intent is
+    # that a future LLM entry layer must be a DIFFERENT, better prompt/logic, and
+    # `enable_synthesis_shadow` keeps it answering the same question unacted so
+    # that redesign has paired data to be judged against.
+    enable_llm_synthesis: bool = False
+
+    # Master switch for the self-hosted engine — it gates BOTH routes, which is
+    # why it keeps the generic name while the per-route knobs are split into
+    # `local_sentiment_*` (below) and `local_synthesis_*` (further down).
+    enable_local_llm: bool = False
+    local_sentiment_base_url: str = "http://127.0.0.1:11434/v1"
+    local_sentiment_model: str = "qwen3:8b"
+    local_sentiment_api_key: str = "local"          # OpenAI SDK demands a non-empty key; unused
+    local_sentiment_timeout_seconds: float = 180.0  # a cold model load can take ~a minute
+    # The per-request context the SENTIMENT server is actually configured with
+    # (OLLAMA_CONTEXT_LENGTH in scripts/run_ollama.bat). Keep the two in step:
+    # Ollama accepts a longer prompt, drops the OLDEST tokens — the instruction
+    # prefix — with no error, and answers anyway (probed 2026-09-03: canary
+    # found at 2k, LOST at 5k and 8k, prompt_tokens pinned at 2050). The
+    # OpenAI-compatible endpoint neither reports the context nor honours
+    # `options.num_ctx`, so it can only be a setting. 0 disables the check.
+    local_sentiment_context_tokens: int = 8192
+    # Extra request body for the local route, as JSON. This is the SERVER's own
+    # dialect for switching reasoning OFF, and it is load-bearing: Qwen3 is a
+    # hybrid-reasoning checkpoint that thinks by DEFAULT, and with reasoning on
+    # it spent the entire 256-token answer budget on the chain and returned
+    # content="" (finish_reason=length) — a total loss of the verdict, not a
+    # degraded one. Probed against Ollama 0.33.2 / qwen3:8b on 2026-09-03:
+    #   {"reasoning_effort": "none"}                     -> WORKS  (2.0s, clean JSON)
+    #   {"think": false}                                 -> ignored (5.9s, empty)
+    #   {"chat_template_kwargs": {"enable_thinking": false}} -> ignored (5.5s, empty)
+    #   "/no_think" appended to the prompt (Qwen3 soft switch) -> ignored
+    # A different server or a non-reasoning model wants something else (or
+    # nothing) — hence a setting rather than a constant. "{}" sends nothing.
+    # NEVER put the HOSTED dialect here (`enable_thinking` / `reasoning`): those
+    # are DashScope/OpenRouter parameters that a local server ignores silently,
+    # which looks identical to working.
+    local_sentiment_extra_body: str = '{"reasoning_effort": "none"}'
+    # Per-RUN share of sentiment routed to the local engine (same shape as
+    # sentiment_qwen_share: a whole-run flip, so each engine accrues comparable
+    # whole-run samples for the per-LLM eval). 1.0 = local scores every run.
+    sentiment_local_share: float = 0.0
+
+    # SHADOW sentiment (2026-09-04, user directive "have the local Qwen always
+    # run so that we can compare ticker per ticker"). Every ticker the primary
+    # engine scores with an LLM is ALSO scored by the other engine on the SAME
+    # article set, off the tick's critical path (a background pool), and both
+    # verdicts land on one `sentiment_shadow` row. The shadow verdict never
+    # reaches the combine — it is measurement only, so a slow or dead local
+    # server can cost accrual but never a signal.
+    #
+    # Latency is why this is a background pass rather than a second inline call:
+    # the local engine's measured ceiling is ~0.54 calls/s (Ollama serves
+    # OLLAMA_NUM_PARALLEL=2 slots; client fan-out past 2 only queues), so a
+    # ~175-call tick is ~325 s of shadow work — fine beside a 30-min cadence,
+    # ruinous in front of the synthesis call.
+    enable_sentiment_shadow: bool = True
+    # "auto" = whichever engine is NOT primary this run (local on a DeepSeek run,
+    # DeepSeek on a local run), so every scored ticker accrues BOTH verdicts
+    # whichever way the per-run flip lands. An explicit engine name pins it.
+    sentiment_shadow_engine: str = "auto"
+    # Safety valve: stop submitting when the background queue is this deep (a
+    # wedged local server must not accumulate a tick's worth of work per tick).
+    # Fraction of ELIGIBLE calls that get a shadow verdict (2026-09-05, user
+    # directive "DeepSeek only 50%, and doesn't shadow the rest"). Eligibility is
+    # decided first by `sentiment_shadow_engine`: pinned to an engine, a run whose
+    # primary IS that engine gets no shadow at all. This share then samples the
+    # remaining calls. Sampling is PER CALL, not per run, and deterministic on
+    # (run_id, ticker) — a random-per-call draw would resample the same ticker on
+    # a retry, and a per-RUN flip would make the pair count swing between "every
+    # ticker" and "none" instead of halving the load evenly. 1.0 = shadow
+    # everything (the 2026-09-04 behaviour), 0.0 = off.
+    sentiment_shadow_share: float = 1.0
+    sentiment_shadow_max_pending: int = 500
+
+    # ── Sentiment DIGEST store (2026-09-06) ──────────────────────────────────
+    # Persist the article digest each sentiment verdict was scored on, keyed by
+    # an ENGINE-FREE id (`sentiment.digest_id_for`), to `sentiment_digests`.
+    # The verdict cache stores only a hash, so without this a past verdict's
+    # exact input could never be replayed; the catalyst-repair pass and the
+    # paired-engine comparison both key on it. Retention prunes the TEXT rows
+    # only — the ids on `signals` / `sentiment_shadow` / `catalyst_repairs`
+    # are permanent.
+    enable_sentiment_digest_store: bool = True
+    sentiment_digest_retention_days: int = 180
+
+    # ── CATALYST-label repair pass (2026-09-06, user directive) ──────────────
+    # The sentiment verdict's `catalyst` class is typed by the SAME call that
+    # scores the news, and the local 8B engine gets it wrong ~14–19% of the
+    # time (DeepSeek ~6%; both label an ETF with a HOLDING's class). The label
+    # is repaired OUTSIDE the scoring prompt — the prompt is never edited for
+    # it, so no scorer epoch fires — by a score-free SPECIALIST call on the
+    # local engine, run in the background over the persisted digest and
+    # written to `catalyst_repairs` (never over `signals.news_catalyst`).
+    # Consumers resolve repair → live → backfill (`news_events`).
+    enable_catalyst_repair: bool = True
+    # Mechanical, zero-cost: a FUND/ETF target (per `company_names.name_keywords`)
+    # whose model label is a company-event class is relabelled `macro_sector`
+    # (an ETF has no earnings, insiders or trials of its own — the model was
+    # reading a holding). The model's label survives in `meta["catalyst_raw"]`
+    # and on the shadow row, so the engine comparison still sees what it said.
+    enable_catalyst_fund_override: bool = True
+    # Per MODEL, the classes measured unreliable enough that every first-pass
+    # verdict landing in them goes to the specialist. `key=cls,cls;key=…` where a
+    # key is a MODEL ID first (`local/qwen3:8b`, as `sentiment_model_for` names
+    # it) and a bare engine name (`local`, `deepseek`) as the fallback — a
+    # measured error rate belongs to a checkpoint, so a model swapped in under
+    # the same engine name starts with an EMPTY set (logged once) and only the
+    # fund / keyword / monitor triggers fire for it until it is measured.
+    catalyst_repair_unreliable_classes: str = (
+        "local/qwen3:8b=product,capital_structure,other,management,company_pr")
+    # Share of UNTRIGGERED first-pass verdicts also sent to the specialist, so
+    # the flagged/unflagged error rates stay comparable over time (deterministic
+    # on (run_id, ticker), like the shadow sample).
+    # The `fund` trigger is OFF (2026-09-11, measured). It was the single
+    # largest consumer of the repair pass — 2,667 of 5,716 rows and **4.00 of
+    # 9.23 GPU-hours, 43%** — on the box that also serves live sentiment, and it
+    # bought nothing: over 3,213 pairs the specialist scored 23.0% error against
+    # the first pass's 22.8%.
+    #
+    # It was always the weakest trigger by construction: a fund's label is
+    # already corrected MECHANICALLY by `sentiment.fund_catalyst_override`, so
+    # the specialist was being asked to re-derive an answer we compute for free.
+    #
+    # Dropping it does NOT blind the pass to funds — the 5% `monitor` hash
+    # sample still draws them, so they keep an UNBIASED read without paying for
+    # every one. And the override itself is untouched: this removes the
+    # specialist CALL, never the label fix.
+    catalyst_repair_fund_trigger: bool = False
+    catalyst_repair_monitor_share: float = 0.05
+    # Background-queue cap: stop submitting when this many digests await the
+    # specialist (a wedged local server must not accumulate a tick per tick).
+    catalyst_repair_max_pending: int = 200
+    # Model id for the specialist; blank = `local_sentiment_model` (one Ollama
+    # serves both). A different model here changes the specialist's cache key.
+    catalyst_repair_model: str = ""
+    # Do CONSUMERS read the repaired label? With this off the repair pass is
+    # pure accrual: `news_events` resolves live → backfill exactly as before and
+    # `catalyst_tilt` fits on every typed event. With it on the resolution order
+    # becomes repair → live → backfill, and the tilt calibration DROPS the
+    # events whose label was checked and stayed doubtful (`unresolved`) —
+    # excluding noise, never converting it (the standing calibration rule).
+    # HELD OFF until the pre-registered bar clears (`--eval`: specialist error
+    # on the local-flagged subset < 25%, the unflagged subset not worse than the
+    # first pass, same-sign date halves); it is one flag, and inert until the
+    # `catalyst_repairs` table has rows either way.
+    enable_catalyst_repair_resolution: bool = False
+    # Do the stacker/exit training sets mask the news-derived columns the panel's
+    # own scorer-epoch mask cannot reach (`news_raw_score`, `news_recency_mass`,
+    # `news_article_count`, the catalyst one-hot)? The panel masks METHOD scores
+    # and confidence; these four are outputs of the sentiment PROMPT and of the
+    # relevance FILTER, both of which moved at the 2026-09-04 news boundary, so
+    # the standing rule ("fit only what the current code produced") applies to
+    # them too. OFF turns the mask off for a measurement arm only — it mixes two
+    # news eras in a decision surface, which is exactly what the rule forbids.
+    enable_stacker_news_epoch_mask: bool = True
+    # news_unpriced / news_unpriced_all (2026-09-07, user directive):
+    # how much of the news move is still AHEAD, anchored on the news
+    # cluster's own first article instead of a fixed look-back. Panel-first
+    # at weight 0 and stacker features; the bull half of this idea measured
+    # as repackaged momentum on a FIXED window in 2026-08, so the anchor is
+    # the thing being tested and the model, not a hand-set weight, decides
+    # the sign per side.
+    enable_news_priced_in: bool = True
+    # TWO-SIDED priced-in check (2026-09-09). The cluster anchor measures the
+    # move since a story BROKE, which only sees a reaction that came AFTER the
+    # article. Measured failure: AMKR ("Soars 12% After-Hours", news then move)
+    # was caught — +0.82 faded to -0.05 — while ALAB ("Is Up 40.6% After Record
+    # Q2", move then article) read as fully un-priced, because an anchor at a
+    # post-move article is itself post-move. A FIXED trailing window does not
+    # care which came first, and is the form `news_bear_fresh` validated
+    # (+0.095 IC, t +2.96, on bear events). So each cluster now takes whichever
+    # of the two readings is MORE priced-in. Revert with false.
+    enable_news_unpriced_two_sided: bool = True
+    # Basis for the NEWS-family stacker features: "rank" (the within-run
+    # centered rank) or "absolute" (the raw score). RANK since 2026-09-07, user
+    # directive, because both of a news score's scale drivers move underneath
+    # the model — the two engines differ 2.7x in magnitude on identical digests,
+    # and a backfilled digest is ~0.40x live. A rank is invariant to both, and
+    # it is the same normalisation the weighted combine already applies.
+    # SERVING dispatches on the ARTIFACT's own stamp, never on this setting, so
+    # flipping it changes nothing until the next retrain.
+    stacker_news_basis: str = "rank"
+    # CLUSTER ARM (2026-09-08): score the digest one NEWS CLUSTER at a time and
+    # blend the verdicts by recency mass, instead of one call over all <=20
+    # articles. Motivated by a measured anchoring failure — AAPL scored +0.35
+    # off a single bullish headline while the same digest carried a Senate China
+    # warning and Qualcomm guiding Apple revenue down; the realized pivot was
+    # -11.29%, and both the per-cluster and thinking arms read it negative.
+    # Measured on 30 reconstructed digests (one day, NOT significant): direction
+    # hit 40% vs 31% for the single call and 41% for thinking-on, at 1.4x the
+    # latency versus thinking-on's 11.8x. OFF by default: it accrues PAIRED
+    # against the live verdict on real digests so the comparison can be made on
+    # live data instead of replayed data, and it decides nothing.
+    # SOURCE-TIER FILTER — MEASURED AND REJECTED (2026-09-09). Drops
+    # aggregator/listicle outlets from the digest unless that would empty it.
+    #
+    # It looked like the largest single improvement found: on ONE signal date
+    # (2026-07-29, n=60) the day-neutral rank IC went -0.052 -> +0.256. Re-run
+    # PAIRED across 12 signal dates (240 ticker-days, same tickers, same
+    # relevant sets, the filter the only variable) it FAILED the house bar:
+    #
+    #     mean IC   OFF -0.003   ON -0.050
+    #     paired difference -0.047   sd 0.297   t -0.55   n_days 12
+    #     halves -0.144 / +0.051  (opposite signs)
+    #
+    # The point estimate is NEGATIVE and the per-day differences run -0.58 to
+    # +0.49 — the +0.256 was one draw from a sd-0.30 distribution. It also
+    # caused a failure mode of its own: stripping the aggregators left ADMA's
+    # digest as ten GlobeNewswire law-firm class-action solicitations, scored
+    # -0.65 on a name that then rose 16%.
+    #
+    # Kept, tested and one flag from live so the experiment is repeatable; the
+    # source list still needs deriving from the whole archive rather than the
+    # single day it was hand-picked from.
+    enable_source_tier_filter: bool = False
+    source_tier_excluded: str = (
+        "motley fool,the motley fool,zacks,24/7 wall st.,simply wall st.,"
+        "insider monkey,gurufocus.com,stockstory,barchart,barchart.com,trefis,"
+        "marketbeat,biztoc.com,stocktwits,tipranks,investing.com,"
+        "the globe and mail,benzinga")
+    # ── the priced-in discount, made arithmetic (sentiment prompt v7d) ──────
+    # Measured 2026-09-09 over 146 re-scored clusters (38 days, rationales
+    # kept): v6's rationale field REQUIRES the model to say what is already
+    # priced in, so it says so in 77% of rationales — and scores those clusters
+    # HIGHER, not lower (mean |s| 0.327 vs 0.309). 48% of them still land in
+    # the CLEAR band or above. The instruction is met verbally and never
+    # reaches the number.
+    #
+    # ON: the model emits "catalyst_score" (the catalyst's full worth) and
+    # "priced_in" (the fraction already traded) and no "score" at all; we
+    # compute `catalyst_score * (1 - priced_in)` in `sentiment.apply_priced_in`,
+    # so the discount cannot be skipped. Its own prompt-version salt, so the
+    # flip re-scores rather than serving v6 verdicts from cache.
+    #
+    # DEFAULT OFF pending the paired offline read (per-day pivot IC vs the v6
+    # baseline on the same digests, day-clustered t, split long/short). Flipping
+    # it needs a news-family scorer epoch placed by the RUNS of the deploying
+    # restart — the whole family consumes the verdict.
+    # ── news_quiet: the news read once the story has gone quiet ─────────
+    # Measured 2026-09-09 (656 directional ticker-days / 50 days, oriented pivot
+    # return per decision, day-clustered): splitting on the age of the FRESHEST
+    # news cluster, >= 48h pays +1.90 pp/decision (t +2.65, same-sign halves)
+    # against -0.23 pp under it, and the paired old-minus-fresh contrast is
+    # +2.17 pp (t +2.52). Per side: SHORT +2.90 (t +3.10) vs -1.07 when fresh;
+    # LONG +0.90 (t +0.86, halves OPPOSITE) vs +0.50. Hit rate carries it
+    # (47.9% -> 58.5%), not move size.
+    #
+    # SHIPPED BOTH SIDES on the user's call (2026-09-09) with the LONG half
+    # explicitly below the house bar. The method is symmetric; the per-side
+    # win-rate filter and adaptive weights re-judge each camp on its own
+    # accruing ledger, which is the honest way for that call to be revisited.
+    #
+    # EXPLORATORY, not pre-registered: the split was found while chasing the
+    # confound that killed the volume-based priced-in estimator, in the same 50
+    # days, over three thresholds (24h fails, 48h and 72h pass).
+    # See memory/volume-priced-in-2026-09.md.
+    # ── how a digest is split into STORIES ──────────────────────────────
+    # "time"    the legacy relative-gap partition (sentiment.recent_cluster)
+    # "content" re-partition from scratch on IDF-weighted content  -- REJECTED
+    # "hybrid"  time partition, same-story pieces MERGED, never split -- LIVE
+    #
+    # The time rule cuts one running story into pieces and the scorer then
+    # judges each piece as an independent event: measured 2026-09-09 over 146
+    # re-scored clusters, 44% of multi-cluster ticker-days carried the SAME
+    # catalyst class in every cluster and 44% took OPPOSITE signs.
+    #
+    # All three arms scored on the SAME 73 ticker-days (2026-09-10). The defect
+    # = a ticker-day with >=2 clusters sharing a catalyst class AND disagreeing
+    # in sign:
+    #
+    #   approach          clusters/day   defect   pair-rate   LLM calls
+    #   time                    2.00     15.8%      11.4%        146
+    #   content @0.25          11.22     77.5%      17.8%        819
+    #   content @0.10           8.34     65.2%      20.4%        609
+    #   hybrid  @0.25           1.73     15.6%      12.7%        126
+    #
+    # CONTENT IS REJECTED at both thresholds: a 13-article digest holds ~8-12
+    # lexically distinct items, so re-partitioning shatters it into singletons
+    # that each carry too little context for a stable read (the per-PAIR
+    # contradiction rate rises too, so it is not merely combinatorial).
+    #
+    # HYBRID is live. Honest caveat: the headline 15.8% -> 15.6% is nearly flat
+    # because the fixed days LEAVE the >=2-cluster population rather than the
+    # rate falling. On the 17 ticker-days where it actually merged, the defect
+    # went 12.5% -> 0.0% -- which is n=2 fixes, far below any evidentiary bar.
+    # What IS solid is that it costs nothing to be wrong: fewer clusters, fewer
+    # LLM calls (126 vs 146), lower abstention (3.4% -> 2.4%), and ZERO
+    # introduced defects. It can only REDUCE the cluster count, which is the
+    # tested property that stops it repeating content mode's failure.
+    #
+    # `news_quiet` PINS "time" at its call site whatever this says: its measured
+    # quantity is hours since the last BURST of coverage began, and a merged
+    # cluster spanning a week would make a name with news today read as quiet.
+    news_cluster_mode: str = "hybrid"
+    news_cluster_min_similarity: float = 0.25
+    # ── passing-mention abstention ──────────────────────────────────────
+    # An article naming the target only in its BODY is a round-up or an
+    # ETF-holdings piece: it mentions the company without being about it.
+    # Measured over 655 ticker-days / 50 days (oriented pivot return per
+    # decision, day-clustered), by the digest's passing-mention share:
+    #   < 20%  +0.903 pp hit 54.5% | 20-50% -0.573 pp hit 48.1% | >=50% -2.223 pp hit 41.9%
+    # A monotone dose-response whose high cohort is ANTI-predictive, so the fix
+    # abstains rather than caps (capping preserves a sign the data says is
+    # wrong). Ranker IC vs the unfiltered baseline, on nameable tickers:
+    #   >= 0.35   +0.0242   t +1.31   same-sign halves   83/655 rows (13%)
+    #   >= 0.50   +0.0049   t +0.55   OPP
+    #   >= 0.65   +0.0075   t +1.81   same-sign halves   11/655 rows (2%)
+    # Shipped at 0.65 on 2026-09-10, then moved to **0.35** the same day (user
+    # request) for 3x the effect. Neither clears the house bar; the surrounding
+    # evidence is what carries it — a monotone dose-response across three
+    # buckets, positive at every threshold, positive on BOTH the ranker and
+    # decider metrics, same-sign halves at the two shipped ones.
+    #
+    # ABSTAIN, never INVERT, even though the >=0.35 cohort CLEARS the house's
+    # auto-inversion bar on the pooled sample (n=83, win 39.8%, one-sided exact
+    # binomial p=0.039, flipped view 60.2%). Split by half the anti-signal
+    # DECAYS — win 32.6% -> 48.6% — so inverting shows opposite-sign halves
+    # (+0.0238, t +0.92) where abstaining does not. Abstention only needs the
+    # read to be uninformative; inversion needs it to be reliably wrong.
+    #
+    # ⚠ THE THRESHOLD WAS CALIBRATED ON THE WRONG POPULATION, corrected
+    # 2026-09-10. Every share above was measured on REPLAYED digests rebuilt
+    # from a 7-day union pool (`news_replay.build_tick_pool`), which is a
+    # deliberately UNFAITHFUL reconstruction — the live digest is a different
+    # shape. Checked against 3,316 real digests from `sentiment_digests`, the
+    # LIVE fire rate is:
+    #     >= 0.35  35.4%      >= 0.65  17.2%      >= 0.85   7.7%
+    #     >= 0.50  29.0%      >= 0.75  12.3%      >= 1.00   6.0%
+    # So 0.35 abstains on more than a THIRD of live digests against the 13% the
+    # +0.0242 was measured at — a 2.7x over-reach silently removing a third of
+    # the cross-section from the 0.40-weight `news` method. 0.75 is the constant
+    # whose LIVE rate (12.3%) matches the measured cohort; the exact 13% point
+    # is 0.714.
+    #
+    # The general trap: an ABSOLUTE threshold tuned on a replayed population
+    # does not transfer to live when the two populations have different shapes.
+    # A within-run QUANTILE rule (gate the top ~13% by share) would be immune
+    # and is the better long-term form; it is not built because it adds
+    # cross-sectional coupling for a below-bar effect.
+    #
+    # At 12% of digests this is still not a refinement, so the news-family
+    # scorer epoch registered for the 0.35 widening STAYS (method_epochs.py).
+    enable_passing_mention_abstention: bool = True
+    passing_mention_abstain_share: float = 0.75
+    # news_bull_fresh (2026-09-10, user request): the bull-side counterpart of
+    # news_bear_fresh, PANEL-FIRST at weight 0.
+    #
+    # ASKED FOR AS A MIRROR; SHIPPED INVERTED, because the mirror was measured
+    # and it is the wrong direction. On 357 bull-news rows / 50 days, per-day
+    # pivot IC within the bull-event population against `news` alone (+0.1533):
+    #   mirror   news x (1 - z3/2)   +0.0832   paired -0.0701  t -1.17  same halves
+    #   INVERT   news x (1 + z3/2)   +0.2090   paired +0.0556  t +1.63  same halves
+    #   guard alone, no news         -0.1043   paired -0.2577  t -2.86  same halves
+    #   guard_invert alone           +0.1264   paired -0.0269  t -0.36  OPP
+    # The guard BY ITSELF is significantly anti-predictive in the mirror
+    # direction, so the bear logic does not transfer; and guard_invert alone
+    # does NOT beat news, so the inverted product is a real interaction rather
+    # than the price term wearing a news label. Hit rate by prior move: 66.3%
+    # for names already up >=1 sigma vs 51.0% flat.
+    #
+    # This is the same finding the whole 2026-09-09 priced-in batch reached from
+    # three other directions: the read is BETTER after the move, not worse. The
+    # bear side is NOT symmetric evidence — its guard has a 20-year mean-
+    # reversion prior (shorting a collapsed name fights the bounce) with no
+    # bull-side twin.
+    #
+    # `news_bull_fresh_invert=False` restores the literal mirror in one line.
+    # Below the house bar either way (t +1.63), and at weight 0 it decides
+    # nothing — the point is to accrue the BETTER direction on live rows.
+    # Logprob-derived CONTINUOUS verdict (2026-09-10, accrual only).
+    # qwen3:8b emits 19 distinct raw values, 100% on a 0.05 grid — an ARGMAX
+    # artifact, not the model's belief. Reading `top_logprobs` at the score's
+    # digit positions and taking the expectation gave, on 35 production
+    # digests: 12 -> 35 distinct values, 100% -> 0% on the grid, rank
+    # correlation +0.9912 with ZERO sign flips, and 100% of argmax-tied rows
+    # made distinct. Requested ONLY on the local engine.
+    #
+    # LIVE AS THE VERDICT since 2026-09-10 (user directive: improvements go
+    # 100% into production, no shadowing or A/B). When the expectation is
+    # available it REPLACES the greedy value in `news_raw_score`; the greedy
+    # value survives only as `news_argmax_score`, for provenance.
+    #
+    # Accepted knowingly: it is NOT validated. Settled pivot labels stop at
+    # 2026-09-04, the day v6 deployed, so no v6-era row carries a label and the
+    # question "does the finer value beat the argmax on per-day pivot IC" cannot
+    # be asked yet. What IS established is that it is the same verdict read more
+    # precisely — rank correlation +0.9955, ZERO sign flips, mean shift 0.021
+    # over 80 production digests — so the risk is bounded to re-ordering the
+    # ~11% of the cross-section the scaled `news` score currently ties.
+    # ── v7dir: name the direction before the number ─────────────────────
+    # A blind judge (shown only the rationale, never the score) disagreed with
+    # the emitted SIGN on 7.8% of live verdicts. Detect-and-flip is unsafe — the
+    # best detector is 21% precise — so the fix makes the inconsistency
+    # impossible instead: field order IS generation order, so a `direction`
+    # emitted between the rationale and the score is chosen from the argument.
+    #
+    # Measured paired on 90 digests, both arms judged blind:
+    #   contradiction  7.8% -> 3.3%   |  direction agrees with its own score 100%
+    #   rank corr A vs B +0.768, 10/90 SIGN FLIPS, mean |score| 0.367 -> 0.422
+    #
+    # SHIPPED ON THE USER'S DIRECTIVE, caveats on the record: McNemar one-sided
+    # exact p = 0.109 (NOT significant, 6 discordant pairs), it changes the sign
+    # of 11% of verdicts and lifts magnitude 15%, and internal consistency is
+    # not accuracy. v6-era pivot labels had not settled at ship time, so "does
+    # it beat v6 on per-day pivot IC" is unanswered — run it first once they do.
+    # ── catalyst-class conviction cap ───────────────────────────────────
+    # Measured 2026-09-11 over 67 days / 5,959 labelled+typed rows (per-day
+    # pivot IC, paired against the uncapped baseline, day-clustered): capping
+    # `analyst` verdicts to +/-0.10 scores **+0.0121, t +2.46, same-sign
+    # halves** — the only one of eight class-level interventions to clear the
+    # house bar. Analyst reads are weak on the tape (oriented -0.882 pp, hit
+    # 47.1% over 745 rows).
+    #
+    # SIGN IS NEVER TOUCHED — a conviction limit, not a direction claim.
+    #
+    # Excluded deliberately: `legal_regulatory` (+0.0060, t +1.64) and
+    # `ma_deal`, which did NOT replicate across labellers (+0.0029 live,
+    # -0.0023 backfill — a 20-day artifact). A LIST so adding one is config.
+    #
+    # SWEPT 2026-09-11 and TIGHTENED 0.10 -> 0.03. The curve is smooth and
+    # monotone with a genuine INTERIOR optimum — 0.0 (abstain outright) is
+    # clearly WORSE than a small lean, so the answer is not "remove the class":
+    #
+    #   limit | 68-day scaled basis | 21-day raw basis (the shipped operation)
+    #   0.0   | +0.0117 (t 2.08)    | +0.0115 (t 1.55)
+    #   0.02  | +0.0183 (t 3.06)    | +0.0243 (t 2.80)
+    #   0.03  | +0.0174 (t 3.03)    | +0.0243 (t 2.79)
+    #   0.05  | +0.0153 (t 2.85)    | +0.0224 (t 2.67)
+    #   0.10  | +0.0124 (t 2.56)    | +0.0168 (t 2.23)
+    #
+    # 0.03 is chosen MID-PLATEAU rather than at the 0.02 maximum: the two are
+    # within noise of each other and 0.03 keeps margin from the sharp drop at
+    # abstain. Both bases agree despite covering different windows AND different
+    # class sources (the 68-day one is mostly `news_event_backfill` classes, the
+    # 21-day one entirely live), which is the strongest corroboration available.
+    #
+    # The two bases exist because the original 0.10 measurement and the shipped
+    # CODE did not do the same thing: production caps the RAW verdict and then
+    # scales it, while `macro_cap50.py` capped the already-scaled column. Close
+    # at the median scale (~0.92), divergent on low-mass rows (~0.63).
+    #
+    # A tight cap does NOT collapse the class into one tie group: the mass x
+    # diversity scaler varies per row, so `cap(raw) * scale` stays ordered.
+    #
+    # Honest size: the news method's own baseline IC over that window is
+    # **-0.0339**, so this improves a currently-NEGATIVE signal; and the cell
+    # clears the bar on the pooled window but on NEITHER half independently
+    # (t +1.66 live, +1.88 backfill). Re-check once v7dir-era labels settle.
+    #
+    # The inverse of what prompted the search: `macro_sector` — the class v6's
+    # LEAN rule is aimed at, and the one the audit flagged as over-scored — is
+    # the BEST-reading class (+0.657 pp, hit 53.5%), and capping it measures
+    # NEGATIVE in all three windows. It is not in this list and must not be.
+    # ── per-method rank participation floor ─────────────────────────────
+    # `method_rank_min_views` (5) is right for a method that scores the whole
+    # cross-section: ranking 3 names produces -1/0/+1 and calls that a signal.
+    # It is WRONG for a method whose ABSTENTION IS THE MECHANISM.
+    #
+    # `news_quiet` is the case. It carries the raw verdict only when the
+    # freshest news cluster is >= `news_quiet_min_age_hours` old and scores 0.0
+    # otherwise, so its cross-section is "names whose story has gone quiet"
+    # (3-7 per run), not "names with news" (114-130). Measured over every run
+    # since it shipped: at 48h it averaged 12.2 views and cleared the floor in
+    # 100% of runs; at 72h it averages 5.2 against a floor of 5 and clears it in
+    # only 66% — so the method was silently WEIGHT 0 in a third of runs, and in
+    # every run since 2026-09-11 05:00Z. Nothing logs that transition.
+    #
+    # 3 is read off the data, not chosen: excluding runs with no qualifying name
+    # at all, every sub-floor run sat at n=3 (x8) or n=4 (x2) and n=1/n=2 never
+    # occurred, so 3 recovers all of them without approaching the degenerate
+    # end. The hard `max(2, ...)` in the aggregator stands regardless.
+    #
+    # The cost is real and is accepted, not hidden: at n=3 the ranks are
+    # -1/0/+1, so the middle name is zeroed and the outer two take the full
+    # extreme whatever their raw gap. That is a magnitude the raw scores do not
+    # support. It is tolerable HERE because the measured effect is a DIRECTION
+    # claim (hit rate 47.9% -> 58.5% with median |pivot| barely moving), and a
+    # coarse rank preserves sign order. Do not copy this override onto a method
+    # whose edge is in its magnitude.
+    #
+    # Format: "method=n" pairs, comma-separated. An unparseable entry is ignored
+    # and logged once.
+    method_rank_min_views_overrides: str = "news_quiet=3"
+    # ── full news-pool archive ──────────────────────────────────────────
+    # Measured 2026-09-11: the merged pool is ~2,433 articles per tick, and only
+    # the ~600-article yfinance/NewsAPI leg was ever persisted
+    # (`cache/news_*.json`), with `sentiment_digests` keeping just the top-20 cut
+    # that reached a scorer. So ~75% of every tick was discarded — the reason
+    # `memory/news-backfill-fidelity-2026-09` found historical news could not be
+    # faithfully regenerated (a replay carried ~3.1 of a live digest's ~6.4
+    # articles and ran at 0.40x magnitude).
+    #
+    # Retention is LONG on purpose: the whole point of the table is to be read
+    # years later by a backfill. Rows are one per unique article for all time,
+    # not one per tick, so growth is the rate of NEW articles, not pool size.
+    enable_news_archive: bool = True
+    news_archive_retention_days: int = 730
+    enable_catalyst_class_cap: bool = True
+    catalyst_cap_classes: str = "analyst"
+    catalyst_cap_limit: float = 0.03
+    enable_direction_field: bool = True
+    enable_logprob_expected_score: bool = True
+    logprob_top_n: int = 5
+    enable_news_bull_fresh: bool = True
+    news_bull_fresh_invert: bool = True
+    enable_news_quiet: bool = True
+    # 72h since 2026-09-10 (user request), was 48h. Measured on the same 50-day
+    # population, oriented pivot return per decision, day-clustered:
+    #   48h  both +1.900 pp t +2.65 | SHORT +2.900 t +3.10 | LONG +0.901 t +0.86 OPP
+    #   72h  both +2.292 pp t +2.45 | SHORT +2.936 t +3.06 | LONG +0.876 t +0.78 OPP
+    # A larger mean on fewer names (177 vs 210) with a slightly lower t; the
+    # SHORT side, which is where the edge lives, is unchanged. 24h does NOT
+    # clear the bar, so the qualifying range is 48-72h and this is its top.
+    news_quiet_min_age_hours: float = 72.0
+    enable_priced_in_decomposition: bool = False
+    enable_cluster_arm: bool = False
+    # Share of LLM-scored tickers that also get the cluster arm, sampled
+    # deterministically on (run_id, ticker) like the shadow pass — a retried
+    # ticker must get the same decision or the sample over-represents retries.
+    cluster_arm_share: float = 0.25
+    # Background-queue cap: the arm adds ~2 local calls per sampled ticker and
+    # the local box now serves 100% of live sentiment ON the critical path.
+    cluster_arm_max_pending: int = 200
+
+    # ── SYNTHESIS engine pairing + A/B (2026-09-04, user directive) ────────────
+    # Probability a given run's LIVE synthesis — the decision that flows through
+    # the gate cascade into the ledger and to IBKR — is produced by the LOCAL
+    # engine (compact prompt) instead of the hosted pool. A per-RUN flip, like
+    # `sentiment_local_share`, so each engine accrues whole-run samples that
+    # `python -m src.analysis.engine_eval` can pair. 0.0 keeps DeepSeek live;
+    # the local engine then only ever answers as the shadow arm (below) or as
+    # the last LLM attempt of a hosted chain (outage tier before rule-based).
+    # Requires `enable_local_llm`; inert otherwise.
+    synthesis_local_share: float = 0.0
+    # PAIRED synthesis: whichever engine did NOT produce the live decision is
+    # ALSO asked for one on the same signals, off the critical path, and every
+    # engine's per-ticker decision lands in `engine_recommendations` (live=True
+    # for the one that acted). Both engines' calls carry the run's own
+    # `run_id`, so a shadow still in flight at persist time rides the next
+    # tick's write (per-(run, engine, ticker) idempotency — no run-wide DELETE).
+    enable_synthesis_shadow: bool = True
+    # "auto" = local on a hosted-live run, deepseek on a local-live run; an
+    # explicit engine name ("local" | "deepseek" | "qwen" | "anthropic") pins it.
+    synthesis_shadow_engine: str = "auto"
+    # Optional THIRD arm as "<engine>:<variant>" (e.g. "deepseek:compact"): the
+    # hosted engine on the local engine's own compact prompt. Pairing local
+    # (compact) against DeepSeek (full) confounds the ENGINE with the PROMPT;
+    # this arm decomposes it (deepseek:full vs deepseek:compact = the prompt's
+    # cost, deepseek:compact vs local:compact = the engine's). Empty = off.
+    synthesis_shadow_extra: str = ""
+    # Single-flight bound: a local synthesis call runs 2-4 min; a second one
+    # queued behind it would still be running at the next tick.
+    synthesis_shadow_max_pending: int = 2
+    # COMPACT prompt budget for the local engine, in tokens (~3.2 chars/token
+    # measured on this prompt). Lowest-ranked ticker blocks are dropped first
+    # until the prompt fits. Set for OLLAMA_CONTEXT_LENGTH=32768 with ~6k of
+    # output headroom; at the default 8192 context the server SILENTLY drops
+    # the OLDEST tokens (the persona and process block) — `_call_local_analyst`
+    # warns when the reported prompt_tokens contradict the estimate.
+    local_synthesis_max_prompt_tokens: int = 24000
+    # ── the SYNTHESIS route's own local config ──────────────────────────────
+    # Sentiment and synthesis are the same model class doing opposite jobs:
+    # ~68 short calls a tick that want parallel slots, versus one very long call
+    # a tick that wants context. Ollama's context / parallelism / KV type are
+    # SERVER-WIDE (per-request `num_ctx` is ignored on the OpenAI endpoint), so
+    # the only way to tune them separately is to serve synthesis from its own
+    # endpoint or its own model — hence these four overrides. Each is INHERITED
+    # from the sentiment (`local_sentiment_*`) value while left blank/0, which is the
+    # single-server default in force today.
+    local_synthesis_base_url: str = ""        # e.g. a 2nd Ollama on :11435
+    local_synthesis_model: str = ""           # e.g. a Modelfile pinning num_ctx
+    local_synthesis_api_key: str = ""         # loopback servers ignore it
+    local_synthesis_extra_body: str = ""      # JSON; that server's own dialect
+    # The per-request context the SYNTHESIS server is configured with. A prompt
+    # larger than this is refused BEFORE the call: the server would otherwise
+    # accept it, silently drop the oldest tokens (the persona and the process
+    # block) and spend MINUTES of GPU on a decision made without its
+    # instructions — which the post-call check then refuses anyway. The
+    # pre-flight makes that refusal free, which is what stops the shadow arm
+    # burning a generation every tick while the context is too small.
+    local_synthesis_context_tokens: int = 0   # 0 → inherit local_sentiment_context_tokens
+    # 40 ticker blocks × ~110 tokens of JSON each; `Return ALL tickers`.
+    local_synthesis_max_output_tokens: int = 6000
+    # 24k tokens of prefill + 6k of decode on an 8B Q4 model on this GPU is a
+    # 2-4 minute call; the sentiment timeout (180 s) would kill every one.
+    local_synthesis_timeout_seconds: float = 900.0
+
     # SENTIMENT engine split (2026-07-13 cost tune): probability a given run scores
     # per-ticker sentiment with Qwen (the pricier engine) vs DeepSeek-flash. A per-RUN
     # flip (not per-call) so each engine accrues whole-run samples for the dashboard's
@@ -626,10 +1243,27 @@ class Settings(BaseSettings):
     # than the 5 fixed market feeds (surfaces Reuters/Bloomberg/Barron's/FT AND
     # Business Wire, the one wire our direct feeds miss). Fetched fresh every tick
     # (reactivity fast-lane). google_news_max_tickers caps the per-tick request
-    # burst; google_news_business_wire adds the per-ticker site:businesswire.com query.
+    # burst (150 since 2026-09-04: the 50 cap left ~85 of the ~135-name universe
+    # with no Google News at all, and a per-ticker sweep runs ~3 queries per name
+    # well inside the Step-1 pool wall); google_news_business_wire adds the
+    # per-ticker site:businesswire.com query.
     enable_google_news: bool = True
-    google_news_max_tickers: int = 50
+    google_news_max_tickers: int = 150
     google_news_business_wire: bool = True
+
+    # News RELEVANCE by company name (2026-09-04, src/data/company_names.py).
+    # The per-ticker digest is built from articles a feed tagged with the symbol
+    # OR whose text mentions the company (SEC registrant name / curated alias /
+    # explicit "(NYSE: AR)" symbol). The search-derived feeds (yfinance
+    # "related" news, Google News) tag a symbol only when a mention CONFIRMS it.
+    # Before: a bare lowercase SUBSTRING test on the symbol ("ar" in text) that
+    # swept the whole pool into short tickers' digests and the model was asked to
+    # find the company in 20 random headlines → 73–79% of calls abstained. False
+    # = the legacy filter + unconditional feed tags (one-setting revert).
+    enable_name_relevance: bool = True
+    # Minimum relevant articles for a digest (was 2). One confirmed article
+    # about the company is evidence; the scaler already discounts thin mass.
+    news_relevance_min_articles: int = 1
 
     # FDA / MedWatch regulatory catalyst RSS (free, no key) — drug approvals/CRLs +
     # device recalls, on the fresh-every-tick fast lane. High signal for drug/device
@@ -1368,6 +2002,17 @@ class Settings(BaseSettings):
     # LLM calls per tick (one synthesis + pinned sentiment per engine combo held).
     enable_pinned_hold_review: bool = True
     enable_signal_decay_exits: bool = True
+    # SHADOW-ONLY (2026-09-05, user directive). `signal_flipped` / `signal_decay`
+    # are still COMPUTED and stamped on the trade, but they no longer close a
+    # position. Measured on the pivot basis over 50,256 simulated held
+    # position-days (first-fire, hold-matched within position, day-clustered):
+    # signal_flipped +0.04 (t +0.13), signal_decay +0.30 (t +1.14) — i.e. no
+    # timing skill, and mildly WRONG-signed. They sat FIRST in the exit chain,
+    # so they were pre-empting the two rules that do measure (trailing_stop
+    # -2.16, t -2.51; ml_exit). `confidence_loss` (the same block's third
+    # trigger) is NOT covered by this flag — it was not part of the directive
+    # and has not been measured separately.
+    signal_decay_exits_shadow_only: bool = True
     signal_decay_flip_threshold: float = -0.10   # oriented combined < this -> flipped
     signal_decay_drop_threshold: float = 0.40    # oriented (entry - today) > this -> decayed
     # ── Confidence-loss floor — entry-relative with absolute backstop ──
@@ -1837,6 +2482,15 @@ class Settings(BaseSettings):
     # the method abstains (a rank among two observations is a coin).
     held_rank_min_ticks: int = 5
     ml_exit_threshold: float = 0.35            # oriented hold-conviction ≤ −this → ml_exit
+    # 100% ROUTING (2026-09-05, user directive). The ML exit used to fire only
+    # for `ml_arm`-stamped trades — the entry/exit coupling that made the ML
+    # A/B one experiment. With the entry arm at `ml_combine_arm_share` 1.0 that
+    # coupling covers new trades anyway; this also covers positions opened
+    # before the switch and any row where the stacker fail-softed to the
+    # weighted combine on one side. Measured -3.13 pp/decision (t -6.54) on the
+    # pivot basis, BUT IN-SAMPLE (the frozen artifact trained on that same
+    # simulated population), so treat that number as an upper bound.
+    ml_exit_all_positions: bool = True
     ml_exit_horizon_days: int = 5              # label look-ahead the exit model optimises
     # Retrain the exit model at EOD on the freshly-materialised panel.
     enable_eod_ml_exit_train: bool = True
@@ -1946,6 +2600,73 @@ class Settings(BaseSettings):
     sim_cost_bucket_min_legs: int = 3       # session-class bucket needs this many fills
     sim_cost_tick_bucket_min_legs: int = 2  # same-tick same-class average needs this many
     sim_cost_bucket_prior_n: int = 8        # shrink bucket mean toward the session mean
+
+    # ── Expected-liquidity / drift-risk forecast (2026-08-30, user directive) ──
+    # Per-ticker EX-ANTE expected one-way execution deviation (bp), computed
+    # right after the pipeline's data fetch from cached daily OHLCV
+    # (Corwin–Schultz primary, Abdi–Ranaldo fallback), level-calibrated onto
+    # the broker's own realized |slippage| and blended with each ticker's fill
+    # history. Persists to signals.exp_halfspread_bps + stamps new trades.
+    # PANEL-FIRST: predicts drift risk, gates/sizes nothing yet.
+    # src/performance/liquidity_forecast.py.
+    enable_liquidity_forecast: bool = True
+    liquidity_forecast_window: int = 63     # daily bars behind the estimators
+    # EOD IBKR BID_ASK sweep (2026-08-31): measures each Gate-4 name's time-avg
+    # quoted half-spread from reqHistoricalData(whatToShow="BID_ASK") daily bars
+    # into cache/ibkr_spread.json — the forecast's PRIMARY structural layer
+    # (CS/AR demoted to fallback). Subprocess from EOD maintenance, own clientId
+    # (ibkr_client_id+50), rotation resumes across nights, fail-soft.
+    enable_eod_spread_sweep: bool = True
+    spread_sweep_budget_seconds: int = 900   # wall-clock cap per nightly run
+    spread_sweep_sleep_seconds: float = 1.5  # pause between historical requests
+    # Polygon real-time NBBO (2026-08-31, verified entitled on the current
+    # plan): serves reconcile._quote_for's book when the IBKR API (which lacks
+    # a top-of-book entitlement) returns none — revives the spread-aware LMT
+    # caps + bid/ask-at-submit persistence. Freshness-gated (a stale off-hours
+    # NBBO never prices an order). The snapshot lastQuote capture is always on.
+    enable_polygon_quotes: bool = True
+
+    # ── NBBO-based SIZING (2026-09-02, user directive; src/performance/nbbo_sizing.py)
+    # Sizes each entry by the QUOTED point-in-time half-spread of the book it is
+    # actually crossing (the LIVE NBBO only — the IBKR sweep is refused as a
+    # fallback, its LEVEL runs 0.78× the real book; no live book ⇒ multiplier
+    # exactly 1.0 — the CS/class proxies separated no outcomes at any threshold
+    # and would be sizing on noise).
+    # Per-side curves, because 30 days of the live ledger measured the two sides
+    # improving for different reasons: LONG only its COST (net keep-minus-drop
+    # excess rises to +1.38 pp/day, t +2.08, at a 20 bp cut while the pivot
+    # excess stays ~0), SHORT its DIRECTION (pivot win rate 58.8% ungated →
+    # 76.7% under 4 bp, p .003; +31 pp inside RTH alone). RTH basis — the
+    # session's own widening is already charged by extended/overnight_size_multiplier.
+    enable_nbbo_sizing: bool = True
+    nbbo_size_long_wide_bps: float = 20.0    # longs wider than this are cut hard
+    nbbo_size_long_wide_mult: float = 0.35   # ...to this multiplier (4 bp smoothing ramp above the cut)
+    nbbo_size_short_knee_bps: float = 5.0    # shorts tighter than this are sized UP
+    nbbo_size_short_tight_mult: float = 1.5  # ...to this (also the tilt's hard ceiling)
+    nbbo_size_short_decay_bps: float = 15.0  # above the knee: 1/(1+(bps-knee)/decay)
+    nbbo_size_floor_mult: float = 0.20       # floor for both curves
+
+    # ── Gate 4b — live-book WIDTH cap (2026-09-03, user directive). An
+    # actionable BUY/SELL whose live NBBO half-spread (RTH basis, the same
+    # `quoted_halfspread_bps` the sizing reads) is at/above this many bp is
+    # DEFERRED — the name re-qualifies at any later tick its book is tighter.
+    # Measured 2026-09-02 on the real LLM funnel (1,308 calls alive at Gate 4,
+    # 36 days, pivot basis, net of calibrated costs): Gate 4 alone keeps n=1121
+    # at win 50.8% / net −405 (mean −0.36%/call); Gate 4 AND book < 12 bp keeps
+    # n=657 at win 53.9% / net +495 (mean +0.75%/call), while the cohort Gate 4
+    # passes but the cap drops (n=479, median book 60 bp) is win 47.0% / net
+    # −860 — both sides improve (LONG net −240 → +235, SHORT −165 → +260). On the
+    # simulated aggregator pool (16,019 rows / 38 days) the same cut takes net
+    # −7,676 (t −4.7) to −468 (t −0.4); LONG paired per-day NET (cap-only minus
+    # Gate-4-only at 12 bp) +1.76 pp/day, t +2.50 over 33 days. Below the
+    # pre-registered bar as a t on the real funnel (net_t 0.56, split halves
+    # +1.33/−0.45 on the pivot excess), so this is a COST cap shipped on the
+    # user's call, not a proven skill gate — see memory/gate4-vs-nbbo-2026-09.
+    # No live book ⇒ PASS (the cap judges a book, not its absence; off-hours
+    # Polygon refuses quotes past 120 s and the session haircuts + LMT caps
+    # carry that risk). ≤ 0 disables. Follow-through is NOT gated by it (its
+    # validated spec consults no gate).
+    gate4_nbbo_max_halfspread_bps: float = 12.0
 
     # ── FOLLOW-THROUGH (2026-08-25, user directive; src/signals/follow_through.py).
     # At each tick, every Gate-4 scored name's hypothetical held positions
@@ -2613,10 +3334,19 @@ class Settings(BaseSettings):
     # recovery never fired — the loop ran 07:39→08:00 with auto-restart enabled and
     # did nothing. A gateway needing this many force-recycles inside the window is
     # therefore treated as the corpse REGARDLESS of whether it answers the dial.
-    # Any genuinely successful request clears the history (only a real response
-    # proves it is back). Keep the limit >2 so an ordinary blip can't escalate.
+    # Keep the limit >2 so an ordinary blip can't escalate. The history is a
+    # WALL-CLOCK list persisted to cache/broker_wedge_recycles.json (2026-09-03):
+    # the broker-sync watchdog answers a wedge with os._exit(1) and --supervise
+    # relaunches a fresh process, and one wedge cycle costs ~4.5 min (5 x 45 s
+    # timeouts + the handshake), so under a 30-min tick cadence a per-process
+    # count inside 900 s was unreachable — the gateway wedged 01:19→02:37 ET
+    # with four force-recycles and zero restarts. A successful request no
+    # longer clears the list either (every cycle ends in a redial that
+    # "succeeds"); the window prune alone bounds staleness. One hour is three
+    # cycles across two ticks; the recovery's own 30-min cooldown and paper-only
+    # guard cap the blast radius of a false positive.
     broker_wedge_recycle_limit: int = 3
-    broker_wedge_recycle_window_seconds: float = 900.0
+    broker_wedge_recycle_window_seconds: float = 3600.0
     # ── GATEWAY auto-recovery (2026-07-13, the last manual ops step automated) ──
     # The app-side self-healing above (auto-reconnect, wedge detection + forced
     # client recycle) can only fix the APP's side of the session. When the GATEWAY

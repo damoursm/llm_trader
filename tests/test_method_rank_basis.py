@@ -580,3 +580,93 @@ def test_tradeable_pool_is_skipped_when_the_gate_is_off(monkeypatch):
                         lambda *a, **k: pytest.fail("liquidity gate is OFF"))
     ranked = _build(monkeypatch, "rank")
     assert len(ranked) == len(_FIXTURE)
+
+
+# ── per-method participation floor (2026-09-11) ─────────────────────────────
+
+def _quiet_maps(quiet_vals, tech_extra=5):
+    """`quiet_vals` non-zero news_quiet views, plus enough tech views that tech
+    is never the method under test."""
+    raw = {f"T{i}": {"news_quiet": (True, v), "tech": (True, v)}
+           for i, v in enumerate(quiet_vals)}
+    for i in range(len(quiet_vals), len(quiet_vals) + tech_extra):
+        raw[f"T{i}"] = {"news_quiet": (True, 0.0), "tech": (True, 0.1 * (i + 1))}
+    return raw
+
+
+def test_news_quiet_ranks_on_three_views_where_the_global_floor_would_drop_it():
+    """The whole point. `method_rank_min_views` (5) is right for a method that
+    scores the cross-section; `news_quiet` scores only names whose story has gone
+    quiet — 3-7 per run against `news`'s 114-130 — because ABSTENTION IS ITS
+    MECHANISM, not a data failure. At 72h it averaged 5.2 views against a floor
+    of 5 and was silently WEIGHT 0 in a third of its runs."""
+    from src.signals.aggregator import _rank_transform_run
+    raw = _quiet_maps((0.5, 0.2, -0.3))
+    out, abstained = _rank_transform_run(raw, tradeable=set(raw), shapes={})
+    assert "news_quiet" not in abstained
+    assert out["T0"]["news_quiet"][1] == pytest.approx(1.0)
+    assert out["T2"]["news_quiet"][1] == pytest.approx(-1.0)
+
+
+def test_without_the_override_the_same_data_is_dropped(monkeypatch):
+    """Proves it is the override doing the work, not a change in the transform."""
+    from config.settings import settings
+    from src.signals.aggregator import _rank_transform_run
+    monkeypatch.setattr(settings, "method_rank_min_views_overrides", "", raising=False)
+    raw = _quiet_maps((0.5, 0.2, -0.3))
+    _out, abstained = _rank_transform_run(raw, tradeable=set(raw), shapes={})
+    assert "news_quiet" in abstained
+
+
+def test_the_override_does_not_leak_onto_other_methods(monkeypatch):
+    """A per-method floor must stay per-method: `tech` with 3 views is still a
+    3-name ranking calling itself a signal, and still gets dropped."""
+    from src.signals.aggregator import _rank_transform_run
+    raw = {f"T{i}": {"tech": (True, v)} for i, v in enumerate((0.5, 0.2, -0.3))}
+    _out, abstained = _rank_transform_run(raw, tradeable=set(raw), shapes={})
+    assert "tech" in abstained
+
+
+def test_the_hard_floor_of_two_cannot_be_undercut(monkeypatch):
+    """`max(2, ...)` stands whatever the override says, so a single view is
+    refused even at `news_quiet=1` — at n=1 the transform returns pct 0.5 -> 0.0
+    anyway, an abstention with extra steps.
+
+    The floor PERMITS n=2, where the two names take +/-1 however close their raw
+    scores are — conviction the data does not support. The shipped override is
+    3, which keeps `news_quiet` clear of that; this test pins the boundary so a
+    future widening to 2 is a deliberate act rather than a typo."""
+    from config.settings import settings
+    from src.signals.aggregator import _rank_transform_run
+    monkeypatch.setattr(settings, "method_rank_min_views_overrides",
+                        "news_quiet=1", raising=False)
+    one = {"A": {"news_quiet": (True, 0.40)}}
+    _o, abstained = _rank_transform_run(one, tradeable={"A"}, shapes={})
+    assert "news_quiet" in abstained
+
+    two = {"A": {"news_quiet": (True, 0.40)}, "B": {"news_quiet": (True, 0.39)}}
+    out, abst2 = _rank_transform_run(two, tradeable={"A", "B"}, shapes={})
+    assert "news_quiet" not in abst2
+    assert out["A"]["news_quiet"][1] == pytest.approx(1.0)     # a 0.01 raw gap
+    assert out["B"]["news_quiet"][1] == pytest.approx(-1.0)    # becomes +/-1
+
+
+def test_a_malformed_override_is_logged_not_silently_dropped(monkeypatch):
+    """An unparseable entry that silently became "no override" is the same
+    observable as a working one — the failure class this repo tests for
+    mechanically rather than by review."""
+    from config.settings import settings
+    from src.signals import aggregator
+    monkeypatch.setattr(settings, "method_rank_min_views_overrides",
+                        "news_quiet=3, bogus, other=x, tech=4", raising=False)
+    aggregator._BAD_MIN_VIEW_OVERRIDES.clear()
+    assert aggregator._rank_min_view_overrides() == {"news_quiet": 3, "tech": 4}
+    assert aggregator._BAD_MIN_VIEW_OVERRIDES == {"bogus", "other=x"}
+
+
+def test_the_shipped_default_covers_news_quiet():
+    """3 is read off the data: excluding runs with no qualifying name at all,
+    every sub-floor run sat at n=3 (x8) or n=4 (x2) and n=1/2 never occurred."""
+    from config.settings import Settings
+    d = Settings.model_fields["method_rank_min_views_overrides"].default
+    assert "news_quiet=3" in d

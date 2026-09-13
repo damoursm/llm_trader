@@ -95,6 +95,17 @@ def run_retention() -> dict:
                                             settings.sim_retention_keep_days)),
         ("exit_signals_pruned", lambda: prune_beyond("exit_signals", "signal_date",
                                                      settings.exit_signals_keep_days)),
+        # Digest TEXT is the bulky part of the sentiment record; the ids on the
+        # `signals` / `sentiment_shadow` / `catalyst_repairs` rows stay forever.
+        ("sentiment_digests_pruned", lambda: prune_beyond(
+            "sentiment_digests", "generated_at",
+            settings.sentiment_digest_retention_days)),
+        # The archive is the point of the table, so this keeps YEARS, not days —
+        # it prunes on FIRST sighting, because that is the field a point-in-time
+        # replay keys on.
+        ("news_articles_pruned", lambda: prune_beyond(
+            "news_articles", "first_seen_at",
+            settings.news_archive_retention_days)),
     )
     for name, fn in steps:
         try:

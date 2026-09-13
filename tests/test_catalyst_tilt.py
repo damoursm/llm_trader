@@ -109,6 +109,27 @@ def test_calibration_fits_gated_events(monkeypatch):
     assert ct.calibrate_catalyst_tilt(force=True) == {}
 
 
+def test_fit_drops_events_whose_repair_stayed_unresolved(monkeypatch):
+    """The catalyst REPAIR pass marks a label it checked but could not settle
+    as `unresolved`. Those events leave the fit — a calibration excludes noise,
+    it never converts it — while the UNCHECKED events (no repair, quality None)
+    stay: not flagged is not the same as known-bad, and dropping them would
+    starve the fit rather than clean it."""
+    import src.analysis.news_events as ne
+    import src.data.cache as cache
+    good = _events(350, "analyst", 0.5, -4.0)
+    good["catalyst_quality"] = None                     # never checked
+    bad = _events(400, "analyst", 0.5, +4.0)
+    bad["catalyst_quality"] = "unresolved"              # checked, still doubtful
+    ev = pd.concat([good, bad])
+    ev["signal_date"] = "2026-07-10"
+    monkeypatch.setattr(ne, "load_news_events", lambda *a, **k: ev)
+    monkeypatch.setattr(cache, "load_ohlcv", lambda t, interval="1d": _ohlcv(price=10.0))
+    tilts = ct.calibrate_catalyst_tilt(force=True)
+    # The doubtful majority pointed the other way; dropping it keeps the sign.
+    assert tilts[("analyst", "bull")] < -0.5
+
+
 # ── asof + wiring ───────────────────────────────────────────────────────────
 
 def test_asof_flush_registration():
@@ -134,8 +155,15 @@ def test_catalyst_tilt_wiring_complete():
     assert ("signals", "catalyst_tilt") in {(t, c) for t, c, _ in _ADD_COLUMNS}
     assert "catalyst_tilt_score" in TickerSignal.model_fields
     # PANEL-FIRST: not weighted, not a family voter.
-    assert "catalyst_tilt" not in _BASE_WEIGHTS
-    assert "catalyst_tilt" not in FAMILY_OF
+    # Promoted 2026-09-11 (user request) off weight 0 for coherence / family
+    # participation; direction still comes from the stackers.
+    assert 0 < _BASE_WEIGHTS["catalyst_tilt"] <= 0.08
+    # Joined the Sentiment family on 2026-09-11 with its weight — a weight-0
+    # method is excluded from the family vote entirely, and participating is the
+    # stated reason. Sentiment rather than its own family: it is `news` x a
+    # fitted per-(catalyst, side) orientation, so it is the same information,
+    # and the family layer exists so correlated methods are ONE voter.
+    assert FAMILY_OF["catalyst_tilt"] == "Sentiment"
 
 
 def test_score_flows_to_the_signal(monkeypatch):
