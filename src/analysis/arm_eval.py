@@ -115,25 +115,18 @@ def attach_forward_returns(df: pd.DataFrame,
         # Oriented as a STRATEGY return: a declined call earns 0, not NaN.
         df[f"ret_{h}d"] = df["_side"] * df[f"fwd_ret_{h}d"]
     # The pivot pseudo-horizon (2026-08-13 standardization): the signed move to
-    # the next H/L pivot from the call's session close — the decision basis,
+    # the next 30-minute H/L pivot from the call's own tick — the decision basis,
     # comparable across every eval surface. Settled rows only (None otherwise).
     try:
-        from bisect import bisect_left as _bl
-        from src.analysis.simulated_trades import _pivot_targets
-        pv_cache: Dict[str, tuple] = {}
+        from src.analysis.simulated_trades import _pivot_fwd_for_row
 
         def fwd_pv(row) -> Optional[float]:
+            # The next 30-minute pivot strictly after the CALL's own tick, from
+            # its snapshot price (the session close when that is missing).
             tk = row["ticker"]
-            if tk not in pv_cache:
-                pv_cache[tk] = _pivot_targets(dates_by_ticker.get(tk) or [],
-                                              closes_by_ticker.get(tk) or {}, ticker=tk)
-            pdts, sp, endx = pv_cache[tk]
-            if not pdts:
-                return None
-            i = _bl(pdts, row["_sig_date"])
-            if i < len(pdts) and endx[i] >= 0:
-                return float(sp[i])
-            return None
+            _r = _pivot_fwd_for_row(tk, row["_sig_date"], row.get("generated_at"),
+                                    row.get("snap_price"), closes_by_ticker.get(tk) or {})
+            return float(_r[0]) if _r is not None else None
 
         df["fwd_ret_pv"] = df.apply(fwd_pv, axis=1)
         df["ret_pv"] = df["_side"] * df["fwd_ret_pv"]

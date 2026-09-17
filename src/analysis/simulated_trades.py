@@ -364,57 +364,25 @@ def reset_cache() -> None:
 
 # ── the PIVOT pseudo-horizon (2026-08-12, user directive) ────────────────────
 #
-# The signed pivot target (return to the next pivot, peak or trough whichever
-# first — `pivot_target.next_pivot_targets`, the ml_ohlcv-v2 training target)
-# joins the fixed grid as label "pv". It is the DECISION basis: the IC weight
-# tilt, the hard filter, the per-side weights and the inversion arm read pv;
-# the fixed horizons stay for monitoring, holding-period estimation and exits.
+# The signed pivot target — the return from the row's own tick to the next H/L
+# pivot on 30-minute bars (`pivot_rows.pivot_fwd_row`, the one resolver every
+# surface shares) — joins the fixed grid as label "pv". It is the DECISION
+# basis: the IC weight tilt, the hard filter, the per-side weights and the
+# inversion arm read pv; the fixed horizons stay for monitoring, holding-period
+# estimation and exits.
 PIVOT_LABEL = "pv"
 
 
-def _pivot_targets(dates: List[date], closes: Dict[date, float],
-                   ticker: Optional[str] = None):
-    """Per-ticker pivot labels: ``(dates_kept, sp, end_idx)`` — settled rows
-    only carry a finite ``sp`` / non-negative ``end_idx``.
-
-    H/L basis (2026-08-12): the marks live on each bar's HIGH/LOW, so the
-    high/low series are loaded from the OHLCV cache (aligned to the close
-    dates; a missing frame falls back to closes-as-extremes, which degrades
-    the label rather than dropping it). Point-in-time by TRUNCATION: under an
-    as-of cutoff the series end strictly before the cutoff date, so a pivot
-    can settle only if its CONFIRMING bar is inside the visible window."""
-    cut = _asof_cutoff_date()
-    if cut is not None:
-        dates = dates[:bisect_left(dates, cut)]
-    n = len(dates)
-    if n < 50:
-        return [], None, None
-    import numpy as np
-    c = np.asarray([closes[d] for d in dates], dtype=float)
-    h = lo = c
-    if ticker:
-        try:
-            from src.data.cache import load_ohlcv
-            df = load_ohlcv(ticker)
-            if df is not None and not df.empty and "High" in df.columns:
-                hi_m, lo_m = {}, {}
-                import pandas as _pd
-                idx = _pd.DatetimeIndex(df.index)
-                hv = _pd.to_numeric(df["High"], errors="coerce").to_numpy(dtype=float)
-                lv = _pd.to_numeric(df["Low"], errors="coerce").to_numpy(dtype=float)
-                for t, hh, ll in zip(idx, hv, lv):
-                    dd = t.date()
-                    if hh == hh:
-                        hi_m[dd] = hh
-                    if ll == ll:
-                        lo_m[dd] = ll
-                h = np.asarray([hi_m.get(d, closes[d]) for d in dates], dtype=float)
-                lo = np.asarray([lo_m.get(d, closes[d]) for d in dates], dtype=float)
-        except Exception:
-            h = lo = c
-    from src.analysis.pivot_target import next_pivot_targets
-    sp, end = next_pivot_targets(c, h, lo)
-    return dates, sp, end
+def _pivot_fwd_for_row(tk: str, sigd: date, gen, price: Optional[float],
+                       closes: Dict[date, float]):
+    """``(fwd_pct, end_date, end_ts)`` for ONE row, or None: the next 30-minute
+    H/L pivot strictly after the row's own tick (``gen``), from the row's own
+    price (``entry_price`` — the snapshot the sim entered at; the session close
+    when that is missing) — so a pivot later the same session counts. Settled
+    rows only; a ticker without 30-minute history gets None."""
+    from src.analysis.pivot_rows import pivot_fwd_row
+    return pivot_fwd_row(tk, gen if gen else sigd, price, asof_day=_asof_cutoff_date(),
+                         fallback_close=closes.get(sigd))
 
 
 def _window_ret(b_dates: List[date], b_closes: Dict[date, float],
@@ -544,7 +512,6 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
     mp_labels = tuple(h[0] for h in hz) + (PIVOT_LABEL,)
     acc: Dict[str, Dict[str, Dict[str, list]]] = defaultdict(
         lambda: {lbl: {"s": [], "f": [], "d": []} for lbl in mp_labels})
-    pv_by_tk: dict = {}
     pv_fwd: Dict[Tuple[str, date], Optional[float]] = {}
 
     for row in df.itertuples(index=False):
@@ -553,17 +520,10 @@ def compute_method_perf(days: Optional[int] = None, dedupe: str = "events",
         dates, closes = daily.get(tk, ([], {}))
         # The pivot pseudo-horizon (absolute basis here, matching the fixed
         # columns): the signed return to the ticker's next pivot.
-        pk = (tk, sigd)
+        pk = (tk, sigd, gen)
         if pk not in pv_fwd:
-            if tk not in pv_by_tk:
-                pv_by_tk[tk] = _pivot_targets(dates, closes, ticker=tk)
-            pdts, sp, endx = pv_by_tk[tk]
-            out_pv = None
-            if pdts:
-                pi = bisect_left(pdts, sigd)
-                if pi < len(pdts) and endx[pi] >= 0:
-                    out_pv = float(sp[pi])
-            pv_fwd[pk] = out_pv
+            _r = _pivot_fwd_for_row(tk, sigd, gen, getattr(row, "entry_price", None), closes)
+            pv_fwd[pk] = _r[0] if _r is not None else None
         if pv_fwd[pk] is not None:
             cell = acc[method][PIVOT_LABEL]
             cell["s"].append(sc)
@@ -709,7 +669,7 @@ def _directional_perf_impl(days: Optional[int], min_n: int, benchmark: str,
     b_intra = _intraday_series(benchmark)
 
     d_fwd: dict = {}; i_fwd: dict = {}; bd_fwd: dict = {}; bi_fwd: dict = {}
-    pv_by_tk: dict = {}; pv_fwd: dict = {}; b_win: dict = {}
+    pv_fwd: dict = {}; b_win: dict = {}
     all_labels = HORIZON_LABELS + (PIVOT_LABEL,)
     acc: Dict[tuple, Dict[str, Dict[str, list]]] = defaultdict(
         lambda: {lbl: {"s": [], "m": [], "d": []} for lbl in all_labels})
@@ -721,20 +681,12 @@ def _directional_perf_impl(days: Optional[int], min_n: int, benchmark: str,
         # The pivot pseudo-horizon: ticker leg to ITS next pivot; benchmark leg
         # over the SAME calendar window, so market drift is netted per-row even
         # though every row's horizon differs.
-        pk = (tk, sigd)
+        pk = (tk, sigd, gen)
         if pk not in pv_fwd:
-            if tk not in pv_by_tk:
-                pv_by_tk[tk] = _pivot_targets(dts, cls, ticker=tk)
-            pdts, sp, endx = pv_by_tk[tk]
-            out = None
-            if pdts:
-                pi = bisect_left(pdts, sigd)
-                if pi < len(pdts) and endx[pi] >= 0:
-                    out = (float(sp[pi]), pdts[int(endx[pi])])
-            pv_fwd[pk] = out
+            pv_fwd[pk] = _pivot_fwd_for_row(tk, sigd, gen, getattr(row, "entry_price", None), cls)
         pv = pv_fwd[pk]
         if pv is not None:
-            fwd_pv, end_d = pv
+            fwd_pv, end_d = pv[0], pv[1]          # the third element is the resolving bar's start
             bk = (sigd, end_d)
             if bk not in b_win:
                 b_win[bk] = _window_ret(b_dates, b_closes, sigd, end_d)

@@ -12,12 +12,15 @@ the exit consensus still excludes it (``_CONSENSUS_SKIP`` — exit-side skill is
 measured separately in the exit panel).
 
 **v2 (current, ``settings.ml_ohlcv_target = "pivot_rank"``):** a
-``LightGBMRankRegressor`` on the within-day rank of the signed pivot return
-(``analysis/pivot_target.py``), 85 features (the 76 causal OHLCV features + the
-9 leg-state features), uniform day-equal weights, trained on the FULL deep
-cache — no clean-trend/liquidity conditioning, because the 2026-08 experiments
-measured the unconditioned full-data model best (and every weighting scheme
-≤ uniform). Score = ``clip(2·pred, −1, 1)``: the head predicts a centred
+``LightGBMRankRegressor`` on the within-day rank of the signed pivot return —
+since 2026-09-16 the next H/L pivot on 30-MINUTE bars after each training
+row's session close (``analysis/pivot_target.session_close_labels`` over the
+deep store ``data/intraday_store``, 2021→; the daily H/L label is retired) —
+85 features (the 76 causal OHLCV features + the 9 DAILY leg-state features:
+daily features, intraday label), uniform day-equal weights, trained on the
+FULL deep cache — no clean-trend/liquidity conditioning, because the 2026-08
+experiments measured the unconditioned full-data model best (and every
+weighting scheme ≤ uniform). Score = ``clip(2·pred, −1, 1)``: the head predicts a centred
 within-day rank ∈ [−0.5, 0.5], so ×2 maps its natural range onto the method-
 score convention; the number is meaningful RELATIVE to same-day scores, which
 is exactly how the panel consumes it.
@@ -139,60 +142,161 @@ def train_and_persist(deep_parquet: str = "cache/ml/dataset_multi.parquet",
 
 def train_and_persist_pivot(deep_parquet: str = _PIVOT_PARQUET,
                             path: Path = _MODEL_PATH,
-                            rebuild_dataset: bool = False) -> Optional[dict]:
-    """Train the v2 config (signed-pivot within-day-rank GBM, full universe,
-    uniform day-equal weights) and pickle it. Every training row's pivot has
-    printed by construction (``pivot_frame`` emits settled targets only), so no
-    further point-in-time gate is needed at final-training time — the walk-
-    forward cutoffs belong to validation, not to the shipped artifact."""
-    from src.analysis.ml_dataset import (ALL_FEATURE_COLUMNS, load_materialized,
-                                         materialize, missing_feature_columns)
-    from src.analysis.ml_train import LightGBMRankRegressor
-    from src.analysis.pivot_target import LEG_FEATURES, pivot_frame, within_day_rank
+                            rebuild_dataset: bool = False,
+                            extend_store: bool = True) -> Optional[dict]:
+    """Train the v2 config (within-day-rank GBM of the signed pivot target, full
+    universe, uniform day-equal weights) and pickle it.
 
-    df = load_materialized(deep_parquet) if Path(deep_parquet).exists() else None
-    stale = missing_feature_columns(df)
-    if stale:
+    The label (2026-09-16, the only one): each deep row is a (ticker, session)
+    with DAILY features, and its target is the next H/L pivot on 30-MINUTE bars
+    after that session's close — anchored at 16:00 ET with the session close as
+    the price, so the search starts at the next session's first bar
+    (`pivot_target.session_close_labels`). Daily features, intraday label: the
+    label is the next pivot in the subsequent bars whatever bars the features
+    read. The 30-minute history comes from the deep store
+    (`data/intraday_store`, 2021→, extended first unless ``extend_store`` is
+    False), so labelled rows start in 2021; every labelled row's pivot has
+    printed by construction — no further point-in-time gate at final-training
+    time (the walk-forward cutoffs belong to validation).
+
+    Memory: features come out of DuckDB as float32 into ONE matrix and the
+    labels / leg features are streamed per ticker into preallocated vectors —
+    a dict-per-row frame over 9M rows was OOM-killed on this box (2026-09-14).
+    ~8 GB peak; run it alone, never beside an RTH tick."""
+    import gc
+    import time
+
+    import duckdb
+    import pandas as pd
+    from src.analysis.ml_dataset import (ALL_FEATURE_COLUMNS, materialize,
+                                         missing_feature_columns)
+    from src.analysis.ml_train import LightGBMRankRegressor
+    from src.analysis.pivot_target import (LEG_FEATURES, _series, leg_feature_rows,
+                                           pivot_basis, session_close_labels, within_day_rank)
+    from src.data.intraday_store import deep_series_30m, extend_deep_30m
+
+    t0 = time.time()
+    pq = Path(deep_parquet)
+
+    def _cols() -> list:
+        con = duckdb.connect()
+        try:
+            return [c[0] for c in con.sql(f"DESCRIBE SELECT * FROM '{pq.as_posix()}'").fetchall()]
+        finally:
+            con.close()
+
+    cols = _cols() if pq.exists() else []
+    stale = missing_feature_columns(pd.DataFrame(columns=cols)) if cols else list(ALL_FEATURE_COLUMNS)
+    if stale and cols:
         logger.warning(f"[ml_ohlcv] {deep_parquet} lacks {len(stale)} current feature "
                        f"columns (e.g. {stale[:3]}) — rebuilding")
-    if rebuild_dataset or df is None or df.empty or stale:
+    if rebuild_dataset or not cols or stale:
         try:
             materialize(deep_parquet, horizons=[5, 10], date_stride=1)
-            df = load_materialized(deep_parquet)
+            cols = _cols()
         except Exception as e:
             logger.warning(f"[ml_ohlcv] full dataset rebuild failed ({e}); "
                            f"training on the prior parquet if any")
-    if df is None or df.empty:
+    if not cols:
         logger.warning("[ml_ohlcv] no deep dataset to train the pivot model on")
         return None
 
-    pf = pivot_frame(sorted(df["ticker"].unique()))
-    if pf.empty:
-        logger.warning("[ml_ohlcv] pivot frame empty — nothing to train on")
-        return None
-    df = df.merge(pf, on=["ticker", "signal_date"], how="inner")
-    df["sp_buy"] = np.asarray(df["sp_buy"], dtype=float)
-    df = df[np.isfinite(df["sp_buy"])].reset_index(drop=True)
-    feats = [f for f in ALL_FEATURE_COLUMNS if f in df.columns] + list(LEG_FEATURES)
-    if len(df) < 50000:
-        logger.warning(f"[ml_ohlcv] insufficient pivot training rows ({len(df):,})")
-        return None
+    feats0 = [f for f in ALL_FEATURE_COLUMNS if f in cols]
+    feats = feats0 + list(LEG_FEATURES)
+    sel = ", ".join(f'CAST("{f}" AS FLOAT) AS "{f}"' for f in feats0)
+    con = duckdb.connect()
+    try:
+        tickers = [r[0] for r in con.sql(
+            f"SELECT DISTINCT ticker FROM '{pq.as_posix()}' ORDER BY ticker").fetchall()]
+        arr = con.sql(f"""WITH k AS (SELECT ticker, ROW_NUMBER() OVER (ORDER BY ticker) - 1 AS code
+                                     FROM (SELECT DISTINCT ticker FROM '{pq.as_posix()}'))
+                          SELECT k.code::INTEGER AS code, CAST(p.signal_date AS DATE) AS signal_date, {sel}
+                          FROM '{pq.as_posix()}' p JOIN k USING (ticker)
+                          ORDER BY k.code, signal_date""").fetchnumpy()
+    finally:
+        con.close()
+    code = np.asarray(arr.pop("code"), dtype=np.int32)
+    sd = np.asarray(arr.pop("signal_date"))
+    sd_iso = np.asarray(pd.to_datetime(sd).strftime("%Y-%m-%d"))
+    n = len(code)
+    X = np.empty((n, len(feats)), dtype=np.float32)
+    for j, f in enumerate(feats0):
+        X[:, j] = np.asarray(arr.pop(f), dtype=np.float32)
+    del arr
+    gc.collect()
+    X[:, len(feats0):] = np.nan
+    y = np.full(n, np.nan, dtype=np.float64)
+    logger.info(f"[ml_ohlcv] features {X.shape} float32 over {len(tickers)} tickers "
+                f"loaded in {time.time() - t0:.0f}s")
 
-    day_codes, day_idx = np.unique(df["signal_date"].astype(str).to_numpy(),
-                                   return_inverse=True)
-    yr = within_day_rank(df["sp_buy"].to_numpy(np.float64), day_idx.astype(np.int32))
+    if extend_store:
+        try:
+            extend_deep_30m(tickers, workers=4, budget_seconds=1800.0, min_age_days=3)
+        except Exception as e:
+            logger.warning(f"[ml_ohlcv] deep 30-minute store extension failed ({e}) — "
+                           f"training on the stored history")
+
+    starts = np.searchsorted(code, np.arange(len(tickers)), side="left")
+    ends = np.searchsorted(code, np.arange(len(tickers)), side="right")
+    n_leg = n_lab = n_30 = 0
+    for k, tk in enumerate(tickers):
+        a, b = int(starts[k]), int(ends[k])
+        if b <= a:
+            continue
+        s = _series(tk)
+        if s is None:
+            continue
+        idx_d, c_d, h_d, lo_d = s
+        pos = {d: i for i, d in enumerate(sd_iso[a:b])}       # ISO keys on both sides
+        for rec in leg_feature_rows(c_d, h_d, lo_d, list(idx_d)):
+            i = pos.get(rec["signal_date"])
+            if i is None:
+                continue
+            for j, f in enumerate(LEG_FEATURES):
+                v = rec.get(f)
+                X[a + i, len(feats0) + j] = np.float32(v) if v is not None and v == v else np.nan
+            n_leg += 1
+        s30 = deep_series_30m(tk)
+        if s30 is None:
+            continue
+        n_30 += 1
+        sp, _end = session_close_labels(*s30, list(idx_d), c_d)
+        for d, v in zip(idx_d, sp):
+            if v == v:
+                i = pos.get(d.isoformat())
+                if i is not None:
+                    y[a + i] = float(v)
+                    n_lab += 1
+        if (k + 1) % 500 == 0:
+            logger.info(f"[ml_ohlcv] labels {k + 1}/{len(tickers)} tickers | "
+                        f"{n_lab:,} settled | {time.time() - t0:.0f}s")
+    logger.info(f"[ml_ohlcv] leg rows {n_leg:,} | 30-minute history for {n_30} tickers | "
+                f"settled labels {n_lab:,} of {n:,} rows | {time.time() - t0:.0f}s")
+
+    m = np.isfinite(y)
+    if int(m.sum()) < 50000:
+        logger.warning(f"[ml_ohlcv] insufficient pivot training rows ({int(m.sum()):,})")
+        return None
+    Xm = np.ascontiguousarray(X[m])
+    ym = y[m]
+    dm = sd_iso[m]
+    del X, y
+    gc.collect()
+    day_codes, day_idx = np.unique(dm, return_inverse=True)
+    yr = within_day_rank(ym, day_idx.astype(np.int32))
     cnt = np.bincount(day_idx)
     w = (1.0 / cnt[day_idx]).astype(np.float64)
     w /= w.mean()
-    X = df[feats].to_numpy(dtype=np.float32)
 
     cfg = dict(TRAIN_CONFIG_PIVOT)
-    from src.analysis.pivot_target import pivot_basis
-    cfg["pivot_basis"] = pivot_basis()    # hl+threshold since 2026-08-12; serving refuses a mismatch
-    model = LightGBMRankRegressor(num_threads=cfg["num_threads"]).fit(X, yr, w)
+    cfg["pivot_basis"] = pivot_basis()        # marks + threshold + resolution; serving refuses a mismatch
+    cfg["pivot_resolution"] = "30m"
+    cfg["label"] = "next_30m_pivot_from_session_close"
+    model = LightGBMRankRegressor(num_threads=cfg["num_threads"]).fit(Xm, yr, w)
     art = {"model": model, "features": feats, "config": cfg,
            "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-           "n_train": int(len(X)), "train_max_date": str(df["signal_date"].max())}
+           "n_train": int(len(Xm)), "n_days": int(len(day_codes)),
+           "train_min_date": str(day_codes[0]), "train_max_date": str(day_codes[-1])}
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as fh:
         pickle.dump(art, fh)
@@ -200,7 +304,8 @@ def train_and_persist_pivot(deep_parquet: str = _PIVOT_PARQUET,
     _SCORE_CACHE.clear()
     _record_registry(art)
     logger.info(f"[ml_ohlcv] pivot model trained on {art['n_train']:,} rows "
-                f"/ {len(day_codes)} days (<= {art['train_max_date']}) -> {path}")
+                f"/ {len(day_codes)} days ({art['train_min_date']}..{art['train_max_date']}) "
+                f"basis {cfg['pivot_basis']} -> {path} in {time.time() - t0:.0f}s")
     return art
 
 
@@ -320,12 +425,20 @@ def compute_ml_score(ticker: str) -> Tuple[float, str]:
             # features it never saw. Abstain (a method with no view) until the
             # retrain writes a matching artifact — degraded, never wrong.
             from src.analysis.pivot_target import latest_leg_features, pivot_basis
-            if cfg.get("pivot_basis") != pivot_basis():
+            # The artifact must be stamped with the label basis IN FORCE
+            # (marks + threshold + resolution, e.g. hl1@30m): a model trained
+            # on a retired label — the daily H/L one, another threshold — is fed
+            # leg features that still mean what it learned but was fitted to a
+            # target that no longer exists here. Abstain (a method with no
+            # view) until the retrain writes a matching artifact — degraded,
+            # never wrong.
+            _expected = pivot_basis()
+            if cfg.get("pivot_basis") != _expected:
                 global _BASIS_WARNED
                 if not _BASIS_WARNED:
                     logger.warning(
                         f"[ml_ohlcv] artifact pivot_basis={cfg.get('pivot_basis')!r} != "
-                        f"current {pivot_basis()!r} — abstaining until the retrain lands")
+                        f"current {_expected!r} — abstaining until the retrain lands")
                     _BASIS_WARNED = True
                 return _memo(ck, 0.0, "BASIS_STALE")
             leg = latest_leg_features(ticker)

@@ -1,38 +1,102 @@
 ---
 name: evaluate
-description: House standard for evaluating any signal, model, gate or exit rule in llm_trader — H/L pivot targets with last-price resolution for unresolved pivots, simulated trades, split long and short; headline metrics = per-day pivot IC for rankers, counterfactual excess return per decision for gates/exits.
+description: House standard for evaluating any signal, model, gate or exit rule in llm_trader — the next H/L pivot as the label, found on 30-minute bars from the tick's own time and price so it may resolve later the SAME session, unresolved pivots marked at the last visible close, simulated trades, split long and short; headline metrics = per-day pivot IC for rankers, counterfactual excess return per decision for gates/exits.
 argument-hint: "[what to evaluate, e.g. 'the ml_exit upgrade' or 'Gate 1c']"
 ---
 
 Evaluate: $ARGUMENTS
 
-**The standing rule.** When evaluating, use the H/L pivot targets and, if recent
-pivots are unresolved, use the last price as the resolution (next pivot price).
-Also, use the simulated trades and evaluate for both long and short.
+**The standing rule.** When evaluating, use the H/L pivot targets. The label is
+ALWAYS the next H/L pivot — it may confirm later the SAME day as the tick (but
+only strictly AFTER the tick) or many days later, and it is never truncated to a
+fixed horizon or to the day. If the pivot has not resolved yet, use the LAST
+CLOSING PRICE as the resolution. Also, use the simulated trades and evaluate for
+both long and short.
 
 Everything below is how to satisfy that rule correctly in this codebase.
 
-## 1. The label — H/L pivots, last price for the unresolved tail
+## 1. The label — the next H/L pivot on 30-MINUTE bars, from the tick, last CLOSE for the unresolved tail
 
-The target is the signed % move from a bar's close to the **next pivot extreme**
-on the H/L basis (swing highs on each bar's HIGH, lows on its LOW, confirmed by
-`pivot_min_move_pct`). Settled pivots come from the panel
-(`fwd_ret_pivot` / `_pivot_targets`). Recent bars have no confirmed pivot yet —
-do **not** drop them, and do not wait for settlement: the running leg extreme,
-extended by the latest price, stands in as the resolution.
+The target is the signed % move from the row's **own tick price** to the **next
+pivot extreme** on the H/L basis (swing highs on each bar's HIGH, lows on its LOW,
+confirmed by `pivot_min_move_pct`), with the zigzag run over **30-minute
+regular-hours bars** and the search starting at the first bar whose START is at
+or after the tick's timestamp. The bar containing the tick is excluded (it cannot
+be split). The next pivot may therefore come **later the same session** or weeks
+out — the horizon is whatever the pivot takes, never a fixed number of days.
+Unresolved rows are **marked at the LAST VISIBLE CLOSE**, never the running leg's
+extreme.
 
 ```python
 import sys; sys.path.insert(0, ".claude/skills/evaluate")
-from live_labels import label_frame
-
-lab = label_frame(sorted(df["ticker"].unique()))       # omit asof = current prices
-df["y_mkt"]   = [lab.get((t, d), (float("nan"), False))[0] for t, d in zip(df["ticker"], df["signal_date"])]
-df["settled"] = [lab.get((t, d), (float("nan"), False))[1] for t, d in zip(df["ticker"], df["signal_date"])]
+from live_labels_intraday import label_rows          # rows: ticker / generated_at / price
+lab = label_rows(df, bars30m)                        # bars30m: {ticker: 30-min OHLCV, naive-UTC index, RTH only}
+df["y_mkt"], df["settled"], df["same_day"] = lab.target_pct, lab.resolved, lab.same_day
 ```
 
-Report the settled/provisional split alongside every result. Pass `asof="YYYY-MM-DD"`
-for a point-in-time view. This proxy is validated (within-day rank corr with the
-settled label 0.963–1.000, sign agreement ~100%).
+**This is the PRODUCTION label — the only one** (2026-09-14; daily retired 2026-09-16): the
+skill's `live_labels_intraday.py` is a thin wrapper over
+`src/analysis/pivot_target.intraday_pivot_targets` — the same function the
+signals panel (`fwd_ret_pivot`), the sim/directional panels
+(`simulated_trades._pivot_fwd_for_row`), the exit dataset, the tracker's live
+targets and every dashboard surface read through `pivot_rows.pivot_fwd_row`, and
+that trains `ml_ohlcv` (`session_close_labels` over the deep store
+`cache/ml/bars30m_deep`, each deep row anchored at its session close).
+`bars=None` reads the production 30-minute cache (`cache/ohlcv_30m/`, Polygon
+aggregates, RTH-filtered, capped at `intraday_30m_max_bars` = 260 sessions — the
+deep 2021→ history is `cache/ml/bars30m_deep/<TK>.pkl`, never the tick cache); warm it for the panel universe with
+`python -m src.data.backfill --with-30m --skip-daily` before a large read, since
+a tick only refreshes the names it touches. Pass `bars=` only to evaluate on a
+scratch fetch; build such a frame with `.to_numpy()` columns — constructing it
+from JSON-indexed Series against a new DatetimeIndex silently yields all-NaN
+bars, and the labeler refuses such a series rather than scoring it as "no
+pivots". Where the skill and the panel differ is only the UNRESOLVED tail: the
+panel writes settled rows only (a training label never sees a provisional
+value); the skill marks that tail at the last visible close for evaluation.
+
+**Why daily bars were wrong for this.** With the zigzag on daily H/L and the
+anchor at the day's close, the first candidate bar after any anchor is
+*tomorrow*: a swing later the same session was not excluded by a rule, it was
+unrepresentable. Whether a model's FEATURES are daily or intraday does not
+change the label — it is the next pivot in the subsequent bars either way.
+Report the same-session share and the median bars-to-pivot beside every result.
+
+**Which marks, which threshold.** The 30-minute marks basis and the
+confirmation threshold are settings (`pivot_label_basis` hl|close,
+`pivot_min_move_pct`), the labeler follows them, and every trained artifact is
+stamped with the fingerprint in force (`pivot_target.pivot_basis()`, `hl1@30m`).
+**Decided 2026-09-16 (user): H/L marks on 30-minute bars for ALL labels —
+ml_ohlcv, the entry stackers, ml_exit — and the daily H/L label is
+decommissioned** (there is no fallback; a ticker with no 30-minute history has
+no label). The 2026-09-15 five-label comparison
+(`memory/pivot-label-verdict-2026-09.md`) is the record behind the threshold
+question: at 1% the 30-minute H/L label's median move is 1.3% and a third of it
+is the intra-bar extreme; at 2–2.5% it matches the old daily label's swing and
+carries more power. Too many pivots is a threshold question — raise
+`pivot_min_move_pct` — never a reason to go back to daily bars. Report the
+label definition in force beside every number; do not compare levels across
+definitions — only paired contrasts within one.
+
+**Re-scoring `ml_ohlcv` offline.** Production scores an intraday tick on the
+PREVIOUS session's completed bar with the six cross-sectional ranks absent. An
+offline score must reproduce that (previous row, `_XRANK_SOURCES` NaN) — checked
+by its rank correlation with the persisted `ml_ohlcv` column (0.996; the same-day
+row scores −0.006). Same-day features report an IC the served model never had
+(+0.17–0.27 vs +0.05 measured 2026-09-15).
+
+**Mechanical check, every run.** Assert that no resolved row's pivot bar starts
+at or before its tick; the harness must refuse to publish otherwise.
+
+Do **not** use the running leg's extreme as the provisional resolution. That is
+the best price the open leg happened to reach, which nothing guarantees was
+capturable, and it systematically inflates the unresolved tail — measured
+2026-09-13 on 5,101 panel rows: 12.6% unresolved, on which the extreme basis ran
+**39% larger in magnitude** than the close (close = 72% of extreme) with **13.9%
+sign flips**. It flatters hold-friendly models most: the frozen `ml_exit`
+artifact's IC fell +0.128 → +0.072 (out of significance) on the switch, because a
+hold-conviction model graded on the best price a held position reached is graded
+on the one number an open position cannot bank. History:
+`memory/decile-ledger-validity-2026-09.md`.
 
 **Orientation — the double sign flip.** The label above is MARKET-signed. For
 anything position-relative (exits, held positions, a directional call), multiply

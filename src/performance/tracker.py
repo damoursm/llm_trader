@@ -4287,28 +4287,17 @@ def _refresh_open_trade_ohlcv(trades: List[dict]) -> None:
 def _update_pivot_targets(trades: List[dict]) -> None:
     """Per-tick H/L pivot target for every OPEN trade — pure observability.
 
-    Each trade's target is the FIRST pivot on/after its entry session, on the
-    same threshold-zigzag machine as the evaluation label
-    (``pivot_target.live_next_pivot``): SETTLED once its ``pivot_min_move_pct``
-    reversal has printed, PROVISIONAL until then — the running leg extreme,
-    which keeps extending with every new high/low (and with the live mark,
-    below) and freezes only at confirmation, converging to the settled label
-    by construction.
-
-    Anchor: the last completed bar STRICTLY BEFORE ``entry_date``, so the
-    entry session's own extreme can itself be the pivot — an intraday fill
-    rides that swing. (The panel label anchors at signal-date CLOSE and counts
-    pivots strictly after it; this surface evaluates FILLS, hence the
-    deliberate one-bar difference.)
-
-    Live extension: a provisional candidate is extended by the trade's fresh
-    ``current_price`` when the live mark is beyond the completed-bars extreme
-    (today's forming bar isn't in the daily series until the close). The live
-    mark only ever EXTENDS the candidate — confirmation stays on completed
-    bars, so a spiky mark can widen the provisional target but never fake a
-    resolution.
+    Each trade's target is the first RESOLVED 30-minute H/L pivot strictly
+    AFTER its entry fill's timestamp, measured from the entry fill
+    (`pivot_target.live_next_pivot`, the same zigzag as the label) — so a swing
+    later in the entry session is the target when that is what the fill rode
+    into. PROVISIONAL until then at the FRESHEST close (the live mark when it is
+    newer than the last cached bar), never the running extreme. A legacy
+    date-only entry anchors at that session's 09:30 ET open, so the entry
+    session's own swing can be the target.
 
     Fields stamped: ``pivot_target_price`` / ``pivot_target_date`` /
+    ``pivot_target_ts`` (the resolving bar's start, naive UTC) /
     ``pivot_target_pct`` (vs the trade's own entry fill, market-signed) /
     ``pivot_is_peak`` / ``pivot_resolved`` / ``pivot_confirmed_date`` /
     ``pivot_capture_pct`` (% of the entry→target move traversed at the current
@@ -4316,69 +4305,59 @@ def _update_pivot_targets(trades: List[dict]) -> None:
     tick's fields are left in place (last known state), never cleared.
     PROVISIONAL values must never feed a settled-label surface — monitoring
     and open-position evaluation only."""
+    import pandas as _pd
     open_trades = [t for t in trades if t.get("status") == "OPEN"]
     if not open_trades:
         return
     try:
-        from src.analysis.pivot_target import live_next_pivot, _series
+        from src.analysis.pivot_target import live_next_pivot, _NY_TZ_NAME
     except Exception as e:
         logger.warning(f"[tracker] pivot-target update skipped — import failed: {e}")
         return
-
-    today_iso = date.today().isoformat()
-    series_cache: dict = {}
     n_resolved = n_provisional = 0
+    today_iso = date.today().isoformat()
     for trade in open_trades:
         try:
             tk = trade.get("ticker")
-            entry_iso = trade.get("entry_date") or ""
             entry_px = float(trade.get("entry_price") or 0.0)
-            if not tk or not entry_iso or not entry_px > 0:
+            when = trade.get("entry_datetime") or trade.get("entry_date") or ""
+            if not tk or not when or not entry_px > 0:
                 continue
-            if tk not in series_cache:
-                series_cache[tk] = _series(tk)
-            s = series_cache[tk]
-            if s is None:
-                continue
-            idx, c, h, lo = s
-            entry_d = date.fromisoformat(entry_iso[:10])
-            i0 = bisect_left(idx, entry_d) - 1     # last bar strictly before entry
-            if i0 < 0:
-                continue
-            piv = live_next_pivot(c, h, lo, i0)
+            if len(str(when)) <= 10:                       # date only → the session open
+                when = ((_pd.Timestamp(str(when)[:10]) + _pd.Timedelta(hours=9, minutes=30))
+                        .tz_localize(_NY_TZ_NAME).tz_convert("UTC").tz_localize(None))
+            cur = trade.get("current_price")
+            mark = float(cur) if (cur is not None and cur == cur and cur > 0) else None
+            piv = live_next_pivot(tk, when, entry_px, live_mark=mark)
             if piv is None:
                 continue
             px = float(piv["price"])
-            px_date = idx[piv["idx"]].isoformat()
-            if not piv["resolved"]:
-                cur = trade.get("current_price")
-                if cur is not None and cur > 0:
-                    if piv["is_peak"] and cur > px:
-                        px, px_date = float(cur), today_iso
-                    elif not piv["is_peak"] and cur < px:
-                        px, px_date = float(cur), today_iso
+            end_ts = _pd.Timestamp(piv["end_ts"])
+            end_et = end_ts.tz_localize("UTC").tz_convert(_NY_TZ_NAME)
+            resolved = bool(piv["resolved"])
             trade["pivot_target_price"] = round(px, 4)
-            trade["pivot_target_date"] = px_date
+            trade["pivot_target_date"] = end_et.date().isoformat() if resolved else today_iso
+            trade["pivot_target_ts"] = end_ts.isoformat() if resolved else None
             trade["pivot_target_pct"] = round((px / entry_px - 1.0) * 100.0, 3)
-            trade["pivot_is_peak"] = bool(piv["is_peak"])
-            trade["pivot_resolved"] = bool(piv["resolved"])
-            trade["pivot_confirmed_date"] = (idx[piv["confirm_idx"]].isoformat()
-                                             if piv["resolved"] else None)
-            cur = trade.get("current_price")
+            trade["pivot_is_peak"] = (bool(piv["is_peak"]) if piv.get("is_peak") is not None
+                                      else bool(px >= entry_px))
+            trade["pivot_resolved"] = resolved
+            _cts = piv.get("confirm_ts")
+            trade["pivot_confirmed_date"] = (_pd.Timestamp(_cts).tz_localize("UTC").tz_convert(_NY_TZ_NAME)
+                                             .date().isoformat() if (resolved and _cts is not None) else None)
             denom = px - entry_px
-            if cur is not None and cur > 0 and abs(denom) > 1e-9:
-                capture = (float(cur) - entry_px) / denom * 100.0
+            if mark is not None and abs(denom) > 1e-9:
+                capture = (mark - entry_px) / denom * 100.0
                 trade["pivot_capture_pct"] = round(max(-500.0, min(500.0, capture)), 1)
-            if piv["resolved"]:
+            if resolved:
                 n_resolved += 1
             else:
                 n_provisional += 1
         except Exception as e:
             logger.debug(f"[tracker] pivot-target update failed for {trade.get('ticker')}: {e}")
     if n_resolved or n_provisional:
-        logger.info(f"[tracker] Pivot targets updated on {n_resolved + n_provisional} open trade(s) "
-                    f"({n_resolved} resolved / {n_provisional} provisional)")
-
+        logger.info(f"[tracker] Pivot targets (30-min H/L) updated on {n_resolved + n_provisional} "
+                    f"open trade(s) ({n_resolved} resolved / {n_provisional} provisional)")
 
 def update_open_trades() -> None:
     """Refresh current prices and unrealised P&L for all open trades.

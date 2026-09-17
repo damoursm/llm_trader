@@ -1136,7 +1136,9 @@ def _usd(x, signed: bool = True) -> str:
 
 _IC_TOOLTIP = (
     "Spearman rank correlation between a method's score and the forward "
-    "close-to-close return, at the PIVOT decision basis plus the 1/5/10-day "
+    "return, at the PIVOT decision basis (since 2026-09-14: the next H/L pivot on "
+    "30-minute bars from each row's OWN tick time and price — a swing later the same "
+    "session counts, strictly after the tick) plus the 1/5/10-day close-to-close "
     "monitoring grid. Computed over the persisted signals panel — EVERY scored "
     "ticker each run, not just the few that became trades — so it is unbiased by "
     "the trading gates. "
@@ -2155,9 +2157,10 @@ def _methods_tab():
 
 
 _GATE_FUNNEL_TOOLTIP = (
-    "Each actionable GATE judged on the H/L PIVOT target by the cohort it DROPS versus the one it "
-    "lets through, oriented by the direction that would have been traded (sign(action) x the signed "
-    "move to the next pivot). A gate earns its place when what it drops does WORSE than what it keeps. "
+    "Each actionable GATE judged on the H/L PIVOT target — the next pivot on 30-minute bars strictly "
+    "after the call's own tick, so a swing later the same session counts — by the cohort it DROPS versus "
+    "the one it lets through, oriented by the direction that would have been traded (sign(action) x the "
+    "signed move to that pivot). A gate earns its place when what it drops does WORSE than what it keeps. "
     "Gates run in cascade order and a drop is attributed to the FIRST gate that rejects it, so each row "
     "only sees the candidates still alive when it runs and the cohorts partition cleanly. "
     "\u26a0 THE COLUMN TO READ IS 'Value', NOT the raw returns. Orientation makes raw means "
@@ -2320,8 +2323,9 @@ def _method_decile_section():
     return html.Div([
         _h3("Method decile curve — signed pivot return by within-day score rank",
             "Each panel row's method score is ranked WITHIN ITS DAY among that method's non-zero "
-            "scores and bucketed into deciles; bars show the decile's mean SIGNED move to the next "
-            "H/L pivot (win% and n in the hover). This is the exact consumption the rank basis "
+            "scores and bucketed into deciles; bars show the decile's mean SIGNED move from the row's "
+            "own tick price to the next H/L pivot on 30-minute bars — a swing later the same session "
+            "counts, strictly after the tick (win% and n in the hover). This is the exact consumption the rank basis "
             "(method_score_basis=rank) feeds the combine: an upward slope = the day's stronger "
             "scores genuinely carry more upside; a flat or n-shaped curve = the ranking carries "
             "little. Pick a method below."),
@@ -2645,8 +2649,8 @@ _TICKER_PERF_TIPS = {
     "View": "Of those, days the combined score carried an actual direction (|score| ≥ 0.02). The rest are no-view days and are EXCLUDED from the returns, not counted as zero.",
     "Avg score": "Mean combined_score. Positive = the system leans bullish on this name overall.",
     "Avg conf": "Mean confidence. Compare against the ~0.85 actionable bar to see how far off being tradeable a name typically is.",
-    "Ret pivot %": "Mean oriented return to the next H/L pivot extreme (the standing decision basis) — % from the signal day's close to the next confirmed swing high/low, in the signal's direction.",
-    "Hit pivot %": "Share of pivot-settled view-days where the signal's direction matched the sign of the move to the next pivot extreme.",
+    "Ret pivot %": "Mean oriented return to the next H/L pivot extreme (the standing decision basis) — % from the row's OWN tick price to the next confirmed swing high/low on 30-minute bars, strictly after the tick, so a swing later the same session counts; in the signal's direction.",
+    "Hit pivot %": "Share of pivot-settled view-days where the signal's direction matched the sign of the move to the next 30-minute pivot extreme after the tick.",
     "Ret 1d %": "SIMULATED: mean return if the system had taken the signal's own direction each day and held 1 session. A bearish call on a stock that fell counts as a WIN.",
     "Hit 1d %": "Share of 1-day observations where the signal's direction was right.",
     "Ret 5d %": "Same, held 5 sessions — the swing horizon most of the calibration targets.",

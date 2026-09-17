@@ -442,11 +442,16 @@ def get_intraday_bars(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
     to the regular session. Empty DataFrame on failure / when Polygon is unavailable
     (the caller then falls back to yfinance).
     """
+    from_date = (date.today() - timedelta(days=lookback_days)).isoformat()
+    return get_intraday_bars_range(ticker, from_date, date.today().isoformat())
+
+
+def get_intraday_bars_range(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
+    """30-minute RTH bars for an explicit ``[from_date, to_date]`` window (ISO
+    dates, inclusive) — the deep-store extension's fetch (2026-09-16), paginated
+    like ``get_intraday_bars``. Same frame contract; empty on failure."""
     if not is_available():
         return pd.DataFrame()
-
-    from_date = (date.today() - timedelta(days=lookback_days)).isoformat()
-    to_date   = date.today().isoformat()
 
     data = _get(
         f"/v2/aggs/ticker/{to_polygon_symbol(ticker)}/range/30/minute/{from_date}/{to_date}",
@@ -456,8 +461,29 @@ def get_intraday_bars(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
         logger.debug(f"[polygon] get_intraday_bars: no data for {ticker}")
         return pd.DataFrame()
 
+    # Polygon pages long aggregate ranges (~2,000 bars per page regardless of
+    # `limit`, measured 2026-09-14): a lookback past ~150 sessions arrives in
+    # several pages, and reading only the first silently truncated history to
+    # its OLDEST part. Follow `next_url` — the cursor already carries every
+    # parameter, so only the key is appended (the `_get` params path would
+    # drop the cursor, the trap noted at `_get_paginated`).
+    results = list(data["results"])
+    nxt, pages = data.get("next_url"), 0
+    while nxt and pages < 40:
+        try:
+            sep = "&" if "?" in nxt else "?"
+            r = httpx.get(f"{nxt}{sep}apiKey={settings.polygon_api_key}", timeout=_TIMEOUT)
+            r.raise_for_status()
+            js = r.json()
+            results.extend(js.get("results") or [])
+            nxt = js.get("next_url")
+            pages += 1
+        except Exception as exc:
+            logger.debug(f"[polygon] get_intraday_bars: pagination stopped for {ticker}: {exc}")
+            break
+
     rows = []
-    for bar in data["results"]:
+    for bar in results:
         rows.append({
             "ts":     pd.Timestamp(bar["t"], unit="ms", tz="UTC"),  # bar START, UTC
             "Open":   float(bar["o"]),

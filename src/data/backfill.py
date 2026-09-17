@@ -102,20 +102,38 @@ def backfill(days: int = 730, with_30m: bool = False, signal_days: int = 90,
                 logger.info(f"[backfill] daily {i}/{len(universe)} ({daily_ok} ok)")
 
     intraday_ok = 0
+    intraday_stale = 0
     if with_30m:
+        # "ok" means the frame is FRESH, not merely present (2026-09-14): a
+        # rate-limited fetch falls through to the cached frame, which is
+        # non-empty, so the old count reported 3,061/3,063 ok while names like
+        # AAPL/SPY still ended on 2026-09-02 — invisible until the intraday
+        # pivot label read them. A frame whose last bar is older than 4 days
+        # counts as STALE and is named.
+        from datetime import date as _date, timedelta as _td
+        _fresh_after = _date.today() - _td(days=4)
         for i, tk in enumerate(universe, 1):
             try:
                 df = get_history(tk, interval="30m", force_refresh=True)
                 if df is not None and not df.empty:
-                    intraday_ok += 1
+                    last = df.index.max()
+                    # Freshness is judged on the bar's timestamp; a frame whose index
+                    # is not datetime-like (a stub) can only be counted as present.
+                    _last_d = last.date() if hasattr(last, "date") else None
+                    if _last_d is None or _last_d >= _fresh_after:
+                        intraday_ok += 1
+                    else:
+                        intraday_stale += 1
+                        logger.warning(f"[backfill] {tk} 30m frame is STALE (last bar {last}) — "
+                                       "the refresh returned nothing (rate limit?) and the cache stood")
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug(f"[backfill] {tk} 30m failed: {e}")
             if i % 50 == 0:
-                logger.info(f"[backfill] 30m {i}/{len(universe)} ({intraday_ok} ok)")
+                logger.info(f"[backfill] 30m {i}/{len(universe)} ({intraday_ok} fresh, {intraday_stale} stale)")
 
     logger.info(
         f"[backfill] done — daily {daily_ok}/{len(universe)}"
-        + (f", 30m {intraday_ok}/{len(universe)}" if with_30m else "")
+        + (f", 30m {intraday_ok}/{len(universe)} fresh ({intraday_stale} stale)" if with_30m else "")
     )
     return {"total": len(universe), "daily": daily_ok, "intraday": intraday_ok}
 

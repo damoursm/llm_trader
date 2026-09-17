@@ -287,8 +287,7 @@ def follow_through_panel(force: bool = False) -> dict:
             return {"daily": daily if daily is not None else pd.DataFrame(),
                     "cands": pd.DataFrame()}
         from datetime import date as _date
-        from bisect import bisect_left
-        from src.analysis.simulated_trades import _pivot_targets
+        from src.analysis.simulated_trades import _pivot_fwd_for_row
         from src.data.cache import load_ohlcv
         cands = cands.copy()
         cands["signal_date"] = cands["signal_date"].astype(str).str[:10]
@@ -301,15 +300,14 @@ def follow_through_panel(force: bool = False) -> dict:
                     c = pd.to_numeric(load_ohlcv(tk)["Close"], errors="coerce").dropna()
                     dts = [i.date() for i in c.index]
                     px = c.to_numpy(dtype=float)
-                    piv = _pivot_targets(dts, dict(zip(dts, px)), ticker=tk)
-                    series[tk] = (dts, px, piv)
+                    series[tk] = (dts, px, dict(zip(dts, px)))
                 except Exception:
                     series[tk] = None
             s = series[tk]
             if s is None:
                 h1.append(None); pv.append(None); settled.append(False)
                 continue
-            dts, px, (pdts, sp, endx) = s
+            dts, px, closes = s
             d0 = _date.fromisoformat(r.signal_date)
             try:
                 i = dts.index(d0)
@@ -320,10 +318,12 @@ def follow_through_panel(force: bool = False) -> dict:
             h1.append(round(dirn * (px[i + 1] / px[i] - 1.0) * 100.0, 3)
                       if i + 1 < len(px) and px[i] > 0 else None)
             out_pv, ok = None, False
-            if pdts:
-                pi = bisect_left(pdts, d0)
-                if pi < len(pdts) and endx[pi] >= 0:
-                    out_pv, ok = round(dirn * float(sp[pi]), 3), True
+            # The next 30-minute pivot strictly after the candidate's own tick,
+            # from its snapshot price (the session close when missing).
+            _r = _pivot_fwd_for_row(tk, d0, getattr(r, "generated_at", None),
+                                    getattr(r, "price", None), closes)
+            if _r is not None:
+                out_pv, ok = round(dirn * float(_r[0]), 3), True
             pv.append(out_pv); settled.append(ok)
         cands["h1_ret"] = h1
         cands["pivot_ret"] = pv

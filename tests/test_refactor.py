@@ -193,9 +193,11 @@ def test_auto_epoch_never_masks_a_regenerated_method(monkeypatch):
 
 # ── nightly scheduling ────────────────────────────────────────────────────────
 
-def test_nightly_rescore_fires_once_per_date_at_the_configured_time():
+def test_nightly_rescore_fires_once_per_date_at_the_configured_time(monkeypatch):
     from datetime import datetime, time
     import src.scheduler.runner as runner
+    from config.settings import settings
+    monkeypatch.setattr(settings, "enable_auto_refactor", True)   # the schedule, not the deployment's hold
 
     at = time(2, 0)
     assert not runner._should_run_nightly_rescore(datetime(2026, 7, 29, 1, 59), None, at)
@@ -206,11 +208,13 @@ def test_nightly_rescore_fires_once_per_date_at_the_configured_time():
         datetime(2026, 7, 29, 3, 30), datetime(2026, 7, 29).date(), at)
 
 
-def test_nightly_rescore_runs_on_non_market_days():
+def test_nightly_rescore_runs_on_non_market_days(monkeypatch):
     """It repairs stored history, which is just as stale on a Saturday — and a
     weekend night is the quietest window it will ever get."""
     from datetime import datetime, time
     import src.scheduler.runner as runner
+    from config.settings import settings
+    monkeypatch.setattr(settings, "enable_auto_refactor", True)
     saturday = datetime(2026, 8, 1, 2, 0)
     assert runner._should_run_nightly_rescore(saturday, None, time(2, 0))
 

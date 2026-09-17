@@ -202,6 +202,15 @@ def _panel_version() -> Optional[str]:
     return val
 
 
+def _label_key() -> str:
+    """Fingerprint of the pivot label definition in force (marks + threshold + resolution)."""
+    try:
+        from src.analysis.pivot_target import pivot_basis
+        return pivot_basis()
+    except Exception:
+        return "?"
+
+
 def reset_panel_cache() -> None:
     """Drop the memoised panels (tests / forced refresh)."""
     _PANEL_CACHE.clear()
@@ -225,7 +234,10 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
     """
     _key = None
     if signals_df is None:
-        _key = (tuple(horizons), days, dedupe, _panel_version())
+        # The label basis is part of the key (2026-09-15): a process that flips
+        # `pivot_label_basis` / `pivot_min_move_pct` between builds must not be
+        # served a panel labelled under the other definition.
+        _key = (tuple(horizons), days, dedupe, _panel_version(), _label_key())
         _hit = _PANEL_CACHE.get(_key)
         if _hit is not None:
             return _hit.copy()
@@ -364,55 +376,50 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
     for h in horizons:
         df[f"fwd_ret_{h}d"] = df.apply(lambda r: fwd(r, h), axis=1)
 
-    # PIVOT label (2026-08-12, user directive): the signed % return to the next
-    # pivot (`pivot_target.next_pivot_targets` — the ml_ohlcv-v2 training
-    # target) as `fwd_ret_pivot`, with `end_date_pivot` for walk-forward
-    # consumers (a variable-horizon label settles at its OWN end date, so
-    # "label printed" cutoffs must read the row's end, not a fixed offset).
-    # Point-in-time by TRUNCATION at the as-of cutoff: a pivot settles only if
-    # its CONFIRMING bar (pivot+1) is inside the visible window — one bar
-    # stricter than the fixed-horizon guard above, matching the label's real
-    # information timing. Unsettled rows stay NaN (never backfilled).
+    # PIVOT label: the signed % return from each row's OWN tick (time + snapshot
+    # price) to the next H/L pivot on 30-minute bars (`pivot_rows.pivot_fwd_row`
+    # — the one resolver every surface shares) as `fwd_ret_pivot`, with
+    # `end_date_pivot` (the resolving bar's ET session date) for walk-forward
+    # consumers (a variable-horizon label settles at its OWN end date, so "label
+    # printed" cutoffs must read the row's end, not a fixed offset) and
+    # `end_ts_pivot` (the bar's start, naive UTC). A pivot later the same session
+    # counts — strictly after the tick (the bar containing it is excluded).
+    # SETTLED rows only: an unresolved pivot never reaches a training label; the
+    # evaluation surfaces apply the last-close rule for the open tail themselves.
+    # Point-in-time: a pivot counts only once its CONFIRMING bar is visible under
+    # the as-of cutoff. A ticker with no 30-minute history gets NO label.
     try:
-        import numpy as _np
-
-        from src.analysis.pivot_target import next_pivot_targets
-        from src.data.cache import load_ohlcv as _load_hl
+        from src.analysis.pivot_rows import has_intraday_history, pivot_fwd_row
         pv_ret = pd.Series(float("nan"), index=df.index)
         pv_end = pd.Series(None, index=df.index, dtype=object)
+        pv_end_ts = pd.Series(None, index=df.index, dtype=object)
+        # One memoised scan per ticker for the life of the process, TRIMMED to
+        # this build's window plus warm-up — the tick cache holds a year per name.
+        _since = df["_sig_date"].min()
+        _n_lab = _n_rows = 0
+        _no_hist: list = []
+        _has_px = "price" in df.columns
         for tk, ridx in df.groupby("ticker").groups.items():
-            dts = dates_by_ticker.get(tk) or []
-            if _asof_d is not None:
-                dts = dts[:bisect_left(dts, _asof_d)]
-            if len(dts) < 50:
+            _n_rows += len(ridx)
+            if not has_intraday_history(tk, _asof_d, since=_since):
+                _no_hist.append(tk)
                 continue
-            closes = closes_by_ticker[tk]
-            c = _np.asarray([closes[d] for d in dts], dtype=float)
-            # H/L basis (2026-08-12): marks live on each bar's high/low; a
-            # missing frame degrades to closes-as-extremes rather than dropping
-            # the ticker's label.
-            harr = larr = c
-            try:
-                _f = _load_hl(tk)
-                if _f is not None and not _f.empty and "High" in _f.columns:
-                    _idx = pd.DatetimeIndex(_f.index)
-                    _hv = pd.to_numeric(_f["High"], errors="coerce").to_numpy(dtype=float)
-                    _lv = pd.to_numeric(_f["Low"], errors="coerce").to_numpy(dtype=float)
-                    _hm = {t.date(): v for t, v in zip(_idx, _hv) if v == v}
-                    _lm = {t.date(): v for t, v in zip(_idx, _lv) if v == v}
-                    harr = _np.asarray([_hm.get(d, closes[d]) for d in dts], dtype=float)
-                    larr = _np.asarray([_lm.get(d, closes[d]) for d in dts], dtype=float)
-            except Exception:
-                harr = larr = c
-            sp, end = next_pivot_targets(c, harr, larr)
-            pos = _np.searchsorted(_np.array(dts), df.loc[ridx, "_sig_date"].to_numpy())
-            ok = pos < len(dts)
-            for r, p, k in zip(ridx, pos, ok):
-                if k and end[p] >= 0:
-                    pv_ret.at[r] = float(sp[p])
-                    pv_end.at[r] = dts[int(end[p])].isoformat()
+            _closes = closes_by_ticker.get(tk) or {}
+            for r in ridx:
+                lab = pivot_fwd_row(tk, df.at[r, "generated_at"], df.at[r, "price"] if _has_px else None,
+                                    asof_day=_asof_d, fallback_close=_closes.get(df.at[r, "_sig_date"]),
+                                    since=_since)
+                if lab is None:
+                    continue                          # unsettled rows stay NaN (never backfilled)
+                pv_ret.at[r] = float(lab[0])
+                pv_end.at[r] = lab[1].isoformat()
+                pv_end_ts.at[r] = pd.Timestamp(lab[2]).isoformat()
+                _n_lab += 1
+        logger.info(f"[signal_panel] pivot label (30-min H/L): {_n_lab}/{_n_rows} rows settled; "
+                    f"{len(_no_hist)} tickers without 30-min history carry no label")
         df["fwd_ret_pivot"] = pv_ret
         df["end_date_pivot"] = pv_end
+        df["end_ts_pivot"] = pv_end_ts          # the resolving bar's start (naive UTC)
     except Exception as _e:
         logger.debug(f"[signal_panel] pivot label unavailable: {_e}")
 

@@ -1,13 +1,12 @@
-"""Probes for the LIVE (provisional) pivot target — ``live_next_pivot`` and the
-tracker's per-tick ``_update_pivot_targets``.
+"""Probes for the LIVE pivot target — ``live_next_pivot`` and the tracker's
+per-tick ``_update_pivot_targets`` — on 30-minute bars.
 
-The contract under test: for an anchor bar *i0*, the surface reports the FIRST
-pivot after *i0* — settled once its ``pivot_min_move_pct`` reversal has
-printed, PROVISIONAL until then. The provisional value is the running leg
-extreme, so it must (a) keep EXTENDING through sub-threshold wiggles — never
-freeze early, the user's explicit requirement — and (b) CONVERGE to the settled
-label at the confirming bar without a jump. The scan refactor must leave the
-resolved sequence byte-identical (``_resolved_pivots`` is the label machine).
+The contract: for an open trade anchored at its entry fill, the surface
+reports the first RESOLVED 30-minute pivot strictly after the fill (settled at
+its confirming bar), and until then a PROVISIONAL value at the FRESHEST close
+— the live mark when it is newer than the last cached bar — never the running
+leg's extreme. The scan refactor must leave the resolved sequence identical
+(``_resolved_pivots`` is the label machine).
 """
 
 from __future__ import annotations
@@ -18,12 +17,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.analysis.pivot_target import (_pivot_scan, _resolved_pivots,
-                                       live_next_pivot, next_pivot_targets)
-
-
-def _dates(n):
-    return list(pd.date_range("2024-01-02", periods=n, freq="B").date)
+from src.analysis.pivot_target import _pivot_scan, _resolved_pivots
+from tests.intraday_fixtures import sessions_30m, stub_30m
 
 
 def _hl(c, band=0.001):
@@ -51,7 +46,7 @@ def _story_series():
 
 
 PEAK_PX = 102.5 * 1.001          # the settled peak extreme (bar 85's high)
-I0 = 65                          # anchor inside the up leg
+IDX = sessions_30m("2026-08-03", 8)      # 104 bar starts; the story uses the first 100
 
 
 # ── the scan refactor must not move the resolved sequence ────────────────────
@@ -60,171 +55,96 @@ def test_scan_and_resolved_pivots_agree():
     c, h, lo = _story_series()
     (P, PP, FL, CF), pending = _pivot_scan(c, h, lo)
     P2, PP2, FL2, CF2 = _resolved_pivots(c, h, lo)
-    assert np.array_equal(P, P2) and np.array_equal(PP, PP2)
-    assert np.array_equal(FL, FL2) and np.array_equal(CF, CF2)
-    # full story: peak@0 (flat-prefix high), trough@58, peak@85 — down leg pending
-    assert list(P) == [0, 58, 85]
-    assert pending is not None and pending[2] is False        # pending trough
-    assert pending[0] == 99                                    # running low @ last bar
-
-
-# ── provisional semantics ────────────────────────────────────────────────────
-
-def test_provisional_survives_subthreshold_wiggle():
-    """Post-wiggle truncation: the candidate peak must still be the pre-wiggle
-    high — extended, not frozen or confirmed, by a sub-1% pullback."""
-    c, h, lo = _story_series()
-    n = 83                                        # bars 0..82 (wiggle included)
-    piv = live_next_pivot(c[:n], h[:n], lo[:n], I0)
-    assert piv is not None and piv["resolved"] is False
-    assert piv["is_peak"] is True
-    assert piv["idx"] == 79
-    assert piv["price"] == pytest.approx(101.0 * 1.001)
-
-
-def test_provisional_is_monotone_and_converges_at_confirmation():
-    """The up-leg provisional target never decreases across truncations, and
-    the settled value at the confirming bar equals the last provisional —
-    convergence without a jump."""
-    c, h, lo = _story_series()
-    last = -np.inf
-    for n in range(67, 87):                       # provisional throughout
-        piv = live_next_pivot(c[:n], h[:n], lo[:n], I0)
-        assert piv is not None and piv["resolved"] is False, f"n={n}"
-        assert piv["price"] >= last - 1e-12, f"n={n}"
-        last = piv["price"]
-    assert last == pytest.approx(PEAK_PX)
-    piv = live_next_pivot(c[:87], h[:87], lo[:87], I0)    # bar 86 = confirming bar
-    assert piv["resolved"] is True
-    assert piv["idx"] == 85 and piv["confirm_idx"] == 86
-    assert piv["price"] == pytest.approx(last)             # no jump at resolution
-
-
-def test_resolved_matches_next_pivot_targets():
-    c, h, lo = _story_series()
-    piv = live_next_pivot(c, h, lo, I0)
-    assert piv["resolved"] is True
-    sp, end = next_pivot_targets(c, h, lo)
-    assert end[I0] == piv["idx"] == 85
-    assert sp[I0] == pytest.approx((piv["price"] / c[I0] - 1.0) * 100.0)
-
-
-def test_anchor_past_running_extreme_walks_to_next_leg():
-    """Anchor AT the leg extreme: the first pivot after it belongs to the NEXT
-    leg — the running trough candidate, under the as-if-the-leg-stands view."""
-    c, h, lo = _story_series()
-    piv = live_next_pivot(c, h, lo, 85)
-    assert piv is not None and piv["resolved"] is False and piv["seed"] is False
-    assert piv["is_peak"] is False                         # next leg: trough candidate
-    assert piv["idx"] == 99
-    assert piv["price"] == pytest.approx(c[99] * 0.999)
-
-
-def test_anchor_on_newest_session_returns_leg_continuation_seed():
-    """No completed bar after the anchor yet (an entry on the newest session,
-    e.g. Sunday overnight): the pending candidate is returned as a SEED rather
-    than nothing — superseded once the next completed bar lands."""
-    c, h, lo = _story_series()
-    piv = live_next_pivot(c[:86], h[:86], lo[:86], 85)    # pending peak IS bar 85
-    assert piv is not None and piv["seed"] is True
-    assert piv["resolved"] is False
-    assert piv["is_peak"] is True
-    assert piv["idx"] == 85 and piv["price"] == pytest.approx(PEAK_PX)
-    # anchor past the extreme with nothing after it: the walk alternates
-    # (peak@79 stands → wiggle trough@80 stands → running up-candidate @82)
-    # and seeds at the freshest candidate it reached
-    piv2 = live_next_pivot(c[:83], h[:83], lo[:83], 82)   # wiggle bars after peak@79
-    assert piv2 is not None and piv2["seed"] is True
-    assert piv2["is_peak"] is True
-    assert piv2["idx"] == 82
-    assert piv2["price"] == pytest.approx(100.8 * 1.001)
-
-
-def test_no_training_cap_on_resolved_targets():
-    """``next_pivot_targets`` excludes pivots > MAX_PIVOT_DAYS out (a training
-    hygiene rule); the monitoring surface deliberately reports them."""
-    c = np.r_[np.linspace(10, 30, 100), np.linspace(29.9, 20, 20)]
-    c, h, lo = _hl(c, band=0.01)
-    sp, _end = next_pivot_targets(c, h, lo)
-    assert np.isnan(sp[5])                                 # capped out of training
-    piv = live_next_pivot(c, h, lo, 5)
-    assert piv is not None and piv["resolved"] is True
-    assert piv["idx"] == 99
-
-
-def test_short_window_returns_none():
-    c, h, lo = _story_series()
-    assert live_next_pivot(c[:49], h[:49], lo[:49], 10) is None
+    assert list(P) == list(P2) and list(PP) == list(PP2)
+    assert list(FL) == list(FL2) and list(CF) == list(CF2)
+    # the flat opening seeds a peak at bar 0 (confirmed by the fall at 50), then the
+    # trough @58 (confirmed 59) and the peak @85 (confirmed by the crash @86)
+    assert [int(x) for x in P] == [0, 58, 85] and [bool(x) for x in FL] == [True, False, True]
+    assert [int(x) for x in CF] == [50, 59, 86]
+    assert pending is not None and pending[2] is False     # a down leg is pending
 
 
 # ── tracker integration ──────────────────────────────────────────────────────
 
-def _fake_series(c, h, lo, n=None):
+def _series(n=None):
+    c, h, lo = _story_series()
     n = len(c) if n is None else n
-    d = _dates(len(c))[:n]
-    return d, c[:n], h[:n], lo[:n]
+    return IDX[:n], c[:n], h[:n], lo[:n]
 
 
-def _open_trade(dates, entry_bar, entry_px, cur_px, action="BUY"):
+def _open_trade(entry_bar, entry_px, cur_px, action="BUY"):
+    """An open trade whose fill lands one minute INTO bar ``entry_bar`` — so the
+    first eligible bar is ``entry_bar + 1``."""
     return {
         "ticker": "TEST", "status": "OPEN", "action": action,
-        "entry_date": dates[entry_bar].isoformat(),
+        "entry_datetime": (IDX[entry_bar] + pd.Timedelta(minutes=1)).isoformat(),
+        "entry_date": IDX[entry_bar].date().isoformat(),
         "entry_price": entry_px, "current_price": cur_px,
     }
 
 
 def test_update_pivot_targets_resolved_long(monkeypatch):
     from src.performance import tracker
-    c, h, lo = _story_series()
-    d = _dates(len(c))
-    monkeypatch.setattr("src.analysis.pivot_target._series",
-                        lambda tk: _fake_series(c, h, lo))
-    t = _open_trade(d, 66, 95.0, 100.0)          # anchor bar = 65
+    stub_30m(monkeypatch, {"TEST": _series()})
+    t = _open_trade(65, 95.0, 100.0)
     tracker._update_pivot_targets([t])
-    assert t["pivot_resolved"] is True
+    assert t["pivot_resolved"] is True and t["pivot_is_peak"] is True
     assert t["pivot_target_price"] == pytest.approx(PEAK_PX, abs=1e-3)
-    assert t["pivot_target_date"] == d[85].isoformat()
-    assert t["pivot_confirmed_date"] == d[86].isoformat()
+    assert t["pivot_target_ts"] == IDX[85].isoformat()
+    assert t["pivot_target_date"] == IDX[85].date().isoformat()          # EDT: bar date == session date
+    assert t["pivot_confirmed_date"] == IDX[86].date().isoformat()
     assert t["pivot_target_pct"] == pytest.approx((PEAK_PX / 95.0 - 1) * 100, abs=1e-2)
-    assert t["pivot_capture_pct"] == pytest.approx(
-        (100.0 - 95.0) / (PEAK_PX - 95.0) * 100, abs=0.1)
+    assert t["pivot_capture_pct"] == pytest.approx((100.0 - 95.0) / (PEAK_PX - 95.0) * 100, abs=0.1)
 
 
-def test_update_pivot_targets_live_extension(monkeypatch):
-    """Provisional peak + a live mark above the completed-bars extreme: the
-    target extends to the mark (dated today) — but only extends, never resolves."""
+def test_update_pivot_targets_provisional_at_last_close_and_live_mark(monkeypatch):
+    """Pre-confirmation (series cut before bar 86): the target is the LAST
+    CLOSE (bar 85's close), never the running extreme; a live mark replaces
+    it — whichever way it points — but never resolves it."""
     from src.performance import tracker
-    c, h, lo = _story_series()
-    d = _dates(len(c))
-    monkeypatch.setattr("src.analysis.pivot_target._series",
-                        lambda tk: _fake_series(c, h, lo, n=86))   # pre-confirmation
-    t = _open_trade(d, 66, 95.0, 103.5)          # mark above 102.6 extreme
+    stub_30m(monkeypatch, {"TEST": _series(n=86)})
+    t = _open_trade(65, 95.0, 103.5)
     tracker._update_pivot_targets([t])
-    assert t["pivot_resolved"] is False
+    assert t["pivot_resolved"] is False and t["pivot_target_ts"] is None
     assert t["pivot_target_price"] == pytest.approx(103.5)
     assert t["pivot_target_date"] == date.today().isoformat()
-    t2 = _open_trade(d, 66, 95.0, 101.0)         # mark below the extreme: no extension
+    t2 = _open_trade(65, 95.0, None)
     tracker._update_pivot_targets([t2])
-    assert t2["pivot_target_price"] == pytest.approx(PEAK_PX, abs=1e-3)
-    assert t2["pivot_target_date"] == d[85].isoformat()
+    assert t2["pivot_resolved"] is False
+    assert t2["pivot_target_price"] == pytest.approx(102.5)              # the last close, not 102.6 (the high)
 
 
 def test_update_pivot_targets_provisional_short(monkeypatch):
-    """A SELL riding the pending down leg: target below entry (negative pct),
-    capture positive as price falls toward it; a mark ABOVE the running low
-    must not shrink the trough candidate."""
+    """A SELL riding the pending down leg: no resolved pivot after the fill, so
+    the target is the last close (below entry → negative pct), capture positive
+    as price falls toward it."""
     from src.performance import tracker
-    c, h, lo = _story_series()
-    d = _dates(len(c))
-    monkeypatch.setattr("src.analysis.pivot_target._series",
-                        lambda tk: _fake_series(c, h, lo))
-    t = _open_trade(d, 90, 98.0, 97.0, action="SELL")   # anchor 89, pending trough @99
+    stub_30m(monkeypatch, {"TEST": _series()})
+    t = _open_trade(89, 98.0, 97.0, action="SELL")
     tracker._update_pivot_targets([t])
-    trough = c[99] * 0.999
-    assert t["pivot_resolved"] is False
-    assert t["pivot_is_peak"] is False
-    assert t["pivot_target_price"] == pytest.approx(trough, abs=1e-3)
-    assert t["pivot_target_pct"] == pytest.approx((trough / 98.0 - 1) * 100, abs=1e-2)
-    assert t["pivot_capture_pct"] == pytest.approx(
-        (97.0 - 98.0) / (trough - 98.0) * 100, abs=0.1)
-    assert t["pivot_capture_pct"] > 0
+    last_close = 98.8 - 0.2 * 12
+    assert t["pivot_resolved"] is False and t["pivot_is_peak"] is False
+    assert t["pivot_target_price"] == pytest.approx(97.0)                # the live mark stands in
+    t2 = _open_trade(89, 98.0, None, action="SELL")
+    tracker._update_pivot_targets([t2])
+    assert t2["pivot_target_price"] == pytest.approx(last_close, abs=1e-6)
+    assert t2["pivot_target_pct"] == pytest.approx((last_close / 98.0 - 1) * 100, abs=1e-2)
+
+
+def test_update_pivot_targets_date_only_entry_anchors_at_the_open(monkeypatch):
+    """A legacy trade with no entry timestamp anchors at its session's 09:30 ET
+    open, so the entry session's own swing can be the target."""
+    from src.performance import tracker
+    stub_30m(monkeypatch, {"TEST": _series()})
+    t = {"ticker": "TEST", "status": "OPEN", "action": "BUY",
+         "entry_date": IDX[6 * 13].date().isoformat(), "entry_price": 95.0, "current_price": 100.0}
+    tracker._update_pivot_targets([t])
+    assert t["pivot_resolved"] is True and t["pivot_target_ts"] == IDX[85].isoformat()
+
+
+def test_no_30m_history_leaves_the_trade_untouched(monkeypatch):
+    from src.performance import tracker
+    stub_30m(monkeypatch, {})
+    t = _open_trade(65, 95.0, 100.0)
+    tracker._update_pivot_targets([t])
+    assert "pivot_target_price" not in t

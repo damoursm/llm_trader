@@ -192,7 +192,7 @@ def validate_pivot_on_panel(deep_parquet: str, step_days: int = 5,
     never mislabelled. Returns per-row OOS predictions with the realised pivot
     return, the rel-5d return (basis sanity check), and the Gate-4 columns.
     """
-    from src.analysis.pivot_target import (LEG_FEATURES, pivot_frame,
+    from src.analysis.pivot_target import (LEG_FEATURES, pivot_label_frame,
                                            within_day_rank)
     from src.analysis.ml_train import LightGBMRankRegressor
 
@@ -206,7 +206,7 @@ def validate_pivot_on_panel(deep_parquet: str, step_days: int = 5,
         return pd.DataFrame()
 
     tickers = sorted(set(deep["ticker"]) | set(panel["ticker"]))
-    pf = pivot_frame(tickers)
+    pf = pivot_label_frame(tickers)
     if pf.empty:
         return pd.DataFrame()
 

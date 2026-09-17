@@ -1743,6 +1743,15 @@ class Settings(BaseSettings):
     enable_intraday_30m: bool = True       # fetch + score the 30-min candle (Massive/Polygon → yfinance)
     enable_weekly_signals: bool = True     # resample the daily cache → weekly candle (free, no fetch)
     intraday_30m_lookback_days: int = 120  # 30-min history depth per Massive/Polygon fetch
+    # Depth CAP on the 30-minute cache frames (2026-09-15): every tick-path consumer
+    # (multi-timeframe scoring, the intraday fixed horizons in simulated_trades, the
+    # pivot label's trimmed scan) needs at most ~a year; uncapped, the single-source
+    # rebuild of 2026-09-14 (2021->today, ~18k bars/name, 2.9 GB of JSON) made every
+    # tick re-parse ~3,400 multi-MB frames, thrash ohlcv_parse_cache_mb and run
+    # 30+ minutes into the watchdog. 260 sessions x 13 bars. Applied at SAVE time in
+    # cache.save_ohlcv for every non-daily interval; the deep history for research
+    # lives in cache/ml/bars30m_deep, never in the tick cache.
+    intraday_30m_max_bars: int = 3380
     # Strategy blend weights across timeframes (renormalised at runtime over the
     # timeframes that actually produced a score for a given ticker). Daily-dominant
     # by default; set tf_blend_1d=1.0 to revert to daily-only without flipping the flag.
@@ -1865,7 +1874,12 @@ class Settings(BaseSettings):
     # 400 MB bound (~1,000 frames) thrashed against a ~3,400-ticker universe x
     # multiple consumers — measured as 10-24 min ticks. ~1200 MB keeps the whole
     # active universe's parsed frames resident.
-    ohlcv_parse_cache_mb: int = 1200
+    # 1200 → 3072 on 2026-09-14: the 30-minute store now holds years per name
+    # (~0.9 MB parsed each, ~3,000 names ≈ 2.7 GB) for the intraday pivot label;
+    # at 1200 MB every panel build re-parsed the lot (measured: a dashboard warm
+    # that took 968 s ran for hours). One cache per process — scheduler,
+    # dashboard and its warm child each hold their own.
+    ohlcv_parse_cache_mb: int = 3072
     # Per-ticker scoring concurrency. The build_signals loop is I/O-bound (DeepSeek
     # sentiment ~7s/ticker + Massive/OHLCV reads), so a bounded thread pool collapses
     # the serial sum to ~max wall-time with IDENTICAL scores. 1 = sequential (legacy).
@@ -2578,13 +2592,22 @@ class Settings(BaseSettings):
     # WHICH models the weekly job trains (names kept for .env compatibility).
     ml_retrain_weekday: int = 5
     ml_retrain_time: str = "08:00"
-    # Minimum pivot swing (2026-08-12, user directive): a reversal only
-    # CONFIRMS once price retraces this % from the running extreme, so legs
-    # smaller than the round-trip cost never become pivots ("not worth buying
-    # and selling weak price runs"). Changing it changes what every pivot
-    # label MEANS — the ml_ohlcv artifact basis string encodes it, so a
-    # threshold change makes stale artifacts abstain until retrained.
+    # The confirmation threshold (%) of the pivot zigzag — the LABEL (the next
+    # H/L pivot on 30-MINUTE bars from each row's own tick, the only label since
+    # 2026-09-16) and the daily leg-state FEATURES alike: a reversal only
+    # CONFIRMS once price retraces this % from the running extreme, so smaller
+    # swings never become pivots ("not worth buying and selling weak price runs",
+    # 2026-08-12). Raising it FILTERS pivots (the user's stated remedy for too
+    # many); measured 2026-09-15: at 1% the 30-minute label's median move is
+    # ~1.3%, at 2-2.5% it matches the old daily label's swing. Part of the basis
+    # fingerprint (`pivot_target.pivot_basis`, e.g. hl1@30m), so a change makes
+    # every stale artifact abstain until retrained.
     pivot_min_move_pct: float = 1.0
+    # Where the pivot MARKS live (2026-09-15): "hl" = swing highs on the bar's
+    # HIGH and lows on its LOW (the user's choice, 2026-09-16); "close" = both
+    # on the bar's CLOSE (a price the scheduler's own 30-minute tick could trade
+    # - the measured alternative). Part of the basis fingerprint.
+    pivot_label_basis: str = "hl"
     # Stacker training label (2026-08-12): "pivot_rank" = within-day rank of
     # the signed pivot target (fails soft to the fixed rank_5d label while the
     # panel's settled-pivot rows are thin); "rank_5d" pins the legacy label.

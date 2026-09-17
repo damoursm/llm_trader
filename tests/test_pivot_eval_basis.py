@@ -4,8 +4,9 @@ Pivot metrics drive every DECISION evaluation (weights, filter, inversion,
 states, ML labels); fixed horizons stay for monitoring, holding periods and
 exits. These tests pin the four load-bearing properties:
 
-  1. PARITY — the evaluation-side label (`next_pivot_targets`) is the training
-     target (`pivot_frame.sp_buy`) to the digit, on the same series.
+  1. PARITY — the trainer's label (`session_close_labels`, date-only rows at
+     the session close) is the per-row resolver's (`pivot_rows.pivot_fwd_row`)
+     to the digit, on the same 30-minute series.
   2. POINT-IN-TIME — a pivot label exists only once its CONFIRMING bar is
      inside the visible window; under an as-of cutoff the observation drops
      out entirely (never a peeked value).
@@ -28,41 +29,49 @@ import pytest
 from config.settings import settings
 
 
-# ── 1. parity: eval label == training target ────────────────────────────────
+# ── 1. parity: the training label == the per-row label on the same series ──
 
 def _wavy_closes(n=80, seed=7):
     rng = np.random.default_rng(seed)
     return 100.0 + np.cumsum(rng.normal(0, 1.0, n))
 
 
-def test_next_pivot_targets_matches_training_sp_buy(monkeypatch):
+def test_training_label_matches_the_row_resolver(monkeypatch):
+    """`session_close_labels` (the ml_ohlcv trainer's label, date-only rows
+    anchored at the session close) and `pivot_rows.pivot_fwd_row` (the panel's
+    per-row resolver on a date-only row) must agree to the digit."""
     import src.analysis.pivot_target as pt
+    from src.analysis import pivot_rows as pr
+    from tests.intraday_fixtures import replica_30m, stub_30m
 
     c = _wavy_closes()
-    n = len(c)
-    dates = [date(2026, 1, 1) + timedelta(days=i) for i in range(n)]
-    sp, end = pt.next_pivot_targets(c, c * 1.01, c * 0.99)
-
-    rows = pt._leg_target_rows(c, c * 1.01, c * 0.99, dates)
-    assert rows, "training pass produced no rows"
-    by_date = {r["signal_date"]: r for r in rows}
+    dates = [date(2026, 1, 5) + timedelta(days=i) for i in range(len(c))]
+    dates = [d for d in dates if d.weekday() < 5][:60]
+    c = c[:len(dates)]
+    idx, cc, hh, ll = replica_30m(dates, c)
+    sp, end = pt.session_close_labels(idx, cc, hh, ll, dates, c)
+    stub_30m(monkeypatch, {"STK": (idx, cc, hh, ll)})
     checked = 0
-    for i in range(n):
-        r = by_date.get(dates[i].isoformat())
-        if r is None or "sp_buy" not in r:
+    for i, d in enumerate(dates):
+        r = pr.pivot_fwd_row("STK", d, None, fallback_close=float(c[i]))
+        if not (sp[i] == sp[i]):
+            assert r is None, f"{d}: resolver settled a row the trainer did not"
             continue
-        assert sp[i] == pytest.approx(r["sp_buy"]), f"bar {i} diverges"
-        assert dates[end[i]].isoformat() == r["sp_end"]
+        assert r is not None, f"{d}: trainer settled a row the resolver did not"
+        assert r[0] == pytest.approx(sp[i]) and r[1].isoformat() == end[i]
         checked += 1
-    assert checked >= 40, "parity checked on too few settled bars"
+    assert checked >= 20, "parity checked on too few settled rows"
 
 
 def test_unsettled_rows_carry_no_target():
-    from src.analysis.pivot_target import next_pivot_targets
+    from src.analysis.pivot_target import session_close_labels
+    from tests.intraday_fixtures import replica_30m
 
-    c = np.linspace(100.0, 160.0, 60)          # monotone: no pivot ever prints
-    sp, end = next_pivot_targets(c, c * 1.01, c * 0.99)
-    assert np.isnan(sp).all() and (end == -1).all()
+    dates = [date(2026, 1, 5) + timedelta(days=i) for i in range(70)]
+    dates = [d for d in dates if d.weekday() < 5]
+    c = np.linspace(100.0, 160.0, len(dates))          # monotone: no pivot ever prints
+    sp, end = session_close_labels(*replica_30m(dates, c), dates, c)
+    assert np.isnan(sp).all() and all(e is None for e in end)
 
 
 # ── 2. point-in-time: as-of drops unconfirmed pivots ────────────────────────
@@ -71,30 +80,28 @@ def _pivot_series():
     """Closes with a clean trough at index 52 (confirmed by bar 53)."""
     c = list(np.linspace(100.0, 120.0, 50))                       # 0..49 up
     c += [118.0, 115.0, 110.0, 116.0, 121.0]                      # 50..54: trough @52
-    dates = [date(2026, 6, 2) + timedelta(days=i) for i in range(len(c))]
+    dates = [date(2026, 6, 1) + timedelta(days=i) for i in range(80)]
+    dates = [d for d in dates if d.weekday() < 5][:len(c)]
     closes = {d: float(v) for d, v in zip(dates, c)}
     return dates, closes
 
 
 def test_pivot_observation_needs_the_confirming_bar(monkeypatch):
-    import src.analysis.simulated_trades as st
+    from src.analysis import pivot_rows as pr
+    from tests.intraday_fixtures import replica_30m, stub_30m
 
     dates, closes = _pivot_series()
+    stub_30m(monkeypatch, {"STK": replica_30m(dates, closes)})
     # Full visibility: the row on the way down (idx 51) settles at the trough (52).
-    full_dates, sp, end = st._pivot_targets(dates, closes)
-    i = 51
-    assert end[i] == 52
-    assert sp[i] == pytest.approx((closes[dates[52]] / closes[dates[51]] - 1) * 100)
-
-    # As-of the day OF the confirming bar (53): series truncates to < cutoff, so
-    # the trough at 52 has no bar 53 inside the window -> unsettled -> no label.
-    from src.analysis.asof import analysis_asof
-    with analysis_asof(dates[53].isoformat()):
-        st._ASOF_DATE_CACHE = None
-        cut_dates, sp2, end2 = st._pivot_targets(dates, closes)
-        assert len(cut_dates) == 53                # bars 0..52 visible
-        assert end2[51] == -1 and np.isnan(sp2[51])
-    st._ASOF_DATE_CACHE = None
+    r = pr.pivot_fwd_row("STK", dates[51], None, fallback_close=closes[dates[51]])
+    assert r is not None and r[1] == dates[52]
+    assert r[0] == pytest.approx((closes[dates[52]] / closes[dates[51]] - 1) * 100)
+    # As-of the day OF the confirming bar (53): only earlier sessions are visible,
+    # so the trough at 52 has no confirming bar inside the window -> no label.
+    assert pr.pivot_fwd_row("STK", dates[51], None, fallback_close=closes[dates[51]],
+                            asof_day=dates[53]) is None
+    assert pr.pivot_fwd_row("STK", dates[51], None, fallback_close=closes[dates[51]],
+                            asof_day=dates[54]) is not None
 
 
 def test_fwd_daily_respects_the_asof_cutoff(monkeypatch):
@@ -115,11 +122,15 @@ def test_fwd_daily_respects_the_asof_cutoff(monkeypatch):
 def test_directional_perf_emits_pivot_columns(monkeypatch):
     import src.analysis.simulated_trades as st
 
+    from src.analysis.pivot_target import session_close_utc
+    from tests.intraday_fixtures import replica_30m, stub_30m
+
     dates, closes = _pivot_series()
     monkeypatch.setattr(st, "_daily_series", lambda tk: (dates, closes))
     monkeypatch.setattr(st, "_intraday_series", lambda tk: [])
+    stub_30m(monkeypatch, {"STK": replica_30m(dates, closes), "SPY": replica_30m(dates, closes)})
     sim = pd.DataFrame([
-        {"generated_at": "t1", "signal_date": dates[50].isoformat(),
+        {"generated_at": session_close_utc(dates[50]).isoformat(), "signal_date": dates[50].isoformat(),
          "ticker": "STK", "method": "tech", "score": 0.5, "direction": "BUY"},
     ])
     perf = st.compute_directional_perf(sim_df=sim, min_n=1)

@@ -279,6 +279,18 @@ def save_ohlcv(ticker: str, df: "pd.DataFrame", interval: str = "1d") -> None:
     complete document either way.
     """
     import threading
+    if interval != "1d":
+        # INTRADAY DEPTH CAP (2026-09-15): the tick cache keeps the newest
+        # `intraday_30m_max_bars` bars only. The cache accumulates through
+        # `_merge_intraday`, and an unbounded frame (18k bars/name after the
+        # 09-14 rebuild) turned every consumer's parse into minutes per tick.
+        try:
+            from config.settings import settings
+            _cap = int(getattr(settings, "intraday_30m_max_bars", 0) or 0)
+        except Exception:
+            _cap = 0
+        if _cap and len(df) > _cap:
+            df = df.sort_index().iloc[-_cap:]
     _ohlcv_dir(interval).mkdir(parents=True, exist_ok=True)
     path = _ohlcv_path(ticker, interval)
     tmp = path.with_name(f"{path.name}.tmp{threading.get_ident()}")

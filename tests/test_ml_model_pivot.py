@@ -99,9 +99,9 @@ def test_v2_direction_tracks_the_planted_signal(pivot_artifact, monkeypatch):
 
 
 def test_v2_stale_pivot_basis_abstains(pivot_artifact, monkeypatch):
-    """An artifact trained on the RETIRED close basis (no/old pivot_basis in
-    its config) must ABSTAIN — its leg features no longer mean what it learned.
-    The 2026-08-12 H/L refactor guard: degraded, never wrong."""
+    """An artifact with no/old pivot_basis in its config (the retired daily
+    label, or the older close-era one) must ABSTAIN — it was fitted to a target
+    that no longer exists here. Degraded, never wrong."""
     import pickle
 
     from src.signals import ml_model

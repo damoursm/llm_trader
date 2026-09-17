@@ -90,17 +90,20 @@ def _per_trade(t: dict, horizons: Sequence[int]) -> Optional[dict]:
         else:
             fwd[h] = None
     # The pivot pseudo-horizon (2026-08-13 standardization): the oriented move
-    # from the exit-day close to the NEXT H/L pivot extreme — the remaining leg
-    # the exit walked away from, on the decision basis. None until it settles.
+    # from the exit fill to the NEXT H/L pivot extreme on 30-minute bars — the
+    # remaining leg the exit walked away from, on the decision basis. None until
+    # it settles.
     fwd_pv = None
     try:
-        from src.analysis.simulated_trades import _pivot_targets
-        from bisect import bisect_left as _bl
-        pdts, sp, endx = _pivot_targets(dates, closes, ticker=str(t.get("ticker") or ""))
-        if pdts:
-            pi = _bl(pdts, exit_d)
-            if pi < len(pdts) and endx[pi] >= 0:
-                fwd_pv = round(sign * float(sp[pi]), 3)
+        from src.analysis.pivot_rows import pivot_fwd_row
+        # The next 30-minute pivot strictly after the EXIT TICK, from the exit
+        # fill — the remaining leg the exit walked away from, at the resolution
+        # the decision was made at. A date-only legacy row anchors at that
+        # session's close.
+        _when = t.get("exit_datetime") or exit_d
+        _r = pivot_fwd_row(str(t.get("ticker") or ""), _when, exit_price,
+                           fallback_close=closes.get(exit_d))
+        fwd_pv = round(sign * float(_r[0]), 3) if _r is not None else None
     except Exception:
         fwd_pv = None
     return {

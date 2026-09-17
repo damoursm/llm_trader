@@ -173,12 +173,25 @@ def main(argv=None) -> int:
         print("ONE-DAY pivot-IC read - a SANITY CHECK, not a verdict (n=1 day, no t).")
         print("Skill needs many days of panel rows; see .claude/skills/evaluate.")
         try:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".claude/skills/evaluate"))
-            from live_labels import label_frame
+            from datetime import date as _date
+            from src.analysis.pivot_target import _series, next_pivot_targets, session_close_utc
             from src.db import repo
             repo.set_read_only(True)
-            day = repo.fetch_df("SELECT MAX(signal_date) d FROM signals").iloc[0]["d"]
-            lab = label_frame(sorted(r["ticker"] for r in rows))
+            day = str(repo.fetch_df("SELECT MAX(signal_date) d FROM signals").iloc[0]["d"])[:10]
+            # the next 30-minute H/L pivot after that session's close, from its close
+            lab = {}
+            for _tk in sorted(set(r["ticker"] for r in rows)):
+                _s = _series(_tk)
+                if _s is None:
+                    continue
+                _idx, _c, _h, _l = _s
+                try:
+                    _i = list(_idx).index(_date.fromisoformat(day))
+                except ValueError:
+                    continue
+                _r = next_pivot_targets(_tk, [(session_close_utc(day), float(_c[_i]))])[0]
+                if _r is not None:
+                    lab[(_tk, day)] = (float(_r["target_pct"]), bool(_r["resolved"]))
             ys, keep = [], []
             for r in rows:
                 y, settled = lab.get((r["ticker"], day), (float("nan"), False))

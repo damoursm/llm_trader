@@ -33,7 +33,7 @@ import pandas as pd
 
 from src.analysis.signal_panel import _spearman, periodic_ic_stats
 from src.analysis.simulated_trades import (HORIZONS, HORIZON_LABELS, PIVOT_LABEL,
-                                           resolve_horizons, _pivot_targets,
+                                           resolve_horizons,
                                            _daily_series, _fwd_daily,
                                            _intraday_series, _fwd_intraday)
 from src.analysis.exit_methods import exit_category_for
@@ -122,7 +122,7 @@ def _accumulate(df: pd.DataFrame, hz=HORIZONS) -> Dict[str, Dict[str, dict]]:
     ts_ns: Dict[str, Optional[int]] = {}
     daily_fwd: dict = {}
     intra_fwd: dict = {}
-    pv_by_tk: dict = {}
+
     pv_fwd: dict = {}
 
     for row in df.itertuples(index=False):
@@ -132,18 +132,13 @@ def _accumulate(df: pd.DataFrame, hz=HORIZONS) -> Dict[str, Dict[str, dict]]:
         # The pivot pseudo-horizon (2026-08-13 standardization): the signed move
         # to the ticker's next H/L pivot from this held day, oriented by the
         # position's direction — "was HOLDING right, judged on the decision basis".
-        pk = (tk, sigd)
+        pk = (tk, sigd, ts)
         if pk not in pv_fwd:
-            if tk not in pv_by_tk:
-                pv_by_tk[tk] = _pivot_targets(dates, closes, ticker=tk)
-            _pdts, _sp, _endx = pv_by_tk[tk]
-            _out = None
-            if _pdts:
-                from bisect import bisect_left as _bl
-                _pi = _bl(_pdts, sigd)
-                if _pi < len(_pdts) and _endx[_pi] >= 0:
-                    _out = float(_sp[_pi])
-            pv_fwd[pk] = _out
+            # The next 30-minute pivot strictly after THIS row's tick, from the
+            # row's own price (the session close when that is missing).
+            from src.analysis.simulated_trades import _pivot_fwd_for_row
+            _r = _pivot_fwd_for_row(tk, sigd, ts, getattr(row, "entry_price", None), closes)
+            pv_fwd[pk] = _r[0] if _r is not None else None
         if pv_fwd[pk] is not None:
             cell = acc[method][PIVOT_LABEL]
             cell["s"].append(sc)

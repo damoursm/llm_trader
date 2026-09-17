@@ -137,7 +137,19 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # (BASIS_STALE), so between this instant and the retrain landing the
     # method scores nothing rather than something wrong. Supersedes the
     # 2026-08-08 v1→v2 entry (any pre-hl1 row is already pre-this-epoch).
-    "ml_ohlcv": datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc),
+    # 2026-09-17 00:40 UTC (restart deploying the label decommission; the instant
+    # sits between the last run scored by the daily-labelled artifact, the 20:30
+    # ET overnight tick at 00:30:07Z, and the first run scored by the retrained
+    # one — the restarted scheduler's CATCH-UP tick for the same slot, which
+    # stamped 00:43:19Z, 13 minutes after the old run; placed by the runs): the
+    # LABEL moved from the daily H/L pivot to the next H/L pivot on 30-MINUTE
+    # bars (user directive, 2026-09-16) and ml_ohlcv was retrained onto it
+    # (basis `hl1@30m`, 3.8M rows from 2021). Same features, same score
+    # convention, but a rank on a different target — the retrained model's
+    # per-day rank correlation with the old one is 0.69, so stored scores
+    # across this instant are different quantities. Serving's basis guard
+    # again covers the gap: a daily-stamped artifact ABSTAINS (BASIS_STALE).
+    "ml_ohlcv": datetime(2026, 9, 17, 0, 40, tzinfo=timezone.utc),
     # 2026-08-10 16:20 UTC (scheduler restart; the instant sits between the last
     # v1 run 16:00:14 and the first v2 run 16:38:50 — the restarted scheduler's
     # misfire-grace catch-up tick stamped 16:38:50, EARLIER than the restart

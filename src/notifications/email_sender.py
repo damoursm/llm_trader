@@ -379,7 +379,7 @@ HTML_TEMPLATE = """
         {% if t.pivot_target_price is defined and t.pivot_target_price %}
           <span style="font-family:monospace;font-size:12px;">${{ fmt_price_full(t.pivot_target_price) }}</span>
           <span class="{{ 'pos' if t.pivot_target_pct|default(0) > 0 else 'neg' }}">({{ "%+.1f"|format(t.pivot_target_pct|default(0)) }}%)</span>
-          <br><span style="color:#64748b;font-size:10px;" title="H/L pivot target: the next swing extreme on the pivot_min_move_pct zigzag; provisional targets keep extending until the reversal confirms">
+          <br><span style="color:#64748b;font-size:10px;" title="H/L pivot target: the first swing extreme on 30-minute bars strictly AFTER the entry fill (pivot_min_move_pct zigzag) — it may land later the entry session; while unresolved the target is the freshest close, never the running extreme">
             {{ 'resolved' if t.pivot_resolved|default(false) else 'provisional' }}{% if t.pivot_capture_pct is defined and t.pivot_capture_pct is not none %} &middot; {{ "%.0f"|format(t.pivot_capture_pct) }}% captured{% endif %}
           </span>
         {% else %}<span style="color:#475569;">&mdash;</span>{% endif %}
