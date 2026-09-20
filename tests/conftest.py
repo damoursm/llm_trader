@@ -93,6 +93,15 @@ def _no_shadow_sentiment(monkeypatch):
     monkeypatch.setattr(settings, "enable_passing_mention_abstention", False,
                         raising=False)
     monkeypatch.setattr(settings, "enable_sentiment_shadow", False)
+    # HOSTED ENGINES ON for the suite (2026-09-18). Production runs LOCAL-ONLY
+    # (`ENABLE_HOSTED_SENTIMENT_ENGINES=false` in .env) because both hosted
+    # accounts are unfunded, but the multi-engine machinery — try-order, pins,
+    # per-call fallback, provider attribution — is KEPT and revivable the moment
+    # one is re-funded, so the suite keeps exercising it. The revivable-dead-
+    # branch convention, same as the decommissioned prompt arms. The tests that
+    # assert LOCAL-ONLY behaviour turn it back off explicitly.
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", True,
+                        raising=False)
 
 
 @pytest.fixture(autouse=True)

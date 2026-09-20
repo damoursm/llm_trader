@@ -1442,6 +1442,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
     """
     report = _new_report()
     report["run_id"] = run_id
+    _cap_warned = False   # the position-cap CRITICAL is once per sync, not per entry
     _LAST_QUOTE.clear()   # a prior tick's book must never price this tick's rows
     # Boundary for tick-scoped order lifetime: anything submitted before this
     # instant belongs to a previous tick and must not keep working the book.
@@ -1677,6 +1678,21 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             if not ok:
                 logger.info(f"[broker] entry {t['ticker']} skipped — {reason}")
                 t["broker_status"] = f"SKIPPED_CAP: {reason}"
+                # THE POSITION CAP IS NOT AN ORDINARY REFUSAL (2026-09-18). The
+                # SIM ledger enforces no position cap at all, so every entry the
+                # broker refuses here is a trade the ledger HAS and the account
+                # has NOT: past this line the two stop describing the same book,
+                # and every sim-vs-broker comparison over the interval is
+                # quietly invalid. Reported once per sync, not per entry, so a
+                # capped day does not flood the log. The gross-exposure cap
+                # stays INFO — that one is the intended risk stop doing its job.
+                if str(reason).startswith("max_positions") and not _cap_warned:
+                    _cap_warned = True
+                    logger.critical(
+                        f"[broker] POSITION CAP BINDING at {n_open} open "
+                        f"(broker_max_positions={settings.broker_max_positions}) — "
+                        f"the sim ledger has no such cap, so it is now opening trades the "
+                        f"account cannot; sim-vs-broker comparisons from here are not like-for-like")
                 changed = True
                 continue
             side = _entry_side(t["action"])

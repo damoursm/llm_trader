@@ -34,6 +34,24 @@ class Settings(BaseSettings):
     # llm_ab_anthropic_share). Synthesis routing is unaffected either way.
     enable_claude_sentiment: bool = False
 
+    # ── HOSTED SENTIMENT ENGINES (2026-09-18, user directive) ────────────────
+    # False = the self-hosted engine is the ONLY one. DeepSeek and OpenRouter
+    # are then stripped from every try-order, including a `force_engine` pin,
+    # the same way `enable_claude_sentiment=False` strips anthropic.
+    #
+    # Turned off because both hosted accounts are unfunded and every call to
+    # them returns HTTP 402: 1,436 failed calls on 2026-09-18 alone (718
+    # DeepSeek + 718 OpenRouter). A fallback tier that cannot answer is not
+    # resilience, it is two dead round trips and a log full of warnings that
+    # hide real ones.
+    #
+    # ⚠ Read the trade honestly: this REMOVES the resilience tier whose absence
+    # caused the 2026-09-01 outage, when every engine was hosted and the
+    # 0.40-weight `news` method read exactly 0.0000 for a full day. The
+    # protection now rests entirely on the local server staying up. Re-fund an
+    # account and flip this back to restore the tier.
+    enable_hosted_sentiment_engines: bool = True
+
     # SYNTHESIS-only N-way model bake-off. When set to a comma-separated list of
     # model ids, the per-run synthesis engine is picked UNIFORMLY from this pool
     # (equal split) instead of the binary llm_ab_anthropic_share flip — so 3+
@@ -1086,6 +1104,133 @@ class Settings(BaseSettings):
     ml_diff_threshold_long: Optional[float] = 0.0463
     ml_diff_threshold_short: Optional[float] = 0.0374
     ml_raw_confidence_scale: float = 0.12    # saturation control; see above
+
+    # ── ml_ohlcv AS THE SOLE COMBINE (2026-09-18, user directive) ────────────
+    # "have the ml_ohlcv 100% of the weight of the live combine and decision
+    # making process" until the stackers are reviewed and retrained. With this
+    # ON the aggregator stops blending 28 methods and stops consulting the
+    # stackers: combined_buy/sell become max(±ml_ohlcv, 0), the additive
+    # overlays are skipped, and `combine_source` is stamped "ml_ohlcv" so every
+    # downstream surface can segment this era. Every other method still SCORES
+    # and PERSISTS — they leave the combine, not the panel.
+    #
+    # The bands and the divisor below are this score's own, read off its
+    # measured distribution over 572,662 Gate-4 rows (2026-06-17..09-04):
+    #   |score| mean 0.097; p90 +0.177, p95 +0.200, p5 -0.164, p1 -0.202.
+    # Long band = p90 and short band = |p5|, which reproduces the rank combine's
+    # asymmetric "top ~10% / bottom ~5%" shape on the new scale. The divisor is
+    # the |score| quantile that saturates ~9% of rows, matching
+    # `ml_saturation_target`. NOTE: with `rank_entry_rule="gap_cluster"` the
+    # band does NOT gate selection (the cluster is the abstention) — it still
+    # sets `direction`, hence HOLD vs WATCH and the reversal-exit comparison.
+    ml_ohlcv_sole_combine: bool = False
+    ml_ohlcv_diff_threshold_long: float = 0.177
+    ml_ohlcv_diff_threshold_short: float = 0.164
+    ml_ohlcv_raw_confidence_scale: float = 0.20
+
+    # ── ENTRY SELECTION RULE (2026-09-18) ────────────────────────────────────
+    # "topk" is the shipped rank rule (band ∧ top-K by score, K=gate1_rank_cap).
+    # "gap_cluster" takes the run's top/bottom CLUSTER instead: sort the scores,
+    # find the largest hole inside the top `rank_entry_gap_max_frac` of ranks
+    # relative to the local spacing (mean of the ±`rank_entry_gap_window`
+    # neighbouring gaps), and if it is at least `rank_entry_gap_multiple` times
+    # that spacing, everything above it is bought. No cluster ⇒ no trade, which
+    # is this rule's own abstention and why it does not consult the band.
+    # Measured on the E30 ml_ohlcv score over 1,773 runs / 65 days, first
+    # clearance per side per day, session-aware costs: +3.82%/entry (t +2.2)
+    # against +2.13% for the same cluster unfiltered, on 677 entries — 0.3 names
+    # per side per run. The low volume is accepted (user directive 2026-09-18);
+    # the weak t and the +5.13 → +2.50 half decay are ON THE RECORD.
+    rank_entry_rule: str = "topk"            # topk | gap_cluster | top_pct  (arm A)
+    rank_entry_score: str = "combined"       # combined | ml_ohlcv
+
+    # GAP MULTIPLE — 6x, not the 10x this rule was first measured at (2026-09-18,
+    # user directive after the per-side sweep and the holdout).
+    #   * 10x is in the THIN, noisy region. Per side over 1,773 runs: at 10x the
+    #     long side takes 272 entries at +1.86 (t 2.4); at 6x it takes 1,435 at
+    #     +2.27 (t 8.4) — 6x DOMINATES on every axis for longs. Shorts post a
+    #     higher +4.04 at 10x but on 405 entries at t 1.8, while 6x gives 1,869
+    #     at +2.08 (t 6.0), i.e. 2.4x the total return at a fixed size.
+    #   * The 10x headline was also inflated by the truncated freshness window:
+    #     over the first 30 study days (look-back not yet 30 days) it read +5.54
+    #     (t 1.5) against +2.43 (t 2.8) once the window was full.
+    #   * CONFIRMED OUT OF SAMPLE on 11 never-seen days (2026-09-07..09-18):
+    #     gap 6x +0.62 (t 3.5) against gap 10x +0.34 (t 0.4). 10x is the one cell
+    #     that failed the holdout. (Levels there are truncated — only 37% of
+    #     labels resolved — so read the ORDER, not the size.)
+    # Volume consequence, checked before shipping: the gap arm goes 10.4 -> 50.8
+    # entries/day and the union with the top-5% arm 54.2 -> 67.0/day, which at
+    # the ledger's realised 2.30-day mean hold is ~154 concurrent positions
+    # against `broker_max_positions` 200. It also makes the two A/B arms
+    # comparable in size (50.8 vs 52.2/day), which is what the arm comparison
+    # needed.
+    rank_entry_gap_multiple: float = 6.0
+
+    # ── A/B BETWEEN TWO SELECTION RULES (2026-09-18, user directive) ─────────
+    # `rank_entry_ab_share` of runs are decided by `rank_entry_rule_b` instead of
+    # `rank_entry_rule`; both arms TRADE. The flip is per-RUN, like every other
+    # arm here (`ml_combine_arm_share`, `sentiment_local_share`), so each rule
+    # accrues whole-run samples and a run is never half one rule and half the
+    # other. It is a HASH of the run id, not a draw: a retried run must land on
+    # the same arm or the sample over-represents exactly the runs that failed
+    # once. Each arm stamps its own model string (`rank-gap10f` / `rank-top5f`)
+    # on `runs.llm_synthesis_provider`, every recommendation row and every new
+    # trade, so the ledger, the panel and `engine_eval` can all segment it.
+    #
+    # ⚠ EXPOSURE: the two rules differ ~5x in volume (measured 10.4 entries/day
+    # for the gap cluster against 52.2 for the top-5% cut), so a 50/50 split
+    # roughly TRIPLES the book's entry count against the gap cluster alone.
+    rank_entry_ab_share: float = 0.0         # 0 = no A/B, arm A decides every run
+    rank_entry_rule_b: str = "top_pct"
+
+    # ── UNION ROUTING (2026-09-18, user directive) ───────────────────────────
+    # Both rules decide EVERY run and the book trades the union, instead of each
+    # rule getting half the runs. Strictly better for evaluation: each rule
+    # accrues at 100% of its natural rate rather than 50%, and no run is spent
+    # on one rule at the other's expense. Overrides `rank_entry_ab_share`.
+    #
+    # Measured overlap over 1,773 runs: the gap cluster takes 0.68 names/run and
+    # the top-5% cut 8.20, of which 59.5% of the cluster's picks are ALSO in the
+    # top 5% — the cluster searches the top 20% of ranks, so its boundary can
+    # fall outside a 5% cut. The union is 8.48/run, only **3.4% more than the
+    # top-5% rule alone**, so the book's size is set by arm B either way.
+    #
+    # A name both rules pick is ONE position (the ledger's one-open-per-ticker
+    # guard), so the ledger cannot attribute it to a single rule. That is why
+    # each rule's picks are also written to `engine_recommendations` as its own
+    # arm: per-rule evaluation comes from there joined to the panel, which is
+    # the house standard anyway — never from the traded P&L.
+    rank_entry_union: bool = False
+    rank_entry_gap_window: int = 5
+    rank_entry_gap_max_frac: float = 0.20
+
+    # ── OWN-HISTORY FRESHNESS FILTER (2026-09-18) ────────────────────────────
+    # A name is only taken when its score is also unusual FOR IT: strictly above
+    # every score the same model gave it over the previous
+    # `rank_entry_fresh_window_days` trading days (below, for shorts). A ticker
+    # with fewer than `rank_entry_fresh_min_history` prior scores in that window
+    # has no standing and is taken anyway — it cannot be compared with itself,
+    # and that cohort measured BEST in nine of eleven rules (+1.75..+3.28/entry).
+    # Measured: the filter lifts every rule (+0.39..+1.85/entry) and its median
+    # held-out half-window return was the best of five conditions tested.
+    enable_rank_entry_freshness: bool = False
+    rank_entry_fresh_window_days: int = 30
+    rank_entry_fresh_min_history: int = 10
+
+    # ── SHADOW ENTRY RULE (2026-09-18) ───────────────────────────────────────
+    # A second selection rule computed on the same cross-section every run,
+    # persisted to `engine_recommendations` as its own arm and traded by nobody,
+    # so `python -m src.analysis.engine_eval` reads it against the live rule on
+    # the paired disagreement subset. Shipped alongside the gap cluster with
+    # the top-5% rule, which measured +2.57%/entry (t +8.3, halves +2.61/+2.52).
+    # With the A/B on, "auto" records whichever arm did NOT decide this run, so
+    # every run yields a matched pair on the same cross-section and `engine_eval`
+    # reads the two rules on the subset where they DISAGREE — the only subset
+    # that carries information about either. A named rule pins it instead.
+    enable_rank_entry_shadow: bool = False
+    rank_entry_shadow_rule: str = "auto"     # auto | top_pct | topk | gap_cluster
+    rank_entry_shadow_pct: float = 0.05
+    rank_entry_shadow_engine: str = "rank_shadow"
 
     # SELF-CALIBRATING ML DIVISOR (2026-08-18) — src/signals/ml_scale.py.
     # The constant above cannot hold: it controls SATURATION, and the stackers

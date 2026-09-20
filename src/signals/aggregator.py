@@ -1607,6 +1607,14 @@ def _raw_confidence_scale(combine_source: str = "weighted") -> float:
     confidence they are supposed to explain (the exact failure the overlay's
     own 2026-07-27 fix was written to remove).
     """
+    if str(combine_source or "").lower() == "ml_ohlcv":
+        # The sole-combine era (2026-09-18). NOT self-calibrated: `ml_scale`
+        # solves the divisor as a quantile of the ML-SOURCE rows in the panel,
+        # and on the day this switches on there are none, so it would fit the
+        # stackers' distribution and hand it to a ±1 method score. The static
+        # value is the |score| quantile that saturates ~9% of rows, matching
+        # `ml_saturation_target`. Revisit once the era has panel history.
+        return float(getattr(settings, "ml_ohlcv_raw_confidence_scale", 0.20))
     if str(combine_source or "").lower() == "ml":
         # SELF-CALIBRATING since 2026-08-18: the divisor is a saturation
         # control and the stackers' conviction scale moves with every weekly
@@ -1650,7 +1658,18 @@ def _direction_bands(combine_source: str = "weighted") -> tuple:
     `_raw_confidence_scale` for why the ML combine needs its own pair.
     """
     from config.settings import directional as _dir
-    if str(combine_source or "").lower() == "ml":
+    src = str(combine_source or "").lower()
+    if src == "ml_ohlcv":
+        # The sole-combine era: the score is one method's ±1 output, not a blend,
+        # so it needs its own pair. Read off 572,662 Gate-4 rows: p90 +0.177 and
+        # p5 -0.164, which reproduces the rank combine's asymmetric top-10% /
+        # bottom-5% shape on this scale. NOTE the gap-cluster entry rule does not
+        # consult these — the cluster is its own abstention — so they set
+        # `direction`, hence HOLD vs WATCH and the reversal comparison, not what
+        # gets bought.
+        return (float(getattr(settings, "ml_ohlcv_diff_threshold_long", 0.177)),
+                float(getattr(settings, "ml_ohlcv_diff_threshold_short", 0.164)))
+    if src == "ml":
         sym = float(getattr(settings, "rank_diff_threshold", 0.182))
         return (float(getattr(settings, "ml_diff_threshold_long", None) or sym),
                 float(getattr(settings, "ml_diff_threshold_short", None) or sym))
@@ -3142,7 +3161,32 @@ def build_signals(
                         kaufman_long_v + kaufman_short_v + adx_long_v + adx_short_v)
                 return x
 
-            combined = _apply_overlays(combined_buy - combined_sell)
+            # ── ml_ohlcv AS THE SOLE COMBINE (2026-09-18, user directive) ────
+            # "have the ml_ohlcv 100% of the weight of the live combine and
+            # decision making process" until the stackers are reviewed and
+            # retrained. The other 27 weighted methods and both stackers still
+            # SCORE and PERSIST — they leave the COMBINE, not the panel, so the
+            # IC/weight machinery keeps accruing and this is one flag to undo.
+            # The additive overlays are skipped too: an overlay is a tilt ON a
+            # blend, and there is no blend here.
+            _sole = bool(getattr(settings, "ml_ohlcv_sole_combine", False))
+            if _sole:
+                _ml_net = float(ml_ohlcv_v or 0.0)
+                combined_buy, combined_sell = max(0.0, _ml_net), max(0.0, -_ml_net)
+                combine_source = "ml_ohlcv"
+                # `_abs_buy`/`_abs_sell` are deliberately NOT touched. The
+                # absolute twin is what `ml_exit` reads as `ex_combine`, and its
+                # whole purpose is to be BASIS-INVARIANT so the exit model's
+                # feature does not step when the combine changes shape. Writing
+                # the ml_ohlcv score there would shrink that series ~2.5x
+                # (|combined_score_abs| averages 0.20-0.25 against this score's
+                # 0.07-0.11) and hand the frozen exit artifact a distribution it
+                # never saw — on the model that closes EVERY position. The abs
+                # twin therefore stays the weighted absolute combine, exactly as
+                # it already does under the ml-stacker arm.
+
+            combined = (combined_buy - combined_sell) if _sole else \
+                _apply_overlays(combined_buy - combined_sell)
             # The absolute-basis shadow TOTAL. Under method_score_basis="absolute"
             # this equals `combined` exactly (pre-ML-arm), which is the invariant
             # `tests/test_method_rank_basis.py` pins.

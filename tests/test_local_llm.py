@@ -403,3 +403,51 @@ def test_a_locally_opened_trade_is_pinned_to_local_for_its_hold_review():
     groups, legacy = pl._hold_review_groups(trades, run_sent="deepseek", run_synth="deepseek")
     assert groups == {("local", "deepseek"): ["AAA"]}, groups
     assert legacy == []
+
+
+# ── LOCAL-ONLY MODE (2026-09-18, user directive) ─────────────────────────────
+
+def test_hosted_engines_are_stripped_when_disabled(monkeypatch):
+    """`enable_hosted_sentiment_engines=False` must remove deepseek/qwen from
+    EVERY try-order. A tier that returns HTTP 402 on every call is not a
+    fallback, it is two dead round trips per failure."""
+    from config.settings import settings
+    from src.analysis import sentiment as sent
+    monkeypatch.setattr(settings, "enable_local_llm", True, raising=False)
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", False, raising=False)
+    monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "local", raising=False)
+    assert sent._fallback_order() == ("local",)
+    assert sent._sentiment_engine_order(None) == ["local"]
+
+
+def test_a_hosted_pin_coerces_to_local_rather_than_dead_ending(monkeypatch):
+    """A pin is a preference, not a suicide pact (2026-07-22): a hold review or
+    shadow arm pinned to deepseek must fall to local, not to a fabricated 0.0 in
+    the 0.40-weight `news` method."""
+    from config.settings import settings
+    from src.analysis import sentiment as sent
+    monkeypatch.setattr(settings, "enable_local_llm", True, raising=False)
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", False, raising=False)
+    monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "local", raising=False)
+    for pin in ("deepseek", "qwen", "anthropic"):
+        assert sent._sentiment_engine_order(pin) == ["local"], pin
+
+
+def test_the_try_order_is_never_empty(monkeypatch):
+    """Belt and braces: local off AND hosted off must not empty the order, or
+    every ticker scores a fabricated neutral 0.0."""
+    from config.settings import settings
+    from src.analysis import sentiment as sent
+    monkeypatch.setattr(settings, "enable_local_llm", False, raising=False)
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", False, raising=False)
+    assert sent._fallback_order()
+    assert sent._sentiment_engine_order(None)
+
+
+def test_hosted_engines_on_is_the_shipped_order(monkeypatch):
+    from config.settings import settings
+    from src.analysis import sentiment as sent
+    monkeypatch.setattr(settings, "enable_local_llm", True, raising=False)
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", True, raising=False)
+    monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "local", raising=False)
+    assert sent._sentiment_engine_order(None)[:2] == ["local", "deepseek"]

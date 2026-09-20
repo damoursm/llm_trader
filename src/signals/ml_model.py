@@ -396,6 +396,14 @@ def compute_ml_score(ticker: str) -> Tuple[float, str]:
     art = _load_artifact()
     if art is None:
         return 0.0, "NO_MODEL"
+    # 30-MINUTE ARTIFACTS (2026-09-18) take their own path. Dispatching on the
+    # artifact's own stamp rather than on a setting is the same discipline as
+    # the basis guard: the model decides how it must be fed. Without this a
+    # 30-minute model would be served the DAILY frame and score silently wrong
+    # — no error, no abstention, just a different distribution than it was fit
+    # on, which is the failure mode that looks exactly like a working deploy.
+    if str((art.get("config") or {}).get("feature_bars", "")).lower() == "30m":
+        return _score_30m(ticker, art)
     from src.data.cache import _ohlcv_path
     try:
         mt = _ohlcv_path(ticker, "1d").stat().st_mtime_ns
@@ -466,6 +474,87 @@ def compute_ml_score(ticker: str) -> Tuple[float, str]:
         return _memo(ck, round(float(bull[0] - bear[0]), 4), "OK")
     except Exception as e:
         logger.debug(f"[ml_ohlcv] score failed for {ticker}: {e}")
+        return _memo(ck, 0.0, "ERROR")
+
+
+_MIN_30M_BARS = 400          # ~31 sessions; the longest causal window is ret_126
+
+
+def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
+    """Serve an artifact trained on 30-MINUTE feature rows.
+
+    Three things differ from the daily path and all three are load-bearing:
+
+      * the feature frame is built on 30-minute regular-hours bars
+        (`ml_dataset.hlc_30m`) rather than daily sessions;
+      * the row is the last bar whose 30 minutes have ELAPSED, so the score
+        moves through the session instead of being frozen at the previous
+        close, and the series is CUT there before the leg features are computed
+        — a leg state read off the full series would see bars the tick cannot;
+      * the memo is keyed on the half-hour slot as well as the cache file, since
+        keying on the daily file's mtime (what the daily path does) would serve
+        one stale intraday score for the rest of the session.
+    """
+    import pandas as pd                      # lazy, like every other import here
+    cfg = art["config"]
+    now = pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None)
+    slot = int(now.value // (1800 * 10 ** 9))
+    try:
+        from src.data.cache import _ohlcv_path
+        mt = _ohlcv_path(ticker, "30m").stat().st_mtime_ns
+    except Exception:
+        mt = 0
+    ck = (ticker, "30m", slot, mt)
+    hit = _SCORE_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    try:
+        from src.analysis.pivot_target import LEG_FEATURES, leg_feature_rows, pivot_basis
+        expected = pivot_basis()
+        if cfg.get("pivot_basis") != expected:
+            global _BASIS_WARNED
+            if not _BASIS_WARNED:
+                logger.warning(
+                    f"[ml_ohlcv] artifact pivot_basis={cfg.get('pivot_basis')!r} != "
+                    f"current {expected!r} — abstaining until the retrain lands")
+                _BASIS_WARNED = True
+            return _memo(ck, 0.0, "BASIS_STALE")
+
+        from src.analysis.ml_dataset import hlc_30m, ticker_feature_frame
+        hlc = hlc_30m(ticker)
+        if hlc is None:
+            return _memo(ck, 0.0, "NO_DATA")
+        idx, high, low, close, volume = hlc
+        # Completed bars only: a bar STARTING at t is usable from t+30m.
+        n_vis = int(((idx + pd.Timedelta(minutes=30)) <= now).sum())
+        if n_vis < _MIN_30M_BARS:
+            return _memo(ck, 0.0, "NO_DATA")
+        cut = (idx[:n_vis], high.iloc[:n_vis], low.iloc[:n_vis],
+               close.iloc[:n_vis], volume.iloc[:n_vis])
+        fs = ticker_feature_frame(ticker, hlc=cut)
+        if fs is None or fs.empty:
+            return _memo(ck, 0.0, "NO_DATA")
+        row = fs.iloc[-1]
+
+        legs = leg_feature_rows(
+            close.iloc[:n_vis].to_numpy(dtype=float),
+            high.iloc[:n_vis].to_numpy(dtype=float),
+            low.iloc[:n_vis].to_numpy(dtype=float),
+            list(idx[:n_vis]), only_last=True)
+        if not legs:
+            return _memo(ck, 0.0, "NO_DATA")
+        leg = {f: float(legs[0][f]) for f in LEG_FEATURES
+               if f in legs[0] and legs[0][f] == legs[0][f]}
+
+        def _val(f):
+            v = leg.get(f) if f in leg else row.get(f)
+            return float(v) if v is not None and v == v else np.nan
+
+        X = np.array([[_val(f) for f in art["features"]]], dtype=float)
+        pred = float(art["model"].predict(X)[0])
+        return _memo(ck, round(max(-1.0, min(1.0, 2.0 * pred)), 4), "OK")
+    except Exception as e:
+        logger.debug(f"[ml_ohlcv] 30m score failed for {ticker}: {e}")
         return _memo(ck, 0.0, "ERROR")
 
 

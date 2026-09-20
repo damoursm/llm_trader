@@ -149,7 +149,22 @@ METHOD_SCORER_EPOCH: dict[str, datetime] = {
     # per-day rank correlation with the old one is 0.69, so stored scores
     # across this instant are different quantities. Serving's basis guard
     # again covers the gap: a daily-stamped artifact ABSTAINS (BASIS_STALE).
-    "ml_ohlcv": datetime(2026, 9, 17, 0, 40, tzinfo=timezone.utc),
+    # 2026-09-19 23:45 UTC (restart installing `refit_D30_t1.pkl`; the instant
+    # sits in a 24-hour gap with NO runs in it — the last run under the old
+    # artifact was Friday 23:50:09Z and the next is the Sunday 20:00 ET
+    # overnight tick — so unlike the two boundaries above it needed no placing
+    # by the runs): the LABEL is UNCHANGED (still `hl1@30m`, so the basis guard
+    # never fires and `ml_exit`/the stackers stay consistent with the label they
+    # were trained on), but the FEATURE ROWS move from DAILY bars to 30-MINUTE
+    # bars and serving moves from `_score_daily` to `_score_30m`. Three things
+    # change categorically: the features are computed at 30-minute resolution,
+    # the score is served at the last COMPLETED 30-minute bar instead of the
+    # previous session's close (so it now moves through the session instead of
+    # being one value a day), and the 9 leg features ride the 30-minute zigzag.
+    # Measured on a live 260-name cross-section: Spearman with the old column
+    # +0.17, sign agreement 54%, mean |score| 0.0407 -> 0.0855 (2.1x). A
+    # different scorer, not a refinement.
+    "ml_ohlcv": datetime(2026, 9, 19, 23, 45, tzinfo=timezone.utc),
     # 2026-08-10 16:20 UTC (scheduler restart; the instant sits between the last
     # v1 run 16:00:14 and the first v2 run 16:38:50 — the restarted scheduler's
     # misfire-grace catch-up tick stamped 16:38:50, EARLIER than the restart

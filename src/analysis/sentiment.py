@@ -104,9 +104,12 @@ def reset_sentiment_providers() -> None:
     # draw across the active shares, not by reordering the branches.
     elif settings.enable_local_llm and random.random() < settings.sentiment_local_share:
         _PRIMARY_SENTIMENT_ENGINE = "local"
+        _tier = ("hosted engines are the fallback"
+                 if getattr(settings, "enable_hosted_sentiment_engines", True)
+                 else "LOCAL-ONLY — no hosted fallback, this server is the whole tier")
         logger.info(f"[sentiment] LOCAL-primary this run "
                     f"({settings.local_sentiment_model} @ {settings.local_sentiment_base_url}; "
-                    f"share={settings.sentiment_local_share:.0%}; hosted engines are the fallback)")
+                    f"share={settings.sentiment_local_share:.0%}; {_tier})")
     elif settings.qwen_api_key and random.random() < settings.sentiment_qwen_share:
         _PRIMARY_SENTIMENT_ENGINE = "qwen"
         logger.info(f"[sentiment] Qwen-primary this run "
@@ -135,9 +138,18 @@ def _fallback_order() -> tuple:
     `continue`): the flag is a hard on/off, so with `enable_local_llm=False`
     the try-order — and therefore this whole module — is byte-identical to
     before the local engine existed."""
-    if settings.enable_local_llm:
-        return _SENTIMENT_FALLBACK_ORDER
-    return tuple(e for e in _SENTIMENT_FALLBACK_ORDER if e != "local")
+    order = _SENTIMENT_FALLBACK_ORDER
+    if not settings.enable_local_llm:
+        order = tuple(e for e in order if e != "local")
+    if not getattr(settings, "enable_hosted_sentiment_engines", True):
+        # HOSTED ENGINES OFF (2026-09-18): keep only the self-hosted one. A tier
+        # that returns HTTP 402 on every call is not a fallback — it is two dead
+        # round trips per failure and a log that buries the real warnings.
+        # Guarded so an accidental local-off + hosted-off never empties the
+        # order: an empty try-order fabricates a neutral 0.0 in the 0.40-weight
+        # `news` method, which is the one failure this module must never have.
+        order = tuple(e for e in order if e == "local") or _SENTIMENT_FALLBACK_ORDER
+    return order
 
 
 def _sentiment_engine_order(force_engine: Optional[str]) -> list:
@@ -178,6 +190,13 @@ def _sentiment_engine_order(force_engine: Optional[str]) -> list:
         order = [e for e in order if e != "anthropic"] or ["deepseek"]
     if not settings.enable_local_llm:
         order = [e for e in order if e != "local"] or ["deepseek"]
+    if (not getattr(settings, "enable_hosted_sentiment_engines", True)
+            and settings.enable_local_llm):
+        # Applied AFTER the pin, on purpose: a `force_engine="deepseek"` pin —
+        # from a hold review or a shadow arm — must coerce to local rather than
+        # dead-end, exactly as an anthropic pin coerces when Claude is off. A
+        # pin is a preference, not a suicide pact (2026-07-22).
+        order = ["local"]
     return order
 
 

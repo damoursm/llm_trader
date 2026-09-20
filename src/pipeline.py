@@ -2618,11 +2618,21 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         from src.data.liquidity import tradeable_pool
         from src.signals import rank_entry
         recommendations = rank_entry.build_rank_recommendations(
-            signals, tradeable=tradeable_pool([s.ticker for s in signals]))
+            signals, tradeable=tradeable_pool([s.ticker for s in signals]),
+            run_id=run_id)
         # Provenance: the run, every recommendation row and every new trade
-        # stamp "rank"/"rank-v1", so an eval can split this era from the LLM one
+        # stamp "rank" and the ARM's own model string, so an eval can split this
+        # era from the LLM one and the two selection rules from each other
         # exactly as it splits engines.
-        _set_synthesis_meta(rank_entry.RANK_PROVIDER, rank_entry.RANK_MODEL)
+        _rank_arms = rank_entry.active_rules(run_id)
+        _set_synthesis_meta(rank_entry.RANK_PROVIDER, rank_entry.model_stamp(_rank_arms))
+        if len(_rank_arms) > 1:
+            logger.info(f"[rank_entry] UNION routing: {' + '.join(_rank_arms)} both decide this run "
+                        f"(stamp {rank_entry.model_stamp(_rank_arms)})")
+        elif float(getattr(settings, "rank_entry_ab_share", 0.0) or 0.0) > 0:
+            logger.info(f"[rank_entry] A/B arm this run: {_rank_arms[0]} "
+                        f"(stamp {rank_entry.model_stamp(_rank_arms)}, "
+                        f"share={settings.rank_entry_ab_share:g})")
     _synth_latency_s = time.monotonic() - _synth_t0
 
     # ── Fix #2: capture this run's engines for the opener-pinned hold-review ──
@@ -2691,6 +2701,57 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     except Exception as _e:                              # never let a shadow break a run
         logger.warning(f"[engine_shadow] not started: {_e}")
 
+    # ── SHADOW ENTRY RULE (2026-09-18) ───────────────────────────────────────
+    # A second SELECTION RULE on the same cross-section, recorded as its own arm
+    # and traded by nobody. Every shadow that existed before this one was a
+    # different ENGINE answering the same question; this is the same engine
+    # answering it with a different rule, which is what a future promotion has
+    # to be judged on. It reuses `engine_recommendations` verbatim, so
+    # `python -m src.analysis.engine_eval` picks it up as an arm with no schema
+    # change, and it is computed SYNCHRONOUSLY: the rule is arithmetic over
+    # scores that already exist, so there is nothing to wait for and no reason
+    # to risk a background row landing under the wrong run.
+    if getattr(settings, "enable_rank_entry_shadow", False):
+        try:
+            from src.utils import ET as _ET2
+            from src.analysis import engine_shadow as _es
+            from src.signals import rank_entry as _re
+            from src.data.liquidity import tradeable_pool as _tp
+            from src.db import repo as _repo
+            _tpool = _tp([s.ticker for s in signals])
+            _prices = {s.ticker: getattr(s, "price", None) for s in signals}
+            _meta = dict(prompt_variant="n/a", prices=_prices, latency_s=None,
+                         n_signals=len(signals), run_id=run_id,
+                         generated_at=start.isoformat(),
+                         signal_date=start.astimezone(_ET2).date().isoformat())
+            _live_rules = _re.active_rules(run_id)
+            if len(_live_rules) > 1:
+                # UNION routing: both rules decided, so each is recorded as its
+                # own LIVE arm. This — not the ledger — is where per-rule
+                # evaluation comes from: a name both rules picked is ONE
+                # position, so the ledger cannot attribute it to either.
+                for _r in _live_rules:
+                    _recs = _re.picks_for_rule(signals, tradeable=_tpool, rule=_r)
+                    _rows = _es.rows_for(engine=f"rank_{_r}", model=_re.model_stamp(_r),
+                                         live=True, recs=_recs, **_meta)
+                    if _rows:
+                        _repo.insert_engine_recommendations(_rows)
+                    logger.info(f"[rank_entry:arm] rule={_r} — {len(_recs)} picks recorded "
+                                f"as live arm 'rank_{_r}'")
+            else:
+                _shadow_rule = _re.shadow_rule_for(run_id)
+                _shadow_recs = _re.build_shadow_recommendations(
+                    signals, tradeable=_tpool, run_id=run_id)
+                _rows = _es.rows_for(
+                    engine=str(getattr(settings, "rank_entry_shadow_engine", "rank_shadow")),
+                    model=_re.model_stamp(_shadow_rule), live=False, recs=_shadow_recs, **_meta)
+                if _rows:
+                    _repo.insert_engine_recommendations(_rows)
+                logger.info(f"[rank_entry:shadow] rule={_shadow_rule} — {len(_shadow_recs)} picks recorded as arm "
+                            f"{getattr(settings, 'rank_entry_shadow_engine', 'rank_shadow')!r} (traded by nobody)")
+        except Exception as _e:                          # never let a shadow break a run
+            logger.warning(f"[rank_entry:shadow] not recorded: {_e}")
+
     # Keep only the top 10 recommendations by conviction:
     # BUY/SELL first (sorted by confidence desc), then HOLD/WATCH to fill up to 10.
     _ACTION_RANK = {"BUY": 0, "SELL": 0, "HOLD": 1, "WATCH": 2}
@@ -2708,6 +2769,16 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     def _rank(r):
         is_fill = bool(getattr(r, "rule_filled", False))
         return (_ACTION_RANK.get(r.action, 3), is_fill, -r.confidence)
+    # SILENT-DROP GUARD (2026-09-18): this cut runs BEFORE the gate cascade, so
+    # an entry rule that selects more than 10 names loses the overflow with no
+    # trace. The shipped rules cannot reach it (the gap cluster averages 0.6
+    # names a run, the rank cap 6), but a wider rule would, so the condition is
+    # reported rather than left to be discovered from a short email.
+    _n_actionable = sum(1 for r in recommendations if r.action in ("BUY", "SELL"))
+    if _n_actionable > 10:
+        logger.critical(
+            f"[pipeline] {_n_actionable} actionable recommendations exceed the top-10 cut — "
+            f"{_n_actionable - 10} would be dropped before the gates; raise the cut or narrow the rule")
     recommendations = sorted(recommendations, key=_rank)[:10]
 
     # Macro regime gate — adjust threshold and optionally block BUY entries.

@@ -137,15 +137,84 @@ def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     return pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
 
 
-def ticker_feature_frame(ticker: str) -> Optional[pd.DataFrame]:
+def hlc_30m(ticker: str):
+    """``(idx, high, low, close, volume)`` on 30-MINUTE regular-hours bars.
+
+    The same shape `_hlc_by_session` returns for daily bars, so
+    `ticker_feature_frame` can build the identical 76 causal columns at 30-minute
+    resolution. Sources are the deep store (`cache/ml/bars30m_deep`, 2021→, what
+    the trainer reads) extended by the tick cache's fresher tail, de-duplicated
+    on the bar's start; regular hours only, because that is the grid the pivot
+    label is defined on.
+
+    Returns None when neither store has the ticker. The index is naive UTC and
+    ASCENDING, which the caller relies on to cut the frame at the last COMPLETED
+    bar without re-sorting.
+    """
+    frames = []
+    try:
+        from src.data.intraday_store import load_deep_30m
+        deep = load_deep_30m(ticker)
+        if deep is not None and not deep.empty:
+            frames.append(deep)
+    except Exception:
+        pass
+    try:
+        from src.data.cache import load_ohlcv
+        tail = load_ohlcv(ticker, interval="30m")
+        if tail is not None and not tail.empty:
+            t = tail.copy()
+            ix = pd.DatetimeIndex(t.index)
+            if ix.tz is not None:
+                ix = ix.tz_convert("UTC").tz_localize(None)
+            t.index = ix
+            if frames:
+                t = t[t.index > frames[0].index.max()]
+            if not t.empty:
+                frames.append(t)
+    except Exception:
+        pass
+    if not frames:
+        return None
+    df = pd.concat(frames).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col not in df.columns:
+            df[col] = df["Close"] if col != "Volume" else 0.0
+    close = pd.to_numeric(df["Close"], errors="coerce").to_numpy(float)
+    high = pd.to_numeric(df["High"], errors="coerce").to_numpy(float)
+    low = pd.to_numeric(df["Low"], errors="coerce").to_numpy(float)
+    vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).to_numpy(float)
+    ok = np.isfinite(close) & np.isfinite(high) & np.isfinite(low) & (close > 0)
+    idx = pd.DatetimeIndex(df.index)[ok]
+    close, high, low, vol = close[ok], high[ok], low[ok], vol[ok]
+    if not len(idx):
+        return None
+    et = idx.tz_localize("UTC").tz_convert("America/New_York")
+    mins = et.hour * 60 + et.minute
+    rth = (mins >= 570) & (mins <= 930)          # 09:30 through the 15:30 bar
+    idx = idx[rth]
+    if not len(idx):
+        return None
+    return (idx, pd.Series(high[rth]), pd.Series(low[rth]),
+            pd.Series(close[rth]), pd.Series(vol[rth]))
+
+
+def ticker_feature_frame(ticker: str, hlc=None) -> Optional[pd.DataFrame]:
     """Causal feature frame for one ticker, indexed by session date.
 
     Every column is a rolling / ewm / shift over the cached daily bars, so the
     value at row ``i`` uses only bars ``<= i``. Returns None when the ticker has
     no usable history. Also carries ``Close`` so the caller can build forward
     labels off the identical session grid.
+
+    ``hlc`` overrides the daily series with a pre-built ``(idx, high, low,
+    close, volume)`` tuple — how a 30-minute artifact is served (`hlc_30m`). It
+    is an explicit ARGUMENT rather than a monkeypatched module global because
+    `build_signals` scores tickers on a thread pool, where a swapped global
+    would leak one ticker's bars into another's features.
     """
-    hlc = _hlc_by_session(ticker)
+    hlc = _hlc_by_session(ticker) if hlc is None else hlc
     if hlc is None:
         return None
     idx, high, low, close, volume = hlc
