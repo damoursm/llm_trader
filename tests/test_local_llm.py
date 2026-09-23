@@ -451,3 +451,33 @@ def test_hosted_engines_on_is_the_shipped_order(monkeypatch):
     monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", True, raising=False)
     monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "local", raising=False)
     assert sent._sentiment_engine_order(None)[:2] == ["local", "deepseek"]
+
+
+def test_a_dead_local_only_tier_records_why_for_the_health_alert(monkeypatch):
+    """The provider tally says THAT every call fell to "none"; the engine-error
+    tally says WHY. It is what lets the health alert point at the local server
+    instead of at hosted credits — 2026-09-21, a reboot left the local-only tier
+    dead for 20 ticks under an alert that blamed the hosted engines."""
+    monkeypatch.setattr(settings, "enable_local_llm", True)
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", False)
+    monkeypatch.setattr(settings, "enable_claude_sentiment", False)
+    monkeypatch.setattr(sent, "_PRIMARY_SENTIMENT_ENGINE", "local")
+    monkeypatch.setattr(sent, "_sentiment_cache_get", lambda k: None)
+    monkeypatch.setattr(sent, "_sentiment_cache_put", lambda *a, **k: None)
+    monkeypatch.setattr(sent, "_PROVIDER_COUNTS", {})
+    monkeypatch.setattr(sent, "_ENGINE_ERRORS", {})
+
+    class _Dead:
+        def create(self, **kw):
+            raise ConnectionError("Connection error.")
+
+    monkeypatch.setattr(sent, "_get_local", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=_Dead())))
+
+    score, _, _ = sent.analyse_sentiment("AAA", _articles())
+    assert score == 0.0
+    assert sent.get_sentiment_provider_summary() == "none\u00d71"
+    assert sent.get_sentiment_engine_errors() == {"local": (1, "Connection error.")}
+
+    sent.reset_sentiment_providers()
+    assert sent.get_sentiment_engine_errors() == {}, "one run's errors leaked into the next"

@@ -289,14 +289,20 @@ def deep_universe(refresh: bool = False) -> List[str]:
 def run_keys(family: str, keys: Sequence[str], fn: Callable[[str], Optional[pd.DataFrame]],
              workers: int = 4, budget_seconds: float = 0.0, retry_failed: bool = True,
              part_name: Optional[Callable[[str], str]] = None,
-             empty_is_done: bool = True) -> dict:
+             empty_is_done: bool = True, force: bool = False) -> dict:
     """Fetch every pending key on a thread pool, writing ``parts/<key>.parquet``
     and the manifest as results land. ``fn`` returns a DataFrame (possibly
     empty — recorded as done with 0 rows when ``empty_is_done``) or raises.
     ``budget_seconds`` > 0 stops SUBMITTING new keys once exceeded; in-flight
-    keys finish. Returns a summary dict."""
+    keys finish. ``force`` re-fetches EVERY key regardless of the manifest —
+    the refresh of a refetch-and-overwrite family — STALEST FIRST by the
+    manifest's own ``at`` stamp, so a budget stop continues next time instead
+    of restarting. Returns a summary dict."""
     man = Manifest(family)
-    todo = man.pending(keys, retry_failed=retry_failed)
+    if force:
+        todo = sorted(keys, key=lambda k: str((man.done.get(k) or {}).get("at", "")))
+    else:
+        todo = man.pending(keys, retry_failed=retry_failed)
     d = family_dir(family)
     t0 = time.time()
     n_ok = n_fail = n_rows = 0

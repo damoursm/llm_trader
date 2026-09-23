@@ -71,6 +71,13 @@ _SENTIMENT_MAX_TOKENS = 4096
 _PROVIDER_COUNTS: dict = {}
 _PROVIDER_LOCK = threading.Lock()
 
+# Per-run tally of WHY tallied calls failed: engine → [failed calls, last error].
+# The provider tally says THAT every call fell to "none"; this says which engine
+# refused and with what, so the health alert names the real fault instead of a
+# fixed guess (2026-09-21: a local-only tier sat dead for 20 ticks after a reboot
+# while the alert said to top up hosted API credits).
+_ENGINE_ERRORS: dict = {}
+
 # Which engine scores this run — re-flipped per run in reset_sentiment_providers()
 # (2026-07-13: ~90% DeepSeek / ~10% Qwen via sentiment_qwen_share, cost tune), so
 # both providers accumulate whole-run samples for the dashboard's per-LLM evaluation
@@ -83,6 +90,7 @@ def reset_sentiment_providers() -> None:
     global _PRIMARY_SENTIMENT_ENGINE
     with _PROVIDER_LOCK:
         _PROVIDER_COUNTS.clear()
+        _ENGINE_ERRORS.clear()
     # Per-run sentiment engine flip (2026-07-13 cost tune). Qwen is pricier, so it
     # scores only ``sentiment_qwen_share`` of runs (default 10%) and DeepSeek-flash
     # the rest; the non-primary engine is the per-call error fallback. A per-RUN flip
@@ -203,6 +211,23 @@ def _sentiment_engine_order(force_engine: Optional[str]) -> list:
 def _record_sentiment_provider(provider: str) -> None:
     with _PROVIDER_LOCK:
         _PROVIDER_COUNTS[provider] = _PROVIDER_COUNTS.get(provider, 0) + 1
+
+
+def _record_engine_error(engine: str, err: Exception) -> None:
+    with _PROVIDER_LOCK:
+        entry = _ENGINE_ERRORS.setdefault(engine, [0, ""])
+        entry[0] += 1
+        entry[1] = str(err)[:200]
+
+
+def get_sentiment_engine_errors() -> dict:
+    """``{engine: (failed_calls, last_error)}`` over this run's tallied calls.
+
+    Empty when no engine RAISED — which includes a run where no engine was even
+    available to try (every client unconfigured), so an empty dict on a run whose
+    calls all fell to "none" means exactly that."""
+    with _PROVIDER_LOCK:
+        return {e: (n, msg) for e, (n, msg) in _ENGINE_ERRORS.items()}
 
 
 def set_current_run(run_id: Optional[str]) -> None:
@@ -1860,6 +1885,8 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle], *,
         except Exception as e:
             last_err = e
             logger.warning(f"{ticker} sentiment via {engine} failed: {e}")
+            if _tally:
+                _record_engine_error(engine, e)
 
     if raw_score is None:
         logger.error(f"Sentiment analysis failed for {ticker}: {last_err}")

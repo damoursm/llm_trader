@@ -360,6 +360,122 @@ def _weekly_ml_work() -> None:
     logger.info("[scheduler] weekly ML retrain complete")
 
 
+_DEEP_REFRESH_THREAD = None
+_DEEP_PREOPEN_THREAD = None
+
+
+# A scheduler (re)started more than this long after the pre-open slot skips the
+# day rather than catching up. The slot state lives in memory, so every relaunch
+# starts with "not run today", and a mid-session relaunch (a watchdog kill, a
+# restart) would otherwise launch the ~45-minute forced fetch + snapshot builds
+# during trading. Nothing needs the catch-up: a missing snapshot is built on
+# demand by the scorer, and the nightly refresh takes the fast families.
+_DEEP_PREOPEN_CATCHUP_MINUTES = 60
+
+
+def _should_run_deep_preopen(now_naive: datetime, last_date, at: _time) -> bool:
+    """True on the first poll in the hour from ``at`` ET on a MARKET day it
+    hasn't run for (the pre-open run exists to serve that day's session)."""
+    if not settings.enable_deep_preopen:
+        return False
+    start = datetime.combine(now_naive.date(), at)
+    return (last_date != now_naive.date()
+            and start <= now_naive < start + timedelta(minutes=_DEEP_PREOPEN_CATCHUP_MINUTES)
+            and is_market_day(now_naive.date()))
+
+
+def _run_deep_preopen() -> None:
+    """Launch the 08:30 ET pre-open refresh + session snapshot (2026-09-23) —
+    same subprocess discipline as the nightly run. Single-flight."""
+    global _DEEP_PREOPEN_THREAD
+    if _DEEP_PREOPEN_THREAD is not None and _DEEP_PREOPEN_THREAD.is_alive():
+        logger.warning("[scheduler] deep pre-open run still running — not starting another")
+        return
+    _DEEP_PREOPEN_THREAD = threading.Thread(target=_deep_refresh_work, args=("preopen",),
+                                            name="deep-preopen", daemon=True)
+    _DEEP_PREOPEN_THREAD.start()
+    logger.info("[scheduler] deep pre-open refresh + session snapshot STARTING (subprocess)")
+
+
+def _should_run_deep_refresh(now_naive: datetime, last_date, at: _time) -> bool:
+    """True on the first poll at/after ``at`` ET on a date it hasn't run for.
+    NOT gated on `is_market_day`: the weekly refetch-everything families of the
+    deep store (yfinance, Quiver per-ticker history, ticker details, the
+    delisted sweep) fall due on the weekend, which is also the quietest window
+    for them; a market-day-only gate would leave them waiting for Monday night
+    beside the daily families."""
+    if not settings.enable_deep_refresh:
+        return False
+    return last_date != now_naive.date() and now_naive.time() >= at
+
+
+def _run_deep_refresh() -> None:
+    """Launch the deep-store refresh (2026-09-23) in a BACKGROUND thread that
+    runs it as a SUBPROCESS (`python -m src.data.deep.refresh`). A subprocess,
+    not a thread body: the sweep is network-bound for up to
+    `deep_refresh_budget_seconds`, keeps thousands of parquet parts in flight
+    and pulls in duckdb consolidations of 25M-row tables — none of which
+    should share this process's memory or GIL with the overnight ticks. A kill
+    at the budget is a clean process kill (every part is an atomic replace),
+    and the refresh's own state file leaves whatever was cut due again
+    tomorrow. Single-flight."""
+    global _DEEP_REFRESH_THREAD
+    if _DEEP_REFRESH_THREAD is not None and _DEEP_REFRESH_THREAD.is_alive():
+        logger.warning("[scheduler] deep refresh still running from a previous night — "
+                       "not starting another")
+        return
+    _DEEP_REFRESH_THREAD = threading.Thread(target=_deep_refresh_work, name="deep-refresh",
+                                            daemon=True)
+    _DEEP_REFRESH_THREAD.start()
+    logger.info("[scheduler] deep history refresh STARTING (subprocess, background thread)")
+
+
+DEEP_REFRESH_CONSOLE = "logs/deep_refresh_console.log"
+DEEP_PREOPEN_CONSOLE = "logs/deep_preopen_console.log"
+
+
+def _deep_refresh_work(profile: str = "nightly") -> None:
+    """The subprocess's stdout/stderr go to a FILE (`DEEP_REFRESH_CONSOLE`,
+    overwritten each night; ~100-150 KB), never to pipes. The broker watchdog
+    force-exits this process inside the refresh window on most nights (the
+    recurring IBKR gateway wedge, 01:20-02:30 ET), which orphans the refresh;
+    with pipes its every later write would hit a closed pipe — and a print
+    inside yfinance raising there is swallowed by the loader as "no data", so
+    the weekly yfinance sweep would silently refresh nothing and still be
+    stamped complete. A file handle outlives this process; the refresh's own
+    `refresh.lock` keeps the relaunched scheduler from starting a second one."""
+    import os as _os
+    import subprocess as _sp
+    from pathlib import Path as _Path
+    pre = profile == "preopen"
+    budget = float(settings.deep_preopen_budget_seconds if pre else settings.deep_refresh_budget_seconds)
+    console = _Path(DEEP_PREOPEN_CONSOLE if pre else DEEP_REFRESH_CONSOLE)
+    try:
+        console.parent.mkdir(parents=True, exist_ok=True)
+        with open(console, "w", encoding="utf-8", errors="replace") as fh:
+            # a child writing to a FILE defaults to the locale codec (cp1252),
+            # which the utf-8 read below would mangle — pin it to utf-8
+            res = _sp.run(
+                [sys.executable, "-m", "src.data.deep.refresh", "--profile", profile,
+                 "--budget-seconds", str(int(budget))],
+                stdout=fh, stderr=_sp.STDOUT, timeout=budget + 900,
+                env={**_os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+        lines = [l for l in console.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
+        summary = [l for l in lines if l.startswith("deep refresh:")]
+        logger.info("[scheduler] " + (summary[-1] if summary else
+                                      f"deep refresh: rc={res.returncode} "
+                                      f"{(lines[-1] if lines else '')[:300]}"))
+        if res.returncode != 0:
+            logger.warning(f"[scheduler] deep refresh rc={res.returncode} — tail of {console}: "
+                           f"{' | '.join(lines[-6:])[-600:]}")
+    except _sp.TimeoutExpired:
+        logger.warning(f"[scheduler] deep refresh KILLED after {budget + 900:.0f}s — the store keeps "
+                       "every part it wrote; the families it was cut in are due again tomorrow")
+    except Exception as exc:
+        logger.warning(f"[scheduler] deep refresh failed to run: {exc}")
+
+
 def _should_run_nightly_rescore(now_naive: datetime, last_date, at: _time) -> bool:
     """True on the first poll at/after ``at`` ET on a date it hasn't run for.
 
@@ -773,6 +889,17 @@ def start_scheduler() -> None:
     ml_train_time = _parse_hhmm(settings.ml_retrain_time, _time(8, 0)) or _time(8, 0)
     rescore_time = _parse_hhmm(settings.rescore_time, _time(2, 0)) or _time(2, 0)
     last_rescore_date = None
+    deep_refresh_time = _parse_hhmm(settings.deep_refresh_time, _time(23, 45)) or _time(23, 45)
+    last_deep_refresh_date = None
+    deep_preopen_time = _parse_hhmm(settings.deep_preopen_time, _time(8, 30)) or _time(8, 30)
+    last_deep_preopen_date = None
+    if settings.enable_deep_preopen:
+        logger.info(f"Deep pre-open refresh + session snapshot at/after {deep_preopen_time.strftime('%H:%M')} ET "
+                    f"on market days (subprocess, budget {int(settings.deep_preopen_budget_seconds)}s).")
+    if settings.enable_deep_refresh:
+        logger.info(f"Deep history refresh at/after {deep_refresh_time.strftime('%H:%M')} ET every "
+                    f"night incl. weekends (subprocess, budget "
+                    f"{int(settings.deep_refresh_budget_seconds)}s): cache/ml/deep tails.")
     if settings.enable_eod_maintenance:
         logger.info(f"EOD maintenance at/after {eod_time.strftime('%H:%M')} ET: "
                     "forward-return cache warm + table retention (market days).")
@@ -931,6 +1058,25 @@ def start_scheduler() -> None:
                     _run_weekly_ml_train()
                 except Exception as exc:
                     logger.exception(f"[scheduler] weekly ML retrain raised: {exc}")
+
+            # Deep history store refresh (2026-09-23) — its own nightly slot,
+            # every night incl. weekends, a SUBPROCESS: after EDGAR's daily
+            # index and the after-hours bars are final for the day.
+            if _should_run_deep_refresh(now_naive, last_deep_refresh_date, deep_refresh_time):
+                last_deep_refresh_date = now_naive.date()
+                try:
+                    _run_deep_refresh()
+                except Exception as exc:
+                    logger.exception(f"[scheduler] deep refresh trigger raised: {exc}")
+
+            # Pre-open deep refresh + session snapshot (2026-09-23): market days,
+            # at the model features' 08:30 ET knowledge cutoff.
+            if _should_run_deep_preopen(now_naive, last_deep_preopen_date, deep_preopen_time):
+                last_deep_preopen_date = now_naive.date()
+                try:
+                    _run_deep_preopen()
+                except Exception as exc:
+                    logger.exception(f"[scheduler] deep pre-open trigger raised: {exc}")
 
             _time_module.sleep(poll)
     except (KeyboardInterrupt, SystemExit):

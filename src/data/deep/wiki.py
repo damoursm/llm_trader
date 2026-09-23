@@ -87,11 +87,13 @@ def pageviews(title: str, start: str = START, end: Optional[str] = None) -> pd.D
     return df
 
 
-def pageviews_for_ticker(ticker: str) -> pd.DataFrame:
+def pageviews_for_ticker(ticker: str, start: str = START) -> pd.DataFrame:
+    """``start`` is YYYYMMDD (the API's own format); the nightly refresh passes
+    the part's newest day so only the tail is asked for."""
     title = mapping().get(ticker.upper())
     if not title:
         return pd.DataFrame()
-    df = pageviews(title)
+    df = pageviews(title, start=start)
     if len(df):
         df.insert(0, "ticker", ticker.upper())
         df.insert(1, "title", title)

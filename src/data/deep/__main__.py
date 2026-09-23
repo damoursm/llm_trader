@@ -7,6 +7,10 @@ outside price first):
   dividends splits ticker_details ipos context ftd wiki yf quiver delisted
 
 ``--status`` prints the manifest / parquet counts per family and exits.
+
+This is the INITIAL ingest (resumable through the manifest, which skips every
+key already done). Keeping the store current is ``python -m src.data.deep.refresh``
+(``refresh.py``): the nightly incremental tail the scheduler runs.
 """
 from __future__ import annotations
 

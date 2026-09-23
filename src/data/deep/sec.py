@@ -94,15 +94,18 @@ def _filings_frame(block: dict, cik10: str) -> pd.DataFrame:
     return df
 
 
-def fetch_filings(cik10: str, ticker: str = "") -> pd.DataFrame:
-    """Every filing for a CIK: the recent block + each older overflow file."""
+def fetch_filings(cik10: str, ticker: str = "", recent_only: bool = False) -> pd.DataFrame:
+    """Every filing for a CIK: the recent block + each older overflow file.
+    ``recent_only`` stops at the recent block (up to 1,001 filings, real-time
+    — more than any registrant files between two nights): the nightly
+    refresh's unit, merged on accession by the caller."""
     r = http_get(_SUBM_URL.format(name=f"CIK{cik10}.json"), headers=SEC_HEADERS,
                  timeout=60, limiter=_LIMITER)
     if r is None or r.status_code != 200:
         raise RuntimeError(f"submissions HTTP {getattr(r, 'status_code', None)}")
     j = r.json()
     frames = [_filings_frame((j.get("filings") or {}).get("recent") or {}, cik10)]
-    for f in (j.get("filings") or {}).get("files") or []:
+    for f in ([] if recent_only else ((j.get("filings") or {}).get("files") or [])):
         name = f.get("name")
         if not name:
             continue

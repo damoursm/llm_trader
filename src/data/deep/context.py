@@ -170,6 +170,36 @@ def fred_series_vintages(series_id: str, api_key: str) -> pd.DataFrame:
         ["date", "realtime_start"]).reset_index(drop=True)
 
 
+def fred_series_update(series_id: str, api_key: str, since: str) -> pd.DataFrame:
+    """The vintages of a series valid anywhere in the real-time window
+    ``[since, today]`` — the nightly refresh's unit, which
+    ``refresh.merge_vintage_update`` folds into the stored table (that merge
+    is what discards the window's clamped ``realtime_start`` on values first
+    printed before ``since``). A window that still exceeds ALFRED's
+    2,000-vintage cap (a very long gap) falls back to the full fetch; a series
+    with no ALFRED history returns its plain observations dated >= ``since``
+    stamped ``vintage = False``."""
+    rows, st = _fred_window(series_id, api_key, since, "9999-12-31")
+    vintage = True
+    if isinstance(st, tuple) and st[0] == 400 and "vintage dates" in st[1]:
+        return fred_series_vintages(series_id, api_key)
+    if isinstance(st, tuple) and st[0] == 400 and "not exist in ALFRED" in st[1]:
+        vintage = False
+        plain = _fred_plain(series_id, api_key)
+        plain = plain[plain["date"] >= since]
+        rows = [{"date": d, "value": v, "realtime_start": d, "realtime_end": "9999-12-31"}
+                for d, v in zip(plain["date"], plain["value"])]
+    elif st != 200:
+        logger.warning(f"[deep.context] FRED {series_id} update window {since}: HTTP {st}")
+        return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+    df = merge_vintages(pd.DataFrame(rows))
+    df["vintage"] = bool(vintage)
+    df.insert(0, "series_id", series_id)
+    return df[["series_id", "date", "realtime_start", "realtime_end", "value", "vintage"]]
+
+
 def _fred_plain(series_id: str, api_key: str, observation_end: Optional[str] = None) -> pd.DataFrame:
     """Today's FRED view of a series (no vintages), optionally up to a date."""
     rows: List[dict] = []

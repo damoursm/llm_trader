@@ -244,3 +244,25 @@ def test_the_template_is_a_module_level_string():
     cheapest place to notice."""
     assert isinstance(es.HTML_TEMPLATE, str) and len(es.HTML_TEMPLATE) > 1000
     assert "{{" in es.HTML_TEMPLATE and "{%" in es.HTML_TEMPLATE
+
+
+def test_the_llm_banner_carries_the_fix_and_blames_synthesis_only_when_it_failed(sent):
+    """A sentiment-only outage must not claim the recommendations are rule-based
+    (entries come from the rank rule since 2026-09-04), and the banner carries the
+    remedy the health verdict computed instead of a fixed hosted-credits hint."""
+    es.send_recommendations([_rec()], llm_health={
+        "down": True, "sentiment_down": True, "synthesis_down": False,
+        "message": "per-ticker sentiment scoring failed for every ticker (none×88)",
+        "remedy": "start the local LLM server at http://127.0.0.1:11434/v1 "
+                  "(scheduled task LlmTraderOllama, scripts/run_ollama.bat)"})
+    html = _html(sent)
+    assert "LlmTraderOllama" in html
+    assert "These recommendations are rule-based" not in html
+
+
+def test_the_llm_banner_still_flags_rule_based_recommendations(sent):
+    es.send_recommendations([_rec()], llm_health={
+        "down": True, "synthesis_down": True, "sentiment_down": False,
+        "message": "final synthesis fell through to the rule-based engine",
+        "remedy": "check Anthropic + DeepSeek API credits and keys"})
+    assert "These recommendations are rule-based" in _html(sent)

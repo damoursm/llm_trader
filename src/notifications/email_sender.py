@@ -149,9 +149,9 @@ HTML_TEMPLATE = """
 
 {% if llm_health and llm_health.down %}
 <div style="background:#78350f;border:1px solid #b45309;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fde68a;font-size:13px;">
-  &#129302; <b>LLM layer degraded this run</b> &mdash; {{ llm_health.message }}.
+  &#129302; <b>LLM layer degraded this run</b> &mdash; {{ llm_health.message|e }}.
   <div style="margin-top:6px;color:#fcd34d;line-height:1.7;">
-  These recommendations are rule-based, not AI-generated. Check Anthropic &amp; DeepSeek API credits and keys.
+  {% if llm_health.synthesis_down %}These recommendations are rule-based, not AI-generated. {% endif %}{% if llm_health.remedy %}Fix: {{ llm_health.remedy|e }}.{% else %}Check Anthropic &amp; DeepSeek API credits and keys.{% endif %}
   </div>
 </div>
 {% elif llm_health and llm_health.synthesis_provider %}

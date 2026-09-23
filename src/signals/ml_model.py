@@ -546,8 +546,34 @@ def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
         leg = {f: float(legs[0][f]) for f in LEG_FEATURES
                if f in legs[0] and legs[0][f] == legs[0][f]}
 
+        # DEEP FEATURES (2026-09-23): an artifact trained with the deep store's
+        # point-in-time features (`dp_*`) is fed them from the SESSION SNAPSHOT
+        # of the last completed bar's session — built at 08:30 ET by the
+        # pre-open run, the same cutoff every training row of that session saw
+        # — plus the bar features from this bar. A missing snapshot means the
+        # pre-open run did not land: abstain (and build it in the background)
+        # rather than score a model on inputs it never trained with. A missing
+        # snapshot for an OLDER session means this name's tick cache stopped
+        # there — abstain without building: the tick path never builds history.
+        deep = {}
+        if any(str(f).startswith("dp_") for f in art["features"]):
+            from src.analysis import deep_features as dfe
+            last = idx[n_vis - 1:n_vis]
+            sday = int(dfe.session_days(last)[0])
+            bar_idx = int((dfe.session_days(idx[:n_vis]) == sday).sum()) - 1
+            snapshot = dfe.load_session_snapshot(sday)
+            if snapshot is None:
+                if sday not in dfe.recent_session_days():
+                    return _memo(ck, 0.0, "DEEP_STALE")
+                dfe.trigger_snapshot_build(sday)
+                return _memo(ck, 0.0, "DEEP_PENDING")
+            deep = dfe.serving_vector(ticker, sday, float(close.iloc[n_vis - 1]), bar_idx, snapshot)
+
         def _val(f):
-            v = leg.get(f) if f in leg else row.get(f)
+            if f in deep:
+                v = deep[f]
+            else:
+                v = leg.get(f) if f in leg else row.get(f)
             return float(v) if v is not None and v == v else np.nan
 
         X = np.array([[_val(f) for f in art["features"]]], dtype=float)

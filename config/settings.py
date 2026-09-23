@@ -2787,6 +2787,33 @@ class Settings(BaseSettings):
     enable_eod_spread_sweep: bool = True
     spread_sweep_budget_seconds: int = 900   # wall-clock cap per nightly run
     spread_sweep_sleep_seconds: float = 1.5  # pause between historical requests
+    # ── Deep history store — nightly incremental refresh (2026-09-23, user
+    # directive: every external source in the historical store, kept current by
+    # the scheduler). `python -m src.data.deep.refresh` as a SUBPROCESS from its
+    # own nightly slot — not the 16:20 EOD chain, because EDGAR's daily index
+    # and the 20:00 ET after-hours bars are final only late in the evening —
+    # budget-capped, per-family cadence self-paced in cache/ml/deep/
+    # refresh_state.json (a family cut by the budget is due again next night).
+    # NOT gated on market days: the weekly refetch families need the weekend.
+    enable_deep_refresh: bool = True
+    deep_refresh_time: str = "23:45"            # ET; after the overnight venue's 23:30 tick
+    # The nightly work is ~35 min of tails (skipped on market days: the pre-open
+    # run below already refreshed them), yfinance 47 min and Quiver DPI 54 min
+    # (DAILY since 2026-09-23 — the model features' lags assume it), the weekly
+    # refetches, and LAST Wikipedia (2.4 h), which the cap cuts most nights and
+    # which converges over two (its feature lag is 4 days for that reason).
+    # 4 h ends ~03:45 ET, well clear of the 08:30 pre-open run it must not block.
+    deep_refresh_budget_seconds: int = 14400    # wall-clock cap per night
+    # PRE-OPEN run (2026-09-23): market days at 08:30 ET — the families a
+    # session's model features need as of that morning are re-fetched
+    # (`refresh.PREOPEN_FAMILIES`: SEC filings, yesterday's EDGAR insider index,
+    # pre-market bars, news, FINRA short files, market closes), then the
+    # session snapshot the 30-minute scorer reads is built. 08:30 IS the
+    # features' knowledge cutoff (`deep_features.CUTOFF_ET_MIN`): a fetch that
+    # starts at/after it holds every row the cutoff admits. ~35 min.
+    enable_deep_preopen: bool = True
+    deep_preopen_time: str = "08:30"
+    deep_preopen_budget_seconds: int = 2700
     # Polygon real-time NBBO (2026-08-31, verified entitled on the current
     # plan): serves reconcile._quote_for's book when the IBKR API (which lacks
     # a top-of-book entitlement) returns none — revives the spread-aware LMT

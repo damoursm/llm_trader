@@ -97,18 +97,27 @@ def fetch_ticker(ticker: str) -> Dict[str, pd.DataFrame]:
     return out
 
 
-def run(tickers, workers: int = 1, budget_seconds: float = 0.0, retry_failed: bool = True) -> dict:
-    """Sequential-by-default sweep writing three part dirs; manifest 'yf'."""
+def run(tickers, workers: int = 1, budget_seconds: float = 0.0, retry_failed: bool = True,
+        force: bool = False) -> dict:
+    """Sequential-by-default sweep writing three part dirs; manifest 'yf'.
+    ``force`` refetches every ticker (the weekly refresh — yfinance returns
+    the whole history and restates past consensus, so the part is
+    overwritten), stalest first so a budget stop continues next time."""
     man = Manifest("yf")
-    todo = man.pending(tickers, retry_failed=retry_failed)
+    if force:
+        todo = sorted(tickers, key=lambda t: str((man.done.get(t) or {}).get("at", "")))
+    else:
+        todo = man.pending(tickers, retry_failed=retry_failed)
     dirs = {k: family_dir(k) / "parts" for k in ("yf_earnings", "yf_analyst", "yf_shares")}
     t0 = time.time()
     n_ok = n_fail = 0
     strikes = 0
+    stopped = False
     logger.info(f"[deep.yf] {len(todo)} pending of {len(tickers)} ({len(man.done)} done)")
     for i, tk in enumerate(todo):
         if budget_seconds and (time.time() - t0) > budget_seconds:
             logger.info("[deep.yf] budget stop")
+            stopped = True
             break
         try:
             res = fetch_ticker(tk)
@@ -121,6 +130,7 @@ def run(tickers, workers: int = 1, budget_seconds: float = 0.0, retry_failed: bo
                 time.sleep(wait)
                 if strikes >= len(_BACKOFF):
                     logger.error("[deep.yf] three consecutive rate limits — stopping this run")
+                    stopped = True
                     break
                 continue
             man.mark_failed(tk, repr(e))
@@ -136,4 +146,4 @@ def run(tickers, workers: int = 1, budget_seconds: float = 0.0, retry_failed: bo
             logger.info(f"[deep.yf] {i + 1}/{len(todo)} ({n_fail} failed) {time.time() - t0:.0f}s")
     man.save()
     return {"family": "yf", "pending": len(todo), "ok": n_ok, "failed": n_fail,
-            "seconds": time.time() - t0}
+            "seconds": time.time() - t0, "budget_stop": stopped}

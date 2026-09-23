@@ -121,11 +121,15 @@ def bars1d(ticker: str, start: str = "2005-01-01", end: Optional[str] = None) ->
 
 # ── short interest / volume ──────────────────────────────────────────────────
 
-def short_interest(ticker: str) -> pd.DataFrame:
+def short_interest(ticker: str, start: Optional[str] = None) -> pd.DataFrame:
+    """FINRA short interest per settlement date; ``start`` (ISO) asks only for
+    settlement dates from there on — the nightly refresh's tail."""
     pc = _client()
-    res = _paginate("/stocks/v1/short-interest",
-                    {"ticker": pc.to_polygon_symbol(ticker), "limit": 5000, "order": "asc",
-                     "sort": "settlement_date"}, max_pages=10)
+    params = {"ticker": pc.to_polygon_symbol(ticker), "limit": 5000, "order": "asc",
+              "sort": "settlement_date"}
+    if start:
+        params["settlement_date.gte"] = start
+    res = _paginate("/stocks/v1/short-interest", params, max_pages=10)
     if not res:
         return pd.DataFrame()
     df = pd.DataFrame(res)
@@ -136,11 +140,13 @@ def short_interest(ticker: str) -> pd.DataFrame:
     return df
 
 
-def short_volume(ticker: str) -> pd.DataFrame:
+def short_volume(ticker: str, start: Optional[str] = None) -> pd.DataFrame:
+    """Daily short-sale volume; ``start`` (ISO) asks only for dates from there on."""
     pc = _client()
-    res = _paginate("/stocks/v1/short-volume",
-                    {"ticker": pc.to_polygon_symbol(ticker), "limit": 5000, "order": "asc",
-                     "sort": "date"}, max_pages=10)
+    params = {"ticker": pc.to_polygon_symbol(ticker), "limit": 5000, "order": "asc", "sort": "date"}
+    if start:
+        params["date.gte"] = start
+    res = _paginate("/stocks/v1/short-volume", params, max_pages=10)
     if not res:
         return pd.DataFrame()
     df = pd.DataFrame(res)

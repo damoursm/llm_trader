@@ -76,6 +76,7 @@ from src.data.cluster_watchlist import (
 from src.signals.sector_pairs import find_sector_pairs
 from src.signals.cointegration import find_cointegrated_pairs
 from src.analysis.sentiment import (reset_sentiment_providers, get_sentiment_provider_summary,
+                                    get_sentiment_engine_errors,
                                     get_dominant_sentiment_model, set_current_run,
                                     pop_sentiment_shadow_rows, sentiment_shadow_pending,
                                     pop_sentiment_digest_rows, pop_cluster_arm_rows)
@@ -595,18 +596,36 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
         logger.error(f"[db] Failed to persist run metadata (continuing): {e}")
 
 
+def _sentiment_remedies(errors: dict) -> list:
+    """What to fix, read off the engines that actually FAILED this run — never
+    off a fixed list. The alert used to always say "top up Anthropic + DeepSeek
+    credits", which on 2026-09-21 pointed at the wrong layer for 20 ticks: the
+    tier was local-only and the local server had not come back after a reboot."""
+    if not errors:
+        return ["no sentiment engine was available to try - check ENABLE_LOCAL_LLM, "
+                "ENABLE_HOSTED_SENTIMENT_ENGINES and the API keys"]
+    out = []
+    if "local" in errors:
+        out.append(f"start the local LLM server at {settings.local_sentiment_base_url} "
+                   f"(scheduled task LlmTraderOllama, scripts/run_ollama.bat)")
+    hosted = [e for e in errors if e != "local"]
+    if hosted:
+        out.append(f"check {' + '.join(hosted)} API credits and keys")
+    return out
+
+
 def _assess_llm_health() -> dict:
     """Assess whether the LLM layer functioned this run, for alerting.
 
-    Both per-ticker sentiment scoring and final synthesis run on Claude/DeepSeek.
-    When credits are exhausted or keys are invalid the failure is *silent*:
-    sentiment returns a neutral 0.0 and synthesis falls through to the rule-based
-    last resort. This collapses the two existing provider signals into a single
-    'down' verdict so the degradation can be surfaced (CRITICAL log + email
-    banner) instead of scrolling past in the logs.
+    Sentiment runs on the local server and/or the hosted engines; synthesis (when
+    it runs) on the hosted ones. A dead engine fails *silently*: sentiment returns
+    a neutral 0.0 and synthesis falls through to the rule-based last resort. This
+    collapses the provider signals into a single 'down' verdict so the degradation
+    can be surfaced (CRITICAL log + email banner) instead of scrolling past in the
+    logs, and names each failed engine's last error plus the matching fix.
 
     Returns a dict: {down, synthesis_down, sentiment_down, synthesis_provider,
-    sentiment_summary, message}.
+    sentiment_summary, message, remedy}.
     """
     synth_provider = (get_last_synthesis_meta() or {}).get("provider")
     sent_summary   = get_sentiment_provider_summary()   # e.g. "deepseek×40, none×2" | "none×42" | None
@@ -624,11 +643,16 @@ def _assess_llm_health() -> dict:
         e in sent_summary for e in _LLM_ENGINES)
     sentiment_down      = sentiment_attempted and not sentiment_ok
 
-    parts = []
+    parts, remedies = [], []
     if synthesis_down:
         parts.append("final synthesis fell through to the rule-based engine (recommendations are NOT LLM-generated)")
+        remedies.append("check Anthropic + DeepSeek API credits and keys (synthesis runs on the hosted engines)")
     if sentiment_down:
-        parts.append(f"per-ticker sentiment scoring failed for every ticker ({sent_summary})")
+        errors = get_sentiment_engine_errors()
+        detail = "; ".join(f"{e}: {msg} ×{n}" for e, (n, msg) in errors.items())
+        parts.append(f"per-ticker sentiment scoring failed for every ticker ({sent_summary})"
+                     + (f" — {detail}" if detail else ""))
+        remedies.extend(_sentiment_remedies(errors))
 
     return {
         "down":               synthesis_down or sentiment_down,
@@ -637,6 +661,7 @@ def _assess_llm_health() -> dict:
         "synthesis_provider": synth_provider,
         "sentiment_summary":  sent_summary,
         "message":            "; ".join(parts),
+        "remedy":             "; ".join(remedies),
     }
 
 
@@ -3194,13 +3219,14 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         shadow_arm_branch=shadow_arm_branch,
     )
 
-    # Surface a silent LLM-layer outage (credits exhausted / bad key) loudly:
-    # a CRITICAL log line here, plus an email banner + subject tag below.
+    # Surface a silent LLM-layer outage (dead local server / credits exhausted /
+    # bad key) loudly: a CRITICAL log line here, plus an email banner + subject
+    # tag below.
     llm_health = _assess_llm_health()
     if llm_health["down"]:
         logger.critical(
             f"[llm] LLM LAYER DEGRADED — {llm_health['message']}. "
-            f"Top up / check Anthropic + DeepSeek API credits and keys."
+            f"Fix: {llm_health['remedy']}."
         )
 
     # Surface broker/execution problems (not connected, rejects, position drift)

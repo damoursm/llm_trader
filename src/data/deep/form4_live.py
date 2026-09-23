@@ -405,6 +405,57 @@ def validate(n: int = 300, quarter: str = "2026q1", workers: int = 6) -> dict:
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+def run_days(start: date, end: date, *, universe_only: bool = False, workers: int = 4,
+             refetch: bool = False, deadline: Optional[float] = None) -> dict:
+    """Fetch every weekday in ``[start, end]`` whose day part is missing (all
+    of them with ``refetch``) and consolidate when anything landed. The unit
+    the CLI catch-up and the nightly refresh share.
+
+    A day with no index leaves NO part so it is asked again (a holiday costs
+    one request per run until a newer part exists; an EDGAR outage is
+    recovered). ``deadline`` (unix time) stops before the next day."""
+    import time as _t
+    from src.data.deep import consolidate, family_dir, write_parquet
+    ciks = None
+    if universe_only:
+        from src.data.deep import deep_universe
+        from src.data.deep.sec import cik_map
+        m = cik_map()
+        ciks = {m[t] for t in deep_universe() if t in m}
+        logger.info(f"[form4_live] issuer filter: {len(ciks)} CIKs")
+    parts = family_dir("form345_live") / "parts"
+    total = skipped = fetched = empty = 0
+    stopped = False
+    t0 = datetime.now()
+    d = start
+    while d <= end:
+        if deadline is not None and _t.time() > deadline:
+            stopped = True
+            break
+        if d.weekday() < 5:
+            part = parts / f"{d.isoformat()}.parquet"
+            # resumable: a finished day is never re-fetched unless asked
+            if part.exists() and not refetch:
+                skipped += 1
+            else:
+                df = fetch_day(d, ciks=ciks, workers=workers)
+                if len(df):
+                    write_parquet(df, part)
+                    total += len(df)
+                    fetched += 1
+                else:                       # a holiday has no index; leave no part so it retries
+                    empty += 1
+                    logger.info(f"[form4_live] {d}: no filings (holiday?)")
+                el = (datetime.now() - t0).total_seconds()
+                logger.info(f"[form4_live] {d}: {len(df):,} transactions "
+                            f"(total {total:,}, {skipped} days already on disk, {el:.0f}s)")
+        d += timedelta(days=1)
+    if fetched:
+        consolidate("form345_live")
+    return {"days": fetched, "skipped": skipped, "empty_days": empty, "transactions": total,
+            "seconds": round((datetime.now() - t0).total_seconds(), 1), "budget_stop": stopped}
+
+
 def main(argv=None) -> None:
     import argparse
     import json
@@ -422,6 +473,9 @@ def main(argv=None) -> None:
                     help="seconds between SEC requests (default 0.12 = 10/s, the SEC ceiling). "
                          "Raise it to leave headroom for the live pipeline's own EDGAR calls.")
     ap.add_argument("--refetch", action="store_true", help="re-fetch days whose part already exists")
+    ap.add_argument("--include-today", action="store_true",
+                    help="also ask for today's index (default stops at yesterday: a day part is "
+                         "never re-fetched, and today's index is final only once the day is over)")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--quarter", default="2026q1")
@@ -460,36 +514,12 @@ def main(argv=None) -> None:
     else:
         raise SystemExit("one of --days / --since / --catch-up / --validate is required")
 
-    ciks = None
-    if a.universe_only:
-        from src.data.deep import deep_universe
-        from src.data.deep.sec import cik_map
-        m = cik_map()
-        ciks = {m[t] for t in deep_universe() if t in m}
-        logger.info(f"[form4_live] issuer filter: {len(ciks)} CIKs")
-
-    d = start
-    parts = family_dir("form345_live") / "parts"
-    total = skipped = 0
-    t0 = datetime.now()
-    while d <= date.today():
-        if d.weekday() < 5:
-            part = parts / f"{d.isoformat()}.parquet"
-            # resumable: a finished day is never re-fetched unless asked
-            if part.exists() and not a.refetch:
-                skipped += 1
-            else:
-                df = fetch_day(d, ciks=ciks, workers=a.workers)
-                if len(df):
-                    write_parquet(df, part)
-                    total += len(df)
-                else:                       # a holiday has no index; leave no part so it retries
-                    logger.info(f"[form4_live] {d}: no filings (holiday?)")
-                el = (datetime.now() - t0).total_seconds()
-                logger.info(f"[form4_live] {d}: {len(df):,} transactions "
-                            f"(total {total:,}, {skipped} days already on disk, {el:.0f}s)")
-        d += timedelta(days=1)
-    consolidate("form345_live")
+    end = date.today() if a.include_today else date.today() - timedelta(days=1)
+    r = run_days(start, end, universe_only=a.universe_only, workers=a.workers, refetch=a.refetch)
+    logger.info(f"[form4_live] {start} .. {end}: {r}")
+    if not r["days"] and not (DEEP_DIR / "form345_live.parquet").exists() and any(
+            (family_dir("form345_live") / "parts").glob("*.parquet")):
+        consolidate("form345_live")
 
 
 if __name__ == "__main__":
