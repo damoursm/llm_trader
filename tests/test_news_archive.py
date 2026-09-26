@@ -186,6 +186,6 @@ def test_the_archive_renders_its_timestamp_inside_the_guarded_call():
     import inspect
 
     from src import pipeline
-    assert "_safe(\"news_archive\", _archive_articles, run_id, start, articles)"         in inspect.getsource(pipeline.run_pipeline)
+    assert "_safe(\"news_archive\", _archive_articles, run_id, start, articles, feed_chunks)"         in inspect.getsource(pipeline.run_pipeline)
     body = inspect.getsource(pipeline._archive_articles)
     assert 'hasattr(start, "isoformat")' in body

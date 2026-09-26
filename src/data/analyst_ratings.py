@@ -225,15 +225,24 @@ def fetch_analyst_ratings(
 
     Returns:
         List[NewsArticle] — one per ticker with a meaningful analyst signal.
+
+    Daily-cached PER TICKER (2026-09-25): a name asked about after the day's
+    first call is fetched and appended instead of being served the first
+    call's list (`news_coverage.fetch_with_coverage`).
     """
-    cached = _load_cache()
-    if cached is not None:
-        return cached
-
     if not settings.enable_fetch_data:
-        logger.debug("[analyst_ratings] ENABLE_FETCH_DATA=false — skipping yfinance fetch")
-        return []
+        cached = _load_cache()
+        if cached is None:
+            logger.debug("[analyst_ratings] ENABLE_FETCH_DATA=false — skipping yfinance fetch")
+            return []
+        return cached
+    from src.data.news_coverage import fetch_with_coverage
+    return fetch_with_coverage("analyst", _cache_path(), tickers, _load_cache, _save_cache,
+                               lambda missing: _fetch_ratings(missing, lookback_days))
 
+
+def _fetch_ratings(tickers: List[str], lookback_days: int) -> List[NewsArticle]:
+    """The uncached per-ticker fetch behind `fetch_analyst_ratings`."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     articles: List[NewsArticle] = []
 
@@ -273,7 +282,6 @@ def fetch_analyst_ratings(
             time.sleep(_REQUEST_DELAY)
 
     logger.info(f"[analyst] {len(articles)} analyst articles from {len(tickers)} tickers")
-    _save_cache(articles)
     return articles
 
 

@@ -26,7 +26,7 @@ def _wire(monkeypatch, scores, prev_selected=frozenset()):
     hist = {t: {"2026-08-20": {"ds": ds, "c_abs": 0.1,
                                "scores": {"news": 0.1}}}
             for t, (sc, ds) in scores.items()}
-    monkeypatch.setattr(ft, "_panel_history", lambda n: hist)
+    monkeypatch.setattr(ft, "_panel_history", lambda n, methods=(): hist)
 
     import src.analysis.ml_exit_dataset as me
     monkeypatch.setattr(me, "_load_exit_artifact",
@@ -265,3 +265,76 @@ def test_ft_gate4_is_the_funnel_gate4(monkeypatch):
 
     monkeypatch.setattr(liq, "is_liquid", boom)
     assert ft._gate4_ok("OK", 10.0, sentinel) is False
+
+
+# ── the cohort-anchor queries against the REAL `signals` schema (2026-09-23) ─
+# Every test above replaces `_panel_history` with a fake, which is how its SQL
+# went dark unnoticed: from 2026-09-07 it named 21 stacker-only features that
+# are not `signals` columns, DuckDB refused it, and follow-through scored and
+# traded nothing for 16 days while failing soft. These run the real queries on
+# the isolated test DB, which carries the production schema (conftest).
+
+def _insert_panel(rows_by_date):
+    """`signals` rows through the production writer:
+    {date: [(ticker, direction, news, ft_selected)]}."""
+    from src.db import repo
+    from src.db.schema import SIGNAL_METHOD_COLUMNS
+    for d, rows in rows_by_date.items():
+        out = []
+        for tk, direction, news, sel in rows:
+            scores = {m: 0.0 for m in SIGNAL_METHOD_COLUMNS}
+            scores["news"] = news
+            out.append({"ticker": tk, "type": "STOCK", "direction": direction,
+                        "combined_score": 0.3, "price": 100.0, "scores": scores,
+                        "ft_score": (-0.9 if sel else None), "ft_selected": sel})
+        repo.insert_signals(f"run-{d}", f"{d}T15:00:00+00:00", d, out)
+
+
+def test_panel_history_runs_on_the_real_signals_schema():
+    """Names `signals` does not carry are DROPPED from the SELECT, never sent."""
+    _insert_panel({"2026-09-21": [("AAA", "BULLISH", 0.4, None),
+                                  ("BBB", "NEUTRAL", 0.1, None)],
+                   "2026-09-22": [("AAA", "BEARISH", -0.2, None)]})
+    methods = ["news", "tech", "ml_ohlcv", "tape_score",   # tape_score: a column since 09-25
+               "cat_earnings", "cat_analyst"]              # the one-hots are not columns
+    hist = ft._panel_history(5, methods)
+    assert set(hist) == {"AAA"}                        # a NEUTRAL row anchors no cohort
+    assert hist["AAA"]["2026-09-21"]["ds"] == 1.0
+    assert hist["AAA"]["2026-09-22"]["ds"] == -1.0
+    assert hist["AAA"]["2026-09-21"]["c_abs"] == pytest.approx(0.3)
+    assert hist["AAA"]["2026-09-21"]["scores"]["news"] == pytest.approx(0.4)
+    assert set(hist["AAA"]["2026-09-21"]["scores"]) == {"news", "tech", "ml_ohlcv", "tape_score"}
+
+
+def test_entry_scores_come_from_the_artifact_not_the_stacker_constants():
+    """The entry-day columns are the LOADED artifact's own `ex_<method>` names
+    (what its training handed `method_horizon_days`) — never the state block,
+    never today's stacker list — and every WEIGHTED one must be a `signals`
+    column, or the served horizon clock (`ex_elapsed_ratio`) silently differs
+    from the one the model was trained on."""
+    from src.analysis.ml_exit_dataset import EXIT_FEATURE_COLUMNS, EXIT_STATE_FEATURES
+    from src.db import repo
+    from src.signals.aggregator import _BASE_WEIGHTS
+    art = ["days_held", "ex_ret", "ex_news", "ex_tape_score", "ex_elapsed_ratio"]
+    assert ft._artifact_methods(art) == ["news", "tape_score"]
+    methods = ft._artifact_methods(EXIT_FEATURE_COLUMNS)
+    assert not set(methods) & {f[3:] for f in EXIT_STATE_FEATURES}
+    have = set(repo.fetch_df("SELECT column_name FROM information_schema.columns "
+                             "WHERE table_name = 'signals'",
+                             read_only=False)["column_name"].astype(str))
+    missing_weighted = [m for m in methods if m not in have and _BASE_WEIGHTS.get(m)]
+    assert missing_weighted == []
+
+
+def test_episode_guard_reads_the_prior_panel_date_not_the_last_scored_one():
+    """After an outage the last date follow-through SCORED is weeks old; its
+    selections must not block today's candidates. A prior date follow-through
+    did not score blocks nothing; one it did score blocks its selections."""
+    today = date.today()
+    old = (today - timedelta(days=19)).isoformat()
+    prior = (today - timedelta(days=1)).isoformat()
+    _insert_panel({old: [("OLD", "BULLISH", 0.1, 1.0)],
+                   prior: [("AAA", "BULLISH", 0.1, None)]})
+    assert ft._prev_selected_tickers() == set()
+    _insert_panel({prior: [("AAA", "BULLISH", 0.1, None), ("NEW", "BEARISH", -0.1, 1.0)]})
+    assert ft._prev_selected_tickers() == {"NEW"}

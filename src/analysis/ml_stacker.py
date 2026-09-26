@@ -487,6 +487,10 @@ def add_news_features(panel: "pd.DataFrame") -> "pd.DataFrame":
         day = _news_epoch_day()
         if day and "signal_date" in df.columns:
             stale = df["signal_date"].astype(str) < day
+            # A row the panel restored from an archive re-score already carries
+            # the CURRENT news code's values (`news_replay.restore_news_rescored`).
+            if "news_rescored" in df.columns:
+                stale &= ~df["news_rescored"].fillna(False).astype(bool)
             cols = [c for c in NEWS_EPOCH_MASKED_FEATURES if c in df.columns]
             if stale.any() and cols:
                 df.loc[stale, cols] = float("nan")
@@ -528,6 +532,26 @@ def _resolve_catalyst_series(df, live_cat):
     return pd.Series(out, index=df.index)
 
 
+_MARKET_STATE_FEATURES = ("tape_score", "atr_pct", "bb_width_pct", "vol_ratio")
+_MARKET_STATE_MIN_COVERAGE = 0.80      # the replay covers ~98% of the panel's last runs (2026-09-25)
+
+
+def _warn_thin_market_state(panel: pd.DataFrame) -> List[str]:
+    """Warn for each market-state feature under `_MARKET_STATE_MIN_COVERAGE` and
+    return their names. History comes from the signals_replay merge and the tick
+    writes the columns only since 2026-09-25, so the COLUMN is always present and
+    presence proves nothing: a missing or stale replay shows only as COVERAGE.
+    Loud, because training silently imputes a thin feature."""
+    thin = []
+    for c in _MARKET_STATE_FEATURES:
+        cov = float(panel[c].notna().mean()) if c in panel.columns and len(panel) else 0.0
+        if cov < _MARKET_STATE_MIN_COVERAGE:
+            logger.warning(f"[ml_stacker] {c} is only {cov:.0%} populated on the panel — "
+                           "replay materialisation missing or stale? Training will impute it.")
+            thin.append(c)
+    return thin
+
+
 def build_stacker_dataset(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None,
                           benchmark: Optional[str] = None,
                           dedupe: str = "last") -> pd.DataFrame:
@@ -556,12 +580,7 @@ def build_stacker_dataset(horizons: Sequence[int] = (1, 5, 10), days: Optional[i
     # rather than in STACKER_FEATURES, which names panel columns.
     feats = [c for c in list(STACKER_FEATURES) + CATALYST_ONEHOT_FEATURES
              if c in panel.columns]
-    if "tape_score" not in feats:
-        # The 22nd feature comes from the signals_replay merge; a panel without
-        # it means the replay materialisation is missing/stale. Training would
-        # silently fit a 21-feature model — loud, because that is invisible.
-        logger.warning("[ml_stacker] panel has no tape_score column — replay "
-                       "materialisation missing? Training will drop the feature.")
+    _warn_thin_market_state(panel)
     base = [c for c in _BASELINE_COLUMNS if c in panel.columns]
     # combined_sell_score is kept (not a feature, not a baseline) so the swap
     # validation can form combined_score = swapped_buy - combined_sell_score.

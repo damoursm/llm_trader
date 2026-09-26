@@ -21,7 +21,7 @@ import json
 import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import httpx
 from loguru import logger
@@ -271,72 +271,130 @@ def fetch_alpha_vantage_news(tickers: List[str]) -> List[NewsArticle]:
     return out
 
 
+class FinnhubRateLimited(RuntimeError):
+    """Finnhub answered 429 — the free tier's 60 calls/min are spent."""
+
+
+def finnhub_company_news(ticker: str, lookback_days: int = 3,
+                         max_per_ticker: int = 15) -> Tuple[List[dict], int]:
+    """ONE live Finnhub company-news request for *ticker* — the leg's exact
+    request (``from`` = local today - ``lookback_days``, ``to`` = today) —
+    processed the way the leg always did: newest first, aggregator roundups
+    dropped (`_is_finnhub_noise`), the ``max_per_ticker`` newest real articles
+    kept. Returns ``(items, n_noise_dropped)`` with items as plain dicts
+    (``datetime`` epoch s, ``headline``, ``url``, ``source``, ``summary``) so the
+    background refresher can cache them (`finnhub_refresher`).
+
+    Raises `FinnhubRateLimited` on a 429 and lets any other transport / HTTP
+    error propagate — the caller decides whether a failure is a skip or a stop.
+    """
+    frm = (date.today() - timedelta(days=lookback_days)).isoformat()
+    to = date.today().isoformat()
+    r = httpx.get(_FINNHUB_NEWS, params={
+        "symbol": ticker.upper(), "from": frm, "to": to,
+        "token": settings.finnhub_api_key}, timeout=15)
+    if r.status_code == 429:
+        raise FinnhubRateLimited(ticker)
+    r.raise_for_status()
+    raw = r.json() or []
+    # Newest first, then keep only the top max_per_ticker non-noise articles —
+    # bounds the volume of low-signal back-catalogue Finnhub returns per name.
+    raw = sorted(raw, key=lambda x: x.get("datetime") or 0, reverse=True)
+    kept: List[dict] = []
+    dropped = 0
+    for item in raw:
+        if len(kept) >= max_per_ticker:
+            break
+        ts = item.get("datetime")
+        headline = (item.get("headline") or "").strip()
+        url = (item.get("url") or "").strip()
+        if not ts or not headline or not url:
+            continue
+        source = item.get("source") or "Finnhub"
+        if _is_finnhub_noise(headline, source):
+            dropped += 1
+            continue   # generic roundup / listicle — not a ticker catalyst
+        try:
+            datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        except (ValueError, OSError, TypeError, OverflowError):
+            continue
+        kept.append({"datetime": int(ts), "headline": headline, "url": url, "source": source,
+                     "summary": (item.get("summary") or "")[:1000]})
+    return kept, dropped
+
+
+def finnhub_articles(ticker: str, items: List[dict]) -> List[NewsArticle]:
+    """`finnhub_company_news` items → the leg's NewsArticles (tagged with the
+    queried symbol; no provider sentiment on the free tier)."""
+    return [NewsArticle(
+        title=it["headline"],
+        summary=it.get("summary") or "",
+        url=it["url"],
+        source=it.get("source") or "Finnhub",
+        published_at=datetime.fromtimestamp(int(it["datetime"]), tz=timezone.utc),
+        tickers=[ticker.upper()],
+        provider_sentiment_source="finnhub",
+    ) for it in items or []]
+
+
 def fetch_finnhub_news(tickers: List[str], lookback_days: int = 3,
-                       max_tickers: int = 60, max_per_ticker: int = 15) -> List[NewsArticle]:
+                       max_tickers: int = 0, max_per_ticker: int = 15) -> List[NewsArticle]:
     """Real-time Finnhub company-news for each ticker (last ``lookback_days``),
     noise-filtered and capped to the ``max_per_ticker`` most-recent real articles.
     No per-article sentiment on the free tier, so ``provider_insights`` stays
     empty (these articles still go through the LLM scorer). [] when disabled or
-    no key."""
+    no key.
+
+    ALL-SOURCE (2026-09-25): every ticker is covered — ``max_tickers`` 0 means no
+    cap (it was the first 60) — and most of them are served from the background
+    refresher's cache (`finnhub_refresher`), because the free tier's 60
+    calls/min would hold Step 1 for ~7 minutes on a ~400-name universe. A name
+    with no usable cache entry (never fetched, fetched on another day, or older
+    than ``finnhub_cache_max_age_seconds``) is fetched inline through the SAME
+    rate limiter, up to ``finnhub_inline_budget`` names per call in the
+    universe's order — which is exactly the old behaviour when no refresher runs
+    (a one-off ``main.py`` run, a cold start)."""
     if not settings.enable_finnhub_news or not settings.finnhub_api_key:
         return []
-    frm = (date.today() - timedelta(days=lookback_days)).isoformat()
-    to = date.today().isoformat()
+    from src.data import finnhub_refresher as fr
+    names = list(dict.fromkeys(str(t).strip().upper() for t in (tickers or []) if str(t).strip()))
+    if max_tickers and max_tickers > 0:
+        names = names[:max_tickers]
+    budget = max(0, int(getattr(settings, "finnhub_inline_budget", 60)))
+    max_age = float(getattr(settings, "finnhub_cache_max_age_seconds", 1800))
     out: List[NewsArticle] = []
-    dropped = 0
-    for tk in (tickers or [])[:max_tickers]:
-        try:
-            r = httpx.get(_FINNHUB_NEWS, params={
-                "symbol": tk.upper(), "from": frm, "to": to,
-                "token": settings.finnhub_api_key}, timeout=15)
-            if r.status_code == 429:
-                logger.warning("[finnhub_news] rate limited — stopping early")
-                break
-            r.raise_for_status()
-            items = r.json() or []
-        except Exception as e:
-            logger.debug(f"[finnhub_news] {tk} failed: {e}")
+    ages: List[float] = []
+    n_cache = n_inline = n_missing = 0
+    for tk in names:
+        hit = fr.cached_items(tk, max_age)
+        if hit is not None:
+            items, age = hit
+            n_cache += 1
+            ages.append(age)
+        elif n_inline < budget:
+            items = fr.fetch_now(tk, lookback_days=lookback_days, max_per_ticker=max_per_ticker,
+                                 max_wait=float(getattr(settings, "finnhub_inline_max_wait_seconds", 15)))
+            if items is None:
+                n_missing += 1
+                continue
+            n_inline += 1
+        else:
+            n_missing += 1
             continue
-        # Newest first, then keep only the top max_per_ticker non-noise articles —
-        # bounds the volume of low-signal back-catalogue Finnhub returns per name.
-        items = sorted(items, key=lambda x: x.get("datetime") or 0, reverse=True)
-        kept_tk = 0
-        for item in items:
-            if kept_tk >= max_per_ticker:
-                break
-            ts = item.get("datetime")
-            headline = (item.get("headline") or "").strip()
-            url = (item.get("url") or "").strip()
-            if not ts or not headline or not url:
-                continue
-            source = item.get("source") or "Finnhub"
-            if _is_finnhub_noise(headline, source):
-                dropped += 1
-                continue   # generic roundup / listicle — not a ticker catalyst
-            try:
-                published = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            except (ValueError, OSError, TypeError):
-                continue
-            out.append(NewsArticle(
-                title=headline,
-                summary=(item.get("summary") or "")[:1000],
-                url=url,
-                source=source,
-                published_at=published,
-                tickers=[tk.upper()],
-                provider_sentiment_source="finnhub",
-            ))
-            kept_tk += 1
-        time.sleep(0.1)   # gentle pacing for the free 60/min tier
+        out.extend(finnhub_articles(tk, items))
     out = _dedupe(out)
-    n_tk = min(len(tickers or []), max_tickers)
+    med_age = f"{sorted(ages)[len(ages) // 2] / 60.0:.0f} min" if ages else "n/a"
     if out:
         newest = max(a.published_at for a in out)
         age_min = (datetime.now(timezone.utc) - newest).total_seconds() / 60.0
         # Empirical freshness check: how old is the most recent article Finnhub
         # returned? Lets you SEE whether the feed is <15 min fresh in production.
-        logger.info(f"[finnhub_news] {len(out)} article(s) across {n_tk} ticker(s) "
-                    f"({dropped} noise dropped); newest is {age_min:.0f} min old")
+        logger.info(f"[finnhub_news] {len(out)} article(s) across {n_cache + n_inline}/{len(names)} "
+                    f"ticker(s) (cache {n_cache}, median age {med_age}; inline {n_inline}; "
+                    f"missing {n_missing}); newest is {age_min:.0f} min old")
     else:
-        logger.info(f"[finnhub_news] 0 article(s) across {n_tk} ticker(s) ({dropped} noise dropped)")
+        logger.info(f"[finnhub_news] 0 article(s) across {n_cache + n_inline}/{len(names)} ticker(s) "
+                    f"(cache {n_cache}; inline {n_inline}; missing {n_missing})")
     return out
+
+

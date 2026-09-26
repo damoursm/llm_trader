@@ -1,245 +1,235 @@
 ---
 name: evaluate
-description: House standard for evaluating any signal, model, gate or exit rule in llm_trader — the next H/L pivot as the label, found on 30-minute bars from the tick's own time and price so it may resolve later the SAME session, unresolved pivots marked at the last visible close, simulated trades, split long and short; headline metrics = per-day pivot IC for rankers, counterfactual excess return per decision for gates/exits.
+description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO test sets reported separately (set 1 history 2026-06-17..09-27, set 2 live all-source news from 2026-09-28); model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective (per-side return per day of the top/bottom name per run after the own-history rule) for models trained on it; gates/exits = counterfactual excess return per decision; label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
 argument-hint: "[what to evaluate, e.g. 'the ml_exit upgrade' or 'Gate 1c']"
 ---
 
 Evaluate: $ARGUMENTS
 
-**The standing rule.** When evaluating, use the H/L pivot targets. The label is
-ALWAYS the next H/L pivot — it may confirm later the SAME day as the tick (but
-only strictly AFTER the tick) or many days later, and it is never truncated to a
-fixed horizon or to the day. If the pivot has not resolved yet, use the LAST
-CLOSING PRICE as the resolution. Also, use the simulated trades and evaluate for
-both long and short.
+**The standing rule.** Evaluate on the TWO test sets (§1) with the metric set
+(§2), against the next H/L pivot (§3), on simulated/panel rows (§4), long and
+short — each test set reported separately, never pooled.
 
-Everything below is how to satisfy that rule correctly in this codebase.
+## 1. The two test sets — report each separately, never pool
 
-## 1. The label — the next H/L pivot on 30-MINUTE bars, from the tick, last CLOSE for the unresolved tail
+| set | signal dates | what it is | news features |
+|---|---|---|---|
+| **Set 1 — history** | 2026-06-17 → 2026-09-27 | OHLCV + news since news collection began (first news pull 2026-06-16 08:00 UTC; first scored run 2026-06-17) | the per-source history rebuilt with today's news code: `news_replay` rows `pool_spec='src:<group>'`, read with `src.analysis.news_history.source_feature_frame()` |
+| **Set 2 — live all-source news** | 2026-09-28 → | the live pipeline running the ALL-SOURCE news ingestion (every per-ticker feed asks about every scored name; live since `news_coverage.ALL_SOURCE_SINCE`) | the LIVE values the pipeline persisted — no reconstruction: the `signals` news columns, the archive (`news_articles` + `news_article_feeds` rebuild any single feed's pool) and `sentiment_digests`; the technical-indicator vectors from the live capture, `src.analysis.live_features.load("30m" | "daily")` |
 
-The target is the signed % move from the row's **own tick price** to the **next
-pivot extreme** on the H/L basis (swing highs on each bar's HIGH, lows on its LOW,
-confirmed by `pivot_min_move_pct`), with the zigzag run over **30-minute
-regular-hours bars** and the search starting at the first bar whose START is at
-or after the tick's timestamp. The bar containing the tick is excluded (it cannot
-be split). The next pivot may therefore come **later the same session** or weeks
-out — the horizon is whatever the pivot takes, never a fixed number of days.
-Unresolved rows are **marked at the LAST VISIBLE CLOSE**, never the running leg's
-extreme.
+- Split with `eval_metrics.split_test_sets` / `by_test_set` (dates in `TEST_SETS`).
+  The sets are disjoint.
+- **Set 1 coverage — state it with every result.** `bundle` / `events` / `polygon`
+  from 2026-06-17; `finnhub` / `google` / `all` from 2026-07-03 only; RSS and press
+  wires never. Do NOT use the live `signals` news columns for set 1 — they span
+  six prompt eras and are masked by the news epoch. The history built on
+  2026-09-24 ends 2026-09-23: extend it through 09-27 before using the whole set
+  (`python -m src.analysis.news_history --acquire finnhub`, `--acquire google`,
+  then `--score --loop`).
+- **Set 2 accrues forward.** Fewer than ~10 settled days is a sanity read, never
+  a verdict; state the settled share. Its news features differ from set 1's in COVERAGE by design (set 1's history
+  mirrors the old ingestion: pre-fetch names only, Finnhub 60, Google 150) — a model
+  trained on set 1 meets richer digests on set 2; say so beside any set-2 news result.
+- **In-sample.** A model fitted on any row inside a set is in-sample there:
+  train strictly before the set's first day, or walk forward inside it (§5).
+  `ml_ohlcv`'s live artifact trains through 2026-06-01, so both sets are out of
+  sample for it; the panel-trained stackers and `ml_exit` are not unless refit
+  walk-forward.
+- **Reading them together.** A change ships when it clears the bar (§5) on set 1
+  and set 2 does not contradict it. An effect on set 1 only suggests a
+  reconstruction artifact (the Google and Finnhub rebuilds recover ~60% of live's
+  articles); on set 2 only, either new-ingestion value or too few days — say
+  which, with the day count.
+
+## 2. The metrics
+
+**Models / rankers** — anything emitting a cross-sectional score (methods, ML
+models, the combine, confidence). The MODEL METRIC SET, computed only with
+`src/analysis/eval_metrics.py`:
 
 ```python
-import sys; sys.path.insert(0, ".claude/skills/evaluate")
-from live_labels_intraday import label_rows          # rows: ticker / generated_at / price
-lab = label_rows(df, bars30m)                        # bars30m: {ticker: 30-min OHLCV, naive-UTC index, RTH only}
-df["y_mkt"], df["settled"], df["same_day"] = lab.target_pct, lab.resolved, lab.same_day
+from src.analysis.eval_metrics import by_test_set
+res = by_test_set(df, "score", label="fwd_ret_pivot")   # df: signal_date, ticker, score, label
 ```
 
-**This is the PRODUCTION label — the only one** (2026-09-14; daily retired 2026-09-16): the
-skill's `live_labels_intraday.py` is a thin wrapper over
-`src/analysis/pivot_target.intraday_pivot_targets` — the same function the
-signals panel (`fwd_ret_pivot`), the sim/directional panels
-(`simulated_trades._pivot_fwd_for_row`), the exit dataset, the tracker's live
-targets and every dashboard surface read through `pivot_rows.pivot_fwd_row`, and
-that trains `ml_ohlcv` (`session_close_labels` over the deep store
-`cache/ml/bars30m_deep`, each deep row anchored at its session close).
-`bars=None` reads the production 30-minute cache (`cache/ohlcv_30m/`, Polygon
-aggregates, RTH-filtered, capped at `intraday_30m_max_bars` = 260 sessions — the
-deep 2021→ history is `cache/ml/bars30m_deep/<TK>.pkl`, never the tick cache); warm it for the panel universe with
-`python -m src.data.backfill --with-30m --skip-daily` before a large read, since
-a tick only refreshes the names it touches. Pass `bars=` only to evaluate on a
-scratch fetch; build such a frame with `.to_numpy()` columns — constructing it
-from JSON-indexed Series against a new DatetimeIndex silently yields all-NaN
-bars, and the labeler refuses such a series rather than scoring it as "no
-pivots". Where the skill and the panel differ is only the UNRESOLVED tail: the
-panel writes settled rows only (a training label never sees a provisional
-value); the skill marks that tail at the last visible close for evaluation.
+1. **IC** — mean per-day Spearman correlation of the score with the signed
+   next-H/L-pivot return, over the day's scored cross-section;
+2. **t** — its day-clustered t (one observation per signal date);
+3. **top 5% / bottom 5% returns**,
+4. **top 3% / bottom 3% returns**,
+5. **top 1% / bottom 1% returns** — each day the `ceil(p × n)` highest- and
+   lowest-scored names and the mean of their signed next-pivot return, averaged
+   over days, each tail with its own day-clustered t and split halves.
 
-**Why daily bars were wrong for this.** With the zigzag on daily H/L and the
-anchor at the day's close, the first candidate bar after any anchor is
-*tomorrow*: a swing later the same session was not excluded by a rule, it was
-unrepresentable. Whether a model's FEATURES are daily or intraday does not
-change the label — it is the next pivot in the subsequent bars either way.
-Report the same-session share and the median bars-to-pivot beside every result.
+- The top tail is the long book (positive is good); the bottom tail is the short
+  book (NEGATIVE is good — its oriented return is the negation). The day's
+  universe mean over the same rows is reported beside the tails as the baseline,
+  never as a metric.
+- Rank only the rows the model actually scores: a method that abstains with 0.0
+  is passed its rows WITH a view, or its zeros become a tied block mid-ranking.
+  Tail ties break on the ticker. A day with fewer than 20 scored, labelled rows
+  is skipped (`MIN_DAY_ROWS`).
+- At 1% a tail is 1–5 names a day (~1 on a single news source): its t is the
+  noisiest of the set — read it beside the 3% and 5% tails.
+- IC and its t are the number a change must move; the tails say whether the move
+  reaches the names a rule trades (the LIVE selection short: the top-1 fresh pick
+  per bar; the SHADOW rank rule: the top/bottom 3 per side; the staged cutover
+  rules: top/bottom 5%). A U-shaped payoff has a flat IC and good tails, so both
+  are always reported.
 
-**Which marks, which threshold.** The 30-minute marks basis and the
-confirmation threshold are settings (`pivot_label_basis` hl|close,
-`pivot_min_move_pct`), the labeler follows them, and every trained artifact is
-stamped with the fingerprint in force (`pivot_target.pivot_basis()`, `hl1@30m`).
-**Decided 2026-09-16 (user): H/L marks on 30-minute bars for ALL labels —
-ml_ohlcv, the entry stackers, ml_exit — and the daily H/L label is
-decommissioned** (there is no fallback; a ticker with no 30-minute history has
-no label). The 2026-09-15 five-label comparison
-(`memory/pivot-label-verdict-2026-09.md`) is the record behind the threshold
-question: at 1% the 30-minute H/L label's median move is 1.3% and a third of it
-is the intra-bar extreme; at 2–2.5% it matches the old daily label's swing and
-carries more power. Too many pivots is a threshold question — raise
-`pivot_min_move_pct` — never a reason to go back to daily bars. Report the
-label definition in force beside every number; do not compare levels across
-definitions — only paired contrasts within one.
+**The selection objective** — for models trained on it (the next models, user
+directive 2026-09-25), reported beside the model metric set, PER SIDE:
 
-**Re-scoring `ml_ohlcv` offline.** Production scores an intraday tick on the
-PREVIOUS session's completed bar with the six cross-sectional ranks absent. An
-offline score must reproduce that (previous row, `_XRANK_SOURCES` NaN) — checked
-by its rank correlation with the persisted `ml_ohlcv` column (0.996; the same-day
-row scores −0.006). Same-day features report an IC the served model never had
-(+0.17–0.27 vs +0.05 measured 2026-09-15).
+```python
+from src.analysis.eval_metrics import selection_by_test_set
+res = selection_by_test_set(df, "score", "long")   # and "short"; df: EVERY run's rows +
+                                                   # run_id, fwd_ret_pivot, bars_ahead
+```
 
-**Mechanical check, every run.** Assert that no resolved row's pivot bar starts
-at or before its tick; the harness must refuse to publish otherwise.
+Per run the top (long) or bottom (short) name, kept only when its score is also
+a new extreme against its own last 30 trading days (the live freshness rule; a
+name with under 10 prior scores is kept), one entry per name per day, each
+earning its next-pivot return divided by the sessions to the pivot
+(`bars_ahead / 13`, floored at one day — `bars_ahead` comes from `label_rows`).
+Report the mean return per day with its day-clustered t and halves, entries per
+day, the share of days with an entry, and the all-names baseline. The pick is
+made on the score alone; a pick without a label stays an unlabeled entry.
 
-Do **not** use the running leg's extreme as the provisional resolution. That is
-the best price the open leg happened to reach, which nothing guarantees was
-capturable, and it systematically inflates the unresolved tail — measured
-2026-09-13 on 5,101 panel rows: 12.6% unresolved, on which the extreme basis ran
-**39% larger in magnitude** than the close (close = 72% of extreme) with **13.9%
-sign flips**. It flatters hold-friendly models most: the frozen `ml_exit`
-artifact's IC fell +0.128 → +0.072 (out of significance) on the switch, because a
-hold-conviction model graded on the best price a held position reached is graded
-on the one number an open position cannot bank. History:
-`memory/decile-ledger-validity-2026-09.md`.
+**Deciders** — anything binary (gates, exits, sizing tilts, whole-algorithm
+A/Bs): mean oriented next-pivot return per decision vs the MATCHED
+COUNTERFACTUAL, day-clustered t, net of calibrated costs when the branches trade
+different amounts. Kept vs dropped with the side-mix benchmark (`gate_funnel`:
+`value` = keep_exc − drop_exc); hold-matched control for exits
+(`exit_policy_sim` EXCESS — never raw `mean_ret`); paired same-day arm
+difference (`arm_eval`, the Tier-2 walk-forward backtest). A model that serves a
+decision is judged twice: its score as a model, the rule built on it as a
+decider.
 
-**Orientation — the double sign flip.** The label above is MARKET-signed. For
-anything position-relative (exits, held positions, a directional call), multiply
-by the position's direction sign (+1 long / −1 short): positive then means "the
-move went the position's way". Getting this wrong silently inverts shorts.
+**The live strategy (the selection short, since 2026-09-28)** is a decider whose
+trade ends at an IMPLEMENTABLE exit, not at the pivot: judge a change to it by the
+return per trade and per day (`(1 + mean)^(1/days) − 1`) of the whole rule —
+entry at the pick bar's close (or the delayed entry being tested), cover at half
+the 5-session run-up checked at 30-minute closes, else 15 sessions — net of the
+REAL costs: the NBBO half-spread at entry and exit (`nbbo_backfill.quote_at`),
+IBKR fixed commissions, SEC/TAF on the short sale, and the borrow fee from
+`data/ibkr_borrow` at entry (`ibkr_borrow.borrow_at`). Always beside the
+volatility-matched control (`sel_models.vol_control`): top-1 picks are the most
+volatile names and volatile names drift. Pick parameters out of sample (choose on
+one date half, score on the other). Harnesses: scratchpad `short_eval.py`,
+`short_exit_search.py`, `short_exit_holds.py`, `short_entry_delay.py`
+(`memory/selection-model-exits-2026-09.md`, `memory/sel-short-deploy-2026-09.md`).
 
-**Hard guardrail:** provisional labels are for EVALUATION and MONITORING ONLY.
-Never let them reach a calibration, a training label, or anything that decides
-live trades — they keep extending until confirmation, so fitting on them fits a
-moving target. Training always uses settled labels plus each row's own settle
-date (`end_date_pivot` / `end_date_pv`) as the walk-forward embargo.
+Not used as metrics: AUC, hit %, precision@k (a rank statistic minus magnitude,
+or skill-shaped noise), and compound NAV (a monitor — ~410 days to detect
+0.10%/day).
 
-## 2. The metric — two functionals of one quantity (decided 2026-08-29)
+## 3. The label — the next H/L pivot on 30-minute bars
 
-Every layer of the system is one of two shapes, and each shape has ONE headline
-metric. Both are functionals of the same quantity — the oriented pivot move — so
-the layers' objectives telescope instead of fighting.
+The signed % move from the row's OWN tick price to the extreme of the NEXT
+resolved pivot: zigzag over 30-minute regular-hours bars (swing highs on bar
+HIGHS, lows on bar LOWS, confirmed at `pivot_min_move_pct`), search starting at
+the first bar that begins at or after the tick (the tick's own bar excluded). It
+may resolve later the same session or days out — never a fixed horizon. Report
+the definition in force (`pivot_target.pivot_basis()`, e.g. `hl1@30m`) and never
+compare levels across definitions.
 
-**RANKERS** (anything emitting a cross-sectional score: methods, ML models, the
-combine, confidence) → **mean per-day Spearman IC vs the signed pivot label**,
-with its day-clustered t. This is the number a model or method change must move.
+- **Settled labels**: the panel's `fwd_ret_pivot`
+  (`signal_panel.build_panel(horizons=(5,), dedupe="last")`, settled rows only).
+- **The unresolved tail too** (the evaluation standard) — `label_rows` from this
+  skill folder:
 
-- Not AUC: on a binarized label AUC IS a rank statistic minus the label's
-  magnitude — measured day-level corr with IC +0.905 (1,988 method-days) — and
-  it replicated worse in every split tested. It adds nothing and discards the
-  magnitudes that sizing and rank-shaping consume.
-- Not precision@k / hit%: the weakest future-money predictors measured, and hit%
-  can replicate WITHOUT predicting money — side composition and drift persist
-  (the ~48.6% market-relative baseline problem), which is skill-shaped noise.
-- Measured 2026-08-29 (49 days, 61 methods, Gate-4 pool, live labels).
-  Method-ranking self-replication across contiguous / odd-even / well-covered
-  splits: IC .48/.65/.59 · tail spread .47/.64/.52 · AUC .37/.60/.58 ·
-  hit .38/.22/.63 · mean oriented return .32/.48/.37. IC is the only candidate
-  stable across all three designs, and its half-1 reading predicted half-2
-  realized return nearly as well as the return-unit metrics predicted
-  themselves.
+  ```python
+  import sys; sys.path.insert(0, ".claude/skills/evaluate")
+  from live_labels_intraday import label_rows            # rows: ticker, generated_at, price
+  lab = label_rows(df)                                   # bars=None reads the production 30-min cache
+  df["y"], df["settled"], df["same_day"] = lab.target_pct, lab.resolved, lab.same_day
+  df["bars_ahead"] = lab.bars_ahead                      # bars to the pivot (selection objective)
+  ```
 
-**DECIDERS** (anything binary: gates, exits, sizing tilts, the LLM layer,
-follow-through selection, whole-algorithm A/Bs) → **mean oriented pivot return
-per decision vs the matched counterfactual**, day-clustered t, NET of the
-calibrated costs whenever the compared branches trade different amounts or
-sessions.
+  An unresolved row is marked at the LAST VISIBLE CLOSE, never at the running
+  leg's extreme (measured: +39% magnitude and 14% sign flips, flattering
+  hold-friendly models). Warm the cache first for a large read
+  (`python -m src.data.backfill --with-30m --skip-daily`); a ticker with no
+  30-minute history has no label.
+- **Mechanical check, every run**: no resolved row's pivot bar starts at or
+  before its tick.
+- **Orientation**: the label is MARKET-signed; for anything position-relative
+  (exits, held positions) multiply by the position's direction (+1 long / −1
+  short).
+- **Provisional labels are for evaluation only** — never a training label or a
+  calibration input.
 
-- The counterfactual is not optional: kept-vs-dropped with the side-mix
-  benchmark (`gate_funnel`'s `value` = keep_exc − drop_exc), hold-matched
-  control (`exit_policy_sim`'s EXCESS), paired same-day arm difference
-  (`arm_eval`, the Tier-2 wf backtest). Raw oriented means are incomparable
-  across side mixes, and an exit rule's raw return mostly measures its holding
-  period.
-- IC is a category error here: a binary decision has no cross-section, so its
-  "IC" degenerates to a rescaled mean difference (the funnel's gate-IC column
-  reads ±0.01 noise while the excess column carries the same information in
-  %-per-decision units that ADD UP and compare directly to the cost stack).
+## 4. The population — simulated/panel rows, never the ledger
 
-A model is evaluated as a ranker even when it serves a decision: ml_exit's
-conviction → ranker IC on the oriented remaining move; the CLOSE RULE built on
-it → decider excess. When one number must summarize the whole algorithm, it is
-the decider metric on the end-to-end book vs its counterfactual; compound NAV is
-the monitor, not the target (at ~1.0%/day NAV sd, detecting a 0.10%/day
-improvement needs ~410 days — nothing is decidable there).
+- Models and signals → the `signals` panel, one row per ticker per day (the
+  day's LAST run, `dedupe="last"`); set 1's news features from
+  `news_history.source_feature_frame()`, joined on (run_id, ticker).
+- Exits → `ml_exit_dataset.build_exit_dataset` (simulated held positions;
+  `entry_directional` marks the real held population) and `exit_policy_sim`.
+- Whole-decision policies → `simulated_trades`, `exit_policy_sim`, `policy_eval`.
+- Restrict to the Gate-4 tradeable pool (price ≥ $5, 20-day dollar volume ≥ $5M)
+  unless the question is about observe-only names.
+- Never the trade ledger: a gate's dropped cohort does not exist there, and it
+  holds ~11 attributed trades per method against ~9,000 panel views.
 
-Demoted to diagnostics, never optimization targets: decile/payoff curves (the
-SHAPE input to rank_shaping — a U or hump is invisible to IC and must be fixed
-by transforming the score, after which IC applies again), Brier/calibration (a
-repair step via isotonic, needed because conviction feeds sizing), fixed-horizon
-ICs (monitoring + holding-period machinery), gross win rate (the reporting
-convention).
+## 5. Evidence
 
-## 3. The population — simulated trades, not the ledger
+- Per-day statistics with a DAY-CLUSTERED t; a statistic pooled across days is
+  not the statistic.
+- PAIRED contrasts to compare variants: same rows, same days, per-day
+  difference, t on the difference.
+- Split halves: report both; halves of opposite sign are noise, whatever the t.
+- Walk-forward for anything fitted: train only on rows whose label had printed
+  before the fold's cutoff (each row's settle date, `end_date_pivot`, is the
+  embargo).
+- The house bar, PRE-REGISTERED before the run: paired t ≥ 2 AND same-sign
+  halves, judged on each test set as §1 requires.
+- State n, the day count, the settled share and the label definition. Fewer
+  than ~10 days is a sanity read.
+- Long and short: for a model the top tails ARE its long side and the bottom
+  tails its short side; for a decider report ALL / LONG / SHORT.
 
-Use the simulated/panel surfaces, because the real trade ledger only contains
-what the gates let through (selection bias) and is far smaller:
+## 6. Traps
 
-- **Entry / signal quality** → the `signals` panel (`signal_panel.build_panel`);
-  one row per (ticker, day) with every method score.
-- **Exit rules** → `ml_exit_dataset.build_exit_dataset` (simulated held positions,
-  one row per position-day, with `entry_directional` marking the real held
-  population) and `exit_panel` for the live held book's activation events.
-- **Whole-decision policies** → `simulated_trades`, `exit_policy_sim` (its headline
-  is EXCESS vs a hold-matched control, never raw `mean_ret`), `policy_eval`.
-
-Restrict to the **Gate-4 tradeable population** (price ≥ $5, 20-day dollar volume
-≥ $5M from the OHLCV cache) unless the question is explicitly about observe-only
-names — otherwise the result is dominated by names the system would never trade.
-
-The real ledger is structurally unusable for both metric families: a gate's
-dropped cohort never exists there (no counterfactual), and its power is hopeless
-for rankers — measured 2026-08-29: median 9,176 panel views per method vs median
-11 attributed real trades per method, and at per-trade gross return sd 7.04%
-even a 0.5%/trade edge needs ~800 closed trades pooled. The ledger's roles are
-execution-cost calibration (the constants inside the decider metric's NET
-adjustment), broker reconciliation, and the NAV monitor — never the evaluation
-sample.
-
-## 4. Split long and short — always
-
-Report ALL, LONG and SHORT for every headline number. The sides behave
-differently in this system (the funnel repeatedly measures the SELL side as the
-healthier one), and a pooled number can hide one side degrading. When the pooled
-statistic mixes sign-flipped sides, say so — the pooled oriented IC is a
-different quantity from the per-side raw-frame IC, and confusing the two has
-already produced one false "worse" conclusion.
-
-Also split by side any time you change selection or sizing: a change can be
-side-neutral on scale and still bias side COMPOSITION (that is what the Gate 1c
-side floor exists to fix).
-
-## 5. Statistics that count as evidence here
-
-- **Per-day Spearman IC** with a **day-clustered t** (mean over days ÷ SE of the
-  daily series). Pooled IC across days is not the statistic — the system ranks
-  within a day.
-- **PAIRED contrasts** when comparing two variants: same rows, same folds, per-day
-  difference, t on the difference. Unpaired means with no t are not evidence.
-- **Split-half sign check.** Report both halves. A result whose halves flip sign
-  is noise, whatever the full-window t says — this has killed several otherwise
-  significant-looking findings (every volatility-conditioning attempt so far).
-- **Walk-forward** for anything model-shaped: train only on rows whose label had
-  printed before the fold cutoff (the settle-date embargo).
-- **Pre-register the bar** before running when the result may ship: the house
-  default is paired t ≥ 2 AND same-sign halves.
-- State n, day count, and the settled/provisional mix. Thin day counts (< ~10)
-  are a sanity read, not a verdict.
-
-## 6. Traps that have produced wrong answers here
-
-- `combine_source` resolves **per ticker** — an "ML run" contains weighted
-  fail-soft rows. Filter on the row's own `combine_source`, never group by run.
-- **Epoch masks**: a scorer whose output changed is NaN before its epoch. A column
-  reading "no skill" may just be masked — check coverage before concluding.
-- **Era boundaries**: an artifact retrain or config flip splits the data into two
-  treatments. Split the analysis at the latest boundary; pooling measures neither.
-- `signal_date` is ET, `generated_at` is UTC — join through the `signals` table,
-  never by naive date arithmetic.
-- Any curve fitted on the same window you are evaluating (rank shaping, a
-  calibration) makes the result in-sample — use the as-of history
-  (`shapes_for_date`) or say plainly that the number is not a skill estimate.
-- Absolute IC levels are **not** comparable across different harnesses; paired
-  contrasts within one harness are. Don't compare across scripts.
+- **Pooling across a boundary** — the 2026-09-28 news switch, an artifact
+  retrain, a config flip: split at the boundary; a pooled number measures
+  neither treatment.
+- **Epoch masks** — a scorer whose output changed is NaN before its epoch; "no
+  skill" may be "no data". Check coverage first.
+- **`combine_source` resolves per ticker** — filter on the row's own value, never
+  group by run.
+- **`signal_date` is ET, `generated_at` is UTC** — join through `signals`, never
+  by date arithmetic.
+- **In-sample fitted layers** — a curve fitted on the window being evaluated
+  (rank shaping, a calibration) makes the result in-sample; use the as-of history
+  (`shapes_for_date`) or say so.
+- **Re-score as production serves** — the same bar and the same features
+  available at serving time; check the rank correlation with the persisted live
+  column before trusting an offline IC.
+- **Build serve-time inputs the way serving sees the store** — a session snapshot
+  built at 08:30 has no bar of its own session in the 30-minute grid; a fixture
+  or a rebuild after the fact that holds the session's bars hid a bug that left
+  every price-dependent deep feature missing on ~90% of live names (fixed
+  2026-09-26, `deep_features.RTH.with_session`).
+- **Position vs clock bar** — the `ml30` arrays' `bar` is the bar's POSITION in
+  its session, live runs are keyed by the CLOCK bar; they differ for a name that
+  skipped a bar earlier that session. Compare per-bar scores only where the two
+  agree.
+- **Absolute IC levels are not comparable across harnesses** — only paired
+  contrasts within one.
 
 ## 7. Output
 
-Lead with the verdict and the number that supports it. Give the per-side table,
-then the caveats that would change the reading (day count, provisional share,
-era mixing, selection). If a pre-registered bar was set, say explicitly whether
-it was met — and if it was missed, say the result does not ship.
+Lead with the verdict and the number behind it. Then, for EACH test set:
+
+| model | days | IC | t | top 5% | bot 5% | top 3% | bot 3% | top 1% | bot 1% | baseline |
+|---|---|---|---|---|---|---|---|---|---|---|
+
+with each tail's t beside it (for a decider: the counterfactual excess ALL / LONG
+/ SHORT). For a model trained on the selection objective, add per side:
+
+| model | side | days | entries/day | days with entry | return/day | t | halves | baseline |
+|---|---|---|---|---|---|---|---|---| Then the caveats that would change the reading: day count, settled
+share, boundaries, set 1's news coverage, in-sample fitting. If a bar was
+pre-registered, say whether it was met on each set — if missed, the change does
+not ship.

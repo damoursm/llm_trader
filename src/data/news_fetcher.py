@@ -2,6 +2,7 @@
 
 import feedparser
 import httpx
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
@@ -229,6 +230,11 @@ _GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid
 # with Google News finishing ~14 s in — so a full-universe sweep (~135 names x 3
 # queries) at 8 workers stays well inside the pool wall instead of lengthening it.
 _GOOGLE_NEWS_WORKERS = 8
+# A throttled sweep STOPS itself: once this many feeds of one sweep have come
+# back non-200 (feedparser hands a 429 back as an empty feed), the remaining
+# queries are skipped rather than spending the rest of a ~1,200-query sweep
+# digging the throttle deeper (2026-09-25, the uncapped all-source sweep).
+_GOOGLE_STOP_AFTER_NON200 = 25
 
 
 def _google_name_query(ticker: str) -> Optional[str]:
@@ -273,7 +279,8 @@ def _google_entry_source(entry) -> str:
 
 
 def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool,
-                                  statuses: Optional[Counter] = None) -> List[NewsArticle]:
+                                  statuses: Optional[Counter] = None,
+                                  stop: Optional[threading.Event] = None) -> List[NewsArticle]:
     """Per-ticker Google News: the symbol query + the company-NAME query (when a
     name is known) + (optionally) a Business Wire site-query. Fails soft so one
     bad symbol never aborts the batch. Non-200 feed statuses are tallied into
@@ -287,6 +294,10 @@ def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool,
         queries.append(f'"{ticker}" site:businesswire.com')
     out: List[NewsArticle] = []
     for q in queries:
+        if stop is not None and stop.is_set():
+            if statuses is not None:
+                statuses["skipped"] += 1
+            continue
         try:
             feed = feedparser.parse(_GOOGLE_NEWS_RSS.format(q=quote_plus(q)))
         except Exception as e:
@@ -295,6 +306,9 @@ def _fetch_google_news_for_ticker(ticker: str, cutoff: datetime, with_bw: bool,
         status = getattr(feed, "status", None)
         if statuses is not None and status is not None and int(status) != 200:
             statuses[int(status)] += 1
+            if stop is not None and sum(v for k, v in statuses.items()
+                                        if k != "skipped") >= _GOOGLE_STOP_AFTER_NON200:
+                stop.set()
         for entry in feed.entries:
             pub = _parse_feed_date(entry)
             if pub and pub < cutoff:
@@ -338,9 +352,10 @@ def fetch_google_news(tickers: List[str], max_age_hours: int = 24) -> List[NewsA
     with_bw = bool(settings.google_news_business_wire)
     out: List[NewsArticle] = []
     statuses: Counter = Counter()
+    stop = threading.Event()
     workers = max(1, min(_GOOGLE_NEWS_WORKERS, len(eligible)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gnews") as ex:
-        futs = [ex.submit(_fetch_google_news_for_ticker, t, cutoff, with_bw, statuses)
+        futs = [ex.submit(_fetch_google_news_for_ticker, t, cutoff, with_bw, statuses, stop)
                 for t in eligible]
         for f in as_completed(futs):
             try:
@@ -348,10 +363,13 @@ def fetch_google_news(tickers: List[str], max_age_hours: int = 24) -> List[NewsA
             except Exception as e:
                 logger.debug(f"[google_news] worker failed: {e}")
     out = _dedupe_by_url(out)
+    skipped = statuses.pop("skipped", 0)
     if statuses:
         logger.warning(f"Google News: {sum(statuses.values())} feed(s) returned a non-200 "
                        f"status {dict(statuses)} — throttled or blocked queries read as "
-                       f"empty feeds, so this tick's per-ticker coverage is understated")
+                       f"empty feeds, so this tick's per-ticker coverage is understated"
+                       + (f"; the sweep STOPPED after {_GOOGLE_STOP_AFTER_NON200} and skipped "
+                          f"{skipped} remaining quer{'y' if skipped == 1 else 'ies'}" if skipped else ""))
     logger.info(f"Google News: {len(out)} articles across {len(eligible)} tickers (BW={with_bw})")
     return out
 

@@ -3,10 +3,12 @@ Ticker events watch — Massive corporate ticker-events (symbol/name changes, de
 
 Protective, not a directional alpha source: a rename or delisting can silently strand
 a held position, break the OHLCV cache (the old symbol stops pricing), or leave the
-system tracking a dead ticker. This surfaces RECENT events on the held + watchlist
-names as material NewsArticles — pre-scored via provider_insights (a delisting is
-negative, a rename neutral) so the LLM scorer is skipped — so the synthesis / exit
-logic sees them. Cached daily.
+system tracking a dead ticker. This surfaces RECENT events as material NewsArticles
+— pre-scored via provider_insights (a delisting is negative, a rename neutral) so
+the LLM scorer is skipped — so the synthesis / exit logic sees them. Asked about
+the held + watchlist names until 2026-09-25 and about every name the tick scores
+since (the all-source ingestion, `src/data/news_coverage.py`). Cached daily, per
+ticker.
 """
 
 import json
@@ -35,25 +37,44 @@ def _pdate(value) -> Optional[date]:
         return None
 
 
+def _load_cache() -> Optional[List[NewsArticle]]:
+    path = _cache_path()
+    if not path.exists():
+        return None
+    try:
+        return [NewsArticle.model_validate(a)
+                for a in json.loads(path.read_text(encoding="utf-8"))]
+    except Exception as e:
+        logger.warning(f"[ticker_events] cache load failed: {e}")
+        return None
+
+
+def _save_cache(articles: List[NewsArticle]) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    try:
+        _cache_path().write_text(json.dumps([a.model_dump(mode="json") for a in articles],
+                                            default=str), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"[ticker_events] cache save failed: {e}")
+
+
 def fetch_ticker_events(tickers: List[str]) -> List[NewsArticle]:
     """Recent ticker symbol/name changes + delistings on *tickers* → NewsArticles.
 
-    Daily-cached. Returns [] when disabled / Polygon unavailable. Seed with the held
-    + watchlist names (one call per ticker)."""
+    Daily-cached PER TICKER (2026-09-25: a name asked about after the day's first
+    call is fetched and appended, `news_coverage.fetch_with_coverage`). Returns []
+    when disabled / Polygon unavailable. One call per ticker."""
     if not settings.enable_ticker_events or not polygon_client.is_available():
         return []
-
-    path = _cache_path()
-    if path.exists():
-        try:
-            return [NewsArticle.model_validate(a)
-                    for a in json.loads(path.read_text(encoding="utf-8"))]
-        except Exception as e:
-            logger.warning(f"[ticker_events] cache load failed: {e}")
-
     if not settings.enable_fetch_data:
-        return []
+        return _load_cache() or []
+    from src.data.news_coverage import fetch_with_coverage
+    return fetch_with_coverage("ticker_events", _cache_path(), tickers, _load_cache,
+                               _save_cache, _fetch_events)
 
+
+def _fetch_events(tickers: List[str]) -> List[NewsArticle]:
+    """The uncached per-ticker fetch behind `fetch_ticker_events`."""
     cutoff = date.today() - timedelta(days=settings.ticker_events_lookback_days)
     out: List[NewsArticle] = []
     for tk in dict.fromkeys(t.upper() for t in tickers if is_valid_ticker(t)):
@@ -80,13 +101,6 @@ def fetch_ticker_events(tickers: List[str]) -> List[NewsArticle]:
                 provider_insights={tk: "negative" if is_delist else "neutral"},
                 provider_sentiment_source="massive",
             ))
-
-    CACHE_DIR.mkdir(exist_ok=True)
-    try:
-        path.write_text(json.dumps([a.model_dump(mode="json") for a in out], default=str),
-                        encoding="utf-8")
-    except Exception as e:
-        logger.warning(f"[ticker_events] cache save failed: {e}")
 
     if out:
         logger.info(f"[ticker_events] {len(out)} recent event(s): {[a.tickers[0] for a in out]}")

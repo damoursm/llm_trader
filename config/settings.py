@@ -724,6 +724,16 @@ class Settings(BaseSettings):
     # not one per tick, so growth is the rate of NEW articles, not pool size.
     enable_news_archive: bool = True
     news_archive_retention_days: int = 730
+    # ALL-SOURCE NEWS INGESTION (2026-09-25, src/data/news_coverage.py; test set
+    # 2 from 2026-09-28 is defined by it). Every per-ticker news feed — the
+    # yfinance bundle, Google News, Finnhub, Polygon, 8-K, analyst, EPS, short
+    # interest, ticker events, Quiver — asks about EVERY name the tick scores,
+    # not only the ~130 that exist before the smart-money / macro / peer
+    # additions: Step 1 asks about Step 0's universe plus the previous tick's,
+    # and a top-up covers the rest once the universe is final. False restores
+    # Step 0's list (the caps are their own knobs: google_news_max_tickers,
+    # finnhub_max_tickers).
+    enable_all_source_news: bool = True
     enable_catalyst_class_cap: bool = True
     catalyst_cap_classes: str = "analyst"
     catalyst_cap_limit: float = 0.03
@@ -1325,6 +1335,22 @@ class Settings(BaseSettings):
     # COVERAGE; the provider-sentiment LLM-skip is driven by Polygon insights.
     finnhub_api_key: str = ""
     enable_finnhub_news: bool = False
+    # ALL-SOURCE ingestion (2026-09-25, src/data/finnhub_refresher.py): every
+    # scored name gets Finnhub news, not the first 60. The free tier allows 60
+    # calls/min, so a background thread in the scheduler keeps a per-ticker cache
+    # of the leg's exact request fresh (each name re-asked every
+    # finnhub_refresh_cycle_seconds) and the tick reads it; a name with no entry
+    # fetched today within finnhub_cache_max_age_seconds is fetched inline through
+    # the same limiter, up to finnhub_inline_budget per tick (the old behaviour
+    # when no refresher runs). finnhub_calls_per_minute stays below the tier's 60
+    # so a probe or a history pull never trips a 429.
+    enable_finnhub_refresher: bool = True
+    finnhub_max_tickers: int = 0               # 0 = every name (was the first 60 before 2026-09-25)
+    finnhub_calls_per_minute: int = 50
+    finnhub_refresh_cycle_seconds: int = 600
+    finnhub_cache_max_age_seconds: int = 1800
+    finnhub_inline_budget: int = 60
+    finnhub_inline_max_wait_seconds: float = 15.0
     # Polygon/Massive news + per-article sentiment "insights" (each article carries
     # {ticker, sentiment, reasoning}). ON by default now that we're on the Advanced
     # plan — real-time Benzinga-sourced coverage; feeds the provider-sentiment hybrid
@@ -1388,12 +1414,12 @@ class Settings(BaseSettings):
     # than the 5 fixed market feeds (surfaces Reuters/Bloomberg/Barron's/FT AND
     # Business Wire, the one wire our direct feeds miss). Fetched fresh every tick
     # (reactivity fast-lane). google_news_max_tickers caps the per-tick request
-    # burst (150 since 2026-09-04: the 50 cap left ~85 of the ~135-name universe
-    # with no Google News at all, and a per-ticker sweep runs ~3 queries per name
-    # well inside the Step-1 pool wall); google_news_business_wire adds the
-    # per-ticker site:businesswire.com query.
+    # burst — 0 = NO cap since 2026-09-25 (the all-source ingestion asks about
+    # every scored name, ~400 x 3 queries; it was 150 from 2026-09-04 and 50
+    # before). A throttled sweep stops itself (news_fetcher's non-200 guard);
+    # google_news_business_wire adds the per-ticker site:businesswire.com query.
     enable_google_news: bool = True
-    google_news_max_tickers: int = 150
+    google_news_max_tickers: int = 0
     google_news_business_wire: bool = True
 
     # News RELEVANCE by company name (2026-09-04, src/data/company_names.py).
@@ -2521,6 +2547,13 @@ class Settings(BaseSettings):
     # pre-2026-07-27 behaviour). The mask remains the correctness backstop for
     # everything replay cannot regenerate.
     enable_panel_replay_restore: bool = True
+    # The news family's counterpart (2026-09-23, src/analysis/news_replay.py):
+    # rows re-scored from the ARCHIVED pool (`news_replay` pool_spec 'archive')
+    # under the news epoch in force are restored into the panel instead of being
+    # blanked, so a news-scorer change no longer resets the models' news history —
+    # run `python -m src.analysis.news_replay --source archive` after the change.
+    # Off => pure epoch masking. Inert until archive re-scores exist.
+    enable_news_rescore_restore: bool = True
     # Populate `signals_replay` during EOD maintenance so a scorer change is
     # reflected without a manual `python -m src.analysis.replay --write`.
     enable_eod_replay_refresh: bool = True
@@ -2565,6 +2598,12 @@ class Settings(BaseSettings):
     # (ml_ohlcv PROMOTED to a 0.12 combine weight 2026-08-11 — user-directed.)
     enable_ml_ohlcv: bool = True
     enable_eod_ml_train: bool = True
+    # LIVE FEATURE CAPTURE (2026-09-25, src/analysis/live_features.py): every
+    # tick writes the models' technical-indicator vectors as it computed them —
+    # the 30-minute base + deep features per scored name, and the daily model's
+    # previous-session row once per session — to data/live_features/, in a
+    # background thread. Test set 2 (from 2026-09-28) reads them.
+    enable_live_feature_capture: bool = True
     # Which ml_ohlcv generation trains + serves (2026-08-08): "pivot_rank" = the
     # v2 signed-pivot within-day-rank GBM (85 features incl. leg state, full
     # universe, uniform day-equal weights — the measured winner; promotion gate
@@ -2863,6 +2902,38 @@ class Settings(BaseSettings):
     # validated spec consults no gate).
     gate4_nbbo_max_halfspread_bps: float = 12.0
 
+    # ── SELECTION-SHORT: the ONLY live entry strategy from 2026-09-28 (user
+    # directive 2026-09-26: "Deploy the model with the half give-back with max
+    # hold of 15 days with all borrowable. Use it to make all trades and put all
+    # other models as shadow."). src/signals/sel_short.py: the tail-regression
+    # LONG selection model's top-1 pick per regular-hours bar over every liquid
+    # name, fresh against its own 30-day scores, SHORTED when it rose over the 5
+    # sessions before; covered at half the run-up given back, else after 15
+    # sessions. Every other entry path is shadow (computed + persisted, not traded).
+    enable_sel_short: bool = True
+    sel_short_dir: str = "cache/ml/sel_short"     # model, universe, scores, picks journal
+    sel_short_give_back: float = 0.5              # cover at close - 0.5 x (close - close 5 sessions before)
+    sel_short_max_hold_sessions: int = 15         # time exit: same bar of day, 15 sessions later
+    sel_short_runup_sessions: int = 5             # the "rose into the pick" look-back
+    sel_short_size_multiplier: float = 1.0        # flat size (x broker_base_notional), as evaluated
+    sel_short_min_price: float = 5.0              # the model's universe: price floor ...
+    sel_short_min_dollar_volume: float = 5_000_000.0   # ... and 20-session mean RTH $ volume
+    sel_short_min_run_rows: int = 20              # a bar with fewer scored names is not a cross-section
+    sel_short_own_window_days: int = 30           # freshness: new high vs own scores over 30 sessions
+    sel_short_own_min_history: int = 10           # ... unless fewer prior scores than this
+    sel_short_workers: int = 6                    # scorer processes per run
+    sel_short_fetch_threads: int = 8              # Polygon fetch threads per scorer process
+    sel_short_bar_settle_seconds: float = 20.0    # wait after a bar ends before reading it
+    sel_short_wait_seconds: float = 480.0         # the tick waits this long for its run before trading
+    sel_short_prepare_after_et: str = "09:00"     # daily prepare from this ET time (after the 08:30 pre-open)
+    sel_short_entry_max_age_minutes: float = 75.0 # a journaled pick older than this is not taken
+    sel_short_exit_from_et: str = "10:00"         # exits judged at bar closes 10:00 ...
+    sel_short_exit_until_et: str = "16:10"        # ... through the 16:00 close's tick
+    # The legacy book: no new entries (every model is shadow) and one flatten at
+    # the first regular-hours tick at/after this instant (empty = never).
+    enable_legacy_entries: bool = False
+    legacy_flatten_after: str = "2026-09-28T09:30:00-04:00"
+
     # ── FOLLOW-THROUGH (2026-08-25, user directive; src/signals/follow_through.py).
     # At each tick, every Gate-4 scored name's hypothetical held positions
     # (cohorts entered 1..ft_max_cohort_days sessions ago in the panel direction
@@ -2875,7 +2946,9 @@ class Settings(BaseSettings):
     # RT cost 0.21-0.53%; edge is a POINT EVENT (next-day entry −0.88%) and
     # capture is the overnight gap => same-tick entry + next-session exit.
     enable_follow_through: bool = True            # score + persist (panel-first accrual)
-    enable_follow_through_trading: bool = True    # open the mechanical one-session trades
+    # SHADOW since 2026-09-28 (user directive 2026-09-26: the selection-short
+    # strategy makes all trades) — scored and persisted, never opened.
+    enable_follow_through_trading: bool = False   # open the mechanical one-session trades
     ft_tail_pct: float = 0.05                     # within-tick bottom share of ft_score
     ft_score_max: float = -0.50                   # level guard (abstains on weak days)
     ft_max_cohort_days: int = 15                  # hypothetical-position entry ages scanned
@@ -3751,6 +3824,26 @@ class Settings(BaseSettings):
     # revisit once real borrow rates accrue. 0 = charge nothing.
     enable_short_borrow_cost: bool = True
     short_borrow_annual_pct: float = 3.0
+    # IBKR's borrow book, archived every tick (2026-09-25, user directive —
+    # `src/data/ibkr_borrow.py`): the public short-stock file (shares available
+    # + annual fee for every US symbol, refreshed ~15 min) is downloaded in the
+    # tick's fetch pool and kept RAW under data/ibkr_borrow/, so a later
+    # evaluation charges a short the fee IBKR quoted at its entry. Hosts are
+    # tried in order (ftp3 does not answer from this machine, ftp2 does).
+    enable_ibkr_borrow_snapshot: bool = True
+    ibkr_borrow_hosts: str = "ftp2.interactivebrokers.com,ftp3.interactivebrokers.com"
+    ibkr_borrow_max_age_minutes: float = 120.0     # an older snapshot is "unknown": shorts not checked
+    # The borrow gate on every NEW short (rank-rule SELLs and follow-through):
+    # skip a name IBKR cannot lend in size (not listed, no shares, or shares ×
+    # price below the floor) or lends above the fee cap; it re-qualifies any
+    # tick the file changes. The fee is also stamped on the trade
+    # (`borrow_fee_pct`), which the borrow carry above then charges instead of
+    # the blended 3%. 50%/yr ≈ 1% of the position over a 5-session hold; the
+    # names above it are the squeeze-prone ones (2026-09-25 snapshot: a third of
+    # the selection model's long picks were above 100%/yr).
+    enable_short_borrow_gate: bool = True
+    short_borrow_max_fee_pct: float = 50.0
+    short_borrow_min_available_usd: float = 10_000.0
     sim_per_trade_cost_attribution: bool = True
     # Min filled legs in a tick (run) before that tick's average is trusted for
     # its unfilled trades; below it, fall through to the time-of-day average.

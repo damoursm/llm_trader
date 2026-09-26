@@ -65,6 +65,15 @@ def load_attention_baselines(force: bool = False) -> Dict[str, float]:
         from src.db import repo
         days = max(5, int(getattr(settings, "news_shock_baseline_days", 20)))
         min_days = max(2, int(getattr(settings, "news_shock_min_days", 5)))
+        # ONE ingestion regime per baseline: the all-source ingestion (2026-09-25)
+        # roughly tripled per-ticker coverage for the post-fetch names, so a
+        # baseline from before it would read every such name as an attention
+        # SHOCK for weeks. The method abstains until min_days of the new regime
+        # exist.
+        regime = ""
+        if bool(getattr(settings, "enable_all_source_news", True)):
+            from src.data.news_coverage import ALL_SOURCE_SINCE
+            regime = f"AND generated_at >= '{ALL_SOURCE_SINCE}'"
         df = repo.fetch_df(f"""
             SELECT ticker, median(day_mass) AS base, count(*) AS n_days
             FROM (
@@ -74,6 +83,7 @@ def load_attention_baselines(force: bool = False) -> Dict[str, float]:
                 WHERE signal_date >= (CURRENT_DATE - INTERVAL {days + 5} DAY)::VARCHAR
                   AND signal_date < CURRENT_DATE::VARCHAR
                   AND news_recency_mass IS NOT NULL AND news_recency_mass > 0
+                  {regime}
                 GROUP BY 1, 2
             )
             GROUP BY ticker

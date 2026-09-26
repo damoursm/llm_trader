@@ -99,6 +99,7 @@ Post-combine passes (in order)
         get no adjustment (factor 1.0).
 """
 
+import math
 import threading
 from datetime import date
 from loguru import logger
@@ -1626,6 +1627,17 @@ def _raw_confidence_scale(combine_source: str = "weighted") -> float:
     if str(getattr(settings, "method_score_basis", "rank")).lower() == "rank":
         return float(getattr(settings, "rank_raw_confidence_scale", 0.642))
     return 0.5
+
+
+def _ctx6(x) -> Optional[float]:
+    """A persisted market-state value: 6 decimals like `replay.replay_context`,
+    None (NULL in `signals`) for a missing or non-finite input — never NaN, which
+    DuckDB would store as a value."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return round(v, 6) if math.isfinite(v) else None
 
 
 def _f_or_nan(x) -> float:
@@ -3404,6 +3416,15 @@ def build_signals(
                 momentum_3m_pct=round(momentum_3m_pct, 2),
                 sector_momentum_score=round(sector_momentum_score, 3),
                 sector_benchmark=sector_benchmark_used,
+                # Pre-combine market state (2026-09-25): the same values the
+                # stacker vector above reads, rounded as `replay.replay_context`
+                # stores them, so a live row and a replayed one are one quantity.
+                # The RAW tape check, not `tape_for_conf` (that view is
+                # flag-scoped for the confidence factor).
+                atr_pct=_ctx6(atr_pct) if use_tech else None,
+                bb_width_pct=_ctx6(bb_width_pct) if use_tech else None,
+                vol_ratio=_ctx6(vol_ratio) if use_tech else None,
+                tape_score=(_ctx6(tape_check.score) if tape_check is not None else None),
                 sector_momentum_1m_pct=round(sector_momentum_1m_pct, 2),
                 sector_momentum_3m_pct=round(sector_momentum_3m_pct, 2),
                 market_momentum_score=round(market_momentum_score, 3),

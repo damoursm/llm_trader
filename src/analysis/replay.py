@@ -537,11 +537,12 @@ def restore_replayed(df: pd.DataFrame, methods=None) -> tuple:
     if methods is None:
         methods = REPLAY_TABLE_COLUMNS
     try:
-        # Context columns (atr_pct, vol_ratio, tape_score...) were NEVER
-        # persisted to `signals`, so they are ADDED to the panel rather than
-        # restored. That is the point: they are recovered market conditions the
-        # panel has never carried, and every consumer treats an absent column as
-        # absent, so adding one cannot change an existing analysis.
+        # Context columns (atr_pct, bb_width_pct, vol_ratio, tape_score) were
+        # persisted to `signals` only from 2026-09-25. On a frame without them
+        # they are ADDED; on one with them the replayed value OVERWRITES wherever
+        # it exists, so the live value only fills rows the replay has not
+        # reached — the two are one computation (`replay_context` mirrors the
+        # tick's own technical pass and tape check).
         cols = [m for m in methods if m in df.columns or m in REPLAY_TABLE_COLUMNS]
         if not cols:
             return df, {}

@@ -1577,11 +1577,35 @@ def digest_articles(articles: List[NewsArticle],
                   reverse=True)[:DIGEST_MAX_ARTICLES]
 
 
+def _digest_text(ticker: str, to_score: List[NewsArticle], as_of: Optional[datetime],
+                 digest_override: Optional[tuple] = None) -> str:
+    """The <news> block the model reads: one entry per article with its source
+    and AGE, dated from ``as_of`` (None = now). ``digest_override`` =
+    ``(digest_id, text)`` from `sentiment_digests`: returned verbatim when
+    ``to_score`` is exactly that digest, so a re-score reads the article ages
+    the original call read (a cache hit in a later run re-used a verdict scored
+    at an earlier clock). Anything else rebuilds the text as live does."""
+    if digest_override is not None and digest_override[0] == digest_id_for(ticker, to_score):
+        return digest_override[1]
+    now = as_of or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    digest_lines = []
+    for a in to_score:
+        age_h = (now - a.published_at).total_seconds() / 3600
+        age_label = f"{age_h:.0f}h ago" if age_h < 48 else f"{age_h/24:.1f}d ago"
+        digest_lines.append(
+            f"[{a.source} | {age_label}] {a.title}\n{a.summary[:400]}"
+        )
+    return "\n\n".join(digest_lines)
+
+
 def analyse_sentiment(ticker: str, articles: List[NewsArticle], *,
                       allow_provider: Optional[bool] = None,
                       store_digest: bool = True,
                       force_engine: Optional[str] = None,
-                      as_of: Optional[datetime] = None) -> tuple[float, str, dict]:
+                      as_of: Optional[datetime] = None,
+                      digest_override: Optional[tuple] = None) -> tuple[float, str, dict]:
     """
     Score news sentiment for a ticker with precision controls applied.
 
@@ -1591,6 +1615,11 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle], *,
     (apples-to-apples). On a forced-engine failure the score is the usual
     (0.0, "error") rather than silently switching engines. ``None`` keeps the
     per-run A/B order (`_PRIMARY_SENTIMENT_ENGINE` first, the other as fallback).
+
+    ``digest_override`` (the news re-score path only; None on every live call):
+    ``(digest_id, text)`` of a digest a past run's scorer read — see
+    `_digest_text`. The prompt carries that exact text when this call selects
+    the same digest.
 
     Returns:
         (score, rationale, meta)
@@ -1688,17 +1717,7 @@ def analyse_sentiment(ticker: str, articles: List[NewsArticle], *,
     # Build digest with recency indicator for the model. The age LABELS are part
     # of what the model reads ("3h ago" vs "5.2d ago" is the priced-in check), so
     # a replay must date them from its own tick too, not from today.
-    now = as_of or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    digest_lines = []
-    for a in to_score:
-        age_h = (now - a.published_at).total_seconds() / 3600
-        age_label = f"{age_h:.0f}h ago" if age_h < 48 else f"{age_h/24:.1f}d ago"
-        digest_lines.append(
-            f"[{a.source} | {age_label}] {a.title}\n{a.summary[:400]}"
-        )
-    digest = "\n\n".join(digest_lines)
+    digest = _digest_text(ticker, to_score, as_of, digest_override)
 
     # Ticker-free fixed prefix (shared → DeepSeek auto-caches it across tickers) +
     # per-ticker variable suffix. The prefix carries ALL instructions/examples; the

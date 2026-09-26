@@ -259,21 +259,27 @@ def fetch_short_interest(tickers: List[str]) -> List[NewsArticle]:
       - yfinance ticker.info (shortPercentOfFloat, shortRatio, MoM change)
       - FINRA Reg SHO daily short volume files (flow confirmation)
 
-    Cached daily.
+    Cached daily, PER TICKER (2026-09-25): a name asked about after the day's
+    first call is fetched and appended (`news_coverage.fetch_with_coverage`).
     """
-    cached = _load_cache()
-    if cached is not None:
+    if not settings.enable_fetch_data:
+        cached = _load_cache()
+        if cached is None:
+            logger.debug("[short_interest] ENABLE_FETCH_DATA=false — skipping yfinance fetch")
+            return []
         return cached
+    from src.data.news_coverage import fetch_with_coverage
+    return fetch_with_coverage("short", _cache_path(), tickers, _load_cache, _save_cache,
+                               _fetch_short)
 
+
+def _fetch_short(tickers: List[str]) -> List[NewsArticle]:
+    """The uncached fetch behind `fetch_short_interest`."""
     # ── 1. Fetch FINRA daily short volume (one request covers all tickers) ──
     finra_ratios = _fetch_finra_short_volume(tickers)
 
     # ── 2. Per-ticker short interest from yfinance ───────────────────────────
     articles: List[NewsArticle] = []
-
-    if not settings.enable_fetch_data:
-        logger.debug("[short_interest] ENABLE_FETCH_DATA=false — skipping yfinance fetch")
-        return articles
 
     for sym in tickers:
         try:
@@ -326,5 +332,4 @@ def fetch_short_interest(tickers: List[str]) -> List[NewsArticle]:
             time.sleep(_REQUEST_DELAY)
 
     logger.info(f"[short] {len(articles)} short interest article(s) from {len(tickers)} tickers")
-    _save_cache(articles)
     return articles

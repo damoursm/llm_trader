@@ -106,6 +106,10 @@ def run_retention() -> dict:
         ("news_articles_pruned", lambda: prune_beyond(
             "news_articles", "first_seen_at",
             settings.news_archive_retention_days)),
+        # Its per-feed attribution (2026-09-25) ages out with it.
+        ("news_article_feeds_pruned", lambda: prune_beyond(
+            "news_article_feeds", "first_seen_at",
+            settings.news_archive_retention_days)),
     )
     for name, fn in steps:
         try:

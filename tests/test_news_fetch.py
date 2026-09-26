@@ -345,9 +345,12 @@ def test_pipeline_fetch_news_fast_lanes_rss(monkeypatch):
     fresh = [_art("breaking wire")]
     rss_calls = []
 
-    monkeypatch.setattr(pipeline, "load_news", lambda: cached)          # cache HIT
+    monkeypatch.setattr(pipeline, "load_news", lambda key=None: cached)          # cache HIT
     monkeypatch.setattr(pipeline, "fetch_rss_news", lambda: (rss_calls.append(1) or fresh))
-    monkeypatch.setattr(pipeline, "save_news", lambda a: None)
+    monkeypatch.setattr(pipeline, "save_news", lambda a, key=None: None)
+    # the hour's bundle is per-ticker incremental (2026-09-25): a name it does
+    # not cover yet costs a yfinance call — none here.
+    monkeypatch.setattr(pipeline, "fetch_ticker_news", lambda t: [])
 
     def _no_cached_fetch(t, s):
         raise AssertionError("must not refetch the cached bundle on a cache hit")

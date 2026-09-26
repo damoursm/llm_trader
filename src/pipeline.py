@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 
 from config import settings
 from src.utils import now_et, fmt_et
-from src.data.news_fetcher import fetch_all_news, fetch_cached_news, fetch_rss_news, fetch_google_news, _dedupe_by_url
+from src.data.news_fetcher import (fetch_all_news, fetch_cached_news, fetch_rss_news, fetch_google_news,
+                                   fetch_ticker_news, _dedupe_by_url)
+from src.data import news_coverage
 from src.data.market_data import get_snapshots
 from src.data.cache import load_news, save_news, load_snapshots, save_snapshots, load_latest_snapshots
 from src.data import company_names
@@ -460,6 +462,13 @@ def _persist_run(run_id, start, finished, all_tickers, recommendations, actionab
                 # the panel records what THIS run computed (NULL when the prime
                 # was disabled/failed) — the forecast-vs-realized-drift join.
                 "exp_halfspread_bps": _liq_bps(tk),
+                # Pre-combine market state (2026-09-25): the ATR / Bollinger /
+                # volume-ratio / tape values the stackers read this tick, under
+                # the replay's column names (schema.SIGNAL_MARKET_STATE_COLUMNS).
+                "atr_pct": getattr(s, "atr_pct", None),
+                "bb_width_pct": getattr(s, "bb_width_pct", None),
+                "vol_ratio": getattr(s, "vol_ratio", None),
+                "tape_score": getattr(s, "tape_score", None),
                 "scores": all_scores,
             })
         if sig_rows:
@@ -841,20 +850,69 @@ def _assess_price_provenance(run_id, snapshots) -> Optional[dict]:
     return {"down": bool(flagged), "n_checked": n_checked, "flagged": flagged, "message": message}
 
 
-def _fetch_news(tickers, sectors):
-    # Cache-worthy bundle (per-ticker yfinance + NewsAPI): hourly cache so the
-    # rate-limited / quota-bound feeds aren't re-hammered every 30-min tick.
-    cached = load_news()
+def _bundle_topup(key, tickers) -> list:
+    """yfinance per-ticker news for the names the hour's bundle does not cover
+    yet, appended to the hour's cache; returns the NEW articles only.
+
+    The bundle used to hold whatever the hour's FIRST tick asked for and serve
+    it to every later tick of the hour, so a name that joined later got no
+    yfinance news until the next hour — and the post-fetch names never did at
+    all (2026-09-25, `news_coverage`). The coverage sidecar records which
+    tickers the hour's file holds; a file with none (written before the sidecar
+    existed) covers nothing, so its hour refetches once and merges by URL."""
+    from src.data.cache import _news_path
+    path = _news_path(key)
+    cached = load_news(key)
+    if cached is None:
+        # No bundle for this hour (Step 1's fetch failed): writing one here would
+        # create a bundle WITHOUT its NewsAPI part that every later tick of the
+        # hour would take for the real thing. The next tick's Step 1 asks about
+        # these names anyway (they are in the saved feed universe).
+        return []
+    covered = news_coverage.load_covered(path) or set()
+    missing = [t for t in dict.fromkeys(str(x).strip().upper() for x in tickers if str(x).strip())
+               if t not in covered]
+    if not missing:
+        return []
+    extra = fetch_ticker_news(missing)
+    known = {a.url for a in cached}
+    new = [a for a in _dedupe_by_url(extra) if a.url not in known]
+    save_news(_dedupe_by_url(list(cached) + list(extra)), key)
+    news_coverage.save_covered(path, covered | set(missing))
+    logger.info(f"[news] hourly bundle +{len(missing)} ticker(s) this hour "
+                f"({len(new)} new yfinance article(s))")
+    return new
+
+
+def _news_bundle(tickers, sectors) -> list:
+    """The hourly cache-worthy bundle (per-ticker yfinance + NewsAPI), extended
+    per ticker within the hour (`_bundle_topup`)."""
+    from src.data.cache import _hour_key, _news_path
+    key = _hour_key()
+    cached = load_news(key)
     if cached is None:
         cached = fetch_cached_news(tickers, sectors)
-        save_news(cached)
+        save_news(cached, key)
+        news_coverage.save_covered(_news_path(key), tickers)
         logger.info(f"[news] Fetched cache-worthy bundle ({len(cached)} articles, hourly cache)")
-    else:
-        logger.info(f"[news] Using cached per-ticker + NewsAPI bundle ({len(cached)} articles)")
+        return cached
+    logger.info(f"[news] Using cached per-ticker + NewsAPI bundle ({len(cached)} articles)")
+    new = _bundle_topup(key, tickers)
+    return _dedupe_by_url(list(cached) + list(new)) if new else cached
+
+
+def _fetch_news(tickers, sectors, parts=None):
+    # Cache-worthy bundle (per-ticker yfinance + NewsAPI): hourly cache so the
+    # rate-limited / quota-bound feeds aren't re-hammered every 30-min tick.
+    cached = _news_bundle(tickers, sectors)
     # Fast-lane: RSS + press-release wires fetched FRESH every tick (never cached),
     # mirroring the 8-K fast path — so a catalyst breaking between the hourly
     # refreshes is seen at the NEXT 30-min tick instead of up to ~an hour later.
     fresh_rss = fetch_rss_news()
+    if parts is not None:
+        # The two legs apart, for the archive's feed attribution — merged
+        # below they are indistinguishable.
+        parts["bundle"], parts["rss"] = list(cached), list(fresh_rss)
     articles = _dedupe_by_url(cached + fresh_rss)
     logger.info(
         f"[news] {len(articles)} articles ({len(cached)} cached + "
@@ -863,7 +921,7 @@ def _fetch_news(tickers, sectors):
     return articles
 
 
-def _archive_articles(run_id, start, articles):
+def _archive_articles(run_id, start, articles, feed_chunks=None):
     """Write the tick's whole pool to `news_articles` (URL-deduped, all-time).
 
     Takes the run's `start` datetime and renders it HERE. `_safe` wraps the
@@ -874,9 +932,71 @@ def _archive_articles(run_id, start, articles):
     from src.db import repo
     ts = start.isoformat() if hasattr(start, "isoformat") else str(start)
     out = repo.insert_news_articles(run_id, ts, articles)
-    logger.info(f"[news-archive] {out['new']} new / {out['seen']} already archived "
-                f"({len(articles)} in this tick's pool)")
+    msg = (f"[news-archive] {out['new']} new / {out['seen']} already archived "
+           f"({len(articles)} in this tick's pool)")
+    feeds = news_coverage.feed_attribution(feed_chunks) if feed_chunks else None
+    if feeds:
+        # Which feeds delivered each article (the pool kept only the first copy).
+        # Built HERE, not at the call site, for the same reason as `ts`.
+        f_out = repo.insert_news_article_feeds(run_id, ts, feeds)
+        msg += f"; feed attribution {f_out['new']} new / {f_out['seen']} seen (article, feed) row(s)"
+    logger.info(msg)
     return out
+
+
+# The pipeline's article-chunk labels -> the feed names `news_history` uses.
+_FEED_OF_CHUNK = {"polygon_news": "polygon", "finnhub_news": "finnhub", "google_news": "google"}
+
+
+def _news_topup(names, sectors) -> dict:
+    """The per-ticker news legs for the names that joined the universe AFTER
+    Step 1's fetch (smart money, macro discovery, cointegration peers) and were
+    not in the previous tick's universe either — the all-source ingestion's
+    last mile (2026-09-25, `src/data/news_coverage.py`). Returns
+    ``{feed: [NewsArticle]}`` under the feed names the archive attributes;
+    each leg is fail-soft on its own. The date-keyed legs (analyst, EPS, short
+    interest, ticker events) return their whole day's list — the caller keeps
+    only what the pool does not already hold."""
+    names = list(names or [])
+    jobs = {"bundle": lambda: _bundle_topup(_hour_key_now(), names)}
+    if settings.enable_google_news:
+        jobs["google"] = lambda: fetch_google_news(names)
+    if settings.enable_finnhub_news and settings.finnhub_api_key:
+        jobs["finnhub"] = lambda: fetch_finnhub_news(names, max_tickers=int(settings.finnhub_max_tickers))
+    if settings.enable_polygon_news:
+        jobs["polygon"] = lambda: fetch_polygon_news(names)
+    if settings.enable_8k_filings:
+        jobs["8k"] = lambda: fetch_8k_articles(names, lookback_days=settings.eight_k_lookback_days)
+    if settings.enable_analyst_ratings:
+        jobs["analyst"] = lambda: fetch_analyst_ratings(
+            names, lookback_days=settings.analyst_ratings_lookback_days)
+    if settings.enable_earnings:
+        jobs["eps"] = lambda: fetch_earnings_surprises(names, lookback_days=settings.earnings_lookback_days)
+    if settings.enable_short_interest:
+        jobs["short"] = lambda: fetch_short_interest(names)
+    if settings.enable_ticker_events:
+        jobs["ticker_events"] = lambda: fetch_ticker_events(names)
+    if settings.quiver_api_key:
+        if settings.enable_quiver_gov_contracts:
+            jobs["quiver_contracts"] = lambda: fetch_gov_contracts(names)
+        if settings.enable_quiver_lobbying:
+            jobs["quiver_lobbying"] = lambda: fetch_lobbying(names)
+        if settings.enable_quiver_offexchange:
+            jobs["quiver_darkpool"] = lambda: fetch_offexchange(names)
+    out: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs)), thread_name_prefix="news-topup") as ex:
+        futs = {feed: ex.submit(fn) for feed, fn in jobs.items()}
+        for feed, fut in futs.items():
+            try:
+                out[feed] = list(fut.result() or [])
+            except Exception as e:                    # noqa: BLE001 — one leg never sinks the rest
+                logger.warning(f"[news-topup] {feed} failed: {e}")
+    return out
+
+
+def _hour_key_now():
+    from src.data.cache import _hour_key
+    return _hour_key()
 
 
 def _prime_company_names(all_tickers):
@@ -1713,6 +1833,18 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     run_session = current_session()
     logger.info(f"Pipeline started at {fmt_et(start)} (session: {run_session})")
 
+    # ── SELECTION-SHORT scorer (2026-09-28): the one live entry strategy. Its
+    # scorer runs as a SUBPROCESS beside this tick (~2 min for ~2,000 names) —
+    # the latest completed regular-hours bar, or the daily prepare — and the
+    # trade step below waits for it. Fail-soft: None touches nothing.
+    _sel_handle = None
+    if not observe_only:
+        try:
+            from src.signals import sel_short as _sel_short
+            _sel_handle = _sel_short.launch(start)
+        except Exception as _sel_e:
+            logger.warning(f"[sel_short] launch failed (fail-soft): {_sel_e}")
+
     # ── Long-horizon buy arm A/B (2026-08-01) ─────────────────────────────
     # Per-run coin: replace combined_buy_score with the learned 5d stacker AND
     # hold those buys to ml_arm_min_hold_days, to capture the 5d+ edge the short-hold
@@ -1926,6 +2058,20 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # those fetchers. Full all_tickers coverage is the deliberate cost tradeoff.
     tickers = all_tickers
 
+    # ALL-SOURCE NEWS (2026-09-25, `src/data/news_coverage.py`): the per-ticker
+    # NEWS legs ask about Step 0's universe PLUS the previous tick's final
+    # universe — the smart-money / macro / peer names that only join after this
+    # fetch are nearly the same every tick (date-keyed filing caches) — and
+    # `_news_topup` covers whatever is still missing once the universe is
+    # final. The other per-ticker fetchers (fundamentals, PEAD, put/call, ...)
+    # keep Step 0's list. `enable_all_source_news=false` restores Step 0's list
+    # and no top-up.
+    _all_source = bool(getattr(settings, "enable_all_source_news", True))
+    news_tickers = (news_coverage.news_tickers(tickers, news_coverage.load_feed_universe())
+                    if _all_source else list(tickers))
+    _news_prefetch_extra = news_tickers[len(tickers):]
+    news_parts: dict = {}
+
     with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:
 
         # Group A: non-yfinance-options — submit all at once, run concurrently
@@ -1934,20 +2080,21 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # first simply does the one-time load itself).
         f_names        = (pool.submit(_safe, "company_names", _prime_company_names, all_tickers)
                           if settings.enable_name_relevance else None)
-        f_news         = pool.submit(_safe, "news", _fetch_news, tickers, sectors)
+        f_news         = pool.submit(_safe, "news", _fetch_news, news_tickers, sectors, parts=news_parts)
         f_snapshots    = pool.submit(_safe, "snapshots", _fetch_snapshots, all_tickers)
 
         # Provider news feeds (flag-gated). Polygon carries per-article sentiment
         # insights (feeds the provider-sentiment hybrid → LLM-skip); Finnhub adds
         # real-time news coverage (no sentiment on the free tier).
-        f_polygon_news = (pool.submit(_safe, "polygon_news", fetch_polygon_news, all_tickers)
+        f_polygon_news = (pool.submit(_safe, "polygon_news", fetch_polygon_news, news_tickers)
                           if settings.enable_polygon_news else None)
-        f_finnhub_news = (pool.submit(_safe, "finnhub_news", fetch_finnhub_news, tickers)
+        f_finnhub_news = (pool.submit(_safe, "finnhub_news", fetch_finnhub_news, news_tickers,
+                                      max_tickers=int(settings.finnhub_max_tickers))
                           if (settings.enable_finnhub_news and settings.finnhub_api_key) else None)
 
         # Per-ticker Google News RSS (free, no key) — fresh every tick. Widens
         # coverage to Reuters/Bloomberg/Barron's/FT and closes the Business Wire gap.
-        f_google_news = (pool.submit(_safe, "google_news", fetch_google_news, tickers)
+        f_google_news = (pool.submit(_safe, "google_news", fetch_google_news, news_tickers)
                          if settings.enable_google_news else None)
 
         # Alpha Vantage pre-scored news (LLM-skip hybrid; one batched call, hourly
@@ -1964,12 +2111,19 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         _quiver_on = bool(settings.quiver_api_key)
         f_quiver_congress = (pool.submit(_safe, "quiver_congress", fetch_congress_trades)
                              if (_quiver_on and settings.enable_quiver_congress) else None)
-        f_quiver_contracts = (pool.submit(_safe, "quiver_contracts", fetch_gov_contracts, all_tickers)
+        f_quiver_contracts = (pool.submit(_safe, "quiver_contracts", fetch_gov_contracts, news_tickers)
                               if (_quiver_on and settings.enable_quiver_gov_contracts) else None)
-        f_quiver_lobbying = (pool.submit(_safe, "quiver_lobbying", fetch_lobbying, all_tickers)
+        f_quiver_lobbying = (pool.submit(_safe, "quiver_lobbying", fetch_lobbying, news_tickers)
                              if (_quiver_on and settings.enable_quiver_lobbying) else None)
-        f_quiver_offexchange = (pool.submit(_safe, "quiver_offexchange", fetch_offexchange, all_tickers)
+        f_quiver_offexchange = (pool.submit(_safe, "quiver_offexchange", fetch_offexchange, news_tickers)
                                 if (_quiver_on and settings.enable_quiver_offexchange) else None)
+
+        # IBKR's borrow book (2026-09-25): archived every tick so a later
+        # evaluation charges a short the fee IBKR quoted at entry, and read by
+        # the borrow check on every new short. The pool's exit waits for it.
+        if settings.enable_ibkr_borrow_snapshot:
+            from src.data import ibkr_borrow
+            pool.submit(_safe, "ibkr_borrow", ibkr_borrow.snapshot)
 
         f_trends       = (pool.submit(_safe, "trends", fetch_google_trends, tickers)
                           if settings.enable_google_trends else None)
@@ -1980,17 +2134,20 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                                       user_agent=settings.reddit_user_agent)
                           if settings.enable_reddit_sentiment else None)
 
-        f_analyst      = (pool.submit(_safe, "analyst", fetch_analyst_ratings, tickers,
+        f_analyst      = (pool.submit(_safe, "analyst", fetch_analyst_ratings, news_tickers,
                                       lookback_days=settings.analyst_ratings_lookback_days)
                           if settings.enable_analyst_ratings else None)
 
-        # Ticker events (renames/delistings) — protective, only the held + watchlist
-        # names (one call each), not the whole universe.
+        # Ticker events (renames/delistings) — protective. The held + watchlist
+        # names always; every news name since the all-source ingestion (daily
+        # cached per ticker, one call each).
         f_ticker_events = (pool.submit(_safe, "ticker_events", fetch_ticker_events,
-                                       list(settings.stocks_list) + list(open_trade_tickers))
+                                       list(dict.fromkeys(list(settings.stocks_list)
+                                                          + list(open_trade_tickers)
+                                                          + (list(news_tickers) if _all_source else []))))
                            if settings.enable_ticker_events else None)
 
-        f_eps          = (pool.submit(_safe, "eps", fetch_earnings_surprises, tickers,
+        f_eps          = (pool.submit(_safe, "eps", fetch_earnings_surprises, news_tickers,
                                       lookback_days=settings.earnings_lookback_days)
                           if settings.enable_earnings else None)
 
@@ -2008,7 +2165,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f_corp_actions = (pool.submit(_safe, "corp_actions", fetch_corporate_actions_context, tickers)
                           if settings.enable_corporate_actions else None)
 
-        f_short        = (pool.submit(_safe, "short", fetch_short_interest, tickers)
+        f_short        = (pool.submit(_safe, "short", fetch_short_interest, news_tickers)
                           if settings.enable_short_interest else None)
 
         f_fred         = (pool.submit(_safe, "fred", fetch_macro_context, settings.fred_api_key)
@@ -2078,6 +2235,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
         # Group C: EDGAR — one thread, all four sources sequential inside it
         f_edgar = pool.submit(_run_edgar_tasks, all_tickers)
+        # The previous tick's extra names get their 8-K scan in a SECOND
+        # sequential stream: in Group C it would delay the insider / SEC-filing
+        # results the smart-money expansion waits for. Two streams at the
+        # module's 0.12 s spacing stay near 5 req/s, inside SEC's 10.
+        f_8k_extra = (pool.submit(_safe, "8k_extra", fetch_8k_articles, _news_prefetch_extra,
+                                  lookback_days=settings.eight_k_lookback_days)
+                      if (settings.enable_8k_filings and _news_prefetch_extra) else None)
 
     # ── Collect results ───────────────────────────────────────────────────
 
@@ -2090,7 +2254,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # Merge all article sources into a single list
     articles = get(f_news) or []
     _article_chunks = {
-        "8k":           edgar.get("8k"),
+        "8k":           (list(edgar.get("8k") or []) + list(get(f_8k_extra) or [])) or None,
         "trends":       get(f_trends),
         "reddit":       get(f_reddit),
         "analyst":      get(f_analyst),
@@ -2115,15 +2279,12 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # feeds) — first occurrence wins, preserving source ordering.
     articles = _dedupe_by_url(articles)
     logger.info(f"Steps 1–3: {len(articles)} total articles assembled")
-
-    # Archive the FULL pool before anything cuts it. `sentiment_digests` keeps
-    # only the top-20 slice that reached a scorer (and nothing at all for an
-    # abstained ticker), and `cache/news_*.json` keeps only the yfinance/NewsAPI
-    # leg — ~600 of ~2,433 — so without this ~75% of every tick is gone the
-    # moment the tick ends. That is the gap that made historical news
-    # unrecoverable (memory/news-backfill-fidelity-2026-09).
-    if bool(getattr(settings, "enable_news_archive", True)):
-        _safe("news_archive", _archive_articles, run_id, start, articles)
+    # Every leg's articles BEFORE the dedupe, under the feed names the archive
+    # attributes (the dedupe keeps only the first deliverer of a URL).
+    feed_chunks = {"bundle": news_parts.get("bundle"), "rss": news_parts.get("rss")}
+    for _label, _chunk in _article_chunks.items():
+        feed_chunks[_FEED_OF_CHUNK.get(_label, _label)] = _chunk
+    # The pool is ARCHIVED once the news top-up below has completed it.
 
     # Macro-news scan — derives a geopolitical / oil / tariff / policy regime
     # read from the SAME article flow (no extra fetch cost). Caches hourly to
@@ -2323,6 +2484,52 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                     save_snapshots(snapshots)
                 except Exception as e:
                     logger.debug(f"[snapshots] top-up cache save failed: {e}")
+
+    # ── News top-up for post-fetch discoveries (all-source ingestion) ──────
+    # The per-ticker news legs asked about Step 0's universe plus the previous
+    # tick's; a name that joined after the fetch and was in neither list gets
+    # them now, before anything scores (`news_coverage`).
+    _news_asked = {str(t).upper() for t in news_tickers}
+    _news_delta = ([t for t in all_tickers if str(t).upper() not in _news_asked]
+                   if _all_source else [])
+    _topup_added = 0
+    if _news_delta:
+        _topup = _safe("news_topup", _news_topup, _news_delta, sectors) or {}
+        _pool_urls = {a.url for a in articles}
+        _new_arts = []
+        for _feed, _chunk in _topup.items():
+            if not _chunk:
+                continue
+            feed_chunks[_feed] = list(feed_chunks.get(_feed) or []) + list(_chunk)
+            for _a in _chunk:
+                if _a.url not in _pool_urls:
+                    _pool_urls.add(_a.url)
+                    _new_arts.append(_a)
+        if _new_arts:
+            articles = list(articles) + _new_arts
+        _topup_added = len(_new_arts)
+    if _all_source:
+        logger.info(
+            f"[news-coverage] {len(all_tickers)} scored; per-ticker news feeds asked about "
+            f"{len(news_tickers) + len(_news_delta)}: {len(tickers)} from Step 0 + "
+            f"{len(_news_prefetch_extra)} from the previous tick's universe + "
+            f"{len(_news_delta)} topped up (+{_topup_added} article(s)); pool {len(articles)}")
+        news_coverage.save_feed_universe(all_tickers, run_id)
+        try:
+            from src.data import finnhub_refresher
+            finnhub_refresher.set_targets(all_tickers)
+        except Exception as e:                        # noqa: BLE001
+            logger.debug(f"[finnhub] set_targets failed: {e}")
+
+    # Archive the FULL pool before anything cuts it. `sentiment_digests` keeps
+    # only the top-20 slice that reached a scorer (and nothing at all for an
+    # abstained ticker), and `cache/news_*.json` keeps only the yfinance/NewsAPI
+    # leg — ~600 of ~2,433 — so without this ~75% of every tick is gone the
+    # moment the tick ends. That is the gap that made historical news
+    # unrecoverable (memory/news-backfill-fidelity-2026-09). Since 2026-09-25
+    # it also records WHICH feeds delivered each article (`news_article_feeds`).
+    if bool(getattr(settings, "enable_news_archive", True)):
+        _safe("news_archive", _archive_articles, run_id, start, articles, feed_chunks)
 
     # ── Expected-liquidity / drift-risk forecast (2026-08-30) ──────────────
     # Right after the data fetch, before anything scores: per-ticker expected
@@ -3035,6 +3242,16 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # the aggregator backstop's confidence_loss (signal_flipped/signal_decay
         # are shadow-only), trailing_stop, adverse_stop and ml_exit; the
         # opener-pinned LLM exits below fire only when a review exists.
+        # ── SELECTION-SHORT exits + the one-shot legacy flatten (2026-09-28),
+        # BEFORE the legacy monitor: the legacy book is closed as a whole at the
+        # first regular-hours tick at/after `legacy_flatten_after`, and the
+        # strategy's shorts take only their own two rules.
+        try:
+            from src.performance.tracker import flatten_legacy_positions, monitor_sel_short_positions
+            flatten_legacy_positions(hold_prompt_active=hold_prompt_active)
+            monitor_sel_short_positions(hold_prompt_active=hold_prompt_active)
+        except Exception as _sel_x:
+            logger.warning(f"[sel_short] exit pass failed (fail-soft): {_sel_x}")
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
@@ -3050,15 +3267,34 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         _synth_model = _synth_meta.get("model") or (
             "rule-based (no LLM)" if _synth_meta.get("provider") == "rule-based" else None
         )
-        trade_diag = record_new_trades(
-            actionable, signals_by_ticker=signals_by_ticker, run_id=run_id,
-            llm_synthesis_model=_synth_model,
-            llm_sentiment_model=_sent_model,   # snapshotted before the hold-reviews
-            universe_sources=universe_source,
-            blind_synthesis=blind_synthesis,   # A/B arm stamp (entry_blind_synthesis)
-            synth_arm=arm_shadow.live_arm_name(dual_case, blind_synthesis),
-            macro_regime_context=macro_regime_context,   # RISK_OFF sizing haircut
-        ) or {}
+        # The rank rule's recommendations are SHADOW since 2026-09-28 (user
+        # directive 2026-09-26): still computed, gated and persisted (the
+        # recommendations table + the signals panel), never opened.
+        # `trade_diag` feeds gate_diag below on EVERY tick — assign it first.
+        trade_diag = {}
+        if settings.enable_legacy_entries:
+            trade_diag = record_new_trades(
+                actionable, signals_by_ticker=signals_by_ticker, run_id=run_id,
+                llm_synthesis_model=_synth_model,
+                llm_sentiment_model=_sent_model,   # snapshotted before the hold-reviews
+                universe_sources=universe_source,
+                blind_synthesis=blind_synthesis,   # A/B arm stamp (entry_blind_synthesis)
+                synth_arm=arm_shadow.live_arm_name(dual_case, blind_synthesis),
+                macro_regime_context=macro_regime_context,   # RISK_OFF sizing haircut
+            ) or {}
+        else:
+            logger.info(f"[sel_short] legacy entries are SHADOW: {len(actionable or [])} actionable "
+                        f"recommendation(s) persisted, not traded")
+        # ── SELECTION-SHORT entries: wait for this tick's scorer (bounded), then
+        # open every journaled short still fresh — including a late pick a
+        # previous tick's scorer journaled after that tick had traded.
+        try:
+            from src.signals import sel_short as _sel_short
+            _sel_short.wait(_sel_handle)
+            from src.performance.tracker import record_sel_short_trades
+            record_sel_short_trades(run_id=run_id)
+        except Exception as _sel_o:
+            logger.warning(f"[sel_short] entry pass failed (fail-soft): {_sel_o}")
 
         # ── FOLLOW-THROUGH (2026-08-25): exit-as-entry candidates ────────────
         # Score every Gate-4 name's hypothetical held cohorts with the live
@@ -3218,6 +3454,17 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         universe_sources=universe_source,
         shadow_arm_branch=shadow_arm_branch,
     )
+
+    # LIVE FEATURE CAPTURE (2026-09-25): the models' technical-indicator
+    # vectors — the 30-minute base + deep features ml_ohlcv was served, and the
+    # daily model's previous-session row — as THIS tick computed them, written
+    # to data/live_features/ in a background thread (never the critical path).
+    if bool(getattr(settings, "enable_live_feature_capture", True)):
+        try:
+            from src.analysis import live_features
+            live_features.capture_async(run_id, start, list(signals_by_ticker))
+        except Exception as e:                        # noqa: BLE001
+            logger.warning(f"[live-features] capture not started: {e}")
 
     # Surface a silent LLM-layer outage (dead local server / credits exhausted /
     # bad key) loudly: a CRITICAL log line here, plus an email banner + subject

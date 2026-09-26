@@ -62,6 +62,49 @@ def _no_gateway_auto_restart(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_news_coverage_and_live_features(tmp_path, monkeypatch):
+    """The all-source news ingestion (2026-09-25) writes coverage sidecars, the
+    tick's feed universe and a Finnhub cache under cache/, and the live feature
+    capture writes data/live_features/ from a background thread. No test may
+    touch the production copies — every path is redirected, the capture is
+    switched off (its own tests opt in) and the refresher's in-memory state is
+    dropped, so a cached Finnhub entry never leaks from one test to the next."""
+    from config.settings import settings
+    from src.analysis import live_features
+    from src.data import finnhub_refresher, news_coverage
+
+    monkeypatch.setattr(news_coverage, "COVERAGE_DIR", tmp_path / "coverage")
+    monkeypatch.setattr(news_coverage, "FEED_UNIVERSE_PATH", tmp_path / "news_feed_universe.json")
+    monkeypatch.setattr(finnhub_refresher, "CACHE_PATH", tmp_path / "finnhub_news_cache.json")
+    monkeypatch.setattr(finnhub_refresher, "STATE_PATH", tmp_path / "finnhub_refresher_state.json")
+    monkeypatch.setattr(live_features, "LIVE_DIR", tmp_path / "live_features")
+    monkeypatch.setattr(settings, "enable_live_feature_capture", False)
+    finnhub_refresher.reset()
+    # IBKR's borrow file (2026-09-25): never downloaded by a test, and the real
+    # archive under data/ibkr_borrow/ must not decide a test's shorts.
+    from src.data import ibkr_borrow
+    monkeypatch.setattr(ibkr_borrow, "ARCHIVE_DIR", tmp_path / "ibkr_borrow")
+    monkeypatch.setattr(settings, "enable_ibkr_borrow_snapshot", False)
+    ibkr_borrow.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_sel_short(tmp_path, monkeypatch):
+    """The selection-short strategy (2026-09-28) keeps its model, score history
+    and picks journal under cache/ml/sel_short and flattens the legacy book once
+    per `legacy_flatten_after`. No test may read or write the production copies,
+    launch its scorer subprocess or trip the flatten: its own tests opt in."""
+    from config.settings import settings
+    from src.performance import tracker
+    from src.signals import sel_short
+    monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel_short"))
+    monkeypatch.setattr(settings, "enable_sel_short", False)
+    monkeypatch.setattr(settings, "legacy_flatten_after", "")
+    monkeypatch.setattr(tracker, "_LEGACY_FLATTEN_MARKER", tmp_path / "legacy_flatten_done.json")
+    sel_short._MODEL.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolated_wedge_history(tmp_path, monkeypatch):
     """Point the broker's persisted repeated-wedge history at a throwaway file.
 

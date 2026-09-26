@@ -54,6 +54,10 @@ KNOWN_DEAD_SOURCES = frozenset({"tick", "insider"})
 # return is a WARNING and a dashboard flag: "ran OK but returned nothing".
 EXPECTED_SPARSE_SOURCES = frozenset({
     "8k", "sec", "analyst", "eps", "pead", "short",
+    # All-source news (2026-09-25): the 8-K scan of the previous tick's extra
+    # names, and the top-up of names that joined after the fetch — both often
+    # legitimately empty (no 8-K in the window; nothing new joined).
+    "8k_extra", "news_topup",
     "trends", "reddit", "whisper", "revision", "options", "gex",
     "earnings_cal", "macro_news", "polygon_news", "finnhub_news",
     # Alpha Vantage pre-scored news + StockTwits crowd sentiment — optional,

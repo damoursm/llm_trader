@@ -480,6 +480,107 @@ def compute_ml_score(ticker: str) -> Tuple[float, str]:
 _MIN_30M_BARS = 400          # ~31 sessions; the longest causal window is ret_126
 
 
+_FEAT_CACHE: dict = {}
+
+
+def features_30m(ticker: str, now=None):
+    """``(frame, label)`` — the 30-MINUTE feature row a 30-minute artifact is
+    served on, for the last bar whose 30 minutes have ELAPSED at ``now``
+    (naive UTC; default the clock). ``frame`` is None with a reason label
+    (``NO_DATA`` / ``ERROR``) when there is no usable row, else a dict:
+
+      ``features``  every `ticker_feature_frame` column at that bar, the 9 leg
+                    features (computed on the series CUT at the bar) over them;
+      ``bar_ts``    the bar's start (naive UTC), ``close`` its close,
+      ``sday`` / ``bar_idx``  its session day and index within the session
+                    (what `deep_features.serving_vector` needs), ``n_bars``.
+
+    Shared by `_score_30m` and the live feature capture
+    (`src/analysis/live_features.py`, 2026-09-25) — one computation, so the
+    captured vector IS the one the model was served. Memoised per (ticker,
+    half-hour slot, tick-cache mtime), like the score."""
+    import pandas as pd
+    if now is None:
+        now = pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None)
+    else:
+        now = pd.Timestamp(now)
+        if now.tzinfo is not None:
+            now = now.tz_convert("UTC").tz_localize(None)
+    slot = int(now.value // (1800 * 10 ** 9))
+    try:
+        from src.data.cache import _ohlcv_path
+        mt = _ohlcv_path(ticker, "30m").stat().st_mtime_ns
+    except Exception:
+        mt = 0
+    ck = (ticker, slot, mt)
+    hit = _FEAT_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    try:
+        from src.analysis.ml_dataset import hlc_30m
+        hlc = hlc_30m(ticker)
+    except Exception as e:
+        logger.debug(f"[ml_ohlcv] 30m bars failed for {ticker}: {e}")
+        return _memo_feat(ck, None, "ERROR")
+    frame, label = features_30m_from_hlc(ticker, hlc, now)
+    return _memo_feat(ck, frame, label)
+
+
+def features_30m_from_hlc(ticker: str, hlc, now):
+    """`features_30m` on bars the CALLER supplies (``hlc`` in `ml_dataset.hlc_30m`'s
+    shape; ``now`` naive UTC) — no memo. The selection-short scorer
+    (`src/signals/sel_short.py`) serves ~2,000 names whose freshest bars it
+    fetches itself, the tick cache holding only the names a tick touches; one
+    function, so its vectors are the ones `features_30m` would compute."""
+    import pandas as pd
+    try:
+        from src.analysis.pivot_target import LEG_FEATURES, leg_feature_rows
+        from src.analysis.ml_dataset import ticker_feature_frame
+        if hlc is None:
+            return None, "NO_DATA"
+        idx, high, low, close, volume = hlc
+        # Completed bars only: a bar STARTING at t is usable from t+30m.
+        n_vis = int(((idx + pd.Timedelta(minutes=30)) <= now).sum())
+        if n_vis < _MIN_30M_BARS:
+            return None, "NO_DATA"
+        cut = (idx[:n_vis], high.iloc[:n_vis], low.iloc[:n_vis],
+               close.iloc[:n_vis], volume.iloc[:n_vis])
+        fs = ticker_feature_frame(ticker, hlc=cut)
+        if fs is None or fs.empty:
+            return None, "NO_DATA"
+        row = fs.iloc[-1]
+
+        legs = leg_feature_rows(
+            close.iloc[:n_vis].to_numpy(dtype=float),
+            high.iloc[:n_vis].to_numpy(dtype=float),
+            low.iloc[:n_vis].to_numpy(dtype=float),
+            list(idx[:n_vis]), only_last=True)
+        if not legs:
+            return None, "NO_DATA"
+        leg = {f: float(legs[0][f]) for f in LEG_FEATURES
+               if f in legs[0] and legs[0][f] == legs[0][f]}
+        feats = {str(k): v for k, v in row.items()}
+        feats.update(leg)
+        from src.analysis import deep_features as dfe
+        sdays = dfe.session_days(idx[:n_vis])
+        sday = int(sdays[-1])
+        frame = {"features": feats, "bar_ts": pd.Timestamp(idx[n_vis - 1]),
+                 "close": float(close.iloc[n_vis - 1]), "sday": sday,
+                 "bar_idx": int((sdays == sday).sum()) - 1, "n_bars": n_vis}
+        return frame, "OK"
+    except Exception as e:
+        logger.debug(f"[ml_ohlcv] 30m features failed for {ticker}: {e}")
+        return None, "ERROR"
+
+
+def _memo_feat(key, frame, label: str):
+    _FEAT_CACHE[key] = (frame, label)
+    if len(_FEAT_CACHE) > 8000:                          # bound the per-run memo
+        _FEAT_CACHE.clear()
+        _FEAT_CACHE[key] = (frame, label)
+    return frame, label
+
+
 def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
     """Serve an artifact trained on 30-MINUTE feature rows.
 
@@ -494,6 +595,9 @@ def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
       * the memo is keyed on the half-hour slot as well as the cache file, since
         keying on the daily file's mtime (what the daily path does) would serve
         one stale intraday score for the rest of the session.
+
+    The feature row itself comes from `features_30m` (shared with the live
+    feature capture, so the captured vector is the served one).
     """
     import pandas as pd                      # lazy, like every other import here
     cfg = art["config"]
@@ -509,7 +613,7 @@ def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
     if hit is not None:
         return hit
     try:
-        from src.analysis.pivot_target import LEG_FEATURES, leg_feature_rows, pivot_basis
+        from src.analysis.pivot_target import pivot_basis
         expected = pivot_basis()
         if cfg.get("pivot_basis") != expected:
             global _BASIS_WARNED
@@ -520,31 +624,10 @@ def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
                 _BASIS_WARNED = True
             return _memo(ck, 0.0, "BASIS_STALE")
 
-        from src.analysis.ml_dataset import hlc_30m, ticker_feature_frame
-        hlc = hlc_30m(ticker)
-        if hlc is None:
-            return _memo(ck, 0.0, "NO_DATA")
-        idx, high, low, close, volume = hlc
-        # Completed bars only: a bar STARTING at t is usable from t+30m.
-        n_vis = int(((idx + pd.Timedelta(minutes=30)) <= now).sum())
-        if n_vis < _MIN_30M_BARS:
-            return _memo(ck, 0.0, "NO_DATA")
-        cut = (idx[:n_vis], high.iloc[:n_vis], low.iloc[:n_vis],
-               close.iloc[:n_vis], volume.iloc[:n_vis])
-        fs = ticker_feature_frame(ticker, hlc=cut)
-        if fs is None or fs.empty:
-            return _memo(ck, 0.0, "NO_DATA")
-        row = fs.iloc[-1]
-
-        legs = leg_feature_rows(
-            close.iloc[:n_vis].to_numpy(dtype=float),
-            high.iloc[:n_vis].to_numpy(dtype=float),
-            low.iloc[:n_vis].to_numpy(dtype=float),
-            list(idx[:n_vis]), only_last=True)
-        if not legs:
-            return _memo(ck, 0.0, "NO_DATA")
-        leg = {f: float(legs[0][f]) for f in LEG_FEATURES
-               if f in legs[0] and legs[0][f] == legs[0][f]}
+        frame, label = features_30m(ticker, now)
+        if frame is None:
+            return _memo(ck, 0.0, label)
+        feats = frame["features"]
 
         # DEEP FEATURES (2026-09-23): an artifact trained with the deep store's
         # point-in-time features (`dp_*`) is fed them from the SESSION SNAPSHOT
@@ -558,22 +641,17 @@ def _score_30m(ticker: str, art: dict) -> Tuple[float, str]:
         deep = {}
         if any(str(f).startswith("dp_") for f in art["features"]):
             from src.analysis import deep_features as dfe
-            last = idx[n_vis - 1:n_vis]
-            sday = int(dfe.session_days(last)[0])
-            bar_idx = int((dfe.session_days(idx[:n_vis]) == sday).sum()) - 1
+            sday = frame["sday"]
             snapshot = dfe.load_session_snapshot(sday)
             if snapshot is None:
                 if sday not in dfe.recent_session_days():
                     return _memo(ck, 0.0, "DEEP_STALE")
                 dfe.trigger_snapshot_build(sday)
                 return _memo(ck, 0.0, "DEEP_PENDING")
-            deep = dfe.serving_vector(ticker, sday, float(close.iloc[n_vis - 1]), bar_idx, snapshot)
+            deep = dfe.serving_vector(ticker, sday, frame["close"], frame["bar_idx"], snapshot)
 
         def _val(f):
-            if f in deep:
-                v = deep[f]
-            else:
-                v = leg.get(f) if f in leg else row.get(f)
+            v = deep[f] if f in deep else feats.get(f)
             return float(v) if v is not None and v == v else np.nan
 
         X = np.array([[_val(f) for f in art["features"]]], dtype=float)
@@ -593,9 +671,10 @@ def _memo(key, net: float, label: str) -> Tuple[float, str]:
 
 
 def reset_caches() -> None:
-    """Test hook — drop the artifact + score memos."""
+    """Test hook — drop the artifact, score and feature memos."""
     _ART_CACHE.update(mtime=None, art=None)
     _SCORE_CACHE.clear()
+    _FEAT_CACHE.clear()
 
 
 if __name__ == "__main__":  # pragma: no cover

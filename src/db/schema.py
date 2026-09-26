@@ -45,6 +45,12 @@ news_articles       — THE FULL per-tick article pool, URL-deduped and stored
                       what makes a point-in-time reconstruction honest: an
                       article is visible to a replayed tick only from the run
                       that first saw it.
+news_article_feeds  — which FEEDS delivered each archived article (since the
+                      2026-09-25 all-source ingestion): one row per (url_hash,
+                      feed) with that feed's first/last sighting and the
+                      tickers it tagged, because the pool keeps only the first
+                      copy of a URL — what rebuilds a single feed's pool for
+                      the per-source news features.
 sentiment_digests   — the article digest each sentiment verdict was scored on,
                       keyed by an ENGINE-FREE digest_id (ticker + article set),
                       so a repair or a human judgment attaches to the exact
@@ -181,6 +187,22 @@ SIGNAL_LOGPROB_COLUMNS = ("news_expected_score", "news_argmax_score")
 # — CONTEXT, not a method score (predicts execution drift, not direction).
 # NULL on rows written before the column existed or when the run had no view.
 SIGNAL_LIQUIDITY_COLUMNS = ("exp_halfspread_bps",)
+
+# Pre-combine market state (2026-09-25): ATR(14) / close, Bollinger width /
+# middle band and the 5d/20d volume ratio from the tick's own
+# `compute_technical_score` pass, plus the tape composite from
+# `compute_tape_confirmation` — the four values the stackers read at serving
+# time, under the SAME names `replay.replay_context` stores in `signals_replay`.
+# CONTEXT, not method scores. Before 2026-09-25 only the EOD replay recorded
+# them, so a run's rows lacked them until the replay reached that day; the tick
+# now writes them itself, and where a replayed value exists
+# `replay.restore_replayed` still overwrites the panel column with it (the two
+# are one computation, so this only fills the gap). NULL on rows written before
+# the column existed, when the technical pass is disabled, or when the tape
+# check did not run. Short or missing history gives the neutral values the
+# replay stores too (the technical module's EMPTY_RESULT, a NO_DATA tape at
+# 0.0), not NULL — the stackers read those same values when they serve.
+SIGNAL_MARKET_STATE_COLUMNS = ("atr_pct", "bb_width_pct", "vol_ratio", "tape_score")
 
 # News-event dataset columns (2026-08-15): the sentiment LLM's dominant catalyst
 # class (sentiment.NEWS_CATALYST_TYPES) + its RAW verdict before the evidence/
@@ -457,6 +479,7 @@ SCHEMA_STATEMENTS = [
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_LOGPROB_COLUMNS)},
         {", ".join(f"{c} {t}" for c, t in SIGNAL_NEWS_EVENT_COLUMNS)},
         {", ".join(f"{c} DOUBLE" for c in SIGNAL_LIQUIDITY_COLUMNS)},
+        {", ".join(f"{c} DOUBLE" for c in SIGNAL_MARKET_STATE_COLUMNS)},
         combine_source      VARCHAR,
         scores              VARCHAR
     );
@@ -741,6 +764,17 @@ SCHEMA_STATEMENTS = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS news_article_feeds (
+        url_hash      VARCHAR,
+        feed          VARCHAR,
+        tickers_json  VARCHAR,
+        first_seen_at VARCHAR,
+        first_run_id  VARCHAR,
+        last_seen_at  VARCHAR,
+        n_sightings   INTEGER
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS sentiment_digests (
         digest_id     VARCHAR,
         ticker        VARCHAR,
@@ -800,7 +834,9 @@ SCHEMA_STATEMENTS = [
         news_unpriced_all  DOUBLE,
         news_catalyst      VARCHAR,
         news_recency_mass  DOUBLE,
-        news_article_count INTEGER
+        news_article_count INTEGER,
+        news_digest_id     VARCHAR,
+        news_epoch         VARCHAR
     );
     """,
     """
@@ -933,6 +969,8 @@ _ADD_COLUMNS = (
     ("signals", "catalyst_tilt", "DOUBLE"),
     # Expected-liquidity forecast context column (2026-08-30) on an existing DB.
     *(("signals", col, "DOUBLE") for col in SIGNAL_LIQUIDITY_COLUMNS),
+    # Pre-combine market state (2026-09-25) on an existing DB.
+    *(("signals", col, "DOUBLE") for col in SIGNAL_MARKET_STATE_COLUMNS),
     # Book-at-submit columns (2026-08-31) on an existing broker_orders table.
     ("broker_orders", "bid_at_submit", "DOUBLE"),
     ("broker_orders", "ask_at_submit", "DOUBLE"),
@@ -947,6 +985,11 @@ _ADD_COLUMNS = (
     # 2026-09-12: the two weighted news methods that shipped after the table did.
     ("news_replay", "news_quiet", "DOUBLE"),
     ("news_replay", "news_bull_fresh", "DOUBLE"),
+    # 2026-09-23: the archive re-score's certificate (the digest the scorer read,
+    # compared with the live row's) and the news epoch it was scored under — the
+    # panel restores a row only while that epoch is still in force.
+    ("news_replay", "news_digest_id", "VARCHAR"),
+    ("news_replay", "news_epoch", "VARCHAR"),
     ("catalyst_repairs", "arm", "VARCHAR"),
     ("catalyst_repairs", "rationale", "VARCHAR"),
 )

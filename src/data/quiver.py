@@ -279,6 +279,28 @@ _DPI_MIN_BARS = 10        # need history to judge a shift
 _DPI_SHIFT = 0.06         # recent-vs-baseline DPI delta to flag (≈6 percentage pts)
 
 
+def _deep_dpi_rows(tk: str) -> list:
+    """The deep store's copy of ``/historical/offexchange/{tk}`` — refreshed every
+    night by `src/data/deep/refresh.py` from the SAME endpoint and stored
+    verbatim (``Date``, ``DPI``, ...), so the article builder below reads it
+    exactly like the API answer. [] when the store holds no part for the name."""
+    try:
+        from src.data import deep
+        part = deep.DEEP_DIR / "quiver_dpi" / "parts" / f"{tk}.parquet"
+        if not part.exists():
+            return []
+        import duckdb
+        con = duckdb.connect()
+        try:
+            df = con.execute("SELECT * FROM read_parquet(?)", [part.as_posix()]).df()
+        finally:
+            con.close()
+        return df.to_dict("records")
+    except Exception as e:                            # noqa: BLE001 — fail-soft like _get
+        logger.debug(f"[quiver] deep DPI read failed for {tk}: {e}")
+        return []
+
+
 def fetch_offexchange(tickers: List[str]) -> List[NewsArticle]:
     """Per-ticker dark-pool index (DPI = off-exchange share of volume). Emits an
     article only when the recent DPI departs meaningfully from its baseline —
@@ -287,8 +309,14 @@ def fetch_offexchange(tickers: List[str]) -> List[NewsArticle]:
     if not (settings.enable_quiver_offexchange and is_available()):
         return []
     out: List[NewsArticle] = []
-    for tk in [t.upper() for t in (tickers or [])][: settings.quiver_offexchange_max_tickers]:
-        rows = _get(f"/historical/offexchange/{tk}")
+    names = list(dict.fromkeys(t.upper() for t in (tickers or [])))
+    cap = int(settings.quiver_offexchange_max_tickers)
+    for i, tk in enumerate(names):
+        # ALL-SOURCE (2026-09-25): past the API cap (Hobbyist rate limits — the
+        # live leg and the nightly deep refresh together already draw 429s) a
+        # name reads the deep store's copy of the SAME endpoint, refreshed nightly
+        # and stored verbatim, instead of going without.
+        rows = _get(f"/historical/offexchange/{tk}") if i < cap else _deep_dpi_rows(tk)
         if not rows or len(rows) < _DPI_MIN_BARS:
             continue
         # Quiver returns rows NEWEST-FIRST; sort by date so "recent" is genuinely
@@ -324,6 +352,8 @@ def fetch_offexchange(tickers: List[str]) -> List[NewsArticle]:
             published_at=datetime(d.year, d.month, d.day, tzinfo=timezone.utc),
             tickers=[tk],
         ))
-        time.sleep(0.1)   # gentle pacing for the per-ticker loop
-    logger.info(f"[quiver] Off-exchange: {len(out)} dark-pool shift article(s)")
+        if i < cap:
+            time.sleep(0.1)   # gentle pacing for the per-ticker API loop
+    logger.info(f"[quiver] Off-exchange: {len(out)} dark-pool shift article(s) "
+                f"({min(cap, len(names))} name(s) from the API, {max(0, len(names) - cap)} from the deep store)")
     return out

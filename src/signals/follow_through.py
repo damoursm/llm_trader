@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import time
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from loguru import logger
 
@@ -61,18 +61,39 @@ def _gate4_ok(ticker: str, price: Optional[float], dfc=None) -> bool:
         return False
 
 
-def _panel_history(n_days: int) -> Dict[str, dict]:
+def _artifact_methods(art_features: Sequence[str]) -> List[str]:
+    """The methods behind the LOADED ml_exit artifact's `ex_<method>` features —
+    the entry-day columns its training read (`build_exit_dataset` hands exactly
+    these to `method_horizon_days`), not today's constants, which move whenever
+    the stacker feature set does."""
+    from src.analysis.ml_exit_dataset import EXIT_STATE_FEATURES
+    state = set(EXIT_STATE_FEATURES)
+    return [f[3:] for f in art_features if f.startswith("ex_") and f not in state]
+
+
+def _panel_history(n_days: int, methods: Sequence[str] = ()) -> Dict[str, dict]:
     """Last `n_days` distinct panel dates' per-(date, ticker) direction, abs
-    combine and method scores (last run of each day) — the cohort anchors.
-    One query per tick; {} on any failure."""
+    combine and entry-day method scores (last run of each day) — the cohort
+    anchors. One query per tick; {} on any failure.
+
+    ``methods`` (`_artifact_methods`) only feed `method_horizon_days` →
+    `ex_elapsed_ratio`, and the SELECT takes the ones `signals` actually HAS,
+    read from the live schema on every call. Built from `STACKER_LIVE_FEATURES`
+    until 2026-09-23, it broke when that list gained 21 names on 2026-09-07
+    that were not `signals` columns (`atr_pct`, `bb_width_pct`, `vol_ratio` —
+    columns since 2026-09-25 — and the `cat_*` one-hots): DuckDB refused the
+    query, this returned {} on every tick, and follow-through scored and traded
+    nothing for 16 days while failing soft."""
     from src.db import repo
-    from src.analysis.ml_stacker import STACKER_LIVE_FEATURES
-    mcols = [m for m in STACKER_LIVE_FEATURES if m != "tape_score"]
     try:
+        have = set(repo.fetch_df(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'signals'")["column_name"].astype(str))
+        mcols = [m for m in methods if m in have]
+        extra = "".join(f', "{m}"' for m in mcols)
         df = repo.fetch_df(f"""
             SELECT signal_date, ticker, direction,
-                   COALESCE(combined_score_abs, combined_score) AS c_abs,
-                   {', '.join(mcols)}
+                   COALESCE(combined_score_abs, combined_score) AS c_abs{extra}
             FROM (SELECT *, row_number() OVER (PARTITION BY signal_date, ticker
                                                ORDER BY generated_at DESC) rn
                   FROM signals
@@ -99,15 +120,18 @@ def _panel_history(n_days: int) -> Dict[str, dict]:
 
 def _prev_selected_tickers() -> set:
     """Tickers ft_selected on the most recent PRIOR panel date — the first-day-
-    of-episode guard. Empty set on any failure (fail-open: an episode repeat is
+    of-episode guard. The prior date is the last one with ANY panel rows, not the
+    last one follow-through scored: after an outage the latter reaches back past
+    it (on 2026-09-23, to 09-04) and blocks names whose episode ended weeks ago.
+    A prior date follow-through did not score yields no selections, so the guard
+    passes everything. Empty set on any failure (fail-open: an episode repeat is
     a wasted candidate slot, not a safety issue)."""
     from src.db import repo
     try:
         df = repo.fetch_df("""
             SELECT DISTINCT ticker FROM signals
             WHERE ft_selected = 1.0 AND signal_date = (
-                SELECT MAX(signal_date) FROM signals
-                WHERE signal_date < ? AND ft_score IS NOT NULL)
+                SELECT MAX(signal_date) FROM signals WHERE signal_date < ?)
         """, [date.today().isoformat()])
         return set(df["ticker"].astype(str)) if df is not None and not df.empty else set()
     except Exception:
@@ -228,7 +252,8 @@ def compute_follow_through(signals_by_ticker: dict,
             logger.debug("[follow_through] no ml_exit artifact — skipping")
             return {}
         feats_order = list(art["features"])
-        hist = _panel_history(int(settings.ft_max_cohort_days) + 1)
+        hist = _panel_history(int(settings.ft_max_cohort_days) + 1,
+                              _artifact_methods(feats_order))
         if not hist:
             return {}
         # Warm the method-horizon calibration OUTSIDE the budget — its first

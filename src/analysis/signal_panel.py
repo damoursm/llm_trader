@@ -289,6 +289,16 @@ def build_panel(horizons: Sequence[int] = (1, 5, 10), days: Optional[int] = None
             df, _restored = restore_replayed(df)
         except Exception as _e:
             logger.debug(f"[panel] replay restore unavailable: {_e}")
+    # The news family has its own restore (2026-09-23): archive re-scores under
+    # the news epoch in force, so a news-scorer change stops resetting history.
+    if getattr(settings, "enable_news_rescore_restore", True):
+        try:
+            from src.analysis.news_replay import restore_news_rescored
+            df, _news_restored = restore_news_rescored(df)
+            for _k, _v in _news_restored.items():
+                _restored[_k] = (_restored[_k] | _v) if _k in _restored else _v
+        except Exception as _e:
+            logger.debug(f"[panel] news re-score restore unavailable: {_e}")
     if _restored:
         logger.info("[panel] replayed with current scorers: "
                     + ", ".join(f"{k}({int(v.sum())})" for k, v in sorted(_restored.items())))

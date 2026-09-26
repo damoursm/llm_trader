@@ -176,16 +176,24 @@ def fetch_earnings_surprises(
     Only generates an article when |surprise| ≥ min_surprise_pct and the report is
     within lookback_days of today.
 
-    Cached daily.
+    Cached daily, PER TICKER (2026-09-25): a name asked about after the day's
+    first call is fetched and appended (`news_coverage.fetch_with_coverage`).
     """
-    cached = _load_surprises_cache()
-    if cached is not None:
-        return cached
-
     if not settings.enable_fetch_data:
-        logger.debug("[earnings] ENABLE_FETCH_DATA=false — skipping yfinance surprises fetch")
-        return []
+        cached = _load_surprises_cache()
+        if cached is None:
+            logger.debug("[earnings] ENABLE_FETCH_DATA=false — skipping yfinance surprises fetch")
+            return []
+        return cached
+    from src.data.news_coverage import fetch_with_coverage
+    return fetch_with_coverage(
+        "eps", _surprises_path(), tickers, _load_surprises_cache, _save_surprises_cache,
+        lambda missing: _fetch_surprises(missing, lookback_days, min_surprise_pct))
 
+
+def _fetch_surprises(tickers: List[str], lookback_days: int,
+                     min_surprise_pct: float) -> List[NewsArticle]:
+    """The uncached per-ticker fetch behind `fetch_earnings_surprises`."""
     cutoff = date.today() - timedelta(days=lookback_days)
     articles: List[NewsArticle] = []
 
@@ -243,7 +251,6 @@ def fetch_earnings_surprises(
             time.sleep(_REQUEST_DELAY)
 
     logger.info(f"[earnings] {len(articles)} EPS surprise article(s) from {len(tickers)} tickers")
-    _save_surprises_cache(articles)
     return articles
 
 

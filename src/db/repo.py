@@ -22,7 +22,8 @@ from src.db.schema import (SIGNAL_METHOD_COLUMNS, SIGNAL_NEWS_ATTENTION_COLUMNS,
                            SIGNAL_COMBINED_SIDE_COLUMNS,
                            SIGNAL_NEWS_EVENT_COLUMNS,
                            SIGNAL_FT_COLUMNS,
-                           SIGNAL_LIQUIDITY_COLUMNS)
+                           SIGNAL_LIQUIDITY_COLUMNS,
+                           SIGNAL_MARKET_STATE_COLUMNS)
 
 
 # When True, read paths open read-only connections. The dashboard sets this so it
@@ -328,6 +329,7 @@ _SIGNAL_COLS = (_SIGNAL_BASE_COLS + list(SIGNAL_METHOD_COLUMNS)
                + ["combine_source"]
                + list(SIGNAL_FT_COLUMNS)
                + list(SIGNAL_LIQUIDITY_COLUMNS)
+               + list(SIGNAL_MARKET_STATE_COLUMNS)
                + ["scores"])
 
 
@@ -370,6 +372,7 @@ def insert_signals(run_id: str, generated_at: str, signal_date: str,
             + [r.get("combine_source")]
             + [_f(r.get(c)) for c in SIGNAL_FT_COLUMNS]
             + [_f(r.get(c)) for c in SIGNAL_LIQUIDITY_COLUMNS]
+            + [_f(r.get(c)) for c in SIGNAL_MARKET_STATE_COLUMNS]
             + [_json(scores)]
         ))
     placeholders = ", ".join(["?"] * len(_SIGNAL_COLS))
@@ -623,6 +626,44 @@ def insert_news_articles(run_id: str, generated_at: str, articles: List) -> dict
     return {"new": int(n_new), "seen": len(seen) - int(n_new)}
 
 
+def insert_news_article_feeds(run_id: str, generated_at: str, attribution: dict) -> dict:
+    """Which FEEDS delivered each archived article (2026-09-25, the all-source
+    news ingestion — `src/data/news_coverage.py`).
+
+    `news_articles` keeps ONE row per article and the tick's pool keeps the
+    first copy of a URL, so the second and third feeds that carried the same
+    story were invisible — and a per-source feature group (`news_history`)
+    needs exactly that. One row per (url_hash, feed): the first and last tick
+    THAT feed delivered it, and the tickers that feed tagged it with when it
+    first did. A past run's pool for one feed = the rows with
+    ``first_seen_at <= run <= last_seen_at``, joined to `news_articles` for the
+    text. ``attribution`` is `news_coverage.feed_attribution`'s
+    ``{url_hash: {feed: [tickers]}}``. Returns ``{"new": n, "seen": n}``.
+    """
+    rows = []
+    for h, legs in (attribution or {}).items():
+        for feed, tks in (legs or {}).items():
+            rows.append((str(h), str(feed), json.dumps(list(tks)) if tks else None,
+                         generated_at, str(run_id), generated_at, 1))
+    if not rows:
+        return {"new": 0, "seen": 0}
+    with connect() as conn:
+        conn.execute("CREATE TEMP TABLE _naf_in AS SELECT * FROM news_article_feeds WHERE 1=0")
+        conn.executemany("INSERT INTO _naf_in VALUES (?,?,?,?,?,?,?)", rows)
+        n_new = conn.execute(
+            "SELECT count(*) FROM _naf_in i WHERE NOT EXISTS (SELECT 1 FROM news_article_feeds f "
+            "WHERE f.url_hash = i.url_hash AND f.feed = i.feed)").fetchone()[0]
+        # repeat sighting: bump the tail, never the head
+        conn.execute(
+            "UPDATE news_article_feeds AS f SET last_seen_at = ?, n_sightings = f.n_sightings + 1 "
+            "FROM _naf_in AS i WHERE f.url_hash = i.url_hash AND f.feed = i.feed", [generated_at])
+        conn.execute(
+            "INSERT INTO news_article_feeds SELECT * FROM _naf_in i WHERE NOT EXISTS "
+            "(SELECT 1 FROM news_article_feeds f WHERE f.url_hash = i.url_hash AND f.feed = i.feed)")
+        conn.execute("DROP TABLE _naf_in")
+    return {"new": int(n_new), "seen": len(rows) - int(n_new)}
+
+
 def insert_sentiment_digests(rows: List[dict]) -> None:
     """Persist the article digests the sentiment scorer actually saw, keyed by
     the ENGINE-FREE ``digest_id`` (2026-09-06).
@@ -748,6 +789,8 @@ _NEWS_REPLAY_COLS = (
     # mechanically (`tests/test_db_signals.py` pins the same relationship for
     # `SIGNAL_METHOD_COLUMNS`), so a drift test now pins this one too.
     "news_quiet", "news_bull_fresh",
+    # 2026-09-23: archive re-score provenance (certificate + scoring epoch).
+    "news_digest_id", "news_epoch",
 )
 
 

@@ -814,6 +814,15 @@ def _current_slot(now_naive: datetime, slots: list[tuple[_time, str]]) -> tuple[
     return candidate
 
 
+def _finnhub_keepalive() -> None:
+    """Wake the Finnhub refresher before a slot (it idles through weekends)."""
+    try:
+        from src.data import finnhub_refresher
+        finnhub_refresher.keepalive()
+    except Exception as exc:                          # noqa: BLE001 — never the loop's problem
+        logger.debug(f"[scheduler] finnhub keepalive failed: {exc}")
+
+
 def start_scheduler() -> None:
     """Run the intraday poll loop: one tick per slot, NYSE market days only.
 
@@ -923,6 +932,17 @@ def start_scheduler() -> None:
                     "(ENABLE_EOD_ML_{TRAIN,BUY_TRAIN,EXIT_TRAIN}=false) — "
                     "ml_ohlcv / ml_buy / ml_sell / ml_exit are FROZEN at their "
                     "current artifacts. See .env for why and how to resume.")
+    # The Finnhub refresher (all-source news, 2026-09-25): a daemon thread that
+    # keeps every scored name's Finnhub news fresh inside the free tier's 60
+    # calls/min, so the tick reads a cache instead of spending ~7 minutes on
+    # the calls. A refresher that fails to start degrades the leg to its
+    # inline budget (the first 60 names), never the tick.
+    try:
+        from src.data import finnhub_refresher
+        finnhub_refresher.start()
+    except Exception as exc:                          # noqa: BLE001
+        logger.warning(f"[scheduler] Finnhub refresher did not start ({exc}) — the Finnhub "
+                       "leg falls back to its inline budget")
     try:
         while True:
             now_naive = now_et().replace(tzinfo=None)
@@ -955,6 +975,11 @@ def start_scheduler() -> None:
                             "normal operation. Keep the machine plugged in / awake."
                         )
             prev_poll = now_naive
+
+            # A slot within 20 minutes wakes the Finnhub refresher, so the first
+            # tick after a weekend finds its cache warm.
+            if _missed_slots_between(now_naive, now_naive + timedelta(minutes=20), slots, 0):
+                _finnhub_keepalive()
 
             current = _current_slot(now_naive, slots)
 

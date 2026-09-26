@@ -1350,6 +1350,16 @@ class TickerSignal(BaseModel):
     family_conf_factor: float = 1.0    # ∈ [1∓family_agreement_factor_span] cross-family vote
     tape_conf_factor: float = 1.0      # ∈ [1∓tape_confirmation_factor_span] raw tape alignment
     sector_conf_factor: float = 1.0    # 1.10 aligned / 0.75 contradicted (third-pass sector alignment)
+    # Pre-combine market state (2026-09-25) — the inputs underneath
+    # movement_factor / volume_factor / tape_conf_factor, persisted to `signals`
+    # under the replay's column names (schema.SIGNAL_MARKET_STATE_COLUMNS).
+    # None = not computed this run (technical pass disabled, tape check not
+    # run). Short history gives the neutral values the replay stores and the
+    # stackers read (technical EMPTY_RESULT, a NO_DATA tape at 0.0).
+    atr_pct: Optional[float] = None        # ATR(14) / close
+    bb_width_pct: Optional[float] = None   # (BB upper - lower) / middle
+    vol_ratio: Optional[float] = None      # 5d mean volume / prior 20d mean
+    tape_score: Optional[float] = None     # raw tape composite, NOT flag-scoped like tape_confirmation_score
     # GEX fields — populated when enable_gex=true
     gex_signal: str = ""           # PINNED | AMPLIFIED | NEUTRAL | ""
     gamma_flip: Optional[float] = None
