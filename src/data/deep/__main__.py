@@ -26,7 +26,7 @@ from src.data.deep import (DEEP_DIR, consolidate, deep_universe, run_keys, statu
 
 ORDER = ["sec_filings", "companyfacts", "form345", "form13f", "bars30m_full", "short_interest",
          "short_volume", "dividends", "splits", "ticker_details", "ipos", "context", "ftd",
-         "wiki", "yf", "quiver", "polygon_news", "delisted"]
+         "wiki", "yf", "quiver", "polygon_news", "delisted", "regsho"]
 
 
 def _universe(a) -> list:
@@ -119,6 +119,11 @@ def run_family(fam: str, a) -> dict:
         r = run_keys(fam, keys[: a.limit] if a.limit else keys, ftd.fetch_file, workers=min(w, 3),
                      budget_seconds=b, retry_failed=rf)
         consolidate(fam)
+    elif fam == "regsho":
+        from src.data.deep import regsho
+        r = regsho.run(since=date.fromisoformat(a.since) if a.since else regsho.START,
+                       workers=min(w, 3), budget_seconds=b,
+                       markets=[m for m in a.markets.split(",") if m] if a.markets else regsho.MARKETS)
     elif fam == "wiki":
         from src.data.deep import wiki
         m = wiki.mapping(refresh=a.refresh_universe)
@@ -171,6 +176,8 @@ def main(argv=None) -> None:
     ap.add_argument("--refresh-universe", action="store_true")
     ap.add_argument("--no-retry-failed", action="store_true")
     ap.add_argument("--delisted-since", default="2021-01-01")
+    ap.add_argument("--since", default="", help="regsho: first list date (default 2021-01-04)")
+    ap.add_argument("--markets", default="", help="regsho: comma list of markets (default all)")
     ap.add_argument("--delisted-30m", action="store_true", help="also fetch 30-minute bars for delisted names")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--consolidate-only", action="store_true")

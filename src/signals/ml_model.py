@@ -526,12 +526,14 @@ def features_30m(ticker: str, now=None):
     return _memo_feat(ck, frame, label)
 
 
-def features_30m_from_hlc(ticker: str, hlc, now):
+def features_30m_from_hlc(ticker: str, hlc, now, with_series: bool = False):
     """`features_30m` on bars the CALLER supplies (``hlc`` in `ml_dataset.hlc_30m`'s
     shape; ``now`` naive UTC) — no memo. The selection-short scorer
     (`src/signals/sel_short.py`) serves ~2,000 names whose freshest bars it
     fetches itself, the tick cache holding only the names a tick touches; one
-    function, so its vectors are the ones `features_30m` would compute."""
+    function, so its vectors are the ones `features_30m` would compute.
+    ``with_series`` adds ``frame["atr_series"]`` (the visible bars' `atr_pct_14`)
+    and ``frame["n_vis"]`` — the V2 model arm's own-history input (`sel_v2.bar_extras`)."""
     import pandas as pd
     try:
         from src.analysis.pivot_target import LEG_FEATURES, leg_feature_rows
@@ -567,6 +569,10 @@ def features_30m_from_hlc(ticker: str, hlc, now):
         frame = {"features": feats, "bar_ts": pd.Timestamp(idx[n_vis - 1]),
                  "close": float(close.iloc[n_vis - 1]), "sday": sday,
                  "bar_idx": int((sdays == sday).sum()) - 1, "n_bars": n_vis}
+        if with_series:
+            frame["atr_series"] = fs["atr_pct_14"].to_numpy(dtype=float) if "atr_pct_14" in fs.columns \
+                else np.full(n_vis, np.nan)
+            frame["n_vis"] = n_vis
         return frame, "OK"
     except Exception as e:
         logger.debug(f"[ml_ohlcv] 30m features failed for {ticker}: {e}")

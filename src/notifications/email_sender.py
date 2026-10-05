@@ -174,12 +174,27 @@ HTML_TEMPLATE = """
   {% if broker_health.broker_timeouts %}<br>&bull; <b>Requests timed out</b> &mdash; IB Gateway is likely wedged (process up, API dead). Restart the gateway / check IBC; the app auto-recovers the gateway in paper mode.{% endif %}
   {% if broker_health.errors and '10329' in (broker_health.errors | join(' ')) %}<br>&bull; <b>Error 10329 (directly routed)</b> &mdash; a gateway API <i>Precautionary Setting</i> is discarding direct-routed orders. Set <code>BypassOrderPrecautions=yes</code> + <code>BypassRedirectOrderWarning=yes</code> in <code>C:\\IBC\\config.ini</code> and relaunch the gateway.{% endif %}
   {% if not broker_health.connected %}<br>&bull; <b>Not connected</b> &mdash; check IB Gateway is running on the configured port and logged in.{% endif %}
+  {% if broker_health.gateway_session %}<br>&bull; <b>IB Gateway logged out of IBKR</b> since {{ broker_health.gateway_session.since }} ({{ broker_health.gateway_session.reason | e }}) &mdash; orders cannot reach IBKR. {% if broker_health.gateway_session.auto_recoverable %}IBKR demanded a re-login that IBC could not complete; the scheduler restarts the gateway automatically (paper, 30-min cooldown){% if broker_health.gateway_relogin_restart %} &mdash; restarted this run, login still pending{% endif %}. If it stays logged out, restart the <code>IBC Gateway</code> scheduled task.{% else %}A manual login to this paper account elsewhere (TWS, Client Portal, mobile) logs the Gateway out &mdash; close that session, then restart the <code>IBC Gateway</code> scheduled task (never automatic: it would throw that session out).{% endif %}{% endif %}
   <br>Full detail is in the broker order log (dashboard Execution tab).
   </div>
 </div>
 {% elif broker_health %}
 <div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
-  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.fills_repaired %} &middot; {{ broker_health.fills_repaired }} fill(s) repaired{% endif %}{% if broker_health.retries %} &middot; {{ broker_health.retries }} transient submit retr{{ 'y' if broker_health.retries == 1 else 'ies' }}{% endif %}{% if broker_health.stale_cancels %} &middot; {{ broker_health.stale_cancels }} stale order(s) re-anchored{% endif %}{% if broker_health.entry_cancels_on_close %} &middot; {{ broker_health.entry_cancels_on_close }} working entr{{ 'y' if broker_health.entry_cancels_on_close == 1 else 'ies' }} cancelled on close{% endif %}{% if broker_health.slippage %} &middot; avg slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps (+ = adverse){% endif %}.
+  &#9989; Broker ({{ broker_health.mode }}) &mdash; {{ broker_health.entries }} entr{{ 'y' if broker_health.entries == 1 else 'ies' }} / {{ broker_health.exits }} exit(s) submitted this run{% if broker_health.fills_repaired %} &middot; {{ broker_health.fills_repaired }} fill(s) repaired{% endif %}{% if broker_health.retries %} &middot; {{ broker_health.retries }} transient submit retr{{ 'y' if broker_health.retries == 1 else 'ies' }}{% endif %}{% if broker_health.stale_cancels %} &middot; {{ broker_health.stale_cancels }} stale order(s) re-anchored{% endif %}{% if broker_health.entry_cancels_on_close %} &middot; {{ broker_health.entry_cancels_on_close }} working entr{{ 'y' if broker_health.entry_cancels_on_close == 1 else 'ies' }} cancelled on close{% endif %}{% if broker_health.slippage %} &middot; avg slippage {{ "%+.1f"|format((broker_health.slippage | sum(attribute='bps')) / (broker_health.slippage | length)) }} bps (+ = adverse){% endif %}{% if broker_health.gateway_relogin_restart %} &middot; IB Gateway restarted automatically after IBKR's refused re-login ({{ broker_health.gateway_relogin_restart | e }}){% endif %}.
+</div>
+{% endif %}
+
+{% if sel_health and sel_health.down %}
+<div style="background:#7c2d12;border:1px solid #c2410c;border-radius:8px;padding:12px 16px;margin:0 0 18px;color:#fed7aa;font-size:13px;">
+  &#128276; <b>Selection-short scorer issue</b> &mdash; {{ sel_health.runs }}/{{ sel_health.bars_due }} bar(s) scored today.
+  <div style="margin-top:6px;color:#fdba74;line-height:1.7;">
+  {% for p in sel_health.problems %}&bull; {{ p | e }}<br>{% endfor %}
+  No pick is taken from a bar that was never scored. Scorer log: <code>logs/sel_short.log</code>; runs: <code>cache/ml/sel_short/runs/</code>.
+  </div>
+</div>
+{% elif sel_health and sel_health.bars_due %}
+<div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:10px 16px;margin:0 0 18px;color:#86efac;font-size:12px;">
+  &#9989; Selection-short scorer &mdash; {{ sel_health.runs }}/{{ sel_health.bars_due }} bar(s) scored today{% if sel_health.snapshot and sel_health.snapshot.coverage is not none %} &middot; session snapshot {{ '%.0f'|format(100 * sel_health.snapshot.coverage) }}% priced{% endif %}{% for n in sel_health.notes or [] %} &middot; {{ n | e }}{% endfor %}.
 </div>
 {% endif %}
 
@@ -5517,6 +5532,7 @@ def send_recommendations(
     llm_health: Optional[dict] = None,     # LLM-layer health verdict this run (down/message)
     broker_health: Optional[dict] = None,  # broker/execution reconcile verdict this run
     price_health: Optional[dict] = None,   # price-provenance verdict (entry vs snapshot divergence)
+    sel_health: Optional[dict] = None,     # selection-short scorer health (sel_short.health + down)
 ) -> bool:
     """Render and send the recommendation email with embedded chart images."""
     all_recs_check = all_recommendations or recommendations
@@ -5670,6 +5686,7 @@ def send_recommendations(
         llm_health=llm_health,
         broker_health=broker_health,
         price_health=price_health,
+        sel_health=sel_health,
         total=total_analysed or len(all_recs),
         colors=ACTION_COLOR,
         # recommendation lists
@@ -5918,6 +5935,9 @@ def send_recommendations(
 
     if price_health and price_health.get("down"):
         subject = "🔔 PRICE | " + subject
+
+    if sel_health and sel_health.get("down"):
+        subject = "🔔 SCORER | " + subject
 
     try:
         # Outer wrapper: multipart/related so inline CID images are recognised

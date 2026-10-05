@@ -14,14 +14,31 @@ ET starts), single-source (Polygon, adjusted).
 * ``load_deep_30m(tk)`` — the stored frame, or None.
 * ``deep_series_30m(tk)`` — ``(idx, c, h, lo)`` for the label scan: the deep
   frame extended by whatever the TICK cache holds after its last bar (the tick
-  cache is refreshed every tick for live names, the deep store only on demand),
+  cache is refreshed every tick for live names; the deep store is extended through
+  the previous session every market day — by the 08:30 ET pre-open run
+  (`deep.refresh.extend_bars_30m`) and the selection short's `--prepare` — and on
+  demand),
   falling back to the tick cache alone for a name the store has never seen.
   NaN / non-positive bars are dropped.
 * ``extend_deep_30m(tickers, ...)`` — fetch and append the bars each ticker is
-  missing (from its last stored session to today; from ``DEEP_FROM`` for a new
-  name), with a wall-clock budget and a worker pool. Idempotent; a killed run
-  costs only its in-flight names. Never run beside an RTH tick — a few thousand
-  Polygon calls share the tick's rate budget (`memory/refactor-rewalk-kill-loop`).
+  missing (from its last stored session, re-read as an overlap, to today; from
+  ``DEEP_FROM`` for a new name), with a wall-clock budget and a worker pool. A
+  rescaled overlap only prompts the split-data check below. Idempotent; a killed run
+  costs only its in-flight names. A full catch-up is a few thousand Polygon calls
+  that share the tick's rate budget — never beside an RTH tick
+  (`memory/refactor-rewalk-kill-loop`); the daily one-session extension (one call
+  per name, before the open) is the scheduled exception. Writers use a per-process
+  temp file, so the two daily extenders cannot interleave one pickle.
+* ``reset_split_tickers(tickers)`` — SPLITS (user directives 2026-09-27/28): the
+  deep store's split data decides. A name whose split took effect after its
+  history was last adjusted (``_adjusted_asof.json``) has its WHOLE history
+  refetched before any inference — by the pre-open run, the selection short's
+  prepare and each of its runs. Never on a price change alone (the block comment
+  above ``SPLIT_SCALE_TOLERANCE``).
+
+Beyond `ml_ohlcv`'s labels, this store is the price grid of every deep-feature
+session snapshot (`analysis/deep_features.RTH`) and the history the selection
+short's series is rebuilt from.
 
 CLI: ``python -m src.data.intraday_store --extend [--workers 4] [--budget-seconds N]
 [--min-age-days 3] [--tickers A,B]`` and ``--stats``.
@@ -30,6 +47,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -85,7 +103,10 @@ def save_deep_30m(tk: str, df: pd.DataFrame) -> None:
     DEEP_DIR.mkdir(parents=True, exist_ok=True)
     df = _rth_only(_naive_utc_index(df))
     df = df[~df.index.duplicated(keep="last")]
-    tmp = _path(tk).with_suffix(".pkl.tmp")
+    # a per-PROCESS temp name: the pre-open refresh and the selection short's
+    # prepare can extend the same name at the same moment, and two writers
+    # sharing one temp file can install an interleaved pickle
+    tmp = _path(tk).with_suffix(f".pkl.{os.getpid()}.tmp")
     with open(tmp, "wb") as fh:
         pickle.dump(df, fh)
     os.replace(tmp, _path(tk))
@@ -139,6 +160,196 @@ def _fetch_range(tk: str, from_date: str, to_date: str) -> pd.DataFrame:
     return _naive_utc_index(df)
 
 
+# ── splits: reset a ticker's history before any inference on it ─────────────
+# Polygon serves bars ADJUSTED as of the fetch day, and the store only ever
+# APPENDED: after a split the stored pre-split bars sat on the old scale beside
+# post-split ones (MGN 1-for-30, 2026-09-17: $0.18 -> $4.89 between two bars) —
+# a fake run-up for the selection short's riser rule, a fake ATR% for its vol
+# arm, garbage features for the model and the snapshots. User directives
+# 2026-09-27/28: "When seeing a stock split in the data ingestion we should
+# automatically reset the historical data before doing any kind of inference on
+# this ticker" — and "verify from your split data if it's possible instead of
+# assuming depending on the price change". So the SPLIT DATA decides (the deep
+# store's `splits` family: announced splits with their execution date):
+#   * `reset_split_tickers` resets every name whose split took effect after its
+#     history was last adjusted (the `_adjusted_asof.json` stamp) — in the
+#     pre-open run, the selection short's prepare and each of its runs, i.e.
+#     before any inference, including a split effective TODAY;
+#   * an extension re-reads the last stored session; a changed scale only
+#     PROMPTS the split-data check — confirmed, the name is reset; unconfirmed,
+#     it is logged (a data correction, or a split the data does not hold yet)
+#     and appended as before, never reset on the price change alone.
+SPLIT_SCALE_TOLERANCE = 0.02               # |fresh / stored - 1| beyond this = look at the split data
+SPLITS_PATH = Path("cache/ml/deep/splits.parquet")
+# The store was built in September 2026 and only appended since; a name with no
+# stamp is taken as adjusted as of this date, so every split since is re-checked.
+_ADJ_DEFAULT = "2026-08-01"
+
+
+def _adj_path() -> Path:
+    return DEEP_DIR / "_adjusted_asof.json"
+
+
+def _adjusted_asof() -> Dict[str, str]:
+    try:
+        import json
+        return json.loads(_adj_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+_STAMP_LOCK = threading.Lock()
+
+
+def _stamp_adjusted(tk: str, day: date) -> None:
+    """One read-modify-write at a time: `extend_deep_30m` stamps NEW names from its worker
+    threads, which shared one temp file and raced (2026-10-05, 103 new listings: 7 'failed'
+    after their bars were saved, and stamps lost)."""
+    import json
+    with _STAMP_LOCK:
+        stamps = _adjusted_asof()
+        stamps[tk.upper()] = day.isoformat()
+        DEEP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _adj_path().with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(stamps, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, _adj_path())
+
+
+def scale_change(old: pd.DataFrame, fresh: pd.DataFrame) -> Optional[float]:
+    """The median fresh/stored close ratio over the bars both hold, when it is
+    off 1 by more than `SPLIT_SCALE_TOLERANCE` (the adjustment basis changed),
+    else None."""
+    common = pd.DatetimeIndex(old.index).intersection(pd.DatetimeIndex(fresh.index))
+    if len(common) == 0:
+        return None
+    a = pd.to_numeric(old.loc[common, "Close"], errors="coerce").to_numpy(float)
+    b = pd.to_numeric(fresh.loc[common, "Close"], errors="coerce").to_numpy(float)
+    ok = np.isfinite(a) & np.isfinite(b) & (a > 0) & (b > 0)
+    if not ok.any():
+        return None
+    med = float(np.median(b[ok] / a[ok]))
+    return med if abs(med - 1.0) > SPLIT_SCALE_TOLERANCE else None
+
+
+def reset_deep_30m(tk: str, today: Optional[date] = None, why: str = "") -> str:
+    """Refetch the ticker's WHOLE history (adjusted as of now) and replace the
+    stored frame. Returns 'reset', 'empty' or 'failed'."""
+    today = today or date.today()
+    try:
+        fresh = _fetch_range(tk, DEEP_FROM, today.isoformat())
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"[intraday_store] {tk}: history reset failed ({e})")
+        return "failed"
+    if fresh.empty:
+        return "empty"
+    save_deep_30m(tk, fresh)
+    _stamp_adjusted(tk, today)
+    logger.warning(f"[intraday_store] {tk}: history RESET ({why or 'split'}) — {len(fresh)} bars refetched")
+    return "reset"
+
+
+_SPLIT_CACHE: Dict[str, tuple] = {}
+
+
+def latest_splits(today: date) -> Optional[Dict[str, date]]:
+    """``{ticker: latest split execution date <= today}`` from the split data
+    (read once per file version), or None when it cannot be read."""
+    p = Path(SPLITS_PATH)
+    try:
+        key = (p.as_posix(), p.stat().st_mtime, today.isoformat())
+    except OSError:
+        return None
+    hit = _SPLIT_CACHE.get("v")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        import duckdb
+        df = duckdb.connect().execute(
+            f"SELECT ticker, max(execution_date) AS d FROM read_parquet('{p.as_posix()}') "
+            "WHERE split_from > 0 AND split_to > 0 AND split_from <> split_to "
+            f"AND execution_date <= '{today.isoformat()}' GROUP BY ticker").fetchdf()
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"[intraday_store] split data unreadable ({e})")
+        return None
+    out = {str(t).upper(): d for t, d in zip(df["ticker"], pd.to_datetime(df["d"]).dt.date)}
+    _SPLIT_CACHE["v"] = (key, out)
+    return out
+
+
+def split_rows() -> Optional[Dict[str, List[Tuple[date, float, float]]]]:
+    """``{ticker: [(execution date, split_from, split_to), ...]}`` from the split data —
+    every split it records, future-dated ones included (the caller cuts by date) — read
+    once per file version, or None when it cannot be read."""
+    p = Path(SPLITS_PATH)
+    try:
+        key = (p.as_posix(), p.stat().st_mtime)
+    except OSError:
+        return None
+    hit = _SPLIT_CACHE.get("rows")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        import duckdb
+        df = duckdb.connect().execute(
+            f"SELECT DISTINCT ticker, execution_date, split_from, split_to FROM read_parquet('{p.as_posix()}') "
+            "WHERE split_from > 0 AND split_to > 0 AND split_from <> split_to").fetchdf()
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"[intraday_store] split data unreadable ({e})")
+        return None
+    out: Dict[str, List[Tuple[date, float, float]]] = {}
+    for t, d, a, b in zip(df["ticker"], pd.to_datetime(df["execution_date"]).dt.date, df["split_from"], df["split_to"]):
+        out.setdefault(str(t).upper(), []).append((d, float(a), float(b)))
+    _SPLIT_CACHE["rows"] = (key, out)
+    return out
+
+
+def split_factor_between(tk: str, after: date, through: date,
+                         rows: Optional[Dict[str, List[Tuple[date, float, float]]]] = None) -> Optional[float]:
+    """What a price quoted on ``after`` is multiplied by to compare with one quoted on
+    ``through``: the product of split_from / split_to over the splits executed in
+    (``after``, ``through``] (a 1-for-10 reverse split: x10; a 2-for-1 split: x0.5). A split
+    dated after ``through`` never counts. 1.0 when none; None when the split data cannot be read."""
+    rows = split_rows() if rows is None else rows
+    if rows is None:
+        return None
+    f = 1.0
+    for d, a, b in rows.get(tk.upper(), []):
+        if after < d <= through:
+            f *= a / b
+    return f
+
+
+def split_to_apply(tk: str, today: date, splits: Optional[Dict[str, date]] = None) -> Optional[date]:
+    """The execution date of a split the split data records for ``tk`` AFTER its
+    stored history was last adjusted (and on/before ``today``), else None."""
+    splits = latest_splits(today) if splits is None else splits
+    d = (splits or {}).get(tk.upper())
+    if d is None:
+        return None
+    asof = date.fromisoformat(_adjusted_asof().get(tk.upper(), _ADJ_DEFAULT))
+    return d if d > asof else None
+
+
+def reset_split_tickers(tickers: Iterable[str], today: Optional[date] = None) -> Dict[str, str]:
+    """Reset every ticker in ``tickers`` whose split (the split data) took
+    effect after its stored history was last adjusted and on/before ``today``.
+    Returns ``{ticker: outcome}`` for the names it touched. Fail-soft: unreadable
+    split data resets nothing (logged)."""
+    today = today or date.today()
+    names = {t.upper() for t in tickers}
+    splits = latest_splits(today) if names else None
+    if not splits:
+        return {}
+    out: Dict[str, str] = {}
+    for tk in sorted(names & set(splits)):
+        if not _path(tk).exists():
+            continue
+        d = split_to_apply(tk, today, splits)
+        if d is not None:
+            out[tk] = reset_deep_30m(tk, today, why=f"split effective {d}")
+    return out
+
+
 def extend_deep_30m(tickers: Iterable[str], *, workers: int = 4, budget_seconds: float = 1800.0,
                     min_age_days: int = 3, today: Optional[date] = None) -> Dict[str, int]:
     """Append the missing bars for every ticker whose stored history ends more
@@ -151,8 +362,10 @@ def extend_deep_30m(tickers: Iterable[str], *, workers: int = 4, budget_seconds:
         if last is None:
             todo.append((tk, DEEP_FROM))
         elif (today - last).days > min_age_days:
-            todo.append((tk, (last + timedelta(days=1)).isoformat()))
-    stats = dict(considered=0, fresh=0, extended=0, new=0, empty=0, failed=0, skipped_budget=0)
+            # from the last stored session itself: the overlap is re-read and
+            # compared, so a split shows up as a scale change (`scale_change`)
+            todo.append((tk, last.isoformat()))
+    stats = dict(considered=0, fresh=0, extended=0, new=0, empty=0, failed=0, skipped_budget=0, reset=0)
     stats["considered"] = len(todo)
     if not todo:
         return stats
@@ -168,7 +381,18 @@ def extend_deep_30m(tickers: Iterable[str], *, workers: int = 4, budget_seconds:
             old = load_deep_30m(tk)
             if old is None:
                 save_deep_30m(tk, fresh)
+                _stamp_adjusted(tk, date.today())
                 return tk, "new"
+            ratio = scale_change(old, fresh)
+            if ratio is not None:
+                # the price change only PROMPTS a look at the split data
+                d = split_to_apply(tk, date.today())
+                if d is not None:
+                    return tk, reset_deep_30m(tk, date.today(),
+                                             why=f"split effective {d}, stored bars rescaled x{ratio:.4g}")
+                logger.warning(f"[intraday_store] {tk}: stored bars rescaled x{ratio:.4g} but the split data "
+                               f"records no split since the history was adjusted — NOT reset (a data "
+                               f"correction, or a split not in the data yet); appended as before")
             merged = pd.concat([old, fresh[fresh.index > old.index.max()]]).sort_index()
             save_deep_30m(tk, merged)
             return tk, "extended"

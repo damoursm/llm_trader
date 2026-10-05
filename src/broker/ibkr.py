@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -55,10 +56,17 @@ def _install_ib_log_bridge() -> None:
     class _LoguruBridge(_logging.Handler):
         def emit(self, record: "_logging.LogRecord") -> None:  # noqa: D102
             try:
+                msg = record.getMessage()
                 level = ("CRITICAL" if record.levelno >= _logging.CRITICAL
                          else "ERROR" if record.levelno >= _logging.ERROR
                          else "WARNING")
-                logger.log(level, f"[ib_async] {record.getMessage()}")
+                if level != "CRITICAL" and _is_socket_reset(msg):
+                    # The gateway closed the API socket (IBC's daily restart, a
+                    # gateway restart): the client redials at the next call, and a
+                    # redial that FAILS raises the broker alert — the reset itself
+                    # is not an error. Expected while probing an idle session.
+                    level = "INFO" if _QUIET["probe"] else "WARNING"
+                logger.log(level, f"[ib_async] {msg}")
             except Exception:
                 pass
 
@@ -68,6 +76,17 @@ def _install_ib_log_bridge() -> None:
             continue
         h = _LoguruBridge(level=_logging.WARNING)
         lg.addHandler(h)
+
+
+# A closed API socket as ib_async reports it (Windows and POSIX wordings).
+_SOCKET_RESET_MARKERS = ("winerror 10053", "winerror 10054", "connection reset", "connectionreseterror",
+                         "broken pipe", "forcibly closed", "connection was aborted", "peer closed")
+_QUIET = {"probe": False}          # set while a liveness probe expects a dead socket
+
+
+def _is_socket_reset(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(k in m for k in _SOCKET_RESET_MARKERS)
 
 
 _install_ib_log_bridge()
@@ -159,6 +178,11 @@ class IBKRBroker(Broker):
         self._expected_disconnect = False    # deliberate disconnects don't warn
         self._consecutive_timeouts = 0       # wedge detection: request timeouts since last success
         self._wedge_recycle_times: list = self._load_wedge_history()  # wall-clock stamps of recent force-recycles
+        # The gateway's link to IBKR (errors 1100 lost / 1101-1102 restored): a
+        # gateway logged out of IBKR keeps its API port open, so connects succeed
+        # and a sync with nothing to send looks healthy (2026-09-28 10:59-12:07,
+        # after a manual login elsewhere). UTC instant of the loss, or None.
+        self._link_lost_at: Optional[datetime] = None
 
     # ── connection ────────────────────────────────────────────────────────
     def _get_ib(self):
@@ -185,15 +209,78 @@ class IBKRBroker(Broker):
                 self._ib.disconnectedEvent += self._on_disconnected
             except Exception:
                 pass
+            try:
+                self._ib.errorEvent += self._on_ib_error
+            except Exception:
+                pass
         return self._ib
+
+    def _on_ib_error(self, reqId, errorCode, errorString, *args):
+        """IBKR's connectivity codes (sent with reqId -1): 1100 = the gateway lost
+        IBKR; 1101/1102 = restored. Never raises."""
+        try:
+            code = int(errorCode)
+            if code == 1100 and self._link_lost_at is None:
+                self._link_lost_at = datetime.now(timezone.utc)
+            elif code in (1101, 1102) and self._link_lost_at is not None:
+                logger.info(f"[broker:ibkr] IBKR connectivity restored (error {code}) after "
+                            f"{(datetime.now(timezone.utc) - self._link_lost_at).total_seconds():.0f}s")
+                self._link_lost_at = None
+        except Exception:
+            pass
+
+    def ibkr_link_lost_since(self) -> Optional[datetime]:
+        """When the gateway reported losing IBKR (error 1100) without a restore
+        since — the gateway is up but cannot reach IBKR — else None."""
+        return self._link_lost_at
 
     def _on_disconnected(self):
         if self._expected_disconnect:
+            return
+        try:
+            from src.broker.gateway_recovery import in_scheduled_restart_window
+            scheduled = in_scheduled_restart_window() is not None
+        except Exception:
+            scheduled = False
+        if scheduled:
+            logger.info(f"[broker:ibkr] session {self.host}:{self.port} closed by IBC's scheduled daily "
+                        f"gateway restart — reconnecting once the gateway is back")
             return
         logger.warning(
             f"[broker:ibkr] session {self.host}:{self.port} dropped — "
             f"auto-reconnect runs at the next broker call"
         )
+
+    def _alive(self, ib) -> bool:
+        """One cheap round trip (``reqCurrentTime``, 5 s bound). ``isConnected()``
+        reads True on a socket the gateway closed while this client was idle — no
+        event loop runs between broker calls — so IBC's daily 23:50 restart used to
+        be discovered by the first REAL request of the next sync, which failed and
+        logged two errors (2026-09-28 23:54). Probed here, the dead session is
+        redialed quietly before any work. A client without the call (a test stub)
+        counts as alive."""
+        probe = getattr(ib, "reqCurrentTime", None)
+        if probe is None:
+            return True
+        prev = getattr(ib, "RequestTimeout", 0)
+        _QUIET["probe"] = True
+        self._expected_disconnect = True
+        try:
+            try:
+                ib.RequestTimeout = 5.0
+            except Exception:
+                pass
+            probe()
+            return bool(ib.isConnected())
+        except Exception:
+            return False
+        finally:
+            try:
+                ib.RequestTimeout = prev
+            except Exception:
+                pass
+            self._expected_disconnect = False
+            _QUIET["probe"] = False
 
     # ── repeated-wedge history (persisted) ────────────────────────────────
     @staticmethod
@@ -257,7 +344,10 @@ class IBKRBroker(Broker):
         backend is dead (else this would no-op and the wedge would persist)."""
         ib = self._get_ib()
         if ib.isConnected() and not force:
-            return True
+            if self._alive(ib):
+                return True
+            logger.info(f"[broker:ibkr] the API session to {self.host}:{self.port} had closed while idle "
+                        f"(a gateway restart) — redialing")
         reconnecting = self._ever_connected
         try:
             # Reset any half-dead client state a dropped session left behind —
@@ -289,12 +379,31 @@ class IBKRBroker(Broker):
             self._reconnect_block_until = 0.0
             self._ever_connected = True
             self._consecutive_timeouts = 0        # fresh session — clear the wedge counter
+            # a fresh API session: a gateway still logged out re-sends 1100 on connect
+            self._link_lost_at = None
             logger.info(
                 f"[broker:ibkr] {'reconnected' if reconnecting else 'connected'} "
                 f"{self.host}:{self.port} (clientId={self.client_id})"
             )
             return True
         except Exception as e:
+            # IBC's scheduled daily restart: the gateway is coming back within a
+            # minute — wait for it (bounded by the window) and dial once more,
+            # instead of failing the sync or tripping the gateway recovery.
+            try:
+                from src.broker.gateway_recovery import in_scheduled_restart_window, wait_for_gateway
+                end = in_scheduled_restart_window()
+            except Exception:
+                end = None
+            if end is not None and not getattr(self, "_waiting_for_restart", False):
+                logger.info(f"[broker:ibkr] gateway down during IBC's scheduled daily restart — waiting for it "
+                            f"(until {end.astimezone(timezone.utc):%H:%M} UTC) before redialing")
+                self._waiting_for_restart = True
+                try:
+                    if wait_for_gateway(end):
+                        return self.connect(force=True)
+                finally:
+                    self._waiting_for_restart = False
             cooldown = max(0.0, float(settings.broker_reconnect_cooldown_seconds or 0.0))
             self._reconnect_block_until = time.monotonic() + cooldown
             # A failed forced (wedge-recovery) dial closed the socket, so the
@@ -857,7 +966,9 @@ class IBKRBroker(Broker):
             return None
         finally:
             try:
-                if acct:
+                # a dropped session took the subscription with it: cancelling it
+                # then only logs "cancelPnL: No subscription" (2026-09-28 23:54)
+                if acct and self._ib.isConnected():
                     self._ib.cancelPnL(acct)
             except Exception:
                 pass

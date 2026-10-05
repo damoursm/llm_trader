@@ -1648,6 +1648,12 @@ class Settings(BaseSettings):
     screen_min_dollar_volume: float = 20_000_000  # liquidity gate: min 20d avg $ volume (filters thin pumps)
     screen_max_fetch_per_run: int = 30         # cap cold OHLCV fetches per run (cache warms over time)
     screen_max_results: int = 20               # max setups the screener injects into the universe
+    # The screener never screens (and, outside its curated list, never fetches) a cached
+    # frame whose last bar is more than this many SPY sessions old: a delisted/acquired name
+    # (frozen takeover-price bars read as fresh 52w highs; CRNX/APGE/FBRX/ATAI 2026-09-29)
+    # or one nothing refreshes. Counted in SPY's own bars, so an outage that freezes every
+    # cache judges nothing stale. -1 = off.
+    screen_max_stale_sessions: int = 2
 
     # Macro → Discovery loop — closes the gap between the macro/regime modules and stock selection.
     # The sector-rotation (top inflows), business-cycle (phase leaders), and DIX (regime → factor
@@ -1945,7 +1951,9 @@ class Settings(BaseSettings):
     horizon_ic_min_n: int = 15            # min joint obs before a (method,horizon) IC is used
     horizon_min_conviction: float = 0.05  # min |edge(h)| for a horizon to be a trade candidate
     horizon_cost_hurdle_pct: float = 0.40  # round-trip cost the net edge must clear (~27-41bp)
-    horizon_ic_cache_seconds: int = 1800  # reuse the heavy IC matrix across ticks (30 min)
+    # reuse the heavy IC matrix across ticks; 6 h (was 30 min) since 2026-09-28 —
+    # its outputs are shadow-only and it cost ~2.5 min of a tick on average
+    horizon_ic_cache_seconds: int = 21600
     # Matched exit: once a position is held ≥ its target-horizon duration, multiply
     # the opener-pinned hold-review confidence floor by this so it must still be
     # STRONGLY confirmed to survive past its edge window (short-horizon trades exit
@@ -2440,8 +2448,9 @@ class Settings(BaseSettings):
     # ~356 (0.3%), and every one of them is Bayesian-shrunk over weeks — so a
     # 30-minute versus 2-hour refresh is statistically indistinguishable while
     # costing 4× less. EOD maintenance clears these caches explicitly, so a fresh
-    # panel/retrain is picked up at once rather than waiting out the TTL.
-    ic_weight_cache_seconds: int = 7200
+    # panel/retrain is picked up at once rather than waiting out the TTL. 6 h
+    # since 2026-09-28 (runtime review): the calibrations feed only the shadow book.
+    ic_weight_cache_seconds: int = 21600
     # Method INVERSION (manual, evidence-driven) — comma-separated method names whose
     # RAW score is reliably anti-predictive NET OF BETA across horizons (confirm via
     # `python -m src.analysis.scorecard` or `simulated_trades --directional`: a side
@@ -2853,6 +2862,11 @@ class Settings(BaseSettings):
     enable_deep_preopen: bool = True
     deep_preopen_time: str = "08:30"
     deep_preopen_budget_seconds: int = 2700
+    # The NIGHTLY refresh runs its families in concurrent lanes, one per
+    # rate-limited provider (`refresh.NIGHTLY_LANES`, 2026-09-29): one after
+    # another it used 13,658 of its 14,400 s (Wikipedia 8,773). False = the old
+    # one-after-another order. The pre-open run always uses its lanes.
+    deep_refresh_lanes: bool = True
     # Polygon real-time NBBO (2026-08-31, verified entitled on the current
     # plan): serves reconcile._quote_for's book when the IBKR API (which lacks
     # a top-of-book entitlement) returns none — revives the spread-aware LMT
@@ -2908,11 +2922,19 @@ class Settings(BaseSettings):
     # other models as shadow."). src/signals/sel_short.py: the tail-regression
     # LONG selection model's top-1 pick per regular-hours bar over every liquid
     # name, fresh against its own 30-day scores, SHORTED when it rose over the 5
-    # sessions before; covered at half the run-up given back, else after 15
+    # sessions before; covered at half the run-up given back (the vol arm: all of it), else after 15
     # sessions. Every other entry path is shadow (computed + persisted, not traded).
     enable_sel_short: bool = True
     sel_short_dir: str = "cache/ml/sel_short"     # model, universe, scores, picks journal
-    sel_short_give_back: float = 0.5              # cover at close - 0.5 x (close - close 5 sessions before)
+    sel_short_give_back: float = 0.5              # model + ETF arms: cover at close - 0.5 x (close - close 5 sessions before)
+    # THE VOL ARM covers once the WHOLE run-up has been given back (user directive 2026-10-04 evening: "Deploy the
+    # 100% give-back to live", then "Vol arm only" once the per-arm numbers were in): its picks journal target = the
+    # close 5 sessions before; most trades close earlier on the ATR exit or at the 15-session limit. Evidence (the
+    # vol book Feb 2021 - Sep 2026, audited compounding engine at 8 slices): growth +105% -> +200% a year (log
+    # +0.38, 95% +0.21..+0.54, 6 of 6 years); return per day 2.88 -> 2.19 (-0.69, 95% -1.42..-0.11). The model arm at
+    # 100% fell to 0.30 %/day from 1.20 and lost money at every slice count; the ETF arm's growth did not change
+    # (0.78 -> 0.53 %/day) -> both keep half. memory/vol-give-back-slices-2026-10.md
+    sel_short_vol_give_back: float = 1.0
     sel_short_max_hold_sessions: int = 15         # time exit: same bar of day, 15 sessions later
     sel_short_runup_sessions: int = 5             # the "rose into the pick" look-back
     sel_short_size_multiplier: float = 1.0        # flat size (x broker_base_notional), as evaluated
@@ -2927,8 +2949,134 @@ class Settings(BaseSettings):
     sel_short_wait_seconds: float = 480.0         # the tick waits this long for its run before trading
     sel_short_prepare_after_et: str = "09:00"     # daily prepare from this ET time (after the 08:30 pre-open)
     sel_short_entry_max_age_minutes: float = 75.0 # a journaled pick older than this is not taken
-    sel_short_exit_from_et: str = "10:00"         # exits judged at bar closes 10:00 ...
-    sel_short_exit_until_et: str = "16:10"        # ... through the 16:00 close's tick
+    # ONE POSITION PER TICKER is OFF (user directive 2026-09-28: "Remove the one
+    # position per ticker rule and restart the scheduler"): a repeat pick of a name
+    # the book already shorts opens ANOTHER trade — a second short of the base size,
+    # netted into one position at IBKR (the broker sync splits it by what each open
+    # trade owns). 0 = no limit; 1 = the old rule (a repeat pick is noted on the open
+    # trade, `sel_also`). Measured on 2025 + Jan-Sep 2026 (live book): model 0.87 ->
+    # 1.04 %/day, vol 1.99 -> 2.22 — not significant; up to 3-4 shorts stacked on one
+    # name (memory/sel-short-backtest-audit-2026-09.md).
+    sel_short_max_open_per_ticker: int = 0
+    # Exits are judged at EVERY tick, in every session (user directive 2026-09-27:
+    # "We should always have the possibility to enter or exit at any time"); the
+    # target only on a mark fetched within this many minutes.
+    sel_short_mark_max_age_minutes: float = 45.0
+    # The VOLATILITY-NORMALISED exit, both arms (user directive 2026-09-28:
+    # "Implement the Cover when volatility halves (in profit) for the two live
+    # models in production"): cover a short that is IN PROFIT (a fresh live mark
+    # below the entry price) once the name's 30-minute ATR% (`sel_short_vol_feature`
+    # at the latest completed regular-hours bar, built like the pick's) has fallen
+    # to this share of its value at the pick bar. Measured on 2025 + Jan-Sep 2026
+    # (live-faithful, net %/day, with the short-interest filter): vol 1.67 -> 2.08
+    # (+0.41, 95% -0.17..+1.14; +0.49 in 2025, +0.32 in 2026), model 0.85 -> 0.91
+    # (+0.05, -0.20..+0.37) — NOT significant, judged on the live trades
+    # (memory/short-adaptive-exits-2026-09.md).
+    enable_sel_short_volnorm_exit: bool = True
+    sel_short_volnorm_ratio: float = 0.5
+    # The vol arm's SQUEEZE COVER (user directive 2026-10-05: "have it tuned so that
+    # we don't have margin calls while still maximizing growth"): buy a vol short back
+    # at the first tick whose fresh mark is at or above this multiple of its entry
+    # price, the entry carried through every split executed since the entry day.
+    # Tuned with 10 slices of the account (pre-registered, memory/
+    # vol-arm-margin-protection-2026-10.md): on every common stock 2021-26, with and
+    # without the 400-bar floor, no margin call from any start date at bar closes or
+    # highs; mean growth over the 2021-25 starts +149%/yr vs +131% without a cover
+    # (which is margin-called from 5 of 6 starts); 1 of 437 trades covered, return
+    # per day 2.30 -> 2.25. 8x was not safe.
+    enable_sel_short_vol_squeeze_cover: bool = True
+    sel_short_vol_cover_multiple: float = 6.0
+    # The SIMULATED ACCOUNT the vol arm is sized from (user directive 2026-10-05: "Have
+    # the account based sizing considering the simulated 5000$+1000$ every two weeks";
+    # src/performance/sim_account.py): $5,000 at the start plus $1,000 every 14 calendar
+    # days, its equity the money paid in plus the dollar P&L of the trades it funded
+    # (from the ledger). Each new VOL short = 1/`sel_short_account_slices` of that equity
+    # in whole shares, at most the equity minus the open shorts' value and
+    # `sel_short_account_max_dollar_volume_share` of the stock's 20-session dollar
+    # volume, within the Reg T initial-margin room, none under FINRA's $2,000 minimum;
+    # equity below the open shorts' Reg T maintenance buys every funded short back
+    # (`sel_margin_call`) — the audited replay engine's rules, tuned with the squeeze
+    # cover above (10 slices). The model and ETF arms keep the flat order size.
+    enable_sel_short_account_sizing: bool = True
+    sel_short_account_start: str = "2026-10-05"
+    sel_short_account_initial: float = 5000.0
+    sel_short_account_deposit: float = 1000.0
+    sel_short_account_deposit_days: int = 14
+    sel_short_account_slices: int = 10
+    sel_short_account_max_dollar_volume_share: float = 0.01
+    sel_short_account_min_equity: float = 2000.0
+    # The SHORT-INTEREST filter, both arms (user directive 2026-09-27: "Add in live
+    # production the 'Under one day of volume' filter"): short a pick only when its
+    # short interest is under one day of volume — FINRA days to cover (the deep
+    # feature `dp_si_dtc`, as of the session's 08:30 ET snapshot) at most this
+    # (1.0 = FINRA's floor). A pick above it is journaled `crowded`, not traded; an
+    # unknown value passes. Measured Jan-Sep 2026 (live-faithful, 24 h return per
+    # day, net): vol 1.71 -> 2.41 %/day, model 0.11 -> 1.41 — found in sample, the
+    # model's gain all May-September (memory/short-protective-exits-2026-09.md).
+    enable_sel_short_dtc_filter: bool = True
+    sel_short_max_days_to_cover: float = 1.0
+    # The RELATIVE-VOLUME filter, VOL ARM ONLY (user directive 2026-10-01: "implement
+    # relative volume filter to prod"): short a vol pick only when its bar's volume is at
+    # least this multiple of the name's mean 30-minute bar volume over its previous 260
+    # regular-hours bars (`sel_short.rvol_at`; 20 sessions, >= 20 bars needed; unknown
+    # passes). Below it the pick is journaled `low_rvol` (target + deadline kept), never
+    # traded, still the name's pick of the day. 1.58 = the 20th percentile of the live
+    # rule's trades 2021-26 (no outcome used). Measured Feb 2021 - Sep 2026: with the
+    # names delisted since 2021 596 -> 477 trades, 2.37 -> 2.63 %/day (+0.26, 95%
+    # +0.02..+0.55); today's names alone 342 -> 264, 2.09 -> 2.34 (+0.26, -0.06..+0.66) —
+    # the feature found by searching (post hoc); judge it on the live picks
+    # (memory/relax-confidence-study-2026-10.md).
+    enable_sel_short_vol_rvol_filter: bool = True
+    sel_short_vol_min_rvol: float = 1.58
+    # The VOLATILITY arm, trading beside the model (user directive 2026-09-26:
+    # "Deploy 'Short the most volatile name' ... alongside the current short model
+    # ... we'll evaluate which one is the best"): per bar the name with the highest
+    # 30-minute ATR% (this base feature), fresh against its own ATR% history (the
+    # window below), then the model's riser / short-interest / borrow / give-back /
+    # 15-session rules. One position per ticker across both arms; every trade
+    # stamps `sel_arm`.
+    enable_sel_short_vol: bool = True
+    sel_short_vol_feature: str = "atr_pct_14"
+    # The vol arm's own freshness window (user directive 2026-09-27: "For the
+    # volatility arm, use the window 20, top-1"); the model arm keeps
+    # `sel_short_own_window_days` (30). Measured: 1.71 vs 1.59 %/day (per 24 h,
+    # average trade), 72 vs 70 trades — within noise (scratchpad rank_params.py).
+    sel_short_vol_own_window_days: int = 20
+    # The vol arm's ADDED STOCKS (user directives 2026-10-05: "New listings + test the
+    # rest", then "Add them to live and backtest the results are good"): the model's
+    # name list is frozen at its install, and ~1,000 liquid common stocks sat outside
+    # the deep store. Each prepare screens Polygon's whole-market daily bars for common
+    # stocks / ADRs (Polygon type CS / ADRC) outside the deep store that averaged
+    # >= `sel_short_min_dollar_volume` over >= 10 of the last 20 sessions, whatever
+    # their listing date, fetches their 30-minute history into the deep store, records
+    # them (`vol_listings.json`) and seeds their vol score history; the vol arm ranks
+    # them beside the model's names, never the model or ETF arm (`sel_short.add_listings`).
+    enable_sel_short_vol_added_stocks: bool = True
+    # The ETF arm (user directive 2026-10-02: "Add the ETF vol as a new arm"): the vol
+    # arm's rule — each bar's most volatile name by 30-minute ATR%, fresh against its
+    # own history (window below), its first fresh pick of the day, riser, days to
+    # cover, relative volume, borrow, the same exits — on the EXCHANGE-TRADED
+    # PRODUCTS alone (ETF / ETN / ETV / ETS, leveraged and inverse included;
+    # `sel_short.etf_names`). `prepare` adds the deep store's products outside the
+    # model's training set to the day's universe; the scorer computes their ATR% and
+    # days to cover but never scores them with the model (status VOL_ONLY), and the
+    # model and vol arms keep their own universe. Measured Feb 2021 - Sep 2026 with
+    # the products delisted since: 141 trades, +0.78 %/day (95% -0.03..+1.58), median
+    # trade +7.1%, the six worst all 2x long single-stock funds (HIMZ -238%) — judged
+    # on its live picks (memory/etf-expansion-2026-10.md).
+    enable_sel_short_etf: bool = True
+    sel_short_etf_own_window_days: int = 20
+    # LIVE PATH FIRST (user directive 2026-09-28): the selection short's trading
+    # steps run at the START of each tick — marks + exits, then (on the main
+    # thread while Steps 1-3 fetch) the wait for its scorer's inference, its
+    # entries and a broker sync — instead of after the shadow pipeline. The
+    # end-of-tick exits/entries/sync still run as a second pass. False = the old
+    # order (everything after "Pipeline complete").
+    enable_live_path_first: bool = True
+    # The email's six research evaluations (method / LLM / macro / stage /
+    # method-eval / out-of-sample) are reused within a day for this long — they
+    # cost ~3 min of every tick and move with the panel, not the tick's marks.
+    email_eval_cache_seconds: float = 21600.0
     # The legacy book: no new entries (every model is shadow) and one flatten at
     # the first regular-hours tick at/after this instant (empty = never).
     enable_legacy_entries: bool = False
@@ -3643,6 +3791,31 @@ class Settings(BaseSettings):
     # path, skipped the final in-tick dial for no reason). The wait costs nothing
     # when the port comes up sooner — the loop returns as soon as it is listening.
     broker_gateway_restart_wait_seconds: int = 300
+    # A gateway process younger than this with no API listener is still BOOTING
+    # (IBC's relaunch opens the port ~25-45 s after start): the recovery waits for
+    # it instead of killing it (2026-09-29 03:02:20: a gateway 22 s old was killed
+    # and relaunched). Older and still no port = stuck -> restarted. 0 = off.
+    broker_gateway_boot_grace_seconds: int = 120
+    # IBC's log folder: its last login outcome tells whether the gateway is
+    # logged in to IBKR (a logged-out gateway still accepts API connections).
+    ibc_log_dir: str = r"C:\IBC\Logs"
+    # IBC restarts the gateway every day at its AutoRestartTime (read from this
+    # config — only that line; 11:50 PM here): the API socket closes and the
+    # gateway is back ~15-60 s later. From one minute before it to
+    # `broker_gateway_restart_window_minutes` after, the broker client WAITS for
+    # the gateway instead of failing and the auto-recovery never intervenes (it
+    # would kill the gateway IBC is restarting). `broker_gateway_restart_et`
+    # ("HH:MM" ET) overrides the time read from the config (2026-09-29).
+    ibc_config_path: str = r"C:\IBC\config.ini"
+    # IBKR sometimes demands a re-login (its nightly session reset, ~00:15-00:45 ET);
+    # IBC's re-login was refused every time since August ("Unrecognized Username
+    # or Password") and a full restart logs in. The sync restarts the gateway for
+    # THAT refusal (paper-only, cooldown-guarded, never inside IBC's own restart
+    # window); a refusal right after "Existing session detected" — someone logged
+    # in to the account elsewhere — stays alert-only (2026-09-29).
+    broker_gateway_relogin_restart: bool = True
+    broker_gateway_restart_et: str = ""
+    broker_gateway_restart_window_minutes: float = 5.0
     # ── Settle pass: fill fast or kill ───────────────────────────────────
     # After this tick's orders are submitted, actively watch them for up to
     # this many seconds: fills are recorded the moment they land; a zero-fill
@@ -3665,6 +3838,13 @@ class Settings(BaseSettings):
     # order that missed on a moving book gets several fresh-quote retries within
     # the budget instead of one. The final poll never re-anchors (it observes).
     broker_settle_reanchor_every: int = 2
+    # REFUSED orders (IBKR ended them at once, nothing filled) are resent in the
+    # SAME tick, re-anchored at a fresh quote, this many times (user directive
+    # 2026-09-27: "Try resend them during the same tick"), then again on later
+    # ticks. An ENTRY refused on broker_refused_max_ticks ticks is given up
+    # (REFUSED_GAVE_UP, never sent again); an exit keeps trying until flat.
+    broker_refused_resends_per_tick: int = 2
+    broker_refused_max_ticks: int = 6
     # ── Order lifetime: tick-scoped (default) or age-based ──────────────
     # Tick-scoped (True): an order lives exactly one tick. Any order still
     # unfilled at the next sync is cancelled and re-decided from THIS tick's

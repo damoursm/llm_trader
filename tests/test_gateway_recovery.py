@@ -315,3 +315,73 @@ def test_port_listener_still_takes_precedence(monkeypatch):
     gr.maybe_restart_gateway("test", wait=False)
     assert killed == ["4242"]
     assert called["sig"] is False, "the scan should not run when a listener was found"
+
+
+# ── a gateway still BOOTING is waited for, never killed (2026-09-29) ─────────
+# 03:02:20: the sync's connect retries ran out while a freshly started gateway was
+# still booting (no listener yet); the recovery killed it by signature and
+# relaunched it. A gateway process younger than broker_gateway_boot_grace_seconds
+# is left to open its port.
+
+def _booting(monkeypatch, age, ports):
+    monkeypatch.setattr(settings, "broker_mode", "ibkr_paper")
+    monkeypatch.setattr(settings, "broker_gateway_auto_restart", True)
+    monkeypatch.setattr(settings, "broker_gateway_boot_grace_seconds", 120)
+    probes = iter(ports)
+    monkeypatch.setattr(gr, "_pid_listening_on", lambda port: next(probes, None))
+    monkeypatch.setattr(gr, "_gateway_pids_by_signature", lambda: [6016])
+    monkeypatch.setattr(gr, "_process_ages", lambda pids: {6016: age})
+    clock = {"t": 1000.0}
+
+    def mono():
+        clock["t"] += 5.0
+        return clock["t"]
+    monkeypatch.setattr(gr.time, "monotonic", mono)
+
+
+def _kills(calls):
+    return [c for c in calls if c[0] in ("taskkill", "schtasks")]
+
+
+def test_a_booting_gateway_is_not_killed(monkeypatch, _fresh_recovery_state):
+    _booting(monkeypatch, age=22.0, ports=[None])
+    assert gr.maybe_restart_gateway("sync connect retries exhausted", wait=False) is False
+    assert _kills(_fresh_recovery_state) == []
+    # the cooldown was not consumed: a gateway that later proves dead is still recovered
+    _booting(monkeypatch, age=3600.0, ports=[None, None])
+    assert gr.maybe_restart_gateway("dead", wait=False) is True
+    assert ["taskkill", "/PID", "6016", "/F"] in _fresh_recovery_state
+
+
+def test_the_sync_waits_for_a_booting_gateway_to_open_its_port(monkeypatch, _fresh_recovery_state):
+    _booting(monkeypatch, age=22.0, ports=[None, None, 4321])
+    assert gr.maybe_restart_gateway("sync connect retries exhausted", wait=True) is True
+    assert _kills(_fresh_recovery_state) == []
+
+
+def test_a_gateway_stuck_past_the_grace_is_restarted(monkeypatch, _fresh_recovery_state):
+    _booting(monkeypatch, age=100.0, ports=[None] * 50)     # 20 s of grace left, never binds
+    gr.maybe_restart_gateway("sync connect retries exhausted", wait=False)
+    assert _kills(_fresh_recovery_state) == []               # wait=False: never killed while booting
+    gr._reset_for_tests()
+    assert gr.maybe_restart_gateway("sync connect retries exhausted", wait=True) is False  # never came back
+    assert ["taskkill", "/PID", "6016", "/F"] in _fresh_recovery_state
+    assert any(c[:2] == ["schtasks", "/Run"] for c in _fresh_recovery_state)
+
+
+def test_a_listening_or_old_gateway_is_recovered_as_before(monkeypatch, _fresh_recovery_state):
+    _booting(monkeypatch, age=22.0, ports=[4242, 4242])     # a listener = wedged, not booting
+    assert gr.maybe_restart_gateway("wedged", wait=False) is True
+    assert ["taskkill", "/PID", "4242", "/F"] in _fresh_recovery_state
+
+
+def test_process_ages_parses_and_is_fail_soft(monkeypatch):
+    monkeypatch.setattr(gr.subprocess, "run", lambda cmd, **k: SimpleNamespace(
+        returncode=0, stdout="6016~~~22.5\r\ngarbage\r\n7000~~~3600\r\n", stderr=""))
+    assert gr._process_ages([6016, 7000]) == {6016: 22.5, 7000: 3600.0}
+    assert gr._process_ages([]) == {}
+
+    def boom(*a, **k):
+        raise OSError("no powershell")
+    monkeypatch.setattr(gr.subprocess, "run", boom)
+    assert gr._process_ages([6016]) == {}

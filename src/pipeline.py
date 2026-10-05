@@ -711,6 +711,10 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
     problems = []
     if not report.get("connected"):
         problems.append("broker NOT connected — orders were not placed")
+    _gs = report.get("gateway_session")
+    if _gs:
+        problems.append(f"IB Gateway NOT logged in to IBKR since {_gs.get('since')} ({_gs.get('reason')}) — "
+                        "orders cannot reach IBKR")
     if report.get("broker_timeouts"):
         # Not real IBKR rejects — the gateway did not respond (alive-but-wedged:
         # socket open, API dead). Actionable wording so the operator restarts the
@@ -774,6 +778,11 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
                            if d.get("action") in _PENDING_DRIFT_ACTIONS],
         "slippage":       report.get("slippage", []),
         "message":        "; ".join(problems),
+        "gateway_session": report.get("gateway_session"),
+        # the sync restarted a gateway IBKR had logged out (a refused re-login):
+        # "logged in" is a note in the healthy line; a pending login leaves
+        # `gateway_session` set, i.e. still a problem above
+        "gateway_relogin_restart": report.get("gateway_relogin_restart"),
         # The EXACT per-order failure reasons (e.g. "exit NET: Cancelled: Error
         # 10329 … directly routed to OVERNIGHT … Precautionary Settings") — order-
         # preserving dedupe. The concise `message` above is the count summary; this
@@ -1793,6 +1802,112 @@ def _passes_agreement_gate(direction: str, sig) -> bool:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _broker_sync_watchdogged(run_id: str, actionable_by_ticker: Optional[dict]) -> Optional[dict]:
+    """One broker reconcile under its wall-clock watchdog. No-op (None) when the
+    broker is off. If the reconcile hangs past ``broker_sync_watchdog_seconds``
+    (a stuck broker call RequestTimeout somehow didn't catch), force-exit so the
+    task manager restarts a fresh process — a hung tick blocks the whole poll
+    loop, and nothing else recovers a frozen (non-exited) process."""
+    if not settings.broker_mode or settings.broker_mode == "off":
+        return None
+    from src.broker.reconcile import sync as _broker_sync
+    _wd = None
+    _wd_cap = float(getattr(settings, "broker_sync_watchdog_seconds", 0) or 0)
+    if _wd_cap > 0:
+        import os
+        import threading
+
+        def _broker_watchdog_kill():
+            try:
+                logger.critical(
+                    f"[broker] reconcile exceeded {_wd_cap:.0f}s wall-clock — a broker "
+                    "call is stuck; force-exiting so the scheduler restarts (this was the "
+                    "2026-07-06 6-hour freeze). Internal sim/ledger already persisted.")
+            except Exception:
+                pass
+            os._exit(1)
+        _wd = threading.Timer(_wd_cap, _broker_watchdog_kill)
+        _wd.daemon = True
+        _wd.start()
+    try:
+        return _broker_sync(run_id=run_id, actionable_by_ticker=actionable_by_ticker)
+    except Exception as e:
+        logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
+        return None
+    finally:
+        if _wd is not None:
+            _wd.cancel()
+
+
+def _merge_broker_reports(first: Optional[dict], second: Optional[dict]) -> Optional[dict]:
+    """One report for a tick that reconciled twice (the live path at the start,
+    the end-of-tick sync): counters summed, orders / slippage / errors joined,
+    drift and the account read from the LATER sync (the book as the tick left it)."""
+    if not first:
+        return second
+    if not second:
+        return first
+    out = dict(second)
+    for k, v in first.items():
+        if isinstance(v, bool) or k in ("drift",):
+            continue
+        if isinstance(v, (int, float)) and isinstance(second.get(k), (int, float)) and k not in (
+                "account_equity", "pnl_daily", "pnl_unrealized", "pnl_realized"):
+            out[k] = second[k] + v
+        elif isinstance(v, list) and isinstance(second.get(k), list):
+            out[k] = list(v) + list(second[k])
+    out["ok"] = bool(first.get("ok", True)) and bool(second.get("ok", True))
+    out["connected"] = bool(first.get("connected")) or bool(second.get("connected"))
+    for k, v in first.items():          # what only the first sync did (a gateway restart)
+        if k not in out:
+            out[k] = v
+    return out
+
+
+def _live_marks_and_exits() -> None:
+    """The live path's first half (user directive 2026-09-28, "running the
+    trading steps first"): the cost calibration and the ledger marks, then the
+    selection short's exits and the one-shot legacy flatten — at the START of
+    the tick, not after the shadow pipeline. Fail-soft."""
+    try:
+        calibrate_sim_costs()
+        update_open_trades()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] marks failed (fail-soft): {e}")
+    try:
+        from src.performance.tracker import flatten_legacy_positions, monitor_sel_short_positions
+        _hold = bool(get_open_trades())
+        flatten_legacy_positions(hold_prompt_active=_hold)
+        monitor_sel_short_positions(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] sel_short exit pass failed (fail-soft): {e}")
+
+
+def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None) -> Optional[dict]:
+    """The live path's second half, on the main thread while Steps 1–3 fetch in
+    the pool: wait for this tick's scorer — the two models' data fetch, feature
+    engineering and inference (model + vol arm) for every completed bar not yet
+    run — open its picks (on a fresh IBKR borrow file), and reconcile the broker.
+    Returns the sync's report."""
+    t0 = time.time()
+    if borrow_future is not None:
+        try:
+            borrow_future.result(timeout=120)
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning(f"[live] borrow file not ready ({e}) — the borrow check uses the last one")
+    try:
+        from src.signals import sel_short as _ss
+        _ss.wait(sel_handle)
+        from src.performance.tracker import record_sel_short_trades
+        record_sel_short_trades(run_id=run_id)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] sel_short entry pass failed (fail-soft): {e}")
+    report = _broker_sync_watchdogged(run_id, None)
+    logger.info(f"[live] entries + broker sync done {time.time() - t0:.0f}s into the fetch "
+                f"(before the shadow pipeline)")
+    return report
+
+
 def run_pipeline(send_email: bool = False, observe_only: bool = False,
                  email_if_configured: bool = True) -> None:
     """Execute the full analysis pipeline.
@@ -1835,8 +1950,9 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     # ── SELECTION-SHORT scorer (2026-09-28): the one live entry strategy. Its
     # scorer runs as a SUBPROCESS beside this tick (~2 min for ~2,000 names) —
-    # the latest completed regular-hours bar, or the daily prepare — and the
-    # trade step below waits for it. Fail-soft: None touches nothing.
+    # every completed regular-hours bar not yet run, or the daily prepare — and
+    # the live path below waits for it (with `enable_live_path_first` off, the
+    # end-of-tick trade step does). Fail-soft: None touches nothing.
     _sel_handle = None
     if not observe_only:
         try:
@@ -1844,6 +1960,20 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             _sel_handle = _sel_short.launch(start)
         except Exception as _sel_e:
             logger.warning(f"[sel_short] launch failed (fail-soft): {_sel_e}")
+
+    # ── LIVE TRADING PATH FIRST (user directive 2026-09-28). The selection
+    # short trades on its scorer alone — a subprocess that fetches the day's
+    # bars, builds both models' features and scores them — and needs nothing
+    # the shadow pipeline below computes. So its trading steps run at the START
+    # of the tick instead of after the 15-45-minute shadow pipeline: marks and
+    # exits now; entries (after WAITING for the scorer's inference) and the
+    # broker sync on the main thread while Steps 1-3 fetch in the pool. The
+    # end-of-tick block still runs the legacy exits (they need this tick's shadow
+    # signals), re-judges the strategy's exits and syncs again.
+    live_first = (not observe_only) and bool(getattr(settings, "enable_live_path_first", False))
+    live_broker_report = None
+    if live_first:
+        _live_marks_and_exits()
 
     # ── Long-horizon buy arm A/B (2026-08-01) ─────────────────────────────
     # Per-run coin: replace combined_buy_score with the learned 5d stacker AND
@@ -2121,9 +2251,10 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # IBKR's borrow book (2026-09-25): archived every tick so a later
         # evaluation charges a short the fee IBKR quoted at entry, and read by
         # the borrow check on every new short. The pool's exit waits for it.
+        f_borrow = None
         if settings.enable_ibkr_borrow_snapshot:
             from src.data import ibkr_borrow
-            pool.submit(_safe, "ibkr_borrow", ibkr_borrow.snapshot)
+            f_borrow = pool.submit(_safe, "ibkr_borrow", ibkr_borrow.snapshot)
 
         f_trends       = (pool.submit(_safe, "trends", fetch_google_trends, tickers)
                           if settings.enable_google_trends else None)
@@ -2242,6 +2373,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         f_8k_extra = (pool.submit(_safe, "8k_extra", fetch_8k_articles, _news_prefetch_extra,
                                   lookback_days=settings.eight_k_lookback_days)
                       if (settings.enable_8k_filings and _news_prefetch_extra) else None)
+
+        # The live path's entries + broker sync, on the MAIN thread (ib_async)
+        # while the pool fetches: waits for the scorer's inference first.
+        if live_first:
+            live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow)
 
     # ── Collect results ───────────────────────────────────────────────────
 
@@ -3328,46 +3464,15 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # this tick, reconcile a real broker (IBKR paper) against it — submit entries
         # for new opens, close exits, report slippage/drift. No-op when broker_mode=off;
         # the reconciler is exception-safe and never breaks the run.
-        if settings.broker_mode and settings.broker_mode != "off":
-            from src.broker.reconcile import sync as _broker_sync
-            # Wall-clock watchdog: if the reconcile hangs past the cap (a stuck
-            # broker call RequestTimeout somehow didn't catch), force-exit so the
-            # task manager restarts a fresh process — a hung tick blocks the whole
-            # poll loop, and nothing else recovers a frozen (non-exited) process.
-            _wd = None
-            _wd_cap = float(getattr(settings, "broker_sync_watchdog_seconds", 0) or 0)
-            if _wd_cap > 0:
-                import os
-                import threading
-
-                def _broker_watchdog_kill():
-                    try:
-                        logger.critical(
-                            f"[broker] reconcile exceeded {_wd_cap:.0f}s wall-clock — a broker "
-                            "call is stuck; force-exiting so the scheduler restarts (this was the "
-                            "2026-07-06 6-hour freeze). Internal sim/ledger already persisted.")
-                    except Exception:
-                        pass
-                    os._exit(1)
-                _wd = threading.Timer(_wd_cap, _broker_watchdog_kill)
-                _wd.daemon = True
-                _wd.start()
-            try:
-                # The tick's actionable set (ticker → BUY/SELL) drives the
-                # price-aware next-tick resubmit for previously-unfilled entries
-                # (reconcile._resubmit_decision): still-wanted → chase; decayed →
-                # only resubmit at an equal-or-better price than the decision.
-                _actionable_by_ticker = {
-                    r.ticker: r.action for r in (actionable or [])
-                    if getattr(r, "ticker", None) and getattr(r, "action", None)
-                }
-                broker_report = _broker_sync(
-                    run_id=run_id, actionable_by_ticker=_actionable_by_ticker)
-            except Exception as e:
-                logger.warning(f"[broker] sync raised unexpectedly (internal sim unaffected): {e}")
-            finally:
-                if _wd is not None:
-                    _wd.cancel()
+        # The tick's actionable set (ticker → BUY/SELL) drives the price-aware
+        # next-tick resubmit for previously-unfilled LEGACY entries
+        # (reconcile._resubmit_decision). This end-of-tick sync also resends, in
+        # the same tick, anything the live-path sync (tick start) left unfilled.
+        broker_report = _broker_sync_watchdogged(run_id, {
+            r.ticker: r.action for r in (actionable or [])
+            if getattr(r, "ticker", None) and getattr(r, "action", None)
+        })
+        broker_report = _merge_broker_reports(live_broker_report, broker_report)
 
     # Merge per-gate counters from the actionable filter + the trade-entry path
     # into one diagnostic blob so the user can see at a glance which constraints
@@ -3408,7 +3513,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     )
     if not observe_only:
         log_performance_summary()
-        perf = get_performance_for_email()
+        perf = get_performance_for_email(cache_evals=True)   # the slow research evals: reused within the day
 
         # Hypothetical always-open book — fully isolated from the real-trade
         # ledger above. Update marks then snapshot for the email section.
@@ -3489,6 +3594,20 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             f"[broker] EXECUTION ISSUE ({broker_health['mode']}) — {broker_health['message']}.{_bdetail}"
         )
 
+    # The selection short's scorer health (user directive 2026-09-27): bars left
+    # unscored, crashed runs, thin bars, scorer exits != 0, and a pre-open session
+    # snapshot that was missing or defective — none of them may pass as a quiet
+    # no-trade day. Banner + subject tag, and it forces the email like the others.
+    sel_health = None
+    try:
+        from src.signals import sel_short as _sel_short_h
+        sel_health = _sel_short_h.health()
+        sel_health["down"] = bool(sel_health.get("problems"))
+        if sel_health["down"]:
+            logger.critical("[sel_short] SCORER ISSUE — " + " | ".join(sel_health["problems"]))
+    except Exception as _sh_e:                                     # noqa: BLE001
+        logger.warning(f"[sel_short] health check failed (fail-soft): {_sh_e}")
+
     _print_summary(actionable, smart_money or [])
 
     email_configured = bool(settings.smtp_user and settings.email_recipients)
@@ -3504,6 +3623,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             (price_health and price_health.get("down"))
             or (llm_health and llm_health.get("down"))
             or (broker_health and broker_health.get("down"))
+            or (sel_health and sel_health.get("down"))
         )
     )
     forced_by_problem = health_problem and not (send_email or email_if_configured)
@@ -3579,6 +3699,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             llm_health=llm_health,
             broker_health=broker_health,
             price_health=price_health,
+            sel_health=sel_health,
         )
     else:
         logger.info("Email not configured — skipping.")

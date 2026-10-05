@@ -1,17 +1,17 @@
 # Production deployment (Windows) — reliable always-on scheduling
 
-Three independent pieces must stay up for unattended trading (what is LIVE on this box as of 2026-09-05 is in the last column):
+Three independent pieces must stay up for unattended trading (what is LIVE on this box as of 2026-09-28 is in the last column):
 
 | Piece | Job | Kept alive by |
 |---|---|---|
-| **Scheduler** (`main.py --supervise`, via `scripts\run_scheduler.bat`) | runs the pipeline every 30 min, places paper/live orders | Task Scheduler job **`LlmTraderScheduler`** (auto-restart on crash); inside it `--supervise` relaunches the `--schedule` child whenever a watchdog force-exits it |
+| **Scheduler** (`main.py --supervise`, via `scripts\run_scheduler.bat`) | runs the pipeline every 30 min, places paper/live orders; launches its own SUBPROCESSES — the selection-short scorer on every market-day tick (`python -m src.signals.sel_short`, log `logs\sel_short.log`), the 08:30 ET deep pre-open run, the 23:45 ET deep refresh and the EOD spread sweep — each safe to orphan when the scheduler is killed (a file log and an OS or heartbeat lock, never a pipe) | Task Scheduler job **`LlmTraderScheduler`** (auto-restart on crash); inside it `--supervise` relaunches the `--schedule` child whenever a watchdog force-exits it |
 | **IB Gateway** (headless, paper port 4002) | the broker connection the scheduler talks to | **IBC** under Task Scheduler job **`IBC Gateway`** (`C:\IBC\StartGateway.bat /INLINE`, at log on + daily `AutoRestartTime` 23:50) |
-| **Ollama** (`scripts\run_ollama.bat`, loopback `127.0.0.1:11434`) | the LOCAL sentiment engine — primary on half the runs (`SENTIMENT_LOCAL_SHARE=0.5`) and the shadow scorer on the other half | Task Scheduler job **`LlmTraderOllama`** (`scripts\register_ollama_task.ps1`) — **not yet registered here**: the running server was started by hand from `run_ollama.bat`, so a reboot leaves the sentiment A/B silently 100% DeepSeek until it is relaunched |
+| **Ollama** (`scripts\run_ollama.bat`, loopback `127.0.0.1:11434`) | the LOCAL sentiment engine — the ONLY one (`SENTIMENT_LOCAL_SHARE=1.0`, hosted engines off). Since 2026-09-28 news reaches no trade (the selection short reads none), so a dead server costs the news columns of the panel and the shadow rank rule, not trading; it also serves the one-year news backfill scorers between ticks | Task Scheduler job **`LlmTraderOllama`** (`scripts\register_ollama_task.ps1`, at log on) |
 
 The scheduler tolerates a down broker (it skips the broker sync and alerts, internal
-sim unaffected) and a down model server (a local-primary run falls through to the hosted
-engines; only if those are down too does the run record sentiment provider `none`, which
-reaches the email banner), so strict start order isn't required — but in steady state all
+sim unaffected) and a down model server (the run records sentiment provider `none`, which
+reaches the email banner, and the news family reads 0.0 until it is back — shadow and panel
+only since 2026-09-28), so strict start order isn't required — but in steady state all
 three run 24/7. **The one supported way to bounce the trader stack is
 `scripts\restart_all.ps1`** (stops both `LlmTrader*` tasks, force-kills any straggler
 including a surviving `--supervise` parent, restarts the tasks); the model server is
@@ -79,8 +79,17 @@ around the whole tick) via `os._exit(1)`, which `--supervise` then relaunches.
 `BypassRedirectOrderWarning=yes` — the two API-precaution bypasses the overnight-venue
 orders need), launched by the `IBC Gateway` task. The scheduler also has a gateway
 auto-recovery (`broker_gateway_auto_restart`, paper-only): on a wedged-but-alive or dead
-gateway it kills the java process on the port and fires that task. The TWS walkthrough
-below is the original desktop setup and still works — only the port (7497) differs.
+gateway it kills the java process on the port and fires that task — except a gateway still
+BOOTING (no listener yet and started < `BROKER_GATEWAY_BOOT_GRACE_SECONDS`, 120 s, ago), whose
+port it waits for instead (2026-09-29). A gateway that is alive
+but logged OUT of IBKR never arms the wedge detector (it still answers the scheduler, so
+nothing looks wedged); each sync reads IBC's log instead — IBKR's own refused re-login is
+restarted automatically, a login elsewhere is alerted only (the caveats below). IBC's own daily restart
+(`AutoRestartTime`, 23:50) is expected, not a failure: the scheduler reads that time from
+`C:\IBC\config.ini`, WAITS for the gateway from 23:49 to 23:55 instead of failing, never
+runs the recovery in that window, and redials quietly a session the restart closed while
+it was idle (2026-09-29). Changing `AutoRestartTime` needs no scheduler change. The TWS walkthrough below is the original desktop setup and still works —
+only the port (7497) differs.
 
 IBC ([IbcAlpha/IBC](https://github.com/IbcAlpha/IBC)) logs into TWS for you and, via
 **`AutoRestartTime`**, restarts it daily **without re-authenticating** — so it runs the
@@ -101,6 +110,36 @@ whole week on one Monday login. This replaces the daily logoff that kept breakin
    auto-accepts the pipeline's API connection, and holds the session with daily restarts.
 
 ### Caveats
+- **Never log in to the paper account anywhere else while the gateway runs** (TWS, Client
+  Portal, the mobile app). IBKR keeps one session per username: the other login takes
+  over ("Existing session detected"), IBC's re-login is then refused ("Unrecognized
+  Username or Password"), and the gateway sits logged OUT with its API port still open —
+  connects succeed and an idle sync looks healthy, but nothing can trade (2026-09-28
+  10:58–12:07). Every broker sync therefore reads IBC's last login outcome (the IBC log in
+  `C:\IBC\Logs`, setting `IBC_LOG_DIR`) and IBKR's own connectivity codes (1100 lost,
+  1101/1102 restored); either one turns the email's broker banner red — "IB Gateway NOT
+  logged in to IBKR since …" — with a 🔔 BROKER subject tag. This case (a refusal within
+  10 minutes after "Existing session detected") is deliberately not restarted
+  automatically (a re-login would throw out your own session). Once the other session is
+  closed, restart the gateway:
+  ```powershell
+  Stop-ScheduledTask -TaskName 'IBC Gateway'
+  Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'ibcalpha\.ibc\.|StartGateway\.bat' } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # a straggler the task stop left
+  Start-ScheduledTask -TaskName 'IBC Gateway'
+  ```
+  and check the IBC log ends on `Login has completed`.
+- **IBKR's own re-login demand is recovered automatically** (2026-09-29). Around its
+  nightly session reset (~00:15–00:45 ET, sometimes at the 23:50 restart) IBKR asks the
+  gateway to re-login ("Re-login is required"); IBC's re-login was then refused
+  ("Unrecognized Username or Password") 9 of 9 times since August, while a FULL gateway
+  restart logs in (e.g. 2026-09-29: logged out 00:25, restored 03:02). With no "Existing
+  session detected" before the refusal, the next broker sync restarts the gateway itself
+  (`BROKER_GATEWAY_RELOGIN_RESTART`, default on; paper-only, the 30-min restart cooldown,
+  never inside the 23:49–23:55 window), waits up to 90 s for IBC's `Login has completed`,
+  redials, and notes it in the email's green broker line ("IB Gateway restarted
+  automatically after IBKR's refused re-login"). If the login is still pending the banner
+  stays red and the next sync after the cooldown tries again.
 - **TWS is a GUI app** — it needs a logged-in Windows desktop session. For a dedicated
   box, enable **Windows auto-logon** so IBC can start TWS at boot. *(If you drop the
   monitoring UI later, switch to headless **IB Gateway** — lighter, same IBC flow —
@@ -146,3 +185,6 @@ survivor before `Start-ScheduledTask`.
 - [ ] A market-hours tick logs `connected … 7497` and `sync — … drift=0`.
 - [ ] Paper validation window complete (slippage / tracking-error / reject-rate acceptable).
 - [ ] Circuit breakers in place (daily-loss kill switch, etc. — see Tier-1 #4).
+- [ ] The selection short's shorts locate on the LIVE account: its borrow check reads IBKR's PUBLIC
+      short-stock file (availability and fee per symbol), which the account's own locate can still
+      refuse. Measure the paper refusal rate first (`broker_orders` rejects on the `sel_short` trades).

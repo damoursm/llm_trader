@@ -249,3 +249,43 @@ def test_opposite_sign_holding_is_not_treated_as_progress(monkeypatch):
     _sync(monkeypatch, broker, [trade], actionable={"TEST": "BUY"})
     assert len(broker.requests) == 1
     assert broker.requests[0].quantity == 10        # full target, no offset
+
+
+# ── the legacy book is SHADOW once the selection short is live (2026-09-28) ──
+
+def test_unfilled_legacy_entry_is_not_sent_while_the_selection_short_is_live(monkeypatch):
+    """An unfilled legacy entry (never sent, or killed unfilled) is not sent or
+    chased — the one-shot flatten closes its ledger row; the selection short's
+    own entries go through."""
+    monkeypatch.setattr(settings, "enable_sel_short", True)
+    monkeypatch.setattr(settings, "enable_legacy_entries", False)
+    broker = _FakeBroker()
+    legacy, killed = _fresh_entry(), dict(_killed_entry(), ticker="OLD", recommendation_id="k")
+    mine = dict(_fresh_entry("SELL"), ticker="SEL", recommendation_id="s", entry_mechanism="sel_short")
+    _sync(monkeypatch, broker, [legacy, killed, mine], actionable={"TEST": "BUY", "OLD": "BUY"})
+    assert [r.ticker for r in broker.requests] == ["SEL"]
+    assert legacy["broker_status"] == killed["broker_status"] == "LEGACY_ENTRY_SHADOWED"
+    # with legacy entries back on, the same row is sent again
+    monkeypatch.setattr(settings, "enable_legacy_entries", True)
+    broker2 = _FakeBroker()
+    _sync(monkeypatch, broker2, [_fresh_entry()], actionable={"TEST": "BUY"})
+    assert len(broker2.requests) == 1
+
+
+def test_a_killed_selection_short_entry_is_resent_whatever_the_legacy_map_says(monkeypatch):
+    """The price-aware gate reads the legacy rank rule's map: a selection short
+    absent from it (or on its long side) must not be stranded once its price
+    fell — it is re-anchored and resent while its ledger row is open."""
+    monkeypatch.setattr(settings, "enable_sel_short", True)
+    monkeypatch.setattr(settings, "enable_legacy_entries", False)
+    for legacy_map in ({}, {"TEST": "BUY"}):
+        broker = _FakeBroker()
+        trade = dict(_killed_entry(action="SELL", entry=100.0, price=96.0), entry_mechanism="sel_short")
+        _sync(monkeypatch, broker, [trade], actionable=legacy_map)
+        assert len(broker.requests) == 1 and broker.requests[0].side == "SELL"
+    # a legacy short in the same state stays held (its gate is unchanged)
+    monkeypatch.setattr(settings, "enable_sel_short", False)
+    broker = _FakeBroker()
+    trade = _killed_entry(action="SELL", entry=100.0, price=96.0)
+    _sync(monkeypatch, broker, [trade], actionable={})
+    assert broker.requests == [] and trade["broker_status"] == "RESUBMIT_HELD_ADVERSE"

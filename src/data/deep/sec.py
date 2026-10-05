@@ -17,7 +17,9 @@ shared limiter at 0.12 s across all worker threads.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import re
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 from loguru import logger
@@ -62,6 +64,62 @@ def cik_map() -> Dict[str, str]:
     repo's existing loader; delisted / renamed names are not in it)."""
     from src.data.eight_k import _load_ticker_cik_map
     return _load_ticker_cik_map()
+
+
+# ── EDGAR's live feed: who filed since an instant ────────────────────────────
+# The "latest filings" listing, newest first, 100 a page, one entry per filing
+# AND per role (filer / issuer / reporting owner / subject), about one business
+# day deep (offset ~5,000; deeper pages answer 503). Its <updated> is the true
+# acceptance instant with its UTC offset — unlike the submissions JSON, whose
+# ``acceptanceDateTime`` is Eastern time mislabelled "Z" for filings accepted
+# before ~09:00 ET (measured 2026-09-29: 188 of 1,759).
+
+_CURRENT_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&company=&dateb="
+                "&owner=include&start={start}&count=100&output=atom")
+_ENTRY_UPDATED = re.compile(r"<updated>([^<]+)</updated>")
+_ENTRY_TITLE_CIK = re.compile(r"\((\d{10})\)")
+_ENTRY_LINK_CIK = re.compile(r"/Archives/edgar/data/(\d+)/\d{18}/")
+
+
+def current_filer_ciks(since: datetime, max_pages: int = 60) -> Optional[Set[str]]:
+    """The 10-digit CIK of every company on EDGAR's live feed with a filing
+    accepted at/after ``since`` (an aware instant) — or None when the feed cannot
+    PROVE it reached back to ``since``: a page failed, an entry did not parse, or
+    the listing ended (it is ~a business day deep) before an older entry. The
+    pre-open run re-reads only these companies' submissions; every one of the
+    1,076 universe filings accepted inside the feed's 23-hour span on 2026-09-29
+    was on it (``refresh`` falls back to the full pass on None)."""
+    since_utc = since.astimezone(timezone.utc)
+    ciks: Set[str] = set()
+    for page in range(max(1, int(max_pages))):
+        r = http_get(_CURRENT_URL.format(start=100 * page), headers=SEC_HEADERS, timeout=60,
+                     limiter=_LIMITER)
+        if r is None or r.status_code != 200:
+            logger.warning(f"[deep.sec] live feed page {page} unavailable — cannot prove coverage")
+            return None
+        entries = r.text.split("<entry>")[1:]
+        if not entries:
+            logger.warning(f"[deep.sec] live feed ended at page {page} before {since_utc:%Y-%m-%d %H:%M} UTC")
+            return None
+        for e in entries:
+            m = _ENTRY_UPDATED.search(e)
+            try:
+                ts = datetime.fromisoformat(m.group(1).strip()) if m else None
+            except ValueError:
+                ts = None
+            if ts is None or ts.tzinfo is None:
+                logger.warning("[deep.sec] live feed entry without a readable instant — cannot prove coverage")
+                return None
+            if ts.astimezone(timezone.utc) < since_utc:
+                return ciks
+            found = {c for c in _ENTRY_TITLE_CIK.findall(e)} | {
+                c.zfill(10) for c in _ENTRY_LINK_CIK.findall(e)}
+            if not found:
+                logger.warning("[deep.sec] live feed entry without a CIK — cannot prove coverage")
+                return None
+            ciks |= found
+    logger.warning(f"[deep.sec] live feed: {max_pages} pages without reaching {since_utc:%Y-%m-%d %H:%M} UTC")
+    return None
 
 
 # ── filings ──────────────────────────────────────────────────────────────────

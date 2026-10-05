@@ -221,3 +221,24 @@ def test_real_cost_keeps_legitimate_spread_of_fills(monkeypatch):
     legs = [_costed_leg(0.5) for _ in range(10)] + [_costed_leg(-0.1) for _ in range(10)]
     frac = real_one_way_cost_fraction(legs, min_legs=10)
     assert frac == pytest.approx(0.0020, abs=3e-4)             # mean of +0.5 and -0.1
+
+
+def test_the_discard_warning_fires_once_per_new_bad_leg_not_every_tick(monkeypatch):
+    """2026-09-29: the same 32 stale legacy legs were discarded on every tick's
+    calibration and warned every time. Warn when the count changes."""
+    from loguru import logger
+    from config.settings import settings
+    from src.performance import broker_view as bv
+    monkeypatch.setattr(settings, "sim_real_fill_cost_sanity_pct", 2.0)
+    monkeypatch.setitem(bv._LAST_DISCARD_WARNED, "n", -1)
+    seen = []
+    hid = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    try:
+        legs = [_costed_leg(0.20) for _ in range(20)] + [_costed_leg(-7.0)]
+        for _ in range(3):                                    # three ticks, same legs
+            bv.real_one_way_cost_fraction(legs, min_legs=10)
+        assert sum("discarded 1/21" in s for s in seen) == 1
+        bv.real_one_way_cost_fraction(legs + [_costed_leg(-5.0)], min_legs=10)   # a NEW bad leg
+        assert sum("discarded 2/22" in s for s in seen) == 1
+    finally:
+        logger.remove(hid)

@@ -227,7 +227,7 @@ def test_run_screener_ranks_and_caps(monkeypatch):
     tickers = [f"T{i:02d}" for i in range(settings.screen_max_results + 5)]
     monkeypatch.setattr(sc, "_candidate_pool", lambda: tickers)
     monkeypatch.setattr(sc, "_load_for_screen",
-                        lambda tk, budget: strong if tk == "T00" else plain)
+                        lambda tk, budget, ref=None: strong if tk == "T00" else plain)
 
     ctx = sc.run_screener()
     assert len(ctx.hits) <= settings.screen_max_results
@@ -241,6 +241,6 @@ def test_run_screener_skips_frames_missing_required_columns(monkeypatch):
     monkeypatch.setattr(settings, "enable_opportunity_screener", True)
     monkeypatch.setattr(sc, "_candidate_pool", lambda: ["ZZZZ"])
     monkeypatch.setattr(sc, "_load_for_screen",
-                        lambda tk, budget: _frame().drop(columns=["Volume"]))
+                        lambda tk, budget, ref=None: _frame().drop(columns=["Volume"]))
     ctx = sc.run_screener()
     assert ctx.hits == [] and ctx.universe_size == 0

@@ -141,6 +141,12 @@ def one_way_cost_pcts_from_legs(legs: List[dict]) -> List[float]:
     return out
 
 
+# The discard count last WARNED: the same stale legs are discarded on every
+# tick's calibration (32 legacy fills from June-September, 2026-09-29), so the
+# warning fires when the count CHANGES — a new bad leg — and is DEBUG otherwise.
+_LAST_DISCARD_WARNED = {"n": -1}
+
+
 def real_one_way_cost_fraction(legs: List[dict], min_legs: int) -> Optional[float]:
     """Average all-in one-way cost as a FRACTION (e.g. 0.0056) over real LMT
     fills, for calibrating the simulated cost model. None until at least
@@ -165,11 +171,14 @@ def real_one_way_cost_fraction(legs: List[dict], min_legs: int) -> Optional[floa
         kept = [p for p in pcts if abs(p) <= band]
         dropped = len(pcts) - len(kept)
         if dropped:
-            logger.warning(
-                f"[cost-calib] discarded {dropped}/{len(pcts)} filled leg(s) with an "
-                f"implausible one-way cost (|cost| > {band:g}%) — almost certainly a "
-                f"stale decision price, not real execution; see the price-provenance check"
-            )
+            msg = (f"[cost-calib] discarded {dropped}/{len(pcts)} filled leg(s) with an "
+                   f"implausible one-way cost (|cost| > {band:g}%) — almost certainly a "
+                   f"stale decision price, not real execution; see the price-provenance check")
+            if dropped != _LAST_DISCARD_WARNED["n"]:
+                _LAST_DISCARD_WARNED["n"] = dropped
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
         pcts = kept
     if len(pcts) < max(1, int(min_legs)):
         return None

@@ -326,7 +326,14 @@ def _macro_llm_attempts() -> list:
     2026-07-22: a DeepSeek primary used to return DeepSeek ALONE, so a DeepSeek
     outage left macro classification with no engine at all. Both providers are now
     always in the chain (order set by the primary), matching the synthesis and
-    sentiment layers — a single provider being down never silences a whole layer."""
+    sentiment layers — a single provider being down never silences a whole layer.
+
+    2026-09-29: both providers are HOSTED (OpenRouter's Qwen, DeepSeek), so with
+    ``enable_hosted_sentiment_engines`` off (local-only mode: every hosted account
+    is unfunded) the chain is empty and the keyword heuristic classifies — it did
+    anyway, after two HTTP 402s on every tick."""
+    if not getattr(settings, "enable_hosted_sentiment_engines", True):
+        return []
     think = settings.llm_max_thinking
     from src.analysis.qwen_api import thinking_body
     qwen = ("qwen", settings.qwen_model, settings.qwen_base_url, settings.qwen_api_key,
@@ -508,7 +515,7 @@ def fetch_macro_news_context(articles: Optional[List[NewsArticle]] = None) -> Op
         signal = _signal_from_score(score)
         top_theme = themes[0].category.replace("_", " ") if themes else "—"
         summary = (
-            f"Heuristic read (no DeepSeek key): {len(themes)} active macro theme(s), "
+            f"Heuristic read (no hosted LLM): {len(themes)} active macro theme(s), "
             f"led by {top_theme}. Score={score:+.2f} → {signal}."
         )
 

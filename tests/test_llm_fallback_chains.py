@@ -132,3 +132,20 @@ def test_hold_review_fallback_never_retries_the_pinned_engine():
     from src.pipeline import hold_review_fallbacks
     for pin in ("deepseek", "qwen", "anthropic"):
         assert pin not in hold_review_fallbacks(pin)
+
+
+def test_macro_news_calls_no_hosted_llm_in_local_only_mode(monkeypatch):
+    """2026-09-29: with the hosted engines off (unfunded accounts) macro-news
+    still called OpenRouter's Qwen and DeepSeek on every tick — two HTTP 402s —
+    before its keyword heuristic classified anyway."""
+    import openai
+    from src.data import macro_news
+    monkeypatch.setattr(settings, "enable_hosted_sentiment_engines", False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "k1")
+    monkeypatch.setattr(settings, "qwen_api_key", "k2")
+    assert macro_news._macro_llm_attempts() == []
+
+    def _no_client(*a, **k):
+        raise AssertionError("a hosted LLM client was built in local-only mode")
+    monkeypatch.setattr(openai, "OpenAI", _no_client)
+    assert macro_news._deepseek_classify([]) is None       # -> the heuristic path

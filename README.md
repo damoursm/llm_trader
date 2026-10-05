@@ -1,6 +1,8 @@
 # LLM Trader
 
-An AI-powered stock analysis system that aggregates dozens of free data sources — news, technicals, insider trades, options flow, SEC filings, macro indicators, breadth signals, and alternative data — weights them with a configurable signal aggregator (the learned ML stackers are the live combine), selects BUY/SELL entries by a measured cross-sectional RANK rule, and runs an LLM synthesis of the same picture as an unacted shadow so the two decision paths can be compared ticker for ticker.
+An AI-powered stock analysis system that aggregates dozens of data sources — news (scored by a self-hosted LLM), technicals, insider trades, options flow, SEC filings, macro indicators, breadth signals, alternative data and a point-in-time "deep" history store — scores every name every 30 minutes and persists the full cross-section as a learning panel.
+
+**What trades (since 2026-09-28): one strategy, the SELECTION SHORT.** A LightGBM selection model on 30-minute bars (OHLCV features + point-in-time deep features) ranks ~2,150 liquid names on every regular-hours bar; its top pick — when it is a fresh high against the name's own history — is SHORTED if the stock rose over the previous 5 sessions, its short interest is under one day of volume and IBKR can lend it, then covered once half that run-up is given back or after 15 sessions; a second arm applies the same rule to each bar's most volatile name (30-minute ATR%) ([Step 5S](#step-5s--the-selection-short-the-live-strategy-srcsignalssel_shortpy), runbook [`docs/SEL_SHORT.md`](docs/SEL_SHORT.md)). Everything else — the weighted/ML signal combine, the cross-sectional rank rule that used to pick the trades, follow-through — still runs and persists every tick as an unacted SHADOW.
 
 ---
 
@@ -68,7 +70,9 @@ An AI-powered stock analysis system that aggregates dozens of free data sources 
 │  3N. Extended-Session Gap — live pre/after-market print vs last completed │
 │                             close in ATR units (off-hours runs only)     │
 │  4.  Signal Aggregation   — weighted combination with coherence scoring  │
-│  5.  Recommendations      — rank rule BUY / SELL (LLM = unacted shadow) │
+│  5.  Recommendations      — rank rule BUY / SELL — SHADOW since 09-28    │
+│  5S. Selection Short      — THE LIVE STRATEGY: top fresh 30-min pick,    │
+│                             shorted after a 5-session rise, borrowable   │
 │  6.  Performance Tracking — paper trades, P&L, method attribution        │
 │  7.  Charts + Email       — HTML report + inline-chart email             │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -110,7 +114,7 @@ When `ENABLE_OPPORTUNITY_SCREENER=true`, runs a **proactive** technical scan tha
 | Relative strength | trailing `SCREEN_RS_LOOKBACK_DAYS` (63) return minus SPY's ≥ `SCREEN_RS_THRESHOLD_PCT` (±10pp) |
 | Golden / death cross | 50-day SMA crossing the 200-day within the last `SCREEN_CROSS_LOOKBACK` (5) bars |
 
-A **liquidity gate** (`SCREEN_MIN_PRICE` $5 + `SCREEN_MIN_DOLLAR_VOLUME` $20M avg dollar volume) keeps illiquid micro-pumps out, so widening the funnel doesn't lower quality. The top `SCREEN_MAX_RESULTS` (20) setups — ranked by screen confluence, then relative strength, then volume surge — are **injected into the analysis universe**, where each then receives the full signal stack. This pairs directly with **Trend Strength**: a screener 52-week/Donchian breakout is both the discovery trigger *and* a scoring signal. Surfaced in the email's **Opportunity Screener** section (ticker · bias · setups). Fail-graceful; disable with `ENABLE_OPPORTUNITY_SCREENER=false`.
+A **liquidity gate** (`SCREEN_MIN_PRICE` $5 + `SCREEN_MIN_DOLLAR_VOLUME` $20M avg dollar volume) keeps illiquid micro-pumps out, so widening the funnel doesn't lower quality. The top `SCREEN_MAX_RESULTS` (20) setups — ranked by screen confluence, then relative strength, then volume surge — are **injected into the analysis universe**, where each then receives the full signal stack. This pairs directly with **Trend Strength**: a screener 52-week/Donchian breakout is both the discovery trigger *and* a scoring signal. Surfaced in the email's **Opportunity Screener** section (ticker · bias · setups). A cached frame more than `SCREEN_MAX_STALE_SESSIONS` (2) SPY sessions behind is never screened, and outside the curated list never fetched: an acquired name's frozen takeover-price bars read as fresh 52-week highs (CRNX, APGE, FBRX, ATAI were injected on every tick until 2026-09-29). Fail-graceful; disable with `ENABLE_OPPORTUNITY_SCREENER=false`.
 
 ---
 
@@ -152,13 +156,17 @@ Steps 0–0d widen the discovery funnel; this applies one **uniform quality floo
 
 `liquidity.apply_liquidity_gate()` applies three filters in its cleaning pass: **(1) ticker validation** — `is_valid_ticker` drops junk like `N/A` before it reaches yfinance (which otherwise raises an opaque error and spams the log); **(2) security-type filter** — `is_exotic_security` drops preferred series (`-P[A-Z]`), warrants/units/rights, and OTC foreign ordinaries (5-char `…F/W/U`), which are redundant with a primary listing and/or not on the US consolidated tape (ADRs `…Y` and class shares `BRK-B` are KEPT); disable with `ENABLE_SECURITY_TYPE_FILTER=false`; **(3) liquidity** — keeps a candidate only when its **last close ≥ `DISCOVERY_MIN_PRICE`** ($1) **and** its **20-day average dollar volume ≥ `DISCOVERY_MIN_DOLLAR_VOLUME`** ($5M). _(Loosened 2026-07-05 from $5 / $20M to widen the net toward penny / lower-volume names — the predictability panel's `price` + `dollar_vol` bucket features then measure whether those are easier or harder to predict. The $1 floor keeps out sub-$1 OTC junk; the $5M floor still leaves every name plenty liquid for ~$1k positions. Dollar-volume is the main universe-SIZE lever — raise it toward $20M if ticks get slow.)_ Data is loaded **cache-first** with a bounded warm-up fetch (`DISCOVERY_GATE_MAX_FETCH`, a single shared budget per run); a name whose liquidity cannot be verified is **dropped (fail-closed)** — the base watchlist is never affected, and a genuinely liquid name re-appears next run once its OHLCV cache is warm.
 
-**Never gated** (pinned/intentional): the static watchlist, sector ETFs, commodities, factor/thematic ETFs, and open-trade tickers. The gate runs as one pass at the end of Step 0 (covering trending, market-wide earnings/analyst catalysts, and cluster-watch injections) and again at the macro→discovery (Step 3.85) and cointegration-peer (Step 3.9) injection points. The opportunity screener (Step 0b) applies the same price/dollar-volume floor internally. Disable with `ENABLE_DISCOVERY_LIQUIDITY_GATE=false`.
+**Never gated** (pinned/intentional): the static watchlist, sector ETFs, commodities, factor/thematic ETFs, and open-trade tickers. The gate runs as one pass at the end of Step 0 (covering trending, market-wide earnings/analyst catalysts, and cluster-watch injections) and again at the macro→discovery (Step 3.85) and cointegration-peer (Step 3.9) injection points. The opportunity screener (Step 0b) applies the same price/dollar-volume floor internally. A name whose history fetch came back empty is not re-fetched until the next day (recorded only when the run's other fetches returned data, so an outage marks nothing). Disable with `ENABLE_DISCOVERY_LIQUIDITY_GATE=false`.
 
 ---
 
 ### Step 1 — News Fetch (`src/data/news_fetcher.py`)
 
 Pulls articles from several layers and deduplicates by URL, filtered to the last 24 hours. The **fresh-every-tick fast lane** (RSS + PR wires + FDA + Google News) is never cached so breaking catalysts aren't hidden; the rate-limited per-ticker yfinance + NewsAPI bundle is cached hourly.
+
+**All-source ingestion (2026-09-25, `ENABLE_ALL_SOURCE_NEWS`).** Every per-ticker feed asks about EVERY name the tick scores (~400), not just Step 0's list (~130): the next tick's feeds also ask about the previous tick's final universe (`cache/news_feed_universe.json`), a top-up covers the names still missing once the universe is final, and the date/hour-keyed event caches (analyst, EPS, short interest, ticker events, the yfinance bundle) are incremental per ticker through coverage sidecars (`src/data/news_coverage.py`, `cache/coverage/`). It adds ~170 names a tick to the LLM scorer (~+5 min).
+
+**Every tick's merged pool is archived** before anything cuts it (`ENABLE_NEWS_ARCHIVE`): `news_articles` holds one row per unique article with its first/last sighting, and `news_article_feeds` records every feed that delivered it (the pool keeps only the first copy of a URL). Until 2026-09-11 ~75% of each tick's articles were discarded when the tick ended, which is why news history before then can only be reconstructed.
 
 **Layer A — RSS + press-release wires + regulatory (no key required, fetched fresh every tick)**
 
@@ -174,7 +182,7 @@ Pulls articles from several layers and deduplicates by URL, filtered to the last
 
 **Layer B — per-ticker Google News (no key required, fetched fresh every tick)**
 
-`fetch_google_news` runs **two** per-ticker Google News RSS queries — by SYMBOL (`"<TICKER>" stock`) and by COMPANY NAME (`"antero resources" stock`) — plus a `site:businesswire.com` query, so each article is ticker-tagged and coverage widens to Reuters/Bloomberg/Barron's/FT/Investing.com **and** Business Wire. The name query is not redundant: Google treats a quoted symbol as a literal word, so the symbol query finds only pieces that actually print the ticker (measured over 24h on 120 names: symbol 347 confirmed articles / 81 tickers, name 617 / 83, either 92). Bounded by `GOOGLE_NEWS_MAX_TICKERS` (**150**).
+`fetch_google_news` runs **two** per-ticker Google News RSS queries — by SYMBOL (`"<TICKER>" stock`) and by COMPANY NAME (`"antero resources" stock`) — plus a `site:businesswire.com` query, so each article is ticker-tagged and coverage widens to Reuters/Bloomberg/Barron's/FT/Investing.com **and** Business Wire. The name query is not redundant: Google treats a quoted symbol as a literal word, so the symbol query finds only pieces that actually print the ticker (measured over 24h on 120 names: symbol 347 confirmed articles / 81 tickers, name 617 / 83, either 92). Uncapped since 2026-09-25 (`GOOGLE_NEWS_MAX_TICKERS=0`: ~1,200 queries a tick; a sweep that collects 25 non-200 answers stops itself — feedparser reports a 429 as an empty feed).
 
 **Layer C — NewsAPI targeted queries (requires `NEWSAPI_KEY`)**
 
@@ -182,7 +190,7 @@ Two targeted queries: the first 10 watchlist tickers joined with `OR`, and secto
 
 **Layer D — provider news + alt-data**
 
-Polygon `/v2/reference/news` (Benzinga-sourced, carries per-article sentiment `insights` → can skip the LLM scorer) and Finnhub `company-news` (coverage only). Optional, off by default: Alpha Vantage `NEWS_SENTIMENT` (pre-scored, hourly-cached, budget-gated) and StockTwits crowd sentiment (token-gated). All normalised to `NewsArticle`.
+Polygon `/v2/reference/news` (Benzinga-sourced, carries per-article sentiment `insights` → can skip the LLM scorer) and Finnhub `company-news`, kept OFF the tick by a background refresher (`src/data/finnhub_refresher.py`: a per-ticker cache re-asked every 10 min at 50 calls/min under the free tier's 60; the tick serves today's fresh entries and fetches the rest inline; it idles when no tick has fed it for 2 h and publishes its state to `cache/finnhub_refresher_state.json`). Optional, off by default: Alpha Vantage `NEWS_SENTIMENT` (pre-scored, hourly-cached, budget-gated) and StockTwits crowd sentiment (token-gated). All normalised to `NewsArticle`.
 
 ---
 
@@ -209,7 +217,7 @@ Fetches recent 8-K filings for every ticker directly from SEC EDGAR's submission
 | 1.05 | Material Cybersecurity Incident |
 | 3.01 | Notice of Delisting |
 
-8-K filings are converted to `NewsArticle` objects and scored by the same DeepSeek LLM as RSS articles — no separate pipeline stage needed.
+8-K filings are converted to `NewsArticle` objects and scored by the same LLM sentiment scorer as RSS articles (the local Qwen engine — see [Model Routing](#model-routing)) — no separate pipeline stage needed.
 
 ---
 
@@ -217,7 +225,7 @@ Fetches recent 8-K filings for every ticker directly from SEC EDGAR's submission
 
 When `ENABLE_GOOGLE_TRENDS=true`, fetches relative search interest for each watchlist ticker via the `pytrends` unofficial API. Cached daily. No API key required.
 
-**Signal logic:** Compares the latest weekly interest score to the 4-week average. A spike (current ≥ 130% of average) signals rising retail attention — often precedes breakout moves or short squeezes. A sharp drop signals fading interest. Articles describe the spike/drop intensity and are scored by the DeepSeek sentiment pipeline alongside news.
+**Signal logic:** Compares the latest weekly interest score to the 4-week average. A spike (current ≥ 130% of average) signals rising retail attention — often precedes breakout moves or short squeezes. A sharp drop signals fading interest. Articles describe the spike/drop intensity and are scored by the LLM sentiment pipeline alongside news.
 
 ---
 
@@ -225,7 +233,7 @@ When `ENABLE_GOOGLE_TRENDS=true`, fetches relative search interest for each watc
 
 When `ENABLE_REDDIT_SENTIMENT=true`, scans three subreddits — **r/wallstreetbets**, **r/stocks**, and **r/investing** — via the Reddit API. Cached hourly. Requires free Reddit API credentials.
 
-**What is measured:** For each watchlist ticker, counts posts and comments mentioning the ticker in the last 24 hours, computes upvote-weighted sentiment (post score as a weight proxy), and classifies the combined signal as BULLISH, BEARISH, or NEUTRAL. Results are surfaced as `NewsArticle` objects so they flow through the same DeepSeek scoring pipeline as news.
+**What is measured:** For each watchlist ticker, counts posts and comments mentioning the ticker in the last 24 hours, computes upvote-weighted sentiment (post score as a weight proxy), and classifies the combined signal as BULLISH, BEARISH, or NEUTRAL. Results are surfaced as `NewsArticle` objects so they flow through the same LLM scoring pipeline as news.
 
 **Why it matters:** r/wallstreetbets in particular can generate self-fulfilling retail squeezes. A significant spike in WSB mention count + positive sentiment often precedes the initial leg of a retail-driven move.
 
@@ -235,7 +243,7 @@ When `ENABLE_REDDIT_SENTIMENT=true`, scans three subreddits — **r/wallstreetbe
 
 When `ENABLE_ANALYST_RATINGS=true`, fetches recent upgrades, downgrades, initiations, and price-target changes from yfinance for each ticker. Cached daily. No API key required.
 
-Each rating change is converted to a `NewsArticle` with a structured summary (e.g., "Goldman Sachs upgrades NVDA from Neutral to Buy, raises PT from $500 to $650") and scored by DeepSeek. Upgrades contribute positively; downgrades and PT cuts contribute negatively to sentiment scores.
+Each rating change is converted to a `NewsArticle` with a structured summary (e.g., "Goldman Sachs upgrades NVDA from Neutral to Buy, raises PT from $500 to $650") and scored by the LLM sentiment scorer. Upgrades contribute positively; downgrades and PT cuts contribute negatively to sentiment scores.
 
 ---
 
@@ -243,7 +251,7 @@ Each rating change is converted to a `NewsArticle` with a structured summary (e.
 
 When `ENABLE_EARNINGS=true`, fetches recent earnings beat/miss data from yfinance `earnings_dates`. Configurable lookback (default: 90 days). Cached daily.
 
-Beat/miss records are surfaced as `NewsArticle` objects. A beat of >10% is a strong positive catalyst; a miss of >10% is a strong negative one. These are combined with news articles before DeepSeek scoring, so an earnings beat in the recent past raises the ticker's sentiment score even without current news coverage.
+Beat/miss records are surfaced as `NewsArticle` objects. A beat of >10% is a strong positive catalyst; a miss of >10% is a strong negative one. These are combined with news articles before LLM scoring, so an earnings beat in the recent past raises the ticker's sentiment score even without current news coverage.
 
 ---
 
@@ -302,9 +310,9 @@ When `ENABLE_SHORT_INTEREST=true`, combines two free sources to detect squeeze s
 
 ### Step 2 — Market Data (`src/data/market_data.py`)
 
-Bulk price snapshots for every ticker via a three-tier path: **(1) Polygon batch** (the per-ticker `/v2/snapshot` endpoint **403s on the free tier**, so this returns empty there), **(2) yfinance per-ticker** (live, with 429 exponential backoff 60→120→240s, stops after 3 failures), **(3) a deterministic grouped-daily close fallback** — one Polygon `/v2/aggs/grouped` call (which DOES work on the free tier) fills any still-uncovered ticker with the last completed close, marked `price_source="prev_close"`. This lifted bulk coverage on a wide discovered universe from ~37% to ~90%+.
+Bulk price snapshots for every ticker via a three-tier path: **(1) the Polygon batch snapshot** — the PRIMARY source (Stocks Advanced: real-time, `price_source="live"`; measured 99.88% reliable, one retry on a transport error), which since 2026-08-31 also carries every name's live NBBO (`lastQuote`, feeding the liquidity forecast, NBBO sizing and Gate 4b); **(2) yfinance per-ticker** (429 backoff 60→120→240 s, stops after 3 failures) — and the ONLY source for what Polygon does not serve: indices (^VIX/^MOVE, which feed the Macro Regime Filter), futures, options chains and fundamentals; **(3) a deterministic grouped-daily close fallback** — one Polygon `/v2/aggs/grouped` call fills any still-uncovered ticker with the last completed close, marked `price_source="prev_close"`.
 
-**Two separate price paths.** This bulk snapshot feeds the analysis panel / scoring context / price-provenance check — **not** trade fills. Execution prices come from `tracker._fetch_price` (IBKR real-time → yfinance → Polygon single-ticker), fetched live only for the handful of actionable/held tickers. A live intraday price is inherently non-deterministic; the deterministic anchor used for analysis/NAV/IC is the completed daily **close**.
+**Two separate price paths.** This bulk snapshot feeds the analysis panel / scoring context / price-provenance check — **not** trade fills. Execution prices come from `tracker._fetch_price` (regular hours: Polygon last trade → yfinance; the IBKR price leg is OFF because this account has no API entitlement for live US quotes), fetched live only for the handful of actionable/held tickers. A live intraday price is inherently non-deterministic; the deterministic anchor used for analysis/NAV/IC is the completed daily **close**.
 
 **Intraday operation (no unclosed-bar look-ahead):** the pipeline runs every 30 min during market hours on **live** prices, and the daily OHLCV history used by the indicators is **completed-bars-only** — the still-forming current-session bar is dropped until the 16:00 ET close (`market_data._drop_forming_bar`). So no indicator or return calculation ever reads an unclosed daily bar; the live price is used for fills and mark-to-market, the completed daily bars for the multi-day signals (Hybrid model).
 
@@ -1509,11 +1517,11 @@ COINTEGRATION_PVALUE=0.05      # ADF significance level (0.01 | 0.05 | 0.10)
 
 ### Step 4 — Signal Aggregation (`src/signals/aggregator.py`)
 
-Combines up to sixteen signal methods with dynamically normalized weights:
+Combines the weighted signal methods — 32 today (`broker_advisor` among them, but off); the full list and base weights are in CLAUDE.md ("Weighted methods") — with dynamically normalized weights. Since 2026-09-05 the learned ML stackers (`ml_buy` / `ml_sell`, `src/analysis/ml_stacker.py`) replace the weighted camps as the combine, and since 2026-09-28 the whole combine feeds only the SHADOW rank rule (Step 5) and the learning panel: the selection short (Step 5S) reads none of it. The main methods:
 
 | Method | Base weight | Source |
 |---|---|---|
-| News sentiment | 40% | DeepSeek V4-Flash LLM scoring of all article-type sources |
+| News sentiment | 40% | local Qwen3-8B LLM scoring of every article-type source |
 | Sentiment velocity | 12% | Δ news tone (recent − prior window) — rate of change, not level |
 | Technical analysis | 30% | RSI, MACD, SMA20/50, Bollinger Bands |
 | Smart money / insider | 30% | Insider trades + options flow + SEC filings |
@@ -1534,7 +1542,7 @@ Weights are re-normalized at runtime based on which methods are enabled — they
 
 **Confidence formula:**
 ```
-raw_confidence     = min(1.0, |combined_score| / 0.5)
+raw_confidence     = min(1.0, |combined_score| / scale)   # scale 0.642 on the rank basis; ~0.12, self-calibrated, on the ML combine
 coherence_factor   = 0.45 + agreement_ratio × 0.90   ∈ [0.45, 1.35]
 movement_factor    = f(ATR%, BB-width%, GEX_signal)   ∈ [0.70, 1.30]
 volume_factor      = f(vol_ratio, |combined|, coherence)  ∈ [0.90, 1.15]
@@ -1551,15 +1559,15 @@ confidence = raw_confidence × coherence_factor × movement_factor × volume_fac
 
 **Second pass — sector alignment:** Individual stocks are cross-referenced against their sector ETF. Alignment → 1.10× confidence boost; contradiction → 0.75× penalty.
 
-**Actionable threshold:** Only `BUY` and `SELL` with `confidence ≥ 0.78` AND `sources_agreeing ≥ 2` are considered actionable. A single strong source never produces a BUY/SELL regardless of score magnitude.
+**Actionable threshold:** superseded. Since 2026-09-04 the rank rule (Step 5) picks BUY/SELL from the within-run rank of `combined_score`, so the old confidence floor no longer applies, and the two-source agreement gate (Gate 1b) has been off since 2026-08-17; the remaining gates (liquidity, live-book width, anti-chase, earnings blackout, PANIC BUY block) screen the shadow recommendations.
 
 ---
 
-### Step 5 — Final Recommendations (`src/signals/rank_entry.py`; LLM shadow in `src/analysis/claude_analyst.py`)
+### Step 5 — Final Recommendations (`src/signals/rank_entry.py`; LLM shadow in `src/analysis/claude_analyst.py`) — SHADOW since 2026-09-28
 
-**Since 2026-09-04 the trades are decided MECHANICALLY** (`enable_llm_synthesis=false`). `rank_entry.build_rank_recommendations` selects, per run and per side, the top-K BUY / bottom-K SELL names by within-run rank of `combined_score` over the tradeable (Gate-4) cross-section, but only among the names whose direction BAND fired (`rank_diff_threshold_long/_short`, roughly the top 10% / bottom 5%) — so a run where nothing clears the band trades nothing. K = `gate1_rank_cap` (3) per side. The rows are ordinary `Recommendation` objects, so everything downstream (Gates 2/3/4/4b/5, the earnings blackout, the PANIC BUY block, sizing, the ledger, the broker sync, the email and the panel) is unchanged; Gate 1's absolute confidence floor and Gate 1c's cap no longer apply, since the rule produces no stated confidence. Measured pre-registered on the H/L pivot label over 2026-08-13 → 09-04 (1,245 actionable decisions, per-run and per-side count-matched): the LLM funnel +0.19 %/decision (indistinguishable from random, t +0.56), the rank rule +1.56 % (beats random by +1.60, t +2.11). The run stamps `llm_synthesis_provider='rank'` / model `rank-v1`.
+**SHADOW since 2026-09-28.** The rank rule below still runs, gates and persists its recommendations every tick (the `recommendations` table and the `signals` panel), but nothing opens them (`ENABLE_LEGACY_ENTRIES=false`) — the trades come from the selection short ([Step 5S](#step-5s--the-selection-short-the-live-strategy-srcsignalssel_shortpy)). **From 2026-09-04 to 09-25 it decided the trades MECHANICALLY** (`enable_llm_synthesis=false`). `rank_entry.build_rank_recommendations` selects, per run and per side, the top-K BUY / bottom-K SELL names by within-run rank of `combined_score` over the tradeable (Gate-4) cross-section, but only among the names whose direction BAND fired (`rank_diff_threshold_long/_short`, roughly the top 10% / bottom 5%) — so a run where nothing clears the band trades nothing. K = `gate1_rank_cap` (3) per side. The rows are ordinary `Recommendation` objects, so everything downstream (Gates 2/3/4/4b/5, the earnings blackout, the PANIC BUY block, sizing, the ledger, the broker sync, the email and the panel) is unchanged; Gate 1's absolute confidence floor and Gate 1c's cap no longer apply, since the rule produces no stated confidence. Measured pre-registered on the H/L pivot label over 2026-08-13 → 09-04 (1,245 actionable decisions, per-run and per-side count-matched): the LLM funnel +0.19 %/decision (indistinguishable from random, t +0.56), the rank rule +1.56 % (beats random by +1.60, t +2.11). The run stamps `llm_synthesis_provider='rank'` / model `rank-v1`.
 
-**The LLM synthesis still runs on every tick as a SHADOW** (`enable_synthesis_shadow`, engine `deepseek` in production): all ticker signals plus every macro/breadth/volatility context block are passed in one structured prompt, and every engine's per-ticker decision — the acting rank rule and the shadow LLM alike — lands in the `engine_recommendations` table (`live` flag) for a ticker-by-ticker comparison. The shadow verdict never opens, closes or sizes a trade. The context-block descriptions throughout this README ("passed into the synthesis prompt", "tells the model how much to trust…") describe that shadow prompt — where a section says "Claude uses this…" read it as the synthesis model, which has been DeepSeek since the engine bake-off; `enable_llm_synthesis=true` makes it the decider again.
+**The LLM synthesis shadow is OFF since 2026-09-18** (`ENABLE_SYNTHESIS_SHADOW=false` — the local-only directive: both hosted accounts are unfunded, and the synthesis prompt does not fit the local 8B model's context). Until then it ran on every tick: all ticker signals plus every macro/breadth/volatility context block were passed in one structured prompt, and every engine's per-ticker decision — the acting rank rule and the shadow LLM alike — landed in the `engine_recommendations` table (`live` flag; it ends 2026-09-17/18) for a ticker-by-ticker comparison. The shadow verdict never opened, closed or sized a trade. The context-block descriptions throughout this README ("passed into the synthesis prompt", "tells the model how much to trust…") describe that prompt — where a section says "Claude uses this…" read it as the synthesis model (DeepSeek since the engine bake-off); `enable_llm_synthesis=true` with a funded engine makes it the decider again.
 
 **Context blocks injected into the (shadow) synthesis prompt:**
 
@@ -1584,13 +1592,27 @@ confidence = raw_confidence × coherence_factor × movement_factor × volume_fac
 
 The synthesis model acts as a portfolio manager with numbered decision rules covering: conviction thresholds, smart money weighting, macro overlays, cluster handling, volatility regimes, breadth conditions, earnings event caution, and more. When no ticker clears the bar, it outputs HOLD/WATCH for all.
 
-**Automatic fallback chain (when the LLM is the decider):** if the chosen synthesis engine's API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to the other provider via the OpenAI-compatible streaming API; if that fails too, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The engine that answered is logged at INFO level and recorded per run, per recommendation and per trade. In the current shadow role a failed call simply costs one comparison row.
+**Automatic fallback chain (when the LLM is the decider):** if the chosen synthesis engine's API call fails for any reason (credits exhausted, authentication error, rate limit, server error, or connection failure), `generate_recommendations()` automatically re-sends the identical prompt to the other provider via the OpenAI-compatible streaming API; if that fails too, a rule-based converter produces conservative HOLD/WATCH/BUY/SELL from the raw signal scores. The engine that answered is logged at INFO level and recorded per run, per recommendation and per trade. With the shadow off, no synthesis call is made at all.
+
+---
+
+### Step 5S — The Selection Short, the live strategy (`src/signals/sel_short.py`)
+
+**Since 2026-09-28 this is the ONLY strategy that opens trades** (user directive 2026-09-26: *"Deploy the model with the half give-back with max hold of 15 days with all borrowable. Use it to make all trades and put all other models as shadow."*). Operational runbook: [`docs/SEL_SHORT.md`](docs/SEL_SHORT.md).
+
+- **Signal.** V2 (`fx_v2_le2026-04-30`, from 2026-10-02; extra inputs `src/signals/sel_v2.py`): v1's recipe trained with the delisted companies, v1's 146 inputs + 15 (run-up, own-ATR margin, relative volume, reverse splits, SEC distress / dilution filings, the bar's ATR% / run-up ranks and sector-relative values) + the 6 cross-sectional ranks, 8 yfinance inputs blanked. v1 — `tailreg_long_400` (`src/analysis/sel_models.py`): a LightGBM tail regressor fit on 30-minute bars through 2026-04-30, 146 features — the bar's 85 OHLCV / pivot-leg features (the same function `ml_ohlcv` is served through) plus 61 per-ticker point-in-time deep features from the pre-open session snapshot (filings, insider, earnings, analyst, short interest, news attention, fundamentals, extended-hours bars — see [Models and the deep history store](#models-and-the-deep-history-store)). It ranks the liquid universe — deep-store names with price ≥ $5 and a 20-session mean regular-hours dollar volume ≥ $5M, ~2,150 a day — on every regular-hours bar. The bar's top-1 is kept only when FRESH (a new high against the name's own scores over the previous 30 sessions, or fewer than 10 of them) and it is the name's first fresh pick of the day.
+- **The vol arm** (from 2026-09-28, user directive 2026-09-26: *"Deploy 'Short the most volatile name' … alongside the current short model"*). The same run ranks every name by its 30-minute ATR% and applies the same rule — top-1, fresh against its own ATR% history over 20 sessions, first pick of the day — then the same trade and exit. A name both arms pick on the same bar is one trade (`sel_arm = "model+vol"`); a later pick of a name already shorted opens another trade on top (no one-position-per-ticker limit since 2026-09-28, `SEL_SHORT_MAX_OPEN_PER_TICKER`).
+- **Trade.** SHORT the pick only when it ROSE over the 5 sessions before (vs the last close at or before the same bar 5 sessions earlier, whatever its age; a base from before a gap in the stored history, such as a reused ticker, is flagged `pre5_stale` in the journal), its short interest is under one day of volume (FINRA days to cover ≤ 1.0 in the pre-open snapshot, both arms, from 2026-09-28 — user directive 2026-09-27; a refused pick is journaled `crowded`) and IBKR can lend it (≥ $10k available at any fee, from IBKR's borrow file — Step 6). Flat size (1.0 × the base order), no gate cascade, no sizing chain; a pick whose price already sits at its target when the entry step runs is skipped.
+- **Exit.** Cover when HALF the 5-session run-up has been given back (`target = close − 0.5 × (close − close 5 sessions before)`), checked at EVERY tick in every session on a fresh mark (user directive 2026-09-27: entries and exits must always be possible); otherwise at the first tick at/after the same bar 15 sessions later. And, from 2026-09-28 (user directive: "Implement the Cover when volatility halves (in profit) for the two live models in production"), a short that is in profit is covered once the name's 30-minute ATR% has fallen to half its value at the pick bar (`sel_volnorm`; measured on 2025 + Jan–Sep 2026: vol 1.67 → 2.08 %/day, model 0.85 → 0.91 — not significant, judged live). No stop and no trail — every one measured (22 rules, 2026-09-27) lowered the return per day.
+- **Performance** (live-faithful re-test 2026-09-27: every bar, the $5 floor on the traded price, one position per ticker, NBBO costs, today's borrow fees; return per day = the average trade over its average 24-hour hold): the MODEL arm **0.11 %/day** on 139 trades Jan–Sep 2026 (median trade +9.4%, five squeezes of −106…−350%), **1.41 %/day** on 56 with the short-interest filter (all of the gain May–September); the VOL arm **1.71 %/day** on 72, **2.41 %/day** on 53 with the filter. The filter was chosen in sample. The deploy-time +1.40 %/day (156 trades) used looser mechanics and overstated the model arm.
+- **How it runs.** Each tick launches the scorer as a SUBPROCESS at its start — `--run` for every completed regular-hours bar not yet run (~2–3 min a bar for ~2,150 names: the day's bars fetched from Polygon, both arms' features and inference) or the daily `--prepare` from 09:00 ET. The tick's trading path runs FIRST (`ENABLE_LIVE_PATH_FIRST`, user directive 2026-09-28): marks and exits at once; then, while the shadow pipeline fetches its data, it waits for the scorer (≤ 480 s), opens the picks and syncs the broker — entries go out ~2.5 min into the tick instead of after the shadow pipeline (10–40 min; a 1–2 tick delay measured harmless either way). The end of the tick re-judges the exits, takes a late scorer's picks and syncs again. A split recorded in the deep store's split data resets that name's 30-minute history before any inference. Live scores equal the evaluation arrays' construction exactly. Every email carries the scorer's health: a red banner and a 🔔 SCORER subject tag for a bar never scored or crashed, a thin run, a scorer error, or a pre-open snapshot missing or defective that the scorer could not rebuild; otherwise a green line. State lives in `cache/ml/sel_short/` (model, universe, the scores that feed the freshness rule, the decision journal); log `logs/sel_short.log`. Runbook: [`docs/SEL_SHORT.md`](docs/SEL_SHORT.md).
+- **The legacy book.** Every position the older strategies opened was closed ONCE at the first regular-hours tick at/after 2026-09-28 09:30 ET (`LEGACY_FLATTEN_AFTER`): 22 trades at 09:44, IBKR flat once their exits filled; a marker file keeps it from running again. Legacy exits never touch a selection short, and while this strategy is live the broker never sends a legacy entry that has not filled.
 
 ---
 
 ### Step 6 — Performance Tracking (`src/performance/tracker.py` + `src/performance/daily_nav.py`)
 
-Every actionable signal is recorded in the **DuckDB** trade ledger (`data/llm_trader.db`; the legacy `cache/trades.json` is now import-only — see [Database & Dashboard](#database--dashboard)). Each trade carries:
+Every trade is recorded in the **DuckDB** trade ledger (`data/llm_trader.db`; the legacy `cache/trades.json` is now import-only — see [Database & Dashboard](#database--dashboard)) — since 2026-09-28 only the selection short opens them (`entry_mechanism="sel_short"`); the legacy books (the rank rule, follow-through) open none unless re-enabled. Each trade carries:
 
 | Field | Purpose |
 |---|---|
@@ -1599,16 +1621,18 @@ Every actionable signal is recorded in the **DuckDB** trade ledger (`data/llm_tr
 | `current_price`, `current_price_datetime` | Live M2M mark + timestamp; refreshed each pipeline tick. |
 | `exit_date`, `exit_datetime`, `exit_price` | Same datetime/price pairing when the trade closes (auto-close or signal reversal). |
 | `return_pct` | Spread-adjusted buy-and-hold percent return (see formula below). |
-| `position_size_multiplier`, `sector_key` | The product of the sizing chain (continuous confidence ramp × agreement breadth × expected-edge blend × predictability tilt × NBBO liquidity tilt × regime / session haircuts) and the bucket used for the 3× per-sector cap. |
+| `position_size_multiplier`, `sector_key` | The selection short: a flat `SEL_SHORT_SIZE_MULTIPLIER` (1.0). The legacy book: the product of its sizing chain (continuous confidence ramp × agreement breadth × expected-edge blend × predictability tilt × NBBO liquidity tilt × regime / session haircuts) and the bucket used for the per-sector cap. |
+| `entry_mechanism`, `sel_*`, `borrow_*` | Which strategy opened it (`sel_short`, or a legacy mechanism); the selection short's pick record (`sel_arm`, `sel_score` / `sel_vol_score`, `sel_bar_end`, `sel_runup_pct`, `sel_target_price`, `sel_deadline`, `sel_days_to_cover`, `sel_stack_n` (its place in a stack of shorts on one name), `sel_atr_pct` — the pick bar's 30-min ATR% — and `sel_also` for later picks of a held name; a volatility cover adds `sel_exit_atr_pct` / `sel_exit_atr_bar`); the borrow fee and availability IBKR quoted when a short was opened. |
 | `method_scores`, `methods_agreeing`, `dominant_method` | Per-method attribution captured at entry. |
 | `status` | `OPEN` or `CLOSED`. |
 
 Lifecycle:
 
-1. **Open** (`record_new_trades`) — entry price fetched **live** at recommendation time and stamped together with `entry_datetime`; position-size multiplier set by the sizing chain above; correlation haircut applied. The **intraday timing gate** (`enable_intraday_timing`, default on) defers an entry whose 30-min momentum is strongly against it — the next 30-min tick re-checks, so the position waits for a less hostile entry.
+0. **Selection short** (`record_sel_short_trades` → `monitor_sel_short_positions`) — opens each journaled pick still ≤ 75 min old at a live price (skipping a name already open, one already at its target, one IBKR cannot lend), and covers it on its three rules only: `sel_target` (half the run-up given back, judged at every tick in every session on a mark ≤ 45 min old), `sel_volnorm` (in profit once the 30-min ATR% has halved since the pick) or `sel_time` (15 sessions). The legacy exits below never touch it. Both run twice a tick — in the live path at the start of the tick and again at its end. **`flatten_legacy_positions`** closed every legacy position once, at the first regular-hours tick at/after 2026-09-28 09:30 ET (09:44, 22 trades).
+1. **Legacy open** (`record_new_trades`, only with `ENABLE_LEGACY_ENTRIES=true`) — entry price fetched **live** at recommendation time and stamped together with `entry_datetime`; position-size multiplier set by the sizing chain above; correlation haircut applied. The **intraday timing gate** (`enable_intraday_timing`, default on) defers an entry whose 30-min momentum is strongly against it — the next 30-min tick re-checks, so the position waits for a less hostile entry.
 2. **Refresh / mark** (`update_open_trades`) — every tick re-fetches the live price and updates `current_price`/`current_price_datetime`/`return_pct`/`weighted_return_pct`/`days_held` for every open trade. **There is no time cap** — a position is held as long as its thesis holds (`days_held` is observability only).
-3. **Monitor close** (`monitor_open_positions`) — the live reasons, in priority order (production since 2026-09-05, LLM hold review off): `macro_regime_exit` (holding a long while macro = PANIC), `confidence_loss` (today's aggregator confidence below `max(absolute_floor, relative_factor × entry_confidence)`), `trailing_stop` (give-back of half the peak once MFE armed past 3%), `adverse_stop` (long 8% / short 20% on the cost-adjusted mark), and `ml_exit` (the learned exit-timer, on every position, closes at hold-conviction ≤ −0.35). `signal_flipped` (today's oriented combined score crosses against the trade) and `signal_decay` (entry strength minus today's strength exceeds the drop threshold) are computed and stamped as SHADOW exits but no longer close anything (`signal_decay_exits_shadow_only`) — measured ~0 timing skill on the pivot basis. There is no time-based exit. With `enable_intraday_exit` (opt-in) it also closes on a hard 30-min reversal against the position (`intraday_reversal`).
-4. **Reversal close** (`close_trades_on_signal_reversal`) — if today's actionable signal flips the direction of an open position (in rank mode: the ticker made the opposite side's top-K and cleared the gates this run), it closes with `exit_datetime = current_price_datetime` (re-uses the most recent live mark, no extra fetch) and the new leg is opened immediately after.
+3. **Legacy monitor close** (`monitor_open_positions`, legacy positions only) — the reasons, in priority order (production since 2026-09-05, LLM hold review off): `macro_regime_exit` (holding a long while macro = PANIC), `confidence_loss` (today's aggregator confidence below `max(absolute_floor, relative_factor × entry_confidence)`), `trailing_stop` (give-back of half the peak once MFE armed past 3%), `adverse_stop` (long 8% / short 20% on the cost-adjusted mark), and `ml_exit` (the learned exit-timer, on every position, closes at hold-conviction ≤ −0.35). `signal_flipped` (today's oriented combined score crosses against the trade) and `signal_decay` (entry strength minus today's strength exceeds the drop threshold) are computed and stamped as SHADOW exits but no longer close anything (`signal_decay_exits_shadow_only`) — measured ~0 timing skill on the pivot basis. There is no time-based exit. With `enable_intraday_exit` (opt-in) it also closes on a hard 30-min reversal against the position (`intraday_reversal`).
+4. **Legacy reversal close** (`close_trades_on_signal_reversal`, legacy positions only) — if today's actionable signal flips the direction of an open position (in rank mode: the ticker made the opposite side's top-K and cleared the gates this run), it closes with `exit_datetime = current_price_datetime` (re-uses the most recent live mark, no extra fetch) and the new leg is opened immediately after.
 
 Before either refresh runs, `update_open_trades` does two preparatory passes that make every downstream metric deterministic and current:
 
@@ -1634,6 +1658,8 @@ SELL : eff_entry = entry × (1 − half_in)        # received the bid
        return_pct = (eff_entry − eff_exit) / eff_entry × 100
 ```
 
+**The table below is the cold-start PRIOR only.** Each leg is charged the best-fitting REALIZED cost: the leg's own fill when it filled, else the same-tick or time-of-day average of real LMT fills in its liquidity class (`spread.resolve_leg_cost`), plus the commission ceiling and — for shorts — the borrow carry above. The formula below is reached only on a fills-free database and for sub-minimum-price legs.
+
 **Half-spread by asset type and price tier (`_dynamic_half_spread`):**
 
 | Asset type | Price tier | Half-spread |
@@ -1652,7 +1678,7 @@ Entry and exit half-spreads are evaluated independently from their respective pr
 
 For **open trades**, `return_pct` is the live M2M using `current_price` in place of `exit_price` — same formula, same spread treatment. So open positions count exactly like closed positions in every win-rate, average, best/worst calculation. Refreshed each pipeline tick by `update_open_trades`.
 
-For a brand-new trade entered and immediately marked at the same price, `return_pct` is **`−2 × half_spread`** (small negative) — the round-trip transaction cost. This means **win rate already accounts for spread**: a "win" requires the price move to cover the full round-trip cost; the threshold stays `> 0` because the spread is baked into `return_pct` before the comparison.
+For a brand-new trade entered and immediately marked at the same price, `return_pct` is **`−2 × half_spread`** (small negative) — the round-trip transaction cost. **Win rates, however, are GROSS** — a standing convention: a win means the position moved the right way on raw prices (`tracker.is_gross_win`), and costs are measured by the RETURN metrics only. So a right-direction trade whose move was smaller than the round trip is a WIN with a negative return.
 
 ---
 
@@ -1662,22 +1688,16 @@ Prices throughout the email and logs are formatted with `2`, `4`, or `6` decimal
 
 ---
 
-#### Confidence-scaled position sizing
+#### Position sizing
 
-Each trade is assigned a `position_size_multiplier` based on the signal's confidence level:
+- **The selection short (live):** a flat `SEL_SHORT_SIZE_MULTIPLIER` (1.0) × the broker's base order (`BROKER_BASE_NOTIONAL` 2,000 CAD, converted at the live FX rate) — no confidence ramp and no haircuts; the evaluation that justified it assumed a flat notional.
+- **The legacy book (shadow since 2026-09-28):** a continuous confidence ramp (capped at 1.5×) × agreement breadth × expected-edge blend × predictability tilt × NBBO liquidity tilt → the RISK_OFF haircut (×0.5) → a correlation-aware haircut (scales down against same-direction open peers, hard skip at the correlated-exposure cap) → the session haircuts (×0.5 extended, ×0.25 overnight). Details (legacy, no longer in production): `docs/archive/CLAUDE_2026-09-26.md`, "Sizing chain".
 
-| Confidence | Multiplier | Interpretation |
-|---|---|---|
-| 0.78 – 0.85 | **1.0×** | Baseline — meets the actionable threshold |
-| 0.85 – 0.92 | **1.5×** | Mid-conviction — worth committing more capital |
-| > 0.92 | **2.0×** | High-conviction — maximum allocation |
+The multiplier is the **weight** used everywhere capital-weighting applies: `wtd_avg_return`, the per-day portfolio return inside the daily-NAV engine, and the size-adjusted method statistics. `sector_key` is stored on every trade as a passive diagnostic: the old per-sector cap was replaced by the correlation-aware haircut, which catches cross-sector factor concentration (NVDA + AVGO + SMH) a GICS bucket cap missed.
 
-The multiplier is the **weight** used everywhere capital-weighting applies: `wtd_avg_return`, the per-day portfolio return inside the daily-NAV engine, and the size-adjusted method statistics.
+#### Short borrow — the IBKR borrow book (`src/data/ibkr_borrow.py`)
 
-**Per-sector cap:** the sum of multipliers across all *open* positions in the same sector cannot exceed **3.0×**. If a new trade would push the sector over the cap, its multiplier is reduced to fit (or the trade is skipped if the sector is already at capacity). Sector groupings:
-- Sector ETFs (XLK, XLF …): each ETF is its own bucket
-- Commodities (GLD, SLV, GDX …): grouped together as "COMMODITY"
-- Stocks: looked up in `_SECTOR_MAP`; unknown stocks each count independently
+IBKR's public short-stock file (shares available to borrow and the annual fee for ~19,750 US symbols, refreshed by IBKR ~every 15 min) is downloaded on every tick (`ENABLE_IBKR_BORROW_SNAPSHOT`) and archived RAW in `data/ibkr_borrow/<ET date>/<HHMMSS>.txt.gz` — never delete it: IBKR keeps no history, and `borrow_at(ticker, when)` reads the file in force at any past instant. Every NEW equity short is checked when it is opened (`ENABLE_SHORT_BORROW_GATE`): the selection short needs ≥ $10k available at ANY fee ("all borrowable"); the legacy books also refuse a fee above `SHORT_BORROW_MAX_FEE_PCT` (50%/yr). A short's holding cost charges the fee IBKR quoted at entry (`borrow_fee_pct`), per calendar day. With no snapshot newer than 120 min the check is skipped (warned) — the broker still refuses a short it cannot locate.
 
 ---
 
@@ -1732,7 +1752,7 @@ Each row of the email's Performance Breakdown table comes from this function. Fo
 | Metric | Formula | Source |
 |---|---|---|
 | `trades` | `len(trades)` | — |
-| `win_rate` | `100 × count(t.return_pct > 0) / len(trades)` | Stored `return_pct` (spread-adjusted). |
+| `win_rate` | `100 × count(gross win) / count(trades with usable prices)` | GROSS: raw entry/exit prices (`tracker.gross_win_rate`); a trade with unusable prices leaves numerator and denominator. |
 | `compound_return` | `daily_nav.compute_compound_return(trades)` | Path-faithful daily walk. |
 | `avg_return` | `mean(t.return_pct)` | Stored `return_pct`. |
 | `wtd_avg_return` | `Σ(t.return_pct · t.position_size_multiplier) / Σ(t.position_size_multiplier)` | Capital-weighted. |
@@ -1748,7 +1768,7 @@ Every *new* trade stores ten raw method scores at entry time:
 
 | Field | Signal |
 |---|---|
-| `news` | News sentiment (DeepSeek) |
+| `news` | News sentiment (local Qwen LLM) |
 | `tech` | Technical analysis (RSI/MACD/SMA/BB) |
 | `insider` | Smart money (Form 4 + options flow + 13F) |
 | `put_call` | Put/Call ratio |
@@ -1763,6 +1783,8 @@ Every *new* trade stores ten raw method scores at entry time:
 | `iv_expr` | IV Expression (real options-chain IV percentile × OI skew) |
 | `coint` | Cointegration Pairs (Engle-Granger ADF + spread z-score) |
 | `cross_sectional` | Cross-Sectional Ranking (avg per-method z-score vs universe) |
+
+Selection-short trades carry no method scores (the model is the method), so they appear in no method row, solo simulation or method evaluation below.
 
 Plus `methods_agreeing` (the subset with `|score| > 0.10` in the trade direction) and `dominant_method` (highest absolute score). After sufficient attributed trades accumulate, the email section **Signal Method Attribution** shows four analytics tables:
 
@@ -1819,6 +1841,8 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 | Smart money | Insider/politician trades with cluster badges |
 | Portfolio | 1w/2w/1m + since-inception dollar-weighted return tiles, P&L curve, open/closed trades with `fmt_price()` precision |
 
+**Health banners** — above every section, one per health check: the LLM, the broker (incl. an IB Gateway logged out of IBKR — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) §2), price provenance and the selection-short scorer. Each is red with a subject tag (`🤖 LLM DOWN` / `🔔 BROKER` / `🔔 PRICE` / `🔔 SCORER`) when something is wrong and green otherwise; a problem sends the email off-schedule (`EMAIL_ON_PROBLEM`).
+
 **Email** — charts embedded as inline base64 PNG (no attachments). Degrades gracefully to text-only if `kaleido` is not installed. Signal method performance tables are sorted by solo win rate (best signal first). Prices in trade tables use `fmt_price()` for sub-penny precision.
 
 ---
@@ -1827,16 +1851,34 @@ Legacy trades (recorded before this feature) have no `methods_agreeing` field an
 
 | Task | Model | Fallback |
 |---|---|---|
-| Per-ticker sentiment scoring | **100% LOCAL** (`SENTIMENT_LOCAL_SHARE=1.0`): the self-hosted Qwen3-8B (Ollama, `local/<model>`) scores every digest | Per-call fallback local -> deepseek -> qwen. DeepSeek is now SHADOW-ONLY and scores 100% of digests without driving anything (`sentiment_shadow` table), so every call carries a paired verdict |
+| Per-ticker sentiment scoring | **LOCAL ONLY** (`SENTIMENT_LOCAL_SHARE=1.0`, `ENABLE_HOSTED_SENTIMENT_ENGINES=false` since 2026-09-18): the self-hosted Qwen3-8B (Ollama, `local/<model>`) scores every digest | None — a dead model server leaves the news family at 0.0 until it is back (the LLM health alert names it). The DeepSeek shadow pairing is OFF (`ENABLE_SENTIMENT_SHADOW=false`; the paired `sentiment_shadow` data ends 2026-09-17) |
 | Technical analysis scoring | Computed locally (RSI, MACD, SMA, BB) | — |
-| Entry selection / exit timing | MECHANICAL: the rank rule over the ML-stacker combine (`ML_COMBINE_ARM_SHARE=1.0`) decides entries; `ml_exit` + the mechanical stops decide exits | The weighted combine per side when a stacker artifact is missing (`combine_source`) |
-| LLM synthesis (BUY/SELL/HOLD/WATCH) | Runs as an UNACTED SHADOW: DeepSeek V4-Flash (`SYNTHESIS_SHADOW_ENGINE=deepseek`), persisted to `engine_recommendations` | — (a failed shadow call costs one comparison row) |
+| Entry selection / exit timing | MECHANICAL: the **selection short** decides every entry and exit (Step 5S; a LightGBM model, no LLM). The rank rule over the ML-stacker combine still runs as a SHADOW | — |
+| LLM synthesis (BUY/SELL/HOLD/WATCH) | OFF since 2026-09-18 (`ENABLE_SYNTHESIS_SHADOW=false`, the local-only directive): no synthesis call is made; `engine_recommendations` ends 2026-09-17/18 | — |
 
-`ENABLE_LLM_SYNTHESIS=true` makes the LLM the decider again; then `ANALYST_MODEL` / `LLM_AB_SYNTHESIS_MODELS` choose the engine (the live pool is the single id `deepseek-v4-flash`; the Anthropic leg is unfunded).
+`ENABLE_LLM_SYNTHESIS=true` makes the LLM the decider of the legacy book again; then `ANALYST_MODEL` / `LLM_AB_SYNTHESIS_MODELS` choose the engine (the pool is the single id `deepseek-v4-flash`). Every hosted account — DeepSeek, OpenRouter, Anthropic — is currently UNFUNDED, so that path needs one funded first.
 
 **Synthesis A/B bake-off (`LLM_AB_SYNTHESIS_MODELS`):** instead of always using `ANALYST_MODEL`, set a comma-separated pool and each run picks one model UNIFORMLY (equal split), so every model accumulates comparable samples and shows as its own row in the dashboard's per-LLM evaluation (keyed by exact model id). Current pool: `claude-haiku-4-5-20251001,claude-opus-4-8,deepseek-v4-flash-thinking,deepseek-v4-pro-thinking` (≈¼ each). **DeepSeek arms encode reasoning mode via a `-thinking` suffix** — a logical id decoded by `_deepseek_spec` into (API model, thinking flag); thinking is the synthesis quality lever and is free on flash, while pro is ~3× flash on cache-miss tokens. The logical id is recorded for provenance so flash-thinking and pro-thinking are distinct rows. Empty pool → legacy binary `ANALYST_MODEL` ⇄ DeepSeek behavior. **Sentiment is unaffected** (stays flash non-thinking, the high-volume cost driver).
 
 **Cross-engine synthesis fallback (LLM-decider mode):** When the chosen analyst engine raises any API error — credits exhausted (400/402), bad key (401), permission denied (403), rate limit (429), server error (5xx), or connection failure — `generate_recommendations()` automatically retries the identical prompt through the OTHER provider's default model (the cross-engine fallback stays cheap flash non-thinking) via the OpenAI-compatible API. Requires `DEEPSEEK_API_KEY` in `.env`. If both fail, the pipeline falls back to a rule-based converter (`_fallback_recommendations()`). The source model is logged at INFO level so you can see which analyst ran.
+
+---
+
+## Models and the deep history store
+
+**The deep history store** (`src/data/deep/`, `cache/ml/deep/`) holds point-in-time external history back to 2021 or earlier: SEC filings (8-K acceptance instants), XBRL facts, Form 3/4/5 (the bulk sets plus live EDGAR parsing), 13F roll-ups, fails-to-deliver, Polygon extended-hours bars / short interest / short volume / dividends / splits / news with provider sentiment / delisted names, ALFRED macro vintages, yfinance earnings and analyst actions, Wikipedia pageviews, and Quiver congress / lobbying / contracts / dark pool. Every row carries the instant it became knowable. The scheduler keeps it current with a nightly refresh at 23:45 ET (every night incl. weekends; a subprocess under an OS lock, 4 h budget) and, on market days, a pre-open run at 08:30 ET that re-fetches the fast families, extends the deep 30-minute store through the previous session and builds the day's session snapshot. Status: `python -m src.data.deep.refresh --status`.
+
+**Deep features** (`src/analysis/deep_features.py`): 73 features in 17 groups built from the store with ONE knowledge cutoff per session — 08:30 ET, what the live store holds when a model is served — where slow data enters as state + age + change, plus an anchor price so "how much of the reaction has happened" moves with every 30-minute bar. Live scoring reads them from the pre-open **session snapshot** (`cache/ml/deep/snapshot/<date>.parquet`). Since 2026-09-26 a snapshot built before the open carries the price-dependent features too; until the first live consumer (the selection short) exposed it, they were missing on ~90% of names.
+
+**`ml_ohlcv`** — a LightGBM rank regressor on the next H/L pivot, served on 30-minute bars since 2026-09-19 (85 OHLCV + pivot-leg features, 11.6M training rows through 2026-06-01) — is a weighted method of the shadow combine. **The ML stackers** (`ml_buy` / `ml_sell`) have been the combine since 2026-09-05 and **`ml_exit`** is the learned exit timer; both now serve only the shadow rank rule and the legacy book. Retrains are held (`ENABLE_EOD_ML_*=false`).
+
+**Selection-objective models** (`src/analysis/sel_models.py` on the `ml30.py` arrays): LightGBM `lambdarank` / `tailreg` per side, trained on 30-minute rows with the base + deep features to pick the top-1 name per bar after the own-history freshness rule. The long `tailreg` model is the live selection short's model — used as a SHORT, because its evaluation found the picks' spike to be volatility, and the collectable effect the decline that followed a 5-session run-up.
+
+**Live feature capture** (`src/analysis/live_features.py`, `data/live_features/`): every tick writes the exact feature vectors it computed — the 30-minute base + deep features per scored name, and the daily model's row once per session — so the next models train on what the live pipeline saw, not on a reconstruction. The deep columns are the training construction from 2026-09-28 on.
+
+**The evaluation standard** (`.claude/skills/evaluate/SKILL.md`, `src/analysis/eval_metrics.py`): models are judged by the per-day IC to the next H/L pivot on 30-minute bars, its day-clustered t, and the top/bottom 5/3/1% tails; deciders by the counterfactual excess per decision; the live strategy by its implementable exit net of real costs, beside a volatility-matched control. Every model is reported on TWO test sets, never pooled: set 1 = history (signal dates 2026-06-17 → 09-27, news features from the per-source rebuild) and set 2 = the live all-source-news pipeline from 2026-09-28.
+
+**News history rebuilds** (research only; nothing live reads them — `docs/NEWS_BACKFILL.md`): the per-source news history (each feed rebuilt point-in-time and scored alone, for 80 runs from June), the archive re-score (a news-scorer change re-scores the exact stored digests instead of resetting the history), and the one-year Finnhub + events backfill (every session since 2025-10-06, ~2,000 names a day, at the 08:30 ET cutoff).
 
 ---
 
@@ -1853,6 +1895,11 @@ Trades, recommendations, and run history live in a single embedded **DuckDB** fi
 | `recommendations` | Every recommendation with rationale, attribution (`dominant_method`, `methods_agreeing`), and the actionable flag |
 | `trades` | The real signal-driven trade ledger — full dict in a JSON `data` column + projected scalar columns |
 | `hypothetical_trades` | The always-open paper book |
+| `signals` | THE LEARNING PANEL: every run's full per-ticker cross-section — every method score, the combine, the confidence components, the news-event columns, and (since 2026-09-25) the pre-combine market state `atr_pct` / `bb_width_pct` / `vol_ratio` / `tape_score` |
+| `news_articles`, `news_article_feeds` | The full news-pool archive (since 2026-09-11): one row per unique article with its first/last sighting, and (since 2026-09-25) every feed that delivered it |
+| `sentiment_digests` | The exact digest text each sentiment call read — what makes a scorer change re-scorable instead of an epoch reset |
+| `news_replay` | Research-only rebuilt news features (per-source history `src:*`, archive re-score, the one-year backfill `pre:*`); nothing live reads it |
+| `broker_orders`, `broker_reconciles` | Every order event with its fill, slippage, commission and the two-sided book at submit; the per-tick broker account / reconcile report |
 
 **Concurrency:** DuckDB allows a single read-write handle *or* many read-only handles across processes. The pipeline is the **sole writer** and holds the write lock only momentarily (open → write → close); it persists run metadata, sources, and recommendations at the end of every run, wrapped so a database hiccup never aborts a run. The dashboard connects **read-only**.
 
@@ -1866,7 +1913,7 @@ A read-only [Plotly Dash](https://dash.plotly.com/) app for inspecting the datab
 python main.py --dashboard      # http://127.0.0.1:8050 by default
 ```
 
-Six tabs:
+Seven tabs (the selection short's trades show in **Returns** and **Execution**, `entry_mechanism="sel_short"`; there is no dedicated tab yet):
 
 | Tab | Shows |
 |---|---|
@@ -1875,9 +1922,10 @@ Six tabs:
 | Exit Performance | The exit-side mirror of Entry Performance — per-exit-method IC/win/ret (held ledger or simulated over all scored tickers), exit-reason outcomes, post-exit "what if we'd held longer", exit-timing-vs-random Monte Carlo, the same confidence-component isolation applied to held positions mid-hold, the edge-decay curve, and a close-rule counterfactual comparison |
 | Returns | KPI tiles (compound, win rate, best/worst), equity curve, open/closed trades, and a Simulated ⇄ IBKR (actual fills) toggle |
 | Execution | Price-provenance flags, broker fill/reject/slippage forensics, and sim-vs-broker tracking error |
+| Follow-Through | The exit-as-entry mechanism's panel accrual and its (now shadow) trade book |
 | Data Quality | Per-source reliability (success rate, latency) and per-method score coverage, so a feed going dark shows up before it silently degrades signals |
 
-Each tab's content is embedded directly in the tab, so switching is instant and handled client-side; the page is rebuilt with fresh data on each load (reload to refresh — the selected tab is remembered). Tables are sortable (click a column header, shift-click for multi-sort) and filterable (per-column search box), with human-readable headers and Eastern-time timestamps. Hover any column header, metric tile, or section heading for a plain-English explanation. It is served by **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows, where gunicorn doesn't run) — wrapped in an auto-restart supervisor loop so it stays alive for always-on use (it falls back to the Dash dev server only if waitress isn't installed). All database access is read-only with exponential-backoff retry around the brief daily write-lock window, and the heavy performance computation is cached for 60 seconds. Host and port are configurable via `DASHBOARD_HOST` / `DASHBOARD_PORT`.
+Each tab is filled LAZILY the first time it is opened and kept afterwards, so a page load stays cheap and switching back is instant; the page is rebuilt with fresh data on each load (reload to refresh — the selected tab is remembered). Tables are sortable (click a column header, shift-click for multi-sort) and filterable (per-column search box), with human-readable headers and Eastern-time timestamps. Hover any column header, metric tile, or section heading for a plain-English explanation. It is served by **waitress** — a production-grade, multi-threaded, cross-platform WSGI server (the right choice on Windows, where gunicorn doesn't run) — wrapped in an auto-restart supervisor loop so it stays alive for always-on use (it falls back to the Dash dev server only if waitress isn't installed). All database access is read-only with exponential-backoff retry around the brief daily write-lock window, and the heavy accessors are cached per DATA VERSION (the latest run id) and re-warmed in a child process when a new run lands. It binds to loopback (`DASHBOARD_HOST=127.0.0.1`); the one public entrance is a Tailscale Funnel behind HTTP Basic auth (see `docs/DEPLOYMENT.md`).
 
 ---
 
@@ -1914,7 +1962,16 @@ Each tab's content is embedded directly in the tab, so switching is instant and 
 | IV Rank + Directional | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
 | IV Expression | — | reuses GEX caches | `cache/gex_*.json` |
 | Cointegration | — | via OHLCV cache | `cache/ohlcv/<TICKER>.json` |
-| Trades · hypotheticals · runs · recs | — | permanent | **DuckDB** `data/llm_trader.db` |
+| OHLCV 30-min tick cache | per ticker | ~25 min refresh; newest 260 sessions kept | `cache/ohlcv_30m/*.json` |
+| Deep 30-min store (2021→, RTH) — the selection short's series and every snapshot's price grid | per ticker | extended through the previous session daily (08:30 pre-open run, the selection short's prepare) | `cache/ml/bars30m_deep/*.pkl` |
+| Deep history store (SEC, insider, 13F, short interest, analyst, earnings, news, macro vintages, alt-data…) | per family / ticker | extended nightly (23:45 ET) + fast families pre-open | `cache/ml/deep/<family>/` |
+| Session snapshots (the deep features as of 08:30 ET) | session date | built by the pre-open run; rebuilt on demand | `cache/ml/deep/snapshot/<date>.parquet` |
+| Selection-short state (model, universe, score history, picks journal) | model / day / bar | permanent — `scores/` is the freshness rule's memory | `cache/ml/sel_short/` |
+| News coverage sidecars + the last tick's final universe | cache file / — | the cache's own key | `cache/coverage/*.json`, `cache/news_feed_universe.json` |
+| Finnhub company news (the refresher's cache) | ticker | served only when fetched today within 30 min | `cache/finnhub_news_cache.json` |
+| **Live feature vectors** (30-min base + deep per scored name per tick; daily rows) | run / session | **permanent — never delete** | `data/live_features/{30m,daily}/` |
+| **IBKR borrow book** (the raw short-stock file) | the file's own timestamp | **permanent — never delete** | `data/ibkr_borrow/<date>/<HHMMSS>.txt.gz` |
+| Trades · hypotheticals · runs · recs · signals · news archive | — | permanent | **DuckDB** `data/llm_trader.db` |
 
 ---
 
@@ -1944,14 +2001,30 @@ Configure `.env`:
 
 ```env
 # Required
-DEEPSEEK_API_KEY=your_key
-ENABLE_LOCAL_LLM=true              # local Ollama sentiment engine (scripts/run_ollama.bat)
+POLYGON_API_KEY=your_key           # Massive/Polygon Stocks Advanced: snapshots + NBBO, 30-min bars, news, reference data
+ENABLE_LOCAL_LLM=true              # local Ollama sentiment engine (scripts/run_ollama.bat) — the only LLM in use
+ENABLE_HOSTED_SENTIMENT_ENGINES=false
+BROKER_MODE=ibkr_paper             # off | dry_run | ibkr_paper | ibkr_live (IB Gateway via IBC — docs/DEPLOYMENT.md)
 
-# Optional — only consulted when the LLM is the decider (ENABLE_LLM_SYNTHESIS=true)
+# The live strategy (docs/SEL_SHORT.md) — everything else runs as shadow
+ENABLE_SEL_SHORT=true
+SEL_SHORT_SIZE_MULTIPLIER=1.0      # x the broker base order
+ENABLE_LEGACY_ENTRIES=false        # the rank rule computes and persists, never opens
+ENABLE_FOLLOW_THROUGH_TRADING=false
+LEGACY_FLATTEN_AFTER=2026-09-28T09:30:00-04:00   # one-shot close of the legacy book; empty = never
+ENABLE_IBKR_BORROW_SNAPSHOT=true   # IBKR's short-stock file, archived every tick (data/ibkr_borrow/)
+ENABLE_SHORT_BORROW_GATE=true      # every new short must be borrowable
+
+# Optional — hosted LLMs (every account is unfunded today; consulted only if re-enabled)
+DEEPSEEK_API_KEY=your_key
 ANTHROPIC_API_KEY=your_key
 ANALYST_MODEL=claude-haiku-4-5-20251001
+ENABLE_SENTIMENT_SHADOW=false
+ENABLE_SYNTHESIS_SHADOW=false
 
 # Recommended
+FINNHUB_API_KEY=your_key           # free tier; the background refresher keeps it under 60 calls/min
+QUIVER_API_KEY=your_key            # congress / lobbying / contracts / dark pool
 NEWSAPI_KEY=your_key
 ALPHA_VANTAGE_KEY=your_key
 FRED_API_KEY=your_key      # https://fred.stlouisfed.org/docs/api/api_key.html
@@ -2001,6 +2074,11 @@ ENABLE_REDDIT_SENTIMENT=true
 ENABLE_SECTOR_ROTATION=true
 ENABLE_ROTATION_DRIVERS=true
 ENABLE_BUSINESS_CYCLE_ROTATION=true
+ENABLE_ALL_SOURCE_NEWS=true        # every per-ticker news feed asks about every scored name
+ENABLE_NEWS_ARCHIVE=true           # the full merged news pool, every tick (news_articles)
+ENABLE_LIVE_FEATURE_CAPTURE=true   # data/live_features/: the model feature vectors each tick saw
+ENABLE_DEEP_REFRESH=true           # the nightly deep-store refresh (23:45 ET)
+ENABLE_DEEP_PREOPEN=true           # the 08:30 ET pre-open run: fast families, 30-min store, session snapshot
 
 # Reddit (required for reddit sentiment)
 REDDIT_CLIENT_ID=your_id
@@ -2022,16 +2100,38 @@ INTRADAY_SESSION_END=16:00
 ## Running
 
 ```bash
-python main.py             # Run once, console output only
-python main.py --email     # Run once and send email report
-python main.py --schedule  # Start APScheduler (every 30 min, 9:30-16:00 ET, Mon-Fri; emails at close)
-python main.py --dashboard # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
-python main.py --backfill  # Pre-warm the OHLCV caches for the whole universe via Massive/Polygon (deep daily history), then exit
+python main.py              # Run once, console output only
+python main.py --email      # Run once and send email report
+python main.py --schedule   # Poll-loop runner: RTH every 30 min 09:30-16:00 ET, extended 04:00-19:50, overnight Sun-Thu nights
+python main.py --supervise  # PRODUCTION (scripts/run_scheduler.bat): --schedule under an auto-restart supervisor
+python main.py --dashboard  # Launch the read-only monitoring dashboard (Plotly Dash via waitress)
+python main.py --backfill   # Pre-warm the OHLCV caches for the whole universe via Massive/Polygon (deep daily history), then exit
+```
+
+Production runs as Task Scheduler jobs (`docs/DEPLOYMENT.md`); restart it only with `scripts/restart_all.ps1` — never an ad-hoc `python.exe`, which is how duplicate schedulers appear.
+
+**The live strategy** — the scheduler launches the scorer itself; these are for inspection and repair (full runbook: [`docs/SEL_SHORT.md`](docs/SEL_SHORT.md)):
+
+```bash
+python -m src.signals.sel_short --prepare --day 2026-09-29               # the day's universe (+ 30-min store extension, snapshot check)
+python -m src.signals.sel_short --run --day 2026-09-29 --bar 3            # score one bar and journal its decision
+python -m src.signals.sel_short --backfill --day 2026-09-15 --until 2026-09-25   # rebuild score days (the freshness history)
+```
+
+**Deep store, features and research** (nothing below trades):
+
+```bash
+python -m src.data.deep.refresh --status                   # the deep history store: per-family last refresh, due flag, newest key
+python -m src.data.intraday_store --extend                 # extend the deep 30-minute store (cache/ml/bars30m_deep)
+python -m src.analysis.deep_features --snapshot 2026-09-29  # (re)build a session snapshot of the deep features
+python -m src.analysis.ml30 --build --eval-since 2026-05-01 # the 30-minute model arrays (base + deep features, pivot labels)
+python -m src.analysis.sel_models --validate               # selection-objective models (lambdarank / tailreg) on those arrays
+python -m src.analysis.news_finnhub_backfill --status --source events   # the one-year news backfill (docs/NEWS_BACKFILL.md)
 ```
 
 **Universe OHLCV backfill** — `python main.py --backfill` (or `python -m src.data.backfill --days 730 [--with-30m] [--skip-daily]`) pre-fetches deep daily history for the **whole universe** (watchlist + sector/commodity/factor ETFs + held/hypothetical + every ticker scored in the `signals` panel over the last 90 days) via Massive/Polygon and warms `cache/ohlcv/`. Purely additive (merges, never deletes). Run it once so the live pipeline starts with deep, warm caches — faster first ticks, deeper multi-timeframe indicators, and forward returns ready for the Signal-IC panel.
 
-- **30-min:** add `--with-30m` (or `--skip-daily --with-30m` for a 30-min-only top-up) to warm `cache/ohlcv_30m/`. Depth is Polygon-capped at ~120 days (`intraday_30m_lookback_days`).
+- **30-min:** add `--with-30m` (or `--skip-daily --with-30m` for a 30-min-only top-up) to warm the TICK cache `cache/ohlcv_30m/` (fetched `intraday_30m_lookback_days` 120 at a time, capped at 260 sessions when saved — `intraday_30m_max_bars`). The deep 2021→ history lives in a separate store, `cache/ml/bars30m_deep/` (`python -m src.data.intraday_store --extend`).
 - **Weekly:** needs no pass — it is resampled from the daily cache on demand, so the daily backfill gives deep weekly bars automatically (~2y → ~106 weekly bars).
 
 ---
@@ -2043,14 +2143,15 @@ llm_trader/
 ├── main.py
 ├── requirements.txt
 ├── .env
-├── cache/
+├── cache/                           # caches, incl. cache/ml/ (deep store, 30-min store, model artifacts, sel_short state)
 ├── logs/
-├── data/                            # DuckDB database (single source of truth)
+├── data/                            # DuckDB database (single source of truth) + live_features/ + ibkr_borrow/ (permanent)
+├── docs/                            # runbooks: SEL_SHORT (the live strategy), DEPLOYMENT, NEWS_BACKFILL, ML_OHLCV_CUTOVER
 ├── config/
 │   └── settings.py
 ├── dashboard/                       # Read-only Plotly Dash monitoring app (served via waitress)
-│   ├── app.py                       # 6 tabs: rationale · entry perf · exit perf · returns · execution · data quality
-│   ├── data.py                      # Read-only DuckDB access + retry + 60s perf cache
+│   ├── app.py                       # 7 lazy tabs: rationale · entry · exit · returns · execution · follow-through · data quality
+│   ├── data.py                      # Read-only DuckDB access + retry + data-version cache + background warmer
 │   └── figures.py                   # Plotly figures (win-rate bars, equity curve)
 └── src/
     ├── pipeline.py
@@ -2087,25 +2188,47 @@ llm_trader/
     │   ├── sector_rotation.py        # "Ebb and Flow" per-sector money flow
     │   ├── rotation_drivers.py       # Rate-cycle phase: DFF+CPI → EASING_CYCLE|PIVOT_IMMINENT…
     │   ├── business_cycle_rotation.py # Fidelity-style economic phase → sector leadership biases
-    │   └── cache.py                  # Hourly cache + incremental OHLCV
+    │   ├── cache.py                  # Hourly cache + incremental OHLCV
+    │   ├── polygon_client.py         # Massive/Polygon: snapshots + live NBBO, bars, news, reference data
+    │   ├── company_names.py          # company-name news relevance + security types
+    │   ├── news_coverage.py          # all-source news ingestion: coverage sidecars, the previous tick's universe
+    │   ├── finnhub_refresher.py      # background per-ticker Finnhub cache, kept off the tick
+    │   ├── ibkr_borrow.py            # IBKR short-stock file: raw archive + the borrow check
+    │   ├── intraday_store.py         # the deep 30-minute store (2021→, regular hours)
+    │   └── deep/                     # the deep history store (SEC, live Form 4, 13F, FTD, Polygon, yfinance, Quiver,
+    │                                 #   ALFRED, Wikipedia…); refresh.py = the nightly refresh + the 08:30 pre-open run
     ├── analysis/
-    │   ├── sentiment.py              # DeepSeek V4-Flash / local Qwen sentiment scoring (+ shadow pairing)
+    │   ├── sentiment.py              # local Qwen sentiment scoring (hosted engines + shadow pairing off since 2026-09-18)
     │   ├── technical.py              # RSI, MACD, SMA, Bollinger Bands
-    │   └── claude_analyst.py         # LLM synthesis (unacted shadow; decider when ENABLE_LLM_SYNTHESIS=true)
+    │   ├── claude_analyst.py         # LLM synthesis (off; the decider when ENABLE_LLM_SYNTHESIS=true)
+    │   ├── ml_stacker.py             # the learned ML combine (stackers) — feeds the shadow rank rule
+    │   ├── ml_exit_dataset.py        # the learned exit timer (legacy book)
+    │   ├── deep_features.py          # the deep store as point-in-time features; the pre-open session snapshots
+    │   ├── live_features.py          # the live feature capture (data/live_features/)
+    │   ├── ml30.py                   # the 30-minute model arrays (the training recipe)
+    │   ├── sel_models.py             # selection-objective models — the live model came from here
+    │   ├── eval_metrics.py           # the house evaluation metrics + the two test sets
+    │   └── news_replay.py …          # news history rebuilds: news_replay, news_history, news_finnhub_backfill (research)
     ├── signals/
     │   ├── aggregator.py             # Weighted combination + coherence + cluster
-    │   ├── rank_entry.py             # The LIVE entry decider: band + top-K per side by combined_score rank
+    │   ├── sel_short.py              # THE LIVE STRATEGY: the selection short's scorer (a subprocess each tick)
+    │   ├── rank_entry.py             # the rank rule — band + top-K per side — SHADOW since 2026-09-28
+    │   ├── ml_model.py               # ml_ohlcv (30-minute rows) + the 30-minute feature function
+    │   ├── follow_through.py         # exit-as-entry — shadow
     │   └── vwap.py                   # Rolling 20-day VWAP distance score
     ├── performance/
-    │   ├── tracker.py                # Paper trades, P&L, auto-close
+    │   ├── tracker.py                # Ledger: the selection short's entries and covers, the legacy book, the one-shot flatten
     │   └── daily_nav.py              # Path-faithful daily-compound NAV engine
+    ├── broker/
+    │   ├── reconcile.py              # per-tick sync with IBKR: entries, exits, drift, settle-or-kill
+    │   └── ibkr.py                   # ib_async client, reconnect + gateway recovery
     ├── db/
     │   ├── connection.py             # Short-lived DuckDB connections (read-write / read-only)
     │   ├── schema.py                 # Idempotent table DDL (runs, recs, trades, …)
     │   ├── repo.py                   # Read/write API (trades, runs, recommendations)
     │   └── migrate.py                # One-time JSON → DuckDB import
     ├── scheduler/
-    │   └── runner.py                 # APScheduler intraday automation (every 30 min, 9:30-16:00 ET)
+    │   └── runner.py                 # the poll-loop scheduler: RTH / extended / overnight slots, EOD, deep refresh + pre-open
     ├── charts/
     │   ├── builder.py                # Plotly figures
     │   └── report.py                 # Self-contained HTML report

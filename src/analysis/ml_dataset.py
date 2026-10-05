@@ -174,6 +174,15 @@ def hlc_30m(ticker: str):
                 frames.append(t)
     except Exception:
         pass
+    return hlc_from_frames(frames)
+
+
+def hlc_from_frames(frames):
+    """`hlc_30m`'s tuple from OHLCV frames (naive-UTC bar starts), the first one
+    the base history and each later one a NEWER tail: de-duplicated on the bar's
+    start (the later frame wins), non-finite bars dropped, regular hours only.
+    Shared with the selection-short scorer, which supplies today's bars itself."""
+    frames = [f for f in frames if f is not None and not f.empty]
     if not frames:
         return None
     df = pd.concat(frames).sort_index()
@@ -228,11 +237,13 @@ def ticker_feature_frame(ticker: str, hlc=None) -> Optional[pd.DataFrame]:
     fs = pd.DataFrame(index=idx)
     fs["Close"] = close.values
 
-    # returns / momentum (%)
+    # returns / momentum (%) — assigned by POSITION (``.values``) like every other column:
+    # the 30-minute path hands RangeIndex Series to a timestamp-indexed frame, and a
+    # Series assignment aligned to nothing -> all NaN (memory ret-features-nan-30m-bug).
     for w in (1, 5, 10, 21, 63, 126, 252):
-        fs[f"ret_{w}"] = (close / close.shift(w) - 1.0) * 100.0
+        fs[f"ret_{w}"] = ((close / close.shift(w) - 1.0) * 100.0).values
     # 12-1 skip-month momentum: 252d ago -> 21d ago, excluding the last month.
-    fs["ret_12_1"] = (close.shift(21) / close.shift(252) - 1.0) * 100.0
+    fs["ret_12_1"] = ((close.shift(21) / close.shift(252) - 1.0) * 100.0).values
 
     # trend quality
     net = close - close.shift(20)

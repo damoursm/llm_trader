@@ -27,6 +27,14 @@ defaults in force.
 > OFF and unexecuted**; the five staged pieces below are still staged. If the 5%
 > model is ever revisited, sections 2.2 onward apply unchanged.
 > Deployment record: `memory/ml-ohlcv-30m-rows-deploy-2026-09.md`.
+>
+> **THE RANK RULE ITSELF IS SHADOW since 2026-09-28.** The selection short
+> (`src/signals/sel_short.py`, CLAUDE.md top section, `docs/SEL_SHORT.md`) makes
+> every trade and `enable_legacy_entries` is False, so this cutover — which swaps
+> what the rank rule ranks on and how it enters — would now change only the
+> shadow recommendations and the panel. Trading on it again needs
+> `ENABLE_LEGACY_ENTRIES=true` as well (and a decision about the selection short,
+> which would then share the book).
 
 User directive, 2026-09-18: *"Deploy to production the retrained ml_ohlcv model
 'Gap cluster ≥ 10×, at a new 30-day high or no history' and have it be the live

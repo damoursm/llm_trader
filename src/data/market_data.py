@@ -667,6 +667,18 @@ def _merge_intraday(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.D
     return combined[~combined.index.duplicated(keep="last")]
 
 
+def _latest_completed_30m_start(now_utc) -> Optional["pd.Timestamp"]:
+    """UTC start of the latest regular-hours 30-minute bar completed by
+    ``now_utc`` on today's session (bars start 09:30 ... 15:30 ET), or None
+    before the first bar of the day has completed."""
+    et = pd.Timestamp(now_utc).tz_convert("America/New_York")
+    mins = et.hour * 60 + et.minute
+    start = min(((mins - 30) // 30) * 30, 930)
+    if start < 570:
+        return None
+    return (et.normalize() + pd.Timedelta(minutes=start)).tz_convert("UTC")
+
+
 def _get_intraday_history(ticker: str, interval: str = "30m",
                           force_refresh: bool = False) -> pd.DataFrame:
     """Intraday OHLCV with a short-TTL cache (``interval`` namespace).
@@ -687,8 +699,15 @@ def _get_intraday_history(ticker: str, interval: str = "30m",
             return _drop_forming_bar(cached, interval)   # RTH 30m bars are static off-hours
         last = _ts_to_utc(cached.index[-1])
         if last is not None:
-            age_min = (_datetime.now(_timezone.utc) - last).total_seconds() / 60.0
-            if age_min <= settings.intraday_30m_ttl_minutes:
+            # The cache holds COMPLETED bars labelled by their START, so its
+            # newest bar is always >= 30 min old in RTH: judged against a 25-min
+            # TTL it was never fresh, and every call refetched 120 days (1,205
+            # fetches per tick for ~400 names, XLK 87 times — runtime review
+            # 2026-09-28). Fresh = it already holds the latest completed bar.
+            now_utc = _datetime.now(_timezone.utc)
+            want = _latest_completed_30m_start(now_utc)
+            age_min = (now_utc - last).total_seconds() / 60.0
+            if (want is not None and last >= want) or age_min <= settings.intraday_30m_ttl_minutes:
                 return _drop_forming_bar(cached, interval)
 
     if not settings.enable_fetch_data:

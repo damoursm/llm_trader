@@ -167,6 +167,28 @@ def get_grouped_daily_closes(max_lookback: int = 5) -> Dict[str, float]:
                     if b.get("T") and b.get("c")}
     return {}
 
+def get_grouped_daily(day: str) -> List[dict]:
+    """Every US ticker's daily bar of session ``day`` (``YYYY-MM-DD``, split-adjusted)
+    in ONE grouped-daily call: Polygon's raw rows (``T`` ticker, ``o h l c v``…),
+    ``[]`` when the day has none (a holiday, a session not closed yet) or the call
+    fails. The selection short's added-stocks screen reads it (`sel_short.grouped_day`)."""
+    if not is_available():
+        return []
+    j = _get(f"/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true"})
+    return list((j or {}).get("results") or [])
+
+
+def get_ticker_details(ticker: str) -> Optional[dict]:
+    """Polygon's reference record of one ticker (``type`` — CS, ADRC, ETF…,
+    ``list_date``, ``active``, ``name``, ``primary_exchange``), or None when Polygon
+    has none (an exchange test symbol such as ZVZZT, a typo) or the call fails."""
+    if not is_available():
+        return None
+    j = _get(f"/v3/reference/tickers/{to_polygon_symbol(ticker)}", {})
+    r = (j or {}).get("results")
+    return dict(r) if r else None
+
+
 def is_available() -> bool:
     """True when POLYGON_API_KEY is configured."""
     return bool(settings.polygon_api_key)

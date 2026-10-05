@@ -25,6 +25,7 @@ Fail-graceful: any error returns an empty context; the screener never blocks the
 from datetime import date
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -103,19 +104,75 @@ def _candidate_pool() -> List[str]:
     return sorted(set(out))
 
 
-def _load_for_screen(ticker: str, budget: Dict[str, int]) -> Optional[pd.DataFrame]:
-    """Cache-first OHLCV load; a bounded warm-up fetch primes the cache when allowed."""
+_CURATED = frozenset(_SCREEN_UNIVERSE)
+
+
+def _ref_sessions(spy_df: Optional[pd.DataFrame]) -> Optional[np.ndarray]:
+    """The benchmark's sessions (sorted ``datetime64[D]``) — the calendar a cached
+    frame's staleness is counted in. None when there is no benchmark frame."""
+    if spy_df is None or spy_df.empty or "Close" not in spy_df.columns:
+        return None
+    closes = pd.to_numeric(spy_df["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return None
+    return np.unique(pd.DatetimeIndex(closes.index).tz_localize(None).normalize().values.astype("datetime64[D]"))
+
+
+def _sessions_behind(df: Optional[pd.DataFrame], ref: Optional[np.ndarray]) -> Optional[int]:
+    """How many benchmark sessions the frame's last VALID bar is behind the
+    benchmark's own last bar (0 = current). None when it cannot be told (no frame,
+    no benchmark) — then nothing is judged stale. Counted against the benchmark's
+    bars, not the clock: a provider outage that freezes every cache, SPY's too,
+    makes nothing stale."""
+    if ref is None or len(ref) == 0 or df is None or df.empty or "Close" not in df.columns:
+        return None
+    try:
+        closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if closes.empty:
+            return None
+        last = pd.Timestamp(closes.index[-1])
+        last = (last.tz_localize(None) if last.tzinfo is not None else last).normalize()
+        return int(len(ref) - np.searchsorted(ref, np.datetime64(last.date(), "D"), side="right"))
+    except Exception:                                              # noqa: BLE001
+        return None
+
+
+def _load_for_screen(ticker: str, budget: Dict[str, int],
+                     ref: Optional[np.ndarray] = None) -> Optional[pd.DataFrame]:
+    """Cache-first OHLCV load; a bounded warm-up fetch primes the cache when allowed.
+
+    A cache whose last bar is more than ``screen_max_stale_sessions`` benchmark
+    sessions old stopped updating — an acquired/delisted name (CRNX, APGE, FBRX,
+    ATAI: their frozen takeover-price bars read as fresh 52-week highs and were
+    injected every tick, then failed every snapshot) or one nothing refreshes any
+    more. It is never screened on those old bars and, outside the curated list,
+    never fetched (EDAP, BXDIF came back empty on every tick's warm-up fetch). A
+    curated name gets one refresh within the budget and is screened only if that
+    brings it current (2026-09-29)."""
     df = load_ohlcv(ticker)
-    if df is not None and not df.empty and len(df) >= _MIN_BARS:
+    max_stale = int(getattr(settings, "screen_max_stale_sessions", 2))
+    lag = _sessions_behind(df, ref)
+    stale = lag is not None and max_stale >= 0 and lag > max_stale
+    if df is not None and not df.empty and len(df) >= _MIN_BARS and not stale:
         return df
+    if stale and ticker not in _CURATED:
+        budget["stale"] = budget.get("stale", 0) + 1
+        return None
     if settings.enable_fetch_data and budget["n"] > 0:
         budget["n"] -= 1
         try:
             fetched = get_history(ticker, period="15mo")
             if fetched is not None and not fetched.empty:
+                f_lag = _sessions_behind(fetched, ref)
+                if f_lag is not None and max_stale >= 0 and f_lag > max_stale:
+                    budget["stale"] = budget.get("stale", 0) + 1
+                    return None
                 return fetched
         except Exception as e:
             logger.debug(f"[screener] fetch failed for {ticker}: {e}")
+    if stale:
+        budget["stale"] = budget.get("stale", 0) + 1
+        return None
     return df
 
 
@@ -236,12 +293,13 @@ def run_screener() -> ScreenerContext:
             if base > 0:
                 spy_ret = (float(c.iloc[-1]) / base - 1) * 100.0
 
+        ref = _ref_sessions(spy_df)
         pool = _candidate_pool()
         hits: List[ScreenHit] = []
         evaluated = 0
         required = {"High", "Low", "Close", "Volume"}
         for tk in pool:
-            df = _load_for_screen(tk, budget)
+            df = _load_for_screen(tk, budget, ref)
             if df is None or df.empty or not required.issubset(df.columns):
                 continue
             evaluated += 1
@@ -272,6 +330,12 @@ def run_screener() -> ScreenerContext:
         logger.info(
             f"[screener] {len(top)} setup(s) / {evaluated} evaluated / {fetched} fetched | {summary}"
         )
+        if budget.get("stale"):
+            logger.info(
+                f"[screener] skipped {budget['stale']} stale cache(s) (last bar > "
+                f"{int(getattr(settings, 'screen_max_stale_sessions', 2))} sessions behind SPY) "
+                "— never screened on old bars"
+            )
         return ScreenerContext(
             hits=top, universe_size=evaluated, fetched=fetched, report_date=today, summary=summary,
         )

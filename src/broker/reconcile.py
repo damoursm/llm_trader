@@ -49,7 +49,7 @@ import math
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -316,6 +316,23 @@ _TERMINAL_STATUSES = ("Filled", "Cancelled", "ApiCancelled", "Inactive", "DRYRUN
                       "RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED",
                       "DUPLICATE_REF_NOT_SUBMITTED")
 
+# A submit IBKR REFUSED outright: the order ended at once with nothing filled.
+# It is resent in the same tick (user directive 2026-09-27: "Try resend them
+# during the same tick") and again on later ticks — before, the refused
+# order's id and terminal status were stored and the entry pass skipped the
+# trade forever (39 refused entries by 2026-09-27, none ever resent).
+_REFUSED_STATUSES = ("Cancelled", "ApiCancelled", "Inactive")
+
+# An exit leg's terminal "nothing to send": the trade's own entry never filled,
+# so no share of it is held. Without it, such a closed trade kept an exit armed
+# forever, sized from WHATEVER the broker held in the ticker — a 09-22 JPM buy
+# that never filled sold another trade's 4 shares on 09-25, 28 minutes after
+# they were bought (31 such trades in the ledger on 2026-09-27).
+_NEVER_FILLED = "NEVER_FILLED"
+# How old an unfilled entry order must be before it is taken as final even when
+# the broker left it in a non-terminal state (a DAY order expired unseen).
+_ENTRY_FINAL_AFTER_MINUTES = 720
+
 
 def _leg_needs_refresh(t: dict, prefix: str) -> bool:
     """True when a submitted order leg ('broker_' or 'broker_exit_') is missing
@@ -494,6 +511,65 @@ def _tally_submit_failure(report: dict, kind: str, ticker: str, res: OrderResult
     else:
         report["rejects"] += 1
     report["errors"].append(f"{kind} {ticker}: {res.error or res.status or 'unknown'}")
+
+
+def _is_refusal(res: OrderResult) -> bool:
+    """IBKR ended the order at once without a fill — a refusal, as opposed to a
+    transient failure (retried by `_submit_with_retry`) or a working order."""
+    return (not res.ok and not (res.filled_qty or 0)
+            and (res.status or "") in _REFUSED_STATUSES and not _looks_unresponsive(res))
+
+
+def _resend_refused(broker: Broker, t: dict, prefix: str, intent: str, req: OrderRequest,
+                    res: OrderResult, model_price: float, outside_rth: bool, report: dict,
+                    submitted_refs: set):
+    """Resend a refused order IN THIS TICK (user directive 2026-09-27), up to
+    ``broker_refused_resends_per_tick`` times, each re-anchored at a fresh quote
+    under the leg's next ``-rN`` ref. Every refused attempt is recorded. Returns
+    the last (request, result, model price)."""
+    n_max = max(0, int(getattr(settings, "broker_refused_resends_per_tick", 0) or 0))
+    tries = 0
+    while _is_refusal(res) and tries < n_max:
+        tries += 1
+        _record_order(
+            report, event="SUBMIT_REFUSED", intent=intent, ticker=t["ticker"], side=req.side,
+            order_type=req.order_type, requested_qty=req.quantity, filled_qty=0,
+            model_price=model_price, limit_price=req.limit_price, fill_price=None,
+            commission=None, status=res.status, ok=False, error=res.error,
+            order_id=res.order_id, client_ref=req.client_ref, submitted_at=res.submitted_at,
+        )
+        t[f"{prefix}refused_order_ids"] = (t.get(f"{prefix}refused_order_ids") or []) + [res.order_id]
+        n = int(t.get(f"{prefix}resubmit_n") or 0) + 1
+        t[f"{prefix}resubmit_n"] = n
+        live = _live_price(t["ticker"]) or model_price
+        limit = _limit_price_for(req.side, live, outside_rth, _quote_for(broker, t["ticker"]))
+        req = replace(req, client_ref=f"{_leg_ref_base(t, prefix)}-r{n}", order_type="LMT",
+                      limit_price=limit or req.limit_price)
+        logger.info(f"[broker] {intent} {t['ticker']}: refused ({res.error or res.status}) — "
+                    f"resending in this tick ({tries}/{n_max}) at {live} under {req.client_ref}")
+        report["refused_resends"] = report.get("refused_resends", 0) + 1
+        model_price = live
+        res = _submit_with_retry(broker, req, model_price=live, report=report, intent=intent)
+        submitted_refs.add(req.client_ref)
+    return req, res, model_price
+
+
+def _park_refused(t: dict, prefix: str, res: OrderResult, give_up_after: int = 0) -> None:
+    """A leg still refused after this tick's resends: archive the order id and
+    clear the leg so the next tick sends it again. An ENTRY refused on
+    ``give_up_after`` ticks is given up (``REFUSED_GAVE_UP``, never sent again);
+    exits pass 0 — an exit keeps trying until the position is flat."""
+    t[f"{prefix}refused_order_ids"] = (t.get(f"{prefix}refused_order_ids") or []) + [res.order_id]
+    t[f"{prefix}order_id"] = None
+    t[f"{prefix}resubmit_n"] = int(t.get(f"{prefix}resubmit_n") or 0) + 1
+    k = int(t.get(f"{prefix}refused_ticks") or 0) + 1
+    t[f"{prefix}refused_ticks"] = k
+    t[f"{prefix}refused_reason"] = res.error or res.status
+    t[f"{prefix}status"] = "REFUSED"
+    if give_up_after and k >= give_up_after:
+        t[f"{prefix}status"] = "REFUSED_GAVE_UP"
+        logger.warning(f"[broker] {t['ticker']}: {'entry' if prefix == 'broker_' else 'exit'} refused on {k} "
+                       f"ticks ({t[f'{prefix}refused_reason']}) — given up, not sent again")
 
 
 def _known_order_result(broker: Broker, req: OrderRequest) -> Optional[OrderResult]:
@@ -708,6 +784,41 @@ def _working_refs(broker: Broker) -> Optional[set]:
         return None
 
 
+def _owned_by_open(trades: List[dict], exclude: Optional[dict] = None) -> Dict[str, int]:
+    """Signed shares the OPEN trades own per ticker (their recorded entry fills;
+    + long, - short), ``exclude`` left out. The selection short stacks a repeat
+    pick of a held name as a SEPARATE trade (user directive 2026-09-28: "Remove
+    the one position per ticker rule"), so the broker's one netted position in a
+    ticker is split among several open trades: sizing an entry, judging whether a
+    position backs a dead entry leg, or sizing an exit must count only the shares
+    no OTHER open trade owns."""
+    out: Dict[str, int] = {}
+    for ot in trades:
+        if ot is exclude or ot.get("status") != "OPEN":
+            continue
+        q = int(ot.get("broker_fill_qty") or 0)
+        if q > 0:
+            out[ot["ticker"]] = out.get(ot["ticker"], 0) + (q if ot.get("action") == "BUY" else -q)
+    return out
+
+
+def _entry_qty(t: dict, price: float, equity_usd: float, fx_notional: float) -> int:
+    """Whole shares for an entry. A selection short the SIMULATED ACCOUNT funded
+    (`sim_account`, user directive 2026-10-05: the vol arm sized from $5,000 + $1,000
+    every 14 days) orders exactly the account's share count, whatever the price it is
+    resent at; every other entry the configured sizing (`broker_sizing_mode`) times the
+    trade's multiplier."""
+    if t.get("sel_account_shares") is not None:
+        try:
+            return max(0, int(t["sel_account_shares"]))
+        except (TypeError, ValueError):
+            return 0
+    mult = t.get("position_size_multiplier", 1.0)
+    if settings.broker_sizing_mode == "equity_pct":
+        return shares_for(equity_usd, price, mult)
+    return shares_for_notional(settings.broker_base_notional, fx_notional, price, mult)
+
+
 def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
                            positions: Optional[dict] = None,
                            sync_started: Optional[datetime] = None) -> bool:
@@ -817,7 +928,10 @@ def _cancel_stale_unfilled(broker: Broker, trades: List[dict], report: dict,
                     continue   # working or filled — the fill-refresh pass owns it
                 expected_sign = 1 if t["action"] == "BUY" else -1
                 held = (positions or {}).get(t["ticker"])
-                backed = bool(held and held.quantity * expected_sign > 0)
+                held_same = int(abs(held.quantity)) if (held and held.quantity * expected_sign > 0) else 0
+                # shares another OPEN trade owns do not back this leg (stacked trades)
+                others = max(0, _owned_by_open(trades, exclude=t).get(t["ticker"], 0) * expected_sign)
+                backed = held_same - others > 0
                 if intent == "ENTRY" and backed:
                     logger.info(
                         f"[broker] entry {t['ticker']}: order {ref} is dead but a "
@@ -1438,7 +1552,32 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
     ``actionable_by_ticker`` (optional) maps ticker → the tick's actionable
     action ("BUY"/"SELL"); when supplied it drives the price-aware next-tick
     resubmit for previously-unfilled entries (``_resubmit_decision``). Omitted →
-    the legacy always-chase behavior.
+    the legacy always-chase behavior. A selection-short entry never goes through
+    that gate (the map is the legacy rank rule's): it is re-anchored and resent
+    while its ledger row is open. While the selection short is live and legacy
+    entries are off, an unfilled legacy entry is not sent at all
+    (``LEGACY_ENTRY_SHADOWED``).
+
+    Called TWICE a tick (user directive 2026-09-28): by the live path right after
+    the selection short's entries, and at the end of the tick; the pipeline
+    merges the two reports. Idempotent, so the second call resends what the
+    first left unfilled. Rules added with the 2026-09-28 order cleanup (user
+    directives 2026-09-27: resend in the same tick, no stale order live):
+
+    * an order IBKR REFUSES (``Cancelled`` / ``ApiCancelled`` / ``Inactive``) is
+      resent in the same sync up to ``broker_refused_resends_per_tick`` times,
+      then parked (``REFUSED``) for the next tick; an ENTRY refused on
+      ``broker_refused_max_ticks`` ticks is given up (``REFUSED_GAVE_UP``) —
+      an exit never is, and a parked exit counts as pending for the drift pass;
+    * a CLOSED trade whose entry never filled sends no exit; once that entry is
+      final (terminal, or ``_ENTRY_FINAL_AFTER_MINUTES`` old) the leg is stamped
+      ``NEVER_FILLED`` and never looked at again — restored / adopted rows
+      excepted (they size from the live position);
+    * a closed trade's exit quantity is the broker's holding MINUS what the
+      ticker's OPEN trades own; no position row means flat (nothing is sent,
+      re-checked next tick); a holding of the wrong sign is left to the drift pass;
+    * the report carries ``gateway_session`` when the gateway is logged out of
+      IBKR (``_gateway_session``) — the broker health goes DOWN on it.
     """
     report = _new_report()
     report["run_id"] = run_id
@@ -1484,6 +1623,32 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 report["connected"] = bool(broker.connect())
         except Exception as e:
             connect_err = e
+    # Is the gateway logged in to IBKR? A logged-out gateway still accepts the
+    # API connection above, so this is checked on its own (user directive
+    # 2026-09-28: an alert in the email digest).
+    report["gateway_session"] = _gateway_session(broker)
+    gs = report["gateway_session"]
+    if (gs and gs.get("auto_recoverable")
+            and getattr(settings, "broker_gateway_relogin_restart", False)):
+        # IBKR asked the gateway to re-login (its nightly session reset, ~00:15-
+        # 00:45 ET) and IBC's re-login was refused — 9 of 9 times since August;
+        # a FULL restart logs in (user, 2026-09-29: "The production needs to be
+        # reliable"). Paper-only, cooldown-guarded, never inside IBC's own daily
+        # restart window (`maybe_restart_gateway`).
+        try:
+            from datetime import datetime as _dt
+            from src.broker.gateway_recovery import maybe_restart_gateway, wait_for_login
+            started = _dt.now()
+            if maybe_restart_gateway(f"gateway logged out of IBKR since {gs.get('since')} — IBKR's "
+                                     f"re-login was refused", wait=True):
+                logged_in = wait_for_login(started)
+                report["connected"] = bool(broker.connect(force=True))
+                report["gateway_session"] = _gateway_session(broker)
+                report["gateway_relogin_restart"] = "logged in" if logged_in else "restarted, login pending"
+                logger.info(f"[broker] gateway restarted after a refused re-login — "
+                            f"{report['gateway_relogin_restart']}")
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning(f"[broker] gateway re-login restart failed (fail-soft): {e}")
     if not report["connected"]:
         report["ok"] = False
         if connect_err is not None:
@@ -1603,8 +1768,19 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         for t in open_trades:
             if t.get("broker_order_id"):
                 continue  # idempotent — already submitted
-            if t.get("broker_status") == "DUPLICATE_REF_NOT_SUBMITTED":
-                continue  # twin of an already-submitted trade — never re-sent
+            if t.get("broker_status") in ("DUPLICATE_REF_NOT_SUBMITTED", "REFUSED_GAVE_UP"):
+                continue  # twin of an already-submitted trade / refused too often — never re-sent
+            if (settings.enable_sel_short and not settings.enable_legacy_entries
+                    and t.get("entry_mechanism") != "sel_short"):
+                # The selection short is the live book (2026-09-28) and the legacy
+                # books are SHADOW: a legacy entry the broker never filled is not
+                # sent (or chased) now, only for the one-shot flatten to close it.
+                # A filled or partly filled one keeps its position until then.
+                if t.get("broker_status") != "LEGACY_ENTRY_SHADOWED":
+                    t["broker_status"] = "LEGACY_ENTRY_SHADOWED"
+                    changed = True
+                    logger.info(f"[broker] entry {t['ticker']}: legacy entry not sent — the legacy book is shadow")
+                continue
             price = float(t.get("entry_price") or t.get("current_price") or 0.0)
             resubmit_n = int(t.get("broker_resubmit_n") or 0)
             if resubmit_n and t.get("current_price"):
@@ -1612,8 +1788,17 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 # chase only when the price is still near the decision AND the
                 # signal hasn't flipped; otherwise HOLD and let the next tick
                 # re-evaluate. Off / no map → legacy chase.
+                # The selection short takes its own rule: re-anchor and resend
+                # while its ledger row is open — the monitor closes the row once
+                # the target is reached, and an entry 1-3 bars late measured as
+                # good as one at the pick (2026-09-26). The price-aware gate reads
+                # the LEGACY rank rule's map, where these names are absent
+                # ("decayed": a short resent only at a higher price) or on its
+                # long side ("flipped"), so it would strand every short whose
+                # price fell before it filled.
                 if (settings.broker_price_aware_resubmit
                         and actionable_by_ticker is not None
+                        and t.get("entry_mechanism") != "sel_short"
                         and _resubmit_decision(t, actionable_by_ticker) == "skip"):
                     t["broker_status"] = "RESUBMIT_HELD_ADVERSE"
                     changed = True
@@ -1636,11 +1821,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 # this tick) so the capped LMT follows the market in bounded
                 # steps instead of resting at the old entry price forever.
                 price = float(t["current_price"])
-            mult = t.get("position_size_multiplier", 1.0)
-            if settings.broker_sizing_mode == "equity_pct":
-                qty = shares_for(equity_usd, price, mult)
-            else:
-                qty = shares_for_notional(settings.broker_base_notional, fx_notional, price, mult)
+            qty = _entry_qty(t, price, equity_usd, fx_notional)
             if qty <= 0:
                 t["broker_status"] = "SKIPPED_ZERO_QTY"
                 changed = True
@@ -1659,6 +1840,11 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             want_sign = 1 if t["action"] == "BUY" else -1
             have = (int(abs(held_now.quantity))
                     if held_now is not None and held_now.quantity * want_sign > 0 else 0)
+            if have:
+                # Another OPEN trade's shares are not this trade's: a stacked
+                # repeat pick of a held name (2026-09-28) is sized in full.
+                others = max(0, _owned_by_open(open_trades, exclude=t).get(t["ticker"], 0) * want_sign)
+                have = max(0, have - others)
             if have:
                 target = qty
                 qty = max(0, qty - have)
@@ -1711,21 +1897,28 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 t["broker_status"] = "DUPLICATE_REF_NOT_SUBMITTED"
                 changed = True
                 continue
-            res = _submit_with_retry(broker, OrderRequest(
+            req = OrderRequest(
                 ticker=t["ticker"], side=side, quantity=qty,
                 order_type=order_type, limit_price=limit,
                 client_ref=ref,
                 intent="ENTRY", outside_rth=outside_rth,
                 overnight=_overnight_routing_active(),
-            ), model_price=price, report=report, intent="ENTRY")
+            )
+            res = _submit_with_retry(broker, req, model_price=price, report=report, intent="ENTRY")
             submitted_refs.add(ref)
+            if _is_refusal(res):
+                req, res, price = _resend_refused(broker, t, "broker_", "ENTRY", req, res, price,
+                                                  outside_rth, report, submitted_refs)
             _apply_entry_result(t, res)
+            if _is_refusal(res):
+                _park_refused(t, "broker_", res,
+                              give_up_after=int(getattr(settings, "broker_refused_max_ticks", 0) or 0))
             _persist_legs(trades, t)   # the order is live NOW — never lose that
             changed = True
             _record_order(
                 report, event="SUBMIT", intent="ENTRY", ticker=t["ticker"], side=side,
-                order_type=order_type, requested_qty=qty,
-                filled_qty=res.filled_qty, model_price=price, limit_price=limit,
+                order_type=req.order_type, requested_qty=qty,
+                filled_qty=res.filled_qty, model_price=price, limit_price=req.limit_price,
                 fill_price=res.avg_fill_price, commission=res.commission,
                 status=res.status, ok=res.ok, error=res.error,
                 order_id=res.order_id, client_ref=res.client_ref,
@@ -1742,26 +1935,60 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
 
         # ── EXITS: CLOSED trades that still hold a broker position ────────
         exited_this_tick: set = set()
+        # What OPEN trades own, per ticker (signed recorded fills): a closed
+        # trade's exit takes only the shares left after them.
+        owned_by_open: Dict[str, int] = {}
+        for ot in open_trades:
+            q = int(ot.get("broker_fill_qty") or 0)
+            if q > 0:
+                owned_by_open[ot["ticker"]] = (owned_by_open.get(ot["ticker"], 0)
+                                               + (q if ot["action"] == "BUY" else -q))
+        # Shares already on their way out per ticker: the unfilled remainder of
+        # other closed trades' WORKING exit orders, plus the exits sent earlier in
+        # this pass — several closed trades on one ticker (stacked repeat picks,
+        # 2026-09-28) must never each cover the whole holding.
+        leaving: Dict[str, int] = {}
+        for ct in closed_trades:
+            if ct.get("broker_exit_order_id") and (ct.get("broker_exit_status") or "") not in _TERMINAL_STATUSES:
+                rem = int(ct.get("broker_exit_requested_qty") or 0) - int(ct.get("broker_exit_fill_qty") or 0)
+                if rem > 0:
+                    leaving[ct["ticker"]] = leaving.get(ct["ticker"], 0) + rem
         for t in closed_trades:
             if not t.get("broker_order_id") or t.get("broker_exit_order_id"):
                 continue  # never entered via broker, or already exited
             if t.get("broker_exit_status") == "DUPLICATE_REF_NOT_SUBMITTED":
                 continue  # twin's exit already flattens the shared position
-            # Size from what the broker ACTUALLY holds when the positions
-            # feed has a row: a recorded fill count that lagged (partial
-            # known at exit time, the rest discovered later by fill refresh)
-            # would otherwise leave a residual position with no open trade
-            # behind it. The goal after a ledger close is a FLAT broker book
-            # in that ticker. Sign-checked: a holding OPPOSITE to the trade's
-            # direction is never blind-traded (the drift pass handles it).
-            # No position row at all → fall back to the recorded fill qty so
-            # a confirmed entry is always covered even when the feed lags; a
-            # stale record at worst leaves a residue the drift pass flattens.
+            own_fill = int(t.get("broker_fill_qty") or 0)
+            # A row restored from a backup or adopted from drift carries no fill
+            # count by design — its exit sizes from the live position below.
+            if own_fill <= 0 and (t.get("broker_status") or "") not in _RESTORED_STATUSES:
+                # Its entry never filled: no share of this trade is held, so it
+                # sends no exit — whatever the broker holds in the ticker belongs
+                # to an open trade or is drift (the drift pass flattens drift).
+                # Once the entry is final (terminal, or too old to fill unseen)
+                # the leg is stamped terminal and never looked at again.
+                ent = t.get("broker_status") or ""
+                age = _age_minutes(t.get("broker_submitted_at"))
+                if t.get("broker_exit_status") != _NEVER_FILLED and (
+                        ent in _TERMINAL_STATUSES
+                        or (age is not None and age >= _ENTRY_FINAL_AFTER_MINUTES)):
+                    t["broker_exit_status"] = _NEVER_FILLED
+                    changed = True
+                continue
+            # Size from what the broker ACTUALLY holds: a recorded fill count
+            # that lagged (partial known at exit time, the rest discovered later
+            # by fill refresh) would otherwise leave a residual position with no
+            # open trade behind it. The goal after a ledger close is a FLAT
+            # broker book in that ticker — MINUS what open trades own there, so a
+            # closed trade can never take a later trade's shares. Sign-checked:
+            # a holding OPPOSITE to the trade's direction is never blind-traded
+            # (the drift pass handles it). No position row = flat at the broker:
+            # nothing to close (an exit sized from the recorded fill would open
+            # the opposite position); the leg is re-checked next tick, so a
+            # positions feed that lagged a fill only delays the exit one tick.
             held = positions.get(t["ticker"])
             expected_sign = 1 if t["action"] == "BUY" else -1
-            if held is None:
-                qty = int(t.get("broker_fill_qty") or 0)
-            elif held.quantity == 0:
+            if held is None or held.quantity == 0:
                 qty = 0
             elif held.quantity * expected_sign < 0:
                 logger.warning(
@@ -1771,10 +1998,22 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 )
                 qty = 0
             else:
-                qty = int(abs(held.quantity))
+                others = max(0, owned_by_open.get(t["ticker"], 0) * expected_sign)
+                going = leaving.get(t["ticker"], 0)
+                qty = max(0, int(abs(held.quantity)) - others - going)
+                if others or going:
+                    logger.info(f"[broker] exit {t['ticker']}: of the {int(abs(held.quantity))} held, {others} "
+                                f"belong to open trade(s) and {going} are already being covered — closing {qty}")
             if qty <= 0:
-                t["broker_exit_status"] = "NOTHING_TO_CLOSE"
-                changed = True
+                # A TWIN (the same exit ref already sent this pass) keeps its
+                # durable duplicate status; any other trade re-checks next tick.
+                ref0 = (t.get("recommendation_id") or t["ticker"]) + "-exit"
+                if int(t.get("broker_exit_resubmit_n") or 0):
+                    ref0 = f"{ref0}-r{int(t.get('broker_exit_resubmit_n') or 0)}"
+                why = "DUPLICATE_REF_NOT_SUBMITTED" if ref0 in submitted_refs else "NOTHING_TO_CLOSE"
+                if t.get("broker_exit_status") != why:
+                    t["broker_exit_status"] = why
+                    changed = True
                 continue
             side = _exit_side(t["action"])
             model = float(t.get("exit_price") or t.get("current_price") or 0.0)
@@ -1804,21 +2043,27 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 t["broker_exit_status"] = "DUPLICATE_REF_NOT_SUBMITTED"
                 changed = True
                 continue
-            res = _submit_with_retry(broker, OrderRequest(
+            req = OrderRequest(
                 ticker=t["ticker"], side=side, quantity=qty,
                 order_type=order_type, limit_price=limit,
                 client_ref=ref,
                 intent="EXIT", outside_rth=outside_rth,
                 overnight=_overnight_routing_active(),
-            ), model_price=model, report=report, intent="EXIT")
+            )
+            res = _submit_with_retry(broker, req, model_price=model, report=report, intent="EXIT")
             submitted_refs.add(ref)
+            if _is_refusal(res):
+                req, res, model = _resend_refused(broker, t, "broker_exit_", "EXIT", req, res, model,
+                                                  outside_rth, report, submitted_refs)
             _apply_exit_result(t, res)
+            if _is_refusal(res):
+                _park_refused(t, "broker_exit_", res)     # an exit never gives up
             _persist_legs(trades, t)   # the order is live NOW — never lose that
             changed = True
             _record_order(
                 report, event="SUBMIT", intent="EXIT", ticker=t["ticker"], side=side,
-                order_type=order_type, requested_qty=qty,
-                filled_qty=res.filled_qty, model_price=model, limit_price=limit,
+                order_type=req.order_type, requested_qty=qty,
+                filled_qty=res.filled_qty, model_price=model, limit_price=req.limit_price,
                 fill_price=res.avg_fill_price, commission=res.commission,
                 status=res.status, ok=res.ok, error=res.error,
                 order_id=res.order_id, client_ref=res.client_ref,
@@ -1827,6 +2072,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             if res.ok:
                 report["exits_submitted"] += 1
                 exited_this_tick.add(t["ticker"])
+                leaving[t["ticker"]] = leaving.get(t["ticker"], 0) + qty
                 _record_slippage(report, "EXIT", t["ticker"], side,
                                  model, res.avg_fill_price, res.commission)
             else:
@@ -1840,8 +2086,11 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         open_tickers = {t["ticker"] for t in open_trades}
         pending_exit_tickers = {
             t["ticker"] for t in closed_trades
-            if t.get("broker_exit_order_id")
-            and (t.get("broker_exit_status") or "") not in _TERMINAL_STATUSES
+            if (t.get("broker_exit_order_id")
+                and (t.get("broker_exit_status") or "") not in _TERMINAL_STATUSES)
+            # a REFUSED exit still owns its position: it is resent next tick, and
+            # a drift flatten beside it could fill twice and overshoot
+            or t.get("broker_exit_status") == "REFUSED"
         }
         drift_action = (settings.broker_drift_action or "report").lower()
         if drift_action == "flatten" and settings.broker_mode == "ibkr_live":
@@ -1913,6 +2162,28 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         f"drift={len(report['drift'])} equity={report['account_equity']:.0f}"
     )
     return report
+
+
+def _gateway_session(broker) -> Optional[dict]:
+    """None while the gateway is logged in to IBKR; else ``{"since", "reason"}``
+    — from IBC's last login outcome (a refused login) or the broker's link state
+    (error 1100 with no restore). Fail-soft: None when it cannot tell."""
+    try:
+        from src.broker.gateway_recovery import ibc_login_state
+        st = ibc_login_state()
+        if st is not None and not st.get("logged_in"):
+            return {"since": st.get("at"), "reason": st.get("reason"),
+                    # IBKR's own re-login demand that IBC could not complete — a full
+                    # gateway restart logs in; a login elsewhere must not be kicked out
+                    "auto_recoverable": not st.get("existing_session")}
+        lost = getattr(broker, "ibkr_link_lost_since", None)
+        lost = lost() if callable(lost) else None
+        if lost is not None:
+            return {"since": lost.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                    "reason": "IBKR connectivity lost (error 1100), not restored"}
+    except Exception as e:                                         # noqa: BLE001
+        logger.debug(f"[broker] gateway session check failed: {e}")
+    return None
 
 
 def _apply_entry_result(t: dict, res) -> None:

@@ -22,15 +22,19 @@ polygon_client's key handling and 403/429 semantics are reused unchanged.
 """
 from __future__ import annotations
 
+import time
 from datetime import date, timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
 
 from src.data.deep import RateLimiter
 
-_LIMITER = RateLimiter(0.05)          # 20 req/s ceiling, well under the paid tiers' allowance
+# 33 req/s ceiling, well under the paid tiers' allowance (raised from 20 on
+# 2026-09-29: the FINRA families now take one market-wide sweep each, so the
+# per-ticker bars and news have the budget to themselves)
+_LIMITER = RateLimiter(0.03)
 _NY = "America/New_York"
 BARS_FROM = "2021-01-01"
 
@@ -41,8 +45,17 @@ def _client():
 
 
 def _get(path: str, params: dict) -> Optional[dict]:
+    """One GET through the limiter, retried ONCE after 1.5 s when it failed
+    (``None``: a 429, a 5xx past the client's own retry, a transport error) — a
+    failed per-ticker call used to read as "no new rows" and the key was marked
+    done without its data."""
     _LIMITER.wait()
-    return _client()._get(path, params)
+    j = _client()._get(path, params)
+    if j is None:
+        time.sleep(1.5)
+        _LIMITER.wait()
+        j = _client()._get(path, params)
+    return j
 
 
 def _paginate(path: str, params: dict, max_pages: int = 80) -> List[dict]:
@@ -62,6 +75,67 @@ def _paginate(path: str, params: dict, max_pages: int = 80) -> List[dict]:
         except Exception as e:                           # noqa: BLE001
             logger.debug(f"[deep.polygon] pagination stopped on {path}: {e}")
             break
+    return out
+
+
+def _paginate_all(path: str, params: dict, max_pages: int = 200) -> Tuple[List[dict], bool]:
+    """``_paginate`` that also says whether it reached the END: False when the
+    first call failed (``_get`` -> None: a 429, a 5xx after its retry, a
+    transport error), a cursor page failed, or ``max_pages`` ran out with a cursor
+    left. A caller that must hold EVERY row falls back on False."""
+    pc = _client()
+    j = _get(path, params)
+    if j is None:
+        return [], False
+    out: List[dict] = []
+    pages = 0
+    while True:
+        out.extend(j.get("results") or [])
+        nxt = j.get("next_url")
+        if not nxt:
+            return out, True
+        if pages >= max_pages:
+            logger.warning(f"[deep.polygon] {path}: {max_pages} pages and a cursor left — incomplete")
+            return out, False
+        pages += 1
+        _LIMITER.wait()
+        try:
+            j = pc._follow_next_url(nxt)
+        except Exception as e:                           # noqa: BLE001
+            logger.warning(f"[deep.polygon] {path}: page {pages} failed ({e}) — incomplete")
+            return out, False
+
+
+def _bulk_by_symbol(path: str, date_param: str, since_by: Dict[str, str], max_age_days: int,
+                    frame) -> Dict[str, pd.DataFrame]:
+    """Serve every key whose tail starts within ``max_age_days`` from ONE
+    market-wide query (``<date_param>.gte`` = the oldest such tail), cut per key
+    to ITS OWN ``since`` — the rows the per-ticker call (``ticker=<symbol>``,
+    ``<date_param>.gte=<since>``) returns. Symbols match EXACTLY, case included
+    (FINRA's ``BCpC`` is a preferred, not ``BCPC``), and every universe spelling
+    of one symbol gets the rows (``BRK-B`` and ``BRK.B`` both hold parts).
+    Keys it cannot vouch for — an older tail, no part yet — and EVERY key when
+    the sweep is incomplete are left out: ``run_tails`` fetches those one by one."""
+    pc = _client()
+    floor = (date.today() - timedelta(days=int(max_age_days))).isoformat()
+    served = {k: s for k, s in since_by.items() if s and s >= floor}
+    if not served:
+        return {}
+    start = min(served.values())
+    res, complete = _paginate_all(path, {f"{date_param}.gte": start, "limit": 50000,
+                                         "order": "asc", "sort": date_param})
+    if not complete:
+        logger.warning(f"[deep.polygon] {path}: market-wide sweep from {start} incomplete — "
+                       f"every key falls back to its own call")
+        return {}
+    by_sym: Dict[str, List[dict]] = {}
+    for r in res:
+        by_sym.setdefault(str(r.get("ticker", "")), []).append(r)
+    out: Dict[str, pd.DataFrame] = {}
+    for k, since in served.items():
+        rows = [dict(r) for r in by_sym.get(pc.to_polygon_symbol(k), [])
+                if str(r.get(date_param, "")) >= since]
+        out[k] = frame(rows, k)
     return out
 
 
@@ -129,7 +203,11 @@ def short_interest(ticker: str, start: Optional[str] = None) -> pd.DataFrame:
               "sort": "settlement_date"}
     if start:
         params["settlement_date.gte"] = start
-    res = _paginate("/stocks/v1/short-interest", params, max_pages=10)
+    return _short_interest_frame(_paginate("/stocks/v1/short-interest", params, max_pages=10), ticker)
+
+
+def _short_interest_frame(res: List[dict], ticker: str) -> pd.DataFrame:
+    """The per-ticker call's rows -> the stored frame (shared by the bulk path)."""
     if not res:
         return pd.DataFrame()
     df = pd.DataFrame(res)
@@ -140,13 +218,24 @@ def short_interest(ticker: str, start: Optional[str] = None) -> pd.DataFrame:
     return df
 
 
+def short_interest_bulk(since_by: Dict[str, str], max_age_days: int = 45) -> Dict[str, pd.DataFrame]:
+    """Every key's short-interest tail from the market-wide listing (settlement
+    dates twice a month: one sweep instead of 3,430 calls). See ``_bulk_by_symbol``."""
+    return _bulk_by_symbol("/stocks/v1/short-interest", "settlement_date", since_by, max_age_days,
+                           _short_interest_frame)
+
+
 def short_volume(ticker: str, start: Optional[str] = None) -> pd.DataFrame:
     """Daily short-sale volume; ``start`` (ISO) asks only for dates from there on."""
     pc = _client()
     params = {"ticker": pc.to_polygon_symbol(ticker), "limit": 5000, "order": "asc", "sort": "date"}
     if start:
         params["date.gte"] = start
-    res = _paginate("/stocks/v1/short-volume", params, max_pages=10)
+    return _short_volume_frame(_paginate("/stocks/v1/short-volume", params, max_pages=10), ticker)
+
+
+def _short_volume_frame(res: List[dict], ticker: str) -> pd.DataFrame:
+    """The per-ticker call's rows -> the stored frame (shared by the bulk path)."""
     if not res:
         return pd.DataFrame()
     df = pd.DataFrame(res)
@@ -155,6 +244,12 @@ def short_volume(ticker: str, start: Optional[str] = None) -> pd.DataFrame:
         if c not in ("ticker", "date"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+def short_volume_bulk(since_by: Dict[str, str], max_age_days: int = 10) -> Dict[str, pd.DataFrame]:
+    """Every key's daily short-volume tail from the market-wide listing (~15k
+    symbols a day: one sweep instead of 3,430 calls). See ``_bulk_by_symbol``."""
+    return _bulk_by_symbol("/stocks/v1/short-volume", "date", since_by, max_age_days, _short_volume_frame)
 
 
 # ── market-wide sweeps ───────────────────────────────────────────────────────

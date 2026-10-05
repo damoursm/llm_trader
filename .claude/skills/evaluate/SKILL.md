@@ -1,6 +1,6 @@
 ---
 name: evaluate
-description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO test sets reported separately (set 1 history 2026-06-17..09-27, set 2 live all-source news from 2026-09-28); model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective (per-side return per day of the top/bottom name per run after the own-history rule) for models trained on it; gates/exits = counterfactual excess return per decision; label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
+description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO test sets reported separately (set 1 history 2026-06-17..09-27, set 2 live all-source news from 2026-09-28); model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective (per-side return per day of the top/bottom name per run after the own-history rule) for models trained on it; gates/exits = counterfactual excess return per decision; the LIVE STRATEGY = return per day AND growth per year (the account fed $5,000 plus $1,000 every 14 days, compounding through the audited replay engine, money- and time-weighted); label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
 argument-hint: "[what to evaluate, e.g. 'the ml_exit upgrade' or 'Gate 1c']"
 ---
 
@@ -106,13 +106,34 @@ decision is judged twice: its score as a model, the rule built on it as a
 decider.
 
 **The live strategy (the selection short, since 2026-09-28)** is a decider whose
-trade ends at an IMPLEMENTABLE exit, not at the pivot: judge a change to it by the
-return per trade and per day (`(1 + mean)^(1/days) − 1`) of the whole rule —
-entry at the pick bar's close (or the delayed entry being tested), cover at half
-the 5-session run-up checked at 30-minute closes, else 15 sessions — net of the
-REAL costs: the NBBO half-spread at entry and exit (`nbbo_backfill.quote_at`),
-IBKR fixed commissions, SEC/TAF on the short sale, and the borrow fee from
-`data/ibkr_borrow` at entry (`ibkr_borrow.borrow_at`). Always beside the
+trade ends at an IMPLEMENTABLE exit, not at the pivot. Judge a change to it on TWO
+metrics, both reported every time (user directives 2026-10-04: "growth per year and
+return per day are the new metrics to follow"; "5000$ plus 1000$ every two weeks is
+the incoming capital in the account"):
+
+1. **Return per day** = `(1 + mean net trade)^(1 / mean 24-hour hold) − 1` of the
+   whole rule, with the return per trade beside it (paired day bootstrap);
+2. **Growth per year** = the account fed **$5,000 at the start plus $1,000 every 14
+   calendar days** (the first deposit 14 days after the start), compounding through
+   the audited replay engine: each short sized from the account's current value at a
+   STATED share (e.g. 8 slices = 1/8 of the account), shorts ≤ 100% of the account
+   and ≤ 1% of the stock's 20-session dollar volume, IBKR's borrow formula (shares ×
+   roundup(102% × prior close) × fee / 360 per calendar day from settlement), Reg T
+   margin with forced buy-backs at maintenance, no new short under $2,000 of equity
+   (FINRA 4210). Report it MONEY-WEIGHTED (the yearly rate that turns every dollar paid
+   in into the final balance — the objective) and TIME-WEIGHTED (per unit of the account
+   — the strategy alone; drawdowns are taken on it), with the final balance, the money
+   paid in, the worst drawdown and the margin calls. Differences: 21-day block
+   bootstrap of the daily per-unit log-return difference. Start-date checks show
+   balances against money paid in (an annualized rate from a short window explodes).
+
+The two can disagree (the vol arm's 100% give-back raised growth and lowered return per
+day): say so and let the user choose. Every trade of the rule — entry at the pick bar's
+close (or the delayed entry being tested), cover at the arm's give-back checked at
+30-minute closes, else 15 sessions — is net of the REAL costs: the NBBO half-spread at
+entry and exit (`nbbo_backfill.quote_at`), IBKR fixed commissions, SEC/TAF on the short
+sale, and the borrow fee from `data/ibkr_borrow` at entry (`ibkr_borrow.borrow_at`).
+Engine and conventions: `memory/metrics-growth-and-return-per-day.md`. Always beside the
 volatility-matched control (`sel_models.vol_control`): top-1 picks are the most
 volatile names and volatile names drift. Pick parameters out of sample (choose on
 one date half, score on the other). Harnesses: scratchpad `short_eval.py`,
@@ -120,8 +141,9 @@ one date half, score on the other). Harnesses: scratchpad `short_eval.py`,
 (`memory/selection-model-exits-2026-09.md`, `memory/sel-short-deploy-2026-09.md`).
 
 Not used as metrics: AUC, hit %, precision@k (a rank statistic minus magnitude,
-or skill-shaped noise), and compound NAV (a monitor — ~410 days to detect
-0.10%/day).
+or skill-shaped noise), and the LIVE LEDGER's compound NAV (a monitor — ~410 days to
+detect 0.10%/day). The REPLAYED account's growth per year above is a metric for the
+live strategy.
 
 ## 3. The label — the next H/L pivot on 30-minute bars
 
@@ -226,7 +248,12 @@ Lead with the verdict and the number behind it. Then, for EACH test set:
 |---|---|---|---|---|---|---|---|---|---|---|
 
 with each tail's t beside it (for a decider: the counterfactual excess ALL / LONG
-/ SHORT). For a model trained on the selection objective, add per side:
+/ SHORT). For a change to the LIVE STRATEGY, both metrics:
+
+| rule | trades | return/trade | return/day (95%) | growth/yr money-weighted | time-weighted | worst drawdown | margin calls | balance / paid in |
+|---|---|---|---|---|---|---|---|---|
+
+For a model trained on the selection objective, add per side:
 
 | model | side | days | entries/day | days with entry | return/day | t | halves | baseline |
 |---|---|---|---|---|---|---|---|---| Then the caveats that would change the reading: day count, settled

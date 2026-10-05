@@ -21,6 +21,8 @@ unverifiable/illiquid names out, and a genuinely liquid name re-appears next run
 cache is warm. The base watchlist is never subject to this, so dropping a discovered name is safe.
 """
 
+import threading
+from datetime import date
 from typing import Dict, List, Optional, Iterable
 
 import pandas as pd
@@ -32,6 +34,38 @@ from src.data.market_data import get_history, is_valid_ticker, is_exotic_securit
 
 _CACHE_MIN_BARS = 20    # accept the cache outright at/above this many bars
 _EVAL_MIN_BARS  = 10    # below this, too little data to judge liquidity → fail-closed
+
+# Names whose history fetch came back EMPTY today (2026-09-29: FGRS — listed, no
+# bars — was re-fetched and warned about by the smart-money gate on every tick).
+# Such a name fails the gate closed anyway; it is simply not re-fetched until the
+# next day. Recorded only when the same run's other fetches returned data, so a
+# provider outage (every fetch empty) never marks anything. Open-trade names are
+# never gated (pipeline ``_protected``), so this can never drop a held name.
+_NO_DATA: Dict[str, date] = {}
+_NO_DATA_LOCK = threading.Lock()
+
+
+def _no_data_today(ticker: str) -> bool:
+    return _NO_DATA.get(ticker) == date.today()
+
+
+def _note_fetch(budget: Dict, ticker: str, fetched) -> None:
+    """Tally one warm-up fetch's outcome in the run's shared budget."""
+    with _NO_DATA_LOCK:
+        if fetched is None or getattr(fetched, "empty", True):
+            budget.setdefault("_empty", set()).add(ticker)
+        else:
+            budget["_ok"] = budget.get("_ok", 0) + 1
+
+
+def _commit_no_data(budget: Dict) -> None:
+    """Remember today's empty fetches — only when some fetch in the run succeeded."""
+    with _NO_DATA_LOCK:
+        empty = budget.pop("_empty", set())
+        if empty and budget.get("_ok", 0) > 0:
+            today = date.today()
+            for t in empty:
+                _NO_DATA[t] = today
 DOLLAR_VOLUME_WINDOW = 20   # the "20-day average dollar volume" every gate names
 
 
@@ -82,10 +116,12 @@ def _load(ticker: str, budget: Dict[str, int]) -> Optional[pd.DataFrame]:
         return df
     attempted = budget.get("attempted")
     already_attempted = attempted is not None and ticker in attempted
-    if settings.enable_fetch_data and budget.get("n", 0) > 0 and not already_attempted:
+    if (settings.enable_fetch_data and budget.get("n", 0) > 0 and not already_attempted
+            and not _no_data_today(ticker)):
         budget["n"] -= 1
         try:
             fetched = get_history(ticker, period="3mo")
+            _note_fetch(budget, ticker, fetched)
             if fetched is not None and not fetched.empty:
                 return fetched
         except Exception as e:
@@ -111,6 +147,8 @@ def _prewarm_cold(cands: List[str], budget: Dict[str, int]) -> None:
     for t in cands:
         if budget.get("n", 0) - len(cold) <= 0:
             break
+        if _no_data_today(t):
+            continue                     # came back empty earlier today — not re-fetched
         df = load_ohlcv(t)
         if df is None or df.empty or len(df) < _CACHE_MIN_BARS:
             cold.append(t)
@@ -120,7 +158,7 @@ def _prewarm_cold(cands: List[str], budget: Dict[str, int]) -> None:
 
     def _fetch(t: str) -> None:
         try:
-            get_history(t, period="3mo")
+            _note_fetch(budget, t, get_history(t, period="3mo"))
         except Exception as e:
             logger.debug(f"[liquidity] pre-warm fetch failed for {t}: {e}")
 
@@ -260,6 +298,7 @@ def apply_liquidity_gate(
     dropped: List[str] = []
     for t in cands:
         (kept if is_liquid(t, budget, mp, mdv) else dropped).append(t)
+    _commit_no_data(budget)
 
     if dropped:
         logger.info(

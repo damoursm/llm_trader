@@ -430,8 +430,69 @@ def _run_deep_refresh() -> None:
     logger.info("[scheduler] deep history refresh STARTING (subprocess, background thread)")
 
 
+_DEEP_SLOT_TIMER = None
+
+
+def _deep_slots_tick(now_naive: datetime, st: dict, refresh_at: _time, preopen_at: _time) -> None:
+    """One check of the deep store's two slots — the nightly refresh and the
+    market-day pre-open run; ``st`` holds each one's last date."""
+    if _should_run_deep_refresh(now_naive, st.get("refresh"), refresh_at):
+        st["refresh"] = now_naive.date()
+        try:
+            _run_deep_refresh()
+        except Exception as exc:                          # noqa: BLE001
+            logger.exception(f"[scheduler] deep refresh trigger raised: {exc}")
+    if _should_run_deep_preopen(now_naive, st.get("preopen"), preopen_at):
+        st["preopen"] = now_naive.date()
+        try:
+            _run_deep_preopen()
+        except Exception as exc:                          # noqa: BLE001
+            logger.exception(f"[scheduler] deep pre-open trigger raised: {exc}")
+
+
+def _start_deep_slot_timer(refresh_at: _time, preopen_at: _time, poll_seconds: float = 15.0) -> None:
+    """The deep store's two slots on their OWN clock (2026-09-29). The poll loop
+    runs a tick in-line, so a slot checked there fired only after the tick: the
+    08:30 pre-open run started at 08:51 on 09-28 (behind the 08:30 tick) and
+    the scheduler's kill caught its snapshot build half-done; the 23:45 refresh
+    started at 23:58 behind the 23:30 tick. Both launch a background thread that
+    runs a subprocess, so this timer only decides WHEN. One per process."""
+    global _DEEP_SLOT_TIMER
+    if _DEEP_SLOT_TIMER is not None and _DEEP_SLOT_TIMER.is_alive():
+        return
+    st: dict = {}
+
+    def _loop() -> None:
+        while True:
+            try:
+                _deep_slots_tick(now_et().replace(tzinfo=None), st, refresh_at, preopen_at)
+            except Exception as exc:                      # noqa: BLE001
+                logger.exception(f"[scheduler] deep slot timer raised: {exc}")
+            _time_module.sleep(poll_seconds)
+
+    _DEEP_SLOT_TIMER = threading.Thread(target=_loop, name="deep-slot-timer", daemon=True)
+    _DEEP_SLOT_TIMER.start()
+
+
 DEEP_REFRESH_CONSOLE = "logs/deep_refresh_console.log"
 DEEP_PREOPEN_CONSOLE = "logs/deep_preopen_console.log"
+
+
+def _kill_process_tree(proc) -> None:
+    """Kill ``proc`` AND every descendant. On Windows a killed parent leaves its
+    children running: the pre-open run killed at its budget on 2026-09-28 left
+    the snapshot build's six multiprocessing workers alive for 22 hours."""
+    import os as _os
+    import subprocess as _sp
+    try:
+        if _os.name == "nt":
+            _sp.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=30)
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[scheduler] process-tree kill of pid {proc.pid} failed: {exc}")
+    try:
+        proc.kill()                                       # the root, whatever taskkill did
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 def _deep_refresh_work(profile: str = "nightly") -> None:
@@ -455,23 +516,29 @@ def _deep_refresh_work(profile: str = "nightly") -> None:
         with open(console, "w", encoding="utf-8", errors="replace") as fh:
             # a child writing to a FILE defaults to the locale codec (cp1252),
             # which the utf-8 read below would mangle — pin it to utf-8
-            res = _sp.run(
+            proc = _sp.Popen(
                 [sys.executable, "-m", "src.data.deep.refresh", "--profile", profile,
                  "--budget-seconds", str(int(budget))],
-                stdout=fh, stderr=_sp.STDOUT, timeout=budget + 900,
+                stdout=fh, stderr=_sp.STDOUT,
                 env={**_os.environ, "PYTHONIOENCODING": "utf-8"},
             )
+            try:
+                rc = proc.wait(timeout=budget + 900)
+            except _sp.TimeoutExpired:
+                _kill_process_tree(proc)          # the snapshot build's worker pool too
+                raise
         lines = [l for l in console.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
         summary = [l for l in lines if l.startswith("deep refresh:")]
         logger.info("[scheduler] " + (summary[-1] if summary else
-                                      f"deep refresh: rc={res.returncode} "
+                                      f"deep refresh: rc={rc} "
                                       f"{(lines[-1] if lines else '')[:300]}"))
-        if res.returncode != 0:
-            logger.warning(f"[scheduler] deep refresh rc={res.returncode} — tail of {console}: "
+        if rc != 0:
+            logger.warning(f"[scheduler] deep refresh rc={rc} — tail of {console}: "
                            f"{' | '.join(lines[-6:])[-600:]}")
     except _sp.TimeoutExpired:
-        logger.warning(f"[scheduler] deep refresh KILLED after {budget + 900:.0f}s — the store keeps "
-                       "every part it wrote; the families it was cut in are due again tomorrow")
+        logger.warning(f"[scheduler] deep refresh KILLED after {budget + 900:.0f}s (with its process "
+                       "tree) — the store keeps every part it wrote; the families it was cut in are due "
+                       "again tomorrow")
     except Exception as exc:
         logger.warning(f"[scheduler] deep refresh failed to run: {exc}")
 
@@ -899,9 +966,7 @@ def start_scheduler() -> None:
     rescore_time = _parse_hhmm(settings.rescore_time, _time(2, 0)) or _time(2, 0)
     last_rescore_date = None
     deep_refresh_time = _parse_hhmm(settings.deep_refresh_time, _time(23, 45)) or _time(23, 45)
-    last_deep_refresh_date = None
     deep_preopen_time = _parse_hhmm(settings.deep_preopen_time, _time(8, 30)) or _time(8, 30)
-    last_deep_preopen_date = None
     if settings.enable_deep_preopen:
         logger.info(f"Deep pre-open refresh + session snapshot at/after {deep_preopen_time.strftime('%H:%M')} ET "
                     f"on market days (subprocess, budget {int(settings.deep_preopen_budget_seconds)}s).")
@@ -943,6 +1008,9 @@ def start_scheduler() -> None:
     except Exception as exc:                          # noqa: BLE001
         logger.warning(f"[scheduler] Finnhub refresher did not start ({exc}) — the Finnhub "
                        "leg falls back to its inline budget")
+    # The deep store's slots (the 23:45 refresh, the 08:30 pre-open run) run on
+    # their own timer thread, never behind a tick (2026-09-29).
+    _start_deep_slot_timer(deep_refresh_time, deep_preopen_time)
     try:
         while True:
             now_naive = now_et().replace(tzinfo=None)
@@ -974,7 +1042,6 @@ def start_scheduler() -> None:
                             "is still live; otherwise the next scheduled slot resumes "
                             "normal operation. Keep the machine plugged in / awake."
                         )
-            prev_poll = now_naive
 
             # A slot within 20 minutes wakes the Finnhub refresher, so the first
             # tick after a weekend finds its cache warm.
@@ -1011,7 +1078,7 @@ def start_scheduler() -> None:
                     logger.warning(
                         f"[scheduler] slot {slot_dt.strftime('%H:%M')} ET missed by "
                         f"{lateness / 60:.1f} min (> {grace / 60:.0f} min grace) — skipping "
-                        "(machine was suspended too long). Keep it plugged in / awake."
+                        "(the machine was suspended, or the tick before ran past this slot)."
                     )
                     if slot_dt not in alerted_slots:
                         # Fresh-start case (the gap detector needs two polls to see a
@@ -1084,25 +1151,13 @@ def start_scheduler() -> None:
                 except Exception as exc:
                     logger.exception(f"[scheduler] weekly ML retrain raised: {exc}")
 
-            # Deep history store refresh (2026-09-23) — its own nightly slot,
-            # every night incl. weekends, a SUBPROCESS: after EDGAR's daily
-            # index and the after-hours bars are final for the day.
-            if _should_run_deep_refresh(now_naive, last_deep_refresh_date, deep_refresh_time):
-                last_deep_refresh_date = now_naive.date()
-                try:
-                    _run_deep_refresh()
-                except Exception as exc:
-                    logger.exception(f"[scheduler] deep refresh trigger raised: {exc}")
+            # The deep history refresh (23:45 ET nightly) and the pre-open run
+            # (08:30 ET, market days) are on `_start_deep_slot_timer`'s thread.
 
-            # Pre-open deep refresh + session snapshot (2026-09-23): market days,
-            # at the model features' 08:30 ET knowledge cutoff.
-            if _should_run_deep_preopen(now_naive, last_deep_preopen_date, deep_preopen_time):
-                last_deep_preopen_date = now_naive.date()
-                try:
-                    _run_deep_preopen()
-                except Exception as exc:
-                    logger.exception(f"[scheduler] deep pre-open trigger raised: {exc}")
-
+            # The gap detector measures the SLEEP between polls: stamped here,
+            # after this pass's tick, a tick's own runtime never reads as a
+            # suspend (it did after every tick longer than 5 min, 2026-09-29).
+            prev_poll = now_et().replace(tzinfo=None)
             _time_module.sleep(poll)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Scheduler stopped.")

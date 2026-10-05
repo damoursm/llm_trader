@@ -119,7 +119,8 @@ def test_entry_cancelled_when_trade_closes_before_fill(monkeypatch):
     assert trade["broker_cancel_reason"] == "closed_before_fill"
     assert broker.requests == []          # nothing held → nothing submitted
     assert report["drift"] == []
-    assert trade["broker_exit_status"] == "NOTHING_TO_CLOSE"
+    # its entry never filled: terminal, never an exit (2026-09-27)
+    assert trade["broker_exit_status"] == "NEVER_FILLED"
 
 
 def test_partially_filled_entry_cancelled_then_residual_flattened(monkeypatch):

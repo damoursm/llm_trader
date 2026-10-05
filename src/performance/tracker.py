@@ -18,7 +18,7 @@ from bisect import bisect_left
 from statistics import median
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 from loguru import logger
 
 from src.models import Recommendation
@@ -2048,6 +2048,8 @@ def record_new_trades(
         "skipped_reentry_cooldown": 0,
         "skipped_correlation_cap": 0,
         "skipped_no_price":     0,
+        "skipped_no_borrow":    0,   # SHORT IBKR cannot lend in size (`ibkr_borrow.short_block`)
+        "skipped_borrow_fee":   0,   # SHORT whose annual borrow fee is above the cap
         "haircut_applied":      0,   # informational — size reduced, not skipped
         "extended_haircut_applied": 0,  # entries sized down for an off-RTH fill
         "breadth_tier_applied": 0,   # informational — sized up/down on agreement breadth
@@ -2317,6 +2319,20 @@ def record_new_trades(
             logger.warning(f"[tracker] Skipping {rec.ticker} — entry price is {fmt_price(price)} (warrant/delisted/negative?)")
             continue
 
+        # ── Borrow check for a NEW short (2026-09-25) ─────────────────────
+        # IBKR's own stock-loan book (archived each tick): skip a name it cannot
+        # lend in this size or lends above `short_borrow_max_fee_pct`; it
+        # re-qualifies any tick that changes. Here, not in the gate cascade: a
+        # SELL there also closes a held long on a reversal, which borrows
+        # nothing. The quoted fee rides the trade for the borrow carry.
+        _borrow = None
+        if rec.action == "SELL":
+            from src.data import ibkr_borrow
+            _why, _borrow = ibkr_borrow.short_block(rec.ticker, price)
+            if _why:
+                diag[f"skipped_{_why}"] += 1
+                continue
+
         # ── Intraday timing gate ──────────────────────────────────────────
         # Hybrid model: the daily stack decided the DIRECTION; here a 30-min
         # momentum read only times the ENTRY. Defer (don't open this tick) when
@@ -2526,6 +2542,9 @@ def record_new_trades(
             "pattern_at_entry":       pattern_at_entry,
             "pattern_score_at_entry": pattern_score_at_entry,
         }
+        if rec.action == "SELL" and _borrow is not None:
+            from src.data import ibkr_borrow
+            new_trade.update(ibkr_borrow.entry_stamp(_borrow))
         trades.append(new_trade)
         already_open.add(rec.ticker)
         # Register the just-opened trade as a same-direction peer so the next
@@ -2770,6 +2789,8 @@ def close_trades_on_signal_reversal(actionable_recs: List["Recommendation"],
     for trade in trades:
         if trade["status"] != "OPEN":
             continue
+        if trade.get("entry_mechanism") == "sel_short":
+            continue                  # owns its exits: a legacy (shadow) signal never closes it
         new_action = rev_signal.get(trade["ticker"])
         if new_action is None:
             continue
@@ -3638,7 +3659,7 @@ def _ft_exit_reason(trade: dict, macro_regime_context=None) -> Optional[str]:
 
 
 def _close_trade_now(trade: dict, reason: str, decision_at: str, executed_at: str,
-                     hold_prompt_active: Optional[bool]) -> bool:
+                     hold_prompt_active: Optional[bool], book: str = "follow-through book") -> bool:
     """Close one open trade in place with the monitor's exact close idiom
     (live mark → costs → field stamps). Mirrors the inline block in
     `monitor_open_positions` — keep the two in sync. Returns True on close."""
@@ -3670,7 +3691,7 @@ def _close_trade_now(trade: dict, reason: str, decision_at: str, executed_at: st
     trade["exit_reason"]            = reason
     trade["exit_hold_prompt"]       = hold_prompt_active
     logger.info(f"[monitor] {reason} → closed {trade['action']} {trade['ticker']} "
-                f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  [follow-through book]")
+                f"@ {fmt_price(exit_price)}  return={ret:+.2f}%  [{book}]")
     return True
 
 
@@ -3713,6 +3734,14 @@ def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict]
         price = _fetch_price(ticker)
         if not price or price <= 0:
             continue
+        # The same borrow check as the rank path (2026-09-25): the spec consults
+        # no signal gate, but a short IBKR cannot lend is not a trade at all.
+        _borrow = None
+        if ds < 0:
+            from src.data import ibkr_borrow
+            _why, _borrow = ibkr_borrow.short_block(ticker, price)
+            if _why:
+                continue
         sig = (signals_by_ticker or {}).get(ticker)
         mscores = _method_scores_from_signal(ticker, "BULLISH" if ds > 0 else "BEARISH",
                                              signals_by_ticker)
@@ -3777,6 +3806,9 @@ def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict]
             "max_favorable_excursion": 0.0, "mfe_date": today,
             "max_adverse_excursion": 0.0, "mae_date": today,
         }
+        if ds < 0 and _borrow is not None:
+            from src.data import ibkr_borrow
+            trade.update(ibkr_borrow.entry_stamp(_borrow))
         trades.append(trade)
         open_or_today.add(ticker)
         opened += 1
@@ -3787,6 +3819,440 @@ def record_follow_through_trades(ft_map: dict, signals_by_ticker: Optional[dict]
         _save_trades(trades)
         logger.info(f"[tracker] {opened} follow-through trade(s) recorded")
     return opened
+
+
+# ── SELECTION-SHORT book (2026-09-28, src/signals/sel_short.py) ───────────────
+# The one live entry strategy (user directive 2026-09-26). Its scorer runs as a
+# subprocess beside each tick and journals one decision per regular-hours bar;
+# the functions below turn the journal's shorts into ledger trades, cover them
+# on the strategy's own rules (target, volatility halved in profit, deadline), and
+# flatten the legacy book once.
+
+_LEGACY_FLATTEN_MARKER = Path("cache") / "legacy_flatten_done.json"
+
+
+def _sel_rationale(by_arm: Dict[str, dict]) -> str:
+    """Why the selection short took this name, per arm that picked it."""
+    from src.signals.sel_short import give_back, own_window
+    rec = next(iter(by_arm.values()))
+    share = give_back(next(iter(by_arm)))
+    why = []
+    if "model" in by_arm:
+        why.append(f"top tail-regression pick (score {by_arm['model']['score']:.3f}, fresh)")
+    if "vol" in by_arm:
+        why.append(f"most volatile name (30-min ATR {by_arm['vol']['score']:.2f}%, "
+                   f"a {own_window('vol')}-session high)")
+    dtc = rec.get("days_to_cover")
+    si = f"days to cover {dtc:.2f}" if dtc is not None else "days to cover unknown"
+    atr = next((r.get("atr_pct") for r in by_arm.values() if r.get("atr_pct") is not None), None)
+    vn = (f", or in profit once its 30-min ATR% falls to {float(settings.sel_short_volnorm_ratio):.0%} of "
+          f"{atr:.2f}%" if atr is not None and getattr(settings, "enable_sel_short_volnorm_exit", False) else "")
+    return (f"sel_short[{'+'.join(by_arm)}]: {' and '.join(why)} of the {rec['bar_end'][11:16]} bar, up "
+            f"{rec['runup_pct']:+.1f}% over {settings.sel_short_runup_sessions} sessions, {si} — short; "
+            f"cover at {fmt_price(rec['target'])} ({share:.0%} of the run-up given back){vn} or {rec['deadline'][:16]}")
+
+
+def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime] = None) -> int:
+    """Open the journal's pending shorts. Bypasses the gate cascade BY DESIGN
+    (the strategy was evaluated with none); what it keeps: no stacking on a name
+    ANOTHER book holds, a live price still ABOVE the target (a pick whose
+    price has already given back half its run-up is `target_reached`), IBKR must
+    be able to LEND the name in size (any fee — "all borrowable"). A pick that
+    cannot be taken is marked with the reason; a pick without a price is retried
+    next tick until stale. The short-interest filter is the scorer's: a crowded
+    pick is journaled ``crowded`` and never pending; the trade stamps the pick's
+    days to cover (``sel_days_to_cover``).
+
+    Three arms journal picks (`sel_short.ARMS`: the model, the most-volatile-name
+    rule, the same rule on ETFs). EVERY arm's pick opens its OWN trade with its own
+    target (user directive 2026-10-04, when the vol arm's give-back went to a
+    quarter of the run-up: "Two trades, one per arm"): the same name picked by two
+    arms on one bar opens two trades, the model's first (until then they shared one
+    trade stamped ``sel_arm="model+vol"``). A LATER pick of a name the book already
+    shorts opens ANOTHER trade (user directive 2026-09-28: "Remove the one position
+    per ticker rule"; ``sel_stack_n``), netted at IBKR — up to
+    ``sel_short_max_open_per_ticker`` open trades per name when > 0 (1 = the old
+    rule: the pick is recorded on the open trade under ``sel_also``)."""
+    if not getattr(settings, "enable_sel_short", False):
+        return 0
+    from src.data import ibkr_borrow
+    from src.performance import sim_account
+    from src.signals import sel_short
+    now = now or datetime.now(timezone.utc)
+    picks = sel_short.pending_entries(now)
+    if not picks:
+        return 0
+    rank = {a: i for i, a in enumerate(sel_short.ARMS)}
+    picks = sorted(picks, key=lambda r: (str(r["day"]), int(r["bar_of_day"]), str(r["ticker"]),
+                                         rank.get(r.get("arm") or "model", len(rank))))
+    trades = _load_trades()
+    # every open trade per name: the selection short STACKS a repeat pick of a
+    # name it already shorts (user directive 2026-09-28: "Remove the one position
+    # per ticker rule"); `sel_short_max_open_per_ticker` > 0 caps the stack (1 =
+    # the old rule), and a name another book holds is never stacked on
+    open_by_ticker: Dict[str, List[dict]] = {}
+    for t in trades:
+        if t.get("status") == "OPEN":
+            open_by_ticker.setdefault(t["ticker"], []).append(t)
+    cap = int(getattr(settings, "sel_short_max_open_per_ticker", 0) or 0)
+    today = date.today().isoformat()
+    decision_at = _now_iso()
+    executed_at = _execution_iso()
+    entry_session = _session_of_iso(executed_at)
+    opened, noted = 0, 0
+    # Picks whose outcome is a LEDGER write are marked consumed only after the
+    # ledger is saved: consumed first, a failed save (a DuckDB lock, 2026-09-25
+    # 16:39) lost the trade for good — logged as opened, never persisted, never
+    # retried.
+    after_save: List[tuple] = []
+    prices: Dict[str, Optional[float]] = {}         # one live price per name per pass
+    blocks: Dict[str, tuple] = {}                   # one borrow check per name per pass
+    # what each pick's entry-journal line carries (user directive 2026-10-05: log the borrow at
+    # entry and the restriction state of every pick the entry step settles, taken or not)
+    ctx: Dict[str, dict] = {}
+    for rec in picks:
+        arm = rec.get("arm") or "model"
+        by_arm = {arm: rec}                         # one trade per arm (2026-10-04)
+        tk = str(rec["ticker"])
+        d = date.fromisoformat(str(rec["day"]))
+        key = sel_short.pick_key(rec)               # the arm's own key: the trade's id and IBKR order ref
+
+        def consume(outcome: str, _d: date = d, _key: str = key, _rec: dict = rec) -> None:
+            sel_short.mark_consumed(_d, _key, outcome)
+            sel_short.journal_entry(_rec, outcome, **ctx.get(_key, {}))
+
+        held_all = open_by_ticker.get(tk, [])
+        blocked = any(h.get("entry_mechanism") != "sel_short" for h in held_all) or bool(
+            cap and len(held_all) >= cap)
+        if blocked:
+            held = held_all[-1]                     # the newest open trade on the name
+            new = False
+            if held.get("entry_mechanism") == "sel_short":
+                have = set(str(held.get("sel_arm") or "model").split("+"))
+                have |= {x.get("arm") for x in held.get("sel_also") or []}
+                if arm not in have:
+                    held["sel_also"] = list(held.get("sel_also") or []) + [{"arm": arm, "pick": key, "at": decision_at}]
+                    noted += 1
+                    new = True
+            if new:
+                after_save.append((consume, "already_open"))
+            else:
+                consume("already_open")
+            continue
+        if tk not in prices:
+            prices[tk] = _fetch_price(tk)
+        price = prices[tk]
+        if not price or price <= 0:
+            logger.info(f"[sel_short] {tk}: no live price — retrying next tick")
+            continue
+        tgt = rec.get("target")
+        ctx[key] = {"price": price}
+        if tgt is not None and float(price) <= float(tgt):
+            # Already at the arm's give-back target before the entry step: the
+            # cover rule would close it at the next check, a round trip for costs.
+            # Measured (scratchpad short_entry_delay.py, 206 trades): skipping
+            # these adds +0.5..+1.1 pp/trade at a 1-3 bar delay (t ~1-1.4).
+            consume("target_reached")
+            logger.info(f"[sel_short] {tk}: {fmt_price(price)} already at/below the target "
+                        f"{fmt_price(tgt)} — not entered")
+            continue
+        if tk not in blocks:
+            blocks[tk] = ibkr_borrow.short_block(tk, price, max_fee_pct=None)
+        why, borrow = blocks[tk]
+        # (None, None) = not checked (gate off, no current file, not an equity); a block or a
+        # row = checked, and a block without a row = the name is not in IBKR's file at all
+        ctx[key].update(borrow=borrow, borrow_checked=bool(why) or borrow is not None)
+        if why:
+            consume(why)
+            continue
+        # the vol arm is sized from the SIMULATED ACCOUNT ($5,000 + $1,000 every 14 days, user
+        # directive 2026-10-05); the trades opened earlier in this pass are already in `trades`
+        acct = None
+        if sim_account.arm_funded(arm):
+            n_sh, how, st = sim_account.size(trades, float(price), rec.get("dv20"), now)
+            if n_sh <= 0:
+                consume(how)
+                logger.info(f"[sel_short] {tk} [{arm}]: the simulated account funds no share ({how}) — "
+                            f"{sim_account.summary(st)}")
+                continue
+            acct = {"sel_account_shares": int(n_sh), "sel_account_notional": round(n_sh * float(price), 2),
+                    "sel_account_equity": round(st["equity"], 2),
+                    "sel_account_slices": int(settings.sel_short_account_slices)}
+        mult = float(settings.sel_short_size_multiplier)
+        ref = _reference_close(tk)
+        trade = {
+            "ticker": tk, "run_id": run_id,
+            "recommendation_id": hashlib.sha1(f"sel|{key}".encode("utf-8")).hexdigest()[:16],
+            "type": "STOCK", "action": "SELL", "direction": "BEARISH",
+            "confidence": None,
+            "position_size_multiplier": mult,
+            "confidence_size_multiplier": 1.0, "correlation_size_multiplier": 1.0,
+            "sector_key": None,
+            "entry_date": today, "entry_datetime": executed_at, "entry_session": entry_session,
+            "ml_arm": False, "combine_source": None, "extended_size_multiplier": 1.0,
+            "decision_datetime": decision_at,
+            "entry_price": float(price),
+            "entry_ref_close": ref["close"] if ref else None,
+            "entry_ref_close_date": ref["date"] if ref else None,
+            "rationale": _sel_rationale(by_arm),
+            "time_horizon": "SWING", "target_horizon": f"{settings.sel_short_max_hold_sessions}d",
+            "current_price": float(price), "current_price_datetime": decision_at,
+            "return_pct": 0.0, "weighted_return_pct": 0.0, "days_held": 0,
+            "exit_date": None, "exit_datetime": None, "exit_decision_datetime": None,
+            "exit_price": None, "exit_ref_close": None, "exit_ref_close_date": None,
+            "exit_reason": None, "status": "OPEN",
+            "method_scores": {}, "methods_agreeing": [],
+            "dominant_method": "sel_short",
+            "llm_synthesis_model": None, "llm_sentiment_model": None,
+            "universe_source": "sel_short", "entry_mechanism": "sel_short",
+            "sel_arm": "+".join(by_arm),
+            "sel_score": by_arm["model"].get("score") if "model" in by_arm else None,
+            "sel_vol_score": by_arm["vol"].get("score") if "vol" in by_arm else None,
+            "sel_bar_end": rec.get("bar_end"),
+            "sel_bar_close": rec.get("px"), "sel_pre5_close": rec.get("pre5"),
+            "sel_runup_pct": rec.get("runup_pct"), "sel_target_price": rec.get("target"),
+            "sel_deadline": rec.get("deadline"), "sel_days_to_cover": rec.get("days_to_cover"),
+            # the pick bar's 30-min ATR%: the volatility-normalised exit's reference
+            "sel_atr_pct": next((r.get("atr_pct") for r in by_arm.values() if r.get("atr_pct") is not None),
+                                by_arm["vol"].get("score") if "vol" in by_arm else None),
+            # the vol pick's confidence — journal-only, nothing decides on it (None for a model-only pick)
+            "sel_confidence": by_arm["vol"].get("confidence") if "vol" in by_arm else None,
+            # the short-sale restriction at the pick (Rule 201, `sel_short.ssr_state`) — journal-only
+            "sel_ssr": rec.get("ssr"), "sel_ssr_prev_close": rec.get("ssr_prev_close"),
+            "sel_ssr_day_low": rec.get("ssr_day_low"),
+            "signal_at_entry": {},
+            "max_favorable_excursion": 0.0, "mfe_date": today,
+            "max_adverse_excursion": 0.0, "mae_date": today,
+        }
+        trade.update(ibkr_borrow.entry_stamp(borrow))
+        if acct:
+            trade.update(acct)
+            trade["rationale"] += (f"; {acct['sel_account_shares']} share(s), 1/{acct['sel_account_slices']} of the "
+                                   f"simulated account (${acct['sel_account_equity']:,.0f})")
+        trade["sel_stack_n"] = len(held_all) + 1           # 1 = the only short on the name
+        if held_all:
+            trade["rationale"] += f"; adds to {len(held_all)} open short(s) on {tk}"
+            logger.info(f"[sel_short] {tk}: repeat pick while {len(held_all)} short(s) are open — "
+                        f"stacking short #{len(held_all) + 1}")
+        trades.append(trade)
+        open_by_ticker.setdefault(tk, []).append(trade)
+        opened += 1
+        ctx[key]["recommendation_id"] = trade["recommendation_id"]
+        after_save.append((consume, "opened"))
+        logger.info(f"[sel_short] OPEN SELL {tk} [{trade['sel_arm']}] @ {fmt_price(price)} (bar "
+                    f"{rec['bar_end'][11:16]} close {fmt_price(rec['px'])}, run-up {rec['runup_pct']:+.1f}%, "
+                    f"target {fmt_price(rec['target'])}, deadline {rec['deadline'][:16]}, borrow "
+                    f"{(borrow.fee_pct if borrow else float('nan')):.2f}%/yr, days to cover "
+                    f"{rec.get('days_to_cover')}"
+                    + (f"; {acct['sel_account_shares']} share(s) = ${acct['sel_account_notional']:,.0f} of the "
+                       f"simulated account's ${acct['sel_account_equity']:,.0f}" if acct else "") + ")")
+    if opened or noted:
+        _save_trades(trades)          # raises on failure: nothing below runs, the picks stay pending
+    for fn, outcome in after_save:
+        fn(outcome)
+    return opened
+
+
+def _sel_short_fresh_mark(trade: dict, now: datetime) -> bool:
+    """The live mark was fetched within ``sel_short_mark_max_age_minutes`` — a
+    tick that could not price the name must not cover it on an old price."""
+    try:
+        marked = datetime.fromisoformat(str(trade.get("current_price_datetime")))
+        if marked.tzinfo is None:
+            marked = marked.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return (now - marked).total_seconds() <= 60.0 * float(settings.sel_short_mark_max_age_minutes)
+
+
+def _sel_short_in_profit(trade: dict) -> bool:
+    """The short's live mark is below its entry price (gross, as evaluated)."""
+    px, entry = trade.get("current_price"), trade.get("entry_price")
+    return bool(px and entry and float(px) < float(entry))
+
+
+def _sel_short_cover_level(trade: dict, now: datetime) -> Optional[float]:
+    """The price at or above which the vol arm's SQUEEZE COVER buys a short back (user
+    directive 2026-10-05: "have it tuned so that we don't have margin calls while still
+    maximizing growth"; memory/vol-arm-margin-protection-2026-10.md):
+    `sel_short_vol_cover_multiple` x the entry price, the entry carried through every split
+    executed after the entry day and on/before today (a reverse split mid-hold multiplies the
+    quoted price, not the loss). Unreadable split data falls back to the raw entry — a false
+    cover costs a spread, a missed one can cost the account. None when the cover is off or the
+    trade is not the vol arm's."""
+    if not getattr(settings, "enable_sel_short_vol_squeeze_cover", False):
+        return None
+    if "vol" not in str(trade.get("sel_arm") or "").split("+"):
+        return None
+    try:
+        entry = float(trade.get("entry_price") or 0.0)
+        d0 = date.fromisoformat(str(trade.get("entry_date"))[:10])
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0:
+        return None
+    from src.data.intraday_store import split_factor_between
+    f = split_factor_between(str(trade["ticker"]), d0, now.astimezone(ET).date())
+    if f is None:
+        logger.warning(f"[sel_short] {trade['ticker']}: split data unreadable — squeeze cover on the raw entry price")
+        f = 1.0
+    return float(settings.sel_short_vol_cover_multiple) * entry * f
+
+
+def _sel_short_exit_reason(trade: dict, now: Optional[datetime] = None,
+                           atr_now: Optional[float] = None) -> Optional[str]:
+    """``sel_time`` once the deadline has passed; ``sel_target`` when the live
+    mark is at or below the target; ``sel_cover`` (the vol arm's squeeze cover)
+    when it is at or above `_sel_short_cover_level`; ``sel_volnorm`` when the trade is IN PROFIT
+    (mark below the entry price) and ``atr_now`` — the name's 30-minute ATR% at
+    the latest completed regular-hours bar — has fallen to
+    ``sel_short_volnorm_ratio`` of the pick bar's (``sel_atr_pct``; user directive
+    2026-09-28: "Implement the Cover when volatility halves (in profit) for the
+    two live models in production"); else None. Judged at EVERY tick, in every
+    session (user directive 2026-09-27: "We should always have the possibility
+    to enter or exit at any time"; the evaluation judged RTH 30-minute closes
+    only). The price rules need a fresh mark (`_sel_short_fresh_mark`); the
+    target is checked first, as evaluated."""
+    now = now or datetime.now(timezone.utc)
+    dl = trade.get("sel_deadline")
+    if dl:
+        try:
+            if now >= datetime.fromisoformat(dl):
+                return "sel_time"
+        except ValueError:
+            pass
+    if not _sel_short_fresh_mark(trade, now):
+        return None
+    tgt, px = trade.get("sel_target_price"), trade.get("current_price")
+    if tgt and px and float(px) <= float(tgt):
+        return "sel_target"
+    lvl = _sel_short_cover_level(trade, now)
+    if lvl is not None and px and float(px) >= lvl:
+        return "sel_cover"
+    ref = trade.get("sel_atr_pct")
+    if (atr_now is not None and ref and getattr(settings, "enable_sel_short_volnorm_exit", False)
+            and _sel_short_in_profit(trade)
+            and float(atr_now) <= float(settings.sel_short_volnorm_ratio) * float(ref)):
+        return "sel_volnorm"
+    return None
+
+
+def _sel_short_live_atr(book: List[dict], now: datetime) -> Tuple[Dict[str, dict], bool]:
+    """The volatility-normalised exit's inputs, fetched only for the trades it
+    could close (in profit on a fresh mark): each one's current 30-min ATR%
+    (`sel_short.live_atr`), and — on a trade that lacks it (opened from a journal
+    written before 2026-09-28) — the pick bar's ATR%, stamped as ``sel_atr_pct``.
+    Returns ``(atr by ticker, whether a trade was stamped)``. Fail-soft."""
+    if not getattr(settings, "enable_sel_short_volnorm_exit", False):
+        return {}, False
+    cand = [t for t in book if _sel_short_in_profit(t) and _sel_short_fresh_mark(t, now)]
+    if not cand:
+        return {}, False
+    from src.signals import sel_short
+    changed = False
+    for t in cand:
+        if t.get("sel_atr_pct") is None and t.get("sel_bar_end"):
+            try:
+                d, k = sel_short.bar_from_end(str(t["sel_bar_end"]))
+                v = sel_short.atr_at(str(t["ticker"]), d, k)
+            except Exception:                                        # noqa: BLE001
+                v = None
+            if v is not None:
+                t["sel_atr_pct"] = v
+                changed = True
+    try:
+        return sel_short.live_atr([t["ticker"] for t in cand if t.get("sel_atr_pct")], now), changed
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning(f"[sel_short] live ATR% failed (fail-soft, no volatility exit this pass): {e}")
+        return {}, changed
+
+
+def monitor_sel_short_positions(hold_prompt_active: Optional[bool] = None,
+                                now: Optional[datetime] = None) -> int:
+    """Cover the selection-short book on its rules (after `update_open_trades`,
+    so ``current_price`` is this tick's mark): the deadline, the target, the vol
+    arm's squeeze cover, and the volatility-normalised exit (stamping the ATR%
+    that fired it); then the simulated account's margin check — equity below the
+    open shorts' maintenance buys back every short it funded (``sel_margin_call``)."""
+    from src.performance import sim_account
+    now = now or datetime.now(timezone.utc)
+    trades = _load_trades()
+    decision_at, executed_at = _now_iso(), _execution_iso()
+    book = [t for t in trades if t.get("status") == "OPEN" and t.get("entry_mechanism") == "sel_short"]
+    atr, changed = _sel_short_live_atr(book, now)
+    closed = 0
+    for t in book:
+        a = atr.get(t["ticker"])
+        r = _sel_short_exit_reason(t, now, atr_now=a["atr_pct"] if a else None)
+        if r and _close_trade_now(t, r, decision_at, executed_at, hold_prompt_active, book="sel_short"):
+            closed += 1
+            if r == "sel_cover":
+                t["sel_cover_level"] = _sel_short_cover_level(t, now)
+                logger.warning(f"[sel_short] COVER {t['ticker']} — squeeze: mark {t.get('exit_price')} at/above "
+                               f"{float(settings.sel_short_vol_cover_multiple):g}x the entry "
+                               f"{t.get('entry_price')} (split-adjusted level {t['sel_cover_level']:.4g})")
+            if r == "sel_volnorm":
+                t["sel_exit_atr_pct"], t["sel_exit_atr_bar"] = a["atr_pct"], a["bar_end"]
+                logger.info(f"[sel_short] COVER {t['ticker']} — volatility halved in profit: 30-min ATR "
+                            f"{a['atr_pct']:.2f}% (bar {a['bar_end'][11:16]}) vs {float(t['sel_atr_pct']):.2f}% "
+                            f"at the pick")
+    if sim_account.enabled():
+        called, st = sim_account.margin_call(trades, now)
+        if called:
+            logger.critical(f"[sel_short] SIMULATED ACCOUNT MARGIN CALL — {sim_account.summary(st)}: buying back "
+                            f"every short it funded")
+            for t in book:
+                if (t.get("status") == "OPEN" and sim_account.funded(t)
+                        and _close_trade_now(t, "sel_margin_call", decision_at, executed_at, hold_prompt_active,
+                                             book="sel_short")):
+                    closed += 1
+    if closed or changed:
+        _save_trades(trades)
+    return closed
+
+
+def flatten_legacy_positions(hold_prompt_active: Optional[bool] = None,
+                             now: Optional[datetime] = None) -> int:
+    """ONE-SHOT: at the first regular-hours tick at/after ``legacy_flatten_after``
+    close every open trade the selection-short strategy did not open (user
+    directive 2026-09-26: "close them all Monday"). A marker file records the
+    instant it ran for, so re-enabling legacy entries later never re-triggers it."""
+    raw = str(getattr(settings, "legacy_flatten_after", "") or "").strip()
+    if not raw:
+        return 0
+    try:
+        after = datetime.fromisoformat(raw)
+    except ValueError:
+        logger.warning(f"[sel_short] legacy_flatten_after={raw!r} is not an ISO instant — no flatten")
+        return 0
+    now = now or datetime.now(timezone.utc)
+    if now < after or _session_of_iso(now.isoformat()) != "rth":
+        return 0
+    try:
+        done = json.loads(_LEGACY_FLATTEN_MARKER.read_text(encoding="utf-8"))
+        if done.get("after") == raw:
+            return 0
+    except Exception:
+        pass
+    trades = _load_trades()
+    decision_at, executed_at = _now_iso(), _execution_iso()
+    closed, failed = 0, []
+    for t in trades:
+        if t.get("status") != "OPEN" or t.get("entry_mechanism") == "sel_short":
+            continue
+        if _close_trade_now(t, "legacy_flatten", decision_at, executed_at, hold_prompt_active, book="legacy"):
+            closed += 1
+        else:
+            failed.append(t.get("ticker"))
+    if closed:
+        _save_trades(trades)
+    if not failed:
+        _LEGACY_FLATTEN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _LEGACY_FLATTEN_MARKER.write_text(json.dumps({"after": raw, "ran_at": now.isoformat(),
+                                                      "closed": closed}), encoding="utf-8")
+    logger.info(f"[sel_short] legacy flatten: closed {closed} open legacy trade(s)"
+                + (f"; no price for {failed} — retried next tick" if failed else ""))
+    return closed
 
 
 # ── ML combine arm (2026-08-01) ──────────────────────────────────────────────
@@ -3926,6 +4392,11 @@ def monitor_open_positions(
             if _ft_r is not None and _close_trade_now(trade, _ft_r, decision_at,
                                                       executed_at, hold_prompt_active):
                 closed_count += 1
+            continue
+        # ── SELECTION-SHORT book: owns its exits (half give-back / 15 sessions,
+        # `monitor_sel_short_positions`); no stop, trail or model exit may touch
+        # it — the evaluation measured every stop and trail as destroying it.
+        if trade.get("entry_mechanism") == "sel_short":
             continue
 
         today_signal = (signals_by_ticker or {}).get(trade["ticker"])
@@ -5613,10 +6084,45 @@ def _displayed_one_way_cost_pct(trades: List[dict], real_frac: Optional[float]) 
     return round(sum(costs) / len(costs), 4) if costs else None
 
 
+_EMAIL_EVAL_CACHE: Dict[tuple, tuple] = {}
+
+
+def _slow_evals(window_days, session, direction, asset_type, use_cache: bool) -> dict:
+    """The six research evaluations behind the email's performance section —
+    method / LLM / macro / stage / method-eval / out-of-sample. They move with
+    the panel and the closed book, not with this tick's marks, yet cost ~3 min of
+    every tick (runtime review 2026-09-28): with ``use_cache`` (the pipeline's
+    email) they are reused for ``email_eval_cache_seconds`` within the same day.
+    The dashboard calls without the cache."""
+    key = (window_days, session, direction, asset_type)
+    ttl = float(getattr(settings, "email_eval_cache_seconds", 0) or 0)
+    if use_cache and ttl > 0:
+        hit = _EMAIL_EVAL_CACHE.get(key)
+        if hit is not None and hit[2] == date.today() and time.time() - hit[0] < ttl:
+            return hit[1]
+    memo: Dict[str, object] = {}   # share OHLCV loads across the two eval passes
+    out = {
+        "solo_method_perf": compute_solo_method_performance(window_days=window_days, session=session,
+                                                            direction=direction, asset_type=asset_type),
+        "llm_perf": _compute_llm_perf(window_days=window_days, session=session,
+                                      direction=direction, asset_type=asset_type),
+        "macro_eval": compute_macro_eval(window_days=window_days, session=session, direction=direction,
+                                         bars_memo=memo, asset_type=asset_type),
+        "stage_eval": compute_stage_eval(window_days=window_days, session=session, direction=direction,
+                                         bars_memo=memo, asset_type=asset_type),
+        "method_eval_stats": compute_method_eval_stats(),
+        "oos_comparison": compute_oos_comparison(),
+    }
+    if use_cache and ttl > 0:
+        _EMAIL_EVAL_CACHE[key] = (time.time(), out, date.today())
+    return out
+
+
 def get_performance_for_email(window_days: Optional[int] = None,
                               session: Optional[str] = None,
                               direction: Optional[str] = None,
-                              asset_type: Optional[str] = None) -> dict:
+                              asset_type: Optional[str] = None,
+                              cache_evals: bool = False) -> dict:
     """Return structured performance data for inclusion in the email report.
 
     When ``window_days`` is set, only trades ENTERED within the last N calendar
@@ -5704,17 +6210,13 @@ def get_performance_for_email(window_days: Optional[int] = None,
     performance_table    = _compute_performance_table(all_trades) if all_trades else []
     trades_svg           = _build_trades_svg(closed_trades) if len(closed_trades) >= 2 else ""
     timeline_svg         = _build_timeline_svg(all_trades) if all_trades else ""
-    solo_method_perf     = compute_solo_method_performance(window_days=window_days, session=session,
-                                                           direction=direction, asset_type=asset_type)
-    llm_perf             = _compute_llm_perf(window_days=window_days, session=session,
-                                             direction=direction, asset_type=asset_type)
-    _eval_bars_memo: Dict[str, object] = {}   # share OHLCV loads across the two eval passes
-    macro_eval           = compute_macro_eval(window_days=window_days, session=session, direction=direction,
-                                              bars_memo=_eval_bars_memo, asset_type=asset_type)
-    stage_eval           = compute_stage_eval(window_days=window_days, session=session, direction=direction,
-                                              bars_memo=_eval_bars_memo, asset_type=asset_type)
-    method_eval_stats    = compute_method_eval_stats()
-    oos_comparison       = compute_oos_comparison()
+    _ev = _slow_evals(window_days, session, direction, asset_type, cache_evals)
+    solo_method_perf     = _ev["solo_method_perf"]
+    llm_perf             = _ev["llm_perf"]
+    macro_eval           = _ev["macro_eval"]
+    stage_eval           = _ev["stage_eval"]
+    method_eval_stats    = _ev["method_eval_stats"]
+    oos_comparison       = _ev["oos_comparison"]
     portfolio_metrics    = compute_portfolio_metrics(closed_trades, open_trades)
 
     # Keep stats["compound_return"] in sync with the authoritative portfolio_metrics value

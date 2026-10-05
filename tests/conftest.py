@@ -10,6 +10,7 @@ respects the path injection below).
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,14 @@ def _no_gateway_auto_restart(monkeypatch):
     from config.settings import settings
 
     monkeypatch.setattr(settings, "broker_gateway_auto_restart", False)
+    # Every sync reads IBC's log for the gateway's login state (2026-09-28) —
+    # never the developer's real one: an empty folder reads as "unknown".
+    monkeypatch.setattr(settings, "ibc_log_dir", str(Path(tempfile.gettempdir()) / "llm_trader_tests_no_ibc"))
+    # …and never the real IBC config (its AutoRestartTime opens a wait window at
+    # 23:49-23:55 — a suite run then would behave differently): no restart known.
+    monkeypatch.setattr(settings, "ibc_config_path", str(Path(tempfile.gettempdir()) / "llm_trader_tests_no_ibc"
+                                                         / "config.ini"))
+    monkeypatch.setattr(settings, "broker_gateway_restart_et", "")
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +108,12 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     from src.signals import sel_short
     monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel_short"))
     monkeypatch.setattr(settings, "enable_sel_short", False)
+    # the volatility-normalised exit fetches bars for held names: its tests opt in
+    monkeypatch.setattr(settings, "enable_sel_short_volnorm_exit", False)
+    # the vol arm's squeeze cover reads the production split data, and the simulated account
+    # sizes vol picks (2026-10-05): their tests opt in
+    monkeypatch.setattr(settings, "enable_sel_short_vol_squeeze_cover", False)
+    monkeypatch.setattr(settings, "enable_sel_short_account_sizing", False)
     monkeypatch.setattr(settings, "legacy_flatten_after", "")
     monkeypatch.setattr(tracker, "_LEGACY_FLATTEN_MARKER", tmp_path / "legacy_flatten_done.json")
     sel_short._MODEL.clear()

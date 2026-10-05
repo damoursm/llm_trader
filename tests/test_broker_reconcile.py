@@ -109,9 +109,231 @@ def test_short_entry_then_cover(repo_store):
     b = FakeBroker()
     rec.sync(broker=b)
     assert b.orders[0].side == "SELL"             # opening a short
+    b._positions = [Position("TSLA", -b.orders[0].quantity, 100.0)]   # the short is held
     repo_store["trades"][0]["status"] = "CLOSED"
     rec.sync(broker=b)
     assert b.orders[-1].side == "BUY"             # covering the short
+    assert b.orders[-1].quantity == b.orders[0].quantity
+
+
+def test_no_exit_when_the_broker_is_already_flat(repo_store):
+    """No position row = flat: an exit sized from the recorded fill would OPEN
+    the opposite position (2026-09-27: the ledger's JPM long was already sold at
+    IBKR — the flatten would have shorted 4 JPM). Re-checked next tick."""
+    t = _open_trade("JPM")
+    t.update(status="CLOSED", broker_order_id="o1", broker_fill_qty=4, broker_status="Filled")
+    repo_store["trades"] = [t]
+    b = FakeBroker(positions=[])
+    r = rec.sync(broker=b)
+    assert b.orders == [] and r["exits_submitted"] == 0
+    assert t["broker_exit_status"] == "NOTHING_TO_CLOSE" and not t.get("broker_exit_order_id")
+
+
+def test_a_never_filled_closed_trade_never_takes_another_trades_shares(repo_store):
+    """2026-09-25 JPM: a 09-22 buy that never filled 'exited' the 4 shares a new
+    trade had bought 28 minutes earlier. Its entry never filled, so it sends no
+    exit — stamped terminal — and the open trade keeps its position."""
+    zombie = _open_trade("JPM")
+    zombie.update(status="CLOSED", recommendation_id="old", broker_order_id="o-old",
+                  broker_status="PreSubmitted", broker_fill_qty=0,
+                  broker_submitted_at="2026-09-22T04:03:01+00:00")
+    live = _open_trade("JPM")
+    live.update(recommendation_id="new", broker_order_id="o-new", broker_status="Filled",
+                broker_fill_qty=4)
+    repo_store["trades"] = [zombie, live]
+    b = FakeBroker(positions=[Position("JPM", 4, 340.0)])
+    r = rec.sync(broker=b)
+    assert b.orders == [] and r["exits_submitted"] == 0 and r["drift"] == []
+    assert zombie["broker_exit_status"] == "NEVER_FILLED"
+    r2 = rec.sync(broker=b)                          # terminal: never looked at again
+    assert b.orders == [] and r2["exits_submitted"] == 0
+
+
+def test_a_closed_trade_exits_only_what_open_trades_do_not_own(repo_store):
+    """A closed trade that DID fill closes the holding minus what the open
+    trades in the ticker own — never a later trade's shares."""
+    closed = _open_trade("UVIX", action="SELL")
+    closed.update(status="CLOSED", recommendation_id="old", broker_order_id="o1",
+                  broker_status="Filled", broker_fill_qty=3, exit_price=100.0)
+    live = _open_trade("UVIX", action="SELL")
+    live.update(recommendation_id="new", broker_order_id="o2", broker_status="Filled",
+                broker_fill_qty=10)
+    repo_store["trades"] = [closed, live]
+    b = FakeBroker(positions=[Position("UVIX", -13, 100.0)])
+    r = rec.sync(broker=b)
+    assert r["exits_submitted"] == 1
+    assert b.orders[-1].side == "BUY" and b.orders[-1].quantity == 3
+    # the old short already covered: only the live trade's 10 are held
+    closed2 = dict(closed, recommendation_id="old2", broker_exit_order_id=None,
+                   broker_exit_status=None)
+    repo_store["trades"] = [closed2, live]
+    b2 = FakeBroker(positions=[Position("UVIX", -10, 100.0)])
+    r2 = rec.sync(broker=b2)
+    assert b2.orders == [] and r2["exits_submitted"] == 0
+    assert closed2["broker_exit_status"] == "NOTHING_TO_CLOSE"
+
+
+def _filled_short(ticker, ref, qty):
+    t = _open_trade(ticker, action="SELL")
+    t.update(entry_mechanism="sel_short", recommendation_id=ref, broker_order_id=f"o-{ref}",
+             broker_status="Filled", broker_fill_qty=qty, broker_client_ref=ref)
+    return t
+
+
+def test_a_stacked_short_is_sized_in_full(repo_store):
+    """One position per ticker OFF (2026-09-28): a second open trade on a name the
+    account already shorts orders its OWN full size — the gap sizing counts only
+    shares no OTHER open trade owns (it saw the first short's shares and sent nothing)."""
+    first = _filled_short("XYZ", "a", 5)
+    second = _open_trade("XYZ", action="SELL")
+    second.update(entry_mechanism="sel_short", recommendation_id="b")
+    repo_store["trades"] = [first, second]
+    b = FakeBroker(positions=[Position("XYZ", -5, 100.0)])
+    rec.sync(broker=b)
+    assert [(o.side, o.quantity) for o in b.orders] == [("SELL", 5)] and second["broker_fill_qty"] == 5
+    # unexplained same-side shares still count against a new trade (the gap rule's purpose)
+    third = _open_trade("XYZ", action="SELL")
+    third.update(entry_mechanism="sel_short", recommendation_id="c")
+    repo_store["trades"] = [first, dict(second, broker_order_id="o-b"), third]
+    b2 = FakeBroker(positions=[Position("XYZ", -12, 100.0)])          # 2 shares no trade owns
+    rec.sync(broker=b2)
+    assert [(o.side, o.quantity) for o in b2.orders] == [("SELL", 3)]
+
+
+def test_two_closed_stacked_shorts_cover_the_holding_once(repo_store):
+    """Two closed shorts on one name in the same tick: each used to size its cover
+    from the whole holding — the second order would have bought it back twice."""
+    a, b_ = _filled_short("XYZ", "a", 5), _filled_short("XYZ", "b", 5)
+    for x in (a, b_):
+        x.update(status="CLOSED", exit_price=100.0)
+    repo_store["trades"] = [a, b_]
+    brk = FakeBroker(positions=[Position("XYZ", -10, 100.0)])
+    r = rec.sync(broker=brk)
+    assert [(o.side, o.quantity) for o in brk.orders] == [("BUY", 10)] and r["exits_submitted"] == 1
+    assert b_["broker_exit_status"] == "NOTHING_TO_CLOSE" and r["drift"] == []
+
+
+def test_a_working_cover_is_not_covered_again(repo_store, monkeypatch):
+    """A closed short whose cover order is still WORKING owns those shares: another
+    closed short on the name covers only the rest."""
+    monkeypatch.setattr(settings, "broker_tick_scoped_orders", False)
+    monkeypatch.setattr(settings, "broker_unfilled_cancel_minutes", 0)
+    a, b_ = _filled_short("XYZ", "a", 5), _filled_short("XYZ", "b", 5)
+    a.update(status="CLOSED", exit_price=100.0, broker_exit_order_id="x-a", broker_exit_status="Submitted",
+             broker_exit_requested_qty=5, broker_exit_fill_qty=0)
+    b_.update(status="CLOSED", exit_price=100.0)
+    repo_store["trades"] = [a, b_]
+    brk = FakeBroker(positions=[Position("XYZ", -10, 100.0)])
+    rec.sync(broker=brk)
+    assert [(o.side, o.quantity) for o in brk.orders] == [("BUY", 5)]
+
+
+def test_a_dead_entry_of_a_stacked_short_is_resent_not_parked(repo_store, monkeypatch):
+    """A dead (expired) entry leg stays parked only when a position BACKS it
+    (a prior-day fill the day-scoped feed cannot see) — another open trade's
+    shares do not back it."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(settings, "broker_rest_unfilled_orders", False)
+
+    class DeadBroker(FakeBroker):
+        def cancel_order(self, ref):
+            return False
+
+        def get_open_orders(self):
+            return []
+
+    def dead_leg():
+        t = _open_trade("XYZ", action="SELL")
+        t.update(entry_mechanism="sel_short", recommendation_id="b", broker_order_id="o-b",
+                 broker_status="Submitted", broker_fill_qty=0, broker_client_ref="b",
+                 broker_submitted_at="2026-09-25T14:00:00+00:00")
+        return t
+    pos = {"XYZ": Position("XYZ", -5, 100.0)}
+    now = datetime.now(timezone.utc)
+    second = dead_leg()
+    rec._cancel_stale_unfilled(DeadBroker(), [_filled_short("XYZ", "a", 5), second], rec._new_report(),
+                               positions=pos, sync_started=now)
+    assert second["broker_status"] == "EXPIRED" and second["broker_order_id"] is None
+    alone = dead_leg()                                     # nobody else owns the 5: they back it
+    rec._cancel_stale_unfilled(DeadBroker(), [alone], rec._new_report(), positions=pos, sync_started=now)
+    assert alone["broker_status"] == "Submitted" and alone["broker_order_id"] == "o-b"
+
+
+class RefusingBroker(FakeBroker):
+    """IBKR refusing orders outright: the first ``n_refusals`` submits end at once
+    with status Inactive and nothing filled."""
+
+    def __init__(self, n_refusals, **kw):
+        super().__init__(**kw)
+        self.n_refusals = n_refusals
+
+    def submit_order(self, req):
+        self.orders.append(req)
+        if len(self.orders) <= self.n_refusals:
+            return OrderResult(ok=False, ticker=req.ticker, side=req.side, requested_qty=req.quantity,
+                               filled_qty=0, order_id=f"x{len(self.orders)}", client_ref=req.client_ref,
+                               status="Inactive", error="Inactive: not shortable")
+        return OrderResult(ok=True, ticker=req.ticker, side=req.side, requested_qty=req.quantity,
+                           filled_qty=req.quantity, avg_fill_price=100.0,
+                           order_id=f"o{len(self.orders)}", client_ref=req.client_ref, status="Filled")
+
+
+def _sel_trade(ticker="XYZ"):
+    t = _open_trade(ticker, action="SELL")
+    t.update(entry_mechanism="sel_short", current_price=100.0)
+    return t
+
+
+def test_a_refused_entry_is_resent_in_the_same_tick(repo_store, monkeypatch):
+    """User directive 2026-09-27: 'Try resend them during the same tick'."""
+    monkeypatch.setattr(settings, "enable_sel_short", True)
+    monkeypatch.setattr(settings, "broker_refused_resends_per_tick", 2)
+    monkeypatch.setattr(rec, "_live_price", lambda t: 100.0)
+    t = _sel_trade()
+    repo_store["trades"] = [t]
+    b = RefusingBroker(n_refusals=2)
+    r = rec.sync(broker=b)
+    assert [o.client_ref for o in b.orders] == ["rec-XYZ", "rec-XYZ-r1", "rec-XYZ-r2"]
+    assert t["broker_status"] == "Filled" and t["broker_order_id"] == "o3"
+    assert t["broker_refused_order_ids"] == ["x1", "x2"]
+    assert r["refused_resends"] == 2
+
+
+def test_a_still_refused_entry_is_resent_next_tick_then_given_up(repo_store, monkeypatch):
+    monkeypatch.setattr(settings, "enable_sel_short", True)
+    monkeypatch.setattr(settings, "broker_refused_resends_per_tick", 1)
+    monkeypatch.setattr(settings, "broker_refused_max_ticks", 2)
+    monkeypatch.setattr(rec, "_live_price", lambda t: 100.0)
+    t = _sel_trade()
+    repo_store["trades"] = [t]
+    b = RefusingBroker(n_refusals=99)
+    rec.sync(broker=b)
+    assert len(b.orders) == 2                        # sent + one same-tick resend
+    assert t["broker_status"] == "REFUSED" and t["broker_order_id"] is None
+    rec.sync(broker=b)                               # next tick: sent again
+    assert len(b.orders) == 4 and t["broker_status"] == "REFUSED_GAVE_UP"
+    rec.sync(broker=b)                               # given up: never sent again
+    assert len(b.orders) == 4
+    assert len({o.client_ref for o in b.orders}) == 4   # every attempt under its own ref
+
+
+def test_a_refused_exit_is_resent_and_never_given_up(repo_store, monkeypatch):
+    monkeypatch.setattr(settings, "broker_refused_resends_per_tick", 1)
+    monkeypatch.setattr(settings, "broker_refused_max_ticks", 1)
+    monkeypatch.setattr(rec, "_live_price", lambda t: 100.0)
+    t = _open_trade("MSFT")
+    t.update(status="CLOSED", broker_order_id="o0", broker_status="Filled", broker_fill_qty=10,
+             exit_price=100.0)
+    repo_store["trades"] = [t]
+    b = RefusingBroker(n_refusals=4, positions=[Position("MSFT", 10, 100.0)])
+    r = rec.sync(broker=b)
+    assert [o.side for o in b.orders] == ["SELL", "SELL"]      # no drift flatten beside it
+    assert r["drift"] == []
+    assert t["broker_exit_status"] == "REFUSED" and t["broker_exit_order_id"] is None
+    rec.sync(broker=b)
+    assert t["broker_exit_status"] == "REFUSED"      # exits never give up
+    rec.sync(broker=b)
+    assert t["broker_exit_status"] == "Filled" and len(b.orders) == 5
 
 
 def test_notional_sizing_quantity(repo_store, monkeypatch):
