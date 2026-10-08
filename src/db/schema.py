@@ -12,6 +12,10 @@ recommendations     — every top-N recommendation with its rationale + attribut
 trades              — the real signal-driven ledger (replaces cache/trades.json).
 hypothetical_trades — the always-open paper book (replaces cache/hypothetical_trades.json).
 broker_reconciles   — one row per broker sync: connectivity, counts, drift, errors.
+broker_borrow_fees  — what IBKR CHARGED the account to borrow each short, one row
+                      per position per value date (the Flex statement's Borrow
+                      Fees Details: quantity, price, value, rate, fee); the
+                      ledger's borrow schedule prefers it to its formula.
 broker_orders       — one event row per order submission / fill repair: model vs
                       fill price, cost-normalized slippage bps, commission. The
                       durable record the paper phase measures slippage/rejects from.
@@ -856,6 +860,24 @@ SCHEMA_STATEMENTS = [
         primary_raw     DOUBLE,
         primary_score   DOUBLE,
         latency_s       DOUBLE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS broker_borrow_fees (
+        account      VARCHAR,
+        ticker       VARCHAR,
+        symbol       VARCHAR,
+        conid        BIGINT,
+        value_date   DATE,
+        quantity     DOUBLE,
+        price        DOUBLE,
+        value        DOUBLE,
+        fee_rate     DOUBLE,
+        fee          DOUBLE,
+        currency     VARCHAR,
+        fx_to_base   DOUBLE,
+        description  VARCHAR,
+        fetched_at   VARCHAR
     );
     """,
     """

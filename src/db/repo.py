@@ -409,6 +409,32 @@ def insert_order_quotes(rows: List[dict]) -> None:
         conn.execute("COMMIT")
 
 
+_BORROW_FEE_COLS = ["account", "ticker", "symbol", "conid", "value_date", "quantity", "price", "value",
+                    "fee_rate", "fee", "currency", "fx_to_base", "description", "fetched_at"]
+
+
+def save_broker_borrow_fees(rows: List[dict], account: str, start, end) -> int:
+    """Store IBKR's charged borrow fees for one account's statement period: every row the
+    period held before is replaced, so a re-fetch never doubles a day and a day IBKR
+    corrected is corrected here too."""
+    vals = [tuple(r.get(c) for c in _BORROW_FEE_COLS) for r in rows]
+    ph = ", ".join(["?"] * len(_BORROW_FEE_COLS))
+    with connect() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM broker_borrow_fees WHERE account = ? AND value_date BETWEEN ? AND ?",
+                     [account, start, end])
+        if vals:
+            conn.executemany(f"INSERT INTO broker_borrow_fees ({', '.join(_BORROW_FEE_COLS)}) VALUES ({ph})", vals)
+        conn.execute("COMMIT")
+    return len(vals)
+
+
+def load_broker_borrow_fees() -> List[dict]:
+    """Every borrow fee IBKR charged the account (``broker_borrow_fees``)."""
+    return fetch_df(f"SELECT {', '.join(_BORROW_FEE_COLS)} FROM broker_borrow_fees "
+                    f"ORDER BY value_date, ticker").to_dict("records")
+
+
 _BACKFILL_COLS = ["ticker", "signal_date", "catalyst", "headline_count",
                   "top_headline", "classifier_version", "classified_at"]
 

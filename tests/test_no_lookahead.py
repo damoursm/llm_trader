@@ -24,7 +24,14 @@ any input at a decision point could see something that happened after it:
   day only, never one the data lists for a later day (2026-10-05);
 * the simulated account the vol arm is sized from — the money paid in BY the tick, never a
   deposit due later (2026-10-05);
-* the model's training rows — only labels CONFIRMED by the fit's cut.
+* the corporate-action gap flag that keeps a spin-off out of the vol and ETF rankings — the bar
+  and earlier ones only (2026-10-05);
+* the borrow fee each open short carries into that account's equity — IBKR's rates, closes and
+  charges of the days already over, the file in force for a day not over, never a later day's
+  row or a rewrite of one (2026-10-06);
+* the model's training rows — only labels CONFIRMED by the fit's cut;
+* the dip long book (2026-10-08) — its signal and its exit at session D's open read the closes through
+  D-1 only, never a bar of D or later (mutation-checked 2026-10-08).
 The deep features' point-in-time rules (the 08:30 cutoff, publication lags, rows
 published after the cutoff) are pinned in `tests/test_deep_features.py` — the Reg SHO
 (`rs`) and IBKR borrow (`bw`) groups there too (a list / borrow row of D is known from
@@ -355,8 +362,8 @@ def test_the_squeeze_cover_never_reads_a_split_after_the_tick(monkeypatch):
     from config.settings import settings
     from src.data import intraday_store as ist
     from src.performance import tracker
-    monkeypatch.setattr(settings, "enable_sel_short_vol_squeeze_cover", True)
-    monkeypatch.setattr(settings, "sel_short_vol_cover_multiple", 6.0)
+    monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", True)
+    monkeypatch.setattr(settings, "sel_short_cover_multiple", 6.0)
     now = datetime(2026, 9, 29, 11, 0, tzinfo=ET)
     trade = {"ticker": "SQZ", "sel_arm": "vol", "entry_price": 10.0, "entry_date": "2026-09-22",
              "current_price": 60.0, "current_price_datetime": (now - timedelta(minutes=5)).isoformat(),
@@ -371,17 +378,202 @@ def test_the_squeeze_cover_never_reads_a_split_after_the_tick(monkeypatch):
 
 
 def test_the_simulated_account_never_counts_a_deposit_due_after_the_tick(monkeypatch):
-    """The vol arm's simulated account ($5,000 + $1,000 every 14 days) sizes a short from the money
-    paid in BY the tick: the deposit due the next morning must not move it."""
+    """The simulated account sizes a short from the money paid in BY the tick. Since 2026-10-07 it holds
+    $10,000 and takes no deposits (user directive: "Change the $5000+$1000/14days to $10000"), so no later
+    instant can move it: the eve and the next morning size the same short."""
     from config.settings import settings
     from src.performance import sim_account as sa
     monkeypatch.setattr(settings, "enable_sel_short_account_sizing", True)
-    monkeypatch.setattr(settings, "sel_short_account_start", "2026-10-05")
-    monkeypatch.setattr(settings, "sel_short_account_initial", 5000.0)
-    monkeypatch.setattr(settings, "sel_short_account_deposit", 1000.0)
-    monkeypatch.setattr(settings, "sel_short_account_deposit_days", 14)
+    monkeypatch.setattr(settings, "sel_short_account_initial", 10000.0)
     monkeypatch.setattr(settings, "sel_short_account_slices", 10)
     eve = datetime(2026, 10, 18, 23, 59, tzinfo=ET)
-    assert sa.paid_in(eve) == 5000.0 and sa.size([], 10.0, 3e7, eve)[0] == 50
     morning = datetime(2026, 10, 19, 0, 1, tzinfo=ET)
-    assert sa.paid_in(morning) == 6000.0 and sa.size([], 10.0, 3e7, morning)[0] == 60
+    assert sa.paid_in(eve) == sa.paid_in(morning) == 10000.0
+    assert sa.size([], 10.0, 3e7, eve)[0] == sa.size([], 10.0, 3e7, morning)[0] == 100
+
+
+def test_a_short_keeps_the_margin_ibkr_quoted_at_its_entry(monkeypatch):
+    """IBKR's what-if rate for a name is read once, at the short's entry, and stamped on the trade
+    (user directive 2026-10-05: "build the what-if"): a later quote for the same name or a later
+    change of the default rates never moves the account's requirement for a short opened before it."""
+    from config.settings import settings
+    from src.performance import sim_account as sa
+    monkeypatch.setattr(settings, "enable_sel_short_account_sizing", True)
+    monkeypatch.setattr(settings, "sel_short_account_initial", 5000.0)
+    monkeypatch.setattr(settings, "sel_short_account_house_maint", 2.0)
+    monkeypatch.setattr(settings, "sel_short_account_house_init", 2.86)
+    now = datetime(2026, 10, 6, 11, 0, tzinfo=ET)
+    held = {"entry_mechanism": "sel_short", "sel_arm": "vol", "status": "OPEN", "sel_account_shares": 50,
+            "entry_price": 10.0, "current_price": 12.0, "return_pct": -20.0,
+            "sel_house_maint": 0.30, "sel_house_init": 0.356}
+    base = sa.state([held], now)
+    assert base["maint"] == pytest.approx(250.0)                       # Reg T's $5 a share beats 30%
+    # later: the defaults change and IBKR quotes the name far higher
+    monkeypatch.setattr(settings, "sel_short_account_house_maint", 5.0)
+    monkeypatch.setattr(settings, "sel_short_account_house_init", 6.0)
+    assert sa.state([held], now) == base
+    new = dict(held, sel_house_maint=4.0, sel_house_init=5.72, entry_price=12.0, return_pct=0.0)
+    assert sa.state([held, new], now)["maint"] == pytest.approx(base["maint"] + 4.0 * 50 * 12.0)
+
+
+def test_the_corporate_gap_flag_never_reads_a_bar_after_its_own():
+    """The vol and ETF arms leave out a bar whose ATR% is a corporate-action gap (`ca_gap_state`): the
+    flag at a bar reads only that bar and earlier ones — a crash or a gap written after it never moves it,
+    and the series cut at the bar gives the same answer."""
+    rng = np.random.default_rng(5)
+    sday = np.repeat(np.arange(20000, 20040), 13)
+    c = np.where(sday < 20030, 100.0, 20.0) * (1 + rng.normal(0.0, 0.001, len(sday)))   # a spin-off at session 30
+    h, lo = c * 1.0015, c * 0.9985
+    idx = pd.DatetimeIndex(pd.Timestamp("1970-01-01") + pd.to_timedelta(sday, unit="D")
+                           + pd.to_timedelta(14 * 60 + 30 * (np.arange(len(sday)) % 13), unit="min"))
+    assert ss.ca_gap_state(idx, h, lo, c, idx[30 * 13 + 5])["ca_gap"] is True
+    for j in (30 * 13 + 5, 32 * 13 + 2, 36 * 13):
+        base = ss.ca_gap_state(idx, h, lo, c, idx[j])
+        assert ss.ca_gap_state(idx[:j + 1], h[:j + 1], lo[:j + 1], c[:j + 1], idx[j]) == base
+        h2, l2, c2 = h.copy(), lo.copy(), c.copy()
+        for arr in (h2, l2, c2):
+            arr[j + 1:] *= 0.1                                  # a 90% gap right after the bar
+        assert ss.ca_gap_state(idx, h2, l2, c2, idx[j]) == base
+
+
+def test_the_borrow_fee_at_a_tick_never_reads_a_later_day(monkeypatch):
+    """Each open short carries IBKR's day-by-day borrow fee (`borrow_fees.cost_fraction`) into the simulated
+    account's equity, which sizes the next short: at a tick it reads the rates, closes and IBKR charges of days
+    already over and the file in force now. A row dated the tick's day or later — IBKR's rate, a close, a charge —
+    added or rewritten never moves it; the same history cut at the tick gives the same schedule."""
+    from config.settings import settings
+    from src.performance import borrow_fees as bf
+    monkeypatch.setattr(settings, "enable_ibkr_borrow_schedule", True)
+    now = datetime(2026, 10, 6, 11, 0, tzinfo=ET)
+    rates = [(date(2026, 10, 1), 36.0, "own_archive"), (date(2026, 10, 2), 40.0, "own_archive"),
+             (date(2026, 10, 5), 44.0, "ibkr_api")]
+    closes = [(date(2026, 10, 1), 9.8), (date(2026, 10, 2), 14.5), (date(2026, 10, 5), 10.0)]
+    charged = {("XYZ", date(2026, 10, 2)): {"fee_ps": 0.02, "rate": 40.0, "price": 10.0}}
+    src = {"rates": list(rates), "closes": list(closes), "charged": dict(charged)}
+    monkeypatch.setattr(bf, "_rates", lambda t: src["rates"])
+    monkeypatch.setattr(bf, "_file_rate", lambda t, when: None)
+    monkeypatch.setattr(bf, "_closes", lambda t: src["closes"])
+    monkeypatch.setattr(bf, "_charged", lambda: src["charged"])
+    monkeypatch.setattr(bf, "charged_version", lambda: "v")
+    trade = {"ticker": "XYZ", "action": "SELL", "type": "STOCK", "status": "OPEN", "entry_price": 10.0,
+             "entry_datetime": "2026-10-01T14:00:00+00:00"}
+    for end in ("2026-10-06T15:00:00+00:00", "2026-10-07T01:30:00+00:00"):   # a cover now; one in tonight's session
+        base = bf.schedule(dict(trade), end, now)
+        assert base["days"][-1][1].endswith("_carried")                       # today: the last day over, carried
+        src["rates"] = rates + [(date(2026, 10, 6), 900.0, "ibkr_api"), (date(2026, 10, 7), 950.0, "own_archive")]
+        src["closes"] = closes + [(date(2026, 10, 6), 77.0), (date(2026, 10, 7), 88.0)]
+        src["charged"] = {**charged, ("XYZ", date(2026, 10, 6)): {"fee_ps": 9.9, "rate": 900.0, "price": 78.0}}
+        assert bf.schedule(dict(trade), end, now) == base
+        src.update(rates=list(rates), closes=list(closes), charged=dict(charged))
+
+
+@pytest.mark.parametrize("arm", ["vol", "vol2"])
+def test_the_fallback_candidates_never_read_a_later_bars_record(tmp_path, monkeypatch, arm):
+    """PREREG16's same-bar fallback (2026-10-07): a bar's backups are judged on its own
+    scores and the EARLIER bars' records only — a later bar's journaled fresh top 3 (a rerun
+    out of order) must not make a candidate "not first today", and rewriting it changes nothing."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel_short"))
+    monkeypatch.setattr(settings, "enable_sel_short", True)
+    monkeypatch.setattr(settings, "enable_sel_short_etf", False)
+    monkeypatch.setattr(settings, "sel_short_min_run_rows", 3)
+    monkeypatch.setattr(settings, "sel_short_vol_fallback_ranks", 3)
+    monkeypatch.setattr(settings, "enable_sel_short_vol2", arm == "vol2")
+    res = pd.DataFrame({"ticker": ["V0", "V1", "V2", "V3"], "score": [0.4, 0.3, 0.2, 0.1],
+                        "vol": [9.0, 8.0, 7.0, 6.0], "px": 20.0, "dv20": 1e7, "pre5": 10.0, "status": "OK",
+                        "dtc": 0.5, "rvol": 3.0})
+
+    def backups_at_bar3():
+        run = ss.decide(res, DAY, 3)
+        return [b["ticker"] for b in run["arms"][arm].get("backups") or []]
+
+    clean = backups_at_bar3()
+    assert clean == ["V1", "V2"]
+    later = {"day": DAY.isoformat(), "bar_of_day": 5, "arm": arm, "ticker": "V1", "fresh": True,
+             "decision": "short", "fresh_pool": ["V1", "V2"]}
+    ss._journal(later)
+    assert backups_at_bar3() == clean
+    ss._journal(dict(later, fresh_pool=["V2"], ticker="V2"))
+    assert backups_at_bar3() == clean
+
+
+# ── THE DIP LONG BOOK (2026-10-08) ───────────────────────────────────────────
+
+def _dip_frame(days, drop_last=2, seed=21, rewrite_from=None):
+    """A $1B+-a-day uptrend (flat 30-min bars at each session's close) whose last ``drop_last`` sessions
+    fall 4% each — a 2-session-RSI dip above the 200-session average at the last close. Sessions at or
+    after ``rewrite_from`` get a wildly different path (x3 price, x25 volume)."""
+    rng = np.random.default_rng(seed)
+    n = len(days)
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0.003, 0.004, n)))
+    for k in range(drop_last):
+        close[n - drop_last + k] = close[n - drop_last + k - 1] * 0.96
+    rows, idx = [], []
+    for d, c in zip(days, close):
+        f = 3.0 if rewrite_from is not None and d >= rewrite_from else 1.0
+        vol = 1_000_000.0 * (25.0 if f != 1.0 else 1.0)
+        for k in range(13):
+            idx.append(pd.Timestamp(datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET) + timedelta(minutes=30 * k))
+                       .tz_convert("UTC").tz_localize(None))
+            rows.append((c * f, c * f * 1.001, c * f * 0.999, c * f, vol))
+    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close", "Volume"], index=pd.DatetimeIndex(idx))
+
+
+def test_the_dip_signal_never_reads_a_bar_of_its_own_session(monkeypatch):
+    """The dip book buys at session D's open on the close of D-1: a store that already holds D's bars (and
+    later ones) — rewritten wildly — must not move the numbers or the signal; read through D (the injected
+    leak) they do move, so the guard can fail."""
+    from src.data import intraday_store
+    from src.signals import dip_long as dl
+    hist = ss.sessions_before(DAY, 260)
+    later = [DAY, ss.session_after(DAY, 1)]
+    clean = _dip_frame(hist)
+    future = pd.concat([clean, _dip_frame(hist + later, rewrite_from=DAY).iloc[len(clean):]])
+    prev = dl.prev_session(DAY)
+    assert prev == hist[-1]
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: clean)
+    base = dl.name_stats("SYN", prev)
+    assert dl.qualifies(base) and base["session"] == prev          # the fixture is a real signal
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: future)
+    assert dl.name_stats("SYN", prev) == base
+    assert dl.qualifies(dl.name_stats("SYN", prev))
+    leak = dl.name_stats("SYN", DAY)                                 # the injected leak: reads D
+    assert leak != base and leak["session"] == DAY
+
+
+def test_the_day_signal_file_never_reads_the_trade_day(monkeypatch, tmp_path):
+    """End to end: `compute_signals(D)` on a store holding D's (rewritten) bars equals the one on a store
+    that ends at D-1."""
+    from config.settings import settings
+    from src.data import intraday_store
+    from src.signals import dip_long as dl
+    monkeypatch.setattr(settings, "dip_long_dir", str(tmp_path / "dip_long"))
+    hist = ss.sessions_before(DAY, 260)
+    clean = _dip_frame(hist)
+    future = pd.concat([clean, _dip_frame(hist + [DAY], rewrite_from=DAY).iloc[len(clean):]])
+    monkeypatch.setattr(dl, "candidates", lambda d: (["SYN"], "test"))
+    monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
+    out = []
+    for frame in (clean, future):
+        monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk, _f=frame: _f)
+        out.append([{k: v for k, v in r.items()} for r in dl.compute_signals(DAY)["signals"]])
+    assert out[0] == out[1] and [r["ticker"] for r in out[0]] == ["SYN"]
+
+
+def test_the_dip_exit_never_reads_a_close_of_its_own_session(monkeypatch):
+    """The exit sold at D's open is decided on the closes through D-1: D's own close above its 5-session
+    average (a rebound that has not happened at the open) must not sell, and rewriting D changes nothing."""
+    from src.data import intraday_store
+    from src.signals import dip_long as dl
+    hist = ss.sessions_before(DAY, 260)
+    clean = _dip_frame(hist, drop_last=4)                            # still falling through D-1
+    rebound_d = pd.concat([clean, _dip_frame(hist + [DAY], drop_last=0, rewrite_from=DAY).iloc[len(clean):]])
+    trade = {"ticker": "SYN", "dip_entry_day": hist[-3].isoformat()}
+    monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: clean)
+    base = dl.exit_check(trade, DAY)
+    assert base[0] is None
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: rebound_d)
+    assert dl.exit_check(trade, DAY) == base
+    nxt = ss.session_after(DAY, 1)                                   # the injected leak: judged a day later
+    assert dl.exit_check(trade, nxt)[0] == "dip_rebound"

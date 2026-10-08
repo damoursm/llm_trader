@@ -385,3 +385,81 @@ def test_process_ages_parses_and_is_fail_soft(monkeypatch):
         raise OSError("no powershell")
     monkeypatch.setattr(gr.subprocess, "run", boom)
     assert gr._process_ages([6016]) == {}
+
+
+# ── the relaunch waits for the killed gateway's task instance to END (2026-10-05) ──
+# The IBC task runs with MultipleInstances=IgnoreNew and its instance outlives the
+# killed java by StartGateway.bat's epilogue (~1 s): a /Run inside it is accepted and
+# ignored. 4 of the 5 recoveries 2026-09-29..10-05 (10-05 20:10:14: killed, /Run at
+# once, nothing; back only at the 20:16:35 keep-alive) came back that way.
+
+def _task_states(monkeypatch, states, sig=()):
+    """subprocess.run fake: each `schtasks /Query` answers the next state (the last one
+    repeats); every command is recorded. A fake clock keeps the 20 s wait finite."""
+    calls, it = [], iter(states)
+    last = {"s": states[-1]}
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if cmd[:2] == ["schtasks", "/Query"]:
+            s = next(it, last["s"])
+            row = f'"\\IBC Gateway","2026-10-05 8:16:35 PM","{s}"'
+            return SimpleNamespace(returncode=0, stdout=f"{row}\r\n{row}\r\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(gr.subprocess, "run", fake_run)
+    monkeypatch.setattr(gr, "_gateway_pids_by_signature", lambda: list(sig))
+    clock = {"t": 0.0}
+
+    def mono():
+        clock["t"] += 1.0
+        return clock["t"]
+    monkeypatch.setattr(gr.time, "monotonic", mono)
+    monkeypatch.setattr(settings, "broker_mode", "ibkr_paper")
+    monkeypatch.setattr(settings, "broker_gateway_auto_restart", True)
+    monkeypatch.setattr(gr, "_pid_listening_on", lambda port: 4321)
+    return calls
+
+
+def _sched(calls):
+    return [c[1] for c in calls if c[0] == "schtasks"]
+
+
+def test_the_relaunch_waits_for_the_old_task_instance_to_end(monkeypatch):
+    calls = _task_states(monkeypatch, ["Running", "Running", "Ready"])
+    assert gr.maybe_restart_gateway("logged out", wait=False) is True
+    assert calls[0] == ["taskkill", "/PID", "4321", "/F"]
+    assert _sched(calls) == ["/Query", "/Query", "/Query", "/Run"]      # /Run only once it ended
+
+
+def test_a_task_that_never_ends_is_ended_before_the_relaunch(monkeypatch):
+    calls = _task_states(monkeypatch, ["Running"], sig=[4321])         # only the gateway we killed
+    assert gr.maybe_restart_gateway("logged out", wait=False) is True
+    s = _sched(calls)
+    assert s[-2:] == ["/End", "/Run"] and s.count("/Run") == 1
+
+
+def test_a_gateway_the_keepalive_already_relaunched_is_kept(monkeypatch):
+    calls = _task_states(monkeypatch, ["Running"], sig=[9999])         # a gateway we did NOT kill
+    assert gr.maybe_restart_gateway("logged out", wait=False) is True
+    assert "/End" not in _sched(calls) and "/Run" not in _sched(calls)
+
+
+def test_an_unreadable_task_state_relaunches_at_once(monkeypatch):
+    calls = _task_states(monkeypatch, ["Ready"])
+    monkeypatch.setattr(gr.subprocess, "run", lambda cmd, **kw: (calls.append(list(cmd)), SimpleNamespace(
+        returncode=1 if cmd[:2] == ["schtasks", "/Query"] else 0, stdout="", stderr=""))[1])
+    assert gr.maybe_restart_gateway("logged out", wait=False) is True
+    assert _sched(calls) == ["/Query", "/Run"]
+
+
+def test_task_running_parses_every_trigger_row():
+    assert gr._task_running.__doc__
+    rows = '"\\IBC Gateway","N/A","Ready"\r\n"\\IBC Gateway","2026-10-05 8:36:35 PM","Running"\r\n'
+    import unittest.mock as um
+    with um.patch.object(gr.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=rows, stderr="")):
+        assert gr._task_running("IBC Gateway") is True
+    with um.patch.object(gr.subprocess, "run", return_value=SimpleNamespace(
+            returncode=0, stdout=rows.replace("Running", "Ready"), stderr="")):
+        assert gr._task_running("IBC Gateway") is False
+    with um.patch.object(gr.subprocess, "run", side_effect=OSError("no schtasks")):
+        assert gr._task_running("IBC Gateway") is None

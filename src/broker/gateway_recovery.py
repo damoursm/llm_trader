@@ -250,6 +250,53 @@ def wait_for_gateway(until: datetime, poll_seconds: float = 5.0, grace_seconds: 
     return bool(_pid_listening_on(port))
 
 
+_RELAUNCH_WAIT_SECONDS = 20.0
+
+
+def _task_running(task: str) -> Optional[bool]:
+    """Whether the scheduled task has an instance running (``schtasks /Query``: one CSV
+    row per trigger, the status last), None when it can't be told."""
+    try:
+        r = subprocess.run(["schtasks", "/Query", "/TN", task, "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+    except Exception:                                            # noqa: BLE001
+        return None
+    rows = [ln.strip() for ln in (getattr(r, "stdout", "") or "").splitlines() if ln.strip()]
+    if getattr(r, "returncode", 1) != 0 or not rows:
+        return None
+    return any(ln.rsplit(",", 1)[-1].strip().strip('"').lower() == "running" for ln in rows)
+
+
+def _relaunch(task: str, killed: List[int]):
+    """``schtasks /Run`` once the killed gateway's task instance has ENDED.
+
+    The IBC task runs with MultipleInstances=IgnoreNew, and its instance lives as long as
+    StartGateway.bat: killing the gateway's java leaves the batch file's epilogue running
+    for about a second, and a /Run inside that second is accepted (rc 0) but ignored — 4
+    of the 5 recoveries 2026-09-29..10-05 came back only at the task's 10-minute
+    keep-alive trigger while the sync waited out its 300 s. So: wait for the instance to
+    end (<= 20 s); one still running then is ended first — unless it is a gateway the
+    keep-alive already relaunched (a gateway process we did not kill), which is kept."""
+    deadline = time.monotonic() + _RELAUNCH_WAIT_SECONDS
+    running = _task_running(task)
+    while running and time.monotonic() < deadline:
+        time.sleep(1.0)
+        running = _task_running(task)
+    if running:
+        fresh = [p for p in _gateway_pids_by_signature() if p not in set(killed)]
+        if fresh:
+            logger.info(f"[broker] gateway recovery: task '{task}' is already running a new gateway "
+                        f"(pid {fresh}) — not relaunching")
+            return subprocess.CompletedProcess(["schtasks", "/Run", "/TN", task], 0, "", "")
+        logger.warning(f"[broker] gateway recovery: task '{task}' still running "
+                       f"{_RELAUNCH_WAIT_SECONDS:.0f}s after the kill — ending it before the relaunch")
+        subprocess.run(["schtasks", "/End", "/TN", task],
+                       capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+        time.sleep(2.0)
+    return subprocess.run(["schtasks", "/Run", "/TN", task],
+                          capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+
+
 def maybe_restart_gateway(reason: str, wait: bool = True) -> bool:
     """Kill the gateway owning ``ibkr_port`` and fire the IBC relaunch task.
 
@@ -312,8 +359,7 @@ def maybe_restart_gateway(reason: str, wait: bool = True) -> bool:
         for _t in targets:
             subprocess.run(["taskkill", "/PID", str(_t), "/F"],
                            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
-        r = subprocess.run(["schtasks", "/Run", "/TN", task],
-                           capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+        r = _relaunch(task, targets)
         if r.returncode != 0:
             logger.warning(
                 f"[broker] gateway recovery: schtasks /Run '{task}' failed "

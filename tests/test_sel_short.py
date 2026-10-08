@@ -575,7 +575,13 @@ def test_record_opens_journaled_shorts_at_any_fee(monkeypatch):
     assert t[0]["sel_target_price"] == 9.0 and t[0]["borrow_fee_pct"] == pytest.approx(496.0)
     assert t[0]["position_size_multiplier"] == pytest.approx(settings.sel_short_size_multiplier)
     assert t[0]["sel_days_to_cover"] == 1.0 and "days to cover 1.00" in t[0]["rationale"]
-    assert consumed == {ss.pick_key(_pick("ABC")): "opened", ss.pick_key(_pick("NOB")): "no_borrow"}
+    # a pick IBKR cannot lend is not given up: it stays pending, re-checked every tick inside its window
+    assert consumed == {ss.pick_key(_pick("ABC")): "opened"}
+    monkeypatch.setattr(settings, "enable_sel_short_borrow_retry", False)
+    tracker1, consumed1, _ = _tracker_env(monkeypatch, [_pick("NOB", bar=2)])
+    assert tracker1.record_sel_short_trades(run_id="r1b") == 0
+    assert consumed1 == {ss.pick_key(_pick("NOB", bar=2)): "no_borrow"}
+    monkeypatch.setattr(settings, "enable_sel_short_borrow_retry", True)
     # the same name again while open, with the OLD rule (the switch at 1): not a second position
     monkeypatch.setattr(settings, "sel_short_max_open_per_ticker", 1)
     tracker2, consumed2, _ = _tracker_env(monkeypatch, [_pick("ABC", bar=3)])
@@ -973,22 +979,23 @@ def _cv_trade(**kw):
 def test_the_vol_arms_squeeze_cover_buys_back_at_a_multiple_of_the_split_adjusted_entry(monkeypatch):
     """User directive 2026-10-05: "have it tuned so that we don't have margin calls while still
     maximizing growth" — the vol arm covers a short whose fresh mark reaches
-    `sel_short_vol_cover_multiple` x its entry price, the entry carried through every split
+    `sel_short_cover_multiple` x its entry price, the entry carried through every split
     executed since the entry day (these names reverse-split often: a 1-for-10 mid-hold is not a
     10-fold squeeze)."""
     from src.data import intraday_store as ist
     from src.performance import tracker
     now = et(2026, 9, 29, 11, 0)
-    monkeypatch.setattr(settings, "enable_sel_short_vol_squeeze_cover", True)
-    monkeypatch.setattr(settings, "sel_short_vol_cover_multiple", 6.0)
+    monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", True)
+    monkeypatch.setattr(settings, "sel_short_cover_multiple", 6.0)
     rows = {}
     monkeypatch.setattr(ist, "split_rows", lambda: rows)
     r = tracker._sel_short_exit_reason
     assert r(_cv_trade(), now) == "sel_cover"                                # 60 >= 6 x 10
     assert r(_cv_trade(current_price=59.9), now) is None
-    assert r(_cv_trade(sel_arm="model"), now) is None                        # tuned on the vol arm only
-    assert r(_cv_trade(sel_arm="etf"), now) is None
+    assert r(_cv_trade(sel_arm="model"), now) == "sel_cover"                 # every arm (2026-10-05 evening)
+    assert r(_cv_trade(sel_arm="etf"), now) == "sel_cover"
     assert r(_cv_trade(sel_arm="model+vol"), now) == "sel_cover"             # a joint trade from before 10-04
+    assert r(_cv_trade(entry_mechanism="legacy"), now) is None               # never another book's
     stale = _cv_trade(current_price_datetime=(now - timedelta(hours=2)).isoformat())
     assert r(stale, now) is None                                             # never on an old price
     assert r(_cv_trade(sel_deadline=(now - timedelta(minutes=1)).isoformat()), now) == "sel_time"
@@ -1001,7 +1008,7 @@ def test_the_vol_arms_squeeze_cover_buys_back_at_a_multiple_of_the_split_adjuste
     assert r(_cv_trade(), now) == "sel_cover"
     monkeypatch.setattr(ist, "split_rows", lambda: None)                     # unreadable: the raw entry
     assert r(_cv_trade(), now) == "sel_cover"
-    monkeypatch.setattr(settings, "enable_sel_short_vol_squeeze_cover", False)
+    monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", False)
     assert r(_cv_trade(), now) is None
 
 
@@ -1151,13 +1158,15 @@ def test_the_live_path_runs_before_the_shadow_pipeline_and_after_the_scorer():
     i_launch = body.index("_sel_short.launch(start)")
     i_marks = body.index("_live_marks_and_exits()")
     i_pool = body.index('with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:')
-    i_entries = body.index("live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow)")
+    i_entries = body.index("live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow, "
+                           "dip_closed=_dip_closed)")
     i_collect = body.index("# ── Collect results")
     i_complete = body.index('f"Pipeline complete in')
     assert i_launch < i_marks < i_pool < i_entries < i_collect < i_complete
     helper = src[src.index("def _live_entries_and_sync("):src.index("def run_pipeline(")]
-    assert helper.index("_ss.wait(sel_handle)") < helper.index("record_sel_short_trades(") \
-        < helper.index("_broker_sync_watchdogged(")
+    # the dip long book's open-of-day orders go first (2026-10-08), never behind the scorer wait
+    assert helper.index("record_dip_long_trades(") < helper.index("_ss.wait(sel_handle)") \
+        < helper.index("record_sel_short_trades(") < helper.rindex("_broker_sync_watchdogged(")
     assert "_merge_broker_reports(live_broker_report, broker_report)" in body
     assert type(settings).model_fields["enable_live_path_first"].default is True
 
@@ -1395,3 +1404,149 @@ def test_the_etf_arm_journals_its_own_pick_beside_the_vol_arm(monkeypatch, on):
     assert picks["etf"]["decision"] == "short" and picks["etf"]["n_scored"] == 4
     assert out["arms"]["etf"]["ticker"] == "N23"
     assert len(pd.read_pickle(ss.scores_path(d, "etf"))) == 4                # the ETF arm's own history
+
+
+# ── PREREG16's same-bar fallback and the in-window borrow retry (2026-10-07) ──
+
+def _fb_res():
+    """Five names; the vol arm ranks V0 > V1 > V2 > V3 > V4 by ATR%."""
+    return pd.DataFrame({"ticker": ["V0", "V1", "V2", "V3", "V4"], "score": 0.5,
+                         "vol": [9.0, 8.0, 7.0, 6.0, 5.0], "px": 20.0, "dv20": 1e7, "pre5": 10.0,
+                         "status": "OK", "dtc": 0.5, "rvol": 3.0})
+
+
+def _fb_stand(res, stale=()):
+    st = pd.DataFrame({"n_prior": 50.0, "prior_max": 1.0, "prior_min": 0.0},
+                      index=pd.Index(res.ticker, name="ticker"))
+    for tk in stale:
+        st.loc[tk, "prior_max"] = 99.0                    # its own history holds a higher ATR%: not fresh
+    return st
+
+
+def test_vol_backups_follow_the_evaluated_fallback_rule(on, monkeypatch):
+    monkeypatch.setattr(settings, "sel_short_min_run_rows", 3)
+    monkeypatch.setattr(settings, "sel_short_vol_fallback_ranks", 3)
+    d = date(2026, 10, 6)
+    res = _fb_res()
+    rec = ss.select(res, d, 4, _fb_stand(res), [], arm="vol")
+    assert rec["ticker"] == "V0" and rec["decision"] == "short"
+    assert rec["fresh_pool"] == ["V0", "V1", "V2"]
+    assert [b["ticker"] for b in rec["backups"]] == ["V1", "V2"] and [b["rank"] for b in rec["backups"]] == [2, 3]
+    b = rec["backups"][0]
+    assert b["target"] == pytest.approx(20.0 - ss.give_back("vol") * 10.0)
+    assert datetime.fromisoformat(b["deadline"]) == ss.bar_end_et(ss.session_after(d, 15), 4)
+    # rank 2 not fresh: it leaves the fresh pool and is no backup; rank 4 is never a backup
+    rec = ss.select(res, d, 4, _fb_stand(res, stale=("V1",)), [], arm="vol")
+    assert rec["fresh_pool"] == ["V0", "V2"] and [b["ticker"] for b in rec["backups"]] == ["V2"]
+    # a name already in an earlier bar's fresh pool (or an earlier fresh pick) is not first today — the
+    # records journaled at depth 3 carry the pool as `top3_fresh`
+    for field in ("fresh_pool", "top3_fresh"):
+        rec = ss.select(res, d, 4, _fb_stand(res), [{"arm": "vol", "ticker": "X", "fresh": True,
+                                                     field: ["V2"]}], arm="vol")
+        assert [b["ticker"] for b in rec["backups"]] == ["V1"]
+    rec = ss.select(res, d, 4, _fb_stand(res), [{"arm": "vol", "ticker": "V1", "fresh": True}], arm="vol")
+    assert [b["ticker"] for b in rec["backups"]] == ["V2"]
+    # the filters: a crowded backup, a low-volume one, one that did not rise
+    r2 = res.copy()
+    r2.loc[r2.ticker == "V1", "dtc"] = 5.0
+    r2.loc[r2.ticker == "V2", "rvol"] = 0.5
+    assert ss.select(r2, d, 4, _fb_stand(r2), [], arm="vol")["backups"] == []
+    r3 = res.copy()
+    r3.loc[r3.ticker == "V1", "pre5"] = 25.0
+    assert [b["ticker"] for b in ss.select(r3, d, 4, _fb_stand(r3), [], arm="vol")["backups"]] == ["V2"]
+    # depth 5 (live from 2026-10-07): the pool is the fresh top 5, ranks 2-5 are backups
+    monkeypatch.setattr(settings, "sel_short_vol_fallback_ranks", 5)
+    rec = ss.select(res, d, 4, _fb_stand(res), [], arm="vol")
+    assert rec["fresh_pool"] == ["V0", "V1", "V2", "V3", "V4"]
+    assert [(b["ticker"], b["rank"]) for b in rec["backups"]] == [("V1", 2), ("V2", 3), ("V3", 4), ("V4", 5)]
+    # the model arm has none; off, the vol arm journals none
+    assert "backups" not in ss.select(res, d, 4, _fb_stand(res), [])
+    monkeypatch.setattr(settings, "enable_sel_short_vol_fallback", False)
+    assert "backups" not in ss.select(res, d, 4, _fb_stand(res), [], arm="vol")
+
+
+def _vol_pick(tk, backups, bar=1):
+    p = dict(_pick(tk, bar=bar), arm="vol", backups=backups)
+    return p
+
+
+def _backup(tk, rank):
+    return {"ticker": tk, "rank": rank, "score": 7.0, "px": 10.0, "pre5": 8.0, "runup_pct": 25.0, "target": 9.0,
+            "deadline": ss.bar_end_et(ss.session_after(date(2026, 9, 28), 15), 1).isoformat(),
+            "days_to_cover": 0.4, "rvol": 3.0, "atr_pct": 7.0, "dv20": 1e7, "ssr": False}
+
+
+def _fb_env(monkeypatch, picks):
+    tracker, consumed, calls = _tracker_env(monkeypatch, picks)
+    from src.data import ibkr_borrow
+
+    def block(ticker, price, base=None, now=None, max_fee_pct="default"):
+        calls.append((ticker, max_fee_pct))
+        if ticker.startswith("NOB"):
+            return "no_borrow", None
+        return None, ibkr_borrow.Borrow(ticker, 12.0, 1.0, 900_000, datetime(2026, 9, 28, 9, 0, tzinfo=ET))
+    monkeypatch.setattr(ibkr_borrow, "short_block", block)
+    journal = []
+    monkeypatch.setattr(ss, "journal_entry", lambda rec, outcome, **kw: journal.append((rec["ticker"], outcome)))
+    monkeypatch.setattr(ss, "consumed", lambda d: dict(consumed))
+    return tracker, consumed, calls, journal
+
+
+def test_an_unlendable_vol_pick_shorts_its_first_lendable_backup(monkeypatch):
+    pick = _vol_pick("NOB", [_backup("NOB2", 2), _backup("BCK", 3)])
+    tracker, consumed, calls, journal = _fb_env(monkeypatch, [pick])
+    assert tracker.record_sel_short_trades(run_id="r1") == 1
+    t = [x for x in tracker._load_trades() if x.get("entry_mechanism") == "sel_short"]
+    assert len(t) == 1 and t[0]["ticker"] == "BCK" and t[0]["sel_arm"] == "vol"
+    assert (t[0]["sel_fallback_of"], t[0]["sel_fallback_rank"]) == ("NOB", 3)
+    assert t[0]["sel_vol_score"] == 7.0 and "fallback for NOB" in t[0]["rationale"]
+    bkey = ss.pick_key(dict(pick, ticker="BCK"))
+    assert consumed == {ss.pick_key(pick): "no_borrow_fallback", bkey: "opened"}
+    assert t[0]["recommendation_id"] != tracker.hashlib.sha1(f"sel|{ss.pick_key(pick)}".encode()).hexdigest()[:16]
+    assert ("NOB", "no_borrow_retry") in journal and ("NOB2", "no_borrow_retry") in journal
+    assert [c[0] for c in calls] == ["NOB", "NOB2", "BCK"]
+
+
+def test_no_lendable_backup_leaves_the_pick_pending_and_model_picks_never_fall_back(monkeypatch):
+    pick = _vol_pick("NOB", [_backup("NOB2", 2)])
+    model = dict(_pick("NOB3"), backups=[_backup("BCK", 2)])         # a model pick: no fallback, ever
+    tracker, consumed, calls, journal = _fb_env(monkeypatch, [pick, model])
+    assert tracker.record_sel_short_trades(run_id="r1") == 0
+    assert consumed == {}                                            # both re-checked next tick
+    assert "BCK" not in [c[0] for c in calls]
+    monkeypatch.setattr(settings, "enable_sel_short_vol_fallback", False)
+    tracker2, consumed2, calls2, _ = _fb_env(monkeypatch, [_vol_pick("NOB", [_backup("BCK", 2)])])
+    assert tracker2.record_sel_short_trades(run_id="r2") == 0 and [c[0] for c in calls2] == ["NOB"]
+
+
+def test_a_backup_already_traded_today_is_skipped(monkeypatch):
+    from src.performance import tracker as tr
+    pick = _vol_pick("NOB", [_backup("BCK", 2), _backup("ALT", 3)])
+    tracker, consumed, calls, journal = _fb_env(monkeypatch, [pick])
+    today = date.today().isoformat()
+    # the vol arm's own trade on BCK today (one trade per name per day PER ARM: another arm's never blocks it —
+    # tests/test_sel_short_vol2.py)
+    _seed_trades(tr, [{"ticker": "BCK", "status": "CLOSED", "entry_mechanism": "sel_short", "entry_date": today,
+                       "action": "SELL", "recommendation_id": "old", "sel_arm": "vol"}])
+    assert tracker.record_sel_short_trades(run_id="r1") == 1
+    t = [x for x in tracker._load_trades() if x.get("entry_mechanism") == "sel_short" and x["status"] == "OPEN"]
+    assert [x["ticker"] for x in t] == ["ALT"]
+    assert consumed[ss.pick_key(dict(pick, ticker="BCK"))] == "traded_today"
+
+
+def test_a_vol_pick_ibkr_refuses_falls_back_too(monkeypatch):
+    """IBKR refusing any opening short in the pick (its what-if: close-only / small-cap compliance) is the same
+    untradeable top name as an unlendable one: the bar's lendable backup is shorted instead."""
+    from src.performance import sim_account
+    pick = _vol_pick("REF", [_backup("BCK", 2)])
+    tracker, consumed, calls, journal = _fb_env(monkeypatch, [pick])
+    monkeypatch.setattr(sim_account, "arm_funded", lambda arm: True)
+    monkeypatch.setattr(sim_account, "whatif_enabled", lambda: True)
+    monkeypatch.setattr(sim_account, "ibkr_margin",
+                        lambda tk, px: {"refused": "No Opening Trades"} if tk == "REF" else None)
+    monkeypatch.setattr(sim_account, "size", lambda trades, px, dv, now, rates=None: (10, "ok", {"equity": 5000.0}))
+    monkeypatch.setattr(sim_account, "default_rates", lambda: (2.0, 2.86))
+    assert tracker.record_sel_short_trades(run_id="r1") == 1
+    t = [x for x in tracker._load_trades() if x.get("entry_mechanism") == "sel_short"]
+    assert [x["ticker"] for x in t] == ["BCK"] and t[0]["sel_fallback_of"] == "REF"
+    assert consumed[ss.pick_key(pick)] == "ibkr_refused"

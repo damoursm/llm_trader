@@ -251,5 +251,15 @@ class Broker(ABC):
         """
         return None
 
+    def what_if_short(self, ticker: str, qty: int, limit_price: float) -> Optional[dict]:
+        """The broker's OWN margin for a hypothetical short of *qty* shares at the limit
+        *limit_price* — priced, never transmitted: ``{"init_rate", "maint_rate", ...}`` as
+        multiples of the order's USD value, ``{"refused": reason, ...}`` when the broker will
+        not let the account open the short, or ``{"error": ...}`` without rates.
+
+        Default: None (no broker-side margin — callers use their default rates). Read-only.
+        """
+        return None
+
     def disconnect(self) -> None:  # optional; default no-op
         return None

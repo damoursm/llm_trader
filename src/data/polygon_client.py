@@ -319,6 +319,24 @@ def get_last_price(ticker):
         return None
 
 
+def get_day_low_prev_close(ticker: str) -> Optional[tuple]:
+    """``(today's low so far, the previous session's close)`` from the single-ticker snapshot —
+    Rule 201's trigger inputs (the broker's short-sale price test, 2026-10-05) — or None when
+    Polygon has no trade today or no previous close."""
+    if not is_available() or not ticker:
+        return None
+    j = _get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{to_polygon_symbol(ticker)}", {})
+    if not j or j.get("status") not in ("OK", "NotFound"):
+        return None
+    t = j.get("ticker") or {}
+    try:
+        low = float((t.get("day") or {}).get("l") or 0.0)
+        prev = float((t.get("prevDay") or {}).get("c") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return (low, prev) if low > 0 and prev > 0 else None
+
+
 def get_last_nbbo(ticker: str) -> Optional[dict]:
     """Real-time consolidated NBBO for one ticker via ``/v2/last/nbbo``
     (verified entitled on the current plan, 2026-08-31: sub-second ages in RTH).

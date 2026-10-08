@@ -291,8 +291,8 @@ def test_a_second_rescore_does_not_start_while_one_is_running(monkeypatch):
 def test_eod_maintenance_no_longer_hosts_the_refactor():
     """It must not move back inline — that is what would block the ticks."""
     import inspect
-    import src.scheduler.runner as runner
-    src = inspect.getsource(runner._run_eod_maintenance)
+    import src.scheduler.eod as eod
+    src = inspect.getsource(eod)
     assert "run_refactor" not in src
 
 
@@ -363,8 +363,9 @@ def test_eod_work_no_longer_trains_models():
     """The 2026-08-12 directive: retrains are WEEKLY (Saturday), so the EOD
     body must not reference the trainers anymore."""
     import inspect
+    import src.scheduler.eod as eod
     import src.scheduler.runner as runner
-    src = inspect.getsource(runner._eod_work)
+    src = inspect.getsource(eod)
     for needle in ("eod_train_buy", "eod_train_exit", "ml_model import eod_train"):
         assert needle not in src, f"EOD still trains models ({needle})"
     wk = inspect.getsource(runner._weekly_ml_work)

@@ -39,7 +39,7 @@ grace) as soon as the process wakes. Keep-awake is still requested (it helps on 
 import sys
 import threading
 import time as _time_module
-from datetime import datetime, time as _time, timedelta
+from datetime import datetime, time as _time, timedelta, timezone
 
 from loguru import logger
 
@@ -66,8 +66,30 @@ def _run_tick_watchdogged(**kwargs) -> None:
     to EXIT. On expiry: CRITICAL log + ``os._exit(1)``; the supervisor
     relaunches, and ``reconcile.sync()`` is idempotent on restart (fill
     refresh, stale-cancel, orphan sweep), which is what makes a mid-tick exit
-    recoverable. EOD maintenance and the weekly ML retrains run in background
-    threads and are NOT under this timer."""
+    recoverable. The weekly ML retrains run in a background thread and EOD
+    maintenance in its own process; neither is under this timer.
+
+    The tick holds the database fence for its whole run (`db_fence`): the EOD
+    process opens no connection meanwhile, and a query it already has running
+    is waited out (at most `eod_db_wait_seconds`) before the tick starts."""
+    from src.scheduler import db_fence
+    try:
+        db_fence.raise_fence("tick")
+        waited = db_fence.wait_db_free(float(settings.eod_db_wait_seconds))
+        if waited >= 1.0:
+            logger.info(f"[scheduler] waited {waited:.0f}s for the EOD process's database query")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[scheduler] database fence not raised ({exc}) — the tick goes ahead")
+    try:
+        _run_tick_under_watchdog(**kwargs)
+    finally:
+        try:
+            db_fence.drop_fence()
+        except Exception:                                 # noqa: BLE001
+            pass
+
+
+def _run_tick_under_watchdog(**kwargs) -> None:
     cap = float(getattr(settings, "tick_watchdog_seconds", 0) or 0)
     if cap <= 0:
         run_pipeline(**kwargs)
@@ -270,16 +292,21 @@ def _tick_plan(kind: str, slot_t: _time, end_t: _time) -> tuple[bool, bool]:
     return observe, send_email
 
 
-def _should_run_eod(now_naive: datetime, last_eod_date, eod_time: _time) -> bool:
-    """True on the first poll at/after ``eod_time`` ET on a market day it hasn't
-    yet run for. Independent of the slot grid, so a missed close slot never
-    blocks maintenance — it fires whenever the machine is next awake past the
-    trigger."""
+def _eod_due_day(now_naive: datetime, eod_time: _time):
+    """The market day whose EOD chain is due: today once past ``eod_time`` on a
+    market day, else the latest earlier market day — so a chain a relaunch or a
+    reboot interrupted resumes (its record, `eod.state_path`, says what is left).
+    Independent of the slot grid: a missed close slot never blocks maintenance."""
     if not settings.enable_eod_maintenance:
-        return False
-    return (last_eod_date != now_naive.date()
-            and now_naive.time() >= eod_time
-            and is_market_day(now_naive.date()))
+        return None
+    d = now_naive.date()
+    if is_market_day(d) and now_naive.time() >= eod_time:
+        return d
+    for _ in range(10):
+        d -= timedelta(days=1)
+        if is_market_day(d):
+            return d
+    return None
 
 
 _RESCORE_THREAD = None
@@ -629,159 +656,142 @@ def _maybe_start_nightly_rescore() -> bool:
     return True
 
 
-_EOD_THREAD = None
+# ── EOD maintenance: its own process (2026-10-07) ────────────────────────────
+# The chain (`src.scheduler.eod`) ran as a thread in this process until its 5-13 h
+# replay, competing with the evening ticks for the GIL, pushed ticks past the
+# watchdog — and every relaunch restarted it from scratch. It is a subprocess now:
+# below normal priority, a file log, an OS lock, a per-step record it resumes from,
+# and database access only between ticks (`db_fence`). This process decides WHEN,
+# launches it, and reports the steps it finishes.
+_EOD_PROC_THREAD = None
+_EOD_LAUNCHES: dict = {}          # day -> monotonic launch times, this process
+_EOD_GAVE_UP: set = set()
+_EOD_ANNOUNCED: set = set()       # (day, step) outcomes this process has logged
+_EOD_REFRESHED: set = set()       # days whose finished chain refreshed this process's caches
+_EOD_MAX_LAUNCHES = 3             # per day per process: a chain that keeps dying is left to the operator
+_EOD_RELAUNCH_GAP_SECONDS = 600.0
+_PROCESS_STARTED_ISO = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _run_eod_maintenance() -> None:
-    """Launch the EOD maintenance in a BACKGROUND thread (2026-08-11).
-
-    It ran inline in the scheduler loop until the 20y cache made it a >5.5h job
-    (measured 2026-08-10) that starved the entire extended + overnight sessions
-    — "off the time-critical path" was only true while it was short. Same
-    pattern as the nightly rescore: single-flight guard, daemon thread, the
-    loop keeps ticking. The heavy phases hold no DB lock (compute, then write
-    briefly) and both sides retry on the write lock. `last_eod_date` is marked
-    by the caller at LAUNCH, so a >24h EOD cannot re-trigger itself; a still-
-    running thread at the next day's slot is warned about and skipped."""
-    global _EOD_THREAD
-    if _EOD_THREAD is not None and _EOD_THREAD.is_alive():
-        logger.warning("[scheduler] EOD maintenance still running from a previous "
-                       "day — not starting another")
+def _eod_poll(now_naive: datetime, eod_time: _time) -> None:
+    """One look at the EOD chain: report what it finished, refresh the slow
+    calibrations once it is done, (re)launch it when it is due, not finished and
+    not running."""
+    from src.scheduler import eod
+    cur = eod.current()
+    if cur and cur.get("day"):
+        _eod_announce(cur["day"])
+    day = _eod_due_day(now_naive, eod_time)
+    if day is None:
         return
-    import threading as _threading
-    _EOD_THREAD = _threading.Thread(target=_eod_work, name="eod-maintenance",
-                                    daemon=True)
-    _EOD_THREAD.start()
-    logger.info("[scheduler] EOD maintenance STARTING in background thread")
+    st = _eod_announce(day)
+    if st.get("finished"):
+        _eod_refresh_caches(day, st)
+        return
+    if (_EOD_PROC_THREAD is not None and _EOD_PROC_THREAD.is_alive()) or eod.running():
+        return
+    launches = _EOD_LAUNCHES.setdefault(day, [])
+    if len(launches) >= _EOD_MAX_LAUNCHES:
+        if day not in _EOD_GAVE_UP:
+            _EOD_GAVE_UP.add(day)
+            logger.warning(f"[scheduler] EOD chain for {day} launched {len(launches)} times without "
+                           f"finishing — not relaunching it ({eod.summary_line(st)}; "
+                           f"logs/eod_{day}.log; `python -m src.scheduler.eod --day {day}`)")
+        return
+    if launches and _time_module.monotonic() - launches[-1] < _EOD_RELAUNCH_GAP_SECONDS:
+        return
+    launches.append(_time_module.monotonic())
+    _eod_launch(day, st)
 
 
-def _eod_work() -> None:
-    """The EOD body: cache warm → retention → replay, then walk-forward ∥ ML
-    retrains in parallel (the trains need the replay-refreshed panel; the
-    walk-forward does not feed them). Every stage fail-soft."""
-    logger.info("[scheduler] EOD maintenance: warming forward-return cache + retention…")
-    # Drop the slow-moving panel calibrations so the fresh panel / replay /
-    # walk-forward / retrained models produced below are picked up on the NEXT
-    # tick rather than waiting out ic_weight_cache_seconds (2 h). The TTL is long
-    # precisely because these move slowly WITHIN a day; EOD is when they change.
+def _eod_announce(day) -> dict:
+    """Log each step outcome once per process — only those reached after this
+    process started (earlier ones are already in the log)."""
+    from src.scheduler import eod
+    st = eod.load_state(day)
+    for step in (eod.FLEX,) + eod.STEPS:
+        rec = st["steps"].get(step) or {}
+        key = (str(day), step)
+        if rec.get("status") not in ("ok", "failed") or key in _EOD_ANNOUNCED:
+            continue
+        _EOD_ANNOUNCED.add(key)
+        if str(rec.get("finished") or "") < _PROCESS_STARTED_ISO:
+            continue
+        if rec["status"] == "ok":
+            logger.info(f"[scheduler] EOD {step} ({day}): {rec.get('summary')}")
+        else:
+            logger.warning(f"[scheduler] EOD {step} ({day}) failed: {rec.get('summary')}")
+    return st
+
+
+def _eod_refresh_caches(day, st: dict) -> None:
+    """Once per finished chain: drop the slow-moving panel calibrations so the next
+    tick reads the fresh panel, replay and weights instead of waiting out
+    `ic_weight_cache_seconds`."""
+    if str(day) in _EOD_REFRESHED:
+        return
+    _EOD_REFRESHED.add(str(day))
     try:
         from src.analysis.market_relative import reset_cache as _reset_market_relative
         from src.signals.aggregator import reset_winrate_filter_cache
         reset_winrate_filter_cache()
         _reset_market_relative()
-    except Exception as exc:
+    except Exception as exc:                              # noqa: BLE001
         logger.debug(f"[scheduler] EOD calibration-cache reset skipped: {exc}")
+    if str(st.get("finished") or "") >= _PROCESS_STARTED_ISO:
+        from src.scheduler import eod
+        logger.info(f"[scheduler] EOD maintenance for {day} FINISHED ({eod.summary_line(st)}) — "
+                    "win-rate and market-relative calibrations refreshed")
+
+
+def _eod_launch(day, st: dict) -> None:
+    global _EOD_PROC_THREAD
+    _EOD_PROC_THREAD = threading.Thread(target=_eod_process_work, args=(day, st), name="eod-process",
+                                        daemon=True)
+    _EOD_PROC_THREAD.start()
+
+
+def _eod_process_work(day, st: dict) -> None:
+    """Run the chain as a SUBPROCESS and wait for it. Its output goes to a FILE,
+    never a pipe: a watchdog kill of this process orphans it, and it carries on."""
+    import os as _os
+    import subprocess as _sp
+    from src.scheduler import eod
+    done = [s for s, r in (st.get("steps") or {}).items() if (r or {}).get("status") in eod.FINAL]
     try:
-        from src.data.cache_warm import warm_forward_return_cache
-        warm_forward_return_cache(
-            days=int(settings.eod_cache_warm_days),
-            max_tickers=(settings.eod_cache_warm_max_tickers or None))
-    except Exception as exc:
-        logger.warning(f"[scheduler] EOD cache warm failed: {exc}")
-    try:
-        from src.db.retention import run_retention
-        res = run_retention()
-        if res:
-            logger.info(f"[scheduler] EOD retention: {res}")
-    except Exception as exc:
-        logger.warning(f"[scheduler] EOD retention failed: {exc}")
-    # Rescore history through the CURRENT scorers so the calibrations fit values
-    # today's code produced. Runs AFTER the cache warm above, which is what
-    # supplies the bars a replay reads. Fail-soft: a stale replay table only
-    # means the epoch mask blanks more, never that a wrong value is served.
-    if settings.enable_eod_replay_refresh:
-        try:
-            from src.analysis.replay import materialize
-            n = materialize(days=(int(settings.eod_replay_refresh_days) or None))
-            logger.info(f"[scheduler] EOD replay: {n:,} ticker-days rescored")
-        except Exception as exc:
-            logger.warning(f"[scheduler] EOD replay refresh failed: {exc}")
-    # Append TODAY's point-in-time calibration to `weight_history`. Incremental
-    # by design: each step is a fixed fact about a date once its data is in, so
-    # only the tail is recomputed (`walkforward_eod_days`) rather than rewalking
-    # the whole span, which costs ~60s PER STEP. Runs after the replay above,
-    # which supplies the panel the calibration reads.
-    def _wf_step() -> None:
-        if not settings.enable_eod_walkforward:
-            return
-        try:
-            from datetime import date as _date, timedelta as _td
-            from src.analysis.walkforward import materialize as wf_materialize
-            _lookback = max(1, int(settings.walkforward_eod_days))
-            _start = (_date.today() - _td(days=_lookback)).isoformat()
-            n = wf_materialize(start=_start, step_days=1)
-            logger.info(f"[scheduler] EOD walk-forward: {n} calibration step(s) stored")
-        except Exception as exc:
-            logger.warning(f"[scheduler] EOD walk-forward failed: {exc}")
-
-    # ML retrains are NOT here anymore (2026-08-12, user directive): models
-    # retrain ONCE A WEEK, Saturday morning — see `_run_weekly_ml_train`. The
-    # EOD keeps the data-freshness chain (warm → retention → replay → the
-    # walk-forward below), which the weekly trains then read on Saturday.
-    _wf_step()
-
-    # Walk-forward SHAPE history (2026-08-21): append today's as-of curve row so
-    # the rank-shaping layer has the same point-in-time series the weights have
-    # (`weight_history`'s sibling). Idempotent per date; runs BEFORE the
-    # backtest tail below, which consumes it in walk-forward mode.
-    if settings.enable_eod_shape_history:
-        try:
-            from src.signals.rank_shaping import materialize_shape_history
-            from datetime import date as _d
-            n = materialize_shape_history(start=_d.today().isoformat(), step_days=1)
-            if n:
-                logger.info(f"[scheduler] EOD shape history: {n} row(s) appended")
-        except Exception as exc:
-            logger.warning(f"[scheduler] EOD shape history failed: {exc}")
-
-    # Tier-2 rescoring tail (2026-08-20): keep `signals_backtest` — "what would
-    # the CURRENT entry architecture have decided" — current for the newest
-    # runs. Auto-refactor rewrites the WHOLE table when scorer code moves; this
-    # covers the other staleness source, plain new data, by recomputing the
-    # same trailing span the replay above refreshed (walk-forward weights make
-    # earlier rows fixed facts). Runs AFTER the walk-forward step so today's
-    # rows resolve today's calibration instead of being skipped. Firewalled
-    # table (nothing in the calibration path reads it) — staleness here only
-    # ever degrades an ANALYSIS surface, so fail-soft.
-    if settings.enable_eod_backtest_refresh:
-        try:
-            from src.analysis.backtest import materialize as bt_materialize
-            n = bt_materialize(days=(int(settings.eod_replay_refresh_days) or None))
-            logger.info(f"[scheduler] EOD backtest: {n:,} ticker-days rescored "
-                        "under the current entry architecture")
-        except Exception as exc:
-            logger.warning(f"[scheduler] EOD backtest refresh failed: {exc}")
-
-    # IBKR BID_ASK spread sweep (2026-08-31): measure each Gate-4 name's
-    # time-avg quoted half-spread into cache/ibkr_spread.json — the liquidity
-    # forecast's primary structural layer. A SUBPROCESS, not an in-thread call:
-    # ib_async needs an event loop this background thread doesn't own, and a
-    # second in-process gateway session would contend with the tick's broker
-    # connection. Own clientId (ibkr_client_id+50); budget-capped; the rotation
-    # makes a cut-short run resume next night.
-    if settings.enable_eod_spread_sweep and str(settings.broker_mode or "off").startswith("ibkr"):
-        try:
-            import subprocess as _sp
-            import sys as _sys
-            _budget = float(settings.spread_sweep_budget_seconds)
-            _res = _sp.run(
-                [_sys.executable, "-m", "src.performance.spread_sweep"],
-                capture_output=True, text=True, timeout=_budget + 300,
-                encoding="utf-8", errors="replace",
+        console = eod.CONSOLE
+        console.parent.mkdir(parents=True, exist_ok=True)
+        with open(console, "w", encoding="utf-8", errors="replace") as fh:
+            proc = _sp.Popen(
+                [sys.executable, "-m", "src.scheduler.eod", "--day", str(day)],
+                stdout=fh, stderr=_sp.STDOUT,
+                env={**_os.environ, "PYTHONIOENCODING": "utf-8"},
+                creationflags=(0x00004000 if _os.name == "nt" else 0),   # BELOW_NORMAL_PRIORITY_CLASS
             )
-            _tail = (_res.stdout or "").strip().splitlines()[-8:]
-            logger.info("[scheduler] EOD spread sweep: " + (" ".join(_tail) or f"rc={_res.returncode}"))
-            if _res.returncode != 0:
-                logger.warning(f"[scheduler] EOD spread sweep rc={_res.returncode}: "
-                               f"{(_res.stderr or '').strip()[-400:]}")
-        except Exception as exc:
-            logger.warning(f"[scheduler] EOD spread sweep failed: {exc}")
+            logger.info(f"[scheduler] EOD maintenance for {day} STARTING as its own process (pid {proc.pid}"
+                        + (f"; already done: {', '.join(done)}" if done else "") + f"; logs/eod_{day}.log)")
+            rc = proc.wait()
+        st2 = eod.load_state(day)
+        (logger.info if rc == 0 else logger.warning)(
+            f"[scheduler] EOD process for {day} exited rc={rc}: {eod.summary_line(st2)}")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[scheduler] EOD process for {day} failed to run: {exc}")
 
-    # NOTE the automatic refactor is deliberately NOT here — it runs on its own
-    # nightly slot (`_maybe_start_nightly_rescore`, 02:00 ET by default) in a
-    # background thread. It is a ~40-minute job, and this function runs INLINE
-    # in the scheduler loop, so hosting it here would block every tick for its
-    # duration.
+
+def _eod_fence_ahead(now_naive: datetime, slots) -> None:
+    """Hold the database from `eod_tick_fence_lead_seconds` before a slot, so the
+    EOD process starts no query a tick would have to wait behind; drop it when no
+    slot is near (a running tick holds its own)."""
+    from src.scheduler import db_fence
+    lead = max(0, int(settings.eod_tick_fence_lead_seconds))
+    try:
+        if lead and _missed_slots_between(now_naive, now_naive + timedelta(seconds=lead), slots, 0):
+            if not db_fence.fence_is_ours():
+                db_fence.raise_fence("slot ahead")
+        elif db_fence.fence_is_ours():
+            db_fence.drop_fence()
+    except Exception as exc:                              # noqa: BLE001
+        logger.debug(f"[scheduler] database fence: {exc}")
 
 
 def _alert(subject: str, body: str) -> None:
@@ -959,7 +969,6 @@ def start_scheduler() -> None:
     last_run_slot: datetime | None = None
     alerted_slots: set[datetime] = set()
     prev_poll: datetime | None = None
-    last_eod_date = None
     eod_time = _parse_hhmm(settings.eod_maintenance_time, _time(16, 20)) or _time(16, 20)
     last_ml_train_date = None
     ml_train_time = _parse_hhmm(settings.ml_retrain_time, _time(8, 0)) or _time(8, 0)
@@ -975,8 +984,9 @@ def start_scheduler() -> None:
                     f"night incl. weekends (subprocess, budget "
                     f"{int(settings.deep_refresh_budget_seconds)}s): cache/ml/deep tails.")
     if settings.enable_eod_maintenance:
-        logger.info(f"EOD maintenance at/after {eod_time.strftime('%H:%M')} ET: "
-                    "forward-return cache warm + table retention (market days).")
+        logger.info(f"EOD maintenance at/after {eod_time.strftime('%H:%M')} ET on market days, as its own "
+                    "process (src.scheduler.eod: resumes an interrupted chain; database only between "
+                    f"ticks, fenced {int(settings.eod_tick_fence_lead_seconds)}s ahead of each slot).")
     # Announce the weekly-retrain state at startup. A HELD retrain is silent by
     # construction (`_should_run_weekly_ml_train` just returns False), and a
     # frozen model that everyone believes is refreshing weekly is the same
@@ -1121,8 +1131,6 @@ def start_scheduler() -> None:
                             _alert_crash("catch-up tick", exc)
                 last_run_slot = slot_dt  # mark even when skipped, so we don't retry this slot
 
-            # End-of-day maintenance — once per market day past the trigger,
-            # off the time-critical path (runs between ticks, after the close).
             # Nightly rescore — its own slot, NOT inside EOD maintenance: it is
             # a ~40-minute job and this loop is single-threaded, so running it
             # inline would block the overnight ticks it overlaps. Change
@@ -1134,13 +1142,14 @@ def start_scheduler() -> None:
                 except Exception as exc:
                     logger.exception(f"[scheduler] nightly rescore trigger raised: {exc}")
 
-            if _should_run_eod(now_naive, last_eod_date, eod_time):
-                last_eod_date = now_naive.date()
-                try:
-                    _run_eod_maintenance()
-                except Exception as exc:
-                    logger.exception(f"[scheduler] EOD maintenance raised: {exc}")
-                    _alert_crash("EOD maintenance", exc)
+            # End-of-day maintenance — its own process, launched once past the
+            # trigger on a market day and resumed after an interruption; read
+            # on a fresh clock (a tick above may have run past midnight).
+            try:
+                _eod_poll(now_et().replace(tzinfo=None), eod_time)
+            except Exception as exc:
+                logger.exception(f"[scheduler] EOD maintenance check raised: {exc}")
+                _alert_crash("EOD maintenance", exc)
 
             # Weekly ML retrain — Saturday morning (2026-08-12 directive:
             # models retrain once a week, not nightly).
@@ -1153,6 +1162,10 @@ def start_scheduler() -> None:
 
             # The deep history refresh (23:45 ET nightly) and the pre-open run
             # (08:30 ET, market days) are on `_start_deep_slot_timer`'s thread.
+
+            # The database fence ahead of the next slot (the EOD process starts
+            # no query a tick would wait behind), checked after this pass's tick.
+            _eod_fence_ahead(now_et().replace(tzinfo=None), slots)
 
             # The gap detector measures the SLEEP between polls: stamped here,
             # after this pass's tick, a tick's own runtime never reads as a

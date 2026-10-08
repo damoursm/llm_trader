@@ -381,8 +381,8 @@ def test_sweep_skips_without_ibkr_broker(monkeypatch):
 
 def test_eod_chain_launches_the_sweep():
     import inspect
-    import src.scheduler.runner as runner
-    src = inspect.getsource(runner._eod_work)
+    import src.scheduler.eod as eod
+    src = inspect.getsource(eod)
     assert "spread_sweep" in src
     assert "enable_eod_spread_sweep" in src
 

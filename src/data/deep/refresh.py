@@ -101,6 +101,7 @@ FAMILIES: List[Tuple[str, float]] = [
     ("context", DAILY),
     ("regsho", DAILY),
     ("borrow", DAILY),
+    ("borrow_history", DAILY),
     ("quiver_live", DAILY),
     ("yf", DAILY),
     ("quiver_dpi", DAILY),
@@ -155,6 +156,7 @@ NIGHTLY_LANES: Dict[str, str] = {
     "ticker_details": "polygon", "ipos": "polygon", "delisted": "polygon",
     "quiver_live": "quiver", "quiver_dpi": "quiver", "quiver_history": "quiver",
     "yf": "yf", "context": "context", "wiki": "wiki", "regsho": "regsho", "borrow": "borrow",
+    "borrow_history": "ibkr_hist",
 }
 
 # The pre-open's two per-ticker Polygon families (no market-wide endpoint: bars
@@ -771,6 +773,27 @@ def refresh_borrow(**_) -> dict:
     return {"family": "borrow", "rows": int(borrow.build_daily())}
 
 
+def refresh_borrow_history(deadline: Optional[float] = None, **_) -> dict:
+    """The backtests' borrow history (`src/data/deep/borrow_history.py`, user directive 2026-10-06): IBKR's API fee
+    history for the universe names that have none yet (a name the universe added; paced on its own client id, never
+    through IBC's daily restart, at most 30 minutes), the names the ledger ever shorted without one and the last month
+    for the names it is short (at most 10 minutes each), then ``fee_api_daily.parquet`` rebuilt.
+    The community archive (2017-10 .. 2024-06) is frozen: built once, never here."""
+    from src.data.deep import borrow_history as bh
+    budget = 1800.0 if deadline is None else min(1800.0, _budget(deadline))
+    r = {"family": "borrow_history", "fetch": bh.fetch_missing(budget_seconds=budget)}
+    # the names the ledger ever shorted that have no history yet (a name outside the universe), then the ones it is
+    # short now or covered this week: IBKR's last month of daily rates, so the ledger's day-by-day borrow fee
+    # (src/performance/borrow_fees.py) has IBKR's rate for every day they were held
+    try:
+        r["ledger"] = bh.fetch_missing(budget_seconds=600.0, names=bh.held_short_names(None))
+        r["held"] = bh.refresh_names(bh.held_short_names(), budget_seconds=600.0)
+    except Exception as e:                                          # noqa: BLE001
+        r["held"] = {"error": f"{type(e).__name__}: {e}"[:200]}
+    r["rows"] = int(bh.build_fee_api()["rows"])
+    return r
+
+
 def refresh_context(deadline: Optional[float] = None, **_) -> dict:
     """market_daily / fama_french / dix: one call each, overwritten. cot_tff:
     the current year's file (and January re-reads December's year). FRED:
@@ -1181,6 +1204,7 @@ REFRESHERS: Dict[str, Callable[..., dict]] = {
     "context": refresh_context,
     "regsho": refresh_regsho,
     "borrow": refresh_borrow,
+    "borrow_history": refresh_borrow_history,
     "quiver_live": refresh_quiver_live,
     "short_interest": refresh_short_interest,
     "quiver_dpi": refresh_quiver_dpi,

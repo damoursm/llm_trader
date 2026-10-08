@@ -49,7 +49,7 @@ import math
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -59,6 +59,7 @@ from src.broker.base import OrderResult, Quote
 from src.broker.fx import usd_per_unit
 from src.broker.sizing import shares_for, shares_for_notional, within_caps
 from src.db import repo
+from src.performance.books import is_live
 
 
 def _entry_side(action: str) -> str:
@@ -229,6 +230,60 @@ def _limit_price_for(side: str, model: float, outside_rth: bool = False,
     steps = cap / tick
     cap = (math.ceil(steps) if side == "BUY" else math.floor(steps)) * tick
     return round(cap, 2 if model >= 1.0 else 4)
+
+
+# ── Rule 201 (user 2026-10-05: "The broker doesn't handle Rule 201 when the short-sale restriction is
+# on" — fix it). Once a stock falls 10% under the previous close, a short may not execute at or below
+# the national best bid for the rest of that day and the next. The entry was a marketable sell limit
+# crossing down to the bid, which the venue re-prices above it, and the settle pass then killed it
+# after 30 s — 61% of the vol book's backtest entries were under the restriction. A short entry under
+# it is now priced ONE TICK ABOVE THE BID (a passive offer the rule allows) and rests until the next
+# tick, which re-anchors it at the new bid; the leg is stamped ``broker_ssr``.
+RULE201_DROP = 0.10
+
+
+def _rule201_in_force(t: dict) -> Tuple[bool, str]:
+    """``(in force, why)`` for a NEW short in ``t``'s name: the pick recorded the restriction
+    (``sel_ssr``: the day's low through the pick bar >= 10% under the previous close, or the previous
+    day's trigger) — "pick" —, or it triggered since (Polygon's snapshot: today's low >= 10% under the
+    previous close) — "live"."""
+    if t.get("sel_ssr"):
+        return True, "pick"
+    try:
+        from src.data.polygon_client import get_day_low_prev_close
+        r = get_day_low_prev_close(t["ticker"])
+    except Exception as e:                                     # noqa: BLE001 — no live check this time
+        logger.debug(f"[broker] Rule 201 live check failed for {t.get('ticker')}: {e}")
+        r = None
+    if r and r[0] <= (1.0 - RULE201_DROP) * r[1]:
+        return True, "live"
+    return False, ""
+
+
+def _bid_now(broker, ticker: str) -> Optional[float]:
+    """The national best bid now: the broker's / Polygon's quote (`_quote_for`), else Polygon's
+    last NBBO directly (fresh within ``_NBBO_FRESH_SECONDS``), else None."""
+    q = _quote_for(broker, ticker)
+    if q is not None and q.bid:
+        return float(q.bid)
+    try:
+        from src.data.polygon_client import get_last_nbbo
+        n = get_last_nbbo(ticker)
+        if n and n.get("bid") and n.get("age_s") is not None and n["age_s"] <= _NBBO_FRESH_SECONDS:
+            return float(n["bid"])
+    except Exception as e:                                     # noqa: BLE001
+        logger.debug(f"[broker] bid fetch failed for {ticker}: {e}")
+    return None
+
+
+def _rule201_limit(bid: Optional[float], model: float) -> Optional[float]:
+    """The lowest short price Rule 201 allows: one tick above the national best bid; the model
+    price when there is no bid. Rounded UP to the tick."""
+    if not model or model <= 0:
+        return None
+    tick = 0.01 if model >= 1.0 else 0.0001
+    base = float(bid) + tick if bid and float(bid) > 0 else float(model)
+    return round(math.ceil(base / tick - 1e-9) * tick, 2 if model >= 1.0 else 4)
 
 
 def _overnight_routing_active() -> bool:
@@ -542,7 +597,10 @@ def _resend_refused(broker: Broker, t: dict, prefix: str, intent: str, req: Orde
         n = int(t.get(f"{prefix}resubmit_n") or 0) + 1
         t[f"{prefix}resubmit_n"] = n
         live = _live_price(t["ticker"]) or model_price
-        limit = _limit_price_for(req.side, live, outside_rth, _quote_for(broker, t["ticker"]))
+        if intent == "ENTRY" and t.get("broker_ssr"):         # Rule 201: still one tick above the bid
+            limit = _rule201_limit(_bid_now(broker, t["ticker"]), live)
+        else:
+            limit = _limit_price_for(req.side, live, outside_rth, _quote_for(broker, t["ticker"]))
         req = replace(req, client_ref=f"{_leg_ref_base(t, prefix)}-r{n}", order_type="LMT",
                       limit_price=limit or req.limit_price)
         logger.info(f"[broker] {intent} {t['ticker']}: refused ({res.error or res.status}) — "
@@ -802,17 +860,60 @@ def _owned_by_open(trades: List[dict], exclude: Optional[dict] = None) -> Dict[s
     return out
 
 
+def _buy_in_check(trades: List[dict], positions: dict, report: dict) -> bool:
+    """IBKR bought a short back? (user 2026-10-07: "The lender can take back borrowed shares, and IBKR then
+    buys back our short at market.") Per ticker the selection short holds, IBKR's position is compared with
+    the shares its OPEN trades own (their recorded entry fills, `_owned_by_open`): fewer short shares at
+    IBKR than the open trades own, on `broker_buy_in_confirm_syncs` syncs running, is a forced BUY-IN (or a
+    manual close) — CRITICAL, listed in ``report["buy_in_suspects"]`` and so in the broker banner. The
+    ledger is NOT closed here: a stale positions read would otherwise send the drift pass after a live short.
+    Each trade carries ``broker_short_missing_n`` / ``_since`` while it lasts. True when a trade changed."""
+    owned = _owned_by_open(trades)
+    need = max(1, int(getattr(settings, "broker_buy_in_confirm_syncs", 3) or 3))
+    changed = False
+    by_tk: Dict[str, List[dict]] = {}
+    for t in trades:
+        if (t.get("status") == "OPEN" and t.get("entry_mechanism") == "sel_short"
+                and int(t.get("broker_fill_qty") or 0) > 0 and t.get("action") == "SELL"):
+            by_tk.setdefault(t["ticker"], []).append(t)
+    for tk, ts in by_tk.items():
+        q = owned.get(tk, 0)
+        p = positions.get(tk)
+        held = int(p.quantity) if p is not None else 0
+        missing = held - q if q < 0 and held > q else 0         # q, held: signed (short < 0)
+        for t in ts:
+            if missing > 0:
+                n = int(t.get("broker_short_missing_n") or 0) + 1
+                t["broker_short_missing_n"] = n
+                t.setdefault("broker_short_missing_since", _utcnow_iso())
+                changed = True
+                if n >= need:
+                    report.setdefault("buy_in_suspects", []).append(
+                        {"ticker": tk, "trade": t.get("recommendation_id"), "ledger_short": -q,
+                         "ibkr_short": max(0, -held), "missing": missing, "since": t["broker_short_missing_since"]})
+                    if n == need:
+                        logger.critical(f"[broker] {tk}: IBKR holds {max(0, -held)} short shares, the open trades own "
+                                        f"{-q} — a forced BUY-IN (share recall) or a manual close since "
+                                        f"{t['broker_short_missing_since']}; the ledger still carries it OPEN")
+            elif t.get("broker_short_missing_n"):
+                t.pop("broker_short_missing_n", None)
+                t.pop("broker_short_missing_since", None)
+                changed = True
+    return changed
+
+
 def _entry_qty(t: dict, price: float, equity_usd: float, fx_notional: float) -> int:
     """Whole shares for an entry. A selection short the SIMULATED ACCOUNT funded
-    (`sim_account`, user directive 2026-10-05: the vol arm sized from $5,000 + $1,000
-    every 14 days) orders exactly the account's share count, whatever the price it is
-    resent at; every other entry the configured sizing (`broker_sizing_mode`) times the
-    trade's multiplier."""
-    if t.get("sel_account_shares") is not None:
-        try:
-            return max(0, int(t["sel_account_shares"]))
-        except (TypeError, ValueError):
-            return 0
+    (`sim_account`, user directive 2026-10-05) and a dip long its own cash account funded
+    (`dip_long`, 2026-10-08) order exactly the account's share count, whatever the price
+    they are resent at; every other entry the configured sizing (`broker_sizing_mode`)
+    times the trade's multiplier."""
+    for key in ("sel_account_shares", "dip_account_shares"):     # a live book's simulated account
+        if t.get(key) is not None:
+            try:
+                return max(0, int(t[key]))
+            except (TypeError, ValueError):
+                return 0
     mult = t.get("position_size_multiplier", 1.0)
     if settings.broker_sizing_mode == "equity_pct":
         return shares_for(equity_usd, price, mult)
@@ -1282,6 +1383,8 @@ def _settle_unfilled_this_tick(broker: Broker, trades: List[dict], report: dict,
                 sub_at = t.get(f"{prefix}submitted_at")
                 if _predates(sub_at, sync_started):
                     continue   # an earlier tick's order — the stale pass owns it
+                if prefix == "broker_" and t.get("broker_ssr"):
+                    continue   # a Rule 201 short rests at the bid + 1 tick until the next tick re-anchors it
                 out.append((t, prefix, intent))
         return out
 
@@ -1715,6 +1818,9 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         # ── FILL REFRESH: repair orders that completed after a previous tick ──
         changed = _refresh_fills(broker, trades, report) or changed
 
+        # ── BUY-INS: shorts IBKR holds fewer shares of than the open trades own ──
+        changed = _buy_in_check(trades, positions, report) or changed
+
         # ── ORPHAN SWEEP: working orders no ledger leg owns ───────────────
         # Runs before any decision is made, so this tick reasons about a book
         # that only contains orders the ledger actually placed.
@@ -1770,12 +1876,13 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 continue  # idempotent — already submitted
             if t.get("broker_status") in ("DUPLICATE_REF_NOT_SUBMITTED", "REFUSED_GAVE_UP"):
                 continue  # twin of an already-submitted trade / refused too often — never re-sent
-            if (settings.enable_sel_short and not settings.enable_legacy_entries
-                    and t.get("entry_mechanism") != "sel_short"):
-                # The selection short is the live book (2026-09-28) and the legacy
-                # books are SHADOW: a legacy entry the broker never filled is not
-                # sent (or chased) now, only for the one-shot flatten to close it.
-                # A filled or partly filled one keeps its position until then.
+            if ((settings.enable_sel_short or getattr(settings, "enable_dip_long", False))
+                    and not settings.enable_legacy_entries and not is_live(t)):
+                # The live books trade (the selection short from 2026-09-28, the dip
+                # long book from 2026-10-08) and the legacy books are SHADOW: a legacy
+                # entry the broker never filled is not sent (or chased) now, only for
+                # the one-shot flatten to close it. A filled or partly filled one keeps
+                # its position until then.
                 if t.get("broker_status") != "LEGACY_ENTRY_SHADOWED":
                     t["broker_status"] = "LEGACY_ENTRY_SHADOWED"
                     changed = True
@@ -1788,17 +1895,18 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 # chase only when the price is still near the decision AND the
                 # signal hasn't flipped; otherwise HOLD and let the next tick
                 # re-evaluate. Off / no map → legacy chase.
-                # The selection short takes its own rule: re-anchor and resend
-                # while its ledger row is open — the monitor closes the row once
+                # The live books take their own rule: re-anchor and resend while the
+                # ledger row is open — the selection short's monitor closes the row once
                 # the target is reached, and an entry 1-3 bars late measured as
-                # good as one at the pick (2026-09-26). The price-aware gate reads
+                # good as one at the pick (2026-09-26); a dip long is a liquid
+                # mega-cap bought at the open. The price-aware gate reads
                 # the LEGACY rank rule's map, where these names are absent
                 # ("decayed": a short resent only at a higher price) or on its
                 # long side ("flipped"), so it would strand every short whose
                 # price fell before it filled.
                 if (settings.broker_price_aware_resubmit
                         and actionable_by_ticker is not None
-                        and t.get("entry_mechanism") != "sel_short"
+                        and not is_live(t)
                         and _resubmit_decision(t, actionable_by_ticker) == "skip"):
                     t["broker_status"] = "RESUBMIT_HELD_ADVERSE"
                     changed = True
@@ -1885,6 +1993,16 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
             limit = (_limit_price_for(side, price, outside_rth,
                                       _quote_for(broker, t["ticker"]))
                      if use_limit else None)
+            leg_type = order_type
+            if side == "SELL" and getattr(settings, "enable_broker_rule201", False):
+                ssr, why201 = _rule201_in_force(t)
+                t["broker_ssr"] = ssr
+                if ssr:                        # a short the rule allows: one tick above the bid, resting
+                    limit, leg_type = _rule201_limit(_bid_now(broker, t["ticker"]), price), "LMT"
+                    t["broker_ssr_source"] = why201
+                    logger.info(f"[broker] entry {t['ticker']}: Rule 201 short-sale price test in force "
+                                f"({why201}) — short offered at {limit}, one tick above the bid, resting "
+                                f"until the next tick")
             ref = t.get("recommendation_id") or f"{t.get('run_id', '')}-{t['ticker']}"
             if resubmit_n:
                 ref = f"{ref}-r{resubmit_n}"   # fresh ref per resubmission cycle
@@ -1899,7 +2017,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                 continue
             req = OrderRequest(
                 ticker=t["ticker"], side=side, quantity=qty,
-                order_type=order_type, limit_price=limit,
+                order_type=leg_type, limit_price=limit,
                 client_ref=ref,
                 intent="ENTRY", outside_rth=outside_rth,
                 overnight=_overnight_routing_active(),

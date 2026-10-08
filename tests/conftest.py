@@ -95,6 +95,16 @@ def _isolated_news_coverage_and_live_features(tmp_path, monkeypatch):
     monkeypatch.setattr(ibkr_borrow, "ARCHIVE_DIR", tmp_path / "ibkr_borrow")
     monkeypatch.setattr(settings, "enable_ibkr_borrow_snapshot", False)
     ibkr_borrow.reset()
+    # IBKR's day-by-day borrow fee (2026-10-06) reads the real fee history and
+    # IBKR's charges: off in the baseline (the flat carry the older tests pin;
+    # its own tests opt in), and no test ever calls IBKR's Flex service.
+    from src.broker import flex
+    from src.performance import borrow_fees
+    monkeypatch.setattr(settings, "enable_ibkr_borrow_schedule", False)
+    monkeypatch.setattr(settings, "ibkr_flex_token", "")
+    monkeypatch.setattr(settings, "ibkr_flex_query_id", "")
+    monkeypatch.setattr(flex, "RAW_DIR", tmp_path / "ibkr_flex")
+    borrow_fees.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -112,11 +122,40 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "enable_sel_short_volnorm_exit", False)
     # the vol arm's squeeze cover reads the production split data, and the simulated account
     # sizes vol picks (2026-10-05): their tests opt in
-    monkeypatch.setattr(settings, "enable_sel_short_vol_squeeze_cover", False)
+    monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", False)
     monkeypatch.setattr(settings, "enable_sel_short_account_sizing", False)
+    # IBKR's what-if at entry would dial the REAL gateway (broker_mode comes from .env): its tests
+    # opt in with a fake broker
+    monkeypatch.setattr(settings, "enable_sel_short_ibkr_whatif", False)
+    # the halt guard reads NYSE's current-halt list over the network: its tests opt in with a fake list
+    monkeypatch.setattr(settings, "enable_sel_short_halt_guard", False)
+    # the vol arm's thin stocks (2026-10-07) add a fourth arm to every run: their tests opt in
+    monkeypatch.setattr(settings, "enable_sel_short_thin", False)
+    monkeypatch.setattr(settings, "enable_sel_short_vol2", False)
+    # the dip long book (2026-10-08) reads the deep store and journals under its own dir: its tests opt in
+    monkeypatch.setattr(settings, "enable_dip_long", False)
+    monkeypatch.setattr(settings, "dip_long_dir", str(tmp_path / "dip_long"))
+    from src.data import trade_halts
+    trade_halts.reset()
     monkeypatch.setattr(settings, "legacy_flatten_after", "")
     monkeypatch.setattr(tracker, "_LEGACY_FLATTEN_MARKER", tmp_path / "legacy_flatten_done.json")
     sel_short._MODEL.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_eod(tmp_path, monkeypatch):
+    """The EOD process (2026-10-07) keeps its day records, lock and the database
+    fence under cache/eod, and logs to logs/: a tick a test runs raises the fence
+    there, and a production EOD process would wait behind it. No connection gate
+    survives a test."""
+    from src.db import connection
+    from src.scheduler import db_fence, eod
+    monkeypatch.setattr(db_fence, "DIR", tmp_path / "eod")
+    monkeypatch.setattr(eod, "DIR", tmp_path / "eod")
+    monkeypatch.setattr(eod, "CONSOLE", tmp_path / "logs" / "eod_console.log")
+    monkeypatch.setattr(eod, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(connection, "_GATE", None)
+    monkeypatch.setattr(connection, "_LOCK_RETRIES", connection._LOCK_RETRIES)
 
 
 @pytest.fixture(autouse=True)

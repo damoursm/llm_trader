@@ -200,6 +200,28 @@ def test_a_stacked_short_is_sized_in_full(repo_store):
     assert [(o.side, o.quantity) for o in b2.orders] == [("SELL", 3)]
 
 
+def test_two_arms_on_one_name_each_order_their_own_shares(repo_store):
+    """Two arms pick the same name on one bar (user directive 2026-10-07: "if multiple arms pick the same stock,
+    still order for each one of them"): each trade orders its OWN share count under its own reference — in the
+    same pass, and when the other arm's order already filled."""
+    a, b_ = _open_trade("XYZ", action="SELL"), _open_trade("XYZ", action="SELL")
+    a.update(entry_mechanism="sel_short", recommendation_id="ref-vol", sel_arm="vol", sel_account_shares=7)
+    b_.update(entry_mechanism="sel_short", recommendation_id="ref-vol2", sel_arm="vol2", sel_account_shares=4)
+    repo_store["trades"] = [a, b_]
+    brk = FakeBroker()
+    rec.sync(broker=brk)
+    assert sorted((o.client_ref, o.side, o.quantity) for o in brk.orders) == [("ref-vol", "SELL", 7),
+                                                                             ("ref-vol2", "SELL", 4)]
+    # the vol arm's short already filled at IBKR (7 shares held): vol2's still orders its full 4
+    a2 = _filled_short("XYZ", "ref-vol", 7)
+    b2 = _open_trade("XYZ", action="SELL")
+    b2.update(entry_mechanism="sel_short", recommendation_id="ref-vol2b", sel_arm="vol2", sel_account_shares=4)
+    repo_store["trades"] = [a2, b2]
+    brk2 = FakeBroker(positions=[Position("XYZ", -7, 100.0)])
+    rec.sync(broker=brk2)
+    assert [(o.client_ref, o.side, o.quantity) for o in brk2.orders] == [("ref-vol2b", "SELL", 4)]
+
+
 def test_two_closed_stacked_shorts_cover_the_holding_once(repo_store):
     """Two closed shorts on one name in the same tick: each used to size its cover
     from the whole holding — the second order would have bought it back twice."""

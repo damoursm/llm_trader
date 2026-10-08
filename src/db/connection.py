@@ -34,6 +34,21 @@ _LOCK_MAX_DELAY = 5.0
 # Paths whose schema this PROCESS has already ensured (see connect()).
 _SCHEMA_READY: set = set()
 
+# A context-manager factory every connection of this process enters before it opens
+# (None: no gate). The EOD process installs `db_fence.db_turn` so its connections wait
+# out the scheduler's ticks — the scheduler opens everything read-write, and DuckDB
+# admits one such process at a time (2026-10-07).
+_GATE = None
+
+
+def set_gate(gate, lock_retries: int | None = None) -> None:
+    """Install (or, with None, remove) this process's connection gate; ``lock_retries``
+    widens the open's lock-collision retry for a process that can afford to wait."""
+    global _GATE, _LOCK_RETRIES
+    _GATE = gate
+    if lock_retries is not None:
+        _LOCK_RETRIES = max(1, int(lock_retries))
+
 
 def reset_schema_cache() -> None:
     """Forget which paths have had their schema ensured. For tests that recreate
@@ -87,8 +102,21 @@ def connect(read_only: bool = False):
 
     Read-write connections ensure the schema exists first. Read-only connections
     require the database file to already exist (run the pipeline or migration first).
-    Lock collisions with the other process retry with backoff before raising.
+    Lock collisions with the other process retry with backoff before raising. A
+    process with a gate (`set_gate`) holds its turn for the connection's lifetime.
     """
+    gate = _GATE
+    if gate is None:
+        with _open(read_only) as conn:
+            yield conn
+        return
+    with gate():
+        with _open(read_only) as conn:
+            yield conn
+
+
+@contextmanager
+def _open(read_only: bool):
     path = db_path()
 
     if read_only:

@@ -66,6 +66,10 @@ def _install_ib_log_bridge() -> None:
                     # redial that FAILS raises the broker alert — the reset itself
                     # is not an error. Expected while probing an idle session.
                     level = "INFO" if _QUIET["probe"] else "WARNING"
+                elif level != "CRITICAL" and _QUIET["whatif"] and ("Error 201" in msg or "Error 10349" in msg):
+                    # a what-if's eligibility refusal IS its answer (`what_if_short` returns it and
+                    # the entry step logs the skipped pick); 10349 is IBKR's TIF note
+                    level = "INFO"
                 logger.log(level, f"[ib_async] {msg}")
             except Exception:
                 pass
@@ -81,7 +85,8 @@ def _install_ib_log_bridge() -> None:
 # A closed API socket as ib_async reports it (Windows and POSIX wordings).
 _SOCKET_RESET_MARKERS = ("winerror 10053", "winerror 10054", "connection reset", "connectionreseterror",
                          "broken pipe", "forcibly closed", "connection was aborted", "peer closed")
-_QUIET = {"probe": False}          # set while a liveness probe expects a dead socket
+_QUIET = {"probe": False,          # set while a liveness probe expects a dead socket
+          "whatif": False}         # set while a what-if runs: IBKR's refusal is its answer
 
 
 def _is_socket_reset(msg: str) -> bool:
@@ -972,6 +977,114 @@ class IBKRBroker(Broker):
                     self._ib.cancelPnL(acct)
             except Exception:
                 pass
+
+    # ── what-if margin (priced by IBKR, never transmitted) ────────────────
+    # error 201's eligibility refusals ("No Trading Permission, Customer Ineligible;
+    # Ineligibility reasons: Margin concern/risk management ... close-only" / "No Opening
+    # Trades: Small Cap, Subject to Compliance Restriction", 2026-10-05)
+    _REFUSAL_MARKS = ("no trading permission", "ineligib", "close-only", "no opening trades")
+
+    def _base_currency(self) -> Optional[str]:
+        """The account's base currency (what IBKR's margin figures are in), or None."""
+        if getattr(self, "_ccy", None):
+            return self._ccy
+        try:
+            rows = self._ib.accountValues(self._account())
+            ccy = next((r.currency for r in rows if r.tag == "NetLiquidation" and r.currency), None)
+        except Exception:
+            ccy = None
+        if ccy:
+            self._ccy = ccy
+        return ccy
+
+    def what_if_short(self, ticker: str, qty: int, limit_price: float) -> Optional[dict]:
+        """IBKR's OWN margin for a hypothetical short (user directive 2026-10-05: "build the
+        what-if"): a DAY limit SELL of *qty* at *limit_price* that IBKR prices and never
+        transmits. ``init_rate`` / ``maint_rate`` are the initial / maintenance margin
+        change as multiples of the order's USD value (IBKR's figures are in the base
+        currency); ``refused`` carries IBKR's reason when it will not let the account OPEN
+        the short (error 201: close-only, small-cap compliance restriction); ``error``
+        without rates = no usable answer. None = not asked (no session, bad input).
+
+        The TIF is set explicitly: ib_async 2.1 fails a what-if on IBKR's 10349 "TIF set
+        to DAY by preset" message. Bounded by ``sel_short_whatif_timeout_seconds``. One
+        call per name per entry pass — never in bulk (two bulk probes each coincided with
+        the gateway losing IBKR, 2026-10-05 20:07 / 20:27)."""
+        import math
+        qty = _whole_shares(qty)
+        try:
+            px = float(limit_price)
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0 or not math.isfinite(px) or px <= 0:
+            return None
+        if not self._ensure_connected():
+            return None
+        ib = self._ib
+        sym = to_ib_symbol(ticker)
+        errors: List[tuple] = []
+
+        def on_err(req_id, code, text, contract=None, *args):
+            try:
+                if getattr(contract, "symbol", None) == sym and int(code) not in (399, 10349):
+                    errors.append((int(code), str(text)))
+            except Exception:
+                pass
+        t0 = time.monotonic()
+        prev = getattr(ib, "RequestTimeout", 0)
+        st = None
+        try:
+            from ib_async import LimitOrder
+            contract = self._qualify(ticker)
+            order = LimitOrder("SELL", qty, round(px, 2 if px >= 1 else 4))
+            order.tif = "DAY"
+            ib.errorEvent += on_err
+            _QUIET["whatif"] = True
+            try:
+                ib.RequestTimeout = float(settings.sel_short_whatif_timeout_seconds)
+                st = ib.whatIfOrder(contract, order)
+                if not st and not errors:
+                    ib.sleep(0.3)                    # an error that ended the request may still be in flight
+            finally:
+                _QUIET["whatif"] = False
+                ib.RequestTimeout = prev
+                ib.errorEvent -= on_err
+            self._note_request(None)
+        except Exception as e:
+            self._note_request(e)
+            logger.warning(f"[broker:ibkr] what-if SELL {qty} {ticker} failed: {_exc_text(e)}")
+            return {"qty": qty, "price": px, "error": _exc_text(e)[:240],
+                    "seconds": round(time.monotonic() - t0, 2)}
+        out = {"qty": qty, "price": px, "seconds": round(time.monotonic() - t0, 2)}
+        refusal = next((txt for code, txt in errors
+                        if code == 201 and any(m in txt.lower() for m in self._REFUSAL_MARKS)), None)
+        if refusal:
+            reason = refusal.split("Ineligibility reasons:", 1)[-1].replace("<br>", " ").strip()
+            return {**out, "refused": reason[:240]}
+
+        def num(x):
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return None
+            return v if math.isfinite(v) and abs(v) < 1e300 else None   # 1.79e308 = IBKR's UNSET
+        init_c = num(getattr(st, "initMarginChange", None)) if st else None
+        maint_c = num(getattr(st, "maintMarginChange", None)) if st else None
+        warning = (getattr(st, "warningText", "") or "")[:240] or None if st else None
+        if errors:
+            out["error"] = "; ".join(f"{c}: {t}" for c, t in errors)[:240]
+        if init_c is None or maint_c is None or init_c <= 0 or maint_c <= 0:
+            out.setdefault("error", "no margin in IBKR's answer")
+            logger.warning(f"[broker:ibkr] what-if SELL {qty} {ticker}: {out['error']}")
+            return {**out, "warning": warning}
+        ccy = self._base_currency()
+        from src.broker.fx import usd_per_unit
+        usd = usd_per_unit(ccy) if ccy else 1.0     # unknown currency: read as USD (rates overstated if CAD)
+        value = qty * px
+        out.update(init_change=init_c, maint_change=maint_c, currency=ccy or "?",
+                   init_rate=round(init_c * usd / value, 4), maint_rate=round(maint_c * usd / value, 4),
+                   warning=warning)
+        return out
 
     def cancel_order(self, client_ref: str) -> bool:
         """Cancel the working order tagged *client_ref*; True only on a

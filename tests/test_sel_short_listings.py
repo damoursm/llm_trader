@@ -386,8 +386,9 @@ def test_the_entry_step_journals_every_pick_it_settles_with_the_borrow(monkeypat
     assert a["outcome"] == "opened" and a["price"] == 10.2 and a["borrow_available"] == 900_000
     assert a["borrow_fee_pct"] == 496.0 and a["borrow_checked"] is True and a["borrow_listed"] is True
     assert a["recommendation_id"] == ss.trade_id(ss.pick_key(picks[0])) and a["ssr"] is True
-    assert by["NOB"]["outcome"] == "no_borrow" and by["NOB"]["borrow_listed"] is False and by["NOB"]["ssr"] is False
-    assert by["LOW"]["outcome"] == "no_borrow" and by["LOW"]["borrow_available"] == 100
+    # an unlendable pick is journaled at each check and stays pending inside its window (borrow retry)
+    assert by["NOB"]["outcome"] == "no_borrow_retry" and by["NOB"]["borrow_listed"] is False and by["NOB"]["ssr"] is False
+    assert by["LOW"]["outcome"] == "no_borrow_retry" and by["LOW"]["borrow_available"] == 100
     assert by["TGT"]["outcome"] == "target_reached" and by["TGT"]["borrow_checked"] is None
     t = [x for x in tracker._load_trades() if x.get("entry_mechanism") == "sel_short"]
     assert len(t) == 1 and t[0]["sel_ssr"] is True and t[0]["sel_ssr_day_low"] == 9.5
@@ -437,6 +438,6 @@ def test_the_trade_log_joins_pick_entry_ledger_and_broker_fills(monkeypatch, on)
     assert be["first_submit_at"] == "2026-09-28T14:40:05+00:00" and be["seconds_to_fill"] == 20.0
     assert r["broker_exit"]["attempts"] == 0 and r["broker_return_pct"] is None
     nob = rows[1]
-    assert nob["entry_outcome"] == "no_borrow" and nob["borrow_listed"] is False and "broker_entry" not in nob
+    assert nob["entry_outcome"] == "no_borrow_retry" and nob["borrow_listed"] is False and "broker_entry" not in nob
     assert ss.write_trade_logs([d]) == {"2026-09-28": 2}
     assert len(ss._read_jsonl(ss.tradelog_path(d))) == 2

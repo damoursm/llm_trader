@@ -2949,6 +2949,36 @@ class Settings(BaseSettings):
     sel_short_wait_seconds: float = 480.0         # the tick waits this long for its run before trading
     sel_short_prepare_after_et: str = "09:00"     # daily prepare from this ET time (after the 08:30 pre-open)
     sel_short_entry_max_age_minutes: float = 75.0 # a journaled pick older than this is not taken
+    # A pick IBKR cannot lend is NOT given up at its first check (user 2026-10-07: "if a short shares are
+    # unavailable we find ways to trade it at a different time"): every tick re-checks it — and its fallbacks
+    # below — while it is inside the entry window above (IBKR's file moves through the day). Retrying LATER
+    # was tested and refused: PREREG17 (the next session) and PREREG18 (any later session while the price
+    # keeps half its give-back room) — the delayed trades earn ~+1% against +9.5% on time, growth falls.
+    enable_sel_short_borrow_retry: bool = True
+    # PREREG16 (2026-10-06; deployed 2026-10-07 under the same directive): when IBKR cannot lend the VOL arm's
+    # pick, the entry step shorts the same bar's next-ranked candidate (ranks 2..N by 30-minute ATR%) that
+    # passes the whole rule — fresh, its first fresh top-N bar of the day, a riser, not crowded, the relative
+    # volume — and that IBKR CAN lend. 2021-02..2024-06 on the live account rules: +0.86 pp/yr time-weighted
+    # growth (95% +0.04..+1.94), both halves positive, no margin call (6 added trades). Model / ETF arms untested.
+    # Depth 5 (ranks 2-5, the pool = the bar's fresh top 5) from 2026-10-07 10:10 ET (user: "ranks 2-5 has better
+    # growth. Deploy this config."): PREREG21 +10.04 vs +10.02 %/yr for depth 3 (+0.23 pp/yr time-weighted, 95%
+    # -0.34..+0.88, not significant); depth 10 was worse (+6.55).
+    enable_sel_short_vol_fallback: bool = True
+    sel_short_vol_fallback_ranks: int = 5
+    # Share recalls (user 2026-10-07: "protecting ourselves against share recalls ... IBKR then buys back our
+    # short at market"): every tick stamps each held short's place in IBKR's short-stock file (`sel_borrow_state`:
+    # IBKR DROPS a name it has nothing left to lend — a recall it cannot re-source ends in a buy-in) and names an
+    # emptied pool in the email. JOURNAL-ONLY: covering when the pool empties (PREREG19) cut growth +9.2 -> +2.5
+    # %/yr on 2021-24 — half the shorts meet an empty pool and most still pay. The broker sync, separately, alerts
+    # when IBKR holds fewer short shares than the open trades own (`broker_buy_in_confirm_syncs` syncs running).
+    enable_sel_short_borrow_watch: bool = True
+    # Trading halts (user 2026-10-07: "We can't buy back during a halt, and the stock can reopen much higher"):
+    # EXECUTION SAFETY, not selection — a pick whose name is halted at the entry tick (NYSE's current-halt list,
+    # every US listing; `src/data/trade_halts.py`) is not entered that tick (its price is stale; the backtest
+    # cannot enter a halted name either) and is re-checked next tick inside its window; a held short that is halted
+    # is stamped (`sel_halted`, `sel_halt_since`, `sel_halt_reason`) and named in the log. The halt-history rules
+    # (PREREG22 / 22b) are separate studies.
+    enable_sel_short_halt_guard: bool = True
     # ONE POSITION PER TICKER is OFF (user directive 2026-09-28: "Remove the one
     # position per ticker rule and restart the scheduler"): a repeat pick of a name
     # the book already shorts opens ANOTHER trade — a second short of the base size,
@@ -2974,37 +3004,59 @@ class Settings(BaseSettings):
     # (memory/short-adaptive-exits-2026-09.md).
     enable_sel_short_volnorm_exit: bool = True
     sel_short_volnorm_ratio: float = 0.5
-    # The vol arm's SQUEEZE COVER (user directive 2026-10-05: "have it tuned so that
-    # we don't have margin calls while still maximizing growth"): buy a vol short back
-    # at the first tick whose fresh mark is at or above this multiple of its entry
-    # price, the entry carried through every split executed since the entry day.
-    # Tuned with 10 slices of the account (pre-registered, memory/
-    # vol-arm-margin-protection-2026-10.md): on every common stock 2021-26, with and
-    # without the 400-bar floor, no margin call from any start date at bar closes or
-    # highs; mean growth over the 2021-25 starts +149%/yr vs +131% without a cover
-    # (which is margin-called from 5 of 6 starts); 1 of 437 trades covered, return
-    # per day 2.30 -> 2.25. 8x was not safe.
-    enable_sel_short_vol_squeeze_cover: bool = True
-    sel_short_vol_cover_multiple: float = 6.0
-    # The SIMULATED ACCOUNT the vol arm is sized from (user directive 2026-10-05: "Have
-    # the account based sizing considering the simulated 5000$+1000$ every two weeks";
-    # src/performance/sim_account.py): $5,000 at the start plus $1,000 every 14 calendar
-    # days, its equity the money paid in plus the dollar P&L of the trades it funded
-    # (from the ledger). Each new VOL short = 1/`sel_short_account_slices` of that equity
+    # The SQUEEZE COVER, every arm (user directives 2026-10-05: "have it tuned so that
+    # we don't have margin calls while still maximizing growth", then "Implement/fix
+    # these" — the cover and the account sizing for every arm): buy a short back at
+    # the first tick whose fresh mark is at or above this multiple of its entry price,
+    # the entry carried through every split executed since the entry day. Tuned on the
+    # vol arm; the model and ETF arms take the same level untested.
+    # Re-tuned with the account's 24 slices under IBKR's house margin (PREREG12,
+    # memory/ibkr-house-margin-2026-10.md): 6x kept; 1 of 447 trades covered, return
+    # per day 2.23 -> 2.19.
+    enable_sel_short_squeeze_cover: bool = True
+    sel_short_cover_multiple: float = 6.0
+    # The SIMULATED ACCOUNT every arm is sized from (user directive 2026-10-05: "Have
+    # the account based sizing considering the simulated 5000$+1000$ every two weeks", then
+    # 2026-10-07: "Change the $5000+$1000/14days to $10000. We'll use this number from now
+    # on."; src/performance/sim_account.py): $10,000 at the start, no deposits, its equity
+    # the start balance plus the dollar P&L of the trades it funded
+    # (from the ledger). Each new short (every arm) = 1/`sel_short_account_slices` of that equity
     # in whole shares, at most the equity minus the open shorts' value and
     # `sel_short_account_max_dollar_volume_share` of the stock's 20-session dollar
-    # volume, within the Reg T initial-margin room, none under FINRA's $2,000 minimum;
-    # equity below the open shorts' Reg T maintenance buys every funded short back
-    # (`sel_margin_call`) — the audited replay engine's rules, tuned with the squeeze
-    # cover above (10 slices). The model and ETF arms keep the flat order size.
+    # volume, within the initial-margin room, none under FINRA's $2,000 minimum; equity
+    # below the open shorts' maintenance buys every funded short back (`sel_margin_call`)
+    # — the audited replay engine's rules. Every arm's shorts are sized from the one
+    # account (user directive 2026-10-05 evening); the three arms share its room. 24
+    # slices (user directive 2026-10-05: "deploy 24 slices"): re-tuned with the 6x cover
+    # under IBKR's house margin (PREREG12) — no margin call from any start date at bar
+    # closes or highs, mean growth over the 2021-25 starts +57%/yr, where 10 slices were
+    # margin-called 255 times over the test runs (+35%/yr).
     enable_sel_short_account_sizing: bool = True
-    sel_short_account_start: str = "2026-10-05"
-    sel_short_account_initial: float = 5000.0
-    sel_short_account_deposit: float = 1000.0
-    sel_short_account_deposit_days: int = 14
-    sel_short_account_slices: int = 10
+    sel_short_account_initial: float = 10000.0
+    sel_short_account_slices: int = 24
     sel_short_account_max_dollar_volume_share: float = 0.01
     sel_short_account_min_equity: float = 2000.0
+    # IBKR's HOUSE margin on the account's shorts (user 2026-10-05, "Start with 1": IBKR's own
+    # rules above Reg T): the maintenance / initial requirement as multiples of a short's value,
+    # applied as max(Reg T, house) at every margin check and in every entry's margin room. These
+    # are the DEFAULT rates — a short carries the rates IBKR's what-if quoted at its entry when
+    # there is one (below). IBKR's what-if orders put the volatile names the arms short at a
+    # median 2.00 / 2.86 (memory/ibkr-house-margin-2026-10.md). The initial default is also the
+    # BUDGET: a short whose initial rate is above it is shrunk by default / rate, so no short ties
+    # up more initial margin than one at the default rate (exploratory: with it, 24 slices had no
+    # margin call in 200 draws of the measured rates; without it, a call in every draw).
+    sel_short_account_house_maint: float = 2.0
+    sel_short_account_house_init: float = 2.86
+    # IBKR's WHAT-IF at entry (user directive 2026-10-05: "build the what-if"): one what-if
+    # SELL per funded pick (IBKR prices it, nothing is transmitted; one per name per entry pass)
+    # gives the name's own initial / maintenance rates — stamped on the trade and used by the
+    # account — or IBKR's refusal of any opening short (close-only, small-cap compliance
+    # restriction), which skips the pick (`ibkr_refused`) instead of resending a refused order
+    # for `broker_refused_max_ticks` ticks. Bounded by `sel_short_whatif_timeout_seconds`; no
+    # answer = the default rates. Never in bulk: two bulk probes (66 and ~100 what-ifs in a
+    # minute) each coincided with the gateway losing IBKR (2026-10-05 20:07 / 20:27).
+    enable_sel_short_ibkr_whatif: bool = True
+    sel_short_whatif_timeout_seconds: float = 10.0
     # The SHORT-INTEREST filter, both arms (user directive 2026-09-27: "Add in live
     # production the 'Under one day of volume' filter"): short a pick only when its
     # short interest is under one day of volume — FINRA days to cover (the deep
@@ -3066,6 +3118,55 @@ class Settings(BaseSettings):
     # on its live picks (memory/etf-expansion-2026-10.md).
     enable_sel_short_etf: bool = True
     sel_short_etf_own_window_days: int = 20
+    # The vol arm's THIN STOCKS — DECOMMISSIONED 2026-10-08 (user: "Decommission the Thin arm"; it never traded live:
+    # 0 picks passed its rules on its one day). Off = no thin screen at the prepare, no thin universe, no thin
+    # picks; its code stays for a re-test. (Deployed 2026-10-07: "Add the thin stocks to the live vol arm"; PREREG32):
+    # common stocks / ADRs at $5+ trading `sel_short_thin_min_dollar_volume` .. `sel_short_min_dollar_volume` a
+    # day (20-session mean, fixed at the prepare) — the names the $5M floor leaves out. The vol rule runs on them
+    # as its OWN ranking (arm "thin": the top-1 by 30-minute ATR% among thin names only, fresh against their own
+    # history `scores_thin/`, the same filters, same-bar fallback and exits), so a thin name never takes a liquid
+    # pick's slot; each prepare also screens the whole market for thin common stocks outside the deep store and
+    # fetches their history. FREE CAPITAL ONLY: a thin short is sized from the same simulated account (1/24
+    # slices) but opens only when the initial-margin room left afterwards still holds
+    # `sel_short_thin_reserve_slices` live slices at the default house rate, and the entry step settles every
+    # other arm's picks first. Measured 2021-02 .. 2024-06 (one account from Feb 2021, IBKR's lendability, house
+    # margin, real fees, intrabar margin calls inside): final growth +27.2 vs +10.7 %/yr, time-weighted +3.2 pp
+    # (98.33% -28.5..+24.2, halves -9.0 / +15.7), drawdown 46% vs 12%, 1 margin call; 2021-26 +37.1 vs +28.3 %/yr
+    # with 6 calls — NOT significant on the pre-registered bar; deployed on the user's order.
+    enable_sel_short_thin: bool = False
+    # VOL2 (user directive 2026-10-07: "Deploy it as another version that will also make real trades in the paper
+    # account"): the vol rule WITHOUT the crowding filter, the relative-volume filter and the volatility exit — the
+    # vol arm's ranking, universe, freshness (its own copy of the history, scores_vol2/), fallback, whole give-back,
+    # 15-session limit and 6x cover; funded by the same simulated account; its picks trade beside the vol arm's
+    # (one trade and one order per arm on a name both pick). PREREG37: +20.7 vs +11.7 %/yr on 2021-24 (n.s.),
+    # return per day 0.36 vs 1.44 %, more margin calls over 2021-26 (memory/vol-rule-importance-2026-10.md).
+    enable_sel_short_vol2: bool = True
+    sel_short_thin_min_dollar_volume: float = 1_000_000.0
+    sel_short_thin_reserve_slices: float = 2.0
+    # ── THE MEGA-CAP DIP LONG BOOK (user directive 2026-10-08: "Deploy the mega-cap dip buying strategy to live
+    # production"; src/signals/dip_long.py, PREREG43, memory/long-dip-megacaps-2026-10.md). BUY at the regular-
+    # hours open a common stock / ADR that at the previous close traded >= `dip_long_min_dollar_volume` a day
+    # (20-session mean of close x volume), closed above its `dip_long_trend_sessions` average and had a 2-session
+    # RSI under `dip_long_rsi_max`; SELL at the open after the first close above its `dip_long_exit_sma_sessions`
+    # average, or after `dip_long_max_hold_sessions` sessions. Its own simulated cash account:
+    # `dip_long_account_initial`, no deposits, `dip_long_account_slices` slices (deepest dip first). Entries only
+    # within `dip_long_entry_window_minutes` of the 09:30 open. Measured: 2007-20 (untouched) 71% winners, +0.54%
+    # a trade, +0.26% over SPY the same days (95% +0.12..+0.39), the $10k account +9.3 %/yr vs SPY with dividends
+    # +9.1 (dd 26% vs 55%); 2021-26 (where it was found, delisted names included) +0.94% a trade, +16.3 vs +12.9 %/yr.
+    enable_dip_long: bool = True
+    dip_long_dir: str = "cache/ml/dip_long"           # signals / entries / exits journals
+    # The research engine and data the backtest package's vol adapter wraps (src/backtest/strategies/vol.py; moved
+    # 2026-10-08 out of the session scratchpads): optvol/ (the vol store, evaluator, pieces), vol/ (the bar store),
+    # pylib/ (optuna). Research only — nothing in production reads it.
+    backtest_research_dir: str = r"C:\Users\mathi\PycharmProjects\llm_trader_research"
+    dip_long_min_dollar_volume: float = 1_000_000_000.0
+    dip_long_rsi_max: float = 10.0
+    dip_long_trend_sessions: int = 200
+    dip_long_exit_sma_sessions: int = 5
+    dip_long_max_hold_sessions: int = 10
+    dip_long_account_initial: float = 10000.0
+    dip_long_account_slices: int = 10
+    dip_long_entry_window_minutes: float = 60.0
     # LIVE PATH FIRST (user directive 2026-09-28): the selection short's trading
     # steps run at the START of each tick — marks + exits, then (on the main
     # thread while Steps 1-3 fetch) the wait for its scorer's inference, its
@@ -3845,6 +3946,18 @@ class Settings(BaseSettings):
     # (REFUSED_GAVE_UP, never sent again); an exit keeps trying until flat.
     broker_refused_resends_per_tick: int = 2
     broker_refused_max_ticks: int = 6
+    # A FORCED BUY-IN (user 2026-10-07: "The lender can take back borrowed shares, and IBKR then buys back our
+    # short at market"): IBKR holding fewer short shares than the selection short's open trades own, on this many
+    # syncs running (two a tick), is alerted CRITICAL and in the broker banner (`reconcile._buy_in_check`);
+    # the ledger is left OPEN for the operator — a stale positions read must never close a live short's record.
+    broker_buy_in_confirm_syncs: int = 3
+    # Rule 201 (user 2026-10-05: "The broker doesn't handle Rule 201 when the
+    # short-sale restriction is on" — fix it): a short ENTRY under the short-sale
+    # price test (the pick's `sel_ssr`, or today's low >= 10% under the previous close
+    # on Polygon's snapshot) is offered one tick above the national best bid — the
+    # lowest price the rule allows — and rests until the next tick instead of the
+    # settle pass's kill; the leg is stamped `broker_ssr` (reconcile._rule201_*).
+    enable_broker_rule201: bool = True
     # ── Order lifetime: tick-scoped (default) or age-based ──────────────
     # Tick-scoped (True): an order lives exactly one tick. Any order still
     # unfilled at the next sync is cancelled and re-decided from THIS tick's
@@ -4004,6 +4117,25 @@ class Settings(BaseSettings):
     # revisit once real borrow rates accrue. 0 = charge nothing.
     enable_short_borrow_cost: bool = True
     short_borrow_annual_pct: float = 3.0
+    # IBKR's fee DAY BY DAY (2026-10-06, user: "we want the real exact borrow
+    # fees we would have in live trading a real account and we want that data
+    # to be as complete as possible" — `src/performance/borrow_fees.py`): every
+    # calendar day from the short's settlement to the cover's, shares x
+    # roundup(1.02 x the prior close) x THAT day's rate / 360 — IBKR's charge on
+    # our account when the Flex statement has it, else IBKR's own rate for the
+    # day (our archive of its file, its API) with that formula. Replaces the
+    # flat rate-at-entry carry above for every stock short.
+    enable_ibkr_borrow_schedule: bool = True
+    # A short CLOSED before the schedule existed keeps its old carry until the
+    # formula is checked against IBKR's own charges (user: "IF the formula for
+    # the fees is accurate, then you can backfill using the formula";
+    # `python -m src.performance.borrow_fees --verify`).
+    borrow_backfill_closed: bool = False
+    # IBKR's Flex Web Service: the token and the Activity Flex Query id whose
+    # "Borrow Fees Details" section lists every fee IBKR charged the account
+    # (`src/broker/flex.py`, fetched in the EOD chain). Empty = not fetched.
+    ibkr_flex_token: str = ""
+    ibkr_flex_query_id: str = ""
     # IBKR's borrow book, archived every tick (2026-09-25, user directive —
     # `src/data/ibkr_borrow.py`): the public short-stock file (shares available
     # + annual fee for every US symbol, refreshed ~15 min) is downloaded in the
@@ -4245,6 +4377,14 @@ class Settings(BaseSettings):
     eod_maintenance_time: str = "16:20"        # ET; after the 16:00 close tick settles
     eod_cache_warm_days: int = 120             # panel lookback to warm
     eod_cache_warm_max_tickers: int = 0        # 0 = all panel tickers
+    # The chain runs as its OWN PROCESS (2026-10-07, `src/scheduler/eod.py`) and opens
+    # the database only between ticks (`src/scheduler/db_fence.py`): the scheduler
+    # fences the database this long before each slot and for the whole tick; a tick
+    # that starts while the EOD process is mid-query waits for it at most
+    # eod_db_wait_seconds; the EOD process gives up after eod_timeout_seconds.
+    eod_tick_fence_lead_seconds: int = 120
+    eod_db_wait_seconds: int = 300
+    eod_timeout_seconds: int = 72000
     # Retention: simulated_trades is a derived long-format reshape of `signals`
     # (~25×/row) growing ~130k rows/day. Keep a recent RAW window (the entry-
     # event detector needs its intraday sequence), collapse older data to the

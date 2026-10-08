@@ -749,10 +749,17 @@ def _assess_broker_health(report: Optional[dict]) -> Optional[dict]:
             problems.append(
                 f"{len(hard)} position(s) drifted from the ledger ({names}){suffix}"
             )
+    if report.get("buy_in_suspects"):
+        # IBKR holds fewer short shares than the open trades own (reconcile._buy_in_check):
+        # a forced buy-in after a share recall, or a manual close — the ledger still says OPEN
+        names = ", ".join(sorted({d["ticker"] for d in report["buy_in_suspects"]}))
+        problems.append(f"IBKR holds fewer short shares than the ledger in {names} — a forced BUY-IN (share "
+                        "recall) or a manual close; the ledger still carries them OPEN (check IBKR's trades)")
     if not report.get("ok") and report.get("errors"):
         problems.append("reconcile error")
     return {
         "down":           bool(problems),
+        "buy_in_suspects": report.get("buy_in_suspects", []),
         "mode":           report.get("mode"),
         "connected":      report.get("connected"),
         "entries":        report.get("entries_submitted", 0),
@@ -1864,16 +1871,18 @@ def _merge_broker_reports(first: Optional[dict], second: Optional[dict]) -> Opti
     return out
 
 
-def _live_marks_and_exits() -> None:
+def _live_marks_and_exits() -> int:
     """The live path's first half (user directive 2026-09-28, "running the
     trading steps first"): the cost calibration and the ledger marks, then the
-    selection short's exits and the one-shot legacy flatten — at the START of
-    the tick, not after the shadow pipeline. Fail-soft."""
+    selection short's exits, the dip long book's exits (at the regular-hours
+    open, 2026-10-08) and the one-shot legacy flatten — at the START of the
+    tick, not after the shadow pipeline. Fail-soft. Returns the dip longs sold."""
     try:
         calibrate_sim_costs()
         update_open_trades()
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] marks failed (fail-soft): {e}")
+    _hold = False
     try:
         from src.performance.tracker import flatten_legacy_positions, monitor_sel_short_positions
         _hold = bool(get_open_trades())
@@ -1881,15 +1890,33 @@ def _live_marks_and_exits() -> None:
         monitor_sel_short_positions(hold_prompt_active=_hold)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] sel_short exit pass failed (fail-soft): {e}")
+    try:
+        from src.performance.tracker import monitor_dip_long_positions
+        return monitor_dip_long_positions(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] dip_long exit pass failed (fail-soft): {e}")
+    return 0
 
 
-def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None) -> Optional[dict]:
+def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
+                           dip_closed: int = 0) -> Optional[dict]:
     """The live path's second half, on the main thread while Steps 1–3 fetch in
-    the pool: wait for this tick's scorer — the two models' data fetch, feature
-    engineering and inference (model + vol arm) for every completed bar not yet
-    run — open its picks (on a fresh IBKR borrow file), and reconcile the broker.
-    Returns the sync's report."""
+    the pool: first the dip long book's entries at the open (2026-10-08) — and,
+    when it bought or sold anything this tick (``dip_closed``: the exits of the
+    first half), a broker sync right away, so its orders never wait behind the
+    scorer — then wait for this tick's scorer (the two models' data fetch, feature
+    engineering and inference for every completed bar not yet run), open its
+    picks (on a fresh IBKR borrow file), and reconcile the broker. Returns the
+    syncs' merged report."""
     t0 = time.time()
+    dip_report = None
+    try:
+        from src.performance.tracker import record_dip_long_trades
+        if record_dip_long_trades(run_id=run_id) or dip_closed:
+            dip_report = _broker_sync_watchdogged(run_id, None)
+            logger.info(f"[live] dip_long orders synced {time.time() - t0:.0f}s into the fetch")
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] dip_long entry pass failed (fail-soft): {e}")
     if borrow_future is not None:
         try:
             borrow_future.result(timeout=120)
@@ -1905,7 +1932,7 @@ def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None) -> Optio
     report = _broker_sync_watchdogged(run_id, None)
     logger.info(f"[live] entries + broker sync done {time.time() - t0:.0f}s into the fetch "
                 f"(before the shadow pipeline)")
-    return report
+    return _merge_broker_reports(dip_report, report)
 
 
 def run_pipeline(send_email: bool = False, observe_only: bool = False,
@@ -1972,8 +1999,9 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # signals), re-judges the strategy's exits and syncs again.
     live_first = (not observe_only) and bool(getattr(settings, "enable_live_path_first", False))
     live_broker_report = None
+    _dip_closed = 0
     if live_first:
-        _live_marks_and_exits()
+        _dip_closed = _live_marks_and_exits()
 
     # ── Long-horizon buy arm A/B (2026-08-01) ─────────────────────────────
     # Per-run coin: replace combined_buy_score with the learned 5d stacker AND
@@ -2377,7 +2405,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # The live path's entries + broker sync, on the MAIN thread (ib_async)
         # while the pool fetches: waits for the scorer's inference first.
         if live_first:
-            live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow)
+            live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow, dip_closed=_dip_closed)
 
     # ── Collect results ───────────────────────────────────────────────────
 
@@ -3388,6 +3416,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             monitor_sel_short_positions(hold_prompt_active=hold_prompt_active)
         except Exception as _sel_x:
             logger.warning(f"[sel_short] exit pass failed (fail-soft): {_sel_x}")
+        # ── DIP LONG exits (2026-10-08): due at the regular-hours open; this pass
+        # catches what the live path could not price.
+        try:
+            from src.performance.tracker import monitor_dip_long_positions
+            monitor_dip_long_positions(hold_prompt_active=hold_prompt_active)
+        except Exception as _dip_x:
+            logger.warning(f"[dip_long] exit pass failed (fail-soft): {_dip_x}")
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
@@ -3431,6 +3466,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             record_sel_short_trades(run_id=run_id)
         except Exception as _sel_o:
             logger.warning(f"[sel_short] entry pass failed (fail-soft): {_sel_o}")
+        # ── DIP LONG entries (2026-10-08): inside the opening window only; this
+        # pass retries a signal the live path could not price.
+        try:
+            from src.performance.tracker import record_dip_long_trades
+            record_dip_long_trades(run_id=run_id)
+        except Exception as _dip_o:
+            logger.warning(f"[dip_long] entry pass failed (fail-soft): {_dip_o}")
 
         # ── FOLLOW-THROUGH (2026-08-25): exit-as-entry candidates ────────────
         # Score every Gate-4 name's hypothetical held cohorts with the live
@@ -3602,6 +3644,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     try:
         from src.signals import sel_short as _sel_short_h
         sel_health = _sel_short_h.health()
+        try:                                  # the dip long book's problems ride the same banner (2026-10-08)
+            from src.signals import dip_long as _dip_long_h
+            _dh = _dip_long_h.health(trades=get_open_trades())
+            sel_health["problems"] = list(sel_health.get("problems") or []) + _dh["problems"]
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _dh["notes"]
+        except Exception as _dh_e:                                 # noqa: BLE001
+            logger.warning(f"[dip_long] health check failed (fail-soft): {_dh_e}")
         sel_health["down"] = bool(sel_health.get("problems"))
         if sel_health["down"]:
             logger.critical("[sel_short] SCORER ISSUE — " + " | ".join(sel_health["problems"]))

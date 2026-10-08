@@ -456,13 +456,28 @@ def _daily_returns_for_trade(
     # Zero for longs and when the feature is off.
     from src.performance.spread import borrow_annual_pct
     borrow_daily = 0.0
+    # IBKR's day-by-day fee when the ledger stored the short's schedule
+    # (src/performance/borrow_fees.py): each charged day's fee per share, over
+    # the entry price, falls in the interval that holds it; a day past the last
+    # mark (an open short's provisional day) goes to the last interval.
+    day_fees = None
     if (sign < 0 and getattr(settings, "enable_short_borrow_cost", False)):
-        borrow_daily = borrow_annual_pct(trade) / 100.0 / 365.0
+        from src.performance.borrow_fees import nav_day_fees
+        day_fees = nav_day_fees(trade)
+        if day_fees is None:
+            borrow_daily = borrow_annual_pct(trade) / 100.0 / 365.0
+    entry_px = float(trade.get("entry_price") or 0.0)
+
+    def _scheduled(lo: date, hi: date, last: bool) -> float:
+        if not day_fees or entry_px <= 0:
+            return 0.0
+        return sum(f for v, f in day_fees if lo < v and (v <= hi or last)) / entry_px
 
     results: List[Tuple[date, float, float]] = []
     prev_mark = marks[0][1] if marks[0][1] and marks[0][1] > 0 else None
     prev_date = marks[0][0]
-    for d, mark in marks[1:]:
+    last_i = max((i for i, (_, m) in enumerate(marks) if m is not None and m > 0), default=0)
+    for i, (d, mark) in enumerate(marks[1:], start=1):
         if mark is None or mark <= 0:
             continue
         if prev_mark is None or prev_mark <= 0:
@@ -472,6 +487,8 @@ def _daily_returns_for_trade(
         r = sign * (mark - prev_mark) / prev_mark
         if borrow_daily:
             r -= borrow_daily * max(0, (d - prev_date).days)
+        elif day_fees:
+            r -= _scheduled(prev_date, d, i == last_i)
         results.append((d, r, weight))
         prev_mark = mark
         prev_date = d
