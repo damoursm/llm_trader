@@ -39,7 +39,7 @@ from loguru import logger
 
 from config import settings
 
-FUNDED_ARMS = ("model", "vol", "etf", "thin", "vol2")
+FUNDED_ARMS = ("model", "vol", "etf", "thin", "vol2", "fall")
 SEC_FEE, TAF_PER_SHARE, TAF_MAX = 27.80e-6, 0.000166, 8.30        # the engine's entry fees (cap5k4)
 WHATIF_NOMINAL_USD = 500.0   # the what-if's size: IBKR's rate is a share of the value (measured at ~$500)
 
@@ -152,17 +152,31 @@ def state(trades: Sequence[dict], now: Optional[datetime] = None) -> Dict[str, f
     return out
 
 
+def arm_slices(arm: Optional[str]) -> float:
+    """The arm's slice count — each new short is 1/that of the equity (PREREG80, from the 2026-10-12 session): vol
+    `sel_short_vol_account_slices` (20), ETF `sel_short_etf_account_slices` (16), fall `sel_short_fall_account_slices`
+    (12); any other arm `sel_short_account_slices` (24)."""
+    key = {"vol": "sel_short_vol_account_slices", "etf": "sel_short_etf_account_slices",
+           "fall": "sel_short_fall_account_slices"}.get(str(arm or "model"))
+    v = getattr(settings, key, None) if key else None
+    return float(v) if v else float(settings.sel_short_account_slices)
+
+
 def size(trades: Sequence[dict], price: float, dv20: Optional[float] = None,
          now: Optional[datetime] = None,
          rates: Optional[Tuple[float, float]] = None,
-         reserve_slices: float = 0.0) -> Tuple[int, str, Dict[str, float]]:
+         reserve_slices: float = 0.0,
+         st: Optional[Dict[str, float]] = None,
+         slices: Optional[float] = None) -> Tuple[int, str, Dict[str, float]]:
     """``(shares, why, account state)`` for a new short at ``price``: the engine's sizing rule.
     ``rates`` = the name's house (maintenance, initial) from IBKR's what-if, else the defaults; an
     initial rate above the default shrinks the short by default / rate. ``reserve_slices`` (the vol
     arm's thin stocks, FREE CAPITAL ONLY — PREREG32's cap5k8): the initial-margin room of that many
     live slices at the default house rate stays free after this short ("thin_reserve" when it would
-    not). ``why`` is "ok" or the reason no share fits."""
-    st = state(trades, now)
+    not). ``st`` = an account state to size from (the live account's, `live_account.state`: its equity and margin
+    room hold the dip book's longs too); None = this account's own. ``slices``: the arm's slice count
+    (`arm_slices`); None = `sel_short_account_slices`. ``why`` is "ok" or the reason no share fits."""
+    st = state(trades, now) if st is None else st
     eq = st["equity"]
     if eq < float(settings.sel_short_account_min_equity):
         return 0, "account_below_minimum", st
@@ -180,7 +194,8 @@ def size(trades: Sequence[dict], price: float, dv20: Optional[float] = None,
     if nm > 0:                                     # the entry's own fees out of the margin room
         c0 = comm(nm, price) + SEC_FEE * nm * price + min(TAF_PER_SHARE * nm, TAF_MAX)
         nm = int(math.floor(max(room - c0, 0.0) / rate))
-    alloc = min(eq / max(1, int(settings.sel_short_account_slices)), eq - st["gross"])
+    n_slices = max(1.0, float(slices) if slices else float(settings.sel_short_account_slices))
+    alloc = min(eq / n_slices, eq - st["gross"])
     budget = default_rates()[1]
     if budget > 0 and hi > budget:                 # a dearer name: no more initial margin than a default slice
         alloc *= budget / hi

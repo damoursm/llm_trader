@@ -49,9 +49,10 @@ CONSOLE = Path("logs/eod_console.log")
 LOG_DIR = Path("logs")
 LOG_KEEP_DAYS = 14
 FLEX = "flex"
-STEPS = ("cache_warm", "retention", "replay", "walkforward", "shape_history", "backtest", "spread_sweep")
+STEPS = ("cache_warm", "retention", "replay", "walkforward", "shape_history", "backtest", "spread_sweep",
+         "live_calibration")
 FINAL = ("ok", "failed", "off")
-FLEX_JOIN_SECONDS = 2400.0   # the Flex fetch gives IBKR ~30 min, then keeps the reference for the next run
+FLEX_JOIN_SECONDS = 3900.0   # the Flex fetch gives IBKR up to an hour (its own host), then keeps the reference
 
 _STATE_LOCK = threading.Lock()
 
@@ -233,9 +234,20 @@ def _spread_sweep(day) -> Tuple[object, str]:
     return {"rc": res.returncode}, tail or "rc=0"
 
 
+def _live_calibration(day) -> Tuple[object, str]:
+    # The live record against the production-mimicking simulator's assumptions (2026-10-12): one JSON per market
+    # day, its notes in the email's scorer banner. IBKR's Flex statement lags (its thread may still be waiting):
+    # the borrow comparison reads what `broker_borrow_fees` holds.
+    from src.backtest import live_calibration as LC
+    p = LC.write(_day(day))
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    notes = rec.get("notes") or []
+    return {"path": str(p), "notes": notes}, (f"{len(notes)} note(s): " + "; ".join(notes)) if notes else "no gap"
+
+
 STEP_FNS = {FLEX: _flex, "cache_warm": _cache_warm, "retention": _retention, "replay": _replay,
             "walkforward": _walkforward, "shape_history": _shape_history, "backtest": _backtest,
-            "spread_sweep": _spread_sweep}
+            "spread_sweep": _spread_sweep, "live_calibration": _live_calibration}
 
 
 def _enabled(step: str) -> bool:
@@ -246,6 +258,7 @@ def _enabled(step: str) -> bool:
         "backtest": settings.enable_eod_backtest_refresh,
         "spread_sweep": (settings.enable_eod_spread_sweep
                          and str(settings.broker_mode or "off").startswith("ibkr")),
+        "live_calibration": settings.enable_eod_live_calibration,
     }.get(step, True))
 
 

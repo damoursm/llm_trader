@@ -680,7 +680,7 @@ class IBKRBroker(Broker):
             # A still-working order (e.g. a marketable limit whose cap was exceeded)
             # exits this loop as Submitted — its fill/commission gets repaired by the
             # reconciler's fill-refresh pass on a later tick via get_fills().
-            for _ in range(12):
+            for _ in range(2 if getattr(req, "rest", False) else 12):   # a resting limit: IBKR has it
                 self._ib.sleep(1)
                 if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
                     break

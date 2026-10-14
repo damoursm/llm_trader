@@ -26,7 +26,10 @@ from typing import Iterable, List, Optional, Tuple
 from config import settings
 from src.models import TickerSnapshot
 from src.data import polygon_client
+from src.data import yf_guard as _yf_guard
 from src.performance.market_calendar import current_session
+
+_yf_guard.install()     # yfinance's download is not thread-safe: one at a time in this process (yf_guard)
 
 try:
     from zoneinfo import ZoneInfo as _ZoneInfo

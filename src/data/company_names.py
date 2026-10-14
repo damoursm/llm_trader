@@ -692,10 +692,12 @@ def prime_security_types(force: bool = False) -> int:
             j = pc._get("/v3/reference/tickers", params) or {}
             res = j.get("results") or []
             for r in res:
-                tk = str(r.get("ticker") or "").strip().upper()
+                raw = str(r.get("ticker") or "").strip()
                 ty = str(r.get("type") or "").strip().upper()
-                if tk and ty:
-                    out[tk] = ty
+                # Polygon writes preferreds / rights with a lowercase letter (TpC, BCpC): upper-cased they overwrote the
+                # common stock's own type (Tutor Perini read as a preferred) — never a symbol the project trades
+                if raw and ty and not any(ch.islower() for ch in raw):
+                    out[raw.upper()] = ty
             pages += 1
             nxt = str(j.get("next_url") or "")
             cursor = nxt.split("cursor=")[-1] if "cursor=" in nxt else None

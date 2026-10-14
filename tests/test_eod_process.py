@@ -134,7 +134,7 @@ def _fake_steps(monkeypatch, calls, fail=(), interrupt=()):
     monkeypatch.setattr(eod, "STEP_FNS", {s: make(s) for s in (eod.FLEX,) + eod.STEPS})
     monkeypatch.setattr(settings, "broker_mode", "ibkr_paper")
     for flag in ("enable_eod_replay_refresh", "enable_eod_walkforward", "enable_eod_shape_history",
-                 "enable_eod_backtest_refresh", "enable_eod_spread_sweep"):
+                 "enable_eod_backtest_refresh", "enable_eod_spread_sweep", "enable_eod_live_calibration"):
         monkeypatch.setattr(settings, flag, True)
 
 
@@ -162,7 +162,7 @@ def test_a_relaunch_resumes_at_the_interrupted_step(monkeypatch):
     _fake_steps(monkeypatch, calls2)
     st = eod.run("2026-10-06")
     assert [c for c in calls2 if c != eod.FLEX] == ["replay", "walkforward", "shape_history", "backtest",
-                                                   "spread_sweep"]
+                                                   "spread_sweep", "live_calibration"]
     assert st["finished"] and len(st["runs"]) == 2
 
 

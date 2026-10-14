@@ -37,6 +37,9 @@ class OrderRequest:
                               # sent alongside — the venue defines its own
                               # hours). Ineligible symbols / unentitled
                               # accounts reject fail-soft (SUBMIT_FAILED).
+    rest: bool = False        # a RESTING limit (the dip book's working orders, 2026-10-09): the
+                              # broker returns once IBKR has the order instead of waiting
+                              # for a fill
 
 
 @dataclass

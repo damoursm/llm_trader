@@ -94,6 +94,8 @@ def _isolated_news_coverage_and_live_features(tmp_path, monkeypatch):
     from src.data import ibkr_borrow
     monkeypatch.setattr(ibkr_borrow, "ARCHIVE_DIR", tmp_path / "ibkr_borrow")
     monkeypatch.setattr(settings, "enable_ibkr_borrow_snapshot", False)
+    # the baseline: no current file = not checked (production waits for IBKR's file; its tests opt in)
+    monkeypatch.setattr(settings, "ibkr_borrow_require_file", False)
     ibkr_borrow.reset()
     # IBKR's day-by-day borrow fee (2026-10-06) reads the real fee history and
     # IBKR's charges: off in the baseline (the flat carry the older tests pin;
@@ -124,6 +126,8 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     # sizes vol picks (2026-10-05): their tests opt in
     monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", False)
     monkeypatch.setattr(settings, "enable_sel_short_account_sizing", False)
+    # the ledger's split adjustment (PREREG64) reads the production split data at every load: its tests opt in
+    monkeypatch.setattr(settings, "enable_split_adjustment", False)
     # IBKR's what-if at entry would dial the REAL gateway (broker_mode comes from .env): its tests
     # opt in with a fake broker
     monkeypatch.setattr(settings, "enable_sel_short_ibkr_whatif", False)
@@ -132,9 +136,21 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     # the vol arm's thin stocks (2026-10-07) add a fourth arm to every run: their tests opt in
     monkeypatch.setattr(settings, "enable_sel_short_thin", False)
     monkeypatch.setattr(settings, "enable_sel_short_vol2", False)
+    monkeypatch.setattr(settings, "enable_sel_short_fall", False)
+    monkeypatch.setattr(settings, "sel_short_traded_arms", "")          # the baseline: every arm trades
+    monkeypatch.setattr(settings, "enable_sel_short_live_first_scoring", False)   # one phase: every arm after the full rows
+    monkeypatch.setattr(settings, "enable_live_account", False)         # the baseline: two separate accounts
     # the dip long book (2026-10-08) reads the deep store and journals under its own dir: its tests opt in
     monkeypatch.setattr(settings, "enable_dip_long", False)
     monkeypatch.setattr(settings, "dip_long_dir", str(tmp_path / "dip_long"))
+    monkeypatch.setattr(settings, "dip_long_entry_mode", "open")        # the baseline: buy at the open; the limit
+                                                                        # entry's tests opt in
+    monkeypatch.setattr(settings, "enable_dip_long_filter", False)      # PREREG96's RP33 (2026-10-14): its tests opt
+    monkeypatch.setattr(settings, "dip_long_filter_model", str(tmp_path / "dip_filter" / "model.txt"))   # in
+    monkeypatch.setattr(settings, "enable_etf_dm", False)
+    monkeypatch.setattr(settings, "etf_dm_dir", str(tmp_path / "etf_dm"))
+    # the live record against the simulator (2026-10-12): the email's banner reads it — never production's files
+    monkeypatch.setattr(settings, "live_calibration_dir", str(tmp_path / "live_calibration"))
     from src.data import trade_halts
     trade_halts.reset()
     monkeypatch.setattr(settings, "legacy_flatten_after", "")

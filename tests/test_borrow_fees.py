@@ -284,23 +284,62 @@ def test_a_name_without_daily_closes_takes_its_30_minute_session_closes(monkeypa
     assert bf.prior_close("XYZ", date(2026, 10, 3)) == 14.5
 
 
-def test_an_unreachable_statement_host_falls_back_to_the_request_host(monkeypatch):
-    """IBKR's SendRequest answer named gdcdyn.interactivebrokers.com, whose lookups fail intermittently here
-    (2026-10-06): the host is retried first, then the statement is asked from the SendRequest host, the same path."""
+def test_the_statement_is_only_ever_asked_from_the_host_ibkr_named(monkeypatch):
+    """IBKR's SendRequest names gdcdyn.interactivebrokers.com; the statement is generated there (2026-10-07 .. 10-09
+    the old fallback to the SendRequest host answered "in progress" for 30 minutes every day). An unreachable host is
+    retried, never swapped."""
     import httpx
     from src.broker import flex
     monkeypatch.setattr(flex.time, "sleep", lambda s: None)
     asked = []
+    gdc = "https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
 
     def fake_get(url, params, timeout=60.0):
         asked.append(url)
-        if "gdcdyn" in url:
+        if len(asked) <= 9:                                    # two polls' retries fail, the third reaches it
             raise httpx.ConnectError("[Errno 11002] getaddrinfo failed")
         return SAMPLE
     monkeypatch.setattr(flex, "_get", fake_get)
-    got = flex.get_statement("tok", "777", "https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement")
-    gdc = "https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
-    assert got == SAMPLE and asked == [gdc] * 4 + [flex.GET_URL]
+    assert flex.get_statement("tok", "777", gdc) == SAMPLE
+    assert set(asked) == {gdc}
+
+
+def test_a_name_that_does_not_resolve_is_reached_through_the_shared_edge(monkeypatch):
+    """gdcdyn's lookups fail here for minutes; ndcdyn resolves to the same CDN edge: the request goes to that address
+    with gdcdyn named in TLS (SNI) and the Host header — the same server."""
+    import httpx
+    from src.broker import flex
+
+    def no_dns(url, **kw):
+        raise httpx.ConnectError("[Errno 11001] getaddrinfo failed")
+    monkeypatch.setattr(flex.httpx, "get", no_dns)
+    monkeypatch.setattr(flex.socket, "getaddrinfo", lambda h, *a, **k: [(2, 1, 6, "", ("23.198.214.4", 443))])
+    seen = {}
+
+    class Resp:
+        text = SAMPLE
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, params=None, headers=None, extensions=None):
+            seen.update(url=url, host=headers["Host"], sni=extensions["sni_hostname"])
+            return Resp()
+    monkeypatch.setattr(flex.httpx, "Client", Client)
+    got = flex._get("https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement", {"q": "1"})
+    assert got == SAMPLE
+    assert seen == {"url": "https://23.198.214.4/AccountManagement/FlexWebService/GetStatement",
+                    "host": "gdcdyn.interactivebrokers.com", "sni": "gdcdyn.interactivebrokers.com"}
 
 
 def test_a_statement_still_generating_is_collected_first_on_the_next_run(monkeypatch, tmp_path):
@@ -329,3 +368,28 @@ def test_a_statement_still_generating_is_collected_first_on_the_next_run(monkeyp
     out = flex.fetch_borrow_fees()
     assert out["rows"] == 2 and state["sends"] == 1                        # collected, never re-requested
     assert not (tmp_path / "ibkr_flex" / flex.PENDING).exists()
+
+
+def test_the_reference_is_kept_from_the_moment_ibkr_issues_it_and_never_re_requested(monkeypatch, tmp_path):
+    """A process stopped while it polls leaves the reference for the next run; a pending statement still generating
+    is polled again, never re-initiated."""
+    from src.broker import flex
+    monkeypatch.setattr(settings, "ibkr_flex_token", "tok")
+    monkeypatch.setattr(settings, "ibkr_flex_query_id", "42")
+    monkeypatch.setattr(flex.time, "sleep", lambda s: None)
+    sends, seen_pending = [], []
+
+    def fake_get(url, params, timeout=60.0):
+        if url == flex.SEND_URL:
+            sends.append(1)
+            return ("<FlexStatementResponse><Status>Success</Status><ReferenceCode>777</ReferenceCode>"
+                    "<Url>https://example.test/GetStatement</Url></FlexStatementResponse>")
+        seen_pending.append((tmp_path / "ibkr_flex" / flex.PENDING).exists())
+        return ("<FlexStatementResponse><Status>Warn</Status><ErrorCode>1019</ErrorCode>"
+                "<ErrorMessage>Statement generation in progress.</ErrorMessage></FlexStatementResponse>")
+    monkeypatch.setattr(flex, "_get", fake_get)
+    monkeypatch.setattr(flex, "RAW_DIR", tmp_path / "ibkr_flex")
+    for _ in range(2):
+        with pytest.raises(flex.FlexError):
+            flex.fetch_borrow_fees()
+    assert sends == [1] and all(seen_pending)                  # kept while polling; the second run polled, not re-sent

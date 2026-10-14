@@ -51,7 +51,7 @@ def _captured_warnings(fn):
 def test_403_warns_once_per_endpoint_family(monkeypatch):
     monkeypatch.setattr(pc.settings, "polygon_api_key", "x")
     pc._WARNED_FORBIDDEN.clear()
-    monkeypatch.setattr(pc.httpx, "get", lambda *a, **k: _raiser(403))
+    monkeypatch.setattr(pc, "_http_get", lambda *a, **k: _raiser(403))
 
     base = "/v2/snapshot/locale/us/markets/stocks/tickers"
     out = _captured_warnings(lambda: [pc._get(f"{base}/{t}") for t in ("AAPL", "MSFT", "NVDA")])
@@ -63,14 +63,14 @@ def test_403_warns_once_per_endpoint_family(monkeypatch):
 def test_429_warns_every_call(monkeypatch):
     # Rate-limit is transient — it must NOT be deduped like the 403 entitlement case.
     monkeypatch.setattr(pc.settings, "polygon_api_key", "x")
-    monkeypatch.setattr(pc.httpx, "get", lambda *a, **k: _raiser(429))
+    monkeypatch.setattr(pc, "_http_get", lambda *a, **k: _raiser(429))
     out = _captured_warnings(lambda: [pc._get(f"/v2/aggs/ticker/{t}/range") for t in ("A", "B")])
     assert out.count("Rate limited") == 2
 
 
 def test_404_is_silent(monkeypatch):
     monkeypatch.setattr(pc.settings, "polygon_api_key", "x")
-    monkeypatch.setattr(pc.httpx, "get", lambda *a, **k: _raiser(404))
+    monkeypatch.setattr(pc, "_http_get", lambda *a, **k: _raiser(404))
     out = _captured_warnings(lambda: pc._get("/v2/aggs/ticker/ZZZZ/range"))
     assert out == ""                                        # missing ticker → no noise
 
@@ -157,3 +157,75 @@ def test_fetch_intraday_uses_yf_when_polygon_unavailable(monkeypatch):
                         lambda t, interval="30m": pytest.fail("polygon should not be called"))
     monkeypatch.setattr(md, "_fetch_intraday_yf", lambda t, interval="30m": sentinel)
     assert md._fetch_intraday("AAPL", "30m") is sentinel
+
+
+# ── the shared keep-alive client (2026-10-12) ───────────────────────────────
+
+def test_one_client_per_process_shared_across_threads():
+    """Every request reuses ONE client (its SSL context and its connections): a bare
+    httpx.get built a new client, ~0.3 s of CPU, per call."""
+    import threading
+
+    from src.data import polygon_client as pc
+    got = []
+    ts = [threading.Thread(target=lambda: got.append(pc._client())) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len({id(c) for c in got}) == 1 and got[0] is pc._client()
+
+
+def test_shared_client_keeps_no_cookie():
+    """A bare httpx.get never carried a cookie from one request to the next; the shared
+    client must not either (its jar refuses every cookie)."""
+    from src.data import polygon_client as pc
+    jar = pc._client().cookies
+    req = httpx.Request("GET", "https://api.polygon.io/v2/x")
+    jar.extract_cookies(httpx.Response(200, headers={"set-cookie": "AWSALB=abc; Path=/"}, request=req))
+    assert len(jar.jar) == 0
+
+
+def test_http_get_forwards_url_params_and_timeout(monkeypatch):
+    from src.data import polygon_client as pc
+    seen = {}
+
+    class _C:
+        def get(self, url, params=None, timeout=None):
+            seen.update(url=url, params=params, timeout=timeout)
+            return "resp"
+    monkeypatch.setattr(pc, "_client", lambda: _C())
+    assert pc._http_get("https://api.polygon.io/v2/x", params={"a": 1}) == "resp"
+    assert seen == {"url": "https://api.polygon.io/v2/x", "params": {"a": 1}, "timeout": pc._TIMEOUT}
+
+
+def test_get_sends_the_same_request(monkeypatch):
+    """`_get`'s request is unchanged: the base URL + path, the caller's params plus the
+    key, the module timeout."""
+    from src.data import polygon_client as pc
+    monkeypatch.setattr(pc.settings, "polygon_api_key", "k", raising=False)
+    seen = {}
+
+    class _R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": 1}
+
+    def fake(url, params=None, timeout=None):
+        seen.update(url=url, params=params, timeout=timeout)
+        return _R()
+    monkeypatch.setattr(pc, "_http_get", fake)
+    assert pc._get("/v2/aggs/ticker/AAA/range", {"limit": 5}) == {"ok": 1}
+    assert seen == {"url": "https://api.polygon.io/v2/aggs/ticker/AAA/range",
+                    "params": {"limit": 5, "apiKey": "k"}, "timeout": 30.0}
+
+
+def test_no_bare_httpx_get_left():
+    """Every Polygon request goes through `_http_get` (a bare httpx.get would build a
+    client per call again)."""
+    import inspect
+
+    from src.data import polygon_client as pc
+    assert "httpx.get(" not in inspect.getsource(pc)

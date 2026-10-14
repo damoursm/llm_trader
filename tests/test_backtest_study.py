@@ -70,3 +70,42 @@ def test_the_chained_account_takes_each_weeks_chosen_rule():
     c = S.chained(st, [0, 1], settle)
     got = sorted(p["tkn"] for p in c["res"]["positions"])
     assert got == ["A1", "B2"]
+
+
+# ── PREREG63: the bugs the 2026-10-09 review confirmed ───────────────────────
+
+def test_a_tie_with_the_reference_keeps_the_reference_itself():
+    X = np.array([[0.01, 0.02], [0.01, 0.02], [0.0, 0.0]])          # combos 0 and 1 identical in the window
+    g = np.array([0.5, 0.5, 0.0])
+    choice, _ = S.select(X, g, ref=1, seed=0)
+    assert choice["M0"] == 1 and choice["M4"] == 1
+
+
+def test_a_working_order_before_the_cut_holds_its_place_in_the_window():
+    """An order placed before the cut whose touch comes after it was dropped from the window: the window's account had
+    a free slot it never had."""
+    p = piece("A", "2024-01-03", "2024-01-09", "2024-01-12")         # touch Tuesday after the Sunday cut
+    p.update(oid="A|1", ord_place=[ns("2024-01-04 09:30") + 1, ns("2024-01-05 09:30") + 1,
+                                   ns("2024-01-08 09:30") + 1], ord_lim=99.0, ord_end=ns("2024-01-10 16:00"), ord_k=2)
+    cut = S.cut_of("2024-01-07")
+    (q,) = S.window_pieces([p], S.dnum("2024-01-01"), S.dnum("2024-01-06"), cut)
+    assert q["ord_k"] == -1 and q["placeholder"] and q["ens"] >= cut
+    assert q["ord_place"] == [ns("2024-01-04 09:30") + 1, ns("2024-01-05 09:30") + 1]
+
+
+def test_a_standing_holding_is_bought_at_a_windows_and_a_runs_start():
+    """A dual-momentum holding decided before a window (or a run's start) and still held then was invisible to it."""
+    p = piece("QQQ", "2024-01-31", "2024-02-01", "2024-03-28", e=100.0, x=120.0, strategy="dm")
+    p["rebase"] = True
+    lo = "2024-03-04"
+    (q,) = S.window_pieces([p], S.dnum(lo), S.dnum("2024-03-08"), None)
+    assert q["ens"] >= ns(f"{lo} 00:00") and q["e"] > 100.0 and q["rebased_from"] == p["ens"]
+    (r,) = A.from_start([p], ns(f"{lo} 00:00"))
+    assert r["ens"] == q["ens"] and r["xns"] == p["xns"]
+    plain = dict(p, rebase=False)
+    assert A.from_start([plain], ns(f"{lo} 00:00")) == []
+    assert S.window_pieces([plain], S.dnum(lo), S.dnum("2024-03-08"), None) == []
+
+
+def test_the_drawdown_counts_a_loss_from_the_start():
+    assert S.max_drawdown([0.95, 0.90, 1.2]) == pytest.approx(10.0)

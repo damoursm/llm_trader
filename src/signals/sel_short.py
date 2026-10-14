@@ -48,7 +48,9 @@ from the deep store's last session when it is behind), rebuilds each series
 (`ml_model.features_30m_from_hlc` + `deep_features.serving_vector` from the
 pre-open session snapshot — `ensure_snapshot` first rebuilds a missing or
 DEFECTIVE one), scores, appends every score to the day's score file, selects and
-journals the decision. `tracker.record_sel_short_trades` opens the journal's
+journals the decision — the LIVE arms first (2026-10-12, `score_bar_phased`: their
+ATR% rows and decisions before the model's full features and the shadow arms), the
+tick's `wait` returning on their marker. `tracker.record_sel_short_trades` opens the journal's
 shorts (skipping one already at its target); `tracker.monitor_sel_short_positions`
 covers them. The subprocess holds `busy.lock`, touched every 30 s, so a tick
 never launches a second scorer beside a live one and a dead one's lock goes
@@ -143,10 +145,10 @@ MECHANISM = "sel_short"
 # the model's picks; the most-volatile-name rule's; the same rule on ETFs; the same rule on the THIN stocks (the
 # common stocks trading $1-5M a day, ranked among themselves, on free capital — 2026-10-07); VOL2, the vol rule
 # without the crowding filter, the relative-volume filter and the volatility exit (2026-10-07, PREREG37)
-ARMS = ("model", "vol", "etf", "thin", "vol2")
+ARMS = ("model", "vol", "etf", "thin", "vol2", "fall")
 _SCORE_DIRS = {"model": "scores", "vol": "scores_vol", "etf": "scores_etf", "thin": "scores_thin",
-               "vol2": "scores_vol2"}
-VOL_RULE_ARMS = ("vol", "etf", "thin", "vol2")  # the arms that rank the `vol` column (30-min ATR%)
+               "vol2": "scores_vol2", "fall": "scores_fall"}
+VOL_RULE_ARMS = ("vol", "etf", "thin", "vol2", "fall")  # the arms that rank the `vol` column (30-min ATR%)
 # VOL2 (user directive 2026-10-07: "Deploy it as another version that will also make real trades in the paper
 # account"): the vol arm's ranking, universe, freshness (its own copy of the vol history, `scores_vol2/`), first
 # fresh pick of the day, riser, same-bar fallback, whole give-back target, 15-session limit and 6x cover — WITHOUT
@@ -155,11 +157,42 @@ VOL_RULE_ARMS = ("vol", "etf", "thin", "vol2")  # the arms that rank the `vol` c
 # positive), return per day 0.36 vs 1.44 %, 6 vs 1 margin calls over the 2021-26 context; not significant.
 UNFILTERED_ARMS = ("vol2",)    # no crowding filter, no relative-volume filter
 NO_VOLNORM_ARMS = ("vol2",)    # no volatility exit
+# FALL, THE FALLER SHORTS (user directive 2026-10-09: "Yes add the faller short arm to live"; PREREG38 / PREREG57):
+# the vol arm's own pick — its ranking, universe, freshness (its own copy of the vol history, `scores_fall/`) and
+# first fresh pick of the day — on the bars where that pick did NOT rise over the 5 sessions before (a valid base,
+# the bar's close at or under it), with the vol arm's crowding and relative-volume filters, NO same-bar fallback and
+# NO give-back target (a faller has no run-up to give back): it leaves on the volatility exit (in profit, ATR%
+# halved), the 6x cover or the 15-session limit. 2021-02..2024-06 alone: 38 trades, +10.3%, 1.48 %/day; out of
+# sample 2024-07..2026-09: 45 trades, +12.5%, 1.98 %/day; added to the combined account +6.3 log pp a year on the
+# weekly walk-forward 2023-01..2026-09 (95% +2.2..+11.6, both halves positive, no margin call).
+FALLER_ARMS = ("fall",)
+
+
+def traded_arms() -> Optional[frozenset]:
+    """The arms whose picks the live $10,000 account trades (`sel_short_traded_arms`; None = every arm). The
+    others run as SHADOW: scored and journaled, their picks settled `shadow_arm` by the entry step."""
+    raw = str(getattr(settings, "sel_short_traded_arms", "") or "")
+    arms = frozenset(a.strip() for a in raw.split(",") if a.strip())
+    return arms or None
 
 
 def volnorm_exit(arm) -> bool:
-    """The arm's trades take the volatility-normalised exit (`sel_volnorm`) — every arm but vol2's."""
-    return str(arm or "model") not in NO_VOLNORM_ARMS
+    """The arm's trades take the volatility-normalised exit (`sel_volnorm`) — every arm but vol2's, and the vol
+    arm's only while `enable_sel_short_vol_volnorm_exit` (off from the 2026-10-12 session, PREREG77)."""
+    a = str(arm or "model")
+    if a in NO_VOLNORM_ARMS:
+        return False
+    if a == "vol":
+        return bool(getattr(settings, "enable_sel_short_vol_volnorm_exit", True))
+    return True
+
+
+def cover_multiple(arm) -> float:
+    """The squeeze cover's multiple of the entry for the arm's trades: the vol arm's `sel_short_vol_cover_multiple`
+    (4x from the 2026-10-12 session, PREREG77), every other arm's `sel_short_cover_multiple` (6x)."""
+    if str(arm or "model") == "vol":
+        return float(getattr(settings, "sel_short_vol_cover_multiple", settings.sel_short_cover_multiple))
+    return float(settings.sel_short_cover_multiple)
 DTC_FEATURE = "dp_si_dtc"              # FINRA days to cover in the session snapshot (the short-interest filter)
 LOCK_HEARTBEAT_SECONDS = 30.0
 LOCK_STALE_SECONDS = 180.0
@@ -385,6 +418,19 @@ def own_window(arm: str = "model") -> int:
 
 
 ETP_TYPES = ("ETF", "ETN", "ETV", "ETS")
+# THE VIX-LINKED PRODUCTS the ETF arm leaves out while `sel_short_etf_exclude_vix` (user 2026-10-14: "Yes please" to
+# blocking them until PREREG102 decides): on set A0 the arm's shorts of them lost (-$1,251 a draw; TVIX -297% and
+# -161% in March 2020) and took every A0 draw of the live account into a margin call (PREREG101 / 103). Every active
+# fund whose Polygon name says VIX or volatility premium (2026-10-14), with the delisted ones of earlier years
+VIX_ETPS = frozenset({
+    "UVXY", "UVIX", "VXX", "VIXY", "VIXM", "VXZ", "SVXY", "SVIX", "VYLD", "SVOL", "ZVOL",       # active 2026-10-14
+    "TVIX", "TVIZ", "XIV", "ZIV", "VIIX", "VXXB", "VXZB", "VMAX", "VMIN", "XVZ", "XXV",        # delisted
+})
+
+
+def vix_excluded() -> bool:
+    """The ETF arm leaves the VIX-linked products out (`sel_short_etf_exclude_vix`)."""
+    return bool(getattr(settings, "sel_short_etf_exclude_vix", False))
 _TYPES: dict = {}
 
 
@@ -511,23 +557,209 @@ def pick_key(rec: dict) -> str:
 
 
 def pending_entries(now: Optional[datetime] = None) -> List[dict]:
-    """Today's journaled shorts not yet handed to the ledger and still fresh
-    enough to take (`sel_short_entry_max_age_minutes` after their bar's end)."""
+    """The journaled shorts to hand to the ledger now: today's picks not yet settled and still fresh enough to
+    take (`sel_short_entry_max_age_minutes` after their bar's end) — and the TURN arms' picks (PREREG76, the faller
+    shorts) of today and the earlier sessions of their window whose turn has just come (`turn_entries`), each
+    carrying it under ``turn``."""
     now = now or datetime.now(timezone.utc)
     et = now.astimezone(ET)
     d = et.date()
     done = consumed(d)
     max_age = timedelta(minutes=float(settings.sel_short_entry_max_age_minutes))
-    out = []
+    out, seen = [], set()
     for rec in read_picks(d):
-        if rec.get("decision") != "short" or pick_key(rec) in done:
-            continue
+        if rec.get("decision") != "short" or pick_key(rec) in done or pick_key(rec) in seen:
+            continue                                   # (a pick journaled twice — a rerun after a crash — once)
+        seen.add(pick_key(rec))
+        if _turn_traded(rec.get("arm")):
+            continue                                   # waits for its turn (below), never expired at 75 minutes
         end = datetime.fromisoformat(rec["bar_end"])
         if now - end > max_age:
             mark_consumed(d, pick_key(rec), "expired")
             journal_entry(rec, "expired")
             continue
         out.append(rec)
+    if any(turn_on(a) for a in TURN_ARMS):
+        out.extend(turn_entries(now))
+    return out
+
+
+# ── THE TURN (PREREG76 / PREREG77; user directives 2026-10-10: "Deploy the 'Turn, fallers shorts', even if it's not
+# significant it is better and not hurting", then the ETF arm with it): a fall or ETF pick WAITS, and is shorted once
+# a completed regular-hours bar closes ½ x its ATR$ under the highest close since the pick — the backtest's
+# `VolEngine.turn_pieces` / `EtfArm.pieces(turn=...)` ──
+
+TURN_ARMS = ("fall", "etf")
+_TURN_SWITCH = {"fall": "enable_sel_short_fall_turn", "etf": "enable_sel_short_etf_turn"}
+
+
+def turn_on(arm: Optional[str]) -> bool:
+    """The arm's picks enter on the TURN: the faller shorts (`enable_sel_short_fall_turn`) and the ETF arm
+    (`enable_sel_short_etf_turn`)."""
+    key = _TURN_SWITCH.get(arm or "model")
+    return bool(key and getattr(settings, key, False))
+
+
+def _turn_traded(arm: Optional[str]) -> bool:
+    """A turn arm the live account trades: a SHADOW arm's pick is settled at once (`shadow_arm`), never waited on."""
+    traded = traded_arms()
+    return turn_on(arm) and (traded is None or (arm or "model") in traded)
+
+
+def turn_window_end(rec: dict) -> datetime:
+    """The END of the turn window's last bar: 16:00 ET of the `sel_short_turn_sessions`-th session counting the
+    pick's own."""
+    d = date.fromisoformat(str(rec["day"]))
+    n = max(1, int(settings.sel_short_turn_sessions))
+    return bar_end_et(session_after(d, n - 1) if n > 1 else d, BARS_PER_SESSION - 1)
+
+
+def _turn_bars(rec: dict, now: datetime):
+    """`series`' tuple for the pick's name: the deep store + the sessions after it from Polygon, through the window's
+    last day — the bars as adjusted today."""
+    tk = str(rec["ticker"])
+    last_day = min(now, turn_window_end(rec)).astimezone(ET).date()
+    deep, recent = _deep_and_recent(tk, last_day, fetch=not _NO_FETCH)
+    now_naive = pd.Timestamp(now).tz_convert("UTC").tz_localize(None)
+    return series(tk, recent, now_naive, deep=deep)
+
+
+def turn_state(rec: dict, now: datetime, hlc=None) -> dict:
+    """A waiting pick's turn at ``now`` (``hlc``: `series`' tuple; read with `_turn_bars` when None). Only bars
+    COMPLETED by ``now`` and ending inside the window count. The pick bar's close ``c0`` is read from the bars (their
+    terms: a split during the wait moves the bars and the level together); ATR$ = c0 x the pick's ATR% / 100; the
+    trigger is the FIRST bar after the pick whose close is at most the highest close since the pick (c0 included)
+    minus `sel_short_turn_atr` x ATR$; a pick with a TARGET (the ETF arm's) is CANCELLED by a bar closing at or under
+    it first — the triggering bar itself included (the target scaled to the bars' terms by c0 / the journaled close).
+    Returns ``{"state": "triggered" | "waiting" | "cancelled" | "lapsed" | "no_bars", "k", "window_end", ...}`` —
+    triggered with its ``bar_end`` (ET ISO), ``close``, ``max_close``, ``level``; cancelled with the ``bar_end`` and
+    ``close`` that reached the target; "lapsed" once the window's last bar is older than the entry freshness without
+    a turn (or without the bars to judge it)."""
+    end = turn_window_end(rec)
+    over = now > end + timedelta(minutes=float(settings.sel_short_entry_max_age_minutes))
+    k = float(settings.sel_short_turn_atr)
+    atr = _finite_or_none(rec.get("atr_pct"))
+    out = {"k": k, "window_end": end.isoformat()}
+    if hlc is None and atr is not None:
+        try:
+            hlc = _turn_bars(rec, now)
+        except Exception as e:                                 # noqa: BLE001
+            logger.debug(f"[sel_short] {rec.get('ticker')}: the turn's bars failed ({e})")
+    if hlc is None or atr is None or atr <= 0:
+        return dict(out, state="lapsed" if over else "no_bars")
+    idx, _h, _l, close, _v = hlc
+    starts = pd.DatetimeIndex(idx)
+    c = np.asarray(close, float)
+    pick_start = pd.Timestamp(bar_end_et(date.fromisoformat(str(rec["day"])), int(rec["bar_of_day"])) - BAR) \
+        .tz_convert("UTC").tz_localize(None)
+    j0 = np.flatnonzero(starts == pick_start)
+    if not len(j0) or not (np.isfinite(c[j0[0]]) and c[j0[0]] > 0):
+        return dict(out, state="lapsed" if over else "no_bars")
+    c0 = float(c[j0[0]])
+    ends = starts + BAR
+    cut = min(pd.Timestamp(now).tz_convert("UTC").tz_localize(None), pd.Timestamp(end).tz_convert("UTC").tz_localize(None))
+    after = np.flatnonzero((starts > pick_start) & (ends <= cut))
+    path = c[after]
+    drop = k * c0 * atr / 100.0
+    runmax = np.maximum.accumulate(np.r_[c0, path])[1:]
+    hit = np.flatnonzero(path <= runmax - drop)
+    j_t = int(hit[0]) if len(hit) else None
+    tgt, px0 = _finite_or_none(rec.get("target")), _finite_or_none(rec.get("px"))
+    if tgt is not None:
+        level_t = tgt * (c0 / px0) if px0 else tgt
+        canc = np.flatnonzero(path <= level_t)
+        if len(canc) and (j_t is None or int(canc[0]) <= j_t):
+            j = int(canc[0])
+            bar_end = pd.Timestamp(ends[after[j]]).tz_localize("UTC").tz_convert(ET)
+            return dict(out, state="cancelled", bar_end=bar_end.isoformat(), close=float(path[j]), target=level_t,
+                        pick_close=c0, atr_pct=atr)
+    if j_t is not None:
+        bar_end = pd.Timestamp(ends[after[j_t]]).tz_localize("UTC").tz_convert(ET)
+        return dict(out, state="triggered", bar_end=bar_end.isoformat(), close=float(path[j_t]),
+                    max_close=float(runmax[j_t]), level=float(runmax[j_t] - drop), pick_close=c0, atr_pct=atr)
+    return dict(out, state="lapsed" if over else "waiting", pick_close=c0)
+
+
+def turn_entries(now: datetime) -> List[dict]:
+    """The turn arms' picks still waiting — today's and those of the earlier sessions their window can still reach —
+    whose turn has come at a bar at most `sel_short_entry_max_age_minutes` old, each with its ``turn``. A pick with
+    no turn by its window's end is settled ``turn_lapsed``; one whose target was reached first ``target_reached``;
+    one whose turn is first seen later than the entry freshness ``turn_expired`` (as a pick older than that is
+    ``expired``); one still waiting is left as it is."""
+    d = now.astimezone(ET).date()
+    n = max(1, int(settings.sel_short_turn_sessions))
+    days = sessions_before(d, n + 2) + ([d] if is_session(d) else [])
+    max_age = timedelta(minutes=float(settings.sel_short_entry_max_age_minutes))
+    out = []
+    for day in days:
+        done, seen = None, set()
+        for rec in read_picks(day):
+            if rec.get("decision") != "short" or not _turn_traded(rec.get("arm")):
+                continue
+            done = consumed(day) if done is None else done
+            key = pick_key(rec)
+            if key in done or key in seen:
+                continue                                       # (a pick journaled twice — once)
+            seen.add(key)
+            st = turn_state(rec, now)
+            if st["state"] == "cancelled":
+                mark_consumed(day, key, "target_reached")
+                journal_entry(dict(rec, turn=st), "target_reached")
+                logger.info(f"[sel_short] {rec['ticker']} [{rec.get('arm')}]: reached its target at "
+                            f"{st['bar_end'][:16]} before its turn — not shorted")
+                continue
+            if st["state"] == "lapsed":
+                mark_consumed(day, key, "turn_lapsed")
+                journal_entry(dict(rec, turn=st), "turn_lapsed")
+                logger.info(f"[sel_short] {rec['ticker']} [{rec.get('arm')}]: no turn by {st['window_end'][:16]} "
+                            f"— not shorted (PREREG76)")
+                continue
+            if st["state"] != "triggered":
+                continue                                       # waiting, or its bars not readable: next tick
+            if now - datetime.fromisoformat(st["bar_end"]) > max_age:
+                mark_consumed(day, key, "turn_expired")
+                journal_entry(dict(rec, turn=st), "turn_expired")
+                logger.info(f"[sel_short] {rec['ticker']} [{rec.get('arm')}]: its turn at {st['bar_end'][:16]} was "
+                            f"seen too late — not shorted")
+                continue
+            out.append(_in_todays_terms(dict(rec, turn=st), now))
+    return out
+
+
+# a pick's journaled prices (the pick bar's terms)
+_PICK_PRICE_FIELDS = ("px", "pre5", "target", "ssr_prev_close", "ssr_day_low", "ssr_prev_low", "ssr_prev2_close")
+
+
+def _in_todays_terms(rec: dict, now: datetime) -> dict:
+    """A turn pick handed over sessions after its pick, its journaled prices in the terms of ``now``: x the splits
+    executed after the pick's session through the session ``now`` quotes in (a split takes effect at 04:00 ET of its
+    execution date, as `tracker.apply_splits` reads it; the split data decides). The turn itself is judged on the
+    bars in today's terms (`turn_state`); without this the entry step's target check and the trade's target would
+    stay in the pick's terms — a 2-for-1 split read as the target reached, a 1-for-10 reverse split as a target ten
+    times too low. Unreadable split data leaves the record as journaled (warned)."""
+    from src.data.intraday_store import split_factor_between
+    try:
+        d0 = date.fromisoformat(str(rec["day"])[:10])
+        d1 = (now.astimezone(ET) - timedelta(hours=4)).date()
+        f = split_factor_between(str(rec["ticker"]), d0, max(d0, d1))
+    except Exception as e:                                     # noqa: BLE001
+        logger.warning(f"[sel_short] {rec.get('ticker')}: the split data for its turn is unreadable ({e}) — "
+                       f"its pick's prices are used as journaled")
+        return rec
+    if f is None:
+        logger.warning(f"[sel_short] {rec.get('ticker')}: the split data is unreadable — its pick's prices are used "
+                       f"as journaled for its turn")
+        return rec
+    if not np.isfinite(f) or f <= 0 or abs(f - 1.0) < 1e-12:
+        return rec
+    out = dict(rec)
+    for k in _PICK_PRICE_FIELDS:
+        v = _finite_or_none(out.get(k))
+        if v is not None:
+            out[k] = v * f
+    out["pick_split_factor"] = f
+    logger.warning(f"[sel_short] {rec.get('ticker')} [{rec.get('arm')}]: split x{f:g} since its pick on {d0} — its "
+                   f"closes and target rescaled to today's terms for the entry")
     return out
 
 
@@ -543,7 +775,8 @@ def journal_entry(rec: dict, outcome: str, price: Optional[float] = None, borrow
                   ibkr_margin: Optional[dict] = None) -> None:
     """One line per pick the ledger's entry step settled (`tracker.record_sel_short_trades`,
     `pending_entries`): the outcome (opened, no_borrow, borrow_fee, target_reached,
-    already_open, ibkr_refused, the account's reasons, expired), the live price it was judged
+    already_open, ibkr_refused, the account's reasons, expired; a faller pick's turn_lapsed /
+    turn_expired with its ``turn``), the live price it was judged
     at, the pick's short-sale restriction, what IBKR's borrow file showed then and IBKR's
     what-if margin answer (``ibkr_margin``: its rates, a refusal or an error; None = not asked)
     — for the picks NOT taken too, so the backtest's borrow assumption (every pick borrowable)
@@ -564,6 +797,13 @@ def journal_entry(rec: dict, outcome: str, price: Optional[float] = None, borrow
                 "borrow_fee_pct": getattr(borrow, "fee_pct", None) if borrow is not None else None,
                 "borrow_file_ts": ts.isoformat() if ts is not None else None,
                 "ibkr_margin": ibkr_margin}
+        if rec.get("fallback_of"):
+            line["fallback_of"] = rec.get("fallback_of")
+        if rec.get("pressure_extra_of"):                       # PREREG71's V6: a backup shorted for its borrow pressure
+            line["pressure_extra_of"] = rec.get("pressure_extra_of")
+            line["pressure"] = _finite_or_none(rec.get("pressure"))
+        if rec.get("turn"):                                    # PREREG76: the faller pick's turn (or its absence)
+            line["turn"] = rec.get("turn")
         p = entries_path(d)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as fh:
@@ -975,114 +1215,169 @@ def ensure_day_extras(d: date, names: Sequence[str], force: bool = False) -> int
     return len(todo)
 
 
-def _score_chunk(args) -> List[dict]:
-    """One worker: fetch today's bars for its tickers (threads), then compute each
-    one's feature vector at the target bar and score the chunk in one predict.
-    A V2 model (`sel_v2.is_v2`) is NOT scored here: its cross-sectional inputs need
-    every name of the bar, so the worker returns each row's vector (``_vec``) and
-    the cross-section's sources (``_x_*``) and `score_bar` scores the bar."""
+def _chunk_ctx(args, fetch: bool) -> dict:
+    """A worker's setup for its tickers: the model, the bar's clock, today's bars from
+    Polygon (threads) beside the deep store, the session snapshot."""
     tickers, day_iso, bar_of_day, dv20 = args
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     from loguru import logger as _lg
     _lg.remove()
     from src.analysis import deep_features as dfe
     from src.signals import sel_v2
-    from src.signals.ml_model import features_30m_from_hlc
     booster, meta = load_model()
-    feats = list(meta["features"])
     v2 = sel_v2.is_v2(meta)
-    model_set = set(meta["tickers"]) if meta.get("tickers") else None      # None: every name is the model's
     d = date.fromisoformat(day_iso)
-    day_ext = (sel_v2.read_day_extras(day_extras_path(d)) or {}) if v2 else {}
     end = bar_end_et(d, bar_of_day)
     now_naive = pd.Timestamp(end).tz_convert("UTC").tz_localize(None)
-    target_start = now_naive - BAR
-    pre_day = sessions_before(d, int(settings.sel_short_runup_sessions))[0]
-    fetch = not _NO_FETCH
     with ThreadPoolExecutor(max(1, int(settings.sel_short_fetch_threads))) as ex:
         loaded = dict(zip(tickers, ex.map(lambda t: _deep_and_recent(t, d, fetch), tickers)))
-    snap = dfe.load_session_snapshot(dnum(d))
-    vol_feature = str(settings.sel_short_vol_feature)
-    rows, vecs = [], []
-    for tk in tickers:
-        rec = {"ticker": tk, "dv20": dv20.get(tk, float("nan")), "score": float("nan"),
-               "vol": float("nan"), "dtc": float("nan"), "px": float("nan"), "pre5": float("nan"),
-               "pre5_stale": False, "rvol": float("nan"), "ca_gap": None, "ca_gap_pct": None, "status": ""}
-        deep, today = loaded.get(tk, (None, None))
-        if today is None:
-            rec["status"] = "FETCH_FAILED"
-            rows.append(rec)
-            continue
-        hlc = series(tk, today, now_naive, deep=deep)
-        frame, label = (features_30m_from_hlc(tk, hlc, now_naive, with_series=True) if v2
-                        else features_30m_from_hlc(tk, hlc, now_naive))
-        if frame is None:
-            rec["status"] = label
-            rows.append(rec)
-            continue
-        if pd.Timestamp(frame["bar_ts"]) != target_start:
-            rec["status"] = "NO_BAR"                       # no trade in the target bar
-            rows.append(rec)
-            continue
-        rec["px"] = float(frame["close"])
-        rec["pre5"] = _close_at(hlc[0], hlc[3], pre_day, bar_of_day)
-        rec["pre5_stale"] = _stale_base(hlc[0], pre_day, bar_of_day)   # journal-only: a gap before the base
-        rec["rvol"] = rvol_at(hlc[0], hlc[4], target_start)             # the vol arm's relative-volume filter
-        rec.update(ssr_state(hlc[0], hlc[2], hlc[3], d, target_start))  # journal-only: the short-sale restriction
-        rec.update(ca_gap_state(hlc[0], hlc[1], hlc[2], hlc[3], target_start))  # a corporate-action gap: unranked
-        try:                                   # the volatility arm's score: a base feature, no snapshot needed
-            # float32, as the history (the arrays / backfill) stores it: the live
-            # value then equals the history's for the same bar, so the freshness
-            # comparison against the prior max is like for like (2026-09-26 dry
-            # run: 1,973 of 1,982 names equal, the other 9 the clock-vs-position bars)
-            rec["vol"] = float(np.float32(frame["features"].get(vol_feature, float("nan"))))
-        except (TypeError, ValueError):
-            rec["vol"] = float("nan")
-        if snap is None:
-            rec["status"] = "NO_SNAPSHOT"
-            rows.append(rec)
-            continue
-        deep = dfe.serving_vector(tk, frame["sday"], frame["close"], frame["bar_idx"], snap)
-        rec["dtc"] = float(deep.get(DTC_FEATURE, float("nan")))     # the short-interest filter's input
-        if (model_set is not None and tk not in model_set) or not (
-                rec["dv20"] >= float(settings.sel_short_min_dollar_volume)):
-            # the vol arm's extra names, and the THIN stocks under the vol floor (2026-10-07; never a model
-            # input, never in the V2 cross-section): ATR% + days to cover
-            rec["status"] = "VOL_ONLY"
-            rows.append(rec)
-            continue
-        base = frame["features"]
-        if v2:
-            # the V2 inputs of this name at this bar: its own series' (the visible bars, as the
-            # base features read them) and the session's (the day's file, else read now)
-            n_vis = int(frame["n_vis"])
-            cut = (hlc[0][:n_vis], hlc[1].iloc[:n_vis], hlc[2].iloc[:n_vis], hlc[3].iloc[:n_vis],
-                   hlc[4].iloc[:n_vis])
-            atr = np.asarray(frame.get("atr_series"), dtype=float)
-            if len(atr) != n_vis:
-                atr = np.full(n_vis, np.nan)
-            ext = dict(zip(sel_v2.E_BAR, sel_v2.bar_extras(cut, atr)[-1]))
-            es = day_ext.get(tk)
-            if es is None:
-                es = sel_v2.session_extras(tk, [int(frame["sday"])])[0]
-            ext.update(zip(sel_v2.E_SESS, (float(x) for x in es)))
-            rec["_vec"] = np.array([base[f] if f in base else ext[f] if f in ext else deep.get(f, np.nan)
-                                    for f in feats], dtype=np.float64)
-            for s in sel_v2.XS_SOURCES:
-                rec[f"_x_{s}"] = float(ext[s]) if s in ext else float(base.get(s, np.nan))
-            rec["status"] = "OK"
-            rows.append(rec)
-            continue
-        v = np.array([base[f] if f in base else deep.get(f, np.nan) for f in feats], dtype=np.float64)
-        rec["status"] = "OK"
-        rows.append(rec)
-        vecs.append((len(rows) - 1, v))
+    return {"tickers": tickers, "d": d, "bar_of_day": int(bar_of_day), "dv20": dv20,
+            "booster": booster, "meta": meta, "feats": list(meta["features"]), "v2": v2,
+            "model_set": set(meta["tickers"]) if meta.get("tickers") else None,   # None: every name is the model's
+            "day_ext": (sel_v2.read_day_extras(day_extras_path(d)) or {}) if v2 else {},
+            "now_naive": now_naive, "target_start": now_naive - BAR,
+            "pre_day": sessions_before(d, int(settings.sel_short_runup_sessions))[0],
+            "loaded": loaded, "snap": dfe.load_session_snapshot(dnum(d)),
+            "vol_feature": str(settings.sel_short_vol_feature)}
+
+
+def _name_row(tk: str, c: dict, live_only: bool) -> dict:
+    """One name's row at the bar. ``live_only`` (the LIVE arms' phase, 2026-10-12): stop once
+    the vol, ETF and faller arms have every input — the ATR% from the ATR-only frame
+    (`ml_model.atr_frame_30m_from_hlc`, built as the full frame builds it), the price, the
+    run-up base, the relative volume, the short-sale state, the corporate-action gap, the
+    days to cover — leaving the model's inputs (the full feature frame, the V2 vector) to
+    the second phase; a model name's status is then the provisional ``OK``. The full row is
+    the scorer's row as it always was."""
+    from src.analysis import deep_features as dfe
+    from src.signals import sel_v2
+    from src.signals.ml_model import atr_frame_30m_from_hlc, features_30m_from_hlc
+    rec = {"ticker": tk, "dv20": c["dv20"].get(tk, float("nan")), "score": float("nan"),
+           "vol": float("nan"), "dtc": float("nan"), "px": float("nan"), "pre5": float("nan"),
+           "pre5_stale": False, "rvol": float("nan"), "ca_gap": None, "ca_gap_pct": None, "status": ""}
+    deep, today = c["loaded"].get(tk, (None, None))
+    if today is None:
+        rec["status"] = "FETCH_FAILED"
+        return rec
+    now_naive, target_start, d, bar_of_day = c["now_naive"], c["target_start"], c["d"], c["bar_of_day"]
+    # rebuilt in each phase, never kept: ~0.6 MB a name (2.5 GB over a bar) held between the phases would
+    # raise the scorer's memory peak; the series is the same both times (the same frames)
+    hlc = series(tk, today, now_naive, deep=deep)
+    vol_feature = c["vol_feature"]
+    if live_only and vol_feature == "atr_pct_14":
+        frame, label = atr_frame_30m_from_hlc(tk, hlc, now_naive)
+    elif c["v2"]:
+        frame, label = features_30m_from_hlc(tk, hlc, now_naive, with_series=True)
+    else:
+        frame, label = features_30m_from_hlc(tk, hlc, now_naive)
+    if frame is None:
+        rec["status"] = label
+        return rec
+    if pd.Timestamp(frame["bar_ts"]) != target_start:
+        rec["status"] = "NO_BAR"                       # no trade in the target bar
+        return rec
+    rec["px"] = float(frame["close"])
+    rec["pre5"] = _close_at(hlc[0], hlc[3], c["pre_day"], bar_of_day)
+    rec["pre5_stale"] = _stale_base(hlc[0], c["pre_day"], bar_of_day)   # journal-only: a gap before the base
+    rec["rvol"] = rvol_at(hlc[0], hlc[4], target_start)             # the vol arm's relative-volume filter
+    rec.update(ssr_state(hlc[0], hlc[2], hlc[3], d, target_start))  # journal-only: the short-sale restriction
+    rec.update(ca_gap_state(hlc[0], hlc[1], hlc[2], hlc[3], target_start))  # a corporate-action gap: unranked
+    try:                                   # the volatility arm's score: a base feature, no snapshot needed
+        # float32, as the history (the arrays / backfill) stores it: the live
+        # value then equals the history's for the same bar, so the freshness
+        # comparison against the prior max is like for like (2026-09-26 dry
+        # run: 1,973 of 1,982 names equal, the other 9 the clock-vs-position bars)
+        rec["vol"] = float(np.float32(frame["features"].get(vol_feature, float("nan"))))
+    except (TypeError, ValueError):
+        rec["vol"] = float("nan")
+    snap = c["snap"]
+    if snap is None:
+        rec["status"] = "NO_SNAPSHOT"
+        return rec
+    deep = dfe.serving_vector(tk, frame["sday"], frame["close"], frame["bar_idx"], snap)
+    rec["dtc"] = float(deep.get(DTC_FEATURE, float("nan")))     # the short-interest filter's input
+    model_set = c["model_set"]
+    if (model_set is not None and tk not in model_set) or not (
+            rec["dv20"] >= float(settings.sel_short_min_dollar_volume)):
+        # the vol arm's extra names, and the THIN stocks under the vol floor (2026-10-07; never a model
+        # input, never in the V2 cross-section): ATR% + days to cover
+        rec["status"] = "VOL_ONLY"
+        return rec
+    rec["status"] = "OK"
+    if live_only:
+        return rec                             # the model's inputs: the second phase
+    base = frame["features"]
+    feats = c["feats"]
+    if c["v2"]:
+        # the V2 inputs of this name at this bar: its own series' (the visible bars, as the
+        # base features read them) and the session's (the day's file, else read now)
+        n_vis = int(frame["n_vis"])
+        cut = (hlc[0][:n_vis], hlc[1].iloc[:n_vis], hlc[2].iloc[:n_vis], hlc[3].iloc[:n_vis],
+               hlc[4].iloc[:n_vis])
+        atr = np.asarray(frame.get("atr_series"), dtype=float)
+        if len(atr) != n_vis:
+            atr = np.full(n_vis, np.nan)
+        ext = dict(zip(sel_v2.E_BAR, sel_v2.bar_extras(cut, atr)[-1]))
+        es = c["day_ext"].get(tk)
+        if es is None:
+            es = sel_v2.session_extras(tk, [int(frame["sday"])])[0]
+        ext.update(zip(sel_v2.E_SESS, (float(x) for x in es)))
+        rec["_vec"] = np.array([base[f] if f in base else ext[f] if f in ext else deep.get(f, np.nan)
+                                for f in feats], dtype=np.float64)
+        for s_ in sel_v2.XS_SOURCES:
+            rec[f"_x_{s_}"] = float(ext[s_]) if s_ in ext else float(base.get(s_, np.nan))
+        return rec
+    rec["_v1vec"] = np.array([base[f] if f in base else deep.get(f, np.nan) for f in feats], dtype=np.float64)
+    return rec
+
+
+def _score_rows(c: dict, live_only: bool = False) -> List[dict]:
+    """Every name of the worker's chunk (`_name_row`); a v1 model's rows scored in one
+    predict (a V2 model is scored over the whole bar by `score_v2`)."""
+    rows = [_name_row(tk, c, live_only) for tk in c["tickers"]]
+    vecs = [(i, r.pop("_v1vec")) for i, r in enumerate(rows) if "_v1vec" in r]
     if vecs:
+        booster, meta = c["booster"], c["meta"]
         M = np.vstack([v for _, v in vecs]).astype(np.float32)
         pred = booster.predict(M, num_iteration=int(meta.get("num_iteration") or NUM_ITERATION))
-        for (i, _), s in zip(vecs, pred):
-            rows[i]["score"] = float(s)
+        for (i, _), sc in zip(vecs, pred):
+            rows[i]["score"] = float(sc)
     return rows
+
+
+def _score_chunk(args) -> List[dict]:
+    """One worker: fetch today's bars for its tickers (threads), then compute each
+    one's feature vector at the target bar and score the chunk in one predict.
+    A V2 model (`sel_v2.is_v2`) is NOT scored here: its cross-sectional inputs need
+    every name of the bar, so the worker returns each row's vector (``_vec``) and
+    the cross-section's sources (``_x_*``) and `score_bar` scores the bar."""
+    return _score_rows(_chunk_ctx(args, fetch=not _NO_FETCH))
+
+
+# The LIVE arms first (2026-10-12; user 2026-10-11: "run first only the necessary parts for
+# live production, and after we do the shadow arms"): a worker hands its chunk's live rows to
+# the parent through this queue (set at the worker's start), then computes the full rows on
+# the same fetched bars; the parent decides the live arms as soon as every worker reported.
+_LIVE_Q = None
+
+
+def _init_live_queue(q) -> None:
+    global _LIVE_Q
+    _LIVE_Q = q
+    # a worker never blocks its exit on the queue's feeder thread: when the parent stops reading (a failed bar), a
+    # chunk still waiting in the pipe would otherwise hang the worker at exit and the pool's shutdown with it (the
+    # documented "joining processes that use queues" deadlock). Nothing is lost on a normal run: the parent reads
+    # every chunk's live rows before the pool shuts down.
+    q.cancel_join_thread()
+
+
+def _score_chunk_phased(args) -> List[dict]:
+    """`_score_chunk` in two phases: the chunk's LIVE rows (`_name_row` with ``live_only``)
+    onto the queue, tagged with the chunk's index, then the full rows — returned."""
+    i, chunk_args = args
+    c = _chunk_ctx(chunk_args, fetch=True)
+    _LIVE_Q.put((i, _score_rows(c, live_only=True)))
+    return _score_rows(c)
 
 
 def _dv20(tk: str, d: date) -> float:
@@ -1128,7 +1423,8 @@ def bar_from_end(bar_end_iso: str) -> Tuple[date, int]:
 
 def atr_at(tk: str, d: date, bar_of_day: int) -> Optional[float]:
     """``tk``'s 30-minute ATR% (`sel_short_vol_feature`) at bar ``bar_of_day`` of
-    ``d``: the deep store + that session's Polygon bars, `features_30m_from_hlc`,
+    ``d``: the deep store + that session's Polygon bars, `features_30m_from_hlc`
+    (its ATR-only frame for ``atr_pct_14``, the same construction, 2026-10-12),
     float32 — the scorer's construction. A bar Polygon has not published yet
     serves the session's newest bar (not memoised); a series whose newest bar is
     from an EARLIER session (a failed fetch) gives None, never an old value."""
@@ -1137,10 +1433,12 @@ def atr_at(tk: str, d: date, bar_of_day: int) -> Optional[float]:
     if key in _ATR_MEMO:
         return _ATR_MEMO[key]
     try:
-        from src.signals.ml_model import features_30m_from_hlc
+        from src.signals.ml_model import atr_frame_30m_from_hlc, features_30m_from_hlc
         now_naive = pd.Timestamp(end).tz_convert("UTC").tz_localize(None)
         deep, today = _deep_and_recent(tk, d, fetch=not _NO_FETCH)
-        frame, _label = features_30m_from_hlc(tk, series(tk, today, now_naive, deep=deep), now_naive)
+        build = (atr_frame_30m_from_hlc if str(settings.sel_short_vol_feature) == "atr_pct_14"
+                 else features_30m_from_hlc)
+        frame, _label = build(tk, series(tk, today, now_naive, deep=deep), now_naive)
         if frame is None:
             return None
         bar_ts = pd.Timestamp(frame["bar_ts"])
@@ -1181,12 +1479,14 @@ def universe_path(d: date) -> Path:
 
 def live_arms() -> List[str]:
     """The arms the scorer runs: the model always, the vol and ETF arms when on, the vol arm's thin stocks
-    (`enable_sel_short_thin`) and vol2 (`enable_sel_short_vol2`) with the vol arm."""
+    (`enable_sel_short_thin`), vol2 (`enable_sel_short_vol2`) and the faller shorts (`enable_sel_short_fall`)
+    with the vol arm."""
     vol_on = bool(getattr(settings, "enable_sel_short_vol", False))
     return (["model"] + (["vol"] if vol_on else [])
             + (["etf"] if getattr(settings, "enable_sel_short_etf", False) else [])
             + (["thin"] if vol_on and getattr(settings, "enable_sel_short_thin", False) else [])
-            + (["vol2"] if vol_on and getattr(settings, "enable_sel_short_vol2", False) else []))
+            + (["vol2"] if vol_on and getattr(settings, "enable_sel_short_vol2", False) else [])
+            + (["fall"] if vol_on and getattr(settings, "enable_sel_short_fall", False) else []))
 
 
 # ── the vol arm's THIN STOCKS (user directive 2026-10-07: "Add the thin stocks to the live vol arm") ──
@@ -1410,7 +1710,8 @@ def add_listings(d: date, found: Sequence[dict], backfill: bool = True, arm: str
     out["added"] = [str(r["ticker"]) for r in ok]
     if backfill and out["added"]:
         try:
-            arms_ = (arm,) + (("vol2",) if arm == "vol" and "vol2" in live_arms() else ())   # vol2 = vol's history
+            # vol2 and the faller shorts keep their own copies of the vol arm's history
+            arms_ = (arm,) + tuple(a for a in ("vol2", "fall") if arm == "vol" and a in live_arms())
             out["history"] = backfill_days(sessions_before(d, own_window(arm)), tickers=out["added"],
                                            arms=arms_, merge=True, existing_only=True,
                                            min_visible_bars=int(_MIN_30M_BARS))
@@ -1508,6 +1809,16 @@ def prepare(d: date, extend: bool = True, workers: int = 16) -> dict:
         tp.parent.mkdir(parents=True, exist_ok=True)
         tp.write_text(json.dumps(thin), encoding="utf-8")
         out["thin_universe"] = len(thin)
+    from src.signals import sel_pressure
+    if vol_on and sel_pressure.enabled():     # PREREG71's V6: the day's borrow pressure, every input known at the open
+        t1 = time.time()
+        try:
+            ps = sel_pressure.build(d)
+            out["pressure"] = {"names": ps["n"], "high": ps["high"], "cut": ps["cut"]}
+        except Exception as e:                                 # noqa: BLE001 — the entry step builds it if missing
+            logger.error(f"[sel_short] prepare {d}: the borrow-pressure scores failed ({e})")
+            out["pressure_error"] = f"{type(e).__name__}: {e}"[:200]
+        out["pressure_seconds"] = round(time.time() - t1, 1)
     from src.signals import sel_v2
     if sel_v2.is_v2(meta):                    # the V2 model's per-session inputs, at their 08:30 ET cutoff
         t1 = time.time()
@@ -1815,8 +2126,8 @@ def backfill_days(days: Sequence[date], tickers: Optional[Sequence[str]] = None,
     res = {}
     etf_set = (set(etf_names(tickers, list(meta.get("tickers") or [])))
                if ("etf" in arms or "thin" in arms) else set())
-    for arm, parts in (("model", out_rows), ("vol", vol_rows), ("vol2", vol_rows), ("etf", vol_rows),
-                       ("thin", thin_rows)):
+    for arm, parts in (("model", out_rows), ("vol", vol_rows), ("vol2", vol_rows), ("fall", vol_rows),
+                       ("etf", vol_rows), ("thin", thin_rows)):
         if arm not in arms:
             continue
         df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["dn", "bar", "ticker", "score"])
@@ -1824,7 +2135,7 @@ def backfill_days(days: Sequence[date], tickers: Optional[Sequence[str]] = None,
             df = df[df["ticker"].isin(etf_set)]
         elif arm == "thin":                                # the thin stocks: common stocks only, never a product
             df = df[~df["ticker"].isin(etf_set)]
-        elif arm in ("vol", "vol2") and meta.get("tickers"):   # the vol arm's: the model's names + its added stocks
+        elif arm in ("vol", "vol2", "fall") and meta.get("tickers"):   # the vol arm's: the model's names + its added stocks
             df = df[df["ticker"].isin(set(meta["tickers"]) | set(vol_listing_names()))]
         for dn in dns:
             g = df[df["dn"] == dn]
@@ -1848,6 +2159,19 @@ def backfill_days(days: Sequence[date], tickers: Optional[Sequence[str]] = None,
 
 # ── one run ──────────────────────────────────────────────────────────────────
 
+# The bar's rows come back in ONE order whatever the number of processes: the order
+# the score histories were written in while the scorer ran six of them (chunk k =
+# the sorted names k, k+6, k+12, ...; the chunks in turn). Each row is computed from
+# its own name alone, so the worker count changes nothing but the order — kept, so
+# every file and every sum over the rows stays bit-for-bit what it was (2026-10-12:
+# 12 workers, 2026-10-09 bar 0: every value identical).
+_ROW_ORDER_CHUNKS = 6
+
+
+def _row_order(tickers: Sequence[str]) -> Dict[str, int]:
+    return {t: i for i, t in enumerate(t for k in range(_ROW_ORDER_CHUNKS) for t in tickers[k::_ROW_ORDER_CHUNKS])}
+
+
 def score_bar(d: date, bar_of_day: int, uni: Dict[str, float], fetch: bool = True) -> pd.DataFrame:
     """Every universe name's score at bar ``bar_of_day`` of ``d`` (process pool).
     ``fetch=False`` scores from the stores alone (a past session already in the
@@ -1861,7 +2185,114 @@ def score_bar(d: date, bar_of_day: int, uni: Dict[str, float], fetch: bool = Tru
     with ProcessPoolExecutor(n) as ex:
         for part in ex.map(fn, args):
             rows.extend(part)
+    pos = _row_order(tickers)
+    rows.sort(key=lambda r: pos[r["ticker"]])
     return score_v2(pd.DataFrame(rows))
+
+
+# how long a worker that ended may still deliver its live rows (a chunk in the queue's pipe) before the bar fails
+_LIVE_GRACE_SECONDS = 10.0
+
+# The arms decided in the scorer's FIRST phase (2026-10-12): those ranked on the 30-minute
+# ATR% — no model score needed — that the live account trades (`traded_arms`).
+_LIVE_PHASE_ARMS = ("vol", "etf", "thin", "vol2", "fall")
+# the row fields the live arms read (and the journal records), checked equal in the full rows
+_LIVE_FIELDS = ("dv20", "vol", "dtc", "px", "pre5", "pre5_stale", "rvol", "ca_gap", "ca_gap_pct",
+                "ssr", "ssr_prev_close", "ssr_day_low", "ssr_prev_low", "ssr_prev2_close", "status")
+
+
+def live_phase_arms() -> List[str]:
+    """The live arms the scorer decides FIRST: the traded arms that need no model input
+    (`enable_sel_short_live_first_scoring`; none when off — every arm then waits for the
+    full rows, as before)."""
+    if not getattr(settings, "enable_sel_short_live_first_scoring", False):
+        return []
+    traded = traded_arms()
+    return [a for a in live_arms() if a in _LIVE_PHASE_ARMS and (traded is None or a in traded)]
+
+
+def live_marker_path(d: date, bar_of_day: int) -> Path:
+    return root() / "runs_live" / f"{_iso(d)}_{bar_of_day:02d}.json"
+
+
+def live_done(d: date, bar_of_day: int) -> bool:
+    """The bar's live arms are decided and journaled (`run`'s first phase)."""
+    return live_marker_path(d, bar_of_day).exists()
+
+
+def _collect_live(q, futs: Dict[int, object], grace: Optional[float] = None, poll: float = 1.0) -> Dict[int, List[dict]]:
+    """Every chunk's live rows from the queue, by chunk index (``futs``: index -> its worker's future). A worker that
+    ENDED without reporting them — it failed before them, or its rows were lost — fails the bar once ``grace`` seconds
+    have passed (rows still in the queue's pipe arrive meanwhile); one that failed AFTER reporting them (the shadow
+    phase) does not: its error surfaces at its result, once the live arms are decided."""
+    import queue as _queue
+    grace = _LIVE_GRACE_SECONDS if grace is None else grace
+    live: Dict[int, List[dict]] = {}
+    ended: Dict[int, float] = {}
+    while len(live) < len(futs):
+        try:
+            i, part = q.get(timeout=poll)
+            live[i] = part
+        except _queue.Empty:
+            now_ = time.monotonic()
+            for i, f in futs.items():
+                if i in live or not f.done():
+                    continue
+                if now_ - ended.setdefault(i, now_) < grace:
+                    continue
+                exc = f.exception()
+                raise exc if exc is not None else RuntimeError(f"scorer worker {i} ended without reporting its live rows")
+    return live
+
+
+def score_bar_phased(d: date, bar_of_day: int, uni: Dict[str, float], on_live) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """`score_bar` with the LIVE arms first (2026-10-12; user 2026-10-11: "run first only the
+    necessary parts for live production, and after we do the shadow arms"): every worker
+    reports its chunk's live rows (`_name_row` with ``live_only``) as soon as they are built,
+    ``on_live`` gets the bar's live rows — in `score_bar`'s row order — once the last worker
+    reported (the live arms are decided and journaled then), and the full rows (the model's
+    inputs, on the same fetched bars) follow. Returns (the live rows, the full rows scored)."""
+    import multiprocessing as mp
+    tickers = sorted(uni)
+    n = max(1, int(settings.sel_short_workers))
+    chunks = [tickers[i::n] for i in range(n)]
+    args = [(i, (ch, _iso(d), int(bar_of_day), {t: uni[t] for t in ch})) for i, ch in enumerate(chunks) if ch]
+    pos = _row_order(tickers)
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    with ProcessPoolExecutor(n, mp_context=ctx, initializer=_init_live_queue, initargs=(q,)) as ex:
+        futs = {a[0]: ex.submit(_score_chunk_phased, a) for a in args}
+        live = _collect_live(q, futs)
+        live_rows = sorted((r for part in live.values() for r in part), key=lambda r: pos[r["ticker"]])
+        res_live = pd.DataFrame(live_rows)
+        on_live(res_live)
+        rows = [r for _i, f in sorted(futs.items()) for r in f.result()]
+    rows.sort(key=lambda r: pos[r["ticker"]])
+    return res_live, score_v2(pd.DataFrame(rows))
+
+
+def _live_rows_mismatch(res_live: pd.DataFrame, res: pd.DataFrame) -> List[dict]:
+    """The names whose live row differs from the full row in a field the live arms read —
+    none by construction (the same bars, the same functions); a mismatch is CRITICAL."""
+    if not len(res_live) or not len(res):
+        return [] if len(res_live) == len(res) else [{"ticker": "*", "field": "rows",
+                                                      "live": len(res_live), "full": len(res)}]
+    a = res_live.set_index("ticker")
+    b = res.set_index("ticker")
+    out: List[dict] = []
+    if set(a.index) != set(b.index):
+        out.append({"ticker": "*", "field": "names", "live": len(a), "full": len(b)})
+    common = a.index.intersection(b.index)
+    for f in _LIVE_FIELDS:
+        if f not in a.columns and f not in b.columns:
+            continue
+        x = a[f].reindex(common) if f in a.columns else pd.Series(None, index=common, dtype=object)
+        y = b[f].reindex(common) if f in b.columns else pd.Series(None, index=common, dtype=object)
+        for tk, u, v in zip(common, x, y):
+            same = (u == v) or (pd.isna(u) and pd.isna(v)) if not isinstance(u, (list, dict)) else u == v
+            if not bool(same):
+                out.append({"ticker": str(tk), "field": f, "live": u, "full": v})
+    return out
 
 
 def score_v2(res: pd.DataFrame) -> pd.DataFrame:
@@ -1949,11 +2380,14 @@ def _ssr_journal(top: pd.Series) -> dict:
 
 def give_back(arm: str) -> float:
     """The share of the 5-session run-up an arm's target gives back: the WHOLE run-up for the vol
-    arm (`sel_short_vol_give_back` 1.0; user directive 2026-10-04 evening, "Vol arm only"), HALF
-    for the model and ETF arms (`sel_short_give_back` 0.5; at 100% the model arm fell to 0.30 %/day
-    and the ETF arm's growth did not change)."""
-    return float(settings.sel_short_vol_give_back if arm in ("vol", "thin", "vol2")
-                 else settings.sel_short_give_back)
+    arm (`sel_short_vol_give_back` 1.0; user directive 2026-10-04 evening, "Vol arm only") and the
+    ETF arm (`sel_short_etf_give_back` 1.0 from the 2026-10-12 session, PREREG77), HALF for the
+    model arm (`sel_short_give_back` 0.5; at 100% it fell to 0.30 %/day)."""
+    if arm in ("vol", "thin", "vol2"):
+        return float(settings.sel_short_vol_give_back)
+    if arm == "etf":
+        return float(getattr(settings, "sel_short_etf_give_back", settings.sel_short_give_back))
+    return float(settings.sel_short_give_back)
 
 
 def _is_fresh(score: float, tk: str, stand: pd.DataFrame) -> bool:
@@ -2008,8 +2442,22 @@ def _vol_backups(ok: pd.DataFrame, stand: pd.DataFrame, earlier: Sequence[dict],
              "pre5_stale": bool(row["pre5_stale"]) if "pre5_stale" in row.index and pd.notna(row["pre5_stale"])
              else False}
         b.update(_ssr_journal(row))
+        if arm == "vol":
+            b["pressure"] = _backup_pressure(tk, d)            # the entry step shorts a HIGH one too (PREREG71's V6)
         backups.append(b)
     return {"fresh_pool": fresh_names, "backups": backups}
+
+
+def _backup_pressure(ticker: str, d: date) -> Optional[float]:
+    """Journal-only: the backup's borrow pressure from the day's scores (built by the prepare; never built here)."""
+    try:
+        from src.signals import sel_pressure
+        if not sel_pressure.enabled():
+            return None
+        p, _ = sel_pressure.pressure_of(ticker, d, build_missing=False)
+        return p
+    except Exception:                                          # noqa: BLE001 — a journal field never blocks a bar
+        return None
 
 
 def select(res: pd.DataFrame, d: date, bar_of_day: int, stand: pd.DataFrame,
@@ -2082,6 +2530,28 @@ def select(res: pd.DataFrame, d: date, bar_of_day: int, stand: pd.DataFrame,
         rec["confidence"] = vol_confidence(rec)                # journal-only: nothing decides on it
     if arm in ("vol", "thin", "vol2") and getattr(settings, "enable_sel_short_vol_fallback", False):
         rec.update(_vol_backups(ok, stand, earlier, g, d, bar_of_day, arm))
+    if arm in FALLER_ARMS:
+        # the faller shorts: the same pick, shorted when it did NOT rise over the 5 sessions before (a valid
+        # base, the close at or under it; PREREG38's FALLERS_L) — no target, the vol arm's two filters
+        if not fresh:
+            rec["decision"] = "not_fresh"
+        elif not first:
+            rec["decision"] = "not_first_today"
+        elif rose:
+            rec["decision"] = "a_riser"                       # the vol arm's pick
+        elif not (np.isfinite(pre5) and pre5 > 0):
+            rec["decision"] = "no_base"
+        else:
+            rec["target"] = None                               # no run-up to give back
+            dl = session_after(d, int(settings.sel_short_max_hold_sessions))
+            rec["deadline"] = bar_end_et(dl, bar_of_day).isoformat()
+            rec["decision"] = "crowded" if crowded(dtc) else "short"
+            if rec["decision"] == "short" and low_rvol(rvol, arm):
+                rec["decision"] = "low_rvol"
+            if rec["decision"] == "short" and dtc is None and getattr(settings, "enable_sel_short_dtc_filter", False):
+                logger.warning(f"[sel_short] {arm} pick {tk}: days to cover unknown — the short-interest filter "
+                               f"passes it")
+        return rec
     if not fresh:
         rec["decision"] = "not_fresh"
     elif not first:
@@ -2183,16 +2653,32 @@ def _pick_scores(ok: pd.DataFrame, top: pd.Series, n_prior: float, pmax: float, 
     has_standing = n_prior >= float(settings.sel_short_own_min_history) and np.isfinite(pmax)
     out["own_margin_z"] = _finite_or_none((score - pmax) / sd) if has_standing else None
     other_s, other_tk = (vol_s, vol_tk) if arm == "model" else (model_s, model_tk)
-    tk = str(top["ticker"])
+    out.update(_cross_arm(other_s, other_tk, str(top["ticker"])))
+    out["dv20"] = _finite_or_none(float(top["dv20"])) if "dv20" in top.index else None
+    return out
+
+
+def _cross_arm(other_s: pd.Series, other_tk: pd.Series, tk: str) -> dict:
+    """The OTHER arm's view of the pick ``tk``: its score there and its rank (1 = that arm's top)."""
     mine = other_s[other_tk == tk]
     if len(mine) and np.isfinite(float(mine.iloc[0])):
         v = float(mine.iloc[0])
-        out.update({"other_arm_score": v, "other_arm_rank": int((other_s > v).sum()) + 1,
-                    "other_arm_n": int(len(other_s))})
-    else:
-        out.update({"other_arm_score": None, "other_arm_rank": None, "other_arm_n": int(len(other_s))})
-    out["dv20"] = _finite_or_none(float(top["dv20"])) if "dv20" in top.index else None
-    return out
+        return {"other_arm_score": v, "other_arm_rank": int((other_s > v).sum()) + 1,
+                "other_arm_n": int(len(other_s))}
+    return {"other_arm_score": None, "other_arm_rank": None, "other_arm_n": int(len(other_s))}
+
+
+def _cross_arm_late(res: pd.DataFrame, arm: str, tk: str) -> dict:
+    """`_pick_scores`' cross-arm fields of a LIVE arm's pick, read once the model's scores
+    exist (the scorer's second phase): the same rows (`arm_rows`) and the same floors as
+    `select` reads them, so the values are the ones the one-phase scorer journaled."""
+    sub = arm_rows(res, arm)
+    min_px, min_dv = float(settings.sel_short_min_price), float(settings.sel_short_min_dollar_volume)
+    nan = pd.Series(np.nan, index=sub.index)
+    model_s = sub["score"] if "score" in sub.columns else nan
+    floors = (sub["px"] >= min_px) & (sub["dv20"] >= min_dv)
+    model_ok = floors & (sub["status"] == "OK") & np.isfinite(model_s)
+    return _cross_arm(model_s[model_ok], sub.loc[model_ok, "ticker"], tk)
 
 
 def run(d: date, bar_of_day: int) -> dict:
@@ -2235,10 +2721,29 @@ def run(d: date, bar_of_day: int) -> dict:
     lag = (settle - datetime.now(timezone.utc)).total_seconds()
     if 0 < lag < 120:
         time.sleep(lag)
-    res = score_bar(d, bar_of_day, {**thin, **uni}, fetch=True)
-    if len(res) and "ticker" in res.columns:
-        # the thin stocks' rows (by name, from the day's thin universe): the "thin" arm alone ranks them
-        res["thin"] = res["ticker"].isin(set(thin) - set(uni))
+    thin_names = set(thin) - set(uni)
+    first = live_phase_arms()
+    mismatch: List[dict] = []
+    if first and not live_done(d, bar_of_day):
+        # THE LIVE ARMS FIRST (2026-10-12): decided and journaled as soon as every worker has
+        # their inputs; the shadow arms (the model's full features, its V2 scores) follow
+        def _on_live(res_live: pd.DataFrame) -> None:
+            if len(res_live) and "ticker" in res_live.columns:
+                res_live["thin"] = res_live["ticker"].isin(thin_names)
+            decide(res_live, d, bar_of_day, t0, arms=first, final=False)
+
+        res_live, res = score_bar_phased(d, bar_of_day, {**thin, **uni}, _on_live)
+        if len(res) and "ticker" in res.columns:
+            res["thin"] = res["ticker"].isin(thin_names)
+        mismatch = _live_rows_mismatch(res_live, res)
+        if mismatch:
+            logger.critical(f"[sel_short] {d} bar {bar_of_day}: {len(mismatch)} live row field(s) differ from the "
+                            f"full rows — the live arms decided on {mismatch[:5]}")
+    else:
+        res = score_bar(d, bar_of_day, {**thin, **uni}, fetch=True)
+        if len(res) and "ticker" in res.columns:
+            # the thin stocks' rows (by name, from the day's thin universe): the "thin" arm alone ranks them
+            res["thin"] = res["ticker"].isin(thin_names)
     if cov < SNAPSHOT_MIN_COVERAGE and len(res):
         # still DEFECTIVE after the rebuild (or no snapshot): the model would
         # score on missing deep features, trade on them, and push those scores
@@ -2247,7 +2752,10 @@ def run(d: date, bar_of_day: int) -> dict:
         ok = res["status"] == "OK"
         res.loc[ok, "status"] = "SNAPSHOT_DEFECTIVE"
         res.loc[ok, "score"] = float("nan")
-    return decide(res, d, bar_of_day, t0, extra={"snapshot_coverage": round(float(cov), 3)})
+    extra = {"snapshot_coverage": round(float(cov), 3)}
+    if mismatch:
+        extra["live_mismatch"] = mismatch[:50]
+    return decide(res, d, bar_of_day, t0, extra=extra)
 
 
 def arm_rows(res: pd.DataFrame, arm: str, ca_gaps: bool = False) -> pd.DataFrame:
@@ -2273,13 +2781,15 @@ def arm_rows(res: pd.DataFrame, arm: str, ca_gaps: bool = False) -> pd.DataFrame
             res = res[~thin_rows]
         if arm == "etf":
             names = set(etf_names(list(res["ticker"]), model_names))
+            if vix_excluded():
+                names -= VIX_ETPS                          # never ranked, never in the arm's history
             out = res[res["ticker"].isin(names)]
         elif not model_names or "ticker" not in res.columns:
             out = res                                      # no name list: every name is the model's
         else:
-            keep = set(model_names) | (set(vol_listing_names()) if arm in ("vol", "vol2") else set())
+            keep = set(model_names) | (set(vol_listing_names()) if arm in ("vol", "vol2", "fall") else set())
             out = res[res["ticker"].isin(keep)]
-    if arm in ("vol", "etf", "thin", "vol2") and "ca_gap" in out.columns:
+    if arm in ("vol", "etf", "thin", "vol2", "fall") and "ca_gap" in out.columns:
         gapped = out["ca_gap"].eq(True)
         return out[gapped] if ca_gaps else out[~gapped]
     return out.iloc[0:0] if ca_gaps else out
@@ -2303,15 +2813,28 @@ def _underlying_journal(ticker: str, d: date) -> dict:
 
 
 def decide(res: pd.DataFrame, d: date, bar_of_day: int, t0: Optional[float] = None,
-           extra: Optional[dict] = None) -> dict:
+           extra: Optional[dict] = None, arms: Optional[Sequence[str]] = None, final: bool = True) -> dict:
     """One run's decisions from its scores: each arm's scores appended to its
     history, its standing read, its rule applied, its decision journaled. The
     run file (the run-done marker) holds the model's record with the other
-    arms' under ``arms``."""
+    arms' under ``arms``.
+
+    In two phases (2026-10-12): ``final=False`` decides ``arms`` (the live arms, `run`'s
+    first phase) — journaled, and kept in the bar's live marker (`live_marker_path`);
+    then the final call decides the arms not yet decided and writes the run file with
+    every arm's record (the live arms' read back from the marker)."""
     t0 = time.time() if t0 is None else t0
     min_px = float(settings.sel_short_min_price)
     earlier = [e for e in read_picks(d) if int(e.get("bar_of_day", -1)) < bar_of_day]
-    arms = live_arms()
+    prior: Dict[str, dict] = {}
+    if final and live_done(d, bar_of_day):
+        try:
+            prior = dict(json.loads(live_marker_path(d, bar_of_day).read_text(encoding="utf-8")).get("arms") or {})
+        except Exception as e:                                 # noqa: BLE001
+            logger.error(f"[sel_short] {d} bar {bar_of_day}: live marker unreadable ({e})")
+    if arms is None:
+        arms = [a for a in live_arms() if a not in prior]
+    arms = list(arms)
     recs = {}
     for arm in arms:
         sub = arm_rows(res, arm)
@@ -2327,6 +2850,12 @@ def decide(res: pd.DataFrame, d: date, bar_of_day: int, t0: Optional[float] = No
         rec = select(sub, d, bar_of_day, stand, earlier, arm=arm)
         if arm == "etf" and rec.get("ticker"):
             rec.update(_underlying_journal(rec["ticker"], d))
+        if arm == "etf" and vix_excluded() and "vol" in res.columns:
+            vx = res[res["ticker"].isin(VIX_ETPS) & np.isfinite(res["vol"])]
+            if len(vx):                                # journal-only: the VIX products the block left out
+                vx = vx.sort_values("vol", ascending=False).head(3)
+                rec["vix_excluded"] = [{"ticker": str(t), "vol": _finite_or_none(float(v))}
+                                       for t, v in zip(vx["ticker"], vx["vol"])]
         gx = arm_rows(res, arm, ca_gaps=True)
         if len(gx):                                    # journal-only: who the corporate-action gap rule left out
             gx = gx.sort_values("vol", ascending=False).head(3)
@@ -2336,6 +2865,29 @@ def decide(res: pd.DataFrame, d: date, bar_of_day: int, t0: Optional[float] = No
         rec["seconds"] = round(time.time() - t0, 1)
         rec["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         recs[arm] = rec
+    if not final:
+        for arm in arms:
+            _journal(recs[arm])
+        mp_ = live_marker_path(d, bar_of_day)
+        mp_.parent.mkdir(parents=True, exist_ok=True)
+        tmp = mp_.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"day": _iso(d), "bar_of_day": int(bar_of_day), "arms": recs}, default=str),
+                       encoding="utf-8")
+        os.replace(tmp, mp_)
+        logger.info(f"[sel_short] {d} bar {bar_of_day} LIVE: " + " | ".join(
+            f"{a} {r.get('decision')} {r.get('ticker', '')}"
+            + (f" (days to cover {r['days_to_cover']:.2f})" if r.get("decision") == "crowded" else "")
+            + (f" (relative volume {r['rvol']:.2f})" if r.get("decision") == "low_rvol" else "")
+            for a, r in recs.items()) + f" ({round(time.time() - t0, 1)}s)")
+        return recs
+    journaled_now = list(recs)
+    for arm, rec in prior.items():
+        if rec.get("ticker") and arm != "model":
+            # the model's view of the live pick, known now: kept in the run file (the journal's record
+            # was written before the model's scores existed)
+            rec.update(_cross_arm_late(res, arm, str(rec["ticker"])))
+    order = live_arms()
+    recs = {a: (recs[a] if a in recs else prior[a]) for a in order if a in recs or a in prior}
     recs["model"]["status_counts"] = res["status"].value_counts().to_dict() if len(res) else {}
     # the short-interest filter's input must reach the run: without it every pick
     # passes unjudged, which looks like normal operation
@@ -2351,7 +2903,7 @@ def decide(res: pd.DataFrame, d: date, bar_of_day: int, t0: Optional[float] = No
     if getattr(settings, "enable_sel_short_vol_rvol_filter", False) and len(res) and n_rvol == 0:
         logger.warning(f"[sel_short] {d} bar {bar_of_day}: no scored name carries a relative volume — the "
                        f"vol arm's relative-volume filter cannot judge this run")
-    for arm in arms:
+    for arm in journaled_now:
         _journal(recs[arm])
     run_rec = dict(recs["model"], arms={a: r for a, r in recs.items() if a != "model"})
     rp = root() / "runs" / f"{_iso(d)}_{bar_of_day:02d}.json"
@@ -2432,6 +2984,11 @@ def launch(now: Optional[datetime] = None) -> Optional[dict]:
         args = ["--prepare", "--day", _iso(et.date())]
     if args is None:
         return None
+    prev_h = _ACTIVE.get("handle")
+    if prev_h is not None and not prev_h.get("done") and prev_h["proc"].poll() is not None:
+        # a launch whose end no wait saw (its live phase was all the tick waited for)
+        prev_h["done"], prev_h["rc"] = True, prev_h["proc"].poll()
+        _note_launch(prev_h, prev_h["rc"])
     prev = _ACTIVE.get("proc")
     if prev is not None and prev.poll() is None:
         logger.warning(f"[sel_short] previous subprocess (pid {prev.pid}) still running — not launching {args}")
@@ -2451,7 +3008,21 @@ def launch(now: Optional[datetime] = None) -> Optional[dict]:
                             stdout=log, stderr=subprocess.STDOUT, env=env, cwd=os.getcwd())
     _ACTIVE["proc"] = proc
     logger.info(f"[sel_short] launched {' '.join(args)} (pid {proc.pid})")
-    return {"proc": proc, "args": args, "started": time.time(), "log": log}
+    handle = {"proc": proc, "args": args, "started": time.time(), "log": log}
+    _ACTIVE["handle"] = handle
+    return handle
+
+
+def _launch_bars(handle: dict) -> List[Tuple[date, int]]:
+    """The (day, bar) runs a ``--run`` launch scores (empty for anything else)."""
+    a = list(handle.get("args") or [])
+    if not a or a[0] != "--run" or "--day" not in a or "--bars" not in a:
+        return []
+    try:
+        d = date.fromisoformat(a[a.index("--day") + 1])
+        return [(d, int(b)) for b in str(a[a.index("--bars") + 1]).split(",") if b.strip()]
+    except (ValueError, IndexError):
+        return []
 
 
 def wait(handle: Optional[dict], timeout: Optional[float] = None) -> Optional[int]:
@@ -2470,15 +3041,22 @@ def wait(handle: Optional[dict], timeout: Optional[float] = None) -> Optional[in
     if (handle.get("args") or [""])[0] == "--prepare":
         return None
     timeout = float(settings.sel_short_wait_seconds if timeout is None else timeout)
-    left = max(0.0, timeout - (time.time() - handle["started"]))
-    try:
-        rc = handle["proc"].wait(timeout=left)
-    except subprocess.TimeoutExpired:
-        logger.warning(f"[sel_short] {' '.join(handle['args'])} still running after {timeout:.0f}s — "
-                       "its pick will be taken by the next tick if still fresh")
-        rc = None
-    if rc is None:
-        return None                               # still running: a later wait may still see it end
+    deadline = handle["started"] + timeout
+    bars = _launch_bars(handle)
+    rc = None
+    while True:
+        rc = handle["proc"].poll()
+        if rc is not None:
+            break
+        # the live arms decided and journaled for every bar of the launch (`run`'s first phase,
+        # 2026-10-12): their picks can be taken now — the shadow arms' phase runs on
+        if bars and all(live_done(d_, b) or run_done(d_, b) for d_, b in bars):
+            return None
+        if time.time() >= deadline:
+            logger.warning(f"[sel_short] {' '.join(handle['args'])} still running after {timeout:.0f}s — "
+                           "its pick will be taken by the next tick if still fresh")
+            return None                           # still running: a later wait may still see it end
+        time.sleep(0.2)
     handle["done"], handle["rc"] = True, rc
     _note_launch(handle, rc)
     if rc != 0:
@@ -2525,7 +3103,7 @@ def health(now: Optional[datetime] = None) -> dict:
         out["problems"].append(f"{len(late)} completed bar(s) never scored: "
                                + ", ".join(bar_end_et(d, b).strftime("%H:%M") for b in late)
                                + (f" ({len(failed)} crashed — logs/sel_short.log)" if failed else ""))
-    thin = []
+    thin, mism = [], []
     for b in done:
         try:
             rec = json.loads((root() / "runs" / f"{_iso(d)}_{b:02d}.json").read_text(encoding="utf-8"))
@@ -2533,9 +3111,15 @@ def health(now: Optional[datetime] = None) -> dict:
             continue
         if rec.get("decision") == "thin_run":
             thin.append(bar_end_et(d, b).strftime("%H:%M"))
+        if rec.get("live_mismatch"):
+            mism.append(f"{bar_end_et(d, b).strftime('%H:%M')} ({len(rec['live_mismatch'])})")
     if thin:
         out["problems"].append(f"{len(thin)} bar(s) too thin to rank (<{settings.sel_short_min_run_rows} "
                                f"names scored — data outage?): {', '.join(thin)}")
+    if mism:
+        out["problems"].append(f"{len(mism)} bar(s) whose live arms' rows differed from the full rows (the live "
+                               f"arms may have decided on a row the one-phase scorer would not — `live_mismatch` in "
+                               f"runs/): {', '.join(mism)}")
     try:
         lines = (root() / "launches" / f"{_iso(d)}.jsonl").read_text(encoding="utf-8").splitlines()
         bad = [json.loads(x) for x in lines if x.strip()]
@@ -2571,6 +3155,18 @@ def health(now: Optional[datetime] = None) -> dict:
             out["problems"].append(f"pre-open snapshot was {what}: still {100 * float(snap.get('coverage') or 0):.0f}% "
                                    "after the rebuild — the model arm is off (vol arm unaffected)")
     out["snapshot"] = snap
+    # PREREG71's V6: the day's borrow-pressure scores (the prepare builds them; without them no extra short is taken)
+    try:
+        from src.signals import sel_pressure
+        if sel_pressure.enabled() and getattr(settings, "enable_sel_short_vol", False) and et_hm >= "09:35":
+            ps = sel_pressure.scores(d, build_missing=False)
+            if ps is None:
+                out["problems"].append("borrow-pressure scores MISSING for today — the vol arm's pressure extras "
+                                       "are off until the entry step builds them (logs/sel_short.log)")
+            else:
+                out["notes"].append(f"borrow pressure: {ps.get('high', 0)} of {ps.get('n', 0)} names HIGH")
+    except Exception as e:                                     # noqa: BLE001 — a health line never raises
+        out["problems"].append(f"borrow-pressure scores unreadable ({type(e).__name__})")
     return out
 
 

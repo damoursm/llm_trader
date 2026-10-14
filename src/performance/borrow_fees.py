@@ -339,11 +339,18 @@ def schedule(trade: dict, end=None, now: Optional[datetime] = None) -> Optional[
     closed_today = (now_et.hour, now_et.minute) >= (16, 15)
     closes = [(cd, c) for cd, c in (_closes(ticker) if days else []) if cd < today or (cd == today and closed_today)]
     recs = []
+    split_now, rows = None, None
+    if trade.get("split_factor"):                                   # PREREG64: a split since the entry
+        from src.data.intraday_store import split_factor_between, split_rows
+        from src.performance.tracker import _split_day
+        rows, split_now = split_rows(), _split_day(now)
     for d in days:
         c = charged.get((ticker, d)) if d < today else None        # IBKR charges a day once it is over
         if c is not None:
-            recs.append([d.isoformat(), "ibkr_charged", float(c.get("rate") or 0.0), float(c.get("price") or 0.0),
-                         float(c["fee_ps"])])
+            # IBKR charged the shares of THAT day: a split since then makes them fewer / more of today's shares
+            k = (split_factor_between(ticker, d, max(split_now, d), rows) or 1.0) if rows is not None else 1.0
+            recs.append([d.isoformat(), "ibkr_charged", float(c.get("rate") or 0.0), float(c.get("price") or 0.0) * k,
+                         float(c["fee_ps"]) * k])
             continue
         rate, src = day_rate(ticker, d, now, trade)
         close = prior_close(ticker, d, closes)

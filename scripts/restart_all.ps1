@@ -7,6 +7,12 @@
   schedulers ticking concurrently is a real risk: racing DuckDB writes,
   doubled LLM spend, possible duplicate broker submissions).
 
+  The dashboard is DEACTIVATED while cache\dashboard.disabled exists (user
+  2026-10-13: "You can deactivate the dashboard until further notice") or its
+  task is disabled: it is stopped here and never started, and the scheduler
+  still is (a start of a disabled task would throw and, under "Stop", abort
+  the script before the scheduler's start).
+
   Does NOT require elevation (Stop/Start-ScheduledTask don't need it once the
   tasks already exist - only registration does).
 
@@ -26,6 +32,10 @@ foreach ($t in $Tasks) {
         exit 1
     }
 }
+
+$DashMarker = Join-Path (Split-Path -Parent $PSScriptRoot) "cache\dashboard.disabled"
+$DashOff = (Test-Path $DashMarker) -or ((Get-ScheduledTask -TaskName "LlmTraderDashboard").State -eq "Disabled")
+$StartTasks = if ($DashOff) { @("LlmTraderScheduler") } else { $Tasks }
 
 # 1. Stop both tasks - Task Scheduler kills the tracked python.exe process tree.
 Write-Host "Stopping..." -ForegroundColor Cyan
@@ -49,7 +59,7 @@ if ($left) {
     Write-Host "Force-killing straggler(s): $($left.ProcessId -join ', ')" -ForegroundColor Yellow
     # SUPERVISORS FIRST so none can respawn a --schedule child during cleanup;
     # pause, then RE-SCAN and kill everything remaining (incl. a child a dying
-    # supervisor respawned in the gap — the snapshot above can be stale).
+    # supervisor respawned in the gap - the snapshot above can be stale).
     $left | Where-Object { $_.CommandLine -match 'main\.py --supervise' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
@@ -57,26 +67,34 @@ if ($left) {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
-# 3. Start both tasks.
+# 3. Start the tasks (the dashboard's only when it is not deactivated).
 Write-Host "Starting..." -ForegroundColor Cyan
-foreach ($t in $Tasks) { Start-ScheduledTask -TaskName $t }
+foreach ($t in $StartTasks) { Start-ScheduledTask -TaskName $t }
 
 # 4. Verify: wait for the dashboard port to come up (imports take a few seconds)
 #    and report the final process list + task states.
-$deadline = (Get-Date).AddSeconds(30)
-$listening = $false
-while ((Get-Date) -lt $deadline) {
-    if (Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue) { $listening = $true; break }
-    Start-Sleep -Seconds 2
-}
 Write-Host ""
-if ($listening) {
-    Write-Host "Dashboard serving on http://127.0.0.1:8050" -ForegroundColor Green
+if ($DashOff) {
+    Write-Host "Dashboard DEACTIVATED ($DashMarker or a disabled task) - not started." -ForegroundColor Yellow
 } else {
-    Write-Host "Port 8050 not listening yet - check Task Scheduler > History or logs." -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds(30)
+    $listening = $false
+    while ((Get-Date) -lt $deadline) {
+        if (Get-NetTCPConnection -LocalPort 8050 -State Listen -ErrorAction SilentlyContinue) { $listening = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if ($listening) {
+        Write-Host "Dashboard serving on http://127.0.0.1:8050" -ForegroundColor Green
+    } else {
+        Write-Host "Port 8050 not listening yet - check Task Scheduler > History or logs." -ForegroundColor Yellow
+    }
 }
 
 Get-ScheduledTask -TaskName $Tasks | Select-Object TaskName, State | Format-Table -AutoSize
-Write-Host "Live processes (expect exactly ONE each of --dashboard / --supervise / --schedule):"
+if ($DashOff) {
+    Write-Host "Live processes (expect exactly ONE each of --supervise / --schedule, and NO --dashboard):"
+} else {
+    Write-Host "Live processes (expect exactly ONE each of --dashboard / --supervise / --schedule):"
+}
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object $traderProc |
     Select-Object ProcessId, CommandLine | Format-Table -AutoSize -Wrap

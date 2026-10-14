@@ -60,13 +60,32 @@ def cut_of(sunday) -> int:
 def window_pieces(pieces: Sequence[dict], lo_dn: int, hi_dn: int, cut_ns: Optional[int] = None) -> List[dict]:
     """The pieces decided on sessions [lo_dn, hi_dn] (``pick_day``) and entered before ``cut_ns``; a piece still open
     at the cut ends there, marked at its last bar before it (no bar yet: at its entry price), its borrow recomputed
-    to that day."""
+    to that day. A standing holding (``rebase``) decided before the window and still held at its start is bought then
+    (`account.rebase`). A limit order placed before the cut whose touch comes after it is kept as a working order that
+    never fills in the window (a placeholder): its slot — and, reserving, its room — were taken before the cut."""
     out = []
+    lo_ns = pd.Timestamp(f"{(EPOCH + pd.Timedelta(days=int(lo_dn))).date()}", tz="America/New_York").value
+    held_orders = set()
     for p in pieces:
         d = int(p["pick_day"])
-        if d < lo_dn or d > hi_dn:
+        if d > hi_dn:
             continue
+        if d < lo_dn:
+            if not p.get("rebase") or int(p["xns"]) <= lo_ns or int(p["ens"]) >= lo_ns:
+                continue
+            p = A.rebase(p, lo_ns)
+            if p is None:
+                continue
         if cut_ns is not None and int(p["ens"]) >= cut_ns:
+            if p.get("oid") is not None and int(np.min(np.asarray(p["ord_place"], np.int64))) < cut_ns \
+                    and (p["strategy"] if "strategy" in p else None, p["oid"]) not in held_orders:
+                held_orders.add((p["strategy"] if "strategy" in p else None, p["oid"]))
+                q = dict(p)
+                q.update(ord_k=-1, ens=int(max(int(p["ens"]), cut_ns)), pt=np.zeros(0, np.int64), pc=np.zeros(0),
+                         pl=np.zeros(0), placeholder=True)
+                q["xns"] = q["ens"] + 1
+                q["ord_place"] = [int(x) for x in np.asarray(p["ord_place"], np.int64) if int(x) < cut_ns]
+                out.append(q)
             continue
         if cut_ns is None or int(p["xns"]) <= cut_ns:
             out.append(p)
@@ -182,7 +201,8 @@ def select(X: np.ndarray, g: np.ndarray, ref: int, seed: int) -> Tuple[Dict[str,
     best = int(np.argmax(gc))
     if gc[rc] >= gc[best] - 1e-12:
         best = rc
-    out = {"M0": int(reps[best])}
+    # a tie with the reference keeps the REFERENCE itself (a combo identical to it in the window may differ next week)
+    out = {"M0": ref if best == rc else int(reps[best])}
     D = Xc.shape[1]
     p_rc = 1.0
     if D >= RC_L and len(Xc) > 1:
@@ -298,6 +318,7 @@ def chained(study: Study, picks: Sequence[int], settle, keep_curve: bool = True)
     to its own exit."""
     P: List[dict] = []
     used = set()
+    prev = None
     for w, t in enumerate(study.sundays()):
         c = study.combos[picks[w]]
         hi = min(pd.Timestamp(t) + pd.Timedelta(days=6), pd.Timestamp(study.test_cap))
@@ -306,7 +327,14 @@ def chained(study: Study, picks: Sequence[int], settle, keep_curve: bool = True)
             if r is None:
                 continue
             used.add(name)
-            P.extend(dict(p, strategy=name) for p in window_pieces(arm.pieces[r], dnum(t), dnum(hi), None))
+            ps = window_pieces(arm.pieces[r], dnum(t), dnum(hi), None)
+            if prev is None or prev.rule(name) != r:
+                # the arm turned on (or changed rule) this week: its STANDING holding is bought at the week's start
+                lo_ns = pd.Timestamp(f"{pd.Timestamp(t).date()}", tz="America/New_York").value
+                ps += [q for q in (A.rebase(p, lo_ns) for p in arm.pieces[r] if p.get("rebase")
+                                   and int(p["ens"]) < lo_ns < int(p["xns"])) if q is not None]
+            P.extend(dict(p, strategy=name) for p in ps)
+        prev = c
     strategies = [study.arms[n].strategy for n in study.arms]
     res = A.simulate(P, strategies, study.rules, settle=settle, keep_curve=keep_curve)
     lo = pd.Timestamp(study.first)
@@ -318,6 +346,13 @@ def chained(study: Study, picks: Sequence[int], settle, keep_curve: bool = True)
 def nav_daily(res: dict, days: pd.DatetimeIndex, start: float = 10_000.0) -> np.ndarray:
     bdn = np.array([dnum(d) for d in days], np.int64)
     return np.exp(np.cumsum(daily_logret(res, bdn, max(float(res["final"]), 1e-6), start)))
+
+
+def max_drawdown(nav) -> float:
+    """The worst drawdown (%) of a NAV path that starts at 1.0 ($10,000): a loss from the start counts."""
+    nav = np.asarray(nav, float)
+    peak = np.maximum.accumulate(np.r_[1.0, nav])[1:]
+    return float(np.max(1.0 - nav / peak) * 100.0) if len(nav) else 0.0
 
 
 def diff_ci(nav_a: np.ndarray, nav_b: np.ndarray, years: float, n: int = 4000, block: int = 21, seed: int = 7):

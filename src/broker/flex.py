@@ -17,6 +17,7 @@ statement — or "generation in progress" (code 1019), retried.
 from __future__ import annotations
 
 import json
+import socket
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
@@ -33,7 +34,8 @@ GET_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebServic
 RAW_DIR = Path("data/ibkr_flex")
 IN_PROGRESS = {"1019"}                      # "Statement generation in progress. Please try again shortly."
 BUSY = {"1018"}                             # "Too many requests have been made from this token": wait, ask again
-PENDING = "pending.json"                    # a statement IBKR was still generating when the last run gave up
+PENDING = "pending.json"                    # a statement IBKR issued and we have not collected yet
+EDGE_SIBLING = "ndcdyn.interactivebrokers.com"  # IBKR's Flex hosts share one CDN edge (the same addresses)
 _HEADERS = {"User-Agent": "llm_trader/1.0"}
 
 
@@ -43,8 +45,27 @@ class FlexError(RuntimeError):
         self.code, self.message = code, message
 
 
+def _dns_failed(e: Exception) -> bool:
+    return "getaddrinfo" in str(e) or isinstance(getattr(e, "__cause__", None), socket.gaierror)
+
+
 def _get(url: str, params: dict, timeout: float = 60.0) -> str:
-    r = httpx.get(url, params=params, timeout=timeout, headers=_HEADERS, follow_redirects=True)
+    """A GET. When the host's NAME does not resolve here (this machine's lookups of gdcdyn.interactivebrokers.com
+    fail for minutes at a time, 2026-10-07 .. 10-12) the request goes to the same CDN edge through its sibling's
+    address, the host still named in TLS (SNI) and the Host header — the same server, never another one."""
+    try:
+        r = httpx.get(url, params=params, timeout=timeout, headers=_HEADERS, follow_redirects=True)
+    except httpx.ConnectError as e:
+        u = httpx.URL(url)
+        if not _dns_failed(e) or u.host == EDGE_SIBLING:
+            raise
+        ips = sorted({a[4][0] for a in socket.getaddrinfo(EDGE_SIBLING, 443, socket.AF_INET, socket.SOCK_STREAM)})
+        if not ips:
+            raise
+        logger.info(f"[flex] {u.host} does not resolve here — through the shared edge {ips[0]} (TLS and Host: {u.host})")
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(str(u.copy_with(host=ips[0])), params=params, headers=dict(_HEADERS, Host=u.host),
+                      extensions={"sni_hostname": u.host})
     r.raise_for_status()
     return r.text
 
@@ -70,20 +91,20 @@ def _get_retrying(url: str, params: dict, attempts: int = 4, pause: float = 3.0)
     raise AssertionError("unreachable")
 
 
-def get_statement(token: str, ref: str, url: str = GET_URL, tries: int = 60, wait: float = 30.0,
+def get_statement(token: str, ref: str, url: str = GET_URL, tries: int = 120, wait: float = 30.0,
                   first_wait: float = 10.0) -> str:
-    """GetStatement, retried while IBKR is still generating the statement (a year of one account took over 45
-    minutes on 2026-10-06). A host IBKR names that stays unreachable falls back to the SendRequest host."""
+    """GetStatement on the URL IBKR named — never another host: the statement is generated there (2026-10-07 ..
+    10-09 the old fallback to the SendRequest host answered "in progress" for 30 minutes every day) — retried while
+    IBKR is still generating it (a year of one account took over 45 minutes on 2026-10-06) and while the host cannot
+    be reached at all (each try waits ``wait``)."""
     time.sleep(first_wait)
     for _ in range(max(1, tries)):
         try:
             text = _get_retrying(url, {"t": token, "q": ref, "v": "3"})
         except httpx.ConnectError as e:
-            if url == GET_URL:
-                raise
-            logger.info(f"[flex] {httpx.URL(url).host} unreachable ({e}) — GetStatement on {httpx.URL(GET_URL).host}")
-            url = GET_URL
-            text = _get_retrying(url, {"t": token, "q": ref, "v": "3"})
+            logger.info(f"[flex] {httpx.URL(url).host} unreachable ({e}) — the same host again in {wait:.0f}s")
+            time.sleep(wait)
+            continue
         root = ET.fromstring(text)
         if root.tag != "FlexStatementResponse":
             return text
@@ -154,25 +175,34 @@ def fetch_borrow_fees(raw_dir: Optional[Path] = None) -> Dict[str, object]:
     pend = raw_dir / PENDING
     text = None
     if pend.exists():                       # the last run's statement first: IBKR says never re-initiate
+        p = {}
         try:
             p = json.loads(pend.read_text(encoding="utf-8"))
             if p.get("query") == qid and time.time() - float(p.get("at", 0)) < 2 * 86400:
-                text = get_statement(token, p["ref"], p.get("url") or GET_URL, tries=1, wait=0.0, first_wait=0.0)
-        except FlexError:
+                text = get_statement(token, p["ref"], p.get("url") or GET_URL, first_wait=0.0)
+        except FlexError as e:
+            if e.code == "timeout":         # still generating: kept, never re-initiated
+                logger.warning(f"[flex] statement {p.get('ref')} still generating — kept for the next run")
+                raise
             text = None
         except Exception as e:                                       # noqa: BLE001
             logger.debug(f"[flex] pending statement unreadable: {e}")
-        pend.unlink(missing_ok=True)
+        if text is None:
+            pend.unlink(missing_ok=True)
     if text is None:
         ref, url = request_statement(token, qid)
+        # kept from the moment IBKR issues it: a process stopped while polling leaves it for the next run
+        pend.write_text(json.dumps({"ref": ref, "url": url, "query": qid, "at": time.time()}), encoding="utf-8")
         try:
             text = get_statement(token, ref, url)
         except FlexError as e:
             if e.code == "timeout":
-                pend.write_text(json.dumps({"ref": ref, "url": url, "query": qid, "at": time.time()}), encoding="utf-8")
                 logger.warning(f"[flex] statement {ref} still generating — collected first on the next run")
+            else:
+                pend.unlink(missing_ok=True)
             raise
     (raw_dir / f"{datetime.now():%Y-%m-%d_%H%M%S}_q{qid}.xml").write_text(text, encoding="utf-8")
+    pend.unlink(missing_ok=True)
     rows, periods = parse_borrow_fees(text)
     from src.db import repo
     stored = 0

@@ -141,7 +141,7 @@ def test_get_retries_transient_failure_once(monkeypatch):
             def json(self): return {"status": "OK"}
         return R()
 
-    monkeypatch.setattr(pc.httpx, "get", flaky)
+    monkeypatch.setattr(pc, "_http_get", flaky)
     assert pc._get("/v2/x") == {"status": "OK"}
     assert calls["n"] == 2, "one retry expected"
 
@@ -154,7 +154,7 @@ def test_get_retries_transient_failure_once(monkeypatch):
         raise httpx.HTTPStatusError(
             "403", request=req, response=httpx.Response(403, request=req))
 
-    monkeypatch.setattr(pc.httpx, "get", forbidden)
+    monkeypatch.setattr(pc, "_http_get", forbidden)
     assert pc._get("/v2/y") is None
     assert calls["n"] == 1, "403 must not retry"
 

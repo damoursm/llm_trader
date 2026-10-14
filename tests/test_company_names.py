@@ -489,3 +489,18 @@ def test_the_sweep_is_fail_soft(monkeypatch):
     monkeypatch.setattr(pc, "_get", boom)
     assert cn.prime_security_types(force=True) == 1
     assert cn.security_type("SPY") == "ETF"
+
+
+def test_security_type_sweep_never_lets_a_lowercase_class_overwrite_a_common_stock(tmp_path, monkeypatch):
+    """Polygon writes preferreds / rights with a lowercase letter (``TpC``, ``BCpC``, ``PLMr``); upper-casing them
+    overwrote the common stock's own type (Tutor Perini read as a preferred, Balchem as a structured product)."""
+    from src.data import polygon_client as pc
+    page = {"results": [{"ticker": "BCPC", "type": "CS"}, {"ticker": "BCpC", "type": "SP"},
+                        {"ticker": "BRK.B", "type": "CS"}, {"ticker": "TPC", "type": "CS"},
+                        {"ticker": "TpC", "type": "PFD"}, {"ticker": "XYZr", "type": "RIGHT"}]}
+    monkeypatch.setattr(pc, "_get", lambda path, params=None: page)
+    monkeypatch.setattr(cn, "_sec_type_path", lambda: tmp_path / "security_types.json")
+    monkeypatch.setattr(cn, "_SEC_TYPES", None)
+    assert cn.prime_security_types(force=True) == 3
+    types = json.loads((tmp_path / "security_types.json").read_text(encoding="utf-8"))["types"]
+    assert types == {"BCPC": "CS", "BRK.B": "CS", "TPC": "CS"}

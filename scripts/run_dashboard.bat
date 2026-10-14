@@ -14,6 +14,15 @@ REM ============================================================================
 REM cd to the repo root (this script lives in <root>\scripts\)
 cd /d "%~dp0.."
 
+REM DEACTIVATED while cache\dashboard.disabled exists (user 2026-10-13: "You can
+REM deactivate the dashboard until further notice"): the task's logon trigger and
+REM restart_all.ps1 then start nothing. Exit 0, so the task never retries.
+REM Delete the file, then Start-ScheduledTask LlmTraderDashboard, to reactivate.
+if exist "cache\dashboard.disabled" (
+    echo Dashboard deactivated: cache\dashboard.disabled exists - not starting.
+    exit /b 0
+)
+
 REM Run the dashboard with the project's venv python (absolute via CWD).
 ".venv\Scripts\python.exe" main.py --dashboard
 

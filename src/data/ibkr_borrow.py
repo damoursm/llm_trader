@@ -293,7 +293,11 @@ def short_block(ticker: str, price: Optional[float], base: Optional[Path] = None
     """``(reason, row)`` for opening a NEW short in ``ticker`` at ``price``:
     ``"no_borrow"`` (IBKR cannot lend a position this size), ``"borrow_fee"``
     (annual fee above the cap) or None (borrowable — ``row`` is what IBKR quoted,
-    stamped on the trade). Gate off or no current snapshot → ``(None, None)``.
+    stamped on the trade). Gate off → ``(None, None)``. No current snapshot →
+    ``("no_borrow_file", None)`` with `ibkr_borrow_require_file` (production: a short
+    opens only on IBKR's own file — user 2026-10-12: "Make sure the live is using the
+    real fees and lendability from IBKR"; the caller's pick waits for it), else
+    ``(None, None)`` (not checked).
     ``max_fee_pct``: the fee cap for THIS call — omitted, the setting
     ``short_borrow_max_fee_pct``; None, no fee cap at all (the selection-short
     strategy trades every BORROWABLE name, fee charged, by user directive
@@ -304,11 +308,13 @@ def short_block(ticker: str, price: Optional[float], base: Optional[Path] = None
         return None, None                  # a future / index / FX / crypto short borrows no stock
     table = latest(base=base, now=now)
     if table is None:
+        require = bool(getattr(settings, "ibkr_borrow_require_file", True))
         if time.time() - _UNCHECKED_LOGGED["ts"] > 600:
-            logger.warning("[borrow] no current IBKR borrow file — new shorts are NOT borrow-checked "
-                           "this tick (the broker still refuses a short it cannot locate)")
+            logger.warning("[borrow] no current IBKR borrow file — " + (
+                "new shorts WAIT for it (retried every tick)" if require else
+                "new shorts are NOT borrow-checked this tick (the broker still refuses a short it cannot locate)"))
             _UNCHECKED_LOGGED["ts"] = time.time()
-        return None, None
+        return ("no_borrow_file", None) if require else (None, None)
     b = lookup(table, ticker)
     min_usd = float(getattr(settings, "short_borrow_min_available_usd", 0.0) or 0.0)
     if max_fee_pct is _SETTINGS_CAP:

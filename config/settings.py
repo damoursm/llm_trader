@@ -2835,6 +2835,12 @@ class Settings(BaseSettings):
     enable_eod_spread_sweep: bool = True
     spread_sweep_budget_seconds: int = 900   # wall-clock cap per nightly run
     spread_sweep_sleep_seconds: float = 1.5  # pause between historical requests
+    # EOD live calibration (2026-10-12, `src/backtest/live_calibration.py`): the live record measured against the
+    # production-mimicking simulator's assumptions (lendability at entry, IBKR's refusals and house rates, the entry's
+    # delay and price, the broker's fills, IBKR's charged borrow, the dip orders) -> one JSON per market day and
+    # notes in the email's scorer banner. Reads only; nothing trades on it.
+    enable_eod_live_calibration: bool = True
+    live_calibration_dir: str = "cache/ml/live_calibration"
     # ── Deep history store — nightly incremental refresh (2026-09-23, user
     # directive: every external source in the historical store, kept current by
     # the scheduler). `python -m src.data.deep.refresh` as a SUBPROCESS from its
@@ -2926,7 +2932,7 @@ class Settings(BaseSettings):
     # sessions. Every other entry path is shadow (computed + persisted, not traded).
     enable_sel_short: bool = True
     sel_short_dir: str = "cache/ml/sel_short"     # model, universe, scores, picks journal
-    sel_short_give_back: float = 0.5              # model + ETF arms: cover at close - 0.5 x (close - close 5 sessions before)
+    sel_short_give_back: float = 0.5              # the model arm: cover at close - 0.5 x (close - close 5 sessions before)
     # THE VOL ARM covers once the WHOLE run-up has been given back (user directive 2026-10-04 evening: "Deploy the
     # 100% give-back to live", then "Vol arm only" once the per-arm numbers were in): its picks journal target = the
     # close 5 sessions before; most trades close earlier on the ATR exit or at the 15-session limit. Evidence (the
@@ -2934,7 +2940,16 @@ class Settings(BaseSettings):
     # +0.38, 95% +0.21..+0.54, 6 of 6 years); return per day 2.88 -> 2.19 (-0.69, 95% -1.42..-0.11). The model arm at
     # 100% fell to 0.30 %/day from 1.20 and lost money at every slice count; the ETF arm's growth did not change
     # (0.78 -> 0.53 %/day) -> both keep half. memory/vol-give-back-slices-2026-10.md
-    sel_short_vol_give_back: float = 1.0
+    # 1.25 from 2026-10-14 (PREREG97's G1, the user's go-ahead "Yes please"): the target gives back 125% of the
+    # run-up — below the close 5 sessions before; a run-up past 5x leaves a target under zero, never reached (the
+    # time limit and the 4x cover close it), as the simulator tested. The add rule on paired draws: set A +0.76 ±
+    # 0.14, set B +0.51 ± 0.23 log points a year (40 each), and the untouched set A0 +0.51 ± 0.22
+    sel_short_vol_give_back: float = 1.25
+    # THE ETF ARM gives back the WHOLE run-up too from the 2026-10-12 session (PREREG77, user's choice 2026-10-10 under
+    # the add rule: "models that are not significant but still add value and growth should be added, as long as their
+    # drawback isn't worse"): with the vol arm's 4x cover, its volatility exit off and the ETF turn, the live account
+    # +2.1 / +32.3 pp/yr on sets A / B, drawdowns -2.4 / -16.4 points, no margin call (memory/add-nonsignificant-gains-rule.md)
+    sel_short_etf_give_back: float = 1.0
     sel_short_max_hold_sessions: int = 15         # time exit: same bar of day, 15 sessions later
     sel_short_runup_sessions: int = 5             # the "rose into the pick" look-back
     sel_short_size_multiplier: float = 1.0        # flat size (x broker_base_notional), as evaluated
@@ -2943,7 +2958,11 @@ class Settings(BaseSettings):
     sel_short_min_run_rows: int = 20              # a bar with fewer scored names is not a cross-section
     sel_short_own_window_days: int = 30           # freshness: new high vs own scores over 30 sessions
     sel_short_own_min_history: int = 10           # ... unless fewer prior scores than this
-    sel_short_workers: int = 6                    # scorer processes per run
+    sel_short_workers: int = 8                    # scorer processes per run (12: 72 s a bar, 8: 89 s; 8 from 2026-10-13 for
+                                                  # ~2.4 GB of commit headroom — a 12-worker run took the box to 94.5 of 97.5 GiB)
+    # the scorer decides the LIVE arms (vol / ETF / fall: ATR%, no model input) as soon as their inputs
+    # are in, then the shadow arms on the full features (2026-10-12; False: every arm after the full rows)
+    enable_sel_short_live_first_scoring: bool = True
     sel_short_fetch_threads: int = 8              # Polygon fetch threads per scorer process
     sel_short_bar_settle_seconds: float = 20.0    # wait after a bar ends before reading it
     sel_short_wait_seconds: float = 480.0         # the tick waits this long for its run before trading
@@ -2965,6 +2984,14 @@ class Settings(BaseSettings):
     # -0.34..+0.88, not significant); depth 10 was worse (+6.55).
     enable_sel_short_vol_fallback: bool = True
     sel_short_vol_fallback_ranks: int = 5
+    # PREREG71's V6 (user directive 2026-10-10: "Deploy the narrow part that is working in live"): on a bar where
+    # the vol arm has a live pick, each of the bar's other candidates that pass the whole rule (the backups above)
+    # and are under borrow PRESSURE — HIGH on the no-file pressure model (`src/signals/sel_pressure.py`: a forecast
+    # that a lendable stock becomes unlendable within 5 sessions) — is shorted too, its own trade. Out of sample on
+    # set B (2024-06-25..2026-09-24): the extras +2.42 %/day (95% +0.41..+4.42, Holm p 0.033, both halves +), the
+    # account +58.4 vs +54.4 %/yr, no margin call; ~7 extra shorts a year. Widening it (every bar, top 10, no
+    # filters) failed (PREREG72).
+    enable_sel_short_vol_pressure_extras: bool = True
     # Share recalls (user 2026-10-07: "protecting ourselves against share recalls ... IBKR then buys back our
     # short at market"): every tick stamps each held short's place in IBKR's short-stock file (`sel_borrow_state`:
     # IBKR DROPS a name it has nothing left to lend — a recall it cannot re-source ends in a buy-in) and names an
@@ -3003,6 +3030,10 @@ class Settings(BaseSettings):
     # (+0.05, -0.20..+0.37) — NOT significant, judged on the live trades
     # (memory/short-adaptive-exits-2026-09.md).
     enable_sel_short_volnorm_exit: bool = True
+    # the VOL ARM's volatility exit, OFF from the 2026-10-12 session (PREREG77, the user's choice under the add rule):
+    # alone +3.7 / +9.7 pp/yr, drawdowns -2.2 / -0.9 points, its book 1.59 -> 0.83 %/day on set A (0.43 -> 0.48 on B);
+    # the fall and ETF arms keep it (`enable_sel_short_volnorm_exit`)
+    enable_sel_short_vol_volnorm_exit: bool = False
     sel_short_volnorm_ratio: float = 0.5
     # The SQUEEZE COVER, every arm (user directives 2026-10-05: "have it tuned so that
     # we don't have margin calls while still maximizing growth", then "Implement/fix
@@ -3015,6 +3046,10 @@ class Settings(BaseSettings):
     # per day 2.23 -> 2.19.
     enable_sel_short_squeeze_cover: bool = True
     sel_short_cover_multiple: float = 6.0
+    # THE VOL ARM's squeeze cover at 4x its entry from the 2026-10-12 session (PREREG77, the user's choice under the add
+    # rule): set A unchanged (no vol trade reached 4x there), set B +13.7 pp/yr with its drawdown 36 -> 22%; the other
+    # arms keep `sel_short_cover_multiple`
+    sel_short_vol_cover_multiple: float = 4.0
     # The SIMULATED ACCOUNT every arm is sized from (user directive 2026-10-05: "Have
     # the account based sizing considering the simulated 5000$+1000$ every two weeks", then
     # 2026-10-07: "Change the $5000+$1000/14days to $10000. We'll use this number from now
@@ -3034,6 +3069,14 @@ class Settings(BaseSettings):
     enable_sel_short_account_sizing: bool = True
     sel_short_account_initial: float = 10000.0
     sel_short_account_slices: int = 24
+    # EACH ARM ITS OWN SLICE from the 2026-10-12 session (PREREG80; the user's choice 2026-10-10, "More growth, deeper
+    # drawdown"): vol 1/20, ETF 1/16, fall 1/12 (`sim_account.arm_slices`; an arm without one, the shadow arms, takes
+    # `sel_short_account_slices`). The live account, five draws: set A +35.4 vs +28.3 %/yr, set B +105.8 vs +90.4, no
+    # margin call, worst drawdown +1.0 / +3.5 points (16.4% / 23.4%); every short 1/16 or the fall arm 1/8 met margin
+    # calls (memory/breadth-vs-sizing-2026-10.md)
+    sel_short_vol_account_slices: float = 20.0
+    sel_short_etf_account_slices: float = 16.0
+    sel_short_fall_account_slices: float = 12.0
     sel_short_account_max_dollar_volume_share: float = 0.01
     sel_short_account_min_equity: float = 2000.0
     # IBKR's HOUSE margin on the account's shorts (user 2026-10-05, "Start with 1": IBKR's own
@@ -3118,6 +3161,11 @@ class Settings(BaseSettings):
     # on its live picks (memory/etf-expansion-2026-10.md).
     enable_sel_short_etf: bool = True
     sel_short_etf_own_window_days: int = 20
+    # The ETF arm leaves the VIX-linked products out (`sel_short.VIX_ETPS`: UVXY, UVIX, VXX, VIXY, SVXY, SVIX, SVOL ...)
+    # from 2026-10-14 (user: "Yes please" — the interim block until PREREG102 decides): on the untouched set A0 its
+    # shorts of them lost and took every draw of the live account into a margin call in March 2020 (TVIX -297% /
+    # -161%). Journal-only `vix_excluded` on each ETF decision names the ones it left out.
+    sel_short_etf_exclude_vix: bool = True
     # The vol arm's THIN STOCKS — DECOMMISSIONED 2026-10-08 (user: "Decommission the Thin arm"; it never traded live:
     # 0 picks passed its rules on its one day). Off = no thin screen at the prepare, no thin universe, no thin
     # picks; its code stays for a re-test. (Deployed 2026-10-07: "Add the thin stocks to the live vol arm"; PREREG32):
@@ -3141,6 +3189,49 @@ class Settings(BaseSettings):
     # (one trade and one order per arm on a name both pick). PREREG37: +20.7 vs +11.7 %/yr on 2021-24 (n.s.),
     # return per day 0.36 vs 1.44 %, more margin calls over 2021-26 (memory/vol-rule-importance-2026-10.md).
     enable_sel_short_vol2: bool = True
+    # FALL, THE FALLER SHORTS (user directive 2026-10-09: "Yes add the faller short arm to live"; PREREG38 /
+    # PREREG57, memory/model-combination-search-2026-10.md): the vol arm's own pick on the bars where it did NOT
+    # rise over the 5 sessions before — shorted with the vol arm's crowding and relative-volume filters, no
+    # same-bar fallback, no target (the volatility exit, the 6x cover, the 15-session limit); its own copy of the
+    # vol history (scores_fall/); funded by the same simulated account. 2021-24 alone 1.48 %/day (38 trades),
+    # out of sample 2024-26 1.98 %/day (45); +6.3 log pp a year in the combined account's weekly walk-forward.
+    enable_sel_short_fall: bool = True
+    # THE TURN (PREREG76 / PREREG77; user directives 2026-10-10: "Deploy the 'Turn, fallers shorts', even if it's not
+    # significant it is better and not hurting", then the PREREG77 combination with the ETF arm on the turn): a fall
+    # or ETF pick is not shorted at once — it WAITS, and is shorted at the live price once a completed regular-hours
+    # 30-minute bar closes at least `sel_short_turn_atr` x the pick's ATR$ (its close x its 30-min ATR%) under the
+    # highest close since the pick (the pick close included), within `sel_short_turn_sessions` sessions counting the
+    # pick's own; no turn, no trade (`turn_lapsed`); a bar closing at/under the arm's target first (the ETF arm's; the
+    # fall arm has none) settles it `target_reached`; a turn older than `sel_short_entry_max_age_minutes` when first
+    # seen is `turn_expired`. Exits unchanged (the deadline counted from the pick). Evidence (the live account, five
+    # draws, lendability judged at the turn as live): the faller book 0.90 -> 1.43 %/day on set A, 1.86 -> 2.10 on B,
+    # account growth flat (-0.2 / -0.4 pp); the ETF arm alone -0.5 / +4.7 pp, its book 0.83 -> 0.84 / 0.47 -> 0.91
+    # %/day (memory/entry-timing-short-arms-2026-10.md).
+    enable_sel_short_fall_turn: bool = True
+    enable_sel_short_etf_turn: bool = True
+    sel_short_turn_atr: float = 0.5
+    sel_short_turn_sessions: int = 5
+    # THE LIVE ACCOUNT'S BOOKS (user directive 2026-10-09: "Replace the current live arms by the best combination
+    # model ... from now on, only the best combination model will be used on the 10000$ account. If we want to test
+    # other strategies in live, we'll use another 10000$ account"): the selection-short arms whose picks the $10,000
+    # account trades (comma-separated; empty = every arm). Every other arm is still scored and journaled — its
+    # picks settled `shadow_arm`, never traded.
+    sel_short_traded_arms: str = "vol,etf,fall"
+    # THE LIVE ACCOUNT (src/performance/live_account.py; the same directive): the traded arms' shorts and the dip
+    # long book share ONE $10,000 simulated margin account — one equity, one margin room; each short 1/24 and each
+    # dip long 1/10 of the equity; a short the room cannot fund in full sells the dip book's latest longs whole
+    # (the dip book gives way); at a tick where the maintenance requirement exceeds `live_account_delever_trigger`
+    # x equity the dip longs are sold, the latest first, until it is at most `live_account_delever_target` x
+    # equity; a margin call closes every short and long the account funded. Off: the two books keep their own
+    # accounts. PREREG57's best configuration (memory/model-combination-search-2026-10.md).
+    enable_live_account: bool = True
+    live_account_delever_trigger: float = 0.8
+    live_account_delever_target: float = 0.6
+    # SPLITS DURING A HOLD (PREREG64, user 2026-10-09: "Fix the bugs in production"): a split executed while a trade
+    # is open rescales it as IBKR rescales the position — prices x the factor, share counts / it — from 04:00 ET of
+    # its execution date (`tracker.apply_splits`, the split data `intraday_store.split_rows`); the dip book's working
+    # limit orders likewise (`dip_long.apply_order_splits`). Off: a 1-for-10 reverse split reads as a 900% loss.
+    enable_split_adjustment: bool = True
     sel_short_thin_min_dollar_volume: float = 1_000_000.0
     sel_short_thin_reserve_slices: float = 2.0
     # ── THE MEGA-CAP DIP LONG BOOK (user directive 2026-10-08: "Deploy the mega-cap dip buying strategy to live
@@ -3167,6 +3258,61 @@ class Settings(BaseSettings):
     dip_long_account_initial: float = 10000.0
     dip_long_account_slices: int = 10
     dip_long_entry_window_minutes: float = 60.0
+    # THE LIMIT ENTRY (user directive 2026-10-09: "deploy the Order holds nothing, fills into the room left for the
+    # 1/2 ATR limit in live for the dip buying model"; PREREG59-61, memory/dip-delayed-entry-2026-10.md): "limit" =
+    # each signal becomes a BUY limit at the signal close minus `dip_long_limit_atr` x its 14-session average true
+    # range, placed at the 09:30 tick of each of `dip_long_limit_sessions` sessions from D (quantity fixed at the
+    # first placement), filled at the open when a session opens at/under it, else at the end of the first 30-minute
+    # bar whose low reaches it — AT MOST what the live account's room allows then (no room: nothing, it keeps
+    # working); it reserves nothing. "open" = the original rule (buy at D's open).
+    dip_long_entry_mode: str = "limit"
+    dip_long_limit_atr: float = 0.5
+    dip_long_limit_sessions: int = 5
+    # THE META-MODEL FILTER (PREREG96's RP33, built 2026-10-14; user 2026-10-14: "I'm ok with deploying PREREG96's dip
+    # meta-model filters RP33 and CP33 if they gain in total on all three sets" — RP33 +2.39 / -1.06 / +1.13 log points
+    # a year on sets A / B / A0; src/signals/dip_filter.py, docs/DIP_LONG.md). On: each day's signals are scored when
+    # they are computed (the opening tick, the closes through D-1) by the LightGBM return regressor
+    # `dip_long_filter_model` (+ the .json beside it: the features, the fit window, the cut, the checksums); a signal
+    # scoring under the cut (the 33rd percentile of its training rows' out-of-fold scores) never becomes an order
+    # (journaled `filtered`). Fail-open: no model or no SPY close keeps every signal (a scorer-banner problem). OFF until
+    # the user's review: off, the book is byte-for-byte as before.
+    enable_dip_long_filter: bool = False
+    dip_long_filter_model: str = "cache/ml/dip_long/filter/model.txt"
+    # ── THE CRASH-REBOUND BOOK (user 2026-10-11, PREREG86 "Crash book only", then PREREG88 "deploy the QQQ
+    # decisions, trade TQQQ"; src/signals/crash_long.py, memory/crash-book-leveraged-2026-10.md). DECIDED on
+    # `crash_long_symbol` (QQQ): at the previous close below its `crash_long_trend_sessions` average with a 2-session
+    # RSI under `crash_long_rsi_max` -> BUY `crash_long_trade_symbol` (TQQQ) at the regular-hours open (within
+    # `crash_long_entry_window_minutes`); SELL it at the open after QQQ's first close above its
+    # `crash_long_exit_sma_sessions` average since the entry, or after `crash_long_max_hold_sessions` sessions; one
+    # position at a time, 1/`crash_long_account_slices` of the LIVE ACCOUNT's equity at the traded fund's margin
+    # requirement `crash_long_margin_rate`, selling the dip book's latest longs whole for room as a short does.
+    # QQQ's decisions traded in TQQQ, 1988-2020: +2.75% a trade (QQQ itself +1.44%), worst -36% (1987, synthetic
+    # TQQQ); in the live account +1.6 / +2.0 log points a year over trading QQQ on sets A / B, every draw positive.
+    enable_crash_long: bool = True
+    crash_long_dir: str = "cache/ml/crash_long"       # signals / entries / exits journals
+    crash_long_symbol: str = "QQQ"                    # the DECISION symbol: its closes decide the buy and the sell
+    crash_long_trade_symbol: str = "TQQQ"             # the fund bought and sold (empty: the decision symbol)
+    crash_long_margin_rate: float = 0.75              # the traded fund's requirement, initial = maintenance, as a
+                                                      # share of its value: FINRA 4210's 3 x 25% for a 3x fund
+                                                      # (0: Reg T's 50% / 25%)
+    crash_long_trend_sessions: int = 200
+    crash_long_rsi_max: float = 5.0
+    crash_long_exit_sma_sessions: int = 5
+    crash_long_max_hold_sessions: int = 10
+    crash_long_account_slices: float = 4.0
+    crash_long_entry_window_minutes: float = 60.0
+    # ── THE ETF DUAL-MOMENTUM BOOK (user 2026-10-08: "Improve the ETF trading strategy focussing only on ETFs alone
+    # ... Don't stop until you have a working, proven algo that can trade ETFs"; src/signals/etf_dm.py, PREREG46-51,
+    # memory/etf-dual-momentum-2026-10.md). At each month's last close, the fund of `etf_dm_universe` with the best
+    # mean 3/6/12-month return, held next month if its 12-month return beats T-bills (else cash); traded on the
+    # month's first session within `etf_dm_entry_window_minutes` of the open, its own simulated cash account
+    # (`etf_dm_account_initial`, no deposits). Untouched test 1988-2004: +15.5 vs +12.1 %/yr for the S&P 500 total
+    # return (95% log growth +0.046..+0.234), drawdown 46% vs 47%. OFF until the user deploys it.
+    enable_etf_dm: bool = False
+    etf_dm_dir: str = "cache/ml/etf_dm"               # decisions / rebalances journals
+    etf_dm_universe: str = "QQQ,SPY,IWM,TLT,GLD"
+    etf_dm_account_initial: float = 10000.0
+    etf_dm_entry_window_minutes: float = 60.0
     # LIVE PATH FIRST (user directive 2026-09-28): the selection short's trading
     # steps run at the START of each tick — marks + exits, then (on the main
     # thread while Steps 1-3 fetch) the wait for its scorer's inference, its
@@ -3174,6 +3320,10 @@ class Settings(BaseSettings):
     # end-of-tick exits/entries/sync still run as a second pass. False = the old
     # order (everything after "Pipeline complete").
     enable_live_path_first: bool = True
+    # a slot that comes due while the previous tick's shadow pipeline runs gets its live path on time, run
+    # by the scheduler from inside the long shadow steps (2026-10-12; False: every shadow step inline and
+    # the slot waits for the tick, as before)
+    enable_live_slot_yield: bool = True
     # The email's six research evaluations (method / LLM / macro / stage /
     # method-eval / out-of-sample) are reused within a day for this long — they
     # cost ~3 min of every tick and move with the panel, not the tick's marks.
@@ -3557,8 +3707,9 @@ class Settings(BaseSettings):
     # How often the poll-loop runner re-reads the wall clock to decide whether a
     # 30-min slot is due. Short so that after a Modern-Standby suspension it
     # re-evaluates within this many seconds of resuming (instead of relying on a
-    # precomputed long sleep, which standby skews).
-    scheduler_poll_seconds: int = 30
+    # precomputed long sleep, which standby skews) — and so a slot's tick starts
+    # within seconds of it (30 -> 5, 2026-10-12: ticks began 3-28 s after the slot).
+    scheduler_poll_seconds: int = 5
     # How late a 30-min slot may still run after its boundary. If the machine was
     # suspended past this, the slot is skipped (logged) rather than run stale.
     scheduler_misfire_grace_sec: int = 1500
@@ -4154,6 +4305,9 @@ class Settings(BaseSettings):
     # names above it are the squeeze-prone ones (2026-09-25 snapshot: a third of
     # the selection model's long picks were above 100%/yr).
     enable_short_borrow_gate: bool = True
+    # (2026-10-12, user: "Make sure the live is using the real fees and lendability from IBKR") with no current IBKR
+    # short-stock file a new short WAITS for one (retried every tick in its entry window) instead of opening unchecked
+    ibkr_borrow_require_file: bool = True
     short_borrow_max_fee_pct: float = 50.0
     short_borrow_min_available_usd: float = 10_000.0
     sim_per_trade_cost_attribution: bool = True

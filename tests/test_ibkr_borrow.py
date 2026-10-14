@@ -195,3 +195,17 @@ def test_the_follow_through_path_checks_its_shorts(monkeypatch):
     opened = {t["ticker"]: t for t in tracker._load_trades() if t.get("entry_mechanism") == "follow_through"}
     assert set(opened) == {"OKS", "LNG"}
     assert opened["OKS"]["borrow_fee_pct"] == pytest.approx(0.3)
+
+
+def test_production_waits_for_ibkrs_file_instead_of_shorting_unchecked(on, monkeypatch):
+    """User 2026-10-12: "Make sure the live is using the real fees and lendability from IBKR" — with no current file a
+    new short is not opened unchecked: ("no_borrow_file", None), the caller's pick waits for the next tick."""
+    monkeypatch.setattr(settings, "ibkr_borrow_require_file", True)
+    assert ib.short_block("NONE", 9.0) == ("no_borrow_file", None)          # nothing downloaded or archived
+    monkeypatch.setattr(ib, "_download", lambda timeout=30.0: _file("2026-09-25 10:00:00", ROWS).encode())
+    ib.snapshot()
+    late = datetime(2026, 9, 25, 13, 0, tzinfo=ET)                            # 3 h later > the 120-min cap
+    assert ib.short_block("NONE", 9.0, now=late) == ("no_borrow_file", None)
+    fresh = datetime(2026, 9, 25, 10, 30, tzinfo=ET)
+    assert ib.short_block("NONE", 9.0, now=fresh)[0] == "no_borrow"          # a current file decides as before
+    assert ib.short_block("CL=F", 70.0, now=late) == (None, None)             # a future borrows no stock

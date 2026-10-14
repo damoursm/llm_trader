@@ -137,6 +137,13 @@ def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     return pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
 
 
+def atr_pct_14(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """``atr_pct_14`` at every bar: the 14-bar Wilder average true range as a percent of
+    the close. ONE construction, shared by `ticker_feature_frame` and the selection
+    short's live arms (`ml_model.atr_frame_30m_from_hlc`), so both give the same floats."""
+    return (_wilder(_true_range(high, low, close), 14) / close.replace(0.0, np.nan)) * 100.0
+
+
 def hlc_30m(ticker: str):
     """``(idx, high, low, close, volume)`` on 30-MINUTE regular-hours bars.
 
@@ -273,8 +280,7 @@ def ticker_feature_frame(ticker: str, hlc=None) -> Optional[pd.DataFrame]:
     pct = close.pct_change()
     fs["realized_vol_20"] = (pct.rolling(20).std(ddof=1) * 100.0).values
     fs["realized_vol_60"] = (pct.rolling(60).std(ddof=1) * 100.0).values
-    tr = _true_range(high, low, close)
-    fs["atr_pct_14"] = ((_wilder(tr, 14) / close.replace(0.0, np.nan)) * 100.0).values
+    fs["atr_pct_14"] = atr_pct_14(high, low, close).values
 
     # volume / flow
     vol_sma20 = volume.rolling(20).mean().replace(0.0, np.nan)

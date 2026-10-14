@@ -101,6 +101,22 @@ section. Evidence: `memory/selection-model-exits-2026-09.md`; deployment record:
   short a name, each opens its own trade and its own IBKR order. Evidence (PREREG37,
   2021-02 .. 2024-06, one $10,000 account): +20.7 vs +11.7 %/yr (n.s.), return per day 0.36 vs
   1.44 %, 6 vs 1 margin calls over the 2021-26 context. Trades carry `sel_arm="vol2"`.
+- **The fall arm — the faller shorts** (`enable_sel_short_fall`, user directive 2026-10-09: "Yes
+  add the faller short arm to live"; live from the 2026-10-09 session). The vol arm's OWN pick —
+  its universe, ranking (30-minute ATR%), freshness against its own copy of the vol history
+  (`scores_fall/`, copied from `scores_vol/` on 2026-10-09; new vol listings are backfilled into
+  it), first fresh pick of the day — on the bars where that pick did NOT rise over the 5
+  sessions before (a valid base, the close at or under it; a riser is the vol arm's and journals
+  `a_riser` here, a pick without a base `no_base`), with the vol arm's crowding and
+  relative-volume filters, NO same-bar fallback and NO target (a faller has no run-up to give
+  back): it leaves on the volatility exit (in profit, ATR% halved), the 6x cover or the
+  15-session limit (`sel_short.FALLER_ARMS`). Funded by the same simulated account (1/12 from
+  2026-10-12, PREREG80).
+  Evidence (PREREG38's FALLERS_L, PREREG57): alone 2021-02 .. 2024-06 38 trades, +10.3%,
+  1.48 %/day (95% 0.05..3.33); out of sample 2024-07 .. 2026-09 45 trades, +12.5%, 1.98 %/day
+  (0.58..3.79); added to the simulator's combined account +6.3 log pp a year on the weekly
+  walk-forward 2023-01 .. 2026-09 (95% +2.2..+11.6, halves +6.4 / +6.2, no margin call).
+  Trades carry `sel_arm="fall"`.
 - **Several arms on one name** (user directive 2026-10-07: "if multiple arms pick the same
   stock, still order for each one of them"): every arm's pick opens its own trade and sends its
   own order at IBKR (its own reference, its own share count), whether the other arm's order is
@@ -229,11 +245,22 @@ section. Evidence: `memory/selection-model-exits-2026-09.md`; deployment record:
   don't have margin calls while still maximizing growth", then the cover for every arm;
   `enable_sel_short_squeeze_cover`, `sel_short_cover_multiple` 6.0; tuned on the vol arm, the
   model and ETF arms take it untested). A short whose fresh mark reaches 6× its entry
-  price is bought back (`sel_cover`, judged at every tick like the target), the entry
-  carried through every split executed after the entry day and on/before today
-  (`intraday_store.split_factor_between` on the deep `splits` family: these names
-  reverse-split often, and a 1-for-10 mid-hold is not a 10-fold squeeze; unreadable
-  split data falls back to the raw entry). Why: slices limit what a short weighs when it
+  price is bought back (`sel_cover`, judged at every tick like the target), the entry AS
+  QUOTED AT THE ENTRY carried through every split executed since — from 04:00 ET of the
+  split's date — and through the tick (`intraday_store.split_factor_between` on the deep
+  `splits` family: these names reverse-split often, and a 1-for-10 mid-hold is not a 10-fold
+  squeeze; unreadable split data falls back to the factor already applied to the trade).
+- **Splits during a hold** (PREREG64, `tracker.apply_splits`, `enable_split_adjustment`).
+  From 04:00 ET of a split's execution date every open short is rescaled as IBKR rescales
+  the position: the entry, target, pick closes, reference close and fill price x the
+  factor, the account's and the broker's share counts / it (a reverse split's fraction
+  kept; IBKR pays it in cash, the broker's counts truncate) — the dollars and the return
+  unchanged; once (`split_factor`, `split_orig`, `split_log`), at every ledger load and in
+  the broker's own. Before it a 1-for-10 reverse split read as a 900% loss: a false margin
+  call of the whole live account, and a false buy-in alarm (IBKR holding a tenth of the
+  shares the ledger owned). IBKR's borrow charges of the days before the split count per
+  share of their day (x the factor); a fill IBKR reports later for an order submitted
+  before the split comes into the trade's terms (`reconcile._split_k`). Why: slices limit what a short weighs when it
   opens, not after a squeeze — alone in the account a short at 1/k under IBKR's 200%
   maintenance is margin-called once it rises (k + 1)/3-fold (8.3 at 24 slices); on every
   common stock 2021–26 AMTD Digital (~13-fold in two sessions, 2022) and SMX (~10-fold,
@@ -242,6 +269,7 @@ section. Evidence: `memory/selection-model-exits-2026-09.md`; deployment record:
   starts, calls at closes and highs, the safe setup whose safer neighbours are safe too,
   the best mean growth over the 2021–25 starts): 6× with 24 slices, 1 of 447 trades
   covered, return per day 2.23 → 2.19 (`memory/ibkr-house-margin-2026-10.md`).
+- **THE LIVE ACCOUNT** (user directive 2026-10-09: only the best combination on the $10,000 account — the vol, ETF and fall arms trade (`sel_short_traded_arms`), the model arm and vol2 are journaled as shadow, picks settled `shadow_arm`): the account below is SHARED with the dip long book and, from 2026-10-12, the crash-rebound book (`enable_live_account`, `src/performance/live_account.py`; `docs/CRASH_LONG.md`): one equity, one margin room; a short the room cannot fund in full first sells the dip book's latest longs whole (`dip_gave_way`); de-leveraging at 80% → 60% of equity sells dip longs; a margin call closes every book's positions.
 - **The simulated account every arm is sized from** (user directives 2026-10-05: "Have the
   account based sizing considering the simulated 5000$+1000$ every two weeks", then every arm;
   `src/performance/sim_account.py`, `enable_sel_short_account_sizing`, `sel_short_account_*`).
@@ -257,8 +285,11 @@ section. Evidence: `memory/selection-model-exits-2026-09.md`; deployment record:
   `sel_account_equity` / `sel_account_slices`, and the broker orders exactly that count, also
   when it re-anchors a resend (`reconcile._entry_qty`). Equity below the open shorts'
   maintenance is a margin call: every funded short is bought back (`sel_margin_call`, a
-  CRITICAL log), as a broker would. The three arms share the account's equity and room (the
-  slices were tuned on the vol arm alone).
+  CRITICAL log), as a broker would. The three arms share the account's equity and room. EACH ARM
+  ITS OWN SLICE from the 2026-10-12 session (PREREG80, the user's choice: "More growth, deeper
+  drawdown"): vol 1/20, ETF 1/16, fall 1/12 (`sim_account.arm_slices`; the shadow arms 1/24) —
+  the live account +7.1 / +15.4 pp a year on sets A / B, no margin call, the worst drawdown
+  +1.0 / +3.5 points; every short 1/16, or the fall arm 1/8, met margin calls.
 - **IBKR's margin, and the what-if at entry** (user 2026-10-05: "Start with 1", then "Do both,
   deploy 24 slices and build the what-if"). The account's margin is the larger of Reg T's
   tiers (maintenance 30% or $5 a share at $5 and above, 100% or $2.50 a share below) and
@@ -332,19 +363,35 @@ section. Evidence: `memory/selection-model-exits-2026-09.md`; deployment record:
 | 08:30 | Deep pre-open run (subprocess, on its own timer — never behind the 08:30 tick): the fast families in concurrent lanes — short volume / interest in one market-wide sweep each, SEC filings re-read only for the companies EDGAR's live feed shows filing since the nightly full pass — with the 30-minute store extended beside them, then today's session snapshot (the same rows as the old one-after-another run, which took 47 min + 3 min + 3 min) | `logs/deep_preopen_console.log`, `cache/ml/deep/snapshot/<date>.parquet` |
 | 09:00 tick | `sel_short --prepare`: the store extension (usually the one that does the work — whichever of the two daily extenders runs second finds nothing to fetch), the day's universe, a coverage check of the snapshot if it already exists | `cache/ml/sel_short/prepare/<date>.json` |
 | 09:30 tick | no bar has closed yet: marks and exits only. The one-shot legacy flatten ran at this tick on 2026-09-28 (09:44: the 22 legacy trades closed, IBKR flat once their exits filled); its marker `cache/legacy_flatten_done.json` keeps it from running again | scheduler log `[sel_short] legacy flatten: closed N` |
-| 10:00 → 16:00 ticks | `sel_short --run --day D --bars k…` for every completed bar not yet run, oldest first (bar 0 = 09:30–10:00 … bar 12 = 15:30–16:00): split check, fetch, score ~2,150 names (~2–3 min a bar), journal the decision. The tick's LIVE PATH (start of the tick, while the shadow pipeline fetches) waits for it, opens the pending short and the broker sync sends it | `logs/sel_short.log`, `runs/<date>_<k>.json`, `picks/<date>.jsonl` |
+| 10:00 → 16:00 ticks | `sel_short --run --day D --bars k…` for every completed bar not yet run, oldest first (bar 0 = 09:30–10:00 … bar 12 = 15:30–16:00): split check, fetch, then IN TWO PHASES — the live arms' rows (vol / ETF / fall: ATR%, price, run-up base, filters' inputs) and their decisions journaled first (`runs_live/<date>_<k>.json`), then the full rows (the model's features and V2 scores) and the shadow arms (model, vol2) and the run record. 12 processes, one keep-alive Polygon client each: the live arms decided ~26 s into the run, the whole bar ~90 s (2026-10-09's bar 0 took 300 s before). The tick's LIVE PATH (its start, before any shadow step) waits for the live arms, opens the pending shorts and the broker sync sends them | `logs/sel_short.log`, `runs/<date>_<k>.json`, `runs_live/<date>_<k>.json`, `picks/<date>.jsonl` |
 | every tick | `monitor_sel_short_positions`: `sel_target` / `sel_cover` (vol) / `sel_volnorm` / `sel_time` covers, in every session (the live ATR% is fetched only for trades in profit) | scheduler log, the ledger |
 | every tick | `sel_short.health()`: the email's scorer banner — red with the problems + a 🔔 SCORER subject tag (a completed bar unscored 10 min after it ended, a crashed bar, a `thin_run`, a scorer exit ≠ 0, a pre-open snapshot missing or defective that no run has rebuilt yet, or one whose rebuild failed); otherwise a green line (runs today, snapshot coverage) whose notes carry what the scorer fixed itself (a defective snapshot it rebuilt) | the email |
 | after 17:00 | nothing launches | |
 
-The scorer runs as a SUBPROCESS launched at the start of each tick. The tick's
-trading path runs FIRST (`enable_live_path_first`): marks and exits before
-anything else, then — on the main thread while the shadow pipeline's Steps 1-3
-fetch — it waits for the scorer (at most `sel_short_wait_seconds`, 480 s; never
-for a `--prepare`), opens the picks and syncs the broker. The end-of-tick pass
+The scorer runs as a SUBPROCESS launched at the start of each tick, IBKR's borrow
+file is fetched on its own thread from the same moment, and the tick's WHOLE trading
+path runs FIRST, before any shadow step (`enable_live_path_first`; user 2026-10-11:
+"run first only the necessary parts for live production, and after we do the shadow
+arms"): marks and exits, then it waits for the scorer's LIVE arms (`sel_short.wait`
+returns once every bar of the launch has its `runs_live/` marker — at most
+`sel_short_wait_seconds`, 480 s; never for a `--prepare`), opens the picks and syncs
+the broker, the sync's report persisted at once. Only then does the shadow pipeline
+start. A slot that comes due while the shadow pipeline still runs gets its live path
+on time: the scheduler's hook runs `pipeline.run_live_path` (the same steps, its own
+run id, never the running tick's per-run resets) from inside the long shadow steps;
+the slot's full tick follows when the running one ends. The end-of-tick pass
 re-judges exits, takes a late scorer's picks and syncs again. A pick the tick could not take (the run was slow, no live
 price) is taken by a later tick while it is <= `sel_short_entry_max_age_minutes`
-(75) old; after that it is marked `expired`.
+(75) old; after that it is marked `expired`. THE FALL AND ETF ARMS' PICKS WAIT FOR THEIR TURN (PREREG76 / PREREG77,
+from the 2026-10-12 session; `enable_sel_short_fall_turn`, `enable_sel_short_etf_turn`): `pending_entries` hands such a
+pick over only once a completed regular-hours 30-minute bar has closed at least `sel_short_turn_atr` (½) x the pick's
+ATR$ (its close x its 30-min ATR%) under the highest close since the pick, the pick close included (`sel_short.turn_state`,
+read from the deep store + Polygon's later bars, in their current terms) — within `sel_short_turn_sessions` (5)
+sessions counting the pick's own, searched across the earlier sessions' journals (`turn_entries`); an ETF pick whose
+bar closes at/under its target first (the turning bar included) is settled `target_reached`; it is then entered at
+the live price like any pick (the turn bar at most 75 minutes old; later: `turn_expired`); no turn by the window's last
+bar + 75 minutes: `turn_lapsed`. The trade stamps the turn (`sel_turn_bar_end`, `sel_turn_close`, `sel_turn_max_close`,
+`sel_turn_level`, `sel_turn_k`); its exits are the arm's, the deadline counted from the pick.
 
 ## 3. Files (`cache/ml/sel_short/`)
 
@@ -361,21 +408,23 @@ price) is taken by a later tick while it is <= `sel_short_entry_max_age_minutes`
 | `scores_etf/<date>.pkl` | the ETF arm's history: every bar's ATR% of the exchange-traded products (seeded 2026-10-02 for the 20 sessions 09-04 → 10-02, `--backfill --arms etf --tickers … --merge`) |
 | `scores_thin/<date>.pkl` | the thin stocks' history: every bar's ATR% of the names in that day's thin universe (seeded 2026-10-07 for the 20 sessions before 10-08, `--backfill --arms thin`) |
 | `scores_vol2/<date>.pkl` | the vol2 arm's history: the vol arm's (copied from `scores_vol/` on 2026-10-07, then appended by each run) |
+| `scores_fall/<date>.pkl` | the fall arm's history: the vol arm's (copied from `scores_vol/` on 2026-10-09, then appended by each run) |
 | `universe_thin/<date>.json` | the day's thin stocks (common stocks at $5+ trading $1-5M a day) and their 20-session dollar volume |
 | `etf_underlying.json` | single-stock fund -> underlying and side (431 funds; journal-only) |
 | `picks/<date>.jsonl` | one decision per bar PER ARM (`"arm": "model"` / `"vol"`): `short`, `crowded` (a short the short-interest filter refused — target and deadline kept, never traded), `not_fresh`, `not_first_today`, `not_a_riser`, `thin_run` (< 20 names scored); every pick carries `days_to_cover` (null = unknown), `pre5_stale` (the run-up's base close is from before a gap in the name's history; journal-only) and, JOURNAL-ONLY (2026-09-29, for a blind test of a confidence score — nothing decides on them), its candidate confidence components: `run_mean` / `run_std` / `z_in_run` (the pick against the bar's cross-section), `runner_up` / `runner_up_score` / `gap2_z` (the margin over the bar's second name), `own_margin_z` (the freshness margin; null under 10 priors), `other_arm_score` / `other_arm_rank` / `other_arm_n` (the other arm's view of the same name) and `dv20`; each VOL pick also journals its `confidence` (the frozen rule `src/signals/sel_short_conf_vol_v1.json`, stamped `sel_confidence` on the trade) — journal-only: a bottom-third filter on it lowered return per day on 2021–24, years it never saw (`memory/vol-arm-anatomy-2026-09.md`) |
 | `vol_listings.json` | the vol arm's added listings: ticker → added day, Polygon type, listing date, name (never delete — the vol arm ranks exactly these beside the model's names) |
 | `grouped/<date>.pkl`, `ticker_details.json` | the listings screen's inputs: Polygon's whole-market daily bars per session, Polygon's reference record per candidate (an unknown symbol is asked again after 20 h) |
-| `entries/<date>.jsonl` | every pick the entry step settled (2026-10-05): `outcome` (`opened`, `no_borrow_retry` — IBKR cannot lend it now; journaled at every check, the pick stays pending inside its 75-minute window (2026-10-07) —, `no_borrow` (the retry off), `no_borrow_fallback` (the vol pick settled by the same bar's lendable backup, PREREG16), `halted_retry` (halted at the entry tick: re-checked next tick), `traded_today` (a backup already traded that day), `ibkr_refused`, `borrow_fee`, `target_reached`, `already_open`, `expired`), the live `price`, the pick's `ssr`, and IBKR's borrow row at that moment (`borrow_checked`, `borrow_listed`, `borrow_available`, `borrow_fee_pct`, `borrow_file_ts`) — for the picks NOT taken too |
+| `entries/<date>.jsonl` | every pick the entry step settled (2026-10-05): `outcome` (`opened`, `no_borrow_retry` — IBKR cannot lend it now; journaled at every check, the pick stays pending inside its 75-minute window (2026-10-07) —, `no_borrow` (the retry off), `no_borrow_fallback` (the vol pick settled by the same bar's lendable backup, PREREG16), `halted_retry` (halted at the entry tick: re-checked next tick), `traded_today` (a backup already traded that day; a pressure extra's line carries `pressure_extra_of` and its `pressure` — PREREG71's V6), `ibkr_refused`, `borrow_fee`, `target_reached`, `already_open`, `expired`, and a faller pick's `turn_lapsed` / `turn_expired` with its `turn` — PREREG76), the live `price`, the pick's `ssr`, and IBKR's borrow row at that moment (`borrow_checked`, `borrow_listed`, `borrow_available`, `borrow_fee_pct`, `borrow_file_ts`) — for the picks NOT taken too |
 | `tradelog/<date>.jsonl` | each `short` end to end (2026-10-05): the pick (target, days to cover, relative volume, ATR%, the short-sale restriction `ssr` + its inputs), the entry step, the ledger trade (entry, exit, reason, return) and the broker's legs `broker_entry` / `broker_exit` (status, filled / requested, fill price, commission, attempts, refusals and their errors, the book and limit at the first submit, first fill time, seconds to fill, slippage against the ledger in bp — positive = worse) + `broker_return_pct` (the fills' gross return when both legs filled); the prepare rewrites the last 25 sessions |
-| `picks/<date>.consumed.json` | what the tracker did with each `short` (vol keys end in `|vol`; a fallback trade's key is its OWN bar-and-ticker key): `opened`, `already_open`, `target_reached`, `no_borrow` (retry off), `no_borrow_fallback`, `ibkr_refused`, `traded_today`, `expired` — an unlendable or halted pick is NOT consumed while its window lasts |
+| `picks/<date>.consumed.json` | what the tracker did with each `short` (vol keys end in `|vol`; a fallback trade's key is its OWN bar-and-ticker key): `opened`, `already_open`, `target_reached`, `no_borrow` (retry off), `no_borrow_fallback`, `ibkr_refused`, `traded_today`, `expired`, `turn_lapsed`, `turn_expired` — an unlendable or halted pick is NOT consumed while its window lasts, nor a faller pick waiting for its turn |
 | `runs/<date>_<bar>.failed.json` | a bar whose run crashed (count + error); retried by the next launch, skipped after 2 |
 | `launches/<date>.jsonl` | each scorer launch's arguments, exit code and duration (the email reads it) |
 | `snapshot/<date>.json` | what the day's first snapshot check found (`found` coverage, `rebuilt`, final `coverage`, `error`) — a missing/defective pre-open snapshot shows in the email |
-| `runs/<date>_<bar>.json` | the run record: the model's decision (+ the vol arm's under `arms`), status counts (`OK` / `NO_BAR` / `FETCH_FAILED` / `NO_SNAPSHOT` / `NO_DATA` / `ERROR`), n scored, `n_days_to_cover` (names that carried one), `snapshot_coverage`, seconds |
+| `runs/<date>_<bar>.json` | the run record: the model's decision (+ every other arm's under `arms` — a live arm's with its cross-arm view `other_arm_*`, read once the model's scores exist), status counts (`OK` / `NO_BAR` / `FETCH_FAILED` / `NO_SNAPSHOT` / `NO_DATA` / `ERROR`), n scored, `n_days_to_cover` (names that carried one), `snapshot_coverage`, seconds; `live_mismatch` when a live row differed from its full row (CRITICAL — never expected) |
+| `runs_live/<date>_<bar>.json` | the bar's LIVE arms' decisions (vol / ETF / fall), written as soon as they are journaled, before the shadow arms are scored: the tick's wait returns on it; a rerun after a crashed shadow phase finds it and journals only the shadow arms. A worker that fails before reporting its live rows fails the bar (no marker; rerun next tick); one that fails after them fails only the shadow phase. A live/full row mismatch (`live_mismatch` in `runs/`) is a scorer-banner problem |
 | `busy.lock` | held by a running scorer, touched every 30 s; stale after 180 s |
 
-Never delete `scores/`, `scores_vol/`, `scores_etf/`, `scores_thin/` or `scores_vol2/`: without them every name reads
+Never delete `scores/`, `scores_vol/`, `scores_etf/`, `scores_thin/`, `scores_vol2/` or `scores_fall/`: without them every name reads
 as "no history" and passes the freshness rule. Seeding history for NEW names uses
 `--backfill --tickers … --merge` (without `--merge` a backfill rewrites whole day files).
 
@@ -443,18 +492,25 @@ window is logged by `--prepare` with the exact `--backfill` command to fill it.
 | `ENABLE_SEL_SHORT_ETF=false` / `SEL_SHORT_ETF_OWN_WINDOW_DAYS` | the ETF arm off (its products leave the next prepare's universe; open trades keep their exits) / its freshness window (20) |
 | `ENABLE_SEL_SHORT_THIN=false` / `SEL_SHORT_THIN_MIN_DOLLAR_VOLUME` / `SEL_SHORT_THIN_RESERVE_SLICES` | the vol arm's thin stocks off (no thin screen, no thin universe, no thin picks; open thin trades keep their exits) / the band's lower floor ($1M) / the live slices of margin a thin short must leave free (2) |
 | `ENABLE_SEL_SHORT_VOL2=false` | the vol2 arm off (no vol2 picks; its open trades keep their exits) |
+| `ENABLE_SEL_SHORT_FALL=false` | the fall arm off (no faller picks; its open trades keep their exits) |
+| `ENABLE_SEL_SHORT_FALL_TURN=false` / `ENABLE_SEL_SHORT_ETF_TURN=false` / `SEL_SHORT_TURN_ATR` / `SEL_SHORT_TURN_SESSIONS` | the faller / ETF picks shorted at once again (inside the 75-minute window) instead of waiting for their turn (PREREG76 / 77) / the turn's size in the pick's ATR$ (0.5) / its window in sessions counting the pick's own (5); read by the entry step |
+| `SEL_SHORT_VOL_COVER_MULTIPLE` / `ENABLE_SEL_SHORT_VOL_VOLNORM_EXIT` / `SEL_SHORT_ETF_GIVE_BACK` | PREREG77 (from the 2026-10-12 session): the vol arm's squeeze cover (4x; the other arms `SEL_SHORT_COVER_MULTIPLE` 6x) / the vol arm's volatility exit (off; the fall and ETF arms keep it) / the ETF arm's give-back (1.0 = the whole run-up; the model arm `SEL_SHORT_GIVE_BACK` 0.5); read by the exits and the scorer |
+| `SEL_SHORT_VOL_ACCOUNT_SLICES` / `SEL_SHORT_ETF_ACCOUNT_SLICES` / `SEL_SHORT_FALL_ACCOUNT_SLICES` | PREREG80 (from the 2026-10-12 session): each arm's slice count — a new short is 1/that of the account's equity (20 / 16 / 12; an arm without one, `SEL_SHORT_ACCOUNT_SLICES` 24); read by the entry step's sizing and the dip book's give-way |
 | `SEL_SHORT_OWN_WINDOW_DAYS` / `SEL_SHORT_VOL_OWN_WINDOW_DAYS` | each arm's freshness window in sessions (30 / 20); read by the scorer at each launch |
 | `ENABLE_SEL_SHORT_DTC_FILTER=false` | the short-interest filter off: crowded picks trade again (both arms); picks still record `days_to_cover` |
 | `ENABLE_SEL_SHORT_VOL_RVOL_FILTER=false` / `SEL_SHORT_VOL_MIN_RVOL` | the vol arm's relative-volume filter off (low_rvol picks trade again; picks still record `rvol`) / its cut (1.58 x the usual 30-min volume); read by the scorer at each launch |
 | `SEL_SHORT_MAX_OPEN_PER_TICKER` | open shorts allowed per name (0 = no limit, live; 1 = the old one-position rule) |
 | `ENABLE_SEL_SHORT_BORROW_RETRY=false` | an unlendable pick is given up at its first check (`no_borrow`) instead of being re-checked every tick inside its window (2026-10-07) |
+| `ENABLE_SEL_SHORT_VOL_PRESSURE_EXTRAS=false` | the vol arm's pressure extras off (PREREG71's V6: the live pick's passing backups that are HIGH on the borrow-pressure model, `src/signals/sel_pressure.py`, are shorted too); read by the entry step, the prepare (which builds `pressure/scores/<day>.json`) and the scorer health |
 | `ENABLE_SEL_SHORT_VOL_FALLBACK=false` / `SEL_SHORT_VOL_FALLBACK_RANKS` | the vol arm's same-bar fallback off (an unlendable or IBKR-refused vol pick is simply not traded) / how deep it reaches (5 = ranks 2-5, live from 2026-10-07; 3 = PREREG16's tested depth; 10 worse — PREREG21); read by the scorer at each launch and by the entry step |
 | `ENABLE_SEL_SHORT_HALT_GUARD=false` | names halted at the entry tick are entered anyway, and held shorts are no longer stamped `sel_halted` (NYSE's current-halt list, `src/data/trade_halts.py`) |
 | `ENABLE_SEL_SHORT_BORROW_WATCH=false` | held shorts are no longer stamped with IBKR's borrow state (`sel_borrow_state`; journal-only — covering when the pool empties was refused, PREREG19) |
 | `BROKER_BUY_IN_CONFIRM_SYNCS` | syncs running on which IBKR must hold fewer short shares than the open trades own before the buy-in alert (3) |
 | `SEL_SHORT_MARK_MAX_AGE_MINUTES` | the target and the volatility exit are judged only on a mark this fresh (45) |
 | `ENABLE_SEL_SHORT_VOLNORM_EXIT=false` / `SEL_SHORT_VOLNORM_RATIO` | the volatility-normalised exit off / its threshold (0.5 = the ATR% halved since the pick) |
-| `ENABLE_LIVE_PATH_FIRST=false` | the old tick order: marks, exits, entries and ONE broker sync at the END of the tick, after the shadow pipeline (entries ~10–40 min after the bar instead of ~2.5 min into the tick) |
+| `ENABLE_LIVE_PATH_FIRST=false` | the old tick order: marks, exits, entries and ONE broker sync at the END of the tick, after the shadow pipeline (entries ~10–40 min after the bar), and no live path for a slot that comes due during a long tick |
+| `ENABLE_SEL_SHORT_LIVE_FIRST_SCORING=false` | the scorer decides every arm after the full rows (one phase; the live arms' picks ~1 min later) |
+| `SEL_SHORT_WORKERS` | scorer processes per run (12; the rows keep one order whatever the count) |
 | `BROKER_REFUSED_RESENDS_PER_TICK` / `BROKER_REFUSED_MAX_TICKS` | a refused order is resent this many times in the same tick (2); an entry refused on this many ticks is given up (6) — exits never give up |
 | `SEL_SHORT_MAX_DAYS_TO_COVER` | the filter's threshold in days of volume (1.0 = FINRA's floor, "under one day of volume"); read by the scorer at each launch |
 | `SEL_SHORT_SIZE_MULTIPLIER` | position size vs the base order (1.0) |
@@ -493,10 +549,11 @@ scorer subprocess reads settings at each launch.
 
 ## 8. Known gaps
 
-- Entries execute once the scorer finishes, ~2.5 min after the tick starts (the
-  live path; 2:20–2:36 on the 2026-09-28 afternoon ticks, longer when a tick scores
-  two bars; before 2026-09-28 they waited for the shadow pipeline, 10–40 min). A
-  1–2 tick delay measured harmless either way (§1).
+- Entries execute once the scorer has decided the live arms (the bar's end + the
+  20 s settle + the live phase), longer when a tick scores two bars. A 1–2 tick
+  delay measured harmless either way (§1). The live picks' journal records carry no
+  `other_arm_*` (the model's view of the pick is scored after them; the run file's
+  copy has it).
 - Bar-12 picks (the 16:00 close) enter in the post-market, where short fills are poor.
 - Rule 201 (fixed 2026-10-05, user: "The broker doesn't handle Rule 201 when the
   short-sale restriction is on"): a short entry under the short-sale price test — the
@@ -524,7 +581,8 @@ scorer subprocess reads settings at each launch.
   only while it is <= 75 minutes old; its scores still fill the freshness history.
 - Covers outside regular hours (any-time exits) were not in the evaluation, and fill on
   thinner books; the shadow system's daily and 30-minute TICK caches do not yet reset a
-  history on a split (only the deep 30-minute store, which is all the strategy reads).
+  history on a split (only the deep 30-minute store, which is all the strategy reads; the
+  ledger's open trades are rescaled by `tracker.apply_splits`).
 - The evaluation grouped a run by the bar's POSITION in the session; live groups by
   the CLOCK bar. They differ only for a name that did not trade in an earlier bar.
 - The evidence is ~200 trades, May–September (January to mid-May was ~0 for every

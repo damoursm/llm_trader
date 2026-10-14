@@ -31,7 +31,26 @@ any input at a decision point could see something that happened after it:
   row or a rewrite of one (2026-10-06);
 * the model's training rows — only labels CONFIRMED by the fit's cut;
 * the dip long book (2026-10-08) — its signal and its exit at session D's open read the closes through
-  D-1 only, never a bar of D or later (mutation-checked 2026-10-08).
+  D-1 only, never a bar of D or later (mutation-checked 2026-10-08);
+* the dip book's meta-model filter (2026-10-14, PREREG96's RP33, off until deployed) — every one of its 17 inputs at
+  session D (the name's daily bars, breadth, the name's previous signal, SPY's) and so its score read the closes
+  through D-1 only; a store or SPY series already holding D and later (rewritten, or firing again) moves nothing
+  (mutation-checked 2026-10-14: the name's inputs from the store's last bar, SPY's from its last bar, the previous
+  signal searched past D-1 — each fails the guard);
+* the ETF dual-momentum book (2026-10-08) — the month's pick reads the funds' closes through the previous
+  month's last session and the T-bill rates PUBLISHED by its close (ALFRED vintages), never a bar of the month
+  or a later vintage (mutation-checked 2026-10-08: closes uncut, the month's own close, the vintage cut dropped).
+* the ledger's split adjustment (2026-10-09, PREREG64) — an open trade and a working dip order are rescaled
+  through the splits executed by the tick only, from 04:00 ET of the split's date, never one the data lists for
+  a later day or a later hour (mutation-checked 2026-10-09: the 04:00 shift dropped).
+* the borrow pressure behind the vol arm's extra shorts (2026-10-10, PREREG71's V6) — session D's inputs read the
+  daily bars and IBKR's fee of the sessions BEFORE D, FINRA's report settled 10+ days before, fails-to-deliver settled
+  15-45 days before, the Reg SHO lists before D; rewriting every later row changes nothing (mutation-checked
+  2026-10-10: the fee read on D itself).
+* the turn of the fall and ETF picks (2026-10-10, PREREG76 / 77) — a waiting pick's turn (and the ETF target's
+  cancel) at a tick reads only the bars COMPLETED by the tick, inside its window: the state from the whole series
+  equals the series cut at the tick, a bar still in progress never counts, and rewriting every later bar changes
+  nothing (mutation-checked 2026-10-10: the tick's cut dropped).
 The deep features' point-in-time rules (the 08:30 cutoff, publication lags, rows
 published after the cutoff) are pinned in `tests/test_deep_features.py` — the Reg SHO
 (`rs`) and IBKR borrow (`bw`) groups there too (a list / borrow row of D is known from
@@ -42,7 +61,7 @@ base's history-gap guard and completed-bars-only scoring in `tests/test_sel_shor
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -364,6 +383,7 @@ def test_the_squeeze_cover_never_reads_a_split_after_the_tick(monkeypatch):
     from src.performance import tracker
     monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", True)
     monkeypatch.setattr(settings, "sel_short_cover_multiple", 6.0)
+    monkeypatch.setattr(settings, "sel_short_vol_cover_multiple", 6.0)     # the split's timing at one level (live: 4x)
     now = datetime(2026, 9, 29, 11, 0, tzinfo=ET)
     trade = {"ticker": "SQZ", "sel_arm": "vol", "entry_price": 10.0, "entry_date": "2026-09-22",
              "current_price": 60.0, "current_price_datetime": (now - timedelta(minutes=5)).isoformat(),
@@ -577,3 +597,362 @@ def test_the_dip_exit_never_reads_a_close_of_its_own_session(monkeypatch):
     assert dl.exit_check(trade, DAY) == base
     nxt = ss.session_after(DAY, 1)                                   # the injected leak: judged a day later
     assert dl.exit_check(trade, nxt)[0] == "dip_rebound"
+
+
+# ── THE DIP BOOK'S META-MODEL FILTER (PREREG96's RP33, 2026-10-14) ───────────
+
+def _filter_frames():
+    """SYN: a real dip signal at D-1 (`_dip_frame`); ``wild``: D and D+1 stored and rewritten (x3 price, x25 volume);
+    ``deeper``: D and D+1 stored and the dip going on (the rule fires again on both); SPY: an uptrend, and the same
+    with D and D+1 rewritten."""
+    hist = ss.sessions_before(DAY, 260)
+    later = [DAY, ss.session_after(DAY, 1)]
+    clean = _dip_frame(hist)
+    wild = pd.concat([clean, _dip_frame(hist + later, rewrite_from=DAY).iloc[len(clean):]])
+    deeper = pd.concat([clean, _dip_frame(hist + later, drop_last=4).iloc[len(clean):]])
+    spy = _dip_frame(hist, drop_last=0, seed=8)
+    spy_wild = pd.concat([spy, _dip_frame(hist + later, drop_last=0, seed=8, rewrite_from=DAY).iloc[len(spy):]])
+    return later, clean, wild, deeper, spy, spy_wild
+
+
+def _same_inputs(a: dict, b: dict) -> bool:
+    return a.keys() == b.keys() and all((isinstance(a[k], float) and isinstance(b[k], float) and np.isnan(a[k])
+                                         and np.isnan(b[k])) or a[k] == b[k] for k in a)
+
+
+def test_the_dip_filter_inputs_never_read_a_bar_of_the_trade_day(monkeypatch):
+    """PREREG96's RP33 scores session D's signals on the closes through D-1: a store (and a SPY series) already holding
+    D's bars and later ones — rewritten wildly, or with the dip going on so that the rule fires again on D and D+1 —
+    must not move any of the 17 inputs (the name's 11, breadth, days_since_prev, SPY's 4); read through D (the
+    injected leak) they move, and the fixture holds a later firing a look past D-1 would count."""
+    from src.data import intraday_store
+    from src.signals import dip_filter as DF
+    from src.signals import dip_long as dl
+    monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
+    later, clean, wild, deeper, spy, spy_wild = _filter_frames()
+    prev = dl.prev_session(DAY)
+    assert DF.rule_mask(dl.daily_bars(deeper))[-2:].all()            # the rule fires again on D and D+1
+
+    def inputs(store, spy_):
+        monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: store if tk == "SYN" else spy_)
+        monkeypatch.setattr(DF, "cache_daily", lambda tk: dl.daily_bars(spy_))
+        got, src = DF.spy_inputs(prev)
+        assert src == "cache"
+        return DF.signal_inputs("SYN", prev, 3, got, {"SYN": "2019-05-01"})
+    base = inputs(clean, spy)
+    assert np.isfinite([base[k] for k in DF.FEATURES]).all()         # every input known at D-1
+    for store, spy_ in ((wild, spy_wild), (deeper, spy_wild), (deeper, spy)):
+        assert _same_inputs(inputs(store, spy_), base)
+    # the injected leaks: the name's inputs, SPY's and the previous signal read past D-1
+    leak = DF.name_features(dl.daily_bars(wild), later[-1])
+    assert any(leak[k] != base[k] for k in DF.NAME_FEATURES)
+    assert DF.spy_features_at(dl.daily_bars(spy_wild), later[-1]) != {k: base[k] for k in DF.SPY_FEATURES}
+    assert DF.prev_signal(dl.daily_bars(deeper), ss.session_after(DAY, 2)) == later[-1]
+
+
+def test_the_dip_filter_score_never_reads_the_trade_day(monkeypatch, tmp_path):
+    """End to end: `compute_signals(D)` with the filter on (a stand-in model reading every input) scores and keeps the
+    same on a store and a SPY series holding D's (rewritten) bars as on ones that end at D-1."""
+    from config.settings import settings
+    from src.data import intraday_store
+    from src.signals import dip_filter as DF
+    from src.signals import dip_long as dl
+    monkeypatch.setattr(settings, "dip_long_dir", str(tmp_path / "dip_long"))
+    monkeypatch.setattr(settings, "enable_dip_long_filter", True)
+    monkeypatch.setattr(dl, "candidates", lambda d: (["SYN"], "test"))
+    monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
+    w = np.random.default_rng(0).normal(size=len(DF.FEATURES))
+
+    class Linear:                                                    # a score every input moves
+        def predict(self, X):
+            return np.nan_to_num(np.asarray(X, float)) @ w
+    monkeypatch.setattr(DF, "load_model", lambda path=None: (Linear(), {"policy": {"cut": 0.0}, "prior_signals": {}}))
+    later, clean, wild, deeper, spy, spy_wild = _filter_frames()
+    out = []
+    for store, spy_ in ((clean, spy), (wild, spy_wild), (deeper, spy_wild)):
+        monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk, _s=store, _p=spy_: _s if tk == "SYN" else _p)
+        monkeypatch.setattr(DF, "cache_daily", lambda tk, _p=spy_: dl.daily_bars(_p))
+        day = dl.compute_signals(DAY)
+        out.append([(r["ticker"], r["filter_score"], r["filter_keep"], r["filter_inputs"])
+                    for r in day["signals"] + day["filtered"]])
+    assert out[0] == out[1] == out[2] and [r[0] for r in out[0]] == ["SYN"]
+
+
+# ── THE ETF DUAL-MOMENTUM BOOK (2026-10-08) ──────────────────────────────────
+
+def test_the_etf_decision_never_reads_a_close_after_the_month_end(monkeypatch, tmp_path):
+    """The month's fund is decided at the previous month's last close: a store already holding the month's own
+    sessions — rewritten wildly — must not move a score or the pick; scored at the trading session's own close
+    (the injected leak) every score moves."""
+    from config.settings import settings
+    from src.data import intraday_store
+    from src.signals import etf_dm as em
+    monkeypatch.setattr(settings, "etf_dm_dir", str(tmp_path / "etf_dm"))
+    monkeypatch.setattr(em, "_extend", lambda tks, through: None)
+    monkeypatch.setattr(em, "tbill_growth", lambda a, b: 0.04)
+    d = date(2026, 10, 1)
+    hist = ss.sessions_before(d, 300)
+    assert em.decision_session(d) == hist[-1] == date(2026, 9, 30)
+    later = [d, ss.session_after(d, 1)]
+    clean, future = {}, {}
+    for i, tk in enumerate(em.universe()):
+        clean[tk] = _dip_frame(hist, drop_last=0, seed=31 + i)
+        future[tk] = pd.concat([clean[tk], _dip_frame(hist + later, drop_last=0, seed=31 + i,
+                                                       rewrite_from=d).iloc[len(clean[tk]):]])
+    out = []
+    for store in (clean, future):
+        monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk, _s=store: _s[tk])
+        dec = em.compute_decision(d, write=False)
+        out.append({k: dec[k] for k in ("decided_at_close", "funds", "stale", "top", "tbill_12m", "pick")})
+    assert out[0] == out[1] and out[0]["pick"] in em.universe() and not out[0]["stale"]
+    leak = {tk: em.fund_stats(em.closes(tk, d), d) for tk in em.universe()}       # the injected leak: D's close
+    assert all(leak[tk]["score"] != out[1]["funds"][tk]["score"] for tk in em.universe())
+
+
+def test_the_tbill_hurdle_never_reads_a_rate_published_after_the_month_end(monkeypatch, tmp_path):
+    """The 12-month T-bill return the top fund must beat compounds the DTB3 values PUBLISHED by the month-end
+    close (ALFRED vintages; a day's rate appears the next day): the month-end's own rate, a later revision of an
+    earlier day and every later day must not move it."""
+    import duckdb
+    from src.data import deep
+    from src.signals import etf_dm as em
+    start, me = date(2025, 9, 30), date(2026, 9, 30)
+    days = [x.date() for x in pd.bdate_range(start, me)]
+    nxt = dict(zip(days, days[1:] + [date(2026, 10, 1)]))
+    known = [("DTB3", x.isoformat(), nxt[x].isoformat(), "9999-12-31", 4.0 + 0.002 * i, True)
+             for i, x in enumerate(days) if nxt[x] <= me]
+    unknown = [("DTB3", me.isoformat(), "2026-10-01", "9999-12-31", 9.0, True),     # the month-end's own rate
+               ("DTB3", "2026-06-01", "2026-10-01", "9999-12-31", 40.0, True),      # a revision published later
+               ("DTB3", "2026-10-01", "2026-10-02", "9999-12-31", 40.0, True)]      # a later day
+
+    def growth(rows):
+        p = tmp_path / f"v{len(rows)}"
+        p.mkdir()
+        con = duckdb.connect()
+        con.execute("create table t (series_id varchar, date varchar, realtime_start varchar, "
+                    "realtime_end varchar, value double, vintage boolean)")
+        con.executemany("insert into t values (?, ?, ?, ?, ?, ?)", rows)
+        con.execute(f"copy t to '{(p / 'fred_vintages.parquet').as_posix()}' (format parquet)")
+        con.close()
+        monkeypatch.setattr(deep, "DEEP_DIR", p)
+        return em.tbill_growth(start, me)
+
+    base = growth(known)
+    assert 0.03 < base < 0.06
+    assert growth(known + unknown) == base
+
+
+def test_a_dip_limit_touch_never_reads_a_bar_that_has_not_ended():
+    """The limit entry (2026-10-09) fills at the END of the first 30-minute bar whose low reaches the limit, judged
+    at a tick: a bar still forming at the tick, or any later one, rewritten to reach the limit, must not fill it (its
+    limit is the close of D-1 minus half the ATR — the stats guard above); read past the tick (the injected leak) it
+    does, so the guard can fail."""
+    from src.signals import dip_long as dl
+    d = DAY
+
+    def frame(lows):
+        idx = [(datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET) + timedelta(minutes=30 * k))
+               .astimezone(timezone.utc).replace(tzinfo=None) for k in range(len(lows))]
+        return pd.DataFrame({"Open": 101.0, "High": 102.0, "Low": lows, "Close": 101.0, "Volume": 1e6},
+                            index=pd.DatetimeIndex(idx))
+    tick = datetime(d.year, d.month, d.day, 10, 30, 20, tzinfo=ET).astimezone(timezone.utc)
+    after = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET).astimezone(timezone.utc)
+    clean = frame([101.0, 100.5])                                  # the two bars ended by the tick
+    future = frame([101.0, 100.5, 97.0, 96.0])                     # + the forming bar and a later one, through 98
+    assert dl.first_touch(clean, 98.0, after, tick) is None
+    assert dl.first_touch(future, 98.0, after, tick) is None
+    leak = dl.first_touch(future, 98.0, after, tick + timedelta(minutes=30))   # the injected leak
+    assert leak is not None and leak.astimezone(ET).strftime("%H:%M") == "11:00"
+
+
+def test_a_split_after_the_tick_never_rescales_a_trade_or_a_dip_order(monkeypatch):
+    """PREREG64: the ledger's split adjustment (`tracker.apply_splits`, `dip_long.apply_order_splits`) reads the split
+    data, where announced splits sit before their date. A split executed after the tick — or on the tick's own date
+    while the tick is before 04:00 ET, the pre-market open where it takes effect — must change nothing, whatever it
+    is."""
+    from config.settings import settings
+    from src.data import intraday_store as ist
+    from src.performance import tracker
+    from src.signals import dip_long
+    monkeypatch.setattr(settings, "enable_split_adjustment", True)
+    now = datetime(2026, 10, 7, 3, 59, tzinfo=ET)
+
+    def run(rows):
+        monkeypatch.setattr(ist, "split_rows", lambda rows=rows: rows)
+        t = {"ticker": "SYN", "status": "OPEN", "entry_price": 10.0, "sel_account_shares": 40,
+             "entry_datetime": "2026-10-05T14:00:00+00:00", "entry_date": "2026-10-05", "current_price": 9.0,
+             "current_price_datetime": "2026-10-06T19:00:00+00:00", "broker_fill_qty": 40}
+        o = {"ticker": "SYN", "day": "2026-10-05", "status": "working", "limit": 9.5, "close": 10.0, "qty": 40,
+             "events": []}
+        tracker.apply_splits([t], now)
+        dip_long.apply_order_splits([o], now)
+        o.pop("events")
+        return t, o
+
+    early = [(date(2026, 9, 1), 10.0, 1.0)]                                 # before the entry: in its prices
+    base = run({"SYN": early})
+    for later in ([(date(2026, 10, 7), 10.0, 1.0)], [(date(2026, 10, 8), 1.0, 3.0), (date(2027, 1, 4), 20.0, 1.0)]):
+        assert run({"SYN": early + later}) == base
+
+
+def test_the_borrow_pressure_never_reads_the_session_or_later(tmp_path, monkeypatch):
+    """PREREG71's V6: the pressure of session D (`sel_pressure.inputs`) — rewriting the daily bars of D and later,
+    IBKR's fee of D and later, FINRA's reports settled after D-10, fails-to-deliver settled after D-15, the Reg SHO
+    lists of D and later and a listing dated after D changes nothing; the panel refuses a session of D itself."""
+    from config.settings import settings
+    from src.signals import sel_pressure as SP
+    monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel_short"))
+    days, k = [], date(2026, 6, 1)
+    while len(days) < 66:
+        if k.weekday() < 5:
+            days.append(k)
+        k += timedelta(days=1)
+    before, d, later = days[:60], days[60], days[61:]
+    rng = np.random.default_rng(11)
+
+    def write_bars(scale_later):
+        g = SP.root() / "grouped"
+        g.mkdir(parents=True, exist_ok=True)
+        for i, s in enumerate(days):
+            px = np.array([20.0, 30.0]) * np.exp(0.01 * i) * (scale_later if s >= d else 1.0)
+            pd.DataFrame({"sym": ["AAA", "BBB"], "o": px, "h": px * 1.05, "l": px * 0.95, "c": px,
+                          "v": [2e6, 3e6]}).to_pickle(g / f"{s.isoformat()}.pkl")
+    D = SP.dnum(d)
+    cal = np.array([SP.dnum(s) for s in days], np.int64)
+
+    def frames(rewrite):
+        r = 1e3 if rewrite else 1.0
+        fees = {"AAA": (cal.copy(), np.r_[np.full(60, 15.0), np.full(6, 15.0 * r)])}   # D and later rewritten
+        return {"si": pd.DataFrame({"ticker": ["AAA", "AAA"], "settlement_date": [EPOCH_ + pd.Timedelta(days=D - 20),
+                                                                                  EPOCH_ + pd.Timedelta(days=D - 5)],
+                                    "short_interest": [1e5, 1e5 * r], "days_to_cover": [1.5, 1.5 * r]}),
+                "ftd": pd.DataFrame({"symbol": ["AAA", "AAA"], "sd": [EPOCH_ + pd.Timedelta(days=D - 30),
+                                                                      EPOCH_ + pd.Timedelta(days=D - 10)],
+                                     "q": [4e5, 4e5 * r]}),
+                "regsho": pd.DataFrame({"symbol": ["AAA"] * (2 if rewrite else 1),
+                                        "date": ([days[50]] + ([d] if rewrite else []))}),
+                "splits": pd.DataFrame({"ticker": ["BBB"] if rewrite else [], "d": [D + 2] if rewrite else [],
+                                        "split_from": [10.0] if rewrite else [], "split_to": [1.0] if rewrite else []}),
+                "details": pd.DataFrame({"ticker": ["AAA", "BBB"], "d": [EPOCH_ + pd.Timedelta(days=D - 900),
+                                                                         EPOCH_ + pd.Timedelta(days=D + (30 if rewrite else 400))]}),
+                "fees": fees, "cover": {"AAA": (int(cal[0]), int(cal[-1]))}, "types": {}}
+    write_bars(1.0)
+    a = SP.inputs(d, sessions=before, fetch=False, frames=frames(False))
+    write_bars(7.0)                                                   # the bars of D and later rewritten
+    b = SP.inputs(d, sessions=before, fetch=False, frames=frames(True))
+    pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True))
+    assert np.isfinite(a.set_index("ticker").loc["AAA", "api_fee_prev"])
+    with pytest.raises(ValueError):                                   # D's own bar is never asked for
+        SP.panel(d, before + [d], fetch=False)
+
+
+EPOCH_ = pd.Timestamp("1970-01-01")
+
+
+def test_the_fall_turn_reads_only_bars_completed_by_the_tick(monkeypatch):
+    """PREREG76's turn (`sel_short.turn_state`): at every bar end of the window, and in the middle of the next bar,
+    the waiting pick's state from the whole series equals the series cut at the tick and the series with every
+    later bar rewritten."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "sel_short_turn_atr", 0.5)
+    monkeypatch.setattr(settings, "sel_short_turn_sessions", 5)
+    monkeypatch.setattr(settings, "sel_short_entry_max_age_minutes", 75.0)
+    days = [DAY] + [ss.session_after(DAY, i) for i in range(1, 7)]
+    df = _frame(days, seed=17)
+    pick = 2                                                           # bar 2 of the first day
+    states = set()
+    px0 = float(df["Close"].iloc[pick])
+    for atr, target in ((1.0, None), (3.0, None), (6.0, None), (3.0, px0 * 0.97), (6.0, px0 * 0.99)):
+        rec = {"day": DAY.isoformat(), "bar_of_day": pick, "ticker": "SYN", "atr_pct": atr, "px": px0,
+               "target": target}                                   # the ETF arm's target cancels a pick reaching it
+        for t in range(pick, len(df)):
+            end = (df.index[t] + pd.Timedelta(minutes=30)).tz_localize("UTC").to_pydatetime()
+            for now in (end, end + timedelta(minutes=10)):              # at the bar's end, and inside the next one
+                full = ss.turn_state(rec, now, hlc=_hlc(df))
+                assert full == ss.turn_state(rec, now, hlc=_hlc(df.iloc[:t + 1])), (atr, t, now)
+                assert full == ss.turn_state(rec, now, hlc=_hlc(_rewrite_after(df, t))), (atr, t, now)
+                states.add(full["state"])
+    assert {"triggered", "waiting", "cancelled"} <= states             # the guard saw a turn, a wait and a cancel
+
+
+# ── THE CRASH-REBOUND BOOK (2026-10-11, PREREG86) ─────────────────────────────
+
+def _crash_frame(days, fall=25, sharp=2, rewrite_from=None):
+    """A long rise, then ``fall`` falling sessions under the 200-session average whose last ``sharp`` drop 4% each — a
+    2-session RSI under 5 below the trend at the last close. Sessions at or after ``rewrite_from`` get a wildly
+    different path (x3 price)."""
+    n = len(days)
+    close = np.r_[np.linspace(100.0, 160.0, n - fall), np.linspace(158.0, 120.0, fall)]
+    for k in range(sharp):
+        close[n - sharp + k] = close[n - sharp + k - 1] * 0.96
+    rows, idx = [], []
+    for d, c in zip(days, close):
+        f = 3.0 if rewrite_from is not None and d >= rewrite_from else 1.0
+        for k in range(13):
+            idx.append(pd.Timestamp(datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET) + timedelta(minutes=30 * k))
+                       .tz_convert("UTC").tz_localize(None))
+            rows.append((c * f, c * f * 1.001, c * f * 0.999, c * f, 1_000_000.0))
+    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close", "Volume"], index=pd.DatetimeIndex(idx))
+
+
+def test_the_crash_signal_never_reads_a_bar_of_its_own_session(monkeypatch):
+    """The crash book buys QQQ at session D's open on the close of D-1: a store already holding D's bars (and a
+    later one) — rewritten wildly — must not move the numbers or the signal; read through D (the injected leak)
+    they do move, so the guard can fail."""
+    from src.data import intraday_store
+    from src.signals import crash_long as cl
+    from src.signals import dip_long as dl
+    hist = ss.sessions_before(DAY, 260)
+    later = [DAY, ss.session_after(DAY, 1)]
+    clean = _crash_frame(hist)
+    future = pd.concat([clean, _crash_frame(hist + later, rewrite_from=DAY).iloc[len(clean):]])
+    prev = dl.prev_session(DAY)
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: clean)
+    base = cl.stats_at(cl._daily(), prev)
+    assert cl.qualifies(base) and base["session"] == prev.isoformat()        # the fixture is a real signal
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: future)
+    assert cl.stats_at(cl._daily(), prev) == base
+    leak = cl.stats_at(cl._daily(), DAY)                                     # the injected leak: reads D
+    assert leak != base and leak["session"] == DAY.isoformat()
+
+
+def test_the_crash_exit_never_reads_a_close_of_its_own_session(monkeypatch):
+    """The crash long sold at D's open is decided on the closes through D-1: D's own close above its 5-session
+    average (a rebound that has not happened at the open) must not sell, and rewriting D changes nothing."""
+    from src.data import intraday_store
+    from src.signals import crash_long as cl
+    from src.signals import dip_long as dl
+    hist = ss.sessions_before(DAY, 260)
+    clean = _crash_frame(hist, sharp=4)                                     # still falling through D-1
+    rebound_d = pd.concat([clean, _crash_frame(hist + [DAY], sharp=4, rewrite_from=DAY).iloc[len(clean):]])
+    trade = {"ticker": "TQQQ", "crash_decision_symbol": "QQQ", "crash_entry_day": hist[-3].isoformat()}
+    monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
+    # only QQQ's bars exist: the exit must read the DECISION symbol (QQQ), never the traded fund (TQQQ)
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: clean if tk == "QQQ" else None)
+    base = cl.exit_check(trade, DAY)
+    assert base[0] is None
+    monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: rebound_d if tk == "QQQ" else None)
+    assert cl.exit_check(trade, DAY) == base
+    nxt = ss.session_after(DAY, 1)                                           # the injected leak: judged a day later
+    assert cl.exit_check(trade, nxt)[0] == "crash_rebound"
+
+
+def test_the_live_arms_atr_frame_is_the_full_frames_and_never_reads_a_later_bar():
+    """The live arms' ATR-only frame (2026-10-12, `ml_model.atr_frame_30m_from_hlc`: the scorer
+    decides the vol / ETF / fall arms on it before the model's full features) must equal the
+    full frame's ATR% and bar at every pick bar, and not move when every later bar is
+    rewritten."""
+    from src.signals.ml_model import atr_frame_30m_from_hlc, features_30m_from_hlc
+    df = _frame(ss.sessions_before(DAY, 52))
+    for t in CUTS:
+        hlc = _hlc(df)
+        end = pd.Timestamp(hlc[0][t]) + pd.Timedelta(minutes=30)
+        fast, _ = atr_frame_30m_from_hlc("SYN", hlc, end)
+        full, _ = features_30m_from_hlc("SYN", hlc, end)
+        assert pd.Timestamp(fast["bar_ts"]) == pd.Timestamp(hlc[0][t]) == pd.Timestamp(full["bar_ts"])
+        assert fast["features"]["atr_pct_14"] == full["features"]["atr_pct_14"]
+        assert (fast["close"], fast["sday"], fast["bar_idx"]) == (full["close"], full["sday"], full["bar_idx"])
+        other = _hlc(_rewrite_after(df, t))
+        moved, _ = atr_frame_30m_from_hlc("SYN", other, end)
+        assert moved["features"]["atr_pct_14"] == fast["features"]["atr_pct_14"], f"bar {t}: a later bar leaked"
+        assert moved["close"] == fast["close"]

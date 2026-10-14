@@ -1,11 +1,12 @@
 """Main analysis pipeline: fetch → analyse → recommend → notify."""
 
+import contextvars
 import hashlib
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
+from typing import Callable, List, Optional
 from loguru import logger
 from datetime import datetime, timezone
 
@@ -1871,6 +1872,145 @@ def _merge_broker_reports(first: Optional[dict], second: Optional[dict]) -> Opti
     return out
 
 
+# ── THE NEXT SLOT'S LIVE PATH DURING A LONG SHADOW (2026-10-12) ───────────────
+# The live trading path runs first in every tick; the shadow pipeline after it can
+# run past the next slot (Friday 2026-10-09: the 10:30, 11:30 and 16:30 ticks started
+# ~10 minutes late, and a fetch that hung held the 14:30 tick until the watchdog killed
+# it at 15:15). The scheduler installs a hook here (`set_live_yield`): while the shadow
+# runs a long step — on a worker thread (`_shadow_call`), or between its steps
+# (`_yield_live`) — the main thread runs any slot that came due meanwhile: THAT slot's
+# live path alone (`run_live_path`, the same steps in the same order as a tick's
+# start), on time. The slot's full tick still follows once this one ends, as before.
+# Without the hook (a manual run, the tests) every step runs inline, as before.
+_LIVE_YIELD: Optional[Callable[[], None]] = None
+_YIELD_POLL_SECONDS = 5.0
+
+
+def set_live_yield(fn: Optional[Callable[[], None]]) -> None:
+    """Install (or clear, None) the scheduler's hook: runs a due slot's live path."""
+    global _LIVE_YIELD
+    _LIVE_YIELD = fn
+
+
+def _yield_live() -> None:
+    """Run any slot that came due meanwhile — its live path alone. Fail-soft."""
+    fn = _LIVE_YIELD
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] a due slot's live path failed (fail-soft): {e}")
+
+
+def _shadow_call(fn, *args, **kwargs):
+    """A long shadow step with the main thread kept free for a due slot's live path:
+    ``fn`` runs on a worker thread (the caller's context copied) while the main thread
+    waits for it, running `_yield_live` every few seconds. Returns its result or raises
+    its exception, like the direct call — which it is when no hook is installed."""
+    if _LIVE_YIELD is None:
+        return fn(*args, **kwargs)
+    ctx = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="shadow-step") as ex:
+        fut = ex.submit(ctx.run, fn, *args, **kwargs)
+        while True:
+            done, _ = _futures_wait([fut], timeout=_YIELD_POLL_SECONDS)
+            if done:
+                return fut.result()
+            _yield_live()
+
+
+class _TrackedPool(ThreadPoolExecutor):
+    """Steps 1-3's pool, keeping its futures: the main thread waits for them itself
+    (`_await_futures`) instead of inside the pool's exit, so a due slot's live path
+    can run meanwhile."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.futures: List = []
+
+    def submit(self, *args, **kwargs):
+        fut = super().submit(*args, **kwargs)
+        self.futures.append(fut)
+        return fut
+
+
+def _await_futures(futs) -> None:
+    """Wait for every future, a due slot's live path run meanwhile (no hook: return at
+    once — the pool's exit waits, as before)."""
+    if _LIVE_YIELD is None:
+        return
+    pending = [f for f in futs if f is not None]
+    while pending:
+        _, pending = _futures_wait(pending, timeout=_YIELD_POLL_SECONDS)
+        if pending:
+            _yield_live()
+
+
+def _start_borrow_snapshot(record: bool = True):
+    """IBKR's short-stock file (``ibkr_borrow.snapshot``), fetched on its own thread from
+    the tick's start: the live path's entries wait for it (no longer inside Steps 1-3's
+    pool). ``record``: through `_safe` (this run's source log); a due slot's live path
+    (`run_live_path`, inside another tick's run) fetches it bare. None when off."""
+    if not settings.enable_ibkr_borrow_snapshot:
+        return None
+    from src.data import ibkr_borrow
+    ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ibkr-borrow")
+    try:
+        if record:
+            return ex.submit(_safe, "ibkr_borrow", ibkr_borrow.snapshot)
+        return ex.submit(ibkr_borrow.snapshot)
+    finally:
+        ex.shutdown(wait=False)                  # the thread ends with its one job
+
+
+def _persist_live_report(run_id: str, report: Optional[dict]) -> None:
+    """The live path's broker report, persisted as soon as its sync is done (the tick's
+    end replaces it with the merged report, under the same run id — `insert_broker_report`
+    is idempotent per run id): the fills are in the database for the next slot's cost
+    calibration even when that slot comes due before this tick ends. Fail-soft."""
+    if not report or report.get("mode") in (None, "off"):
+        return
+    try:
+        repo.insert_broker_report(run_id, report)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[broker] live report not persisted yet ({e}) — the tick's end persists it")
+
+
+def run_live_path() -> Optional[dict]:
+    """ONE slot's live trading path alone — what the scheduler runs when the slot comes
+    due while the previous tick's shadow pipeline is still running: this slot's scorer,
+    the marks and exits, the entries (after the scorer's inference) and the broker sync —
+    the steps a tick starts with, in the same order — its broker report persisted under
+    its own run id. Never the per-run resets: they belong to the tick still running.
+    Returns the sync report (None with `enable_live_path_first` off)."""
+    if not bool(getattr(settings, "enable_live_path_first", False)):
+        return None
+    start = datetime.now(timezone.utc)
+    run_id = start.strftime("%Y-%m-%d_%H%M%S")
+    logger.info(f"[live] live path {run_id} ({fmt_et(start)}) — the previous tick's shadow pipeline "
+                f"is still running")
+    handle = None
+    try:
+        from src.signals import sel_short as _sel_short
+        handle = _sel_short.launch(start)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[sel_short] launch failed (fail-soft): {e}")
+    f_borrow = _start_borrow_snapshot(record=False)
+    dip_closed = _live_marks_and_exits()
+    report = _live_entries_and_sync(run_id, handle, f_borrow, dip_closed=dip_closed)
+    _persist_live_report(run_id, report)
+    try:                                      # its broker problems surface now (the slot's full tick re-checks)
+        bh = _assess_broker_health(report)
+        if bh and bh.get("down"):
+            logger.critical(f"[broker] EXECUTION ISSUE in the {fmt_et(start)} live path ({bh['mode']}) — "
+                            f"{bh.get('message')}")
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] broker health of the live path unreadable: {e}")
+    logger.info(f"[live] live path {run_id} done in {time.time() - start.timestamp():.0f}s")
+    return report
+
+
 def _live_marks_and_exits() -> int:
     """The live path's first half (user directive 2026-09-28, "running the
     trading steps first"): the cost calibration and the ledger marks, then the
@@ -1890,18 +2030,39 @@ def _live_marks_and_exits() -> int:
         monitor_sel_short_positions(hold_prompt_active=_hold)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] sel_short exit pass failed (fail-soft): {e}")
+    sold = 0
     try:
         from src.performance.tracker import monitor_dip_long_positions
-        return monitor_dip_long_positions(hold_prompt_active=_hold)
+        sold = monitor_dip_long_positions(hold_prompt_active=_hold)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] dip_long exit pass failed (fail-soft): {e}")
-    return 0
+    try:                            # THE CRASH-REBOUND BOOK (2026-10-11): its exit at the open
+        from src.performance.tracker import monitor_crash_long_positions
+        sold += monitor_crash_long_positions(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] crash_long exit pass failed (fail-soft): {e}")
+    try:                            # THE LIVE ACCOUNT (2026-10-09): margin call / de-leveraging over both books
+        from src.performance.tracker import monitor_live_account
+        sold += monitor_live_account(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] live account check failed (fail-soft): {e}")
+    try:                            # the dip book's limit orders (2026-10-09): this tick's touches, BEFORE the shorts' entries
+        from src.performance.tracker import monitor_dip_long_orders
+        sold += monitor_dip_long_orders()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] dip_long limit orders failed (fail-soft): {e}")
+    try:                            # THE CRASH-REBOUND BOOK (2026-10-11): its buy at the open, after the dip fills
+        from src.performance.tracker import record_crash_long_trades
+        sold += record_crash_long_trades()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] crash_long entry pass failed (fail-soft): {e}")
+    return sold
 
 
 def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
                            dip_closed: int = 0) -> Optional[dict]:
-    """The live path's second half, on the main thread while Steps 1–3 fetch in
-    the pool: first the dip long book's entries at the open (2026-10-08) — and,
+    """The live path's second half, right after the first and before any shadow
+    step (2026-10-12): first the dip long book's entries at the open (2026-10-08) — and,
     when it bought or sold anything this tick (``dip_closed``: the exits of the
     first half), a broker sync right away, so its orders never wait behind the
     scorer — then wait for this tick's scorer (the two models' data fetch, feature
@@ -1910,11 +2071,17 @@ def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
     syncs' merged report."""
     t0 = time.time()
     dip_report = None
+    etf_traded = 0
+    try:                              # the ETF dual-momentum book's monthly rotation (src/signals/etf_dm.py)
+        from src.performance.tracker import rebalance_etf_dm
+        etf_traded = rebalance_etf_dm(run_id=run_id)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] etf_dm rotation failed (fail-soft): {e}")
     try:
         from src.performance.tracker import record_dip_long_trades
-        if record_dip_long_trades(run_id=run_id) or dip_closed:
+        if record_dip_long_trades(run_id=run_id) or dip_closed or etf_traded:
             dip_report = _broker_sync_watchdogged(run_id, None)
-            logger.info(f"[live] dip_long orders synced {time.time() - t0:.0f}s into the fetch")
+            logger.info(f"[live] dip_long / etf_dm orders synced {time.time() - t0:.0f}s into the live entries")
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] dip_long entry pass failed (fail-soft): {e}")
     if borrow_future is not None:
@@ -1930,7 +2097,7 @@ def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] sel_short entry pass failed (fail-soft): {e}")
     report = _broker_sync_watchdogged(run_id, None)
-    logger.info(f"[live] entries + broker sync done {time.time() - t0:.0f}s into the fetch "
+    logger.info(f"[live] entries + broker sync done {time.time() - t0:.0f}s after the marks and exits "
                 f"(before the shadow pipeline)")
     return _merge_broker_reports(dip_report, report)
 
@@ -1976,7 +2143,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     logger.info(f"Pipeline started at {fmt_et(start)} (session: {run_session})")
 
     # ── SELECTION-SHORT scorer (2026-09-28): the one live entry strategy. Its
-    # scorer runs as a SUBPROCESS beside this tick (~2 min for ~2,000 names) —
+    # scorer runs as a SUBPROCESS beside this tick (~1 min for ~4,400 names, its live arms decided first) —
     # every completed regular-hours bar not yet run, or the daily prepare — and
     # the live path below waits for it (with `enable_live_path_first` off, the
     # end-of-tick trade step does). Fail-soft: None touches nothing.
@@ -1987,21 +2154,36 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             _sel_handle = _sel_short.launch(start)
         except Exception as _sel_e:
             logger.warning(f"[sel_short] launch failed (fail-soft): {_sel_e}")
+    # IBKR's borrow book (2026-09-25): archived every tick so a later evaluation
+    # charges a short the fee IBKR quoted at entry, and read by the borrow check on
+    # every new short — fetched from the tick's start on its own thread (2026-10-12).
+    f_borrow = _start_borrow_snapshot()
 
-    # ── LIVE TRADING PATH FIRST (user directive 2026-09-28). The selection
-    # short trades on its scorer alone — a subprocess that fetches the day's
-    # bars, builds both models' features and scores them — and needs nothing
-    # the shadow pipeline below computes. So its trading steps run at the START
-    # of the tick instead of after the 15-45-minute shadow pipeline: marks and
-    # exits now; entries (after WAITING for the scorer's inference) and the
-    # broker sync on the main thread while Steps 1-3 fetch in the pool. The
-    # end-of-tick block still runs the legacy exits (they need this tick's shadow
-    # signals), re-judges the strategy's exits and syncs again.
+    # ── LIVE TRADING PATH FIRST (user directives 2026-09-28 and 2026-10-11: "run
+    # first only the necessary parts for live production, and after we do the shadow
+    # arms, LLM scoring, ... any kind of backfill"). The live books trade on their own
+    # inputs — the selection short's scorer (a subprocess fetching the day's bars and
+    # scoring them), the dip and crash books' daily bars — and need nothing the shadow
+    # pipeline below computes. So the WHOLE live path runs before any shadow step:
+    # marks and exits, then the entries (after WAITING for the scorer's inference) and
+    # the broker sync, its report persisted at once. The end-of-tick block still runs
+    # the legacy exits (they need this tick's shadow signals), re-judges the live
+    # books' exits, takes a late scorer's picks and syncs again.
     live_first = (not observe_only) and bool(getattr(settings, "enable_live_path_first", False))
     live_broker_report = None
     _dip_closed = 0
+    _open_at_step0 = None
     if live_first:
         _dip_closed = _live_marks_and_exits()
+        # Step 0 pins the trades open HERE — after the exits and the dip / crash fills, before this tick's entries
+        # — as when the entries ran beside Steps 1-3: a tick's new shorts never join its shadow universe (nor its
+        # price-provenance check, against a snapshot taken minutes after their entry)
+        try:
+            _open_at_step0 = get_open_trade_tickers()
+        except Exception as _ot_e:                                 # noqa: BLE001
+            logger.warning(f"[live] open trades before the entries unreadable (Step 0 reads them later): {_ot_e}")
+        live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow, dip_closed=_dip_closed)
+        _persist_live_report(run_id, live_broker_report)
 
     # ── Long-horizon buy arm A/B (2026-08-01) ─────────────────────────────
     # Per-run coin: replace combined_buy_score with the learned 5d stacker AND
@@ -2032,7 +2214,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     # ── Step 0: Ticker discovery (serial — rest of pipeline depends on it) ──
     logger.info("Step 0: Discovering trending tickers...")
-    all_tickers = get_trending_tickers(tickers, sectors)
+    all_tickers = _shadow_call(get_trending_tickers, tickers, sectors)
 
     # Universe PROVENANCE (2026-07-03): which discovery source first surfaced
     # each ticker this run — stamped onto every signals row and every new trade
@@ -2070,7 +2252,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     screener_context = None
     if settings.enable_opportunity_screener:
         from src.data.screener import run_screener
-        screener_context = run_screener()
+        screener_context = _shadow_call(run_screener)
         if screener_context and screener_context.hits:
             new_from_screen = [h.ticker for h in screener_context.hits if h.ticker not in all_tickers]
             if new_from_screen:
@@ -2085,7 +2267,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     # (analyst ratings, earnings calendar/surprises, full signal stack) picks them up downstream.
     if settings.enable_earnings_discovery:
         from src.data.earnings import discover_earnings_tickers
-        _earn_disc = discover_earnings_tickers(
+        _earn_disc = _shadow_call(
+            discover_earnings_tickers,
             window_days=settings.earnings_discovery_window_days,
             max_results=settings.earnings_discovery_max,
         )
@@ -2097,7 +2280,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     if settings.enable_analyst_discovery:
         from src.data.analyst_ratings import discover_analyst_tickers
-        _analyst_disc = discover_analyst_tickers(
+        _analyst_disc = _shadow_call(
+            discover_analyst_tickers,
             lookback_days=settings.analyst_discovery_lookback_days,
             min_firms=settings.analyst_discovery_min_firms,
             max_results=settings.analyst_discovery_max,
@@ -2130,7 +2314,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     # Pin tickers of open trades so their prices are always refreshed,
     # even if they've dropped off the trending/discovery list.
-    open_trade_tickers = get_open_trade_tickers()
+    open_trade_tickers = _open_at_step0 if _open_at_step0 is not None else get_open_trade_tickers()
     new_from_trades = [t for t in open_trade_tickers if t not in all_tickers]
     if new_from_trades:
         all_tickers = all_tickers + new_from_trades
@@ -2151,8 +2335,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     if settings.enable_related_discovery:
         try:
             from src.data.related_companies import discover_related_tickers
-            _related = discover_related_tickers(list(tickers) + list(open_trade_tickers),
-                                                max_results=settings.related_discovery_max)
+            _related = _shadow_call(discover_related_tickers, list(tickers) + list(open_trade_tickers),
+                                    max_results=settings.related_discovery_max)
             _new_rel = [t for t in _related if t not in all_tickers]
             if _new_rel:
                 all_tickers = all_tickers + _new_rel
@@ -2174,7 +2358,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                                       + settings.factor_list + list(open_trade_tickers)
                                       + list(hypothetical_tickers))}
     _discovered = [t for t in all_tickers if t.upper() not in _protected]
-    _kept = set(apply_liquidity_gate(_discovered, source="step0 discovery", budget=gate_budget))
+    _kept = set(_shadow_call(apply_liquidity_gate, _discovered, source="step0 discovery", budget=gate_budget))
     _before = len(all_tickers)
     all_tickers = [t for t in all_tickers if t.upper() in _protected or t.upper() in _kept]
     if len(all_tickers) != _before:
@@ -2230,7 +2414,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     _news_prefetch_extra = news_tickers[len(tickers):]
     news_parts: dict = {}
 
-    with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:
+    with _TrackedPool(max_workers=14, thread_name_prefix="pipeline") as pool:
 
         # Group A: non-yfinance-options — submit all at once, run concurrently
         # Company names first: the news fetchers' tag confirmation and the
@@ -2275,14 +2459,6 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                              if (_quiver_on and settings.enable_quiver_lobbying) else None)
         f_quiver_offexchange = (pool.submit(_safe, "quiver_offexchange", fetch_offexchange, news_tickers)
                                 if (_quiver_on and settings.enable_quiver_offexchange) else None)
-
-        # IBKR's borrow book (2026-09-25): archived every tick so a later
-        # evaluation charges a short the fee IBKR quoted at entry, and read by
-        # the borrow check on every new short. The pool's exit waits for it.
-        f_borrow = None
-        if settings.enable_ibkr_borrow_snapshot:
-            from src.data import ibkr_borrow
-            f_borrow = pool.submit(_safe, "ibkr_borrow", ibkr_borrow.snapshot)
 
         f_trends       = (pool.submit(_safe, "trends", fetch_google_trends, tickers)
                           if settings.enable_google_trends else None)
@@ -2402,10 +2578,9 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                                   lookback_days=settings.eight_k_lookback_days)
                       if (settings.enable_8k_filings and _news_prefetch_extra) else None)
 
-        # The live path's entries + broker sync, on the MAIN thread (ib_async)
-        # while the pool fetches: waits for the scorer's inference first.
-        if live_first:
-            live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow, dip_closed=_dip_closed)
+        # The main thread waits for the fetch itself, a due slot's live path run
+        # meanwhile (the pool's exit then has nothing left to wait for).
+        _await_futures(pool.futures)
 
     # ── Collect results ───────────────────────────────────────────────────
 
@@ -2414,6 +2589,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
 
     edgar = get(f_edgar) or {}
     get(f_names)                      # joined for its source-health row only
+    _await_futures([f_borrow])
+    get(f_borrow)                     # the borrow file is on disk from here on, as the pool's exit used to ensure
 
     # Merge all article sources into a single list
     articles = get(f_news) or []
@@ -2726,6 +2903,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             logger.warning(f"[liquidity] forecast unavailable: {e}")
 
     # ── Step 4: Build signals ─────────────────────────────────────────────
+    _yield_live()
     logger.info("Step 4: Building signals...")
     # Context kwargs shared by the main signal build AND the every-tick
     # opener-pinned hold-review (fix #2) — the review reuses them verbatim so it
@@ -2787,7 +2965,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             hold_review_branch = _HoldReviewBranch(
                 _open_trades_now, sectors, build_kwargs, run_session)
 
-    signals = build_signals(
+    signals = _shadow_call(
+        build_signals,
         all_tickers,
         articles,
         snapshots=snapshots,
@@ -2822,8 +3001,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     if settings.enable_horizon_synthesis:
         try:
             from src.signals import edge_curve
-            ic_matrix = edge_curve.get_ic_matrix()
-            dmatrix = (edge_curve.get_directional_ic_matrix()
+            ic_matrix = _shadow_call(edge_curve.get_ic_matrix)
+            dmatrix = (_shadow_call(edge_curve.get_directional_ic_matrix)
                        if settings.enable_directional_shadow else {})
             if ic_matrix or dmatrix:
                 n_tradeable = n_shadow_flip = 0
@@ -3423,6 +3602,22 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             monitor_dip_long_positions(hold_prompt_active=hold_prompt_active)
         except Exception as _dip_x:
             logger.warning(f"[dip_long] exit pass failed (fail-soft): {_dip_x}")
+        try:                       # THE CRASH-REBOUND BOOK (2026-10-11): an exit the live path could not price
+            from src.performance.tracker import monitor_crash_long_positions
+            monitor_crash_long_positions(hold_prompt_active=hold_prompt_active)
+        except Exception as _crash_x:                              # noqa: BLE001
+            logger.warning(f"[crash_long] exit pass failed (fail-soft): {_crash_x}")
+        # ── THE LIVE ACCOUNT (2026-10-09): margin call / de-leveraging over both books
+        try:
+            from src.performance.tracker import monitor_live_account
+            monitor_live_account(hold_prompt_active=hold_prompt_active)
+        except Exception as _acct_x:
+            logger.warning(f"[live_account] check failed (fail-soft): {_acct_x}")
+        try:                       # the dip book's limit orders (2026-10-09): touches the live path did not see
+            from src.performance.tracker import monitor_dip_long_orders
+            monitor_dip_long_orders(run_id=run_id)
+        except Exception as _dip_lo:                               # noqa: BLE001
+            logger.warning(f"[dip_long] limit orders failed (fail-soft): {_dip_lo}")
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
@@ -3473,6 +3668,18 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             record_dip_long_trades(run_id=run_id)
         except Exception as _dip_o:
             logger.warning(f"[dip_long] entry pass failed (fail-soft): {_dip_o}")
+        try:                       # THE CRASH-REBOUND BOOK (2026-10-11): a buy the live path could not price
+            from src.performance.tracker import record_crash_long_trades
+            record_crash_long_trades(run_id=run_id)
+        except Exception as _crash_o:                              # noqa: BLE001
+            logger.warning(f"[crash_long] entry pass failed (fail-soft): {_crash_o}")
+        # ── ETF DUAL-MOMENTUM rotation: the month's first session, opening window; this
+        # pass retries what the live path could not price.
+        try:
+            from src.performance.tracker import rebalance_etf_dm
+            rebalance_etf_dm(run_id=run_id, hold_prompt_active=hold_prompt_active)
+        except Exception as _etf_o:
+            logger.warning(f"[etf_dm] rotation pass failed (fail-soft): {_etf_o}")
 
         # ── FOLLOW-THROUGH (2026-08-25): exit-as-entry candidates ────────────
         # Score every Gate-4 name's hypothetical held cohorts with the live
@@ -3555,7 +3762,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
     )
     if not observe_only:
         log_performance_summary()
-        perf = get_performance_for_email(cache_evals=True)   # the slow research evals: reused within the day
+        perf = _shadow_call(get_performance_for_email, cache_evals=True)   # the slow research evals: reused within the day
 
         # Hypothetical always-open book — fully isolated from the real-trade
         # ledger above. Update marks then snapshot for the email section.
@@ -3651,6 +3858,24 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             sel_health["notes"] = list(sel_health.get("notes") or []) + _dh["notes"]
         except Exception as _dh_e:                                 # noqa: BLE001
             logger.warning(f"[dip_long] health check failed (fail-soft): {_dh_e}")
+        try:                                  # the crash-rebound book's too (2026-10-11)
+            from src.signals import crash_long as _crash_long_h
+            sel_health["problems"] = (list(sel_health.get("problems") or [])
+                                      + _crash_long_h.health(trades=get_open_trades())["problems"])
+        except Exception as _ch_e:                                 # noqa: BLE001
+            logger.warning(f"[crash_long] health check failed (fail-soft): {_ch_e}")
+        try:                                  # the live record against the simulator's assumptions (2026-10-12): notes
+            from src.backtest import live_calibration as _live_cal_h
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _live_cal_h.health()["notes"]
+        except Exception as _lc_e:                                 # noqa: BLE001
+            logger.warning(f"[live_calibration] health read failed (fail-soft): {_lc_e}")
+        try:                                  # the ETF dual-momentum book's too
+            from src.signals import etf_dm as _etf_dm_h
+            _eh = _etf_dm_h.health(trades=get_open_trades())
+            sel_health["problems"] = list(sel_health.get("problems") or []) + _eh["problems"]
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _eh["notes"]
+        except Exception as _eh_e:                                 # noqa: BLE001
+            logger.warning(f"[etf_dm] health check failed (fail-soft): {_eh_e}")
         sel_health["down"] = bool(sel_health.get("problems"))
         if sel_health["down"]:
             logger.critical("[sel_short] SCORER ISSUE — " + " | ".join(sel_health["problems"]))

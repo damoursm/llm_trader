@@ -89,13 +89,32 @@ def _run_tick_watchdogged(**kwargs) -> None:
             pass
 
 
+# The running tick's watchdog deadline (``time.monotonic()``; None: no tick under
+# the watchdog). A due slot's live path run INSIDE the tick (`_make_live_yield`)
+# pushes it back by the time it took: that time is not the tick's own (2026-10-12).
+_TICK_DEADLINE: dict = {"at": None}
+
+
+def _extend_tick_deadline(seconds: float) -> None:
+    if _TICK_DEADLINE.get("at") is not None:
+        _TICK_DEADLINE["at"] += max(0.0, float(seconds))
+
+
+def _live_path_budget_seconds() -> float:
+    """The longest a due slot's live path may take inside a running tick: the scorer wait, two broker syncs under
+    their own watchdog, the borrow file's wait, and slack — the running tick's deadline is pushed by this BEFORE the
+    hooked live path, so the tick watchdog never kills the scheduler in the middle of it (the hook's own hang is
+    still caught: by the broker-sync watchdog, or by the tick's at the end of this budget)."""
+    return (float(getattr(settings, "sel_short_wait_seconds", 480) or 0)
+            + 2 * float(getattr(settings, "broker_sync_watchdog_seconds", 600) or 0) + 120.0 + 300.0)
+
+
 def _run_tick_under_watchdog(**kwargs) -> None:
     cap = float(getattr(settings, "tick_watchdog_seconds", 0) or 0)
     if cap <= 0:
         run_pipeline(**kwargs)
         return
     import os
-    import threading
 
     def _tick_watchdog_kill():
         try:
@@ -108,13 +127,23 @@ def _run_tick_under_watchdog(**kwargs) -> None:
             pass
         os._exit(1)
 
-    wd = threading.Timer(cap, _tick_watchdog_kill)
-    wd.daemon = True
+    stop = threading.Event()
+    _TICK_DEADLINE["at"] = _time_module.monotonic() + cap
+
+    def _watch():
+        while not stop.wait(1.0):
+            at = _TICK_DEADLINE.get("at")
+            if at is not None and _time_module.monotonic() > at:
+                _tick_watchdog_kill()
+                return
+
+    wd = threading.Thread(target=_watch, name="tick-watchdog", daemon=True)
     wd.start()
     try:
         run_pipeline(**kwargs)
     finally:
-        wd.cancel()
+        stop.set()
+        _TICK_DEADLINE["at"] = None
 
 
 def _keep_system_awake(enable: bool) -> None:
@@ -900,6 +929,67 @@ def _finnhub_keepalive() -> None:
         logger.debug(f"[scheduler] finnhub keepalive failed: {exc}")
 
 
+def _make_live_yield(slots: list[tuple[_time, str]], grace: int, end_t: _time, state: dict):
+    """The scheduler's hook into a running tick (`pipeline.set_live_yield`, 2026-10-12):
+    when a slot comes due while the tick is still in its shadow pipeline, run THAT slot's
+    live path at once (`pipeline.run_live_path`) — once per slot, within the misfire
+    grace, never for an observation slot. The slot's full tick still runs when the poll
+    loop gets to it (a cheap repeat of the live steps, then the shadow pipeline).
+    ``state``: ``running`` = the running tick's slot, ``live_tried`` = the slots the hook
+    took (once each, whatever happened), ``live_done`` = the slots whose live path RAN —
+    only those keep the "slot missed" alert quiet."""
+    from src import pipeline as _pl
+
+    def _hook() -> None:
+        now_naive = now_et().replace(tzinfo=None)
+        cur = _current_slot(now_naive, slots)
+        if cur is None:
+            return
+        slot_dt, kind = cur
+        tried = state.setdefault("live_tried", set())
+        if slot_dt == state.get("running") or slot_dt in tried or slot_dt in state["live_done"]:
+            return
+        lateness = (now_naive - slot_dt).total_seconds()
+        if lateness > grace:
+            return
+        tried.add(slot_dt)
+        observe, _ = _tick_plan(kind, slot_dt.time(), end_t)
+        if observe:
+            return
+        running = state.get("running")
+        logger.info(f"[scheduler] slot {slot_dt.strftime('%H:%M')} ET came due {lateness:.0f}s ago while the "
+                    f"{running.strftime('%H:%M') if running else '?'} ET tick runs its shadow pipeline — "
+                    f"its live path now")
+        t0 = _time_module.monotonic()
+        at0 = _TICK_DEADLINE.get("at")
+        if at0 is not None:                       # pushed first: never killed in the middle of the live path
+            _TICK_DEADLINE["at"] = at0 + _live_path_budget_seconds()
+        try:
+            _pl.run_live_path()
+        finally:
+            if at0 is not None and _TICK_DEADLINE.get("at") is not None:
+                _TICK_DEADLINE["at"] = at0 + max(0.0, _time_module.monotonic() - t0)
+        if bool(getattr(settings, "enable_live_path_first", False)):
+            state["live_done"].add(slot_dt)
+
+    return _hook
+
+
+def _run_slot_tick(slot_dt: datetime, hook, state: dict, **kwargs) -> None:
+    """One slot's tick with the live-path hook installed for its duration."""
+    from src import pipeline as _pl
+    state["running"] = slot_dt
+    _pl.set_live_yield(hook if getattr(settings, "enable_live_slot_yield", False) else None)
+    try:
+        _run_tick_watchdogged(**kwargs)
+    finally:
+        _pl.set_live_yield(None)
+        state["running"] = None
+        cutoff = slot_dt - timedelta(days=2)
+        state["live_done"] = {d for d in state["live_done"] if d >= cutoff}
+        state["live_tried"] = {d for d in state.get("live_tried", set()) if d >= cutoff}
+
+
 def start_scheduler() -> None:
     """Run the intraday poll loop: one tick per slot, NYSE market days only.
 
@@ -968,6 +1058,9 @@ def start_scheduler() -> None:
 
     last_run_slot: datetime | None = None
     alerted_slots: set[datetime] = set()
+    # the slots whose live path ran inside a longer tick (`_make_live_yield`)
+    live_state: dict = {"running": None, "live_done": set(), "live_tried": set()}
+    live_hook = _make_live_yield(slots, grace, end_t, live_state)
     prev_poll: datetime | None = None
     eod_time = _parse_hhmm(settings.eod_maintenance_time, _time(16, 20)) or _time(16, 20)
     last_ml_train_date = None
@@ -1079,8 +1172,8 @@ def start_scheduler() -> None:
                         # decision is authoritative for scheduled ticks
                         # (every slot when scheduler_email_every_tick, else
                         # the 16:00 closing report only).
-                        _run_tick_watchdogged(send_email=send_email, observe_only=observe,
-                                              email_if_configured=False)
+                        _run_slot_tick(slot_dt, live_hook, live_state, send_email=send_email,
+                                       observe_only=observe, email_if_configured=False)
                     except Exception as exc:  # never let one tick kill the loop
                         logger.exception(f"[scheduler] tick raised: {exc}")
                         _alert_crash("pipeline tick", exc)   # log-only was silent to the operator
@@ -1090,7 +1183,7 @@ def start_scheduler() -> None:
                         f"{lateness / 60:.1f} min (> {grace / 60:.0f} min grace) — skipping "
                         "(the machine was suspended, or the tick before ran past this slot)."
                     )
-                    if slot_dt not in alerted_slots:
+                    if slot_dt not in alerted_slots and slot_dt not in live_state["live_done"]:
                         # Fresh-start case (the gap detector needs two polls to see a
                         # jump): the scheduler came up and found the latest slot long
                         # past — earlier slots today may have been missed too.
@@ -1124,8 +1217,8 @@ def start_scheduler() -> None:
                             f"{slot_dt.strftime('%H:%M')} ET slot (email=False)"
                         )
                         try:
-                            _run_tick_watchdogged(send_email=False, observe_only=observe,
-                                                  email_if_configured=False)
+                            _run_slot_tick(slot_dt, live_hook, live_state, send_email=False,
+                                           observe_only=observe, email_if_configured=False)
                         except Exception as exc:
                             logger.exception(f"[scheduler] catch-up tick raised: {exc}")
                             _alert_crash("catch-up tick", exc)

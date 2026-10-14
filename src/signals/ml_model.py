@@ -579,6 +579,46 @@ def features_30m_from_hlc(ticker: str, hlc, now, with_series: bool = False):
         return None, "ERROR"
 
 
+def atr_frame_30m_from_hlc(ticker: str, hlc, now):
+    """`features_30m_from_hlc` reduced to what the selection short's LIVE arms read
+    (2026-10-12): the frame with ONE feature, ``atr_pct_14`` (their ranking), and the
+    bar's place (``bar_ts``, ``close``, ``sday``, ``bar_idx``, ``n_bars``) — each built as
+    the full frame builds it: the same visible bars, the same ATR% construction
+    (`ml_dataset.atr_pct_14` on the float series `ticker_feature_frame` reads), the same
+    leg check and session position, the same ``NO_DATA`` / ``ERROR`` labels. ~20 ms a
+    name instead of ~90: the other features — only the shadow model reads them — are
+    computed after the live arms' decision."""
+    import pandas as pd
+    try:
+        from src.analysis.ml_dataset import atr_pct_14
+        from src.analysis.pivot_target import leg_feature_rows
+        if hlc is None:
+            return None, "NO_DATA"
+        idx, high, low, close, volume = hlc
+        n_vis = int(((idx + pd.Timedelta(minutes=30)) <= now).sum())
+        if n_vis < _MIN_30M_BARS or n_vis < 20:          # the full frame's two floors
+            return None, "NO_DATA"
+        atr = atr_pct_14(high.iloc[:n_vis].astype(float), low.iloc[:n_vis].astype(float),
+                         close.iloc[:n_vis].astype(float)).values
+        legs = leg_feature_rows(
+            close.iloc[:n_vis].to_numpy(dtype=float),
+            high.iloc[:n_vis].to_numpy(dtype=float),
+            low.iloc[:n_vis].to_numpy(dtype=float),
+            list(idx[:n_vis]), only_last=True)
+        if not legs:
+            return None, "NO_DATA"
+        from src.analysis import deep_features as dfe
+        sdays = dfe.session_days(idx[:n_vis])
+        sday = int(sdays[-1])
+        frame = {"features": {"atr_pct_14": atr[-1]}, "bar_ts": pd.Timestamp(idx[n_vis - 1]),
+                 "close": float(close.iloc[n_vis - 1]), "sday": sday,
+                 "bar_idx": int((sdays == sday).sum()) - 1, "n_bars": n_vis}
+        return frame, "OK"
+    except Exception as e:
+        logger.debug(f"[ml_ohlcv] 30m ATR frame failed for {ticker}: {e}")
+        return None, "ERROR"
+
+
 def _memo_feat(key, frame, label: str):
     _FEAT_CACHE[key] = (frame, label)
     if len(_FEAT_CACHE) > 8000:                          # bound the per-run memo

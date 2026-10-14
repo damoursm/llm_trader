@@ -157,6 +157,8 @@ def _load_trades() -> List[dict]:
         before = len(trades)
         trades = [t for t in trades if _closed_before(t, _asof)]
         logger.debug(f"[tracker] as-of {_asof}: {len(trades)}/{before} trades visible")
+    elif trades:
+        apply_splits(trades)                       # every reader sees an open trade in the terms quoted now
     if not trades and TRADES_FILE.exists():
         try:
             legacy = _sanitize_trades(json.loads(TRADES_FILE.read_text(encoding="utf-8")))
@@ -173,6 +175,109 @@ def _load_trades() -> List[dict]:
 def _save_trades(trades: List[dict]) -> None:
     """Persist the full trade ledger to DuckDB (full-replace of the trades table)."""
     repo.save_trades(trades)
+
+
+# ── splits during a hold (PREREG64) ─────────────────────────────────────────
+# A split rescales the quoted price and the share count of a position at once (IBKR adjusts both); a ledger trade
+# that kept its pre-split entry and share count would read a 1-for-10 reverse split as a 900% loss on a short —
+# a false margin call for the whole live account — and the broker's share counts would no longer match IBKR's.
+SPLIT_PRICE_FIELDS = ("entry_price", "entry_ref_close", "broker_fill_price", "pivot_target_price",
+                      "sel_bar_close", "sel_pre5_close", "sel_target_price", "sel_ssr_prev_close", "sel_ssr_day_low",
+                      "sel_turn_close", "sel_turn_max_close", "sel_turn_level",
+                      "dip_close", "dip_sma_trend", "dip_limit", "dip_atr14")
+# (the crash book's ``crash_close`` / ``crash_sma_trend`` are its DECISION symbol's numbers, QQQ's — a split of the
+# traded fund, TQQQ, must not rescale them)
+SPLIT_SHARE_FIELDS = ("sel_account_shares", "dip_account_shares", "etf_dm_account_shares", "crash_account_shares",
+                      "broker_fill_qty", "broker_requested_qty", "dip_order_qty", "dip_fill_cap")
+_SPLIT_WARNED: Dict[str, bool] = {}
+
+
+def _split_day(ts) -> Optional[date]:
+    """The session whose split terms a price quoted at ``ts`` is in: a split takes effect at 04:00 ET of its execution
+    date — the pre-market open; the overnight hours before it (and every price our feeds return then) still quote the
+    old terms. A bare date is its own session."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        dt = ts
+    else:
+        s = str(ts).strip()
+        if len(s) <= 10:
+            try:
+                return date.fromisoformat(s[:10])
+            except ValueError:
+                return None
+        try:
+            dt = datetime.fromisoformat(s.replace(" ", "T").replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt.astimezone(ET) - timedelta(hours=4)).date()
+
+
+def apply_splits(trades: List[dict], now: Optional[datetime] = None) -> int:
+    """Rescale every OPEN trade through the splits executed since its entry, as IBKR rescales the position: each
+    price field (`SPLIT_PRICE_FIELDS`) x the factor, each share count (`SPLIT_SHARE_FIELDS`) / it — a 1-for-10
+    reverse split: the entry x10, the shares / 10 (IBKR pays the fraction in cash; the broker's counts truncate);
+    the dollars, the return and the cost fractions are unchanged. The current mark is carried from the terms of its
+    own time. Idempotent: the factor applied is stamped (`split_factor`), the values before the first split kept in
+    `split_orig`, each application logged in `split_log`. A split dated after ``now`` (announced splits sit in the
+    split data before their date) never counts. Returns the number of trades changed."""
+    if not getattr(settings, "enable_split_adjustment", False):
+        return 0
+    open_ = [t for t in trades if t.get("status") == "OPEN" and t.get("ticker")]
+    if not open_:
+        return 0
+    from src.data.intraday_store import split_factor_between, split_rows
+    rows = split_rows()
+    if rows is None:
+        if not _SPLIT_WARNED.get("rows"):
+            logger.warning("[tracker] split data unreadable — open trades are not adjusted for splits")
+            _SPLIT_WARNED["rows"] = True
+        return 0
+    now = now or datetime.now(timezone.utc)
+    today = _split_day(now)
+    changed = 0
+    for t in open_:
+        tk = str(t["ticker"]).upper()
+        if not rows.get(tk) and not t.get("split_factor"):
+            continue
+        d0 = _split_day(t.get("entry_datetime") or t.get("entry_date"))
+        if d0 is None:
+            continue
+        f = split_factor_between(tk, d0, max(today, d0), rows)
+        done = float(t.get("split_factor") or 1.0)
+        if f is None or f <= 0 or abs(f / done - 1.0) < 1e-9:
+            continue
+        orig = t.setdefault("split_orig", {})
+        for k in SPLIT_PRICE_FIELDS + SPLIT_SHARE_FIELDS:
+            if k not in orig and t.get(k) is not None:
+                try:
+                    orig[k] = float(t[k]) / done if k in SPLIT_PRICE_FIELDS else float(t[k]) * done
+                except (TypeError, ValueError):
+                    continue
+        for k in SPLIT_PRICE_FIELDS:
+            if k in orig:
+                t[k] = round(orig[k] * f, 6)
+        for k in SPLIT_SHARE_FIELDS:
+            if k in orig:
+                t[k] = round(orig[k] / f, 6)
+        cur = t.get("current_price")
+        if cur is not None:
+            dc = _split_day(t.get("current_price_datetime")) or d0
+            fc = split_factor_between(tk, d0, max(dc, d0), rows) or 1.0
+            try:
+                t["current_price"] = round(float(cur) * f / fc, 6)
+            except (TypeError, ValueError):
+                pass
+        t["split_factor"] = f
+        t.setdefault("split_log", []).append({"at": now.isoformat(timespec="seconds"), "factor": f, "was": done})
+        changed += 1
+        logger.warning(f"[tracker] {tk}: split since the entry — the trade rescaled x{f:g} (prices) / {f:g} "
+                       f"(shares): entry {fmt_price(t['entry_price'])}, shares "
+                       f"{t.get('sel_account_shares') or t.get('dip_account_shares') or t.get('broker_fill_qty')}")
+    return changed
 
 
 def _fetch_price(ticker: str) -> Optional[float]:
@@ -3834,7 +3939,7 @@ _LEGACY_FLATTEN_MARKER = Path("cache") / "legacy_flatten_done.json"
 
 def _sel_rationale(by_arm: Dict[str, dict]) -> str:
     """Why the selection short took this name, per arm that picked it."""
-    from src.signals.sel_short import give_back, own_window, volnorm_exit
+    from src.signals.sel_short import cover_multiple, give_back, own_window, volnorm_exit
     rec = next(iter(by_arm.values()))
     share = give_back(next(iter(by_arm)))
     why = []
@@ -3849,12 +3954,22 @@ def _sel_rationale(by_arm: Dict[str, dict]) -> str:
     if "vol2" in by_arm:
         why.append(f"most volatile name, VOL2 rule (30-min ATR {by_arm['vol2']['score']:.2f}%, a "
                    f"{own_window('vol2')}-session high; no crowding, relative-volume or volatility-exit rule)")
+    if "fall" in by_arm:
+        why.append(f"most volatile name that FELL (30-min ATR {by_arm['fall']['score']:.2f}%, a "
+                   f"{own_window('fall')}-session high; the faller shorts)")
     dtc = rec.get("days_to_cover")
     si = f"days to cover {dtc:.2f}" if dtc is not None else "days to cover unknown"
     atr = next((r.get("atr_pct") for r in by_arm.values() if r.get("atr_pct") is not None), None)
     vn = (f", or in profit once its 30-min ATR% falls to {float(settings.sel_short_volnorm_ratio):.0%} of "
           f"{atr:.2f}%" if atr is not None and getattr(settings, "enable_sel_short_volnorm_exit", False)
           and volnorm_exit(next(iter(by_arm))) else "")
+    if rec.get("target") is None:
+        # the faller shorts: no run-up to give back — the volatility exit, the squeeze cover or the deadline
+        vtxt = vn[len(", or "):] if vn else ""
+        cover = (f"cover {vtxt + ', ' if vtxt else ''}at {cover_multiple(next(iter(by_arm))):g}x the entry "
+                 f"(the squeeze cover) or at {rec['deadline'][:16]}")
+        return (f"sel_short[{'+'.join(by_arm)}]: {' and '.join(why)} of the {rec['bar_end'][11:16]} bar, "
+                f"{rec['runup_pct']:+.1f}% over {settings.sel_short_runup_sessions} sessions, {si} — short; {cover}")
     return (f"sel_short[{'+'.join(by_arm)}]: {' and '.join(why)} of the {rec['bar_end'][11:16]} bar, up "
             f"{rec['runup_pct']:+.1f}% over {settings.sel_short_runup_sessions} sessions, {si} — short; "
             f"cover at {fmt_price(rec['target'])} ({share:.0%} of the run-up given back){vn} or {rec['deadline'][:16]}")
@@ -3923,9 +4038,14 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
     ctx: Dict[str, dict] = {}
     retry_on = bool(getattr(settings, "enable_sel_short_borrow_retry", False))
     fallback_on = bool(getattr(settings, "enable_sel_short_vol_fallback", False))
+    from src.signals import sel_pressure
+    pressure_on = sel_pressure.enabled()            # PREREG71's V6: the vol pick's backups under borrow pressure
+    traded = sel_short.traded_arms()                # the live account's books; the other arms are shadow
     halt_guard_on = bool(getattr(settings, "enable_sel_short_halt_guard", False))
     from src.data import trade_halts
+    from src.performance import live_account
     halts: Dict[str, Optional[dict]] = {}           # one halt check per name per pass
+    gave_way: List[dict] = []                       # the live account: dip longs sold for a short's room
 
     def attempt(rec: dict, key: str, consume, keep_unlendable: bool) -> str:
         """One pick through the entry checks. Returns ``"opened"``, ``"no_price"`` (left pending:
@@ -3983,8 +4103,14 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
         if tk not in blocks:
             blocks[tk] = ibkr_borrow.short_block(tk, price, max_fee_pct=None)
         why, borrow = blocks[tk]
-        # (None, None) = not checked (gate off, no current file, not an equity); a block or a
-        # row = checked, and a block without a row = the name is not in IBKR's file at all
+        # (None, None) = not checked (gate off, not an equity); a block or a row = checked, and a block
+        # without a row = the name is not in IBKR's file at all. No current IBKR file: the pick WAITS — a
+        # live short opens only on IBKR's own lendability (user 2026-10-12), never unchecked; nothing is
+        # consumed (its entry window still applies) and no fallback runs (the file says nothing of the name)
+        if why == "no_borrow_file":
+            ctx[key].update(borrow=None, borrow_checked=False)
+            sel_short.journal_entry(rec, "no_borrow_file_wait", **ctx.get(key, {}))
+            return "no_borrow_file"
         ctx[key].update(borrow=borrow, borrow_checked=bool(why) or borrow is not None)
         if why:
             if keep_unlendable and why == "no_borrow":
@@ -4016,7 +4142,19 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
             # the thin stocks: free capital only (the room of `sel_short_thin_reserve_slices` live slices stays free)
             kw = ({"reserve_slices": float(getattr(settings, "sel_short_thin_reserve_slices", 0.0) or 0.0)}
                   if arm == "thin" else {})
-            n_sh, how, st = sim_account.size(trades, float(price), rec.get("dv20"), now, rates=rates, **kw)
+            if live_account.enabled():
+                # THE LIVE ACCOUNT (2026-10-09): the dip book gives way — its latest longs sold WHOLE until this
+                # short's slice fits the shared margin room — then the short is sized from the shared account
+                plan, _want, _ = live_account.give_way_plan(trades, float(price), rec.get("dv20"), now, rates=rates,
+                                                            slices=sim_account.arm_slices(arm))
+                for dt in plan:
+                    if _close_trade_now(dt, "dip_gave_way", decision_at, executed_at, None, book="dip_long"):
+                        gave_way.append(dt)
+                        logger.info(f"[live_account] SELL {dt['ticker']} (dip long) to fund the {arm} short of {tk} — "
+                                    f"the dip book gives way")
+                kw["st"] = live_account.state(trades, now)
+            n_sh, how, st = sim_account.size(trades, float(price), rec.get("dv20"), now, rates=rates,
+                                             slices=sim_account.arm_slices(arm), **kw)
             if n_sh <= 0:
                 consume(how)
                 logger.info(f"[sel_short] {tk} [{arm}]: the simulated account funds no share ({how}) — "
@@ -4025,7 +4163,7 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
             h_maint, h_init = rates or sim_account.default_rates()
             acct = {"sel_account_shares": int(n_sh), "sel_account_notional": round(n_sh * float(price), 2),
                     "sel_account_equity": round(st["equity"], 2),
-                    "sel_account_slices": int(settings.sel_short_account_slices),
+                    "sel_account_slices": sim_account.arm_slices(arm),
                     # the house margin the account holds this short at, for its whole life
                     "sel_house_maint": round(h_maint, 4), "sel_house_init": round(h_init, 4),
                     "sel_house_source": "ibkr_whatif" if rates else "default",
@@ -4059,14 +4197,16 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
             "universe_source": "sel_short", "entry_mechanism": "sel_short",
             "sel_arm": "+".join(by_arm),
             "sel_score": by_arm["model"].get("score") if "model" in by_arm else None,
-            "sel_vol_score": (by_arm.get("vol") or by_arm.get("thin") or by_arm.get("vol2") or {}).get("score"),
+            "sel_vol_score": (by_arm.get("vol") or by_arm.get("thin") or by_arm.get("vol2") or by_arm.get("fall")
+                              or {}).get("score"),
             "sel_bar_end": rec.get("bar_end"),
             "sel_bar_close": rec.get("px"), "sel_pre5_close": rec.get("pre5"),
             "sel_runup_pct": rec.get("runup_pct"), "sel_target_price": rec.get("target"),
             "sel_deadline": rec.get("deadline"), "sel_days_to_cover": rec.get("days_to_cover"),
             # the pick bar's 30-min ATR%: the volatility-normalised exit's reference
             "sel_atr_pct": next((r.get("atr_pct") for r in by_arm.values() if r.get("atr_pct") is not None),
-                                (by_arm.get("vol") or by_arm.get("thin") or by_arm.get("vol2") or {}).get("score")),
+                                (by_arm.get("vol") or by_arm.get("thin") or by_arm.get("vol2")
+                                 or by_arm.get("fall") or {}).get("score")),
             # the vol pick's confidence — journal-only, nothing decides on it (None for a model-only pick)
             "sel_confidence": (by_arm.get("vol") or by_arm.get("vol2") or {}).get("confidence"),
             # the short-sale restriction at the pick (Rule 201, `sel_short.ssr_state`) — journal-only
@@ -4075,6 +4215,9 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
             # PREREG16's same-bar fallback: the vol pick IBKR could not lend, and this name's rank
             "sel_fallback_of": rec.get("fallback_of"),
             "sel_fallback_rank": rec.get("rank") if rec.get("fallback_of") else None,
+            # PREREG71's V6: an extra short beside the vol pick — the bar's backup under borrow pressure
+            "sel_pressure_extra_of": rec.get("pressure_extra_of"),
+            "sel_pressure": rec.get("pressure"),
             "signal_at_entry": {},
             "max_favorable_excursion": 0.0, "mfe_date": today,
             "max_adverse_excursion": 0.0, "mae_date": today,
@@ -4083,9 +4226,25 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
         if rec.get("fallback_of"):
             trade["rationale"] += (f"; fallback for {rec['fallback_of']} (IBKR could not lend it): the bar's "
                                    f"rank-{rec.get('rank')} candidate")
+        if rec.get("pressure_extra_of"):
+            trade["rationale"] += (f"; extra short beside {rec['pressure_extra_of']} (PREREG71 V6): the bar's "
+                                   f"rank-{rec.get('rank')} candidate, under borrow pressure "
+                                   f"({float(rec.get('pressure') or 0.0):.2f})")
+        turn = rec.get("turn")
+        if turn:
+            # PREREG76: the faller pick waited for its turn — the bar that turned, in the bars' (today's) terms
+            trade.update(sel_turn_bar_end=turn.get("bar_end"), sel_turn_close=turn.get("close"),
+                         sel_turn_max_close=turn.get("max_close"), sel_turn_level=turn.get("level"),
+                         sel_turn_k=turn.get("k"),
+                         # a split between the pick and its turn: the pick's prices came over x this
+                         # (`sel_short._in_todays_terms`)
+                         sel_turn_split_factor=rec.get("pick_split_factor"))
+            trade["rationale"] += (f"; entered on the turn (PREREG76): the {str(turn.get('bar_end'))[5:16]} bar "
+                                   f"closed {fmt_price(turn.get('close'))}, at least {float(turn.get('k') or 0):g} "
+                                   f"ATR under its highest close since the pick ({fmt_price(turn.get('max_close'))})")
         if acct:
             trade.update(acct)
-            trade["rationale"] += (f"; {acct['sel_account_shares']} share(s), 1/{acct['sel_account_slices']} of the "
+            trade["rationale"] += (f"; {acct['sel_account_shares']} share(s), 1/{acct['sel_account_slices']:g} of the "
                                    f"simulated account (${acct['sel_account_equity']:,.0f})")
             if acct["sel_house_init"] > 0:
                 trade["rationale"] += (f", IBKR margin {acct['sel_house_maint']:.0%} / {acct['sel_house_init']:.0%} "
@@ -4101,13 +4260,75 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
         ctx[key]["recommendation_id"] = trade["recommendation_id"]
         after_save.append((consume, "opened"))
         logger.info(f"[sel_short] OPEN SELL {tk} [{trade['sel_arm']}] @ {fmt_price(price)} (bar "
-                    f"{rec['bar_end'][11:16]} close {fmt_price(rec['px'])}, run-up {rec['runup_pct']:+.1f}%, "
+                    f"{rec['bar_end'][11:16]} close {fmt_price(rec['px'])}, "
+                    + (f"on the turn at {str(turn.get('bar_end'))[5:16]}, " if turn else "")
+                    + f"run-up {rec['runup_pct']:+.1f}%, "
                     f"target {fmt_price(rec['target'])}, deadline {rec['deadline'][:16]}, borrow "
                     f"{(borrow.fee_pct if borrow else float('nan')):.2f}%/yr, days to cover "
                     f"{rec.get('days_to_cover')}"
                     + (f"; {acct['sel_account_shares']} share(s) = ${acct['sel_account_notional']:,.0f} of the "
                        f"simulated account's ${acct['sel_account_equity']:,.0f}" if acct else "") + ")")
         return "opened"
+
+    def backup_rec(rec: dict, b: dict, arm: str, **mark) -> dict:
+        """A backup journaled with the pick (`sel_short._vol_backups`) as a pick of its own."""
+        brec = {**rec, **b, "arm": arm, "decision": "short", **mark}
+        for k in ("fresh_pool", "top3_fresh", "backups", "confidence"):
+            brec.pop(k, None)
+        return brec
+
+    def consumer(d: date, bkey: str, brec: dict):
+        def consume_b(outcome: str, _d: date = d, _key: str = bkey, _rec: dict = brec) -> None:
+            sel_short.mark_consumed(_d, _key, outcome)
+            sel_short.journal_entry(_rec, outcome, **ctx.get(_key, {}))
+        return consume_b
+
+    def fallback(rec: dict, d: date, arm: str, out: str, consume) -> None:
+        """PREREG16: IBKR cannot lend the vol pick (or refuses any opening short in it — the same untradeable top
+        name, 2026-10-07) — the same bar's next-ranked candidate that passes the whole rule and that IBKR CAN lend and
+        accept (the scorer journaled them, in rank order)."""
+        done = sel_short.consumed(d)
+        for b in rec.get("backups") or []:
+            brec = backup_rec(rec, b, arm, fallback_of=str(rec["ticker"]))
+            bkey = sel_short.pick_key(brec)
+            if bkey in done:
+                continue                                    # settled at an earlier tick
+            consume_b = consumer(d, bkey, brec)
+            # one trade per name per day PER ARM, as evaluated — another arm's trade on the name never blocks
+            # this arm's (user directive 2026-10-07: "if multiple arms pick the same stock, still order for each")
+            if _sel_traded_today(trades, brec["ticker"], arm, today):
+                consume_b("traded_today")
+                continue
+            if attempt(brec, bkey, consume_b, keep_unlendable=True) == "opened":
+                if out == "unlendable":                     # the pick itself is settled by its fallback
+                    after_save.append((consume, "no_borrow_fallback"))
+                logger.info(f"[sel_short] {rec['ticker']} [{arm}]: IBKR cannot lend it — shorted the bar's "
+                            f"rank-{b.get('rank')} candidate {brec['ticker']} instead (PREREG16)")
+                break
+
+    def pressure_extras(rec: dict, d: date, arm: str) -> None:
+        """PREREG71's V6 (user directive 2026-10-10): on a bar where the vol arm has a live pick, each of the bar's
+        other candidates that pass the whole rule (the backups) and are under borrow PRESSURE (HIGH on the no-file
+        pressure model, `sel_pressure`) is shorted too — its own trade, the arm's exits and sizing; one per name per
+        day per arm (the pick's own trade or its fallback first). Like the backups, one IBKR cannot lend now is
+        re-checked every tick inside the pick's entry window."""
+        done = sel_short.consumed(d)
+        for b in rec.get("backups") or []:
+            p, high = sel_pressure.pressure_of(str(b["ticker"]), d)
+            if not high:
+                continue
+            brec = backup_rec(rec, b, arm, pressure_extra_of=str(rec["ticker"]), pressure=p)
+            brec.pop("fallback_of", None)
+            bkey = sel_short.pick_key(brec)
+            if bkey in done:
+                continue                                    # settled at an earlier tick (as a fallback or an extra)
+            consume_b = consumer(d, bkey, brec)
+            if _sel_traded_today(trades, brec["ticker"], arm, today):
+                consume_b("traded_today")
+                continue
+            if attempt(brec, bkey, consume_b, keep_unlendable=True) == "opened":
+                logger.info(f"[sel_short] {rec['ticker']} [{arm}]: shorted the bar's rank-{b.get('rank')} candidate "
+                            f"{brec['ticker']} too — under borrow pressure ({p:.2f}; PREREG71 V6)")
 
     for rec in picks:
         arm = rec.get("arm") or "model"
@@ -4118,43 +4339,32 @@ def record_sel_short_trades(run_id: Optional[str] = None, now: Optional[datetime
             sel_short.mark_consumed(_d, _key, outcome)
             sel_short.journal_entry(_rec, outcome, **ctx.get(_key, {}))
 
-        out = attempt(rec, key, consume, keep_unlendable=retry_on)
-        if out not in ("no_borrow", "unlendable", "ibkr_refused") or arm not in ("vol", "thin", "vol2") \
-                or not fallback_on:
+        if traded is not None and arm not in traded:
+            # not one of the live account's books (user directive 2026-10-09): journaled, never traded
+            consume("shadow_arm")
             continue
-        # PREREG16: IBKR cannot lend the vol pick (or refuses any opening short in it — the same
-        # untradeable top name, 2026-10-07) — the same bar's next-ranked candidate that passes the
-        # whole rule and that IBKR CAN lend and accept (the scorer journaled them, in rank order)
-        done = sel_short.consumed(d)
-        for b in rec.get("backups") or []:
-            brec = {**rec, **b, "arm": arm, "decision": "short", "fallback_of": str(rec["ticker"])}
-            for k in ("fresh_pool", "top3_fresh", "backups", "confidence"):
-                brec.pop(k, None)
-            bkey = sel_short.pick_key(brec)
-            if bkey in done:
-                continue                                    # settled at an earlier tick
-
-            def consume_b(outcome: str, _d: date = d, _key: str = bkey, _rec: dict = brec) -> None:
-                sel_short.mark_consumed(_d, _key, outcome)
-                sel_short.journal_entry(_rec, outcome, **ctx.get(_key, {}))
-
-            # one trade per name per day PER ARM, as evaluated — another arm's trade on the name never blocks
-            # this arm's (user directive 2026-10-07: "if multiple arms pick the same stock, still order for each")
-            if any(t.get("entry_mechanism") == "sel_short" and t.get("ticker") == brec["ticker"]
-                   and str(t.get("entry_date")) == today and str(t.get("sel_arm") or "model") == arm for t in trades):
-                consume_b("traded_today")
-                continue
-            if attempt(brec, bkey, consume_b, keep_unlendable=True) == "opened":
-                if out == "unlendable":                     # the pick itself is settled by its fallback
-                    after_save.append((consume, "no_borrow_fallback"))
-                logger.info(f"[sel_short] {rec['ticker']} [{arm}]: IBKR cannot lend it — shorted the bar's "
-                            f"rank-{b.get('rank')} candidate {brec['ticker']} instead (PREREG16)")
-                break
-    if opened or noted:
+        out = attempt(rec, key, consume, keep_unlendable=retry_on)
+        if out in ("no_borrow", "unlendable", "ibkr_refused") and arm in ("vol", "thin", "vol2") and fallback_on:
+            fallback(rec, d, arm, out, consume)
+        if arm == "vol" and pressure_on:
+            pressure_extras(rec, d, arm)
+    if opened or noted or gave_way:
         _save_trades(trades)          # raises on failure: nothing below runs, the picks stay pending
     for fn, outcome in after_save:
         fn(outcome)
+    if gave_way:
+        from src.signals import dip_long
+        for dt in gave_way:
+            dip_long.journal_exit(dip_long.today_et(now), dt, "dip_gave_way",
+                                  {"price": dt.get("exit_price"), "return_pct": dt.get("return_pct")})
     return opened
+
+
+def _sel_traded_today(trades: List[dict], ticker: str, arm: str, today: str) -> bool:
+    """The arm already shorted the name today — one trade per name per day PER ARM, as evaluated (another arm's
+    trade on the name never blocks this arm's; user directive 2026-10-07)."""
+    return any(t.get("entry_mechanism") == "sel_short" and t.get("ticker") == ticker and str(t.get("entry_date")) == today
+               and str(t.get("sel_arm") or "model") == arm for t in trades)
 
 
 def _sel_short_fresh_mark(trade: dict, now: datetime) -> bool:
@@ -4185,7 +4395,8 @@ def _sel_short_cover_level(trade: dict, now: datetime) -> Optional[float]:
     """The price at or above which the SQUEEZE COVER buys a short back, every arm (user
     directives 2026-10-05: "have it tuned so that we don't have margin calls while still
     maximizing growth", then the cover for every arm; memory/vol-arm-margin-protection-2026-10.md):
-    `sel_short_cover_multiple` x the entry price, the entry carried through every split
+    the arm's multiple (`sel_short.cover_multiple`: the vol arm 4x, the others `sel_short_cover_multiple` 6x) x
+    the entry price, the entry carried through every split
     executed after the entry day and on/before today (a reverse split mid-hold multiplies the
     quoted price, not the loss). Unreadable split data falls back to the raw entry — a false
     cover costs a spread, a missed one can cost the account. None when the cover is off or the
@@ -4195,18 +4406,20 @@ def _sel_short_cover_level(trade: dict, now: datetime) -> Optional[float]:
     if trade.get("entry_mechanism", "sel_short") != "sel_short":
         return None
     try:
-        entry = float(trade.get("entry_price") or 0.0)
-        d0 = date.fromisoformat(str(trade.get("entry_date"))[:10])
+        # the entry as quoted at the entry (before `apply_splits` rescaled it), carried through every split since
+        entry = float((trade.get("split_orig") or {}).get("entry_price") or trade.get("entry_price") or 0.0)
+        d0 = _split_day(trade.get("entry_datetime") or trade.get("entry_date"))
     except (TypeError, ValueError):
         return None
-    if entry <= 0:
+    if entry <= 0 or d0 is None:
         return None
     from src.data.intraday_store import split_factor_between
-    f = split_factor_between(str(trade["ticker"]), d0, now.astimezone(ET).date())
+    f = split_factor_between(str(trade["ticker"]), d0, max(_split_day(now), d0))
     if f is None:
         logger.warning(f"[sel_short] {trade['ticker']}: split data unreadable — squeeze cover on the raw entry price")
-        f = 1.0
-    return float(settings.sel_short_cover_multiple) * entry * f
+        f = float(trade.get("split_factor") or 1.0)
+    from src.signals.sel_short import cover_multiple
+    return cover_multiple(trade.get("sel_arm")) * entry * f
 
 
 def _sel_short_exit_reason(trade: dict, now: Optional[datetime] = None,
@@ -4343,6 +4556,7 @@ def monitor_sel_short_positions(hold_prompt_active: Optional[bool] = None,
     that fired it); then the simulated account's margin check — equity below the
     open shorts' maintenance buys back every short it funded (``sel_margin_call``)."""
     from src.performance import sim_account
+    from src.signals import sel_short
     now = now or datetime.now(timezone.utc)
     trades = _load_trades()
     decision_at, executed_at = _now_iso(), _execution_iso()
@@ -4359,14 +4573,15 @@ def monitor_sel_short_positions(hold_prompt_active: Optional[bool] = None,
             if r == "sel_cover":
                 t["sel_cover_level"] = _sel_short_cover_level(t, now)
                 logger.warning(f"[sel_short] COVER {t['ticker']} — squeeze: mark {t.get('exit_price')} at/above "
-                               f"{float(settings.sel_short_cover_multiple):g}x the entry "
+                               f"{sel_short.cover_multiple(t.get('sel_arm')):g}x the entry "
                                f"{t.get('entry_price')} (split-adjusted level {t['sel_cover_level']:.4g})")
             if r == "sel_volnorm":
                 t["sel_exit_atr_pct"], t["sel_exit_atr_bar"] = a["atr_pct"], a["bar_end"]
                 logger.info(f"[sel_short] COVER {t['ticker']} — volatility halved in profit: 30-min ATR "
                             f"{a['atr_pct']:.2f}% (bar {a['bar_end'][11:16]}) vs {float(t['sel_atr_pct']):.2f}% "
                             f"at the pick")
-    if sim_account.enabled():
+    from src.performance import live_account
+    if sim_account.enabled() and not live_account.enabled():      # the live account checks its own (both books)
         called, st = sim_account.margin_call(trades, now)
         if called:
             logger.critical(f"[sel_short] SIMULATED ACCOUNT MARGIN CALL — {sim_account.summary(st)}: buying back "
@@ -4480,13 +4695,299 @@ def monitor_dip_long_positions(hold_prompt_active: Optional[bool] = None,
     return closed
 
 
+def monitor_live_account(hold_prompt_active: Optional[bool] = None, now: Optional[datetime] = None) -> int:
+    """THE LIVE ACCOUNT's check (2026-10-09; `live_account`), after both books' exits on this tick's marks: equity
+    below the maintenance requirement closes every short and every dip long it funded (``sel_margin_call`` /
+    ``dip_margin_call``); otherwise, when the maintenance requirement exceeds `live_account_delever_trigger` x
+    equity, the dip longs are sold, the latest first, whole, until it is at most `live_account_delever_target` x
+    equity (``dip_delever``), never bought back. Returns the number of trades closed."""
+    from src.performance import live_account, sim_account
+    if not live_account.enabled():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    trades = _load_trades()
+    decision_at, executed_at = _now_iso(), _execution_iso()
+    closed: List[tuple] = []
+    called, st = live_account.margin_call(trades, now)
+    if called:
+        logger.critical(f"[live_account] MARGIN CALL — {live_account.summary(st)}: closing every short and long "
+                        f"it funded")
+        for t in trades:
+            if t.get("status") != "OPEN":
+                continue
+            if sim_account.funded(t):
+                if _close_trade_now(t, "sel_margin_call", decision_at, executed_at, hold_prompt_active, book="sel_short"):
+                    closed.append((t, "sel_margin_call"))
+            elif live_account.dip_funded(t):
+                if _close_trade_now(t, "dip_margin_call", decision_at, executed_at, hold_prompt_active, book="dip_long"):
+                    closed.append((t, "dip_margin_call"))
+            elif live_account.crash_funded(t):
+                if _close_trade_now(t, "crash_margin_call", decision_at, executed_at, hold_prompt_active,
+                                    book="crash_long"):
+                    closed.append((t, "crash_margin_call"))
+        cancel_dip_orders("cancel_margin", now)       # and every working dip limit order (the engine's rule)
+    else:
+        plan, st = live_account.delever_plan(trades, now)
+        if plan:
+            logger.warning(f"[live_account] DE-LEVERAGING — maintenance ${st['maint']:,.0f} above "
+                           f"{float(settings.live_account_delever_trigger):.0%} of the equity ${st['equity']:,.0f}: "
+                           f"selling {len(plan)} dip long(s), the latest first ({[t['ticker'] for t in plan]})")
+            for t in plan:
+                if _close_trade_now(t, "dip_delever", decision_at, executed_at, hold_prompt_active, book="dip_long"):
+                    closed.append((t, "dip_delever"))
+    if closed:
+        _save_trades(trades)
+        from src.signals import dip_long
+        from src.signals import crash_long
+        for t, why in closed:
+            if live_account.dip_funded(t):
+                dip_long.journal_exit(dip_long.today_et(now), t, why,
+                                      {"price": t.get("exit_price"), "return_pct": t.get("return_pct")})
+            elif live_account.crash_funded(t):
+                crash_long.journal_exit(dip_long.today_et(now), t, why,
+                                        {"price": t.get("exit_price"), "return_pct": t.get("return_pct")})
+    return len(closed)
+
+
+# ── THE CRASH-REBOUND BOOK (2026-10-11, PREREG86; src/signals/crash_long.py) ────────────────────────────────────
+
+def monitor_crash_long_positions(hold_prompt_active: Optional[bool] = None,
+                                 now: Optional[datetime] = None) -> int:
+    """Sell the crash book's long when its exit is due at this session's open (`crash_long.exit_check`: a close
+    above the 5-session average since the entry, or the 10th session held) — regular hours only, on a price fetched
+    now (no price: retried next tick). Runs whatever `enable_crash_long` says. Returns the number closed."""
+    from src.signals import crash_long, dip_long
+    now = now or datetime.now(timezone.utc)
+    if not dip_long.in_rth(now):
+        return 0
+    trades = _load_trades()
+    book = [t for t in trades if t.get("status") == "OPEN" and t.get("entry_mechanism") == crash_long.MECHANISM]
+    if not book:
+        return 0
+    d = dip_long.today_et(now)
+    decision_at, executed_at = _now_iso(), _execution_iso()
+    closed, changed = 0, False
+    after_save: List[tuple] = []
+    for t in book:
+        try:
+            reason, info = crash_long.exit_check(t, d)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning(f"[crash_long] {t['ticker']}: exit check failed ({e}) — held, re-checked next tick")
+            continue
+        if info.get("held") is not None and t.get("crash_sessions_held") != info["held"]:
+            t["crash_sessions_held"] = info["held"]
+            changed = True
+        if not reason:
+            continue
+        px = _fetch_price(t["ticker"])
+        if not px or px <= 0:
+            logger.warning(f"[crash_long] {t['ticker']}: {reason} due but no live price — retried next tick")
+            continue
+        t["current_price"], t["current_price_datetime"] = float(px), decision_at
+        if _close_trade_now(t, reason, decision_at, executed_at, hold_prompt_active, book="crash_long"):
+            closed += 1
+            t["crash_exit_info"] = info
+            after_save.append((t, reason, {**info, "price": float(px), "return_pct": t.get("return_pct")}))
+            why = (f"{info.get('decision_symbol') or crash_long.symbol()} closed {fmt_price(info['close'])} above its "
+                   f"{settings.crash_long_exit_sma_sessions}-session average {fmt_price(info['sma_exit'])} on "
+                   f"{info.get('rebound_session')}"
+                   if reason == "crash_rebound" else f"held {info.get('held')} sessions")
+            logger.info(f"[crash_long] SELL {t['ticker']} @ {fmt_price(px)} — {why}; return {t.get('return_pct'):+.2f}%")
+    if closed or changed:
+        _save_trades(trades)
+    for t, reason, info in after_save:
+        crash_long.journal_exit(d, t, reason, info)
+    return closed
+
+
+def record_crash_long_trades(run_id: Optional[str] = None, now: Optional[datetime] = None) -> int:
+    """The crash book's entry step at the session's open (`crash_long.in_entry_window`): when the DECISION symbol's
+    previous close qualified (`crash_long.signal_for`, QQQ), BUY the TRADED fund (`crash_long.trade_symbol`, TQQQ) at
+    its live price — one long at a time (``holding`` while one is open), sized from THE LIVE ACCOUNT
+    (`live_account.size_crash`: 1/4 of the equity within the long side's cap and the room at the fund's margin rate)
+    after selling the dip book's latest longs WHOLE when that is what makes room (`live_account.crash_give_way_plan`,
+    exit reason ``dip_gave_way``); another book holding the traded fund settles it ``held``. Settled once a day (keyed
+    by the decision symbol); a missing price or decision is retried next tick. Returns the longs opened."""
+    from src.performance import live_account
+    from src.signals import crash_long, dip_long
+    if not crash_long.enabled() or not live_account.enabled():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    if not crash_long.in_entry_window(now):
+        return 0
+    d = dip_long.today_et(now)
+    sym = crash_long.symbol()                       # the decision
+    tk = crash_long.trade_symbol()                  # the fund bought
+    if sym in crash_long.settled(d):
+        return 0
+    try:
+        sig = crash_long.signal_for(d)
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning(f"[crash_long] decision for {d} failed ({type(e).__name__}: {e}) — retried next tick")
+        return 0
+    if sig.get("stale"):
+        logger.warning(f"[crash_long] {sym}: no stored close for {sig.get('signal_session')} — retried next tick")
+        return 0
+    if not sig.get("signal"):
+        return 0
+    trades = _load_trades()
+    rid = crash_long.trade_id(d, sym)
+    if any(t.get("recommendation_id") == rid for t in trades):
+        return 0
+    if any(t.get("status") == "OPEN" and t.get("entry_mechanism") == crash_long.MECHANISM for t in trades):
+        crash_long.journal_entry(d, sig, "holding")
+        logger.info(f"[crash_long] {sym}: signal while the book holds its long — not stacked")
+        return 0
+    if any(t.get("status") == "OPEN" and t.get("ticker") == tk and t.get("entry_mechanism") != crash_long.MECHANISM
+           for t in trades):                        # another book holds the traded fund (one book per name)
+        crash_long.journal_entry(d, sig, "held")
+        return 0
+    price = _fetch_price(tk)
+    if not price or price <= 0:
+        crash_long.journal_entry(d, sig, "no_price")
+        logger.info(f"[crash_long] {tk}: no live price — retrying next tick")
+        return 0
+    decision_at, executed_at = _now_iso(), _execution_iso()
+    entry_session = _session_of_iso(executed_at)
+    plan, _want, _ = live_account.crash_give_way_plan(trades, float(price), now)
+    gave_way = []
+    for dt in plan:
+        if _close_trade_now(dt, "dip_gave_way", decision_at, executed_at, None, book="dip_long"):
+            gave_way.append(dt)
+            logger.info(f"[live_account] SELL {dt['ticker']} (dip long) to fund the crash book's {tk} long — the "
+                        f"dip book gives way")
+    n, why, st = live_account.size_crash(trades, float(price), now)
+
+    def journal_gave_way():
+        for dt in gave_way:
+            dip_long.journal_exit(d, dt, "dip_gave_way", {"price": dt.get("exit_price"),
+                                                           "return_pct": dt.get("return_pct"),
+                                                           "for": f"crash_long {tk}"})
+    if n <= 0:
+        if gave_way:
+            _save_trades(trades)
+        crash_long.journal_entry(d, sig, why, price=float(price),
+                                 account={k: round(v, 2) for k, v in st.items() if isinstance(v, (int, float))})
+        journal_gave_way()
+        logger.info(f"[crash_long] {tk}: not bought ({why}) — {live_account.summary(st)}")
+        return 0
+    ref = _reference_close(tk)
+    today = d.isoformat()
+    trade = {
+        "ticker": tk, "run_id": run_id, "recommendation_id": rid,
+        "type": "STOCK", "action": "BUY", "direction": "BULLISH",
+        "confidence": None, "position_size_multiplier": 1.0,
+        "confidence_size_multiplier": 1.0, "correlation_size_multiplier": 1.0,
+        "sector_key": None,
+        "entry_date": today, "entry_datetime": executed_at, "entry_session": entry_session,
+        "ml_arm": False, "combine_source": None, "extended_size_multiplier": 1.0,
+        "decision_datetime": decision_at,
+        "entry_price": float(price),
+        "entry_ref_close": ref["close"] if ref else None,
+        "entry_ref_close_date": ref["date"] if ref else None,
+        "rationale": (f"crash_long: {sym} closed {fmt_price(sig['close'])} on {sig['signal_session']} below its "
+                      f"{settings.crash_long_trend_sessions}-session average {fmt_price(sig['sma_trend'])} with a "
+                      f"2-session RSI of {float(sig['rsi2']):.1f} (under {float(settings.crash_long_rsi_max):g}) — "
+                      f"buy {tk} at the open; sell it at the open after {sym}'s first close above its "
+                      f"{settings.crash_long_exit_sma_sessions}-session average, or after "
+                      f"{settings.crash_long_max_hold_sessions} sessions; {n} share(s), 1/"
+                      f"{float(settings.crash_long_account_slices):g} of the live account (${st['equity']:,.0f}) at "
+                      f"a {crash_long.margin_rate():.0%} margin requirement"),
+        "time_horizon": "SWING", "target_horizon": f"{settings.crash_long_max_hold_sessions}d",
+        "current_price": float(price), "current_price_datetime": decision_at,
+        "return_pct": 0.0, "weighted_return_pct": 0.0, "days_held": 0,
+        "exit_date": None, "exit_datetime": None, "exit_decision_datetime": None,
+        "exit_price": None, "exit_ref_close": None, "exit_ref_close_date": None,
+        "exit_reason": None, "status": "OPEN",
+        "method_scores": {}, "methods_agreeing": [],
+        "dominant_method": crash_long.MECHANISM, "llm_synthesis_model": None, "llm_sentiment_model": None,
+        "universe_source": crash_long.MECHANISM, "entry_mechanism": crash_long.MECHANISM,
+        "crash_signal_day": sig["signal_session"], "crash_entry_day": today, "crash_decision_symbol": sym,
+        "crash_close": sig["close"], "crash_sma_trend": sig["sma_trend"], "crash_rsi2": sig["rsi2"],   # sym's numbers
+        "crash_margin_rate": crash_long.margin_rate(),
+        "crash_account_shares": int(n), "crash_account_notional": round(n * float(price), 2),
+        "crash_account_equity": round(st["equity"], 2),
+        "crash_account_slices": float(settings.crash_long_account_slices),
+        "crash_gave_way": [dt.get("recommendation_id") for dt in gave_way],
+        "signal_at_entry": {},
+        "max_favorable_excursion": 0.0, "mfe_date": today, "max_adverse_excursion": 0.0, "mae_date": today,
+    }
+    trades.append(trade)
+    _save_trades(trades)          # raises on failure: nothing below runs, the signal stays unsettled
+    crash_long.journal_entry(d, sig, "opened", price=float(price), shares=int(n), recommendation_id=rid,
+                             gave_way=[dt.get("ticker") for dt in gave_way])
+    journal_gave_way()
+    logger.info(f"[crash_long] BUY {tk} @ {fmt_price(price)} — {sym}'s RSI2 {float(sig['rsi2']):.1f} at the "
+                f"{sig['signal_session']} close {fmt_price(sig['close'])} under its "
+                f"{settings.crash_long_trend_sessions}-session average {fmt_price(sig['sma_trend'])}; {n} share(s) = "
+                f"${n * float(price):,.0f} of the live account's ${st['equity']:,.0f}"
+                + (f"; {len(gave_way)} dip long(s) sold for room" if gave_way else ""))
+    return 1
+
+
+def _dip_trade(tk: str, rid: str, run_id: Optional[str], sig: dict, signal_session: Optional[str], rank: int,
+               n: int, price: float, st: Dict[str, float], stack: int, entry_day: str, entry_iso: str,
+               entry_session: str, decision_at: str, how: str, extra: Optional[dict] = None) -> dict:
+    """The ledger row of a dip long (either entry mode)."""
+    from src.performance import live_account
+    from src.signals import dip_long
+    ref = _reference_close(tk)
+    trade = {
+        "ticker": tk, "run_id": run_id, "recommendation_id": rid,
+        "type": "STOCK", "action": "BUY", "direction": "BULLISH",
+        "confidence": None,
+        "position_size_multiplier": 1.0,
+        "confidence_size_multiplier": 1.0, "correlation_size_multiplier": 1.0,
+        "sector_key": None,
+        "entry_date": entry_day, "entry_datetime": entry_iso, "entry_session": entry_session,
+        "ml_arm": False, "combine_source": None, "extended_size_multiplier": 1.0,
+        "decision_datetime": decision_at,
+        "entry_price": float(price),
+        "entry_ref_close": ref["close"] if ref else None,
+        "entry_ref_close_date": ref["date"] if ref else None,
+        "rationale": (f"dip_long: closed {fmt_price(sig['close'])} on {signal_session} with a 2-session "
+                      f"RSI of {float(sig['rsi2']):.1f} (under {float(settings.dip_long_rsi_max):g}), above its "
+                      f"{settings.dip_long_trend_sessions}-session average {fmt_price(sig['sma_trend'])}, trading "
+                      f"${float(sig['dv20']) / 1e9:.1f}B a day — {how}; sell at the open after the first close "
+                      f"above its {settings.dip_long_exit_sma_sessions}-session average, or after "
+                      f"{settings.dip_long_max_hold_sessions} sessions; {n} share(s), 1/"
+                      f"{settings.dip_long_account_slices} of the simulated account (${st['equity']:,.0f})"),
+        "time_horizon": "SWING", "target_horizon": f"{settings.dip_long_max_hold_sessions}d",
+        "current_price": float(price), "current_price_datetime": decision_at,
+        "return_pct": 0.0, "weighted_return_pct": 0.0, "days_held": 0,
+        "exit_date": None, "exit_datetime": None, "exit_decision_datetime": None,
+        "exit_price": None, "exit_ref_close": None, "exit_ref_close_date": None,
+        "exit_reason": None, "status": "OPEN",
+        "method_scores": {}, "methods_agreeing": [],
+        "dominant_method": dip_long.MECHANISM,
+        "llm_synthesis_model": None, "llm_sentiment_model": None,
+        "universe_source": dip_long.MECHANISM, "entry_mechanism": dip_long.MECHANISM,
+        "dip_signal_day": signal_session, "dip_entry_day": entry_day, "dip_rank": rank,
+        "dip_close": sig["close"], "dip_sma_trend": sig["sma_trend"], "dip_rsi2": sig["rsi2"],
+        "dip_dv20": sig["dv20"],
+        "dip_account_shares": int(n), "dip_account_notional": round(n * float(price), 2),
+        "dip_account_equity": round(st["equity"], 2),
+        "dip_account_cash": round(st["cash"], 2) if st.get("cash") is not None else None,
+        "dip_live_account": bool(live_account.enabled()),
+        "dip_account_slices": int(settings.dip_long_account_slices),
+        "dip_stack_n": stack + 1,                       # 1 = the book's only long on the name
+        "signal_at_entry": {},
+        "max_favorable_excursion": 0.0, "mfe_date": entry_day,
+        "max_adverse_excursion": 0.0, "mae_date": entry_day,
+    }
+    trade.update(extra or {})
+    return trade
+
+
 def record_dip_long_trades(run_id: Optional[str] = None, now: Optional[datetime] = None) -> int:
-    """Open the day's dip signals (`dip_long.signals_for`: the previous close's 2-session RSI under 10 above the
-    200-session average in a $1B+-a-day common stock), deepest dip first, inside the opening window
-    (`dip_long.in_entry_window`). Each signal is settled once a day: ``opened``, ``held`` (another book holds
-    the name — the dip book itself stacks a repeat signal, as the study's account did), or the account's
-    ``no_slot`` / ``no_cash`` / ``account_too_small``; a missing live price is retried next tick. Sized from the
-    book's own simulated cash account (``dip_account_shares`` — what the broker orders). Returns the number opened."""
+    """The dip book's entry step inside the opening window (`dip_long.in_entry_window`). Open mode (the original
+    rule): open the day's signals (`dip_long.signals_for`: the previous close's 2-session RSI under 10 above the
+    200-session average in a $1B+-a-day common stock), deepest dip first, each settled once a day: ``opened``,
+    ``held`` (another book holds the name — the dip book itself stacks a repeat signal, as the study's account
+    did), or the account's ``no_slot`` / ``no_cash`` / ``account_too_small``; a missing live price is retried next
+    tick. LIMIT mode (`dip_long_entry_mode`, from 2026-10-09): the signals become limit ORDERS placed and armed at
+    this session's open (`_place_dip_orders`). Returns the number of longs opened."""
+    from src.performance import live_account
     from src.signals import dip_long
     if not dip_long.enabled():
         return 0
@@ -4499,6 +5000,8 @@ def record_dip_long_trades(run_id: Optional[str] = None, now: Optional[datetime]
     except Exception as e:                                           # noqa: BLE001
         logger.warning(f"[dip_long] signals for {d} failed ({type(e).__name__}: {e}) — retried next tick")
         return 0
+    if dip_long.limit_mode():
+        return _place_dip_orders(day, d, now, run_id)
     sigs = day.get("signals") or []
     if not sigs:
         return 0
@@ -4526,55 +5029,20 @@ def record_dip_long_trades(run_id: Optional[str] = None, now: Optional[datetime]
             dip_long.journal_entry(d, sig, "no_price")
             logger.info(f"[dip_long] {tk}: no live price — retrying next tick")
             continue
-        n, why, st = dip_long.size(trades, float(price))
+        if live_account.enabled():        # THE LIVE ACCOUNT (2026-10-09): one equity and margin room with the shorts
+            n, why, st = live_account.size_long(trades, float(price))
+            acct_txt = live_account.summary(st)
+        else:
+            n, why, st = dip_long.size(trades, float(price))
+            acct_txt = dip_long.summary(st)
         if n <= 0:
             after_save.append((sig, why, {"price": float(price), "account": {k: round(v, 2) for k, v in st.items()}}))
-            logger.info(f"[dip_long] {tk}: not bought ({why}) — {dip_long.summary(st)}")
+            logger.info(f"[dip_long] {tk}: not bought ({why}) — {acct_txt}")
             continue
         stack = sum(1 for t in trades if t.get("status") == "OPEN" and t.get("ticker") == tk
                     and t.get("entry_mechanism") == dip_long.MECHANISM)
-        ref = _reference_close(tk)
-        trade = {
-            "ticker": tk, "run_id": run_id, "recommendation_id": rid,
-            "type": "STOCK", "action": "BUY", "direction": "BULLISH",
-            "confidence": None,
-            "position_size_multiplier": 1.0,
-            "confidence_size_multiplier": 1.0, "correlation_size_multiplier": 1.0,
-            "sector_key": None,
-            "entry_date": today, "entry_datetime": executed_at, "entry_session": entry_session,
-            "ml_arm": False, "combine_source": None, "extended_size_multiplier": 1.0,
-            "decision_datetime": decision_at,
-            "entry_price": float(price),
-            "entry_ref_close": ref["close"] if ref else None,
-            "entry_ref_close_date": ref["date"] if ref else None,
-            "rationale": (f"dip_long: closed {fmt_price(sig['close'])} on {day.get('signal_session')} with a 2-session "
-                          f"RSI of {sig['rsi2']:.1f} (under {float(settings.dip_long_rsi_max):g}), above its "
-                          f"{settings.dip_long_trend_sessions}-session average {fmt_price(sig['sma_trend'])}, trading "
-                          f"${sig['dv20'] / 1e9:.1f}B a day — buy at the open; sell at the open after the first close "
-                          f"above its {settings.dip_long_exit_sma_sessions}-session average, or after "
-                          f"{settings.dip_long_max_hold_sessions} sessions; {n} share(s), 1/"
-                          f"{settings.dip_long_account_slices} of the simulated account (${st['equity']:,.0f})"),
-            "time_horizon": "SWING", "target_horizon": f"{settings.dip_long_max_hold_sessions}d",
-            "current_price": float(price), "current_price_datetime": decision_at,
-            "return_pct": 0.0, "weighted_return_pct": 0.0, "days_held": 0,
-            "exit_date": None, "exit_datetime": None, "exit_decision_datetime": None,
-            "exit_price": None, "exit_ref_close": None, "exit_ref_close_date": None,
-            "exit_reason": None, "status": "OPEN",
-            "method_scores": {}, "methods_agreeing": [],
-            "dominant_method": dip_long.MECHANISM,
-            "llm_synthesis_model": None, "llm_sentiment_model": None,
-            "universe_source": dip_long.MECHANISM, "entry_mechanism": dip_long.MECHANISM,
-            "dip_signal_day": day.get("signal_session"), "dip_entry_day": today, "dip_rank": rank,
-            "dip_close": sig["close"], "dip_sma_trend": sig["sma_trend"], "dip_rsi2": sig["rsi2"],
-            "dip_dv20": sig["dv20"],
-            "dip_account_shares": int(n), "dip_account_notional": round(n * float(price), 2),
-            "dip_account_equity": round(st["equity"], 2), "dip_account_cash": round(st["cash"], 2),
-            "dip_account_slices": int(settings.dip_long_account_slices),
-            "dip_stack_n": stack + 1,                       # 1 = the book's only long on the name
-            "signal_at_entry": {},
-            "max_favorable_excursion": 0.0, "mfe_date": today,
-            "max_adverse_excursion": 0.0, "mae_date": today,
-        }
+        trade = _dip_trade(tk, rid, run_id, sig, day.get("signal_session"), rank, int(n), float(price), st, stack,
+                           today, executed_at, entry_session, decision_at, "buy at the open")
         trades.append(trade)
         ids.add(rid)
         opened += 1
@@ -4589,6 +5057,390 @@ def record_dip_long_trades(run_id: Optional[str] = None, now: Optional[datetime]
     for sig, outcome, kw in after_save:
         dip_long.journal_entry(d, sig, outcome, **kw)
     return opened
+
+
+# ── the dip book's LIMIT ENTRY (2026-10-09; dip_long.py "THE LIMIT ENTRY") ──────────────────────────────────────
+
+def _dip_other_book(trades: List[dict]) -> set:
+    from src.signals import dip_long
+    return {t["ticker"] for t in trades
+            if t.get("status") == "OPEN" and t.get("entry_mechanism") != dip_long.MECHANISM}
+
+
+def _dip_slots_working(books: Dict) -> int:
+    return sum(1 for lst in books.values() for o in lst if o.get("status") == "working")
+
+
+def _place_dip_orders(day: dict, d: date, now: datetime, run_id: Optional[str]) -> int:
+    """At the session's opening tick: today's signals become pending orders (once); then every order whose window
+    includes today — deepest dip first — is ARMED (a working order carried from an earlier session) or PLACED (a
+    pending one: its quantity fixed now, the dip slice at its limit within the live account's room; working orders
+    count toward the 10 dip slots, nothing is reserved; another book's name, no slot or no room: tried again at the
+    next session's open). An order armed at the opening tick fills at once when the session opened at/under its
+    limit (`_fill_dip_orders`). Returns the longs opened PLUS the orders placed or armed — non-zero makes the live
+    path sync the broker at once, so the resting IBKR orders go out right after the open."""
+    from src.performance import live_account
+    from src.signals import dip_long
+    iso = d.isoformat()
+    todays = dip_long.load_orders(d)
+    have = {o["oid"] for o in todays}
+    added = 0
+    for rank, sig in enumerate(day.get("signals") or [], 1):
+        if f"{sig.get('ticker')}|{iso}" in have:
+            continue
+        o = dip_long.make_order(d, sig, rank, day.get("signal_session"))
+        if o is None:
+            dip_long.journal_entry(d, sig, "no_limit")
+            logger.warning(f"[dip_long] {sig.get('ticker')}: no 14-session ATR — no limit order")
+            continue
+        if sig.get("filter_score") is not None:       # the meta-model's score (PREREG96's RP33, the filter on)
+            o["filter_score"] = sig["filter_score"]
+        todays.append(o)
+        have.add(o["oid"])
+        added += 1
+    for sig in day.get("filtered") or []:             # the meta-model dropped these: journaled, never placed
+        if f"{sig.get('ticker')}|{iso}" in have:
+            continue
+        o = dip_long.filtered_order(d, sig, day)
+        todays.append(o)
+        have.add(o["oid"])
+        added += 1
+    if added:
+        dip_long.save_orders(d, todays)
+    books = dip_long.active_orders(d)
+    trades = _load_trades()
+    other = _dip_other_book(trades)
+    now_iso = now.isoformat(timespec="seconds")
+    cand = sorted(((float(o["rsi2"]) if o.get("rsi2") is not None else 1e9, o["day"], o["ticker"], dd, o)
+                   for dd, lst in books.items() for o in lst
+                   if iso in (o.get("window") or []) and o.get("status") in ("pending", "working")),
+                  key=lambda x: x[:3])
+    working = _dip_slots_working(books)
+    changed: set = set()
+    armed_now = 0
+    for _, _, _, dd, o in cand:
+        if iso in (o.get("session_tried") or {}):
+            continue                                  # one placement a session, as in the engine
+        o.setdefault("session_tried", {})[iso] = now_iso
+        changed.add(dd)
+        if o["status"] == "working":                  # carried: armed again (the broker re-places its DAY order)
+            o.setdefault("session_armed_at", {})[iso] = now_iso
+            dip_long.order_event(o, "armed", session=iso)
+            armed_now += 1
+            continue
+        if o["ticker"] in other:
+            dip_long.order_event(o, "held", session=iso)
+            continue
+        if live_account.enabled():
+            n, why, st = live_account.size_long(trades, float(o["limit"]), now, working=working)
+        else:
+            st = dip_long.account_state(trades)
+            if st["open"] + working >= max(1, int(settings.dip_long_account_slices)):
+                n, why = 0, "no_slot"
+            else:
+                n, why, st = dip_long.size(trades, float(o["limit"]))
+        if n <= 0:
+            dip_long.order_event(o, why, session=iso, equity=round(st["equity"], 2))
+            continue
+        o.update(status="working", qty=int(n), placed_at=now_iso, placed_session=iso, ibkr_qty=int(n))
+        o.setdefault("session_armed_at", {})[iso] = now_iso
+        working += 1
+        armed_now += 1
+        dip_long.order_event(o, "placed", session=iso, qty=int(n), equity=round(st["equity"], 2))
+        logger.info(f"[dip_long] LIMIT {o['ticker']}: buy {n} @ {fmt_price(o['limit'])} (close "
+                    f"{fmt_price(o['close'])} - {float(settings.dip_long_limit_atr):g} x ATR {float(o['atr14']):.2f}), "
+                    f"working through {o['window'][-1]} — RSI2 {float(o['rsi2']):.1f}")
+    # the open fill: an order armed at the opening tick fills at the session's open when it opened at/under it
+    fills = []
+    cache: Dict[str, object] = {}
+    for dd, lst in books.items():
+        for o in lst:
+            if o.get("status") != "working" or o.get("open_checked") == iso or not dip_long.placed_on_time(o, d):
+                continue
+            tk = o["ticker"]
+            if tk not in cache:
+                cache[tk] = dip_long.session_bars(tk, d)
+            op = dip_long.session_open(cache[tk], d)
+            if op is None:
+                continue                              # no bar yet: judged on the bars at the next ticks
+            o["open_checked"] = iso
+            changed.add(dd)
+            if op <= float(o["limit"]):
+                at = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET).astimezone(timezone.utc)
+                fills.append((at, dd, o, float(op), "open"))
+    opened = _fill_dip_orders(fills, trades, now, run_id, changed) if fills else 0
+    for dd in changed:
+        dip_long.save_orders(dd, books[dd])
+    return opened + armed_now
+
+
+def _fill_dip_orders(fills: List[tuple], trades: List[dict], now: datetime, run_id: Optional[str],
+                     changed: set) -> int:
+    """Fill the touched orders in time order, then deepest dip first: each buys AT MOST what the live account's
+    room allows at that moment (`live_account.fill_cap`) — the engine's rule (PREREG61 amendment 1); no room: nothing,
+    and the order waits for the next session (``unfunded``); another book's name: no fill. The opened long is
+    linked to the order's resting IBKR order when it has one (the broker then reads its fill). Saves the ledger."""
+    from src.performance import live_account
+    from src.signals import dip_long
+    opened = 0
+    d = dip_long.today_et(now)
+    iso = d.isoformat()
+    decision_at = _now_iso()
+    other = _dip_other_book(trades)
+    ids = {t.get("recommendation_id") for t in trades}
+    journal = []
+    for at, dd, o, price, kind in sorted(fills, key=lambda f: (f[0], float(f[2].get("rsi2") or 0.0))):
+        tk = o["ticker"]
+        changed.add(dd)
+        o["checked_through"] = at.isoformat(timespec="seconds")
+        if tk in other:
+            dip_long.order_event(o, "held", session=iso, at_bar=o["checked_through"])
+            continue
+        if live_account.enabled():
+            cap, st = live_account.fill_cap(trades, price, now)
+        else:
+            n0, _, st = dip_long.size(trades, price)
+            cap = n0 if n0 > 0 else 0
+        n = min(int(o.get("qty") or 0), int(cap))
+        if n <= 0:
+            o["unfunded_session"] = iso
+            o["ibkr_qty"] = 0
+            dip_long.order_event(o, "unfunded", session=iso, at_bar=o["checked_through"], price=price,
+                                 equity=round(st["equity"], 2))
+            logger.info(f"[dip_long] {tk}: limit {fmt_price(o['limit'])} reached ({kind}) but the account has no "
+                        f"room — nothing bought, the order waits for the next session")
+            continue
+        rid = dip_long.trade_id(date.fromisoformat(o["day"]), tk)
+        if rid in ids:
+            o.update(status="filled", trade=rid)
+            continue
+        stack = sum(1 for t in trades if t.get("status") == "OPEN" and t.get("ticker") == tk
+                    and t.get("entry_mechanism") == dip_long.MECHANISM)
+        extra = {"dip_entry_mode": "limit", "dip_limit": float(o["limit"]), "dip_atr14": o.get("atr14"),
+                 "dip_order_day": o["day"], "dip_order_qty": int(o.get("qty") or 0), "dip_fill_kind": kind,
+                 "dip_order_placed_at": o.get("placed_at"), "dip_fill_cap": int(cap)}
+        if o.get("filter_score") is not None:          # the meta-model's score of the signal (the filter on)
+            extra["dip_filter_score"] = o["filter_score"]
+        ib = o.get("ibkr") or {}
+        if kind == "touch" and ib.get("ref") and ib.get("session") == iso and ib.get("state") == "working":
+            # the fill IS the resting IBKR order's: the broker reads its execution (or, unfilled, cancels it and
+            # resends at the market — the tick-scoped lifetime of an entry leg)
+            extra.update(broker_client_ref=ib["ref"], broker_order_id=ib.get("order_id"), broker_side="BUY",
+                         broker_requested_qty=ib.get("qty"), broker_fill_qty=0, broker_fill_price=None,
+                         broker_status=ib.get("status") or "Submitted", broker_submitted_at=ib.get("submitted_at"))
+            ib["state"] = "linked"
+        sig = {"close": o["close"], "rsi2": o["rsi2"], "sma_trend": o["sma_trend"], "dv20": o["dv20"]}
+        how = (f"a buy limit at {fmt_price(o['limit'])} ({float(settings.dip_long_limit_atr):g} x the 14-session ATR "
+               f"under the close), filled {'at the open' if kind == 'open' else 'when a 30-minute bar reached it'}")
+        trade = _dip_trade(tk, rid, run_id, sig, o.get("signal_session"), int(o.get("rank") or 0), n, price, st,
+                           stack, iso, at.isoformat(), "rth", decision_at, how, extra)
+        trades.append(trade)
+        ids.add(rid)
+        opened += 1
+        o.update(status="filled", trade=rid, fill_qty=n, fill_price=price, fill_kind=kind,
+                 filled_at=at.isoformat(timespec="seconds"), ibkr_qty=0)
+        dip_long.order_event(o, "filled", session=iso, qty=n, price=price, kind=kind, cap=int(cap))
+        journal.append((o, n, price, kind, rid))
+        logger.info(f"[dip_long] BUY {tk} {n} @ {fmt_price(price)} — limit order filled "
+                    f"({'at the open' if kind == 'open' else 'bar ending ' + at.astimezone(ET).strftime('%H:%M')}), "
+                    f"{n} of {o.get('qty')} ordered (room for {cap})")
+    if opened:
+        _save_trades(trades)
+    for o, n, price, kind, rid in journal:
+        dip_long.journal_entry(d, {"ticker": o["ticker"], "rsi2": o.get("rsi2"), "close": o.get("close"),
+                                   "sma_trend": o.get("sma_trend"), "dv20": o.get("dv20")}, "filled",
+                               price=price, shares=n, kind=kind, limit=o["limit"], order_day=o["day"],
+                               recommendation_id=rid)
+    return opened
+
+
+def monitor_dip_long_orders(run_id: Optional[str] = None, now: Optional[datetime] = None) -> int:
+    """The dip book's working LIMIT orders at this tick (`dip_long_entry_mode` limit): each order armed for today
+    fills at the END of the first completed regular-hours 30-minute bar (since it was armed, or last judged) whose
+    low reaches its limit — Polygon's bars, the engine's touch — in time order, deepest dip first, at most what the
+    room allows (`_fill_dip_orders`); then every order past its last session lapses (from 16:00 ET of that session).
+    Runs at every tick (after 16:00 it still judges the session's last bar). Returns the longs opened."""
+    from src.signals import dip_long
+    if not dip_long.limit_mode():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    d = dip_long.today_et(now)
+    iso = d.isoformat()
+    books = dip_long.active_orders(d)
+    if not books:
+        return 0
+    trades = _load_trades()
+    et = now.astimezone(ET)
+    buying = dip_long.enabled()                       # the switch stops new longs; the orders still lapse
+    open_at = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET).astimezone(timezone.utc)
+    fills, changed = [], set()
+    cache: Dict[str, object] = {}
+    for dd, lst in books.items():
+        for o in lst:
+            if not buying or o.get("status") != "working" or iso not in (o.get("window") or []):
+                continue
+            armed = (o.get("session_armed_at") or {}).get(iso)
+            if not armed or o.get("unfunded_session") == iso:
+                continue
+            after = open_at if dip_long.placed_on_time(o, d) else datetime.fromisoformat(armed).astimezone(timezone.utc)
+            if o.get("checked_through"):
+                ct = datetime.fromisoformat(o["checked_through"]).astimezone(timezone.utc)
+                if ct > after:
+                    after = ct
+            tk = o["ticker"]
+            if tk not in cache:
+                cache[tk] = dip_long.session_bars(tk, d)
+            bars = cache[tk]
+            if bars is None:
+                continue                              # Polygon failed: judged at the next tick
+            hit = dip_long.first_touch(bars, float(o["limit"]), after, now)
+            if hit is not None:
+                fills.append((hit, dd, o, float(o["limit"]), "touch"))
+            else:
+                last = dip_long.last_completed_end(bars, now)
+                if last is not None and last > after:
+                    o["checked_through"] = last.isoformat(timespec="seconds")
+                    changed.add(dd)
+    opened = _fill_dip_orders(fills, trades, now, run_id, changed) if fills else 0
+    # lapses: the order's last session is over (16:00 ET of it, its last bar judged above)
+    for dd, lst in books.items():
+        for o in lst:
+            if o.get("status") not in ("pending", "working"):
+                continue
+            last = date.fromisoformat((o.get("window") or [o["day"]])[-1])
+            if last < d or (last == d and et.hour >= 16):
+                o.update(status="lapsed", ibkr_qty=0)
+                dip_long.order_event(o, "lapsed")
+                changed.add(dd)
+    for dd in changed:
+        dip_long.save_orders(dd, books[dd])
+    return opened
+
+
+def cancel_dip_orders(reason: str, now: Optional[datetime] = None) -> int:
+    """Cancel every working dip order (a margin call): back to pending, placed again at a later session's open
+    within its window, as in the engine. Returns the number cancelled."""
+    from src.signals import dip_long
+    if not dip_long.limit_mode():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    books = dip_long.active_orders(dip_long.today_et(now))
+    n = 0
+    for dd, lst in books.items():
+        hit = False
+        for o in lst:
+            if o.get("status") == "working":
+                o.update(status="pending", ibkr_qty=0)
+                dip_long.order_event(o, reason)
+                n += 1
+                hit = True
+        if hit:
+            dip_long.save_orders(dd, lst)
+    if n:
+        logger.warning(f"[dip_long] {n} working limit order(s) cancelled ({reason})")
+    return n
+
+
+# ── THE ETF DUAL-MOMENTUM book (src/signals/etf_dm.py; trades only with enable_etf_dm) ──────────────────────
+# One fund or cash, decided at each month's last close; rotated on the month's first session inside the opening
+# window: the held fund sold when it is no longer the pick (whatever the switch says — the rule owns its exit),
+# then the pick bought from the book's own simulated cash account.
+
+def rebalance_etf_dm(run_id: Optional[str] = None, now: Optional[datetime] = None,
+                     hold_prompt_active: Optional[bool] = None) -> int:
+    """The month's rotation, inside the opening window of any session of the month until it is done: sell the
+    book's holding when it is not the month's pick (a price fetched now; none: retried next tick), then — with
+    `enable_etf_dm` — buy the pick with the whole cash. Each step journaled (`rebalances/<day>.jsonl`). Returns the
+    number of trades opened or closed."""
+    from src.signals import etf_dm
+    now = now or datetime.now(timezone.utc)
+    if not etf_dm.in_entry_window(now):
+        return 0
+    trades = _load_trades()
+    held = [t for t in trades if t.get("status") == "OPEN" and t.get("entry_mechanism") == etf_dm.MECHANISM]
+    if not held and not etf_dm.enabled():
+        return 0
+    d = etf_dm.today_et(now)
+    try:
+        dec = etf_dm.decision_for(d)
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning(f"[etf_dm] decision for {etf_dm.month_key(d)} failed ({type(e).__name__}: {e}) — retried next tick")
+        return 0
+    pick = dec.get("pick")
+    decision_at, executed_at = _now_iso(), _execution_iso()
+    acted, notes = 0, []
+    for t in held:
+        if t["ticker"] == pick:
+            continue
+        px = _fetch_price(t["ticker"])
+        if not px or px <= 0:
+            notes.append(("no_price", {"ticker": t["ticker"], "side": "sell"}))
+            continue
+        t["current_price"], t["current_price_datetime"] = float(px), decision_at
+        if _close_trade_now(t, "etf_dm_rotation", decision_at, executed_at, hold_prompt_active, book="etf_dm"):
+            acted += 1
+            notes.append(("sold", {"ticker": t["ticker"], "price": float(px), "return_pct": t.get("return_pct"),
+                                   "next": pick or "cash"}))
+            logger.info(f"[etf_dm] SELL {t['ticker']} @ {fmt_price(px)} — {etf_dm.month_key(d)}'s pick is "
+                        f"{pick or 'cash'}; return {t.get('return_pct'):+.2f}%")
+    still = {t["ticker"] for t in trades if t.get("status") == "OPEN" and t.get("entry_mechanism") == etf_dm.MECHANISM}
+    # a fund another book holds (the selection short's ETF arm) is not bought beside it: one position per name at
+    # IBKR would net the two books' sides — retried at the next opening window
+    other_book = {t["ticker"] for t in trades if t.get("status") == "OPEN" and t.get("entry_mechanism") != etf_dm.MECHANISM}
+    if etf_dm.enabled() and pick and not still and pick in other_book:
+        notes.append(("held", {"ticker": pick}))
+        logger.info(f"[etf_dm] {pick}: another book holds it — not bought this tick")
+    elif etf_dm.enabled() and pick and not still:
+        rid = etf_dm.trade_id(d, pick)
+        if rid not in {t.get("recommendation_id") for t in trades}:
+            px = _fetch_price(pick)
+            n, why, st = etf_dm.size(trades, float(px)) if px and px > 0 else (0, "no_price", etf_dm.account_state(trades))
+            if n <= 0:
+                notes.append((why, {"ticker": pick, "price": float(px) if px else None,
+                                    "account": {k: round(v, 2) for k, v in st.items()}}))
+                logger.info(f"[etf_dm] {pick}: not bought ({why})")
+            else:
+                today = d.isoformat()
+                ref = _reference_close(pick)
+                f = (dec.get("funds") or {}).get(pick) or {}
+                trades.append({
+                    "ticker": pick, "run_id": run_id, "recommendation_id": rid,
+                    "type": "STOCK", "action": "BUY", "direction": "BULLISH", "confidence": None,
+                    "position_size_multiplier": 1.0, "confidence_size_multiplier": 1.0,
+                    "correlation_size_multiplier": 1.0, "sector_key": None,
+                    "entry_date": today, "entry_datetime": executed_at, "entry_session": _session_of_iso(executed_at),
+                    "ml_arm": False, "combine_source": None, "extended_size_multiplier": 1.0,
+                    "decision_datetime": decision_at, "entry_price": float(px),
+                    "entry_ref_close": ref["close"] if ref else None, "entry_ref_close_date": ref["date"] if ref else None,
+                    "rationale": (f"etf_dm: {pick} had the best mean 3/6/12-month return of {', '.join(etf_dm.universe())} "
+                                  f"at the {dec.get('decided_at_close')} close ({f.get('score', 0) * 100:+.1f}%), its 12 "
+                                  f"months {f.get('r252', 0) * 100:+.1f}% beat T-bills' {(dec.get('tbill_12m') or 0) * 100:+.1f}% "
+                                  f"— held for {etf_dm.month_key(d)}; {n} share(s), the whole simulated account "
+                                  f"(${st['equity']:,.0f})"),
+                    "time_horizon": "SWING", "target_horizon": "1m",
+                    "current_price": float(px), "current_price_datetime": decision_at,
+                    "return_pct": 0.0, "weighted_return_pct": 0.0, "days_held": 0,
+                    "exit_date": None, "exit_datetime": None, "exit_decision_datetime": None,
+                    "exit_price": None, "exit_ref_close": None, "exit_ref_close_date": None,
+                    "exit_reason": None, "status": "OPEN", "method_scores": {}, "methods_agreeing": [],
+                    "dominant_method": etf_dm.MECHANISM, "llm_synthesis_model": None, "llm_sentiment_model": None,
+                    "universe_source": etf_dm.MECHANISM, "entry_mechanism": etf_dm.MECHANISM,
+                    "etf_dm_month": etf_dm.month_key(d), "etf_dm_decided_at_close": dec.get("decided_at_close"),
+                    "etf_dm_scores": {k: (v or {}).get("score") for k, v in (dec.get("funds") or {}).items()},
+                    "etf_dm_account_shares": int(n), "etf_dm_account_notional": round(n * float(px), 2),
+                    "etf_dm_account_equity": round(st["equity"], 2),
+                    "signal_at_entry": {}, "max_favorable_excursion": 0.0, "mfe_date": today,
+                    "max_adverse_excursion": 0.0, "mae_date": today,
+                })
+                acted += 1
+                notes.append(("bought", {"ticker": pick, "price": float(px), "shares": int(n), "recommendation_id": rid}))
+                logger.info(f"[etf_dm] BUY {pick} @ {fmt_price(px)} — {etf_dm.month_key(d)}'s pick; {n} share(s) = "
+                            f"${n * float(px):,.0f} of the ETF account's ${st['equity']:,.0f}")
+    if acted:
+        _save_trades(trades)          # raises on failure: nothing below runs
+    for action, kw in notes:
+        etf_dm.journal(d, action, **kw)
+    return acted
 
 
 # ── ML combine arm (2026-08-01) ──────────────────────────────────────────────

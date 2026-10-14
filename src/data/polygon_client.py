@@ -14,8 +14,11 @@ Does NOT cover (stay on yfinance for these):
 
 from __future__ import annotations
 
+import os
 import re
+import threading
 from datetime import date, timedelta
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Dict, List, Optional
 
 import httpx
@@ -76,6 +79,41 @@ _PERIOD_DAYS: Dict[str, int] = {
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# ONE pooled client per process (2026-10-12). A bare ``httpx.get`` builds a new
+# Client for every call: a fresh SSL context (~0.3 s of CPU loading the CA
+# bundle) and a new TLS handshake per request. The selection short's scorer makes
+# ~4,400 calls a bar — measured on 2026-10-09's bar 0: 545 ms a call, 300 s for
+# the bar (~1,300 CPU-seconds of certificate loading alone), against 57 ms and
+# 110 s with one shared client, every output identical. The requests are the
+# same: no cookie kept between calls (a bare get kept none), no cap on
+# concurrent connections (the bare gets had none), redirects off, the caller's
+# timeout. httpx.Client is safe to share between threads; a forked child builds
+# its own.
+_CLIENT: Optional[httpx.Client] = None
+_CLIENT_PID: Optional[int] = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _client() -> httpx.Client:
+    """The process's shared keep-alive client (built on first use)."""
+    global _CLIENT, _CLIENT_PID
+    c = _CLIENT
+    if c is not None and _CLIENT_PID == os.getpid():
+        return c
+    with _CLIENT_LOCK:
+        if _CLIENT is None or _CLIENT_PID != os.getpid():
+            _CLIENT = httpx.Client(
+                cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=32))
+            _CLIENT_PID = os.getpid()
+        return _CLIENT
+
+
+def _http_get(url: str, params: Optional[dict] = None, timeout: float = _TIMEOUT) -> httpx.Response:
+    """One GET on the shared client — every Polygon request goes through here."""
+    return _client().get(url, params=params, timeout=timeout)
+
+
 def _get(path: str, params: Optional[dict] = None,
          _attempt: int = 0) -> Optional[dict]:
     """Authenticated GET to the Polygon REST API.  Returns parsed JSON or None.
@@ -93,7 +131,7 @@ def _get(path: str, params: Optional[dict] = None,
     p = dict(params or {})
     p["apiKey"] = settings.polygon_api_key
     try:
-        r = httpx.get(f"{_BASE}{path}", params=p, timeout=_TIMEOUT)
+        r = _http_get(f"{_BASE}{path}", params=p, timeout=_TIMEOUT)
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as exc:
@@ -167,14 +205,15 @@ def get_grouped_daily_closes(max_lookback: int = 5) -> Dict[str, float]:
                     if b.get("T") and b.get("c")}
     return {}
 
-def get_grouped_daily(day: str) -> List[dict]:
-    """Every US ticker's daily bar of session ``day`` (``YYYY-MM-DD``, split-adjusted)
-    in ONE grouped-daily call: Polygon's raw rows (``T`` ticker, ``o h l c v``…),
+def get_grouped_daily(day: str, adjusted: bool = True) -> List[dict]:
+    """Every US ticker's daily bar of session ``day`` (``YYYY-MM-DD``, split-adjusted unless
+    ``adjusted=False``) in ONE grouped-daily call: Polygon's raw rows (``T`` ticker, ``o h l c v``…),
     ``[]`` when the day has none (a holiday, a session not closed yet) or the call
-    fails. The selection short's added-stocks screen reads it (`sel_short.grouped_day`)."""
+    fails. The selection short's added-stocks screen reads it (`sel_short.grouped_day`); the
+    borrow-pressure model reads the unadjusted bars (`sel_pressure.grouped_ohlc`)."""
     if not is_available():
         return []
-    j = _get(f"/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true"})
+    j = _get(f"/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true" if adjusted else "false"})
     return list((j or {}).get("results") or [])
 
 
@@ -512,7 +551,7 @@ def get_intraday_bars_range(ticker: str, from_date: str, to_date: str) -> pd.Dat
     while nxt and pages < 40:
         try:
             sep = "&" if "?" in nxt else "?"
-            r = httpx.get(f"{nxt}{sep}apiKey={settings.polygon_api_key}", timeout=_TIMEOUT)
+            r = _http_get(f"{nxt}{sep}apiKey={settings.polygon_api_key}", timeout=_TIMEOUT)
             r.raise_for_status()
             js = r.json()
             results.extend(js.get("results") or [])
@@ -576,13 +615,13 @@ def get_ratios_batch(tickers: List[str], chunk: int = 100) -> Dict[str, dict]:
 def _follow_next_url(nxt: str):
     """Fetch a Polygon ``next_url`` WITHOUT clobbering its query string.
 
-    ``httpx.get(url, params=...)`` REPLACES the URL's existing query entirely —
+    A GET with ``params=...`` REPLACES the URL's existing query entirely —
     so passing ``params={"apiKey": ...}`` here silently dropped the cursor,
     filters and limit, and every page after the first returned 10 unfiltered
     default rows (found 2026-08-16 pulling dividend history: page 2 jumped from
     2024 to 2029 ex-dates). Append the key to the cursor URL instead."""
     sep = "&" if "?" in nxt else "?"
-    r = httpx.get(f"{nxt}{sep}apiKey={settings.polygon_api_key}", timeout=_TIMEOUT)
+    r = _http_get(f"{nxt}{sep}apiKey={settings.polygon_api_key}", timeout=_TIMEOUT)
     r.raise_for_status()
     return r.json()
 

@@ -182,7 +182,7 @@ def test_polygon_intraday_pagination_follows_next_url(monkeypatch):
         def raise_for_status(self): pass
         def json(self): return page2
     seen = {}
-    monkeypatch.setattr(pc.httpx, "get", lambda url, timeout=None: seen.setdefault("url", url) and _R() or _R())
+    monkeypatch.setattr(pc, "_http_get", lambda url, timeout=None: seen.setdefault("url", url) and _R() or _R())
     df = pc.get_intraday_bars("AAA", lookback_days=10)
     assert len(df) == 2 and "apiKey=k" in seen["url"] and "cursor=abc" in seen["url"]
 

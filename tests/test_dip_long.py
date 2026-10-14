@@ -141,6 +141,18 @@ def _dip_trade(tk, shares, entry, ret=0.0, status="OPEN"):
             "dip_account_shares": shares, "entry_price": entry, "return_pct": ret}
 
 
+def test_the_candidates_hold_each_class_share_once(monkeypatch):
+    """PREREG64: the universe file lists Berkshire as BRK-B AND BRK.B (one company, identical bars) — the candidates
+    hold it once, in the project's form, so the book never buys it twice."""
+    from src.signals import sel_short
+    monkeypatch.setattr(sel_short, "sessions_before", lambda d, n: [])
+    monkeypatch.setattr(sel_short, "load_universe", lambda d: {"BRK-B": 1.6e9, "BRK.B": 1.6e9, "AAPL": 9e9,
+                                                                "TINY": 1e6})
+    monkeypatch.setattr(dl, "_sec_type", lambda t: "CS")
+    names, src = dl.candidates(date(2026, 10, 9))
+    assert names == ["AAPL", "BRK-B"] and src == "universe"
+
+
 def test_the_account_is_the_studys_cash_account(on):
     trades = [_dip_trade("A", 10, 100.0, ret=10.0, status="CLOSED"),       # +$100 realized
               _dip_trade("B", 5, 200.0, ret=-5.0),                         # -$50 open, $1,000 at work

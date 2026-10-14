@@ -627,18 +627,21 @@ def test_two_arms_picking_one_name_open_one_trade_each_and_later_picks_are_noted
 
 
 def test_give_back_per_arm(on, monkeypatch):
-    """User directive 2026-10-04 evening: the 100% give-back for the VOL arm only ("Vol arm only", once
-    the per-arm numbers were in) — its target is the close 5 sessions before the pick, the whole run-up;
-    the model and ETF arms keep half. Each arm reads its own knob."""
-    assert settings.sel_short_vol_give_back == pytest.approx(1.0) and settings.sel_short_give_back == pytest.approx(0.5)
-    assert [ss.give_back(a) for a in ("model", "vol", "etf")] == [0.5, 1.0, 0.5]
+    """User directive 2026-10-04 evening: the 100% give-back for the VOL arm ("Vol arm only", once the
+    per-arm numbers were in) — its target is the close 5 sessions before the pick, the whole run-up; the
+    ETF arm too from the 2026-10-12 session (PREREG77, the user's choice); the model arm keeps half; the VOL
+    arm gives back 125% from 2026-10-14 (PREREG97's G1: its target is BELOW the close 5 sessions before). Each
+    arm reads its own knob."""
+    assert settings.sel_short_vol_give_back == pytest.approx(1.25) and settings.sel_short_give_back == pytest.approx(0.5)
+    assert settings.sel_short_etf_give_back == pytest.approx(1.0)
+    assert [ss.give_back(a) for a in ("model", "vol", "etf")] == [0.5, 1.25, 1.0]
     d = date(2026, 9, 28)
     res = _res()
     stand = pd.DataFrame({"n_prior": 0.0, "prior_max": np.nan, "prior_min": np.nan},
                          index=pd.Index(res.ticker, name="ticker"))
     got = {a: ss.select(res, d, 2, stand, [], arm=a) for a in ("model", "vol", "etf")}
     assert all(r["decision"] == "short" for r in got.values())
-    assert [got[a]["target"] for a in ("model", "vol", "etf")] == pytest.approx([15.0, 10.0, 15.0])   # px 20, 5 sessions before 10
+    assert [got[a]["target"] for a in ("model", "vol", "etf")] == pytest.approx([15.0, 7.5, 10.0])    # px 20, 5 sessions before 10
     assert len({r["deadline"] for r in got.values()}) == 1                    # the deadline is the same 15 sessions
     monkeypatch.setattr(settings, "sel_short_vol_give_back", 0.25)            # the knobs stay per arm
     monkeypatch.setattr(settings, "sel_short_give_back", 1.0)
@@ -987,6 +990,7 @@ def test_the_vol_arms_squeeze_cover_buys_back_at_a_multiple_of_the_split_adjuste
     now = et(2026, 9, 29, 11, 0)
     monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", True)
     monkeypatch.setattr(settings, "sel_short_cover_multiple", 6.0)
+    monkeypatch.setattr(settings, "sel_short_vol_cover_multiple", 6.0)     # the split mechanics at one level (live: 4x)
     rows = {}
     monkeypatch.setattr(ist, "split_rows", lambda: rows)
     r = tracker._sel_short_exit_reason
@@ -1149,24 +1153,31 @@ def test_features_from_supplied_bars_equal_the_served_ones(monkeypatch):
 #    after the two models' data fetching, engineering and inference) ─────────
 
 def test_the_live_path_runs_before_the_shadow_pipeline_and_after_the_scorer():
-    """Structural: the live path's marks + exits run right after the scorer is
-    launched, its entries + broker sync run INSIDE the Steps 1-3 fetch pool (the
-    main thread, overlapping the fetch) — and only after waiting for the scorer
-    (the models' inference). The end-of-tick pass is kept."""
+    """Structural (2026-10-12: "run first only the necessary parts for live production,
+    and after we do the shadow arms"): the WHOLE live path runs before any shadow step —
+    the scorer launched and IBKR's borrow file started at the tick's start, the marks and
+    exits, then the entries (only after waiting for the scorer's inference) and the
+    broker sync, its report persisted at once — and only then Step 0 and the Steps 1-3
+    fetch pool, which holds nothing live any more. The end-of-tick pass is kept."""
     src = Path("src/pipeline.py").read_text(encoding="utf-8")
     body = src[src.index("def run_pipeline("):]
     i_launch = body.index("_sel_short.launch(start)")
-    i_marks = body.index("_live_marks_and_exits()")
-    i_pool = body.index('with ThreadPoolExecutor(max_workers=14, thread_name_prefix="pipeline") as pool:')
+    i_borrow = body.index("f_borrow = _start_borrow_snapshot()")
+    i_marks = body.index("_dip_closed = _live_marks_and_exits()")
     i_entries = body.index("live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow, "
                            "dip_closed=_dip_closed)")
+    i_persist = body.index("_persist_live_report(run_id, live_broker_report)")
+    i_step0 = body.index('logger.info("Step 0: Discovering trending tickers...")')
+    i_pool = body.index('with _TrackedPool(max_workers=14, thread_name_prefix="pipeline") as pool:')
     i_collect = body.index("# ── Collect results")
     i_complete = body.index('f"Pipeline complete in')
-    assert i_launch < i_marks < i_pool < i_entries < i_collect < i_complete
+    assert i_launch < i_borrow < i_marks < i_entries < i_persist < i_step0 < i_pool < i_collect < i_complete
+    pool_body = body[i_pool:i_collect]
+    assert "_live_entries_and_sync" not in pool_body and "ibkr_borrow" not in pool_body
+    assert body.count("_live_entries_and_sync(") == 1 and body.count("_live_marks_and_exits(") == 1
     helper = src[src.index("def _live_entries_and_sync("):src.index("def run_pipeline(")]
     # the dip long book's open-of-day orders go first (2026-10-08), never behind the scorer wait
-    assert helper.index("record_dip_long_trades(") < helper.index("_ss.wait(sel_handle)") \
-        < helper.index("record_sel_short_trades(") < helper.rindex("_broker_sync_watchdogged(")
+    assert helper.index("record_dip_long_trades(") < helper.index("_ss.wait(sel_handle)")         < helper.index("record_sel_short_trades(") < helper.rindex("_broker_sync_watchdogged(")
     assert "_merge_broker_reports(live_broker_report, broker_report)" in body
     assert type(settings).model_fields["enable_live_path_first"].default is True
 
@@ -1201,6 +1212,9 @@ def test_wait_skips_a_prepare_and_journals_a_run_once(monkeypatch, on):
             self.rc, self.pid = rc, 1
 
         def wait(self, timeout=None):
+            return self.rc
+
+        def poll(self):
             return self.rc
 
     class Log:
@@ -1373,7 +1387,9 @@ def test_a_merge_backfill_adds_names_and_keeps_every_other_row(monkeypatch, on):
 def test_each_arm_ranks_its_own_universe(monkeypatch, on):
     """The model and vol arms rank the model's names (never a VOL_ONLY product);
     the ETF arm ranks the exchange-traded products — the ones in the model's
-    universe included."""
+    universe included. (UVIX is a VIX product: the routing rule is tested with the VIX block off — the block has its
+    own test, `test_etf_arm_leaves_vix_products_out`.)"""
+    monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", False)
     monkeypatch.setattr(ss, "load_model", lambda: (None, {"tickers": ["AAA", "UVIX"]}))
     monkeypatch.setitem(ss._TYPES, "t", {"AAA": "CS", "UVIX": "ETF", "NEWETF": "ETF"})
     res = pd.DataFrame({"ticker": ["AAA", "UVIX", "NEWETF"], "status": ["OK", "OK", "VOL_ONLY"],
@@ -1544,9 +1560,23 @@ def test_a_vol_pick_ibkr_refuses_falls_back_too(monkeypatch):
     monkeypatch.setattr(sim_account, "whatif_enabled", lambda: True)
     monkeypatch.setattr(sim_account, "ibkr_margin",
                         lambda tk, px: {"refused": "No Opening Trades"} if tk == "REF" else None)
-    monkeypatch.setattr(sim_account, "size", lambda trades, px, dv, now, rates=None: (10, "ok", {"equity": 5000.0}))
+    monkeypatch.setattr(sim_account, "size", lambda trades, px, dv, now, rates=None, **kw: (10, "ok", {"equity": 5000.0}))
     monkeypatch.setattr(sim_account, "default_rates", lambda: (2.0, 2.86))
     assert tracker.record_sel_short_trades(run_id="r1") == 1
     t = [x for x in tracker._load_trades() if x.get("entry_mechanism") == "sel_short"]
     assert [x["ticker"] for x in t] == ["BCK"] and t[0]["sel_fallback_of"] == "REF"
     assert consumed[ss.pick_key(pick)] == "ibkr_refused"
+
+
+def test_etf_arm_leaves_vix_products_out(monkeypatch):
+    """User 2026-10-14 ("Yes please" to the interim block until PREREG102): while `sel_short_etf_exclude_vix`, the ETF
+    arm never ranks a VIX-linked product (`VIX_ETPS`) nor takes it into its history; off, they rank as before."""
+    res = pd.DataFrame({"ticker": ["UVXY", "SOXL", "SVIX", "AAPL"], "vol": [9.0, 5.0, 7.0, 1.0],
+                        "px": [20.0, 30.0, 15.0, 200.0], "status": ["VOL_ONLY", "VOL_ONLY", "VOL_ONLY", "OK"]})
+    monkeypatch.setattr(ss, "etf_names", lambda t, m=None: ["UVXY", "SOXL", "SVIX"])
+    monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", True)
+    assert list(ss.arm_rows(res, "etf")["ticker"]) == ["SOXL"]
+    monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", False)
+    assert list(ss.arm_rows(res, "etf")["ticker"]) == ["UVXY", "SOXL", "SVIX"]
+    assert {"UVXY", "UVIX", "VXX", "VIXY", "SVXY", "SVIX", "SVOL", "TVIX"} <= ss.VIX_ETPS
+    assert not {"SOXL", "VXF", "SPLV", "SPHD"} & ss.VIX_ETPS        # not "low volatility" equity funds

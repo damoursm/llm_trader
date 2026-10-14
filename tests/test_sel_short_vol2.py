@@ -125,6 +125,7 @@ def _trade(arm, entry=10.0, mark=8.0, atr0=4.0):
 def test_vol2_trades_never_take_the_volatility_exit(monkeypatch, on):
     from src.performance import tracker
     monkeypatch.setattr(settings, "enable_sel_short_volnorm_exit", True)
+    monkeypatch.setattr(settings, "enable_sel_short_vol_volnorm_exit", True)   # the contrast (live: off, PREREG77)
     monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", True)
     from src.data import intraday_store
     monkeypatch.setattr(intraday_store, "split_factor_between", lambda t, a, b: 1.0)
@@ -143,6 +144,12 @@ def test_vol2_trades_never_take_the_volatility_exit(monkeypatch, on):
     monkeypatch.setattr(ss, "live_atr", lambda names, now_: asked.extend(names) or {})
     tracker._sel_short_live_atr([t_vol, t_vol2], now)
     assert asked == ["AAA"] and len(asked) == 1
+    # PREREG77 (from the 2026-10-12 session): the vol arm's volatility exit is off too — its trade holds, no ATR asked
+    monkeypatch.setattr(settings, "enable_sel_short_vol_volnorm_exit", False)
+    assert tracker._sel_short_exit_reason(t_vol, now, atr_now=1.9) is None
+    asked.clear()
+    tracker._sel_short_live_atr([t_vol, t_vol2], now)
+    assert asked == []
 
 
 def _pick(tk, arm, day=date(2026, 9, 28), bar=1, **kw):

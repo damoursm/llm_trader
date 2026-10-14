@@ -26,6 +26,15 @@ from src.performance.market_calendar import (
     (date(2026, 5, 26), True,  "Tuesday after Memorial Day"),
     (date(2025, 6, 19), False, "Juneteenth 2025"),
     (date(2027, 7, 5),  False, "Independence Day observed (July 4 = Sun)"),
+    # PREREG64: the table reaches back to 2015 (it used to treat every weekday before 2024 as a session)
+    (date(2025, 1, 9),  False, "national day of mourning (President Carter)"),
+    (date(2018, 12, 5), False, "national day of mourning (President G. H. W. Bush)"),
+    (date(2021, 1, 18), False, "MLK Day 2021"),
+    (date(2021, 12, 24), False, "Christmas 2021 observed (Dec 25 = Sat)"),
+    (date(2022, 6, 20), False, "Juneteenth 2022 observed (June 19 = Sun)"),
+    (date(2015, 4, 3),  False, "Good Friday 2015"),
+    (date(2022, 1, 3),  True,  "New Year 2022 fell on a Saturday: not observed"),
+    (date(2021, 1, 19), True,  "Tuesday after MLK Day 2021"),
 ])
 def test_is_market_day(d, expected, reason):
     assert is_market_day(d) is expected, reason

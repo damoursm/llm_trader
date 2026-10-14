@@ -27,6 +27,8 @@ def on(monkeypatch):
     monkeypatch.setattr(settings, "enable_sel_short_account_sizing", True)
     monkeypatch.setattr(settings, "sel_short_account_initial", 5000.0)
     monkeypatch.setattr(settings, "sel_short_account_slices", 10)
+    for arm in ("vol", "etf", "fall"):                     # the mechanism at one slice count (live: 20 / 16 / 12)
+        monkeypatch.setattr(settings, f"sel_short_{arm}_account_slices", 10.0)
     monkeypatch.setattr(settings, "sel_short_account_max_dollar_volume_share", 0.01)
     monkeypatch.setattr(settings, "sel_short_account_min_equity", 2000.0)
     # Reg T only, no what-if: the engine's base rules; the house-margin tests set the rates themselves
@@ -266,3 +268,17 @@ def test_the_entry_step_sizes_each_pick_with_ibkrs_rate_and_skips_a_refused_one(
     journal = {e["ticker"]: e for e in ss._read_jsonl(ss.entries_path(date(2026, 9, 28)))}
     assert journal["NOPE"]["outcome"] == "ibkr_refused" and journal["NOPE"]["ibkr_margin"]["refused"] == refusal
     assert journal["DEAR"]["ibkr_margin"]["init_rate"] == 5.72
+
+
+def test_each_arm_sizes_from_its_own_slice(monkeypatch, on):
+    """PREREG80 (from the 2026-10-12 session): vol 1/20, ETF 1/16, fall 1/12; an arm without its own slice (the shadow
+    arms) takes `sel_short_account_slices`; `size(slices=...)` sizes from it."""
+    monkeypatch.setattr(settings, "sel_short_vol_account_slices", 20.0)
+    monkeypatch.setattr(settings, "sel_short_etf_account_slices", 16.0)
+    monkeypatch.setattr(settings, "sel_short_fall_account_slices", 12.0)
+    monkeypatch.setattr(settings, "sel_short_account_slices", 24)
+    assert [sa.arm_slices(a) for a in ("vol", "etf", "fall", "model", "vol2")] == [20.0, 16.0, 12.0, 24.0, 24.0]
+    n24 = sa.size([], 10.0, 1e9, slices=24)[0]
+    n12 = sa.size([], 10.0, 1e9, slices=12)[0]
+    assert n12 == pytest.approx(2 * n24, abs=1)
+    assert sa.size([], 10.0, 1e9)[0] == n24                      # no slices given: the default

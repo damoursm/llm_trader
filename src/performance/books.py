@@ -6,7 +6,9 @@ from __future__ import annotations
 
 SEL_SHORT = "sel_short"      # the selection short (src/signals/sel_short.py, from 2026-09-28)
 DIP_LONG = "dip_long"        # the mega-cap dip long book (src/signals/dip_long.py, from 2026-10-08)
-LIVE_MECHANISMS = (SEL_SHORT, DIP_LONG)
+ETF_DM = "etf_dm"            # the ETF dual-momentum book (src/signals/etf_dm.py; trades only with enable_etf_dm)
+CRASH_LONG = "crash_long"    # the crash-rebound book (src/signals/crash_long.py, from 2026-10-12)
+LIVE_MECHANISMS = (SEL_SHORT, DIP_LONG, ETF_DM, CRASH_LONG)
 
 
 def is_live(trade: dict) -> bool:

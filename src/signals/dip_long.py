@@ -59,6 +59,7 @@ PREFILTER_SESSIONS = 20                # whole-market daily bars read by the pre
 PREFILTER_MIN_SESSIONS = 15
 SPREAD_MARGIN = 1.0001                 # the study's sizing margin for the half-spread
 FINAL_OUTCOMES = ("opened", "no_slot", "no_cash", "account_too_small", "held")
+ATR_SESSIONS = 14                      # the limit entry's average true range (PREREG59)
 
 
 def enabled() -> bool:
@@ -163,7 +164,34 @@ def stats_at(daily: Optional[pd.DataFrame], through: date, min_history: int = MI
     sma_x = float(np.mean(c[-nx:])) if len(c) >= nx else float("nan")
     dv20 = float(np.mean((c * v)[-20:])) if len(c) >= 20 else float("nan")
     return {"session": pd.Timestamp(d.index[-1]).date(), "close": float(c[-1]), "sma_trend": sma_t,
-            "sma_exit": sma_x, "rsi2": float(rsi2(c)[-1]), "dv20": dv20, "bars": int(len(c))}
+            "sma_exit": sma_x, "rsi2": float(rsi2(c)[-1]), "dv20": dv20, "bars": int(len(c)),
+            "atr14": atr14(d)}
+
+
+def atr14(daily: pd.DataFrame) -> float:
+    """The 14-session average true range at the last row of ``daily`` (the study's PREREG59: the true range
+    max(high - low, |high - previous close|, |low - previous close|), its simple 14-session mean)."""
+    if daily is None or len(daily) < ATR_SESSIONS:
+        return float("nan")
+    h, l, c = (daily[k].to_numpy(float) for k in ("h", "l", "c"))
+    pc = np.r_[np.nan, c[:-1]]
+    with np.errstate(invalid="ignore"):
+        tr = np.nanmax(np.c_[h - l, np.abs(h - pc), np.abs(l - pc)], axis=1)
+    return float(np.mean(tr[-ATR_SESSIONS:]))
+
+
+def limit_price(close: float, atr: float, mult: Optional[float] = None) -> Optional[float]:
+    """The limit entry's price: the signal close minus ``mult`` (default `dip_long_limit_atr`) x its 14-session
+    ATR, floored to the cent — the price IBKR rests, so the ledger, the broker and the backtest share it (None when
+    the ATR is unknown or the limit would not be positive)."""
+    try:
+        m = float(settings.dip_long_limit_atr) if mult is None else float(mult)
+        lim = float(close) - m * float(atr)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lim) and lim > 0.01):
+        return None
+    return math.floor(round(lim * 100.0, 6)) / 100.0
 
 
 def qualifies(st: Optional[dict]) -> bool:
@@ -227,11 +255,12 @@ def candidates(d: date) -> Tuple[List[str], str]:
         src.append("grouped")
     uni = sel_short.load_universe(d)
     if uni:
-        names |= {t for t, v in uni.items() if v is not None and float(v) >= floor}
+        # the project's symbol form: the universe lists Berkshire as BRK-B AND BRK.B (one company, identical bars)
+        names |= {sel_short._internal_symbol(t) for t, v in uni.items() if v is not None and float(v) >= floor}
         src.append("universe")
     if not names:
         from src.data.intraday_store import DEEP_DIR
-        names = {p.stem for p in DEEP_DIR.glob("*.pkl")}
+        names = {sel_short._internal_symbol(p.stem) for p in DEEP_DIR.glob("*.pkl")}
         src.append("store")
         logger.warning(f"[dip_long] {d}: no prefilter data — testing all {len(names)} stored names")
     return sorted(t for t in names if _sec_type(t) in TYPES), "+".join(src)
@@ -294,7 +323,12 @@ def compute_signals(d: date, extend: bool = True) -> dict:
             inactive = [t for t in stale if t not in traded]
             stale = [t for t in stale if t in traded]
     sig = [{"ticker": tk, **st} for tk, st in rows.items() if qualifies(st)]
+    for r in sig:                                      # the limit entry's price (journaled in either mode)
+        r["limit"] = limit_price(r["close"], r.get("atr14"))
     sig.sort(key=lambda r: (r["rsi2"], r["ticker"]))
+    filt = None
+    if getattr(settings, "enable_dip_long_filter", False):     # PREREG96's RP33 (src/signals/dip_filter.py)
+        sig, filt = _meta_filter(sig, d, prev)
     big = sorted((r for r in ({"ticker": tk, **st} for tk, st in rows.items())
                   if math.isfinite(r["dv20"]) and r["dv20"] >= float(settings.dip_long_min_dollar_volume)),
                  key=lambda r: r["rsi2"])
@@ -308,12 +342,28 @@ def compute_signals(d: date, extend: bool = True) -> dict:
            "next": [r for r in big if not qualifies(r)][:10],
            "computed_at": t0.isoformat(timespec="seconds"),
            "seconds": round((datetime.now(timezone.utc) - t0).total_seconds(), 1)}
+    if filt is not None:                               # the meta-model's verdicts (only with the filter on)
+        out["filter"], out["filtered"] = filt["info"], filt["filtered"]
     _write_json(signals_path(d), out)
     logger.info(f"[dip_long] {d}: {len(sig)} signal(s) from the {prev} close among {len(big)} name(s) over "
                 f"${float(settings.dip_long_min_dollar_volume) / 1e9:g}B a day ({len(names)} prefiltered by {src}"
                 f"{f', {len(stale)} stale' if stale else ''}, {out['seconds']:.0f}s)"
-                + (": " + ", ".join(f"{r['ticker']} RSI2 {r['rsi2']:.1f}" for r in sig) if sig else ""))
+                + (": " + ", ".join(f"{r['ticker']} RSI2 {r['rsi2']:.1f}" for r in sig) if sig else "")
+                + (f" — the meta-model filtered {len(filt['filtered'])}" if filt is not None else ""))
     return out
+
+
+def _meta_filter(sig: List[dict], d: date, prev: date) -> Tuple[List[dict], dict]:
+    """PREREG96's RP33 (`dip_filter.apply`): (the kept signals, the journal block); fail-open — any error keeps
+    every signal and is journaled in the block's ``error`` (a scorer-banner problem)."""
+    try:
+        from src.signals import dip_filter
+        return dip_filter.apply(sig, d, prev)
+    except Exception as e:                                      # noqa: BLE001
+        logger.error(f"[dip_long] {d}: the meta-model filter failed ({type(e).__name__}: {e}) — every signal kept")
+        return sig, {"info": {"model": "PREREG96 RP33", "breadth": len(sig), "scored": 0, "kept": len(sig),
+                              "filtered": 0, "error": f"{type(e).__name__}: {e} — every signal kept"},
+                     "filtered": []}
 
 
 def signals_for(d: date) -> dict:
@@ -501,6 +551,227 @@ def trade_id(d: date, ticker: str) -> str:
     return hashlib.sha1(f"dip|{_iso(d)}|{ticker}".encode("utf-8")).hexdigest()[:16]
 
 
+# ── THE LIMIT ENTRY (user directive 2026-10-09; PREREG59-61) ─────────────────
+# "Deploy the Order holds nothing, fills into the room left for the 1/2 ATR limit in live for the dip buying
+# model. Remember that the simulator needs to mimic production as much as possible." Each signal of session D is
+# an ORDER: a BUY limit at the signal close minus `dip_long_limit_atr` x its 14-session ATR, alive sessions D ..
+# D+`dip_long_limit_sessions`-1. The ledger owns the decision, from the same data the backtest engine reads
+# (`src/backtest/account.py` orders="fill", `strategies/dip.py` `order_pieces`): at each window session's
+# 09:30 tick the pending orders are PLACED deepest dip first (quantity fixed then: the dip slice at the limit,
+# within the live account's room; working orders count toward the 10 dip slots; nothing reserved); an order FILLS
+# at the session's open when it opens at/under the limit, else at the END of the first 30-minute regular-hours bar
+# whose low reaches it (Polygon's bars, the deep store's source) — the fills of a tick before the shorts' entries —
+# buying AT MOST what the room allows then; a touch that finds no room buys nothing and the order waits for the
+# next session. A margin call cancels the working orders (placed again at a later 09:30). An order lapses after
+# its last session. The broker mirrors each working order with a resting IBKR DAY limit sized to the room at each
+# tick (`reconcile._sync_dip_orders`); the trade a fill opens is linked to it.
+
+def limit_mode() -> bool:
+    return str(getattr(settings, "dip_long_entry_mode", "open")).strip().lower() == "limit"
+
+
+def window(d: date) -> List[date]:
+    """The sessions an order of session ``d`` lives in: ``d`` and the next `dip_long_limit_sessions` - 1."""
+    from src.signals.sel_short import session_after
+    n = max(1, int(settings.dip_long_limit_sessions))
+    return [d] + [session_after(d, k) for k in range(1, n)]
+
+
+def orders_path(d: date) -> Path:
+    return root() / "orders" / f"{_iso(d)}.json"
+
+
+def load_orders(d: date) -> List[dict]:
+    p = orders_path(d)
+    if not p.exists():
+        return []
+    try:
+        return list(json.loads(p.read_text(encoding="utf-8")).get("orders") or [])
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning(f"[dip_long] {p} unreadable ({e})")
+        return []
+
+
+def save_orders(d: date, orders: Sequence[dict]) -> None:
+    _write_json(orders_path(d), {"day": _iso(d), "orders": list(orders)})
+
+
+def order_days(today: date) -> List[date]:
+    """The order days whose windows can include ``today``: the last `dip_long_limit_sessions` sessions through it."""
+    from src.signals.sel_short import sessions_before
+    n = max(1, int(settings.dip_long_limit_sessions))
+    back = sessions_before(today, n - 1) if n > 1 else []
+    return back + ([today] if is_session(today) else [])
+
+
+def active_orders(today: date, now: Optional[datetime] = None) -> Dict[date, List[dict]]:
+    """``{order day: its orders}`` for the days whose windows can include ``today`` (files that exist), each pending
+    or working order rescaled through the splits executed since its day (`apply_order_splits`)."""
+    out: Dict[date, List[dict]] = {}
+    for d in order_days(today):
+        o = load_orders(d)
+        if o:
+            apply_order_splits(o, now)
+            out[d] = o
+    return out
+
+
+def apply_order_splits(orders: Sequence[dict], now: Optional[datetime] = None) -> int:
+    """PREREG64: a split executed after an order's day rescales the pending / working order as it does a position —
+    its close, ATR, trend average and limit x the factor (the limit floored to the cent again), its quantities / it
+    (whole shares) — from 04:00 ET of the split's execution date (`tracker._split_day`); idempotent through the
+    stamped ``split_factor`` (the order's own values before the first split in ``split_orig``). The order's prices
+    are its day's terms: the signals of day D are computed after D's pre-open run adjusted the store for the splits
+    executed by D. Returns the number of orders changed."""
+    if not getattr(settings, "enable_split_adjustment", False):
+        return 0
+    live = [o for o in orders if o.get("status") in ("pending", "working")]
+    if not live:
+        return 0
+    from src.data.intraday_store import split_factor_between, split_rows
+    from src.performance.tracker import _split_day
+    rows = split_rows()
+    if rows is None:
+        return 0
+    today = _split_day(now or datetime.now(timezone.utc))
+    n = 0
+    for o in live:
+        tk = str(o.get("ticker") or "").upper()
+        if not rows.get(tk) and not o.get("split_factor"):
+            continue
+        try:
+            d0 = date.fromisoformat(str(o["day"])[:10])
+        except (KeyError, ValueError):
+            continue
+        f = split_factor_between(tk, d0, max(today, d0), rows)
+        done = float(o.get("split_factor") or 1.0)
+        if f is None or f <= 0 or abs(f / done - 1.0) < 1e-9:
+            continue
+        orig = o.setdefault("split_orig", {})
+        for k in ("close", "atr14", "sma_trend", "limit", "qty"):
+            if k not in orig and o.get(k) is not None:
+                orig[k] = float(o[k]) / done if k != "qty" else int(o[k])
+        for k in ("close", "atr14", "sma_trend"):
+            if k in orig:
+                o[k] = round(orig[k] * f, 6)
+        if "limit" in orig:
+            o["limit"] = math.floor(round(orig["limit"] * f * 100.0, 6)) / 100.0
+        if orig.get("qty") is not None:
+            o["qty"] = int(math.floor(round(orig["qty"] / f, 6)))
+        if o.get("ibkr_qty"):
+            o["ibkr_qty"] = int(o["qty"] or 0)
+        o["split_factor"] = f
+        order_event(o, "split", factor=f, limit=o.get("limit"), qty=o.get("qty"))
+        logger.warning(f"[dip_long] {tk}: split since the order's day — limit {o.get('limit')}, quantity "
+                       f"{o.get('qty')} (x{f:g})")
+        n += 1
+    return n
+
+
+def make_order(d: date, sig: dict, rank: int, signal_session: Optional[str]) -> Optional[dict]:
+    """A pending order for signal ``sig`` of session ``d`` (None when its limit cannot be priced)."""
+    lim = sig.get("limit")
+    if lim is None:
+        atr = sig.get("atr14")
+        if atr is None or not math.isfinite(float(atr)):
+            st = name_stats(str(sig["ticker"]), prev_session(d))
+            atr = st.get("atr14") if st and st.get("session") == prev_session(d) else None
+        lim = limit_price(sig.get("close"), atr) if atr is not None else None
+        sig = dict(sig, atr14=atr)
+    if lim is None:
+        return None
+    return {"oid": f"{sig['ticker']}|{_iso(d)}", "ticker": str(sig["ticker"]), "day": _iso(d),
+            "signal_session": signal_session, "rank": int(rank), "rsi2": sig.get("rsi2"), "close": sig.get("close"),
+            "atr14": sig.get("atr14"), "limit": float(lim), "dv20": sig.get("dv20"), "sma_trend": sig.get("sma_trend"),
+            "window": [_iso(x) for x in window(d)], "status": "pending", "qty": None, "placed_at": None,
+            "placed_session": None, "ibkr_qty": 0, "ibkr": None, "ibkr_n": 0, "checked_through": None,
+            "unfunded_session": None, "trade": None, "events": []}
+
+
+def filtered_order(d: date, sig: dict, day: dict) -> dict:
+    """The orders file's record of a signal the meta-model dropped (PREREG96's RP33, `dip_filter`): status
+    ``filtered`` — never placed, never rested at IBKR, no slot — with its score and the cut."""
+    cut = (day.get("filter") or {}).get("cut")
+    o = {"oid": f"{sig['ticker']}|{_iso(d)}", "ticker": str(sig["ticker"]), "day": _iso(d),
+         "signal_session": day.get("signal_session"), "rsi2": sig.get("rsi2"), "close": sig.get("close"),
+         "atr14": sig.get("atr14"), "limit": sig.get("limit"), "dv20": sig.get("dv20"),
+         "sma_trend": sig.get("sma_trend"), "status": "filtered", "filter_score": sig.get("filter_score"),
+         "filter_cut": cut, "qty": None, "ibkr_qty": 0, "ibkr": None, "trade": None, "events": []}
+    order_event(o, "filtered", score=sig.get("filter_score"), cut=cut)
+    return o
+
+
+def order_event(o: dict, what: str, **kw) -> None:
+    o.setdefault("events", []).append({"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "what": what,
+                                       **kw})
+
+
+def session_bars(tk: str, d: date) -> Optional[pd.DataFrame]:
+    """Session ``d``'s regular-hours 30-minute bars from Polygon (naive-UTC bar starts, the bar in progress
+    included) — the source the deep store is extended from. None on a failure."""
+    try:
+        from src.data.intraday_store import _fetch_range, _rth_only
+        df = _fetch_range(tk, _iso(d), _iso(d))
+        return _rth_only(df) if df is not None and not df.empty else pd.DataFrame()
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning(f"[dip_long] {tk}: session bars for {d} unavailable ({e})")
+        return None
+
+
+def _bar_times(bars: pd.DataFrame) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+    st = pd.DatetimeIndex(bars.index)
+    st = st.tz_localize("UTC") if st.tz is None else st.tz_convert("UTC")
+    return st, st + pd.Timedelta(minutes=30)
+
+
+def session_open(bars: Optional[pd.DataFrame], d: date) -> Optional[float]:
+    """The session's open: the first bar's open when that bar starts at 09:30 ET of ``d``."""
+    if bars is None or bars.empty:
+        return None
+    st, _ = _bar_times(bars)
+    first = st[0].tz_convert(ET)
+    if first.date() != d or (first.hour, first.minute) != (9, 30):
+        return None
+    v = float(pd.to_numeric(bars["Open"].iloc[0], errors="coerce"))
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def first_touch(bars: Optional[pd.DataFrame], limit: float, after: datetime,
+                upto: datetime) -> Optional[datetime]:
+    """The END of the first COMPLETED bar (ending after ``after``, at or before ``upto``) whose low reaches
+    ``limit`` — the engine's touch; None when there is none."""
+    if bars is None or bars.empty:
+        return None
+    _, end = _bar_times(bars)
+    low = pd.to_numeric(bars["Low"], errors="coerce").to_numpy(float)
+    a, u = pd.Timestamp(after).tz_convert("UTC"), pd.Timestamp(upto).tz_convert("UTC")
+    for k in range(len(low)):
+        if end[k] <= a or end[k] > u:
+            continue
+        if math.isfinite(low[k]) and low[k] <= float(limit):
+            return end[k].to_pydatetime()
+    return None
+
+
+def last_completed_end(bars: Optional[pd.DataFrame], upto: datetime) -> Optional[datetime]:
+    if bars is None or bars.empty:
+        return None
+    _, end = _bar_times(bars)
+    done = [e for e in end if e <= pd.Timestamp(upto).tz_convert("UTC")]
+    return done[-1].to_pydatetime() if done else None
+
+
+def placed_on_time(o: dict, d: date) -> bool:
+    """Placed (or carried into) session ``d`` at its opening tick — the open-fill rule applies; a placement
+    after 09:35 ET judges only the bars that end after it."""
+    raw = o.get("session_armed_at") or {}
+    at = raw.get(_iso(d)) if isinstance(raw, dict) else None
+    if not at:
+        return False
+    t = datetime.fromisoformat(at).astimezone(ET)
+    return t.date() == d and t.hour * 60 + t.minute <= 575
+
+
 # ── health (the email's scorer banner) ───────────────────────────────────────
 
 def health(now: Optional[datetime] = None, trades: Optional[Sequence[dict]] = None) -> dict:
@@ -526,8 +797,20 @@ def health(now: Optional[datetime] = None, trades: Optional[Sequence[dict]] = No
                                            f"{s.get('signal_session')} in the store: {', '.join(s['stale'][:8])}")
                 else:
                     out["notes"].append(f"dip long: {len(s.get('signals') or [])} signal(s) at the open")
+                if getattr(settings, "enable_dip_long_filter", False):
+                    _filter_health(s, out)
             except Exception:                                   # noqa: BLE001
                 out["problems"].append("dip long: today's signal file is unreadable")
+    if limit_mode():                                   # the limit entry's orders: a note, never an alarm
+        try:
+            books = active_orders(d)
+            work = sum(1 for lst in books.values() for o in lst if o.get("status") == "working")
+            filled = sum(1 for lst in books.values() for o in lst if o.get("status") == "filled"
+                         and any(e.get("what") == "filled" and e.get("session") == _iso(d) for e in o.get("events") or []))
+            if work or filled:
+                out["notes"].append(f"dip long: {work} limit order(s) working, {filled} filled today")
+        except Exception as e:                          # noqa: BLE001
+            logger.debug(f"[dip_long] order summary unavailable ({e})")
     late = []
     for t in trades or []:
         if t.get("status") != "OPEN" or t.get("entry_mechanism") != MECHANISM:
@@ -538,6 +821,26 @@ def health(now: Optional[datetime] = None, trades: Optional[Sequence[dict]] = No
     if late:
         out["problems"].append(f"dip long: held past {settings.dip_long_max_hold_sessions} sessions: {', '.join(late)}")
     return out
+
+
+def _filter_health(s: dict, out: dict) -> None:
+    """The meta-model filter's line in the scorer banner (the switch on): a day whose signals it could not score (every
+    signal kept) or that it never saw is a problem; what it filtered, and SPY read from the deep store, are notes."""
+    f = s.get("filter")
+    if not isinstance(f, dict):
+        if s.get("signals"):
+            out["problems"].append("dip long: the meta-model filter is on but today's signals were computed without it "
+                                   "(every signal kept)")
+        return
+    if f.get("error"):
+        out["problems"].append(f"dip long: the meta-model filter did not score today's signals — {f['error']}")
+        return
+    if not f.get("breadth"):
+        return                                         # no signal today: nothing to say
+    out["notes"].append(f"dip long: the meta-model kept {f.get('kept')} of {f.get('breadth')} signal(s), filtered "
+                        f"{f.get('filtered')} (cut {float(f.get('cut') or 0.0):+.3f})"
+                        + ("; SPY from the deep store (the daily cache lacked the close)"
+                           if f.get("spy_source") == "deep_store" else ""))
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
