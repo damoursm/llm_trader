@@ -283,7 +283,8 @@ def test_the_vol_arm_covers_at_4x_without_its_volatility_exit_and_the_others_kee
 def test_the_etf_arm_gives_back_the_whole_run_up(monkeypatch, on):
     monkeypatch.setattr(settings, "sel_short_etf_give_back", 1.0)
     monkeypatch.setattr(settings, "sel_short_give_back", 0.5)
-    assert ss.give_back("etf") == 1.0 and ss.give_back("vol") == 1.0 and ss.give_back("model") == 0.5
+    monkeypatch.setattr(settings, "sel_short_vol_give_back", 1.25)         # the vol arm keeps its own (G1, 2026-10-14)
+    assert ss.give_back("etf") == 1.0 and ss.give_back("vol") == 1.25 and ss.give_back("model") == 0.5
 
 
 def test_the_squeeze_cover_level_is_the_arms(monkeypatch, on):

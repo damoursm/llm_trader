@@ -312,6 +312,45 @@ def filter_keep(path=None, research: bool = False) -> Dict[str, bool]:
     return {str(o): bool(k) for o, k in zip(W["oid"], W["keep"])}
 
 
+def filter_scores(path=None) -> Dict[str, float]:
+    """{order id: its walk-forward score} — PREREG96's map (`filter_keep`'s file), every signal scored at its signal
+    close by the model of its year (PREREG107's ranking key)."""
+    from config import settings
+    p = Path(path) if path is not None else Path(settings.backtest_research_dir) / FILTER_SCORES
+    W = pd.read_pickle(p)
+    W = W[W["score"].notna()]
+    return {str(o): float(s) for o, s in zip(W["oid"], W["score"])}
+
+
+def rank_pieces(pieces: Sequence[dict], scores: Mapping[str, float], by: str = "score",
+                topk: Optional[int] = None) -> List[dict]:
+    """PREREG107 (user 2026-10-14: "does it favor its best picks first? Would it be better the buy the top 1 pick even
+    if we have more slots available?"): the dip book's order pieces (`order_pieces`, shared: copied, never modified)
+    ranked by the meta-model's walk-forward score, highest first (``by="score"``: rank = -score; an unscored order
+    after every scored one, by its RSI2 — production's key; ``by="rsi2"`` keeps production's ranks), and with ``topk``
+    only each signal day's ``topk`` best orders by that score (the day = the order's first session, its ``oid``; an
+    unscored order ranks after the scored ones, by its RSI2)."""
+    if by not in ("score", "rsi2"):
+        raise ValueError(f"by must be 'score' or 'rsi2', not {by!r}")
+
+    def key(p) -> float:
+        s = scores.get(str(p.get("oid")))
+        return -float(s) if s is not None else 1e6 + float(p.get("rank", 0.0))
+    out = [dict(p, rank=key(p)) if by == "score" else dict(p) for p in pieces]
+    if topk is None:
+        return out
+    best: Dict[str, List[tuple]] = {}
+    for p in out:
+        oid = str(p.get("oid"))
+        day = oid.split("|")[-1]
+        best.setdefault(day, [])
+        k = key(p)
+        if (k, oid) not in best[day]:
+            best[day].append((k, oid))
+    keep = {oid for day, rows in best.items() for _, oid in sorted(rows)[:int(topk)]}
+    return [p for p in out if str(p.get("oid")) in keep]
+
+
 def filter_pieces(pieces: Sequence[dict], keep: Mapping[str, bool]) -> List[dict]:
     """``pieces`` (`order_pieces`, built once and shared) without every piece of an order ``keep`` maps to False — the
     same pieces as building them with ``keep``."""

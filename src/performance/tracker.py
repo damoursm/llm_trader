@@ -5072,13 +5072,16 @@ def _dip_slots_working(books: Dict) -> int:
 
 
 def _place_dip_orders(day: dict, d: date, now: datetime, run_id: Optional[str]) -> int:
-    """At the session's opening tick: today's signals become pending orders (once); then every order whose window
-    includes today — deepest dip first — is ARMED (a working order carried from an earlier session) or PLACED (a
-    pending one: its quantity fixed now, the dip slice at its limit within the live account's room; working orders
-    count toward the 10 dip slots, nothing is reserved; another book's name, no slot or no room: tried again at the
-    next session's open). An order armed at the opening tick fills at once when the session opened at/under its
-    limit (`_fill_dip_orders`). Returns the longs opened PLUS the orders placed or armed — non-zero makes the live
-    path sync the broker at once, so the resting IBKR orders go out right after the open."""
+    """At the session's opening tick: today's signals become pending orders (once; with the daily top pick on —
+    PREREG116's Q1, `dip_long_daily_top` — only the day's top pick, the others journaled ``not_top``); then every
+    order whose window includes today — the best-ranked first (`dip_long.rank_key`; the deepest dip first with the
+    rule off) — is ARMED (a working order carried from an earlier session) or PLACED (a pending one: its quantity
+    fixed now, the dip slice at its limit within the live account's room; working orders count toward the
+    `dip_long_account_slices` dip slots, nothing is reserved; another book's name, no slot or no room: tried again at
+    the next session's open; a pending order of a day before the daily top pick is ``superseded``, never placed). An
+    order armed at the opening tick fills at once when the session opened at/under its limit (`_fill_dip_orders`).
+    Returns the longs opened PLUS the orders placed or armed — non-zero makes the live path sync the broker at once,
+    so the resting IBKR orders go out right after the open."""
     from src.performance import live_account
     from src.signals import dip_long
     iso = d.isoformat()
@@ -5093,8 +5096,10 @@ def _place_dip_orders(day: dict, d: date, now: datetime, run_id: Optional[str]) 
             dip_long.journal_entry(d, sig, "no_limit")
             logger.warning(f"[dip_long] {sig.get('ticker')}: no 14-session ATR — no limit order")
             continue
-        if sig.get("filter_score") is not None:       # the meta-model's score (PREREG96's RP33, the filter on)
+        if sig.get("filter_score") is not None:       # the meta-model's score (the RP33 filter / the daily top pick)
             o["filter_score"] = sig["filter_score"]
+        if sig.get("top_rank") is not None:           # PREREG116's Q1: the day's top pick (`dip_long.placeable`)
+            o["dip_top"] = int(sig["top_rank"])
         todays.append(o)
         have.add(o["oid"])
         added += 1
@@ -5105,20 +5110,32 @@ def _place_dip_orders(day: dict, d: date, now: datetime, run_id: Optional[str]) 
         todays.append(o)
         have.add(o["oid"])
         added += 1
+    for sig in day.get("not_top") or []:              # not the day's top pick (PREREG116's Q1): journaled, never placed
+        if f"{sig.get('ticker')}|{iso}" in have:
+            continue
+        o = dip_long.not_top_order(d, sig, day)
+        todays.append(o)
+        have.add(o["oid"])
+        added += 1
     if added:
         dip_long.save_orders(d, todays)
     books = dip_long.active_orders(d)
     trades = _load_trades()
     other = _dip_other_book(trades)
     now_iso = now.isoformat(timespec="seconds")
-    cand = sorted(((float(o["rsi2"]) if o.get("rsi2") is not None else 1e9, o["day"], o["ticker"], dd, o)
-                   for dd, lst in books.items() for o in lst
+    if dip_long.daily_top() > 0:                      # the daily top picks, best first (the engine's rank order)
+        def order_key(o):
+            return dip_long.rank_key(o) + (o["day"],)
+    else:                                             # the deepest dip first
+        def order_key(o):
+            return (float(o["rsi2"]) if o.get("rsi2") is not None else 1e9, o["day"], o["ticker"])
+    cand = sorted(((order_key(o), dd, o) for dd, lst in books.items() for o in lst
                    if iso in (o.get("window") or []) and o.get("status") in ("pending", "working")),
-                  key=lambda x: x[:3])
+                  key=lambda x: x[0])
     working = _dip_slots_working(books)
     changed: set = set()
     armed_now = 0
-    for _, _, _, dd, o in cand:
+    for _, dd, o in cand:
         if iso in (o.get("session_tried") or {}):
             continue                                  # one placement a session, as in the engine
         o.setdefault("session_tried", {})[iso] = now_iso
@@ -5127,6 +5144,10 @@ def _place_dip_orders(day: dict, d: date, now: datetime, run_id: Optional[str]) 
             o.setdefault("session_armed_at", {})[iso] = now_iso
             dip_long.order_event(o, "armed", session=iso)
             armed_now += 1
+            continue
+        if not dip_long.placeable(o):                 # a day's order from before the daily top pick: never placed
+            o.update(status="superseded", ibkr_qty=0)
+            dip_long.order_event(o, "superseded", session=iso, why="not a day's top pick (the daily top pick rule)")
             continue
         if o["ticker"] in other:
             dip_long.order_event(o, "held", session=iso)
@@ -5189,7 +5210,13 @@ def _fill_dip_orders(fills: List[tuple], trades: List[dict], now: datetime, run_
     other = _dip_other_book(trades)
     ids = {t.get("recommendation_id") for t in trades}
     journal = []
-    for at, dd, o, price, kind in sorted(fills, key=lambda f: (f[0], float(f[2].get("rsi2") or 0.0))):
+    if dip_long.daily_top() > 0:                      # the daily top picks: best first at one instant (the engine)
+        def fill_key(f):
+            return (f[0], dip_long.rank_key(f[2]))
+    else:                                             # the deepest dip first
+        def fill_key(f):
+            return (f[0], float(f[2].get("rsi2") or 0.0))
+    for at, dd, o, price, kind in sorted(fills, key=fill_key):
         tk = o["ticker"]
         changed.add(dd)
         o["checked_through"] = at.isoformat(timespec="seconds")
@@ -5219,8 +5246,10 @@ def _fill_dip_orders(fills: List[tuple], trades: List[dict], now: datetime, run_
         extra = {"dip_entry_mode": "limit", "dip_limit": float(o["limit"]), "dip_atr14": o.get("atr14"),
                  "dip_order_day": o["day"], "dip_order_qty": int(o.get("qty") or 0), "dip_fill_kind": kind,
                  "dip_order_placed_at": o.get("placed_at"), "dip_fill_cap": int(cap)}
-        if o.get("filter_score") is not None:          # the meta-model's score of the signal (the filter on)
+        if o.get("filter_score") is not None:          # the meta-model's score of the signal
             extra["dip_filter_score"] = o["filter_score"]
+        if o.get("dip_top") is not None:               # its rank among the day's signals (PREREG116's Q1)
+            extra["dip_top_rank"] = int(o["dip_top"])
         ib = o.get("ibkr") or {}
         if kind == "touch" and ib.get("ref") and ib.get("session") == iso and ib.get("state") == "working":
             # the fill IS the resting IBKR order's: the broker reads its execution (or, unfilled, cancels it and

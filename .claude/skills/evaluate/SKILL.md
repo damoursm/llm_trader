@@ -1,6 +1,6 @@
 ---
 name: evaluate
-description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO KINDS of test sets: the NEWS test sets for signals and models, each reported separately, never pooled (news set 1 history 2026-06-17..09-27, news set 2 live all-source news from 2026-09-28), and the BORROW-DATA sets for strategy backtests, DECIDED on their union — the POOLED HISTORY A0 + A + B, 2018-01-02..2026-09-24 (set A0 2018-01-02..2021-01-29 and set A 2021-02-01..2024-06-24 with IBKR's short-stock file, set B 2024-06-25..2026-09-24 without it; set C our own archive from 2026-09-25, set D the forward holdout — src/backtest/periods.py), every set reported beside; model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective for models trained on it; gates/exits = counterfactual excess return per decision; the LIVE STRATEGY (the $10,000 live account) = return per day, the GROSS win rate AND growth per year on the pooled history (no deposits, the simulator that mimics production, src/backtest/mimic.py) with its years and months; each ARM qualified for the bank on the pooled history (>= 100 trades in 30 entry months, the return per day's entry-month interval above 0, both halves and every leave-one-year-out positive, growth at its slice — src/backtest/bank.py); a change by the pooled add rule (add_rule.pooled_verdict); label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
+description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO KINDS of test sets: the NEWS test sets for signals and models, each reported separately, never pooled (news set 1 history 2026-06-17..09-27, news set 2 live all-source news from 2026-09-28), and the BORROW-DATA sets for strategy backtests, DECIDED on their union — the POOLED HISTORY A0 + A + B, 2018-01-02..2026-09-24 (set A0 2018-01-02..2021-01-29 and set A 2021-02-01..2024-06-24 with IBKR's short-stock file, set B 2024-06-25..2026-09-24 without it; set C our own archive from 2026-09-25, set D the forward holdout — src/backtest/periods.py), every set reported beside; model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective for models trained on it; gates/exits = counterfactual excess return per decision; the LIVE STRATEGY (the $10,000 live account) = return per day, the GROSS win rate AND growth per year on the pooled history (no deposits, the simulator that mimics production, src/backtest/mimic.py) with its years and months; each ARM qualified for the bank on the pooled history (>= 100 trades in 30 entry months, the return per day's entry-month interval above its bar — 0 for a short arm, the same exposure's average day for a long one: SPY, or the fund it trades —, both halves and every leave-one-year-out above it, growth at its slice; an arm failing only significance re-judged on its longest history, clustered — src/backtest/bank.py); a change by the pooled add rule (add_rule.pooled_verdict); label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
 argument-hint: "[what to evaluate, e.g. 'the ml_exit upgrade' or 'Gate 1c']"
 ---
 
@@ -166,12 +166,26 @@ time, on the POOLED HISTORY (§1b), with each arm's GROSS win rate beside (user 
    have growth all the time ... enough trades made so that the results are
    significant, reliable, and transferable"): on the pooled history its own trades —
    at least 100 in at least 30 entry months, the return per day's 95% interval (an
-   entry-month bootstrap) above 0, its average trade positive in both chronological
-   halves and with any one calendar year left out, growth at its live slice;
-   INSUFFICIENT when only short of trades. Its context cells (SPY trend x volatility
+   entry-month bootstrap) above its BAR, its return per day above the bar in both
+   chronological halves and with any one calendar year left out, growth at its live
+   slice; INSUFFICIENT when only short of trades. THE BAR (user 2026-10-15: "test long
+   arms against the market's average daily rise. The idea is to beat the market"): 0
+   for a short arm; for a long arm the same exposure's average day over the same span
+   — SPY's for a stock arm, the fund it trades for an index arm (a 3x fund's own
+   average day: the leverage is never the edge) — `bank.BENCH`, `bank.bench_rpd`. THE
+   RE-JUDGING (user 2026-10-15): an arm failing ONLY significance, its return per day
+   above its bar, is judged on its longest history, significance clustered by month
+   (never trade by trade). Its context cells (SPY trend x volatility
    tercile at the entry, >= 30 trades) say where it earns and where it loses; a filter
    keeping it out of a losing context is justified by >= 30 significantly losing
    removed trades (`bank.filter_test`) and measured out of time (`bank.walk_forward`).
+   CONTEXT ACTIVATION (user 2026-10-14: "a model should understand the context and be
+   activated if historically it performs well in it"): a model trades only in the
+   market cells its walk-forward map switches on (`src/backtest/context.py`, point in
+   time; `bank.activation_map` / `schedule` / `activated`; PREREG108's rules) and is
+   judged on its ACTIVATED trades — no trades in a context it is off in is no fault;
+   a map reaches production only through the pooled add rule
+   (`Mimic(activation=<schedule>)`).
 
 The two can disagree (the vol arm's 100% give-back raised growth and lowered return per
 day): say so and let the user choose. Every trade is net of the costs production's
@@ -335,8 +349,8 @@ parts and the months:
 
 For an ARM, its bank card (`python -m src.backtest.bank`):
 
-| arm | verdict | trades / months | return/day (95%) | gross win | halves | worst year left out | alone at its slice | earns / loses in |
-|---|---|---|---|---|---|---|---|---|
+| arm | verdict (basis) | trades / months | return/day (95%) | bar | gross win | halves | worst year left out | alone at its slice | earns / loses in |
+|---|---|---|---|---|---|---|---|---|---|
 
 For a model trained on the selection objective, add per side:
 

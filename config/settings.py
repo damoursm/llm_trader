@@ -3006,15 +3006,15 @@ class Settings(BaseSettings):
     # is stamped (`sel_halted`, `sel_halt_since`, `sel_halt_reason`) and named in the log. The halt-history rules
     # (PREREG22 / 22b) are separate studies.
     enable_sel_short_halt_guard: bool = True
-    # ONE POSITION PER TICKER is OFF (user directive 2026-09-28: "Remove the one
-    # position per ticker rule and restart the scheduler"): a repeat pick of a name
-    # the book already shorts opens ANOTHER trade — a second short of the base size,
-    # netted into one position at IBKR (the broker sync splits it by what each open
-    # trade owns). 0 = no limit; 1 = the old rule (a repeat pick is noted on the open
-    # trade, `sel_also`). Measured on 2025 + Jan-Sep 2026 (live book): model 0.87 ->
-    # 1.04 %/day, vol 1.99 -> 2.22 — not significant; up to 3-4 shorts stacked on one
-    # name (memory/sel-short-backtest-audit-2026-09.md).
-    sel_short_max_open_per_ticker: int = 0
+    # AT MOST TWO OPEN SHORTS OF ONE NAME across the arms (PREREG113's C2 in PREREG116's Q1, user 2026-10-15:
+    # "Deploy Q1"): a repeat pick of a name the book already shorts opens ANOTHER trade (user directive 2026-09-28:
+    # "Remove the one position per ticker rule") — netted into one position at IBKR, the broker sync splitting it by
+    # what each open trade owns — until the name holds this many open selection-short trades, whatever their arm; a
+    # pick past it is settled `already_open` (noted on the newest open trade, `sel_also`). 0 = no limit (to
+    # 2026-10-15: up to 3-4 shorts stacked on one name); 1 = one per name. Every margin call of the live draws was a
+    # squeeze on a name the account held (BMNR x3 in 2025-07): C2 alone -0.01 +- 0.24 log points a year, margin-call
+    # pairs 10 -> 8 (PREREG113; memory/pooled-retune-new-arms-2026-10.md).
+    sel_short_max_open_per_ticker: int = 2
     # Exits are judged at EVERY tick, in every session (user directive 2026-09-27:
     # "We should always have the possibility to enter or exit at any time"); the
     # target only on a mark fetched within this many minutes.
@@ -3240,7 +3240,8 @@ class Settings(BaseSettings):
     # (20-session mean of close x volume), closed above its `dip_long_trend_sessions` average and had a 2-session
     # RSI under `dip_long_rsi_max`; SELL at the open after the first close above its `dip_long_exit_sma_sessions`
     # average, or after `dip_long_max_hold_sessions` sessions. Its own simulated cash account:
-    # `dip_long_account_initial`, no deposits, `dip_long_account_slices` slices (deepest dip first). Entries only
+    # `dip_long_account_initial`, no deposits, `dip_long_account_slices` slices (each day's top pick from 2026-10-16:
+    # `dip_long_daily_top`; the live account sizes it when `enable_live_account` is on). Entries only
     # within `dip_long_entry_window_minutes` of the 09:30 open. Measured: 2007-20 (untouched) 71% winners, +0.54%
     # a trade, +0.26% over SPY the same days (95% +0.12..+0.39), the $10k account +9.3 %/yr vs SPY with dividends
     # +9.1 (dd 26% vs 55%); 2021-26 (where it was found, delisted names included) +0.94% a trade, +16.3 vs +12.9 %/yr.
@@ -3256,8 +3257,22 @@ class Settings(BaseSettings):
     dip_long_exit_sma_sessions: int = 5
     dip_long_max_hold_sessions: int = 10
     dip_long_account_initial: float = 10000.0
-    dip_long_account_slices: int = 10
+    # each dip long 1/`dip_long_account_slices` of the live account, at most that many open (`live_account.size_long`;
+    # working orders count as slots) — 6 from 2026-10-16 with the daily top pick below (PREREG116's Q1; 10 before)
+    dip_long_account_slices: int = 6
     dip_long_entry_window_minutes: float = 60.0
+    # THE DAILY TOP PICK (PREREG107's O4 at PREREG116's 1/6 slice = Q1 with the stacking cap; user 2026-10-15: "Deploy
+    # Q1"; from the 2026-10-16 session): each signal day only its `dip_long_daily_top` best signals become limit
+    # orders, ranked by `dip_long_rank` — "score": the meta-model's score (`dip_filter.score_signals`, the model
+    # `dip_long_filter_model`, NO cut: the RP33 filter stays `enable_dip_long_filter`), highest first, an unscored
+    # signal after every scored one by its RSI2 (`dip_long.rank_key`, the simulator's `strategies.dip.rank_pieces`);
+    # "rsi2": the deepest dip first. The others are journaled `not_top` (never placed, no slot), and an order of a
+    # day before the rule is never placed (`superseded`). 0 = every signal an order (the rule to 2026-10-15). NEVER
+    # raise the slice with this at 0: the 1/5 slice without the daily top-1 took the live draws' margin-call pairs
+    # 10 -> 27 (PREREG117). Q1 (20 draws a set, pooled A0+A+B): +2.89 +- 0.29 log points a year, margin-call pairs
+    # 10 -> 7, worst drawdown 27.8 -> 26.4.
+    dip_long_daily_top: int = 1
+    dip_long_rank: str = "score"
     # THE LIMIT ENTRY (user directive 2026-10-09: "deploy the Order holds nothing, fills into the room left for the
     # 1/2 ATR limit in live for the dip buying model"; PREREG59-61, memory/dip-delayed-entry-2026-10.md): "limit" =
     # each signal becomes a BUY limit at the signal close minus `dip_long_limit_atr` x its 14-session average true

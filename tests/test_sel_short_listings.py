@@ -57,6 +57,9 @@ def _stand(res):
 # ── routing ──────────────────────────────────────────────────────────────────
 
 def test_the_vol_arm_ranks_its_added_stocks_and_no_other_arm_does(monkeypatch, on):
+    # UVIX stands for any product of the model's names: the VIX block (2026-10-14) is pinned off — its tests are in
+    # tests/test_sel_short.py
+    monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", False)
     monkeypatch.setattr(ss, "load_model", lambda: (None, {"tickers": ["AAA", "UVIX"]}))
     monkeypatch.setitem(ss._TYPES, "t", {"AAA": "CS", "UVIX": "ETF", "NEWETF": "ETF", "NEWCO": "CS"})
     _write_listings(["NEWCO"])

@@ -219,3 +219,130 @@ def test_activated_keeps_a_trade_only_where_its_month_s_map_holds_its_cell():
     assert keep[early.to_numpy()].all()                                 # the burn-in year takes everything
     late_bad = ((t.cell == "below/high") & (t.day > pd.Timestamp("2019-06-01"))).to_numpy()
     assert not keep[late_bad].any() and keep[(t.cell == "above/mid").to_numpy()].all()
+
+
+def test_the_arm_alone_skips_entries_past_its_open_cap():
+    t = pd.DataFrame({"entry_day": pd.to_datetime(["2018-02-01", "2018-02-02", "2018-02-03"]),
+                      "days": [10.0, 10.0, 10.0], "net": [10.0, 10.0, 10.0]})
+    full = BK.alone(t, 0.5, "2018-01-02", "2019-01-02")
+    capped = BK.alone(t, 0.5, "2018-01-02", "2019-01-02", max_open=1)
+    assert full["skipped"] == 0 and capped["skipped"] == 2
+    assert abs(capped["end_equity"] - 10_000 * 1.05) < 1e-6
+    assert full["end_equity"] > capped["end_equity"]
+
+
+# ── the bar and the re-judging (user directive 2026-10-15: "Adopt the re-judging rule and test long arms against the
+# market's average daily rise. The idea is to beat the market but I'm also ok with using 3x for trades we are
+# confident the market will go up (or down).") ──
+
+def _flat_bench(daily_pct, lo="1999-01-01", hi="2026-12-31"):
+    """A benchmark rising ``daily_pct`` every weekday."""
+    days = pd.bdate_range(lo, hi)
+    return pd.Series(daily_pct, index=days, name=f"flat{daily_pct}")
+
+
+def _monthly(months, per_month, values, seed=0, days=3.0, sd=0.0):
+    """Trades on the first days of ``months`` ("YYYY-MM"), ``per_month`` each, month k's trades around ``values[k]``."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for k, m in enumerate(months):
+        first = pd.Period(m, "M").to_timestamp()
+        for j in range(per_month):
+            v = float(values[k % len(values)]) + (rng.normal(0.0, sd) if sd else 0.0)
+            rows.append({"entry_day": first + pd.Timedelta(days=j), "net": v, "gross": v, "days": days})
+    t = pd.DataFrame(rows)
+    t["book"], t["ticker"] = "x", "T"
+    t["decision"] = [d.date() for d in t.entry_day]
+    t["year"] = pd.DatetimeIndex(t.entry_day).year
+    t["set"] = [periods.set_of(d, extra=True) for d in t.decision]
+    t["month"] = pd.DatetimeIndex(t.entry_day).to_period("M").astype(str)
+    return t
+
+
+def _pool_months(per_year=4):
+    """``per_year`` months in each pooled year (2018 .. 2026)."""
+    return [f"{y}-{m:02d}" for y in range(2018, 2027) for m in (2, 4, 6, 8)[:per_year]]
+
+
+def test_the_bar_is_the_benchmark_s_average_day_over_the_days_a_session_spans():
+    b = _flat_bench(0.1)
+    r = BK.bench_rpd(b, "2018-01-02", "2026-09-24")
+    gap = 7.0 / 5.0                                                     # weekdays: a session spans 1.4 days
+    assert abs(r - BK.per_day(0.1, gap)) < 2e-4, r
+    up = pd.Series(np.where(b.index.year == 2020, 1.0, 0.1), index=b.index)
+    assert BK.bench_rpd(up, "2018-01-02", "2026-09-24") > r
+    assert abs(BK.bench_rpd(up, "2018-01-02", "2026-09-24", exclude_years=[2020]) - r) < 2e-4
+
+
+def test_a_long_arm_must_beat_its_bar_a_short_arm_only_zero():
+    t = _trades(400, 0.6, 1.0, seed=12)                                 # ~ +0.2 %/day, held 3 days
+    alone = BK.qualify(BK.card(t, "x", slice_=0.1))
+    assert alone["verdict"] == "QUALIFIES" and alone["bar"] == 0.0 and alone["bar_spec"] is None, alone
+    c = BK.card(t, "x", slice_=0.1, bench=_flat_bench(0.5))            # the market +0.5% a weekday: ~0.36 %/day
+    q = BK.qualify(c)
+    assert c["bench"]["rpd"] > c["overall"]["rpd_hi95"]
+    assert q["verdict"] == "FAILS" and not q["checks"]["significant"] and not q["checks"]["halves"], q
+    assert "average day" in q["why"][0]
+    low = BK.qualify(BK.card(t, "x", slice_=0.1, bench=_flat_bench(0.05)))
+    assert low["verdict"] == "QUALIFIES" and 0.0 < low["bar"] < 0.05, low
+
+
+def test_every_long_live_arm_has_a_bar_and_no_short_arm_has_one():
+    from src.backtest import reliability as REL
+    longs = {a for a, s in REL.SIDE.items() if s == "long"}
+    assert longs and longs == set(BK.BENCH), (longs, BK.BENCH)
+
+
+def test_an_arm_failing_only_significance_is_re_judged_on_its_longest_history():
+    pool = _monthly(_pool_months(), 3, [4.0, -3.6])                    # +0.2 a trade every year; months +-12
+    c = BK.card(pool, "x", slice_=0.1)
+    q = BK.qualify(c)
+    assert q["verdict"] == "FAILS" and [k for k, v in q["checks"].items() if v is False] == ["significant"], q
+    early = _monthly([f"{y}-{m:02d}" for y in range(2000, 2018) for m in range(1, 13)], 2, [1.0], sd=0.5, seed=13)
+    c = BK.card(pool, "x", slice_=0.1, long_trades=early)
+    q = BK.qualify(c)
+    assert q["verdict"] == "QUALIFIES" and q["basis"] == "longest (re-judged)", q
+    assert q["pooled_checks"]["significant"] is False and c["longest"]["n"] == len(pool) + len(early)
+    assert c["longest"]["episodes"] == 36 + 216 and c["longest"]["years_before"][0] == "2000"
+    bad_half = pd.concat([_monthly(_pool_months()[:18], 6, [-1.0]), _monthly(_pool_months()[18:], 6, [3.0])])
+    q = BK.qualify(BK.card(bad_half, "x", slice_=0.1, long_trades=early))
+    assert q["basis"] == "pooled" and q["checks"]["halves"] is False, q   # another check failed: no re-judging
+
+
+def test_the_longest_history_s_significance_counts_each_month_once():
+    pool = _monthly(_pool_months(), 3, [4.0, -3.6])
+    months = [f"{y}-{m:02d}" for y in range(2000, 2018) for m in range(1, 13)]
+    early = _monthly(months, 20, [5.0, -4.6])                            # +0.2 a trade; each month all one way
+    x = np.r_[early.net.to_numpy(), pool.net.to_numpy()]
+    assert x.mean() / (x.std(ddof=1) / math.sqrt(len(x))) > 1.96       # trade by trade it would look significant
+    c = BK.card(pool, "x", slice_=0.1, long_trades=early)
+    q = BK.qualify(c)
+    assert q["basis"] == "longest (re-judged)" and q["verdict"] == "FAILS" and not q["checks"]["significant"], q
+    assert c["longest"]["rpd_lo95"] < 0
+
+
+def test_yearly_summaries_are_judged_clustered_and_against_the_bar():
+    pooled = _trades(17, 5.0, 8.0, seed=6)
+    long = {"by_year": {str(y): {"n": 4, "avg_trade": 2.5 + (0.8 if y % 2 else -0.8), "sd_trade": 6.0,
+                                 "avg_days": 5.0} for y in range(1990, 2015)}}
+    c = BK.card(pooled, "x", long=long, slice_=0.25)
+    assert BK.qualify(c)["verdict"] == "QUALIFIES" and c["longest"]["bar"] == 0.0
+    assert c["longest"]["t"] <= c["longest"]["t_trades_vs_0"] + 1e-9   # the larger standard error decides
+    hot = BK.card(pooled, "x", long=long, slice_=0.25, bench=_flat_bench(1.5, lo="1989-01-01"))
+    q = BK.qualify(hot)
+    assert hot["longest"]["bar_trade"] > hot["longest"]["mean"] and q["verdict"] == "FAILS", q
+    assert not q["checks"]["significant"] and q["basis"] == "longest"
+
+
+def test_the_benchmark_takes_the_carried_history_before_the_daily_cache(monkeypatch):
+    late = pd.Series([0.2, 0.2], index=pd.to_datetime(["2010-02-12", "2010-02-16"]))
+    carried = {"TQQQ": {"days": ["2009-12-31", "2010-02-11", "2010-02-12"], "ret": [1.0, 2.0, 9.0]}}
+    BK.bench_daily.cache_clear()
+    monkeypatch.setattr(BK, "_cache_returns", lambda sym: late)
+    monkeypatch.setattr(BK, "_carried_bench", lambda: carried)
+    try:
+        s = BK.bench_daily("TQQQ")
+        assert list(s.index.strftime("%Y-%m-%d")) == ["2009-12-31", "2010-02-11", "2010-02-12", "2010-02-16"]
+        assert list(s.to_numpy()) == [1.0, 2.0, 0.2, 0.2]               # the cache wins where both hold a day
+    finally:
+        BK.bench_daily.cache_clear()

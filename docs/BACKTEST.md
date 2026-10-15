@@ -86,8 +86,10 @@ scratchpads on 2026-10-08; junctions at the old scratchpad paths keep the older 
   activated by their own rules, never by a regime switch; the evaluation standard, user 2026-10-14 — one pooled
   history, a bank of models): (1) standalone on the pooled history A0 + A + B (and the longest history its data
   allow): its card and its bank qualification (`bank.card` / `bank.qualify`: at least 100 trades in 30 entry months,
-  the return per day's entry-month bootstrap interval above 0, both chronological halves and every leave-one-year-out
-  positive, growth at its live slice), per year and per market context — where it earns, where it loses (a context it
+  the return per day's entry-month bootstrap interval above its BAR — 0 for a short arm, for a long arm the same
+  exposure's average day: SPY's, or the fund it trades —, both chronological halves and every leave-one-year-out above
+  it, growth at its live slice; re-judged on its longest history when it fails only significance), per year and per
+  market context — where it earns, where it loses (a context it
   loses in becomes a filter in its OWN rule, justified by `bank.filter_test` and measured out of time by
   `bank.walk_forward`); (2) in the live account (`Mimic()` + V6 + the arm as one more `Strategy`, 20 stratified draws
   a pooled set, each draw's daily NAV saved): the pooled add rule (`add_rule.pooled_verdict`) with every set and every
@@ -319,6 +321,23 @@ Tests: `tests/test_backtest_prereg102_104.py`. Studies: `llm_trader_research/stu
 live draws S3, E1 = F0; `account102.py`), `studies/prereg104/account104.py` and `studies/prereg96/account96_prod.py`
 (DF, paired on the same live draws).
 
+### The dip book's daily top pick and at most two shorts of one name (PREREG116's Q1, from the 2026-10-16 session)
+
+User 2026-10-15: "Deploy Q1". `Mimic`'s defaults follow production: ``dip_rank`` / ``dip_topk`` read `dip_long_rank` /
+`dip_long_daily_top` (production: "score" / 1 — each signal day only its best order by the walk-forward score,
+`dip.rank_pieces(pieces, dip.filter_scores(), by="score", topk=1)`, production's `dip_long.rank_key`; 0 = None, ranked by
+"rsi2"), the dip slice `dip_long_account_slices` (6, as many open; ``dip_slices`` overrides), ``short_name_cap`` /
+``short_name_scope`` `sel_short_max_open_per_ticker` (2) across the three short arms ("all"). `Mimic()` is therefore
+PREREG116's Q1 (`Mimic(dip_rank="score", dip_topk=1, dip_slices=6, short_name_cap=2, short_name_scope="all")` with
+study102's `BASE_KW`); `Mimic.off()` keeps the rules before (every signal an order at 1/10, no cap). The walk-forward
+scores (`dip.filter_scores`, PREREG96's `prod96/wf_scores_prod.pkl`) run to the signals of 2026-10-06: a later signal is
+unscored and ranked by its RSI2 — production scores it with the model fit on the signals exiting before 2026-10-08.
+THE LIVE REFERENCE for a paired study is now Q1's draws (`studies/prereg116/runs/{A0,A,B}_Q1_s<seed>.pkl`, 20 a set,
+each with its daily NAV; `bank.LIVE_RUNS`); study102's fingerprint (`dip_long_account_slices` among its settings, the
+Mimic fields off their pre-Q1 values) refuses to pair a new run with the old `LIVE_S3` draws — register a new reference
+instead. Tests: `tests/test_dip_top_pick.py` (production and the simulator choose the same order; the defaults follow
+the settings), `tests/test_backtest_dip_rank.py`, `tests/test_backtest_research_books.py`.
+
 ## A rule under test: the short books on sell limits (`Mimic(short_limit=...)`, PREREG66, 2026-10-09)
 
 The dip book's limit entry mirrored for the short arms — a research option, OFF by default, not production:
@@ -514,24 +533,45 @@ need multiple models in our bank of models so that we cover all market condition
   (`audit.card_dirs`) — rebuild them after a live change (`python -m src.backtest.reliability --build` and
   `--build --sets A0`). The daily-bar books' earlier years: PREREG103's LONG history (`table1[arm]["LONG"]["by_year"]`,
   the dip book 2007-2020 — survivorship-biased, context —, the crash book 1988-2020), only its years before 2018. The
-  combination: the live configuration's draws with a daily NAV each (`LIVE_RUNS`: PREREG102's `LIVE_S3`, the
-  configuration of 2026-10-14); a draw without a NAV is read from its positions' P&L realized at their exits
+  combination: the live configuration's draws with a daily NAV each (`LIVE_RUNS`: PREREG116's `Q1`, the
+  configuration from the 2026-10-16 session; PREREG102's `LIVE_S3` for 2026-10-14's); a draw without a NAV is read from its positions' P&L realized at their exits
   (flagged ``realized``).
-* `card(T, arm, regimes, long, slice_, n_trials)`: `overall` (`quality`: `reliability.stats` + the months, the skew,
+* `card(T, arm, regimes, long, slice_, n_trials, max_open, bench, long_trades)`: `overall` (`quality`:
+  `reliability.stats` + the months, the skew,
   the month-clustered t of the mean trade and the return per day's 95% interval from `month_boot` — a bootstrap over
   ENTRY MONTHS, 10,000 resamples, seed 0), `halves` (the first and second half of its trades by time), `loyo` (the
   average trade and return per day with each calendar year left out), `by_year`, `by_set`, `context` (`trend`, `vol`,
   `cell`: SPY above / below its 200-session average and its 20-session realized-volatility tercile at the entry —
   `reliability.regime_table`, whole-history terciles, a reading label — each cell `EARNS` / `LOSES` / `unclear` from
   `MIN_CELL` 30 trades in `MIN_CELL_MONTHS` 10 months), `alone` (the arm alone at its live slice of $10,000: P&L
-  realized at the exits and compounded — growth a year, the worst drawdown, every year), `longest` (with the earlier
-  years: n, the mean and its t, the episodes, the halves before 2018 / 2018-2026, leave-one-year-out), `dsr` (the
-  deflated Sharpe ratio, `audit.dsr_trades`, N from `trials.count`).
+  realized at the exits and compounded — growth a year, the worst drawdown, every year), `bench` (a LONG arm's bar:
+  its benchmark's return per day over the pool, over each half's span and with each year left out), `longest` (with
+  the earlier years — `long` yearly summaries or `long_trades` a table: n, the mean, the clustered significance
+  against the bar, the episodes, the halves before 2018 / 2018-2026 and leave-one-year-out against the bar, `checks`
+  1-3), `dsr` (the deflated Sharpe ratio, `audit.dsr_trades`, N from `trials.count`).
+* THE BAR (user directive 2026-10-15: "test long arms against the market's average daily rise. The idea is to beat
+  the market but I'm also ok with using 3x for trades we are confident the market will go up (or down)."): a LONG
+  arm's edge checks read its return per day against what the same exposure earns on an average day over the same
+  span — `bench_rpd(daily, lo, hi)`: the benchmark's average daily price return over the average calendar days a
+  session spans, the arms' own unit — SPY for a stock arm, the fund it trades for an index arm (a 3x fund's own
+  average day: the leverage is never the edge, the timing is). `BENCH` = {dip: SPY, crash: TQQQ} (pinned for every
+  long live arm by a test); `card(..., bench=<symbol or series>)` names a candidate's. `bench_daily(symbol)`: the daily
+  cache's closes (`cache/ohlcv/<symbol>.json`), before its first session PREREG120's carried history
+  (`audit.bench_history_json()`: SPY / QQQ / IWM stitched to ^GSPC / ^NDX / ^RUT before the ETF, UPRO / TQQQ / TNA
+  synthetic before their inception — identical to the cache on their 2018-2026 overlap). On the pooled history SPY
+  +0.038 %/day, QQQ +0.057, UPRO +0.103, TQQQ +0.150; from 1988 SPY +0.029, TQQQ +0.120. A SHORT arm's bar is 0 (a
+  random short loses the market's rise: 0 is the stricter bar). Context labels and filters stay against 0.
 * `qualify(card)`: QUALIFIES / INSUFFICIENT / FAILS on `enough_trades` (`MIN_TRADES` 100 in `MIN_EPISODES` 30 entry
-  months), `significant` (the interval above 0), `halves` (both positive), `not_one_year` (every leave-one-year-out
-  positive), `growth` (the arm alone grows); INSUFFICIENT = short of trades only. An arm short of trades on the pool
-  whose `long` history exists is read on the whole span (`basis: "longest"`: t ≥ 1.96 over every trade, each earlier
-  year one episode, both the earlier years and the pool positive).
+  months), `significant` (the interval above the bar), `halves` (each half's return per day above the bar over its
+  span), `not_one_year` (every leave-one-year-out above the bar without that year), `growth` (the arm alone grows);
+  INSUFFICIENT = short of trades only; ``bar`` / ``bar_spec`` reported. THE LONGEST HISTORY decides checks 1-3
+  (``pooled_checks`` kept beside) when the pool holds too few trades (`basis: "longest"`) and — THE RE-JUDGING, user
+  2026-10-15 — when the arm fails ONLY significance on the pool with its return per day above its bar (`basis:
+  "longest (re-judged)"`). Its significance is clustered: `long_trades` → the month bootstrap over every month of the
+  whole table, the lower bound above the bar over the whole span; yearly summaries → the t of the mean trade against
+  the bar's per-trade equivalent, each earlier year and each pooled month one cluster, the larger of that and the
+  independent-trade standard error, at least `T_SIG` 1.96. Counting every trade as independent would have admitted
+  PREREG110's gap-down reversal (t 2.66 on 2007-2026; the month interval −0.035 .. +0.575, PREREG119).
 * `filter_test(t, removed)`: a context filter is JUSTIFIED BY ITS TRADES when it removes at least 30 trades in 10
   months whose return per day's interval lies below 0; the kept / removed / all qualities and the change in return
   per day beside. `walk_forward(t, choose, first_year=2020)`: `choose(the trades before Y)` returns a rule (a mask
@@ -544,6 +584,51 @@ need multiple models in our bank of models so that we cover all market condition
   context at their first session (trend, volatility, cell) — months, the average month, the share positive, the
   growth a year, each arm's share of the P&L realized in those months.
 
+* CONTEXT ACTIVATION (PREREG108; user 2026-10-14: "a model should understand the context and be activated if
+  historically it performs well in it. If it is activated, then it can be used to trade."). `src/backtest/context.py`:
+  the cell in force for a decision (`context.at(days)`: the close BEFORE it — SPY above / below its 200-session average
+  x its 20-session realized volatility in terciles of its own history up to that close, an expanding window from
+  2006-08-14, 250 sessions at least; `table`, `cached_table`; `tests/test_context.py` checks a cut history and rewritten
+  later closes change nothing). `bank.activation_map(t, asof, rule)`: an arm's cells on / off from its trades CLOSED
+  before ``asof`` (columns ``cell``, ``net``, ``exit``, ``dmonth``, ``w`` = 1 / the draws when draws are pooled) —
+  "shrunk" (K1: the cell's average trade shrunk toward the arm's own with a prior of `ACTIVATION_PRIOR` 30 trades, on
+  above 0), "proven" (K2: 30 trades in 10 months and a month-clustered t >= 1.96), "optout" (K3: off only at t <= -1.96
+  on as many); no map before a year of closed history (`ACTIVATION_BURN_DAYS`); `bank.schedule` month by month,
+  `bank.activated` the trades an arm then takes. A switched-off cell keeps its shadow record (the map reads the arm's
+  record in every cell), so it can come back on. `Mimic(activation=<schedule file>)` replays a schedule in the account
+  (`mimic.apply_activation`: an arm's pieces decided in a cell its month's map leaves out are dropped — fallbacks and
+  extras included —, counted in `log["activation_<arm>_off"]`). Studies: `studies/prereg108/` (`maps108.py` ->
+  `schedule_K1/K2/K3.json` + `maps108.json`; `account108.py`, staged by the pooled rule: `study102.Study(stage40=
+  "pooled")`). First stage (out of time, the live configuration's 20 draws): K1 switches the dip book off in 18% of
+  its trades (+0.06 %/day against +0.19 for the kept ones; above SPY's trend at mid volatility in 2023-24) and the ETF
+  arm in 17%, the vol, fall and crash books nowhere; K3 switches nothing off; K2 keeps too few trades (the vol arm 47 of
+  258, the ones it drops as good as the ones it keeps).
+
+* RESEARCH BOOKS (PREREG110): a study adds a candidate arm to the live combination without touching production's
+  books — `mimic.register_research(name, pieces, side, slices, max_open, rate, priority, quality, book)` in the
+  study's process (``pieces(lo, hi, period=None | "A0")`` builds the arm's account pieces, the crash book's adapter
+  the template), then `Mimic(research=(name, ...))`: `live_books` builds its pieces (set A0's data on an A0 window)
+  and charges both legs at the ledger's costs, `live_strategies` adds its Strategy (1/``slices`` of the equity, at
+  most ``max_open`` open, the margin ``rate`` initial = maintenance, its ``priority`` and capital ``quality`` — 0.2,
+  the crash book's, takes the dip book's room). Default () = production's books; a production book's name is
+  refused (`tests/test_backtest_research_books.py`). `studies/prereg110/account110.py` runs the pooled add rule on it.
+* STACKING CAP (PREREG113, risk protection): `Mimic(short_name_cap=K, short_name_scope="arm" | "all")` — each short
+  piece's group is its traded name and each short arm gets the engine's group cap: at most K open shorts of one name
+  per arm ("arm") or across the three short arms ("all"). None = production's stacking (no cap).
+* THE DIP BOOK'S ORDERING (PREREG107; user 2026-10-14: "does it favor its best picks first?"):
+  `Mimic(dip_rank="score")` places the dip orders by the meta-model's walk-forward score, highest first (production:
+  "rsi2", the lowest RSI2 first), `dip_topk=k` keeps only each signal day's k best orders, `dip_slices=n` sets the
+  dip book's slice count (as many open as slices) — `strategies.dip.rank_pieces` with PREREG96's score map
+  `filter_scores()` (every order of A0, A and B scored; an unscored order ranks after the scored ones by its RSI2;
+  `tests/test_backtest_dip_rank.py`).
+* `bank.alone(..., max_open=K)` / `bank.card(..., max_open=K)`: the arm-alone growth check skips an entry while K
+  positions are open (counted in ``skipped``) — an arm whose trades overlap heavily is otherwise read at many times
+  its equity (PREREG112's insider clusters: 283 at once). None (the default) takes every trade, as the live arms'
+  own rules bound them.
+* The study harness's fingerprint (`studies/prereg102/study102.py`, `LATE_FIELDS`) leaves a field added after the
+  live draws out while it holds its default (`activation`, `research`, `short_name_cap`, `short_name_scope`,
+  `dip_rank`, `dip_topk`, `dip_slices`), so the live draws S3 stay the paired reference.
+
 First reading (2026-10-14; cards built before the vol give-back 1.25 and the ETF arm's VIX block, the combination the
 configuration of 2026-10-14):
 
@@ -555,6 +640,22 @@ configuration of 2026-10-14):
 | dip | QUALIFIES | 1,490 / 94 | +0.180 (+0.108 .. +0.259) | 65% | +20.6 %/yr, 16% |
 | crash | QUALIFIES (longest: 118 trades 1988-2026, t 3.5) | 17 / 15 | +1.576 (+0.430 .. +3.794) | 76% | +2.8 %/yr, 2% |
 
+Second reading (2026-10-15, the cards rebuilt under the live configuration — the vol give-back 1.25, the ETF arm's
+VIX block; `cache/ml/reliability/2026-10-15*`): vol QUALIFIES (251 / 85, +0.724, +0.406 .. +1.010, 81%, alone +20.4
+%/yr, 19%), ETF QUALIFIES (141 / 63, +0.487, +0.021 .. +1.076, 78%, +4.4 %/yr, 9%), fall INSUFFICIENT (78 / 50, +1.717,
++0.767 .. +2.980, 91%, +7.4 %/yr, 11%), dip and crash unchanged. No arm significantly loses in any point-in-time market
+cell (`bank.filter_test` per cell). PREREG108's activation maps REJECTED (K1 +0.12 +- 0.16 pooled, 2023 carries it).
+
+Third reading (2026-10-15, the bar and the re-judging; `cache/ml/bank/2026-10-15.json`, PREREG120): every live arm
+keeps its verdict — the dip book QUALIFIES against SPY (+0.180, +0.108 .. +0.259, against +0.038; its halves +0.099 /
++0.265 against +0.030 / +0.054), the crash book QUALIFIES on its longest history against TQQQ's average day (118
+trades 1988-2026, +3.22% a trade against +0.60% over its hold, clustered t 2.71; before 2018 +0.53 %/day against
++0.11, 2018-2026 +1.58 against +0.15). PREREG110's candidates (`studies/prereg120/reread120.json`): the bull-market
+index dip on SPY in UPRO QUALIFIES (346 trades 1986-2026, +0.303 %/day, +0.189 .. , against UPRO's +0.071); its QQQ
+version in TQQQ now FAILS by a hair (+0.276, +0.116 .. +0.427, against TQQQ's +0.118); the turn of the month fails
+leave-one-year-out against its fund (no re-judging); the gap-down reversal (2007-2026: +0.263, −0.035 .. +0.575) and
+the calm-bull momentum (2008-2026: +0.057, +0.005 .. +0.106, against SPY's +0.030), both re-judged, FAIL.
+
 The combination: +48.5 %/yr (draws +39.8 .. +58.1), worst drawdown 27.8 (37.0), a margin call in 10 draws of 20 (A 1,
 B 9), 78% of months positive, the worst month −16.4% (−27.2% in the worst draw), the worst 12 months +7.8% on
 average, every calendar year positive on average. Coverage (growth a year in the months of each context): above
@@ -562,6 +663,17 @@ SPY's trend +65% (high volatility) / +50% (mid) / +46% (low), below it +36% (hig
 crash book 25%, the ETF arm −18%) — no month below the trend in low volatility, three in mid. The vol arm's 2026 in
 its seed-0 card (three −300% squeezes) is that draw's lendability: across the combination's 20 draws its 2026
 average trade is +3.8% (−20 .. +33).
+
+Fourth reading (2026-10-15 evening, PREREG116's Q1 deployed for the 2026-10-16 session: the cards rebuilt under
+`Mimic()`'s new defaults, the combination read from Q1's 20 draws a set; the earlier cards in
+`cache/ml/reliability_archive/2026-10-15*_preQ1`): the dip book — each day's top pick — QUALIFIES on 757 trades
+(+0.249 %/day, +0.142 .. +0.359, gross win 68%; A0 / A / B +0.210 / +0.155 / +0.353 against every signal's +0.152 /
++0.061 / +0.290; leave-one-year-out at least +0.23); the vol arm 249 trades (+0.718), the ETF arm 138 (+0.503,
++0.041 ..) — the two-per-name cap removes two or three trades of each; the live calibration's set-B reference for the
+dip book is now +0.354 %/day, gross win 70% (+0.291, 68% before). The combination: +52.8 %/yr (draws +42.7 ..
++63.4), worst drawdown 26.4 (38.0), a margin call in 7 draws of 20 (A 1, B 6), 80% of months positive, the worst
+month −16.0% (−27.2% in the worst draw), the worst 12 months +6.7% on average, every calendar year positive in
+every draw; below SPY's trend in high volatility +39% a year.
 
 
 ## The add rule, mechanically (`src/backtest/add_rule.py`; the pooled rule from 2026-10-14)
@@ -597,4 +709,17 @@ unchanged to reproduce them (`tests/test_add_rule.py` pins it byte for byte). Th
 (2026-10-14): PREREG102's VIX block (E1 against E0, with the VIX-linked products) +2.15 ± 0.22 pooled but carried by
 2020 alone (−0.98 without it) — RISK PROTECTION: 29 → 10 (set, draw) pairs with a margin call; dropping the ETF arm
 (E2 against E1) −1.72 ± 0.32 — futility, RISK PROTECTION (calls 10 → 6, drawdown 27.8 → 23.4); PREREG96's RP33 dip
-filter +1.94 ± 0.12 pooled (A0 +1.67, A +3.32, B +0.23), one more margin-call pair (10 → 11).
+filter +1.94 ± 0.12 pooled (A0 +1.67, A +3.32, B +0.23), one more margin-call pair (10 → 11); at 40 draws a set
++1.81 ± 0.10, calls 21 → 23: REJECT stands.
+
+The night of 2026-10-14/15 (`memory/pooled-retune-new-arms-2026-10.md`; studies PREREG107-115): PREREG109's pooled
+retune (PREREG97's 21 parameters re-run under the live configuration, every trade kept) leaves every live value on its
+pooled plateau; its one MOVE (the days-to-cover cap 1.5) fails the account (−0.51 ± 0.47, margin-call pairs 10 → 31:
+every A0 draw called in March 2020). PREREG113's stacking caps: C1 (one short per name per arm) −3.17 ± 0.39, calls
+10 → 1, drawdown 27.8 → 23.5; C2 (two per name across the short arms) −0.01 ± 0.24, calls 10 → 8, drawdown 25.9 —
+both RISK PROTECTION. PREREG107's dip ordering: O1 (best first) +2.92 but calls 10 → 12 (REJECT); O3 (the day's top
+3) ADD +2.95 ± 0.18; O4 (the day's top 1 at a 1/5 slice) ADD +5.00 ± 0.34 — exploratory, then CONFIRMED on 2010-2017
+by PREREG115 (the dip book alone +14.9 vs +11.2 %/yr, 7 of 8 years; O3 and RP33 not). PREREG114's packages: J1 (O1 +
+C2) ADD +2.78, J2 (RP33 + C2) ADD +1.88, J3 (O4 + C2) ADD +4.52 ± 0.32 (calls 10 → 7, drawdown 27.8 → 26.6; pooled
+growth 48.5 → 55.4 %/yr). New arms: PREREG110's bull-market index dip (N3) qualifies at the trade level on QQQ and
+SPY (`strategies/index_dip.py`); its account test and the other candidates' failures are in the memory note.

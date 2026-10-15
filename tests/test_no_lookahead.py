@@ -678,6 +678,45 @@ def test_the_dip_filter_score_never_reads_the_trade_day(monkeypatch, tmp_path):
     assert out[0] == out[1] == out[2] and [r[0] for r in out[0]] == ["SYN"]
 
 
+def test_the_dip_daily_top_pick_never_reads_the_trade_day(monkeypatch, tmp_path):
+    """PREREG116's Q1 (2026-10-16): the day's top pick is chosen on the meta-model's scores of the closes through D-1
+    — two signals, stores (and SPY) already holding D's bars and later ones, rewritten wildly or with the dip going
+    on, must not move a score, an input, the ranks or the pick; the scores read through D (the injected leak) move."""
+    from config.settings import settings
+    from src.data import intraday_store
+    from src.signals import dip_filter as DF
+    from src.signals import dip_long as dl
+    monkeypatch.setattr(settings, "dip_long_dir", str(tmp_path / "dip_long"))
+    for k, v in {"dip_long_daily_top": 1, "dip_long_rank": "score", "enable_dip_long_filter": False}.items():
+        monkeypatch.setattr(settings, k, v)
+    monkeypatch.setattr(dl, "candidates", lambda d: (["SYN", "TWO"], "test"))
+    monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
+    w = np.random.default_rng(1).normal(size=len(DF.FEATURES))
+
+    class Linear:                                                    # a score every input moves
+        def predict(self, X):
+            return np.nan_to_num(np.asarray(X, float)) @ w
+    monkeypatch.setattr(DF, "load_model", lambda path=None: (Linear(), {"policy": {"cut": 0.0}, "prior_signals": {}}))
+    later, clean, wild, deeper, spy, spy_wild = _filter_frames()
+    hist = ss.sessions_before(DAY, 260)
+    two = _dip_frame(hist, seed=33)
+    two_wild = pd.concat([two, _dip_frame(hist + later, seed=33, rewrite_from=DAY).iloc[len(two):]])
+    out = []
+    for syn, tw, spy_ in ((clean, two, spy), (wild, two_wild, spy_wild), (deeper, two_wild, spy_wild)):
+        frames = {"SYN": syn, "TWO": tw}
+        monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk, _f=frames, _p=spy_: _f.get(tk, _p))
+        monkeypatch.setattr(DF, "cache_daily", lambda tk, _p=spy_: dl.daily_bars(_p))
+        day = dl.compute_signals(DAY)
+        out.append([(r["ticker"], r["top_rank"], r["filter_score"], r["filter_inputs"])
+                    for r in day["signals"] + day["not_top"]])
+    assert out[0] == out[1] == out[2] and len(out[0]) == 2 and out[0][0][1] == 1
+    # the injected leak: the names' inputs read through D+1 move the scores the pick is made on
+    prev = dl.prev_session(DAY)
+    leak = {tk: DF.name_features(dl.daily_bars(f), later[-1]) for tk, f in (("SYN", wild), ("TWO", two_wild))}
+    base = {tk: DF.name_features(dl.daily_bars(f), prev) for tk, f in (("SYN", clean), ("TWO", two))}
+    assert all(any(leak[tk][k] != base[tk][k] for k in DF.NAME_FEATURES) for tk in ("SYN", "TWO"))
+
+
 # ── THE ETF DUAL-MOMENTUM BOOK (2026-10-08) ──────────────────────────────────
 
 def test_the_etf_decision_never_reads_a_close_after_the_month_end(monkeypatch, tmp_path):

@@ -18,6 +18,14 @@ regular-hours bars per ET session — open = the first bar's open, high / low = 
 bar's close, volume = the sum — and every statistic is computed on the series through D-1, never a bar of D
 (`tests/test_no_lookahead.py`). A name needs `MIN_HISTORY` (220) daily bars, as in the study.
 
+THE DAILY TOP PICK (PREREG116's Q1, user 2026-10-15: "Deploy Q1"; from the 2026-10-16 session): of each day's
+signals only the `dip_long_daily_top` (1) best become orders, ranked by `dip_long_rank` ("score": the meta-model's
+score — `dip_filter.score_signals`, the closes through D-1, no cut — highest first, an unscored signal after every
+scored one by its RSI2; `rank_key`, the simulator's `strategies.dip.rank_pieces`); the others are journaled
+``not_top`` and an order of a day before the rule is never placed (``superseded``), so the bigger slice
+(1/`dip_long_account_slices`, 6) only ever buys a day's top pick. Fail-open to the deepest dip: a model or SPY close
+that cannot be read leaves the signals unscored, the error journaled (a scorer-banner problem).
+
 Execution: the regular-hours ticks only. Exits first (`exit_check`: their slots free up for the same
 tick), then entries within `dip_long_entry_window_minutes` of the 09:30 open — marketable limit orders
 through the ordinary broker sync, a few seconds to a minute after the opening auction the study traded.
@@ -42,7 +50,7 @@ import math
 import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -329,6 +337,9 @@ def compute_signals(d: date, extend: bool = True) -> dict:
     filt = None
     if getattr(settings, "enable_dip_long_filter", False):     # PREREG96's RP33 (src/signals/dip_filter.py)
         sig, filt = _meta_filter(sig, d, prev)
+    top = None
+    if daily_top() > 0:                                # PREREG116's Q1: only the day's best signal(s) become orders
+        sig, top = _daily_top(sig, d, prev, daily_top())
     big = sorted((r for r in ({"ticker": tk, **st} for tk, st in rows.items())
                   if math.isfinite(r["dv20"]) and r["dv20"] >= float(settings.dip_long_min_dollar_volume)),
                  key=lambda r: r["rsi2"])
@@ -344,12 +355,16 @@ def compute_signals(d: date, extend: bool = True) -> dict:
            "seconds": round((datetime.now(timezone.utc) - t0).total_seconds(), 1)}
     if filt is not None:                               # the meta-model's verdicts (only with the filter on)
         out["filter"], out["filtered"] = filt["info"], filt["filtered"]
+    if top is not None:                                # the daily top pick (PREREG116's Q1): the rest, journaled
+        out["top"], out["not_top"] = top["info"], top["not_top"]
     _write_json(signals_path(d), out)
     logger.info(f"[dip_long] {d}: {len(sig)} signal(s) from the {prev} close among {len(big)} name(s) over "
                 f"${float(settings.dip_long_min_dollar_volume) / 1e9:g}B a day ({len(names)} prefiltered by {src}"
                 f"{f', {len(stale)} stale' if stale else ''}, {out['seconds']:.0f}s)"
                 + (": " + ", ".join(f"{r['ticker']} RSI2 {r['rsi2']:.1f}" for r in sig) if sig else "")
-                + (f" — the meta-model filtered {len(filt['filtered'])}" if filt is not None else ""))
+                + (f" — the meta-model filtered {len(filt['filtered'])}" if filt is not None else "")
+                + (f" — the daily top pick of {top['info']['breadth']}, {len(top['not_top'])} not ordered"
+                   if top is not None else ""))
     return out
 
 
@@ -364,6 +379,70 @@ def _meta_filter(sig: List[dict], d: date, prev: date) -> Tuple[List[dict], dict
         return sig, {"info": {"model": "PREREG96 RP33", "breadth": len(sig), "scored": 0, "kept": len(sig),
                               "filtered": 0, "error": f"{type(e).__name__}: {e} — every signal kept"},
                      "filtered": []}
+
+
+# ── THE DAILY TOP PICK (PREREG116's Q1, from the 2026-10-16 session) ─────────
+
+def daily_top() -> int:
+    """How many of each day's signals become orders (`dip_long_daily_top`; 0 = every signal, the rule to 2026-10-15)."""
+    return max(0, int(getattr(settings, "dip_long_daily_top", 0) or 0))
+
+
+def rank_by() -> str:
+    """The daily top pick's ranking (`dip_long_rank`): "score" (the meta-model's) or "rsi2" (the deepest dip)."""
+    by = str(getattr(settings, "dip_long_rank", "rsi2") or "rsi2").strip().lower()
+    if by not in ("score", "rsi2"):
+        raise ValueError(f"dip_long_rank must be 'score' or 'rsi2', not {by!r}")
+    return by
+
+
+def rank_key(sig: Mapping, by: Optional[str] = None) -> tuple:
+    """A signal's (or its order's) place in the ranking, lower first — the simulator's `strategies.dip.rank_pieces`:
+    by "score", a scored signal by its meta-model score, highest first, an unscored one after every scored one by its
+    RSI2 (the deepest dip first); by "rsi2", the deepest dip first; a tie goes to the lower order id (the ticker and
+    "|", as the simulator's ``oid`` sorts: "T10|" before "T1|")."""
+    by = by or rank_by()
+    tk = str(sig.get("ticker") or "") + "|"
+    r = sig.get("rsi2")
+    rsi = float(r) if r is not None and math.isfinite(float(r)) else 1e9
+    s = sig.get("filter_score")
+    if by == "score" and s is not None and math.isfinite(float(s)):
+        return (0, -float(s), tk)
+    return (1 if by == "score" else 0, rsi, tk)
+
+
+def _daily_top(sig: List[dict], d: date, prev: date, n: int) -> Tuple[List[dict], dict]:
+    """(the day's ``n`` best signals in rank order, ``{"info": ..., "not_top": [the rest]}``) — by "score" the
+    signals are scored first unless the RP33 filter already did (`dip_filter.score_signals`: the closes through D-1,
+    the day's signal count as its breadth); a model or SPY close that cannot be read leaves them unscored and the
+    ranking falls to the deepest dip (the simulator's rule for an unscored order), the error journaled (a
+    scorer-banner problem). Every signal is stamped ``top_rank`` (1 = the day's best)."""
+    by = rank_by()
+    info: dict = {"rule": "PREREG116 Q1: the day's top pick", "by": by, "top": int(n), "breadth": len(sig),
+                  "error": None}
+    if by == "score" and sig and not any("filter_score" in s or "filter_error" in s for s in sig):
+        try:
+            from src.signals import dip_filter
+            sc = dip_filter.score_signals(sig, d, prev)
+            info.update({k: v for k, v in sc.items() if k not in ("breadth", "error")}, error=sc.get("error"))
+        except Exception as e:                                  # noqa: BLE001
+            info["error"] = f"{type(e).__name__}: {e}"
+    elif by == "score" and sig:                         # the RP33 filter scored them (its block holds the model)
+        info["scored_by"] = "the RP33 filter"
+    info["scored"] = sum(1 for s in sig if s.get("filter_score") is not None)
+    ranked = sorted(sig, key=lambda s: rank_key(s, by))
+    for k, s in enumerate(ranked, 1):
+        s["top_rank"] = k
+    keep, rest = ranked[:n], ranked[n:]
+    info["picked"] = [{"ticker": s["ticker"], "score": s.get("filter_score"), "rsi2": s.get("rsi2")} for s in keep]
+    if info["error"]:
+        logger.error(f"[dip_long] {d}: the daily top pick could not score the signals ({info['error']}) — the "
+                     f"deepest dip instead: {', '.join(s['ticker'] for s in keep) or 'none'}")
+    elif keep:
+        logger.info(f"[dip_long] {d}: the daily top pick by {by}: " + ", ".join(
+            f"{s['ticker']} (score {s['filter_score']:+.3f})" if s.get("filter_score") is not None else
+            f"{s['ticker']} (unscored, RSI2 {float(s['rsi2']):.1f})" for s in keep) + f" of {len(sig)} signal(s)")
+    return keep, {"info": info, "not_top": rest}
 
 
 def signals_for(d: date) -> dict:
@@ -701,6 +780,27 @@ def filtered_order(d: date, sig: dict, day: dict) -> dict:
     return o
 
 
+def not_top_order(d: date, sig: dict, day: dict) -> dict:
+    """The orders file's record of a signal that was not its day's top pick (PREREG116's Q1, `dip_long_daily_top`):
+    status ``not_top`` — never placed, never rested at IBKR, no slot — with its rank and score."""
+    o = {"oid": f"{sig['ticker']}|{_iso(d)}", "ticker": str(sig["ticker"]), "day": _iso(d),
+         "signal_session": day.get("signal_session"), "rsi2": sig.get("rsi2"), "close": sig.get("close"),
+         "atr14": sig.get("atr14"), "limit": sig.get("limit"), "dv20": sig.get("dv20"),
+         "sma_trend": sig.get("sma_trend"), "status": "not_top", "top_rank": sig.get("top_rank"),
+         "filter_score": sig.get("filter_score"), "qty": None, "ibkr_qty": 0, "ibkr": None, "trade": None,
+         "events": []}
+    order_event(o, "not_top", rank=sig.get("top_rank"), score=sig.get("filter_score"))
+    return o
+
+
+def placeable(o: Mapping) -> bool:
+    """Whether a PENDING order may be placed: with the daily top pick on (`dip_long_daily_top`), only a day's top pick
+    (``dip_top``, stamped when its order was made) — an order of a day before the rule never is: the bigger slice
+    never buys a signal that was not its day's top pick (PREREG117: the 1/5 slice without it, margin-call pairs
+    10 -> 27)."""
+    return daily_top() <= 0 or o.get("dip_top") is not None
+
+
 def order_event(o: dict, what: str, **kw) -> None:
     o.setdefault("events", []).append({"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "what": what,
                                        **kw})
@@ -799,6 +899,8 @@ def health(now: Optional[datetime] = None, trades: Optional[Sequence[dict]] = No
                     out["notes"].append(f"dip long: {len(s.get('signals') or [])} signal(s) at the open")
                 if getattr(settings, "enable_dip_long_filter", False):
                     _filter_health(s, out)
+                if daily_top() > 0:
+                    _top_health(s, out)
             except Exception:                                   # noqa: BLE001
                 out["problems"].append("dip long: today's signal file is unreadable")
     if limit_mode():                                   # the limit entry's orders: a note, never an alarm
@@ -841,6 +943,31 @@ def _filter_health(s: dict, out: dict) -> None:
                         f"{f.get('filtered')} (cut {float(f.get('cut') or 0.0):+.3f})"
                         + ("; SPY from the deep store (the daily cache lacked the close)"
                            if f.get("spy_source") == "deep_store" else ""))
+
+
+def _top_health(s: dict, out: dict) -> None:
+    """The daily top pick's line in the scorer banner (PREREG116's Q1): a day whose signals the meta-model could not
+    score (the deepest dip taken instead) is a problem; the pick, a file computed before the rule (none of its signals
+    is placed) and SPY read from the deep store are notes."""
+    t = s.get("top")
+    if not isinstance(t, dict):
+        if s.get("signals"):
+            out["notes"].append("dip long: today's signals were computed before the daily top pick rule — none of "
+                                "their orders is placed")
+        return
+    if t.get("error"):
+        out["problems"].append(f"dip long: the daily top pick could not score today's signals — {t['error']} (the "
+                               f"deepest dip was taken)")
+        return
+    if not t.get("breadth"):
+        return                                         # no signal today: nothing to say
+    picked = ", ".join(f"{p['ticker']}" + (f" (score {float(p['score']):+.2f})" if p.get("score") is not None else
+                                           " (unscored)") for p in t.get("picked") or [])
+    out["notes"].append(f"dip long: today's top pick {picked or 'none'} of {t.get('breadth')} signal(s)"
+                        + (f", {int(t['breadth']) - int(t.get('scored') or 0)} unscored"
+                           if int(t.get("scored") or 0) < int(t.get("breadth") or 0) else "")
+                        + ("; SPY from the deep store (the daily cache lacked the close)"
+                           if t.get("spy_source") == "deep_store" else ""))
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

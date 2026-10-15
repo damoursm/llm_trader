@@ -147,6 +147,11 @@ def _isolated_sel_short(tmp_path, monkeypatch):
                                                                         # entry's tests opt in
     monkeypatch.setattr(settings, "enable_dip_long_filter", False)      # PREREG96's RP33 (2026-10-14): its tests opt
     monkeypatch.setattr(settings, "dip_long_filter_model", str(tmp_path / "dip_filter" / "model.txt"))   # in
+    # PREREG116's Q1 (2026-10-16): the daily top pick at a 1/6 slice and at most two shorts of one name — the
+    # baseline keeps the rules before it (every signal an order at 1/10, no stacking cap); Q1's tests opt in
+    monkeypatch.setattr(settings, "dip_long_daily_top", 0)
+    monkeypatch.setattr(settings, "dip_long_account_slices", 10)
+    monkeypatch.setattr(settings, "sel_short_max_open_per_ticker", 0)
     monkeypatch.setattr(settings, "enable_etf_dm", False)
     monkeypatch.setattr(settings, "etf_dm_dir", str(tmp_path / "etf_dm"))
     # the live record against the simulator (2026-10-12): the email's banner reads it — never production's files

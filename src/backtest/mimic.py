@@ -95,6 +95,14 @@ on, at the ratio 0.5; F3 = off, F4 = 0.3), applied to `vol.FALL` while the books
 filtered by RP33 as production applies it (`strategies.dip.filter_keep()`: every signal scored at signal time by the
 walk-forward model of its year; a filtered signal never becomes an order, never holds a slot).
 
+PREREG116's Q1 (production from the 2026-10-16 session; user 2026-10-15: "Deploy Q1"): the defaults FOLLOW
+PRODUCTION — ``dip_rank`` / ``dip_topk`` read `dip_long_rank` / `dip_long_daily_top` (the dip book's daily top pick by
+the meta-model's walk-forward score, `strategies.dip.rank_pieces`, production's `dip_long.rank_key`), the dip slice
+`dip_long_account_slices` (6), ``short_name_cap`` `sel_short_max_open_per_ticker` (2) across the three short arms
+(``short_name_scope`` "all"); `Mimic.off()` keeps the rules before them (every signal an order at 1/10, no cap). The
+walk-forward scores (`strategies.dip.filter_scores`, PREREG96's map) run to the signals of 2026-10-06: a later signal
+is unscored and ranked by its RSI2.
+
 TRADING HALTS (PREREG99, OFF by default — ``halts=None`` builds every book as before): ``halts="guard"`` is production's
 halt guard at the short arms' entry passes (a pick halted at a pass is re-checked at the next while at most 75 minutes
 old, entered at its first free pass at the 1-minute price then, else lost), ``"wait"`` / ``"wait_half"`` / ``"backup"``
@@ -144,12 +152,56 @@ FIXES = ("lend", "house", "entry", "r201", "ext", "costs", "trigger", "order", "
 # PREREG99: production's halt guard (V0) and the registered variants H1a / H1b / H2 / H3 (`src/backtest/halts.py`)
 HALT_MODES = ("guard", "wait", "wait_half", "backup", "both")
 SHORT_ARMS = ("vol", "etf", "fall")                     # the selection short's arms in the live account
+# PREREG110: research books a study adds to the live combination for an add-rule test (never production's books):
+# name -> {"pieces": pieces(lo, hi, period=None | "A0"), "side", "slices", "max_open", "rate", "priority", "quality",
+# "book"} — filled by `register_research` in the study's process, read through `Mimic(research=(name, ...))`
+RESEARCH: Dict[str, dict] = {}
+
+
+def register_research(name: str, pieces: Callable[..., List[dict]], side: int = 1, slices: float = 4.0,
+                      max_open: Optional[int] = 1, rate: float = 0.75, priority: int = 5, quality: float = 0.2,
+                      book: Optional[str] = None) -> None:
+    """Register a RESEARCH book (PREREG110) for `Mimic(research=...)`: ``pieces(lo, hi, period)`` builds its account
+    pieces for decisions on sessions [lo, hi] (``period="A0"`` on set A0's data, like `strategies.crash.pieces`); its
+    strategy holds at most ``max_open`` positions of 1/``slices`` of the equity each at the margin ``rate`` (initial =
+    maintenance), entering in ``priority`` order with capital ``quality`` (a higher quality takes the dip book's room,
+    as the crash book does); ``book`` its name for one-book-per-name (default its own)."""
+    if name in BOOK or name in SHORT_ARMS:
+        raise ValueError(f"{name!r} is one of production's books")
+    if int(side) not in (1, -1):
+        raise ValueError(f"side must be +1 or -1, not {side!r}")
+    RESEARCH[name] = {"pieces": pieces, "side": int(side), "slices": float(slices), "max_open": max_open,
+                      "rate": float(rate), "priority": int(priority), "quality": float(quality),
+                      "book": book or f"research_{name}"}
+
+
+def research_spec(name: str) -> dict:
+    if name not in RESEARCH:
+        raise KeyError(f"research book {name!r} is not registered (`register_research`) in this process")
+    return RESEARCH[name]
 
 
 def production_etf_vix() -> bool:
     """The ETF arm ranks the VIX-linked products: production's switch (`sel_short_etf_exclude_vix`, on from
     2026-10-14 = they are left out = False)."""
     return not bool(settings.sel_short_etf_exclude_vix)
+
+
+def _prod_short_cap() -> Optional[int]:
+    """Production's stacking cap (`sel_short_max_open_per_ticker`, 2 from 2026-10-16; 0 = no cap = None)."""
+    c = int(getattr(settings, "sel_short_max_open_per_ticker", 0) or 0)
+    return c if c > 0 else None
+
+
+def _prod_dip_topk() -> Optional[int]:
+    """Production's daily top pick (`dip_long_daily_top`, 1 from 2026-10-16; 0 = every signal = None)."""
+    k = int(getattr(settings, "dip_long_daily_top", 0) or 0)
+    return k if k > 0 else None
+
+
+def _prod_dip_rank() -> str:
+    """Production's ranking of the dip orders: `dip_long_rank` with the daily top pick on, else the deepest dip."""
+    return str(getattr(settings, "dip_long_rank", "rsi2") or "rsi2") if _prod_dip_topk() else "rsi2"
 
 
 @dataclass(frozen=True)
@@ -210,6 +262,21 @@ class Mimic:
     # cells, `src/backtest/context.py`); an arm takes no piece decided in a cell its month's map leaves out (a month
     # absent = active everywhere). None = production's arms, always active
     activation: Optional[str] = None
+    # PREREG110: research books added to the live combination (`register_research`); () = production's books only
+    research: Tuple[str, ...] = ()
+    # PREREG113 (risk protection; production from 2026-10-16, PREREG116's Q1): at most ``short_name_cap`` open shorts
+    # of one NAME — per short arm (``short_name_scope`` "arm") or across the three short arms ("all") — through the
+    # engine's group cap (each short piece's group = its name). None = no cap. The defaults are production's:
+    # `sel_short_max_open_per_ticker` (0 = None) counting every arm's open shorts of the name ("all")
+    short_name_cap: Optional[int] = field(default_factory=lambda: _prod_short_cap())
+    short_name_scope: str = "all"
+    # PREREG107 (the dip book's best picks first; production from 2026-10-16, PREREG116's Q1): its orders ranked by the
+    # meta-model's walk-forward score ("score") or the deepest dip first ("rsi2"), only each day's ``dip_topk`` best
+    # (None: every signal), and its slice count (None: production's `dip_long_account_slices`; as many open as
+    # slices). The defaults are production's: `dip_long_daily_top` (0 = None, ranked by "rsi2") and `dip_long_rank`
+    dip_rank: str = field(default_factory=lambda: _prod_dip_rank())
+    dip_topk: Optional[int] = field(default_factory=lambda: _prod_dip_topk())
+    dip_slices: Optional[int] = None
 
     def __post_init__(self):
         if self.entry and not self.r201:
@@ -239,6 +306,21 @@ class Mimic:
             raise ValueError(f"dip_filter must be True or False, not {self.dip_filter!r}")
         if self.activation is not None and not (isinstance(self.activation, str) and Path(self.activation).is_file()):
             raise ValueError(f"activation must be None or a schedule file, not {self.activation!r}")
+        r = self.research
+        if (not isinstance(r, tuple) or any(not isinstance(n, str) for n in r) or len(set(r)) != len(r)
+                or set(r) & (set(BOOK) | set(SHORT_ARMS))):
+            raise ValueError(f"research must be a tuple of distinct research book names, not {r!r}")
+        c = self.short_name_cap
+        if c is not None and (isinstance(c, bool) or not isinstance(c, int) or c < 1):
+            raise ValueError(f"short_name_cap must be None or a whole number >= 1, not {c!r}")
+        if self.short_name_scope not in ("arm", "all"):
+            raise ValueError(f"short_name_scope must be 'arm' or 'all', not {self.short_name_scope!r}")
+        if self.dip_rank not in ("rsi2", "score"):
+            raise ValueError(f"dip_rank must be 'rsi2' or 'score', not {self.dip_rank!r}")
+        for name in ("dip_topk", "dip_slices"):
+            v = getattr(self, name)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+                raise ValueError(f"{name} must be None or a whole number >= 1, not {v!r}")
         arms = self.short_arms
         if (not isinstance(arms, tuple) or set(arms) - set(SHORT_ARMS) or len(set(arms)) != len(arms)
                 or any(not isinstance(a, str) for a in arms)):
@@ -275,7 +357,7 @@ class Mimic:
         """The earlier simulator."""
         return cls(**{f: False for f in FIXES}, seed=seed, lend_model="v1", fee_model=False, fall_turn=None,
                    etf_turn=None, crash=False, lend_persist=0.0, lend_day_lam=0.0, fee_version="v2", draws="iid",
-                   etf_vix=True)
+                   etf_vix=True, short_name_cap=None, dip_rank="rsi2", dip_topk=None, dip_slices=10)
 
     @classmethod
     def borrow_v2(cls, seed: int = 0, **kw) -> "Mimic":
@@ -763,9 +845,11 @@ def rank_shorts(pieces: Sequence[dict]) -> None:
 def live_strategies(mim: Mimic) -> List[A.Strategy]:
     """The live account's strategies (PREREG61's production-mimicking setup): the short arms each at its own slice
     (production's `sim_account.arm_slices`: vol 1/20, ETF 1/16, fall 1/12 from 2026-10-12, PREREG80; the fall arm's
-    ``fall_slices`` when set, PREREG104) with IBKR's house defaults, the dip limit book at 1/10 (10 open) giving way
-    whole, the latest first, de-levered the latest first; ``house`` adds the live sizing's shrink, ``order`` one
-    priority for the short arms. An arm left out of ``short_arms`` keeps its strategy (no pieces: its slice unused)."""
+    ``fall_slices`` when set, PREREG104) with IBKR's house defaults and the stacking cap (``short_name_cap``), the dip
+    limit book at 1/`dip_long_account_slices` (as many open; 1/6 from 2026-10-16, PREREG116's Q1 — ``dip_slices``
+    overrides) giving way whole, the latest first, de-levered the latest first; ``house`` adds the live sizing's
+    shrink, ``order`` one priority for the short arms. An arm left out of ``short_arms`` keeps its strategy (no
+    pieces: its slice unused)."""
     from src.performance.sim_account import arm_slices
     out = []
     for n in ("vol", "etf", "fall"):
@@ -775,8 +859,12 @@ def live_strategies(mim: Mimic) -> List[A.Strategy]:
                            house_maint=float(settings.sel_short_account_house_maint),
                            house_init=float(settings.sel_short_account_house_init),
                            shrink_budget=float(settings.sel_short_account_house_init) if mim.house else None,
-                           orders="fill" if mim.limited(n) else None))
-    k = int(settings.dip_long_account_slices)                  # as many open as slices (`live_account.size_long`)
+                           orders="fill" if mim.limited(n) else None,
+                           # PREREG113: the stacking cap (each short piece's group is its name, `live_books`)
+                           group_cap=mim.short_name_cap,
+                           group_scope=None if mim.short_name_cap is None else
+                           ((n,) if mim.short_name_scope == "arm" else SHORT_ARMS)))
+    k = int(mim.dip_slices or settings.dip_long_account_slices)   # as many open as slices (`live_account.size_long`)
     d = A.dip_long("dip", slices=float(k), max_open=k)
     out.append(replace(d, priority=PRIORITY["dip"], quality=QUALITY["dip"], preemptible=True, yield_whole=True,
                        yield_first="latest", delever_first="latest", delever_order=1, orders="fill", book=BOOK["dip"],
@@ -786,6 +874,10 @@ def live_strategies(mim: Mimic) -> List[A.Strategy]:
         out.append(A.Strategy("crash", 1, slices=float(settings.crash_long_account_slices), max_open=1,  # longs for
                               priority=PRIORITY["crash"], quality=QUALITY["crash"], book=BOOK["crash"],  # room
                               house_maint=rate, house_init=rate))
+    for name in mim.research:      # PREREG110: a study's research books (`register_research`)
+        r = research_spec(name)
+        out.append(A.Strategy(name, r["side"], slices=r["slices"], max_open=r["max_open"], priority=r["priority"],
+                              quality=r["quality"], book=r["book"], house_maint=r["rate"], house_init=r["rate"]))
     return out
 
 
@@ -988,9 +1080,13 @@ def live_books(lo, hi, mim: Mimic, eng=None, etf=None, panel=None, bars: Optiona
             dip = DIP.order_pieces(DIP.LIVE, lo, hi, panel=panel if panel is not None else DIP.build_panel())
         # PREREG96's RP33 as production applies it (`enable_dip_long_filter`): a filtered signal never an order
         books["dip"] = DIP.filter_pieces(dip, DIP.filter_keep()) if mim.dip_filter else list(dip)
+        if mim.dip_rank != "rsi2" or mim.dip_topk is not None:  # PREREG107: best first / the day's top k
+            books["dip"] = DIP.rank_pieces(books["dip"], DIP.filter_scores(), by=mim.dip_rank, topk=mim.dip_topk)
         if crash_on(mim):                                      # PREREG86: production's crash_long, its own pieces
             from src.backtest.strategies import crash as CRASH
             books["crash"] = CRASH.pieces(lo, hi, period="A0") if a0 else CRASH.pieces(lo, hi)
+        for name in mim.research:                              # PREREG110: a study's research books
+            books[name] = list(research_spec(name)["pieces"](lo, hi, period="A0" if a0 else None))
         log = log if log is not None else {}
         if halt is not None:                   # the vol and fall entries through the halt model (`log["halts"]`)
             halt.apply(books, lo, hi, X, log)
@@ -1027,6 +1123,12 @@ def live_books(lo, hi, mim: Mimic, eng=None, etf=None, panel=None, bars: Optiona
                         for p in books["dip"]]
         if "crash" in books:                                   # market buys / sells at the open: both legs
             books["crash"] = [costs.apply(p, 1, adv=adv) for p in books["crash"]]
+        for name in mim.research:                              # PREREG110: market orders at the open, both legs
+            books[name] = [costs.apply(p, research_spec(name)["side"], adv=adv) for p in books[name]]
     if mim.order:
         rank_shorts([p for n in ("vol", "etf", "fall") for p in books[n]])
+    if mim.short_name_cap is not None:         # PREREG113: each short piece's group is its traded name
+        for n in SHORT_ARMS:
+            for p in books[n]:
+                p["group"] = plain(p["tkn"])
     return books

@@ -18,23 +18,33 @@ account engine at the live costs, `Mimic()` seed 0; A0 from the latest ``<day>_A
 ``<day>`` build — `audit.card_dirs`), pooled. It QUALIFIES for the bank when, on the pooled history:
   1. ENOUGH TRADES: at least `MIN_TRADES` (100) in at least `MIN_EPISODES` (30) distinct entry months — the trades of
      one month share its market, so the months are its independent episodes;
-  2. SIGNIFICANT: the 95% interval of its RETURN PER DAY lies above 0 (a bootstrap over ENTRY MONTHS — a month's
-     trades resampled together —, `B_BOOT` resamples, seed 0);
-  3. TRANSFERABLE: its average trade is positive in both chronological halves of its trades, and stays positive with
-     ANY one calendar year left out (a model one year carries does not transfer);
+  2. SIGNIFICANT: the 95% interval of its RETURN PER DAY lies above its BAR (a bootstrap over ENTRY MONTHS — a
+     month's trades resampled together —, `B_BOOT` resamples, seed 0). THE BAR (user directive 2026-10-15: "test long
+     arms against the market's average daily rise. The idea is to beat the market but I'm also ok with using 3x for
+     trades we are confident the market will go up (or down)."): for a LONG arm, what the same exposure earns on an
+     average day over the same span (`BENCH`, `bench_rpd`: SPY's for a stock arm; for an index arm the fund it trades
+     — a 3x fund's own average day, so the leverage is never the edge, the timing is); for a SHORT arm 0 (a random
+     short loses the market's rise: 0 is the stricter bar);
+  3. TRANSFERABLE: its return per day beats its bar in both chronological halves of its trades (each half against the
+     bar over its own span), and with ANY one calendar year left out (a model one year carries does not transfer);
   4. GROWTH: the arm alone at its live slice of a $10,000 account — its P&L realized at each exit and compounded (the
      marks inside a trade unseen) — grows over the pooled history.
-Short of trades only, it is INSUFFICIENT (not proven, not refuted); short of any other check it FAILS. An arm whose
-own data reach before 2018 (the dip book's daily bars from 2007, the crash book's QQQ from 1988: PREREG103's LONG
-history, carried from `audit.baseline_json()`) takes the earlier years when 2018-2026 alone hold too few trades:
-checks 1-3 then read the whole span (each earlier year one episode; the halves = before 2018 / 2018-2026), check 4
-the pooled history. Beside the checks: the GROSS win rate, the return per day, the worst trade, the skew, the
-drawdown at its live slice, every year and every set, and the deflated Sharpe ratio for the trials behind it
-(`trials.count`; nominal trials, so conservative).
+Short of trades only, it is INSUFFICIENT (not proven, not refuted); short of any other check it FAILS. THE LONGEST
+HISTORY — an arm whose own data reach before 2018: the dip book's daily bars from 2007 and the crash book's QQQ from
+1988 (PREREG103's LONG history, carried from `audit.baseline_json()` as yearly summaries), a candidate's earlier trades
+as a table — decides checks 1-3 over the whole span (the halves = before 2018 / 2018-2026), check 4 on the pooled
+history, when 2018-2026 alone hold too few trades, and — THE RE-JUDGING (user 2026-10-15: "Adopt the re-judging rule")
+— when the arm passes every pooled check but significance with a return per day above its bar. Its significance is
+CLUSTERED like the pool's: the month bootstrap over every month of an earlier trade table, or, with yearly summaries
+only, the t of the mean trade against the bar's per-trade equivalent with each earlier year and each pooled month one
+cluster (the larger of that and the independent-trade standard error; at least `T_SIG`). Beside the checks: the GROSS
+win rate, the return per day, the worst trade, the skew, the drawdown at its live slice, every year and every set,
+and the deflated Sharpe ratio for the trials behind it (`trials.count`; nominal trials, so conservative).
 
 WHERE IT EARNS (``context``): its trades by SPY's trend at the entry (above / below the 200-session average), SPY's
 20-session realized-volatility tercile, and the six cells they cross into. A cell of at least `MIN_CELL` (30) trades
-whose interval lies above 0 EARNS, below 0 LOSES. The terciles are cut on the whole history: a LABEL to read results
+whose interval lies above 0 EARNS, below 0 LOSES (where it makes or loses money: against 0 for every arm). The
+terciles are cut on the whole history: a LABEL to read results
 (`reliability.regime_table`) — a filter that DECIDES uses a point-in-time definition (a fixed level, a trailing
 percentile) and gets its `tests/test_no_lookahead.py` guard.
 
@@ -53,6 +63,7 @@ worth the most) — with each arm's share of each context's months.
 """
 from __future__ import annotations
 
+import functools
 import json
 import math
 import pickle
@@ -78,11 +89,16 @@ MIN_EPISODES = 30                # 1. ... in this many distinct entry months
 MIN_CELL = 30                    # a context cell a reading or a filter rests on
 MIN_CELL_MONTHS = 10             # ... in this many distinct entry months
 B_BOOT, SEED = 10_000, 0
+T_SIG = 1.96                     # 2. the clustered t a longest history carried as yearly summaries must reach
+# 2. THE BAR of each LONG live arm: the daily cache's symbol of what the same exposure earns on an average day (a short
+# arm's bar is 0; `card`'s ``bench`` names a candidate's)
+BENCH = {"dip": "SPY", "crash": "TQQQ"}
 FIRST_WF_YEAR = 2020             # the walk-forward's first out-of-time year (two years to decide on)
 START = 10_000.0
-# the live configuration's latest draws with a daily NAV each (research repository): PREREG102's live S3 — the
-# configuration of 2026-10-14 (vol give-back 1.25, the ETF arm without the VIX-linked products)
-LIVE_RUNS = ("studies/prereg102/runs", "LIVE_S3")
+# the live configuration's latest draws with a daily NAV each (research repository): PREREG116's Q1 — the
+# configuration from the 2026-10-16 session (2026-10-14's — vol give-back 1.25, the ETF arm without the VIX-linked
+# products, PREREG102's LIVE_S3 — with the dip book's daily top pick at 1/6 and at most two shorts of one name)
+LIVE_RUNS = ("studies/prereg116/runs", "Q1")
 RUN_FILE = re.compile(r"^(A0|A|B)_(?P<label>.+)_s(?P<seed>\d+)\.pkl$")
 
 
@@ -165,19 +181,25 @@ def _cell_label(s: dict) -> Optional[str]:
     return "EARNS" if s["rpd_lo95"] > 0 else ("LOSES" if s["rpd_hi95"] < 0 else "unclear")
 
 
-def alone(t: pd.DataFrame, slice_: float, lo: str, hi: str, start: float = START) -> dict:
+def alone(t: pd.DataFrame, slice_: float, lo: str, hi: str, start: float = START,
+          max_open: Optional[int] = None) -> dict:
     """The arm alone at its live slice of a $10,000 account: each trade sized at ``slice_`` of the equity REALIZED at
     its entry, its P&L realized at its exit, compounded (the marks inside a trade unseen). Growth a year over [lo, hi],
-    the worst drawdown of the realized equity, every calendar year's growth."""
+    the worst drawdown of the realized equity, every calendar year's growth. ``max_open``: an entry while that many
+    positions are open is skipped (counted in ``skipped``) — an arm whose trades overlap heavily (PREREG112: 283 at
+    once) is otherwise read at many times its equity; None = every trade taken (the live arms' rules bound them)."""
     if not len(t):
         return {"growth": None, "maxdd": None, "years": {}}
     ent = pd.DatetimeIndex(t.entry_day)
     ext = ent + pd.to_timedelta(t.days.to_numpy(float), unit="D")
     ev = sorted([(e, 1, i) for i, e in enumerate(ent)] + [(x, 0, i) for i, x in enumerate(ext)])
-    eq, size, path = start, {}, [(pd.Timestamp(lo), start)]
+    eq, size, path, skipped = start, {}, [(pd.Timestamp(lo), start)], 0
     net = t.net.to_numpy(float) / 100.0
     for when, kind, i in ev:                      # an exit before an entry at the same instant (kind 0 first)
         if kind == 1:
+            if max_open is not None and len(size) >= int(max_open):
+                skipped += 1
+                continue
             size[i] = slice_ * eq
         elif i in size:
             eq += size.pop(i) * net[i]
@@ -192,7 +214,84 @@ def alone(t: pd.DataFrame, slice_: float, lo: str, hi: str, start: float = START
         prev = float(v)
     return {"growth": float((s.iloc[-1] / start) ** (1.0 / yrs) - 1.0) * 100.0 if s.iloc[-1] > 0 else -100.0,
             "maxdd": float(((peak - s) / peak).max() * 100.0), "end_equity": float(s.iloc[-1]), "years": by_year,
-            "basis": f"1/{1 / slice_:g} of the realized equity a trade, P&L at the exits, from ${start:,.0f}"}
+            "skipped": int(skipped), "max_open": max_open,
+            "basis": f"1/{1 / slice_:g} of the realized equity a trade, P&L at the exits, from ${start:,.0f}"
+                     + (f", at most {int(max_open)} open" if max_open is not None else "")}
+
+
+# ── the bar: the market's average day (user directive 2026-10-15) ───────────
+
+def _cache_returns(sym: str) -> pd.Series:
+    """``sym``'s daily price returns (%) from the daily cache (`cache/ohlcv/<sym>.json`), by session date."""
+    raw = json.loads((REPO / "cache" / "ohlcv" / f"{sym}.json").read_text(encoding="utf-8"))
+    idx = pd.DatetimeIndex(pd.to_datetime(raw["index"]))
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    c = pd.Series(pd.DataFrame(raw["data"], columns=raw["columns"])["Close"].to_numpy(float), index=idx.normalize())
+    c = c[np.isfinite(c.to_numpy()) & (c.to_numpy() > 0)].sort_index()
+    c = c[~c.index.duplicated(keep="last")]
+    return (c.pct_change() * 100.0).iloc[1:]
+
+
+@functools.lru_cache(maxsize=None)
+def _carried_bench() -> dict:
+    """PREREG120's carried benchmark histories {symbol: {"days", "ret" (%), ...}} (`audit.bench_history_json()`)."""
+    from src.backtest import audit as AU
+    try:
+        return json.loads(AU.bench_history_json().read_text(encoding="utf-8")).get("specs", {})
+    except OSError:
+        return {}
+
+
+@functools.lru_cache(maxsize=None)
+def bench_daily(spec: str) -> pd.Series:
+    """The benchmark ``spec``'s daily price returns (%, by session): the daily cache's and, before the cache's first
+    return, the carried history when it holds ``spec`` (PREREG120: the index stitched before its ETF, a 3x fund
+    synthetic before its inception — 3x the index's day, T-bill financing, 0.95 %/yr). Shared: never mutate it."""
+    h = _carried_bench().get(spec)
+    old = pd.Series(np.asarray(h["ret"], float), index=pd.DatetimeIndex(pd.to_datetime(h["days"]))) if h else None
+    try:
+        r = _cache_returns(spec)
+    except OSError:
+        if old is None:
+            raise
+        return old
+    return pd.concat([old[old.index < r.index.min()], r]) if old is not None else r
+
+
+def bench_rpd(daily: pd.Series, lo, hi, exclude_years: Sequence[int] = ()) -> Optional[float]:
+    """The benchmark's RETURN PER DAY (%/24-hour day, the arms' unit) over its sessions in [lo, hi], with
+    ``exclude_years`` left out: its average daily return over the average calendar days a session spans (each return
+    counted over the days since the session before it)."""
+    idx = pd.DatetimeIndex(daily.index)
+    gap = np.r_[np.nan, np.diff(idx.asi8) / 86_400e9]
+    m = (idx >= pd.Timestamp(lo)) & (idx <= pd.Timestamp(hi))
+    if len(exclude_years):
+        m &= ~np.isin(idx.year, [int(y) for y in exclude_years])
+    r, g = daily.to_numpy(float)[m], gap[m]
+    ok = np.isfinite(r) & np.isfinite(g)
+    if ok.sum() < 2:
+        return None
+    return per_day(float(r[ok].mean()), float(g[ok].mean()))
+
+
+def _bench_of(arm: str, bench) -> Tuple[Optional[pd.Series], Optional[str]]:
+    """The daily returns and the name of an arm's bar: ``bench`` (a daily cache symbol, or a series of daily returns
+    in %) or the live arm's (`BENCH`); (None, None) = judged against 0."""
+    spec = bench if bench is not None else BENCH.get(arm)
+    if spec is None:
+        return None, None
+    if isinstance(spec, pd.Series):
+        return spec, str(spec.name or "series")
+    return bench_daily(str(spec)), str(spec)
+
+
+def _bar(daily: Optional[pd.Series], lo, hi, exclude_years: Sequence[int] = ()) -> float:
+    """The bar over [lo, hi]: the benchmark's return per day, 0 without a benchmark (a short arm)."""
+    if daily is None:
+        return 0.0
+    b = bench_rpd(daily, lo, hi, exclude_years)
+    return float(b) if b is not None else 0.0
 
 
 def _long_part(long: Mapping) -> Optional[dict]:
@@ -211,12 +310,17 @@ def _long_part(long: Mapping) -> Optional[dict]:
 
 
 def card(T: pd.DataFrame, arm: str, regimes: Optional[pd.DataFrame] = None, long: Optional[Mapping] = None,
-         slice_: Optional[float] = None, n_trials: Optional[Tuple[int, int]] = None) -> dict:
+         slice_: Optional[float] = None, n_trials: Optional[Tuple[int, int]] = None,
+         max_open: Optional[int] = None, bench=None, long_trades: Optional[pd.DataFrame] = None) -> dict:
     """The arm's card on the pooled history (the module docstring): ``overall``, ``halves``, ``loyo`` (the average
     trade and the return per day with each year left out), ``by_year``, ``by_set``, ``context`` (trend, vol, cells),
-    ``alone`` (its live slice), ``longest`` (with a carried LONG history), ``dsr`` (with ``n_trials``)."""
+    ``alone`` (its live slice), ``bench`` (a LONG arm's bar: over the pool, each half's span, each year left out),
+    ``longest`` (with a carried LONG history of yearly summaries, or ``long_trades``: its trades before the pool, a
+    table like ``T``'s), ``dsr`` (with ``n_trials``). ``bench``: the bar's daily cache symbol (or a series of daily
+    returns in %) — default the live arm's (`BENCH`), none for a short arm."""
     from src.backtest import reliability as REL
     t = T[T.book == arm].sort_values("entry_day").reset_index(drop=True)
+    daily, bname = _bench_of(arm, bench)
     rec: Dict[str, object] = {"arm": arm, "side": REL.SIDE.get(arm), "spec": REL.SPEC.get(arm),
                               "span": [POOL_LO, POOL_HI], "overall": quality(t)}
     if not len(t):
@@ -231,6 +335,12 @@ def card(T: pd.DataFrame, arm: str, regimes: Optional[pd.DataFrame] = None, long
         if len(r):
             loyo[str(y)] = {"avg_trade": float(r.net.mean()), "rpd": per_day(float(r.net.mean()), float(r.days.mean()))}
     rec["loyo"] = loyo
+    if daily is not None:
+        split = rec["halves"]["split"]
+        rec["bench"] = {"spec": bname, "rpd": bench_rpd(daily, POOL_LO, POOL_HI),
+                        "halves": {"first": bench_rpd(daily, POOL_LO, pd.Timestamp(split) - pd.Timedelta(days=1)),
+                                   "second": bench_rpd(daily, split, POOL_HI)} if split else {},
+                        "loyo": {y: bench_rpd(daily, POOL_LO, POOL_HI, [int(y)]) for y in loyo}}
     rec["by_year"] = {str(y): REL.stats(g) for y, g in t.groupby("year")}
     rec["by_set"] = {s: REL.stats(g) for s, g in t.groupby("set")}
     if regimes is not None:
@@ -248,9 +358,11 @@ def card(T: pd.DataFrame, arm: str, regimes: Optional[pd.DataFrame] = None, long
             ctx[name] = out
         rec["context"] = ctx
     if slice_:
-        rec["alone"] = alone(t, slice_, POOL_LO, POOL_HI)
-    if long:
-        rec["longest"] = _longest(t, long)
+        rec["alone"] = alone(t, slice_, POOL_LO, POOL_HI, max_open=max_open)
+    if long_trades is not None and len(long_trades):
+        rec["longest"] = _longest_trades(t, long_trades, daily, bname)
+    elif long:
+        rec["longest"] = _longest(t, long, daily, bname)
     if n_trials:
         from src.backtest import audit as AU
         try:
@@ -261,10 +373,39 @@ def card(T: pd.DataFrame, arm: str, regimes: Optional[pd.DataFrame] = None, long
     return rec
 
 
-def _longest(t: pd.DataFrame, long: Mapping) -> Optional[dict]:
-    """The pooled trades with a carried earlier history: n, the mean and its t (independent trades), the episodes
-    (the pooled months + each earlier year), the halves (before 2018 / 2018-2026), the mean trade with each year left
-    out."""
+PRE_HI = (pd.Timestamp(POOL_LO) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")     # the last day before the pool
+
+
+def _long_halves_loyo(per: Mapping[str, Tuple[int, float, float]], lo: str, daily: Optional[pd.Series]) -> dict:
+    """The longest history's halves (before the pool / the pool) and every year left out, each a return per day
+    against the bar over its own span; ``per`` = {year: (n, mean trade, mean days)}."""
+    def mean_of(items):
+        k = sum(n for n, _, _ in items)
+        return (sum(n * mu for n, mu, _ in items) / k, sum(n * d for n, _, d in items) / k) if k else (None, None)
+
+    def rpd_of(items):
+        mu, d = mean_of(items)
+        return per_day(mu, d) if mu is not None and d > 0 else None
+    pre = [v for y, v in per.items() if int(y) < int(POOL_LO[:4])]
+    post = [v for y, v in per.items() if int(y) >= int(POOL_LO[:4])]
+    halves = {"before": {"n": sum(v[0] for v in pre), "avg_trade": mean_of(pre)[0], "rpd": rpd_of(pre),
+                         "bar": _bar(daily, lo, PRE_HI)},
+              "pooled": {"n": sum(v[0] for v in post), "avg_trade": mean_of(post)[0], "rpd": rpd_of(post),
+                         "bar": _bar(daily, POOL_LO, POOL_HI)}}
+    loyo_rpd = {y: rpd_of([v for yy, v in per.items() if yy != y]) for y in per}
+    loyo_bar = {y: _bar(daily, lo, POOL_HI, [int(y)]) for y in per}
+    ok_h = all(h["rpd"] is not None and h["rpd"] > h["bar"] for h in halves.values())
+    ok_y = bool(loyo_rpd) and all(loyo_rpd[y] is not None and loyo_rpd[y] > loyo_bar[y] for y in loyo_rpd)
+    return {"halves": halves, "loyo_rpd": loyo_rpd, "loyo_bar": loyo_bar, "halves_ok": ok_h, "loyo_ok": ok_y}
+
+
+def _longest(t: pd.DataFrame, long: Mapping, daily: Optional[pd.Series] = None,
+             bname: Optional[str] = None) -> Optional[dict]:
+    """The pooled trades with a carried earlier history of YEARLY SUMMARIES: n, the mean, the episodes (the pooled
+    months + each earlier year), its significance — the t of the mean trade against the bar's per-trade equivalent
+    (the bar's return per day over the whole span, compounded over the arm's average hold), CLUSTERED with each earlier
+    year and each pooled month one cluster (the larger of that standard error and the independent-trade one) —, the
+    halves (before 2018 / 2018-2026) and every year left out against the bar, and ``checks`` 1-3 on it."""
     pre = _long_part(long)
     if pre is None:
         return None
@@ -281,51 +422,120 @@ def _longest(t: pd.DataFrame, long: Mapping) -> Optional[dict]:
     tot = sum(k * mu for k, mu, _ in per.values())
     loyo = {y: (tot - k * mu) / (n - k) for y, (k, mu, _) in per.items() if n - k > 0}
     days = (sum(k * d for k, _, d in per.values()) / n) if n else float("nan")
-    return {"n": n, "mean": m, "sd": sd, "t": m / (sd / math.sqrt(n)) if sd > 0 else None,
-            "rpd": per_day(m, days) if days == days and days > 0 else None,
-            "episodes": int(t.month.nunique()) + len(pre["years"]), "years_before": pre["years"],
-            "halves": {"before": {"n": n0, "avg_trade": m0}, "pooled": {"n": n1, "avg_trade": m1}},
-            "loyo": loyo, "source": long.get("source", "PREREG103's LONG history (carried)")}
+    lo = f"{min(pre['years'])}-01-01"
+    bar = _bar(daily, lo, POOL_HI)
+    bar_trade = (math.pow(1.0 + bar / 100.0, days) - 1.0) * 100.0 if days == days and days > 0 else 0.0
+    res = [k * (mu - m) for k, mu, _ in pre["per_year"].values()]
+    g = t.groupby("month").net.agg(["sum", "count"])
+    res += list(g["sum"].to_numpy(float) - g["count"].to_numpy(float) * m)
+    C = len(res)
+    se_cl = math.sqrt(sum(r * r for r in res) * C / (C - 1)) / n if C > 1 else float("nan")
+    se_iid = sd / math.sqrt(n) if sd == sd and n > 1 else float("nan")
+    se = max(v for v in (se_cl, se_iid) if v == v) if (se_cl == se_cl or se_iid == se_iid) else float("nan")
+    tt = (m - bar_trade) / se if se == se and se > 0 else None
+    hl = _long_halves_loyo(per, lo, daily)
+    episodes = int(t.month.nunique()) + len(pre["years"])
+    checks = {"enough_trades": n >= MIN_TRADES and episodes >= MIN_EPISODES,
+              "significant": tt is not None and tt >= T_SIG, "halves": hl["halves_ok"], "not_one_year": hl["loyo_ok"]}
+    return {"n": n, "mean": m, "sd": sd, "t": tt, "t_trades_vs_0": m / se_iid if se_iid == se_iid and se_iid > 0 else None,
+            "se": {"clustered": se_cl, "trades": se_iid}, "bar": bar, "bar_trade": bar_trade, "bench": bname,
+            "span": [lo, POOL_HI], "rpd": per_day(m, days) if days == days and days > 0 else None,
+            "episodes": episodes, "years_before": pre["years"], "halves": hl["halves"], "loyo": loyo,
+            "loyo_rpd": hl["loyo_rpd"], "loyo_bar": hl["loyo_bar"], "checks": checks,
+            "source": long.get("source", "PREREG103's LONG history (carried)")}
+
+
+def _longest_trades(t: pd.DataFrame, earlier: pd.DataFrame, daily: Optional[pd.Series] = None,
+                    bname: Optional[str] = None) -> Optional[dict]:
+    """The pooled trades with the arm's EARLIER TRADES (a table: ``entry_day``, ``net``, ``gross``, ``days``; those
+    entered before the pool): every trade one table — its quality with the month bootstrap over every month (the
+    significance: the 95% lower bound above the bar over the whole span), the halves (before 2018 / 2018-2026) and every
+    year left out against the bar, and ``checks`` 1-3 on it."""
+    e = earlier[pd.DatetimeIndex(pd.to_datetime(earlier.entry_day)) < pd.Timestamp(POOL_LO)]
+    if not len(e):
+        return None
+    cols = ["entry_day", "net", "gross", "days"]
+    A = pd.concat([e[cols], t[cols]], ignore_index=True)
+    A["entry_day"] = pd.DatetimeIndex(pd.to_datetime(A.entry_day)).normalize()
+    A = A.sort_values("entry_day").reset_index(drop=True)
+    A["year"] = A.entry_day.dt.year
+    A["month"] = A.entry_day.dt.to_period("M").astype(str)
+    q = quality(A)
+    lo = str(A.entry_day.min().date())
+    bar = _bar(daily, lo, POOL_HI)
+    per = {str(y): (len(g), float(g.net.mean()), float(g.days.mean())) for y, g in A.groupby("year")}
+    hl = _long_halves_loyo(per, lo, daily)
+    checks = {"enough_trades": q["n"] >= MIN_TRADES and q["months"] >= MIN_EPISODES,
+              "significant": q.get("rpd_lo95") is not None and q["rpd_lo95"] > bar,
+              "halves": hl["halves_ok"], "not_one_year": hl["loyo_ok"]}
+    return {"n": q["n"], "mean": q["avg_trade"], "rpd": q["return_per_day"], "rpd_lo95": q.get("rpd_lo95"),
+            "rpd_hi95": q.get("rpd_hi95"), "t_month": q.get("t_month"), "gross_win_rate": q.get("gross_win_rate"),
+            "bar": bar, "bench": bname, "span": [lo, POOL_HI], "episodes": q["months"],
+            "years_before": sorted({y for y in per if int(y) < int(POOL_LO[:4])}), "halves": hl["halves"],
+            "loyo": {y: float(A.net[A.year != int(y)].mean()) for y in per if (A.year != int(y)).any()},
+            "loyo_rpd": hl["loyo_rpd"], "loyo_bar": hl["loyo_bar"], "checks": checks,
+            "source": "the arm's earlier trades (a table)"}
 
 
 def qualify(c: Mapping) -> dict:
     """The admission checks of the card ``c`` (the module docstring): {"verdict": "QUALIFIES" | "INSUFFICIENT" |
-    "FAILS", "checks": {name: bool or None}, "basis": "pooled" | "longest", "why": [...]}."""
+    "FAILS", "checks": {name: bool or None}, "basis": "pooled" | "longest" | "longest (re-judged)", "bar": the
+    return per day its edge checks are read against (0 for a short arm), "why": [...]} (+ "pooled_checks" when the
+    longest history decided)."""
     o = c.get("overall") or {}
-    why: List[str] = []
+    bn = c.get("bench") or {}
+    bar = float(bn.get("rpd") or 0.0)
+    hv, hb, lb = c.get("halves") or {}, bn.get("halves") or {}, bn.get("loyo") or {}
+    al = c.get("alone") or {}
+    growth = (al.get("growth") is not None and al["growth"] > 0) if al else None
+    n, ep, rpd = o.get("n", 0), o.get("months", 0), o.get("return_per_day")
+    pooled = {"enough_trades": n >= MIN_TRADES and ep >= MIN_EPISODES,
+              "significant": o.get("rpd_lo95") is not None and o["rpd_lo95"] > bar,
+              "halves": all((hv.get(h) or {}).get("return_per_day") is not None
+                            and hv[h]["return_per_day"] > float(hb.get(h) or 0.0) for h in ("first", "second")),
+              "not_one_year": bool(c.get("loyo")) and all(v["rpd"] is not None and v["rpd"] > float(lb.get(y) or 0.0)
+                                                          for y, v in c["loyo"].items()),
+              "growth": growth}
     lg = c.get("longest")
-    use_long = bool(lg) and (o.get("n", 0) < MIN_TRADES or o.get("months", 0) < MIN_EPISODES)
+    rejudge = bool(lg) and [k for k, v in pooled.items() if v is False] == ["significant"] and rpd is not None \
+        and rpd > bar
+    use_long = bool(lg) and (not pooled["enough_trades"] or rejudge)
+    against = f" (its bar: {bn.get('spec')}'s average day, {bar:+.3f} %/day)" if bn else ""
     if use_long:
+        checks = dict(lg["checks"], growth=growth)
         n, ep = lg["n"], lg["episodes"]
-        sig = lg.get("t") is not None and lg["t"] >= 1.96 and o.get("avg_trade", 0) > 0
-        halves = lg["halves"]["before"]["avg_trade"] > 0 and lg["halves"]["pooled"]["avg_trade"] > 0
-        loyo_ok = bool(lg["loyo"]) and min(lg["loyo"].values()) > 0
-        sig_txt = f"t {lg['t']:.2f} over {n} trades (with the years before {POOL_LO[:4]})" if lg.get("t") else "no t"
+        lb_ = lg.get("bar") or 0.0
+        if lg.get("rpd_lo95") is not None:
+            sig_txt = (f"on {n} trades from {lg['span'][0][:4]}: return per day {lg.get('rpd', float('nan')):+.3f} %/day, "
+                       f"95% {lg['rpd_lo95']:+.3f}..{lg['rpd_hi95']:+.3f}")
+        else:
+            sig_txt = (f"t {lg['t']:.2f} (clustered, against {lg['bar_trade']:+.2f}% a trade) over {n} trades from "
+                       f"{lg['span'][0][:4]}" if lg.get("t") is not None else "no t")
+        against = f" (its bar over {lg['span'][0][:4]}-{POOL_HI[:4]}: {lg.get('bench')}'s average day, {lb_:+.3f} %/day)" \
+            if lg.get("bench") else ""
     else:
-        n, ep = o.get("n", 0), o.get("months", 0)
-        sig = o.get("rpd_lo95") is not None and o["rpd_lo95"] > 0
-        hv = c.get("halves") or {}
-        halves = (hv.get("first", {}).get("avg_trade", -1) > 0) and (hv.get("second", {}).get("avg_trade", -1) > 0)
-        loyo_ok = bool(c.get("loyo")) and min(v["avg_trade"] for v in c["loyo"].values()) > 0
+        checks = pooled
         sig_txt = (f"return per day {o.get('return_per_day', float('nan')):+.3f} %/day, 95% "
                    f"{o.get('rpd_lo95', float('nan')):+.3f}..{o.get('rpd_hi95', float('nan')):+.3f}")
-    al = c.get("alone") or {}
-    checks = {"enough_trades": n >= MIN_TRADES and ep >= MIN_EPISODES, "significant": bool(sig),
-              "halves": bool(halves), "not_one_year": bool(loyo_ok),
-              "growth": (al.get("growth") is not None and al["growth"] > 0) if al else None}
+    why: List[str] = []
     if not checks["enough_trades"]:
         why.append(f"{n} trades in {ep} episodes (needs {MIN_TRADES} in {MIN_EPISODES})")
     if not checks["significant"]:
-        why.append(f"not significant: {sig_txt}")
+        why.append(f"not significant: {sig_txt}{against}")
     if not checks["halves"]:
-        why.append("the edge is not in both halves of its history")
+        why.append("the edge is not in both halves of its history" + (" (against its bar)" if against else ""))
     if not checks["not_one_year"]:
-        why.append("one calendar year carries it")
+        why.append("one calendar year carries it" + (" (against its bar)" if against else ""))
     if checks["growth"] is False:
         why.append(f"the arm alone at its live slice does not grow ({al.get('growth'):+.1f} %/yr)")
     failed = [k for k, v in checks.items() if v is False]
     verdict = "QUALIFIES" if not failed else ("INSUFFICIENT" if failed == ["enough_trades"] else "FAILS")
-    return {"verdict": verdict, "checks": checks, "basis": "longest" if use_long else "pooled", "why": why}
+    out = {"verdict": verdict, "checks": checks,
+           "basis": ("longest (re-judged)" if rejudge else "longest") if use_long else "pooled",
+           "bar": bar, "bar_spec": bn.get("spec"), "why": why}
+    if use_long:
+        out["pooled_checks"] = pooled
+    return out
 
 
 # ── filters and choices ──────────────────────────────────────────────────────
@@ -668,8 +878,13 @@ def build(day: Optional[date] = None, cards: Optional[Mapping[str, Path]] = None
             "pool": {"sets": list(POOL), "span": [POOL_LO, POOL_HI], "weights": periods.pool_weights(POOL)},
             "rules": {"min_trades": MIN_TRADES, "min_episodes": MIN_EPISODES, "min_cell": MIN_CELL,
                       "min_cell_months": MIN_CELL_MONTHS, "bootstrap": {"resamples": B_BOOT, "seed": SEED,
-                                                                         "over": "entry months"}},
-            "inputs": {"cards": srcs, "runs": f"{rd} / {lab}", "long": {a: v.get("source") for a, v in long.items()}},
+                                                                         "over": "entry months"},
+                      "bar": {"long": "the same exposure's average day (user directive 2026-10-15)", "short": 0.0,
+                              "bench": dict(BENCH)},
+                      "rejudge": "an arm failing only significance, its return per day above its bar, is judged on "
+                                 "its longest history (user directive 2026-10-15)", "t_sig_summaries": T_SIG},
+            "inputs": {"cards": srcs, "runs": f"{rd} / {lab}", "long": {a: v.get("source") for a, v in long.items()},
+                       "bench_history": str(AU.bench_history_json())},
             "arms": arms, "combination": comb}
 
 
@@ -683,10 +898,13 @@ def lines(b: Mapping) -> List[str]:
     for arm, c in b["arms"].items():
         o, q = c["overall"], c["qualify"]
         al = c.get("alone") or {}
+        bar = f"  bar {q.get('bar_spec')} {q.get('bar', 0.0):+.3f}" if q.get("bar_spec") else ""
         out.append(f"  {arm:6s} {q['verdict']:12s} n {o.get('n', 0):5d} months {o.get('months', 0):3d}  "
                    f"rpd {o.get('return_per_day', float('nan')):+.3f} [{o.get('rpd_lo95', float('nan')):+.3f}, "
-                   f"{o.get('rpd_hi95', float('nan')):+.3f}]  gross win {o.get('gross_win_rate', float('nan')):.0%}  "
-                   f"alone {al.get('growth', float('nan')):+.1f} %/yr dd {al.get('maxdd', float('nan')):.0f}%"
+                   f"{o.get('rpd_hi95', float('nan')):+.3f}]{bar}  gross win "
+                   f"{o.get('gross_win_rate', float('nan')):.0%}  alone {al.get('growth', float('nan')):+.1f} %/yr "
+                   f"dd {al.get('maxdd', float('nan')):.0f}%"
+                   + (f"  [{q['basis']}]" if q.get("basis") != "pooled" else "")
                    + (f"  -- {'; '.join(q['why'])}" if q["why"] else ""))
         for name in ("cell",):
             for k, v in ((c.get("context") or {}).get(name) or {}).items():

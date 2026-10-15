@@ -9,7 +9,9 @@ dip buying model. Remember that the simulator needs to mimic production as much 
 resting orders in `src/broker/reconcile.py` (`_sync_dip_orders`), tests `tests/test_dip_long.py`,
 `tests/test_dip_limit.py` and the dip guards in `tests/test_no_lookahead.py`. The studies:
 `memory/long-dip-megacaps-2026-10.md` (the rule), `memory/dip-delayed-entry-2026-10.md` (the limit entry,
-PREREG59-61), report https://claude.ai/artifact/3eY5F8UWDZTg2tpEqcpGz6 (sections 8-10).
+PREREG59-61), report https://claude.ai/artifact/3eY5F8UWDZTg2tpEqcpGz6 (sections 8-10). From the 2026-10-16 session only
+each day's TOP-SCORED signal becomes an order, at a 1/6 slice (THE DAILY TOP PICK below; PREREG116's Q1, user
+2026-10-15: "Deploy Q1"; tests `tests/test_dip_top_pick.py`).
 
 ## The rule
 
@@ -18,7 +20,8 @@ PREREG59-61), report https://claude.ai/artifact/3eY5F8UWDZTg2tpEqcpGz6 (sections
 | Universe | Polygon type CS / ADRC, 20-session mean of close x regular-hours volume >= $1B (`dip_long_min_dollar_volume`); each name once in the project's form — the universe file lists Berkshire as BRK-B AND BRK.B, the candidates keep BRK-B (PREREG64: it was bought twice in the simulator's book) |
 | Signal (close of D-1) | close above its 200-session average, 2-session RSI under 10 |
 | Order | a BUY limit at that close minus `dip_long_limit_atr` (0.5) x its 14-session average true range, floored to the cent (`dip_long.limit_price`), alive sessions D .. D+4 (`dip_long_limit_sessions`); `dip_long_entry_mode=open` restores the original buy at D's open |
-| Placed | at each window session's opening tick, deepest dip (lowest RSI) first; the quantity is fixed when first placed: 1/10 of THE LIVE ACCOUNT's equity at the limit price, within its margin room at Reg T's 50% and the longs' value at most the equity; working orders count toward the 10 dip slots and RESERVE NOTHING; another book's name, no slot, no room: tried again at the next session's opening tick |
+| Ordered | only the day's TOP PICK (`dip_long_daily_top` 1): the best of the day's signals by the meta-model's score (below), the others journaled `not_top`; `dip_long_daily_top=0` orders every signal (the rule to 2026-10-15) |
+| Placed | at each window session's opening tick, best-ranked first (`dip_long.rank_key`: by score; the deepest dip first with the rule off); the quantity is fixed when first placed: 1/6 (`dip_long_account_slices`; 1/10 to 2026-10-15) of THE LIVE ACCOUNT's equity at the limit price, within its margin room at Reg T's 50% and the longs' value at most the equity; working orders count toward the 6 dip slots and RESERVE NOTHING; another book's name, no slot, no room: tried again at the next session's opening tick; an order of a day before the daily top pick is never placed (`superseded`) |
 | Filled | at the session's OPEN when it opens at/under the limit, else at the END of the first completed 30-minute regular-hours bar whose low reaches it (Polygon's bars); AT MOST what the live account's room allows at that tick (`live_account.fill_cap`) — the rest is not bought; no room: nothing, and the order waits for the next session (`unfunded`) |
 | Lapses | after 16:00 of its last session; a margin call cancels the working orders (placed again at a later opening tick) |
 | Splits | a split executed after the order's day rescales a pending or working order like a position, from 04:00 ET of its date (`dip_long.apply_order_splits`: close, ATR, trend average and limit x the factor, the limit floored to the cent, the quantity / it in whole shares; event `split`); an open long is rescaled by the ledger (`tracker.apply_splits`, PREREG64) |
@@ -37,7 +40,28 @@ before its other entries, and `Rules(one_book_per_name=True)` (the books never s
 the live combination 2021-26: +58.6 %/yr from 2021 vs +55.0 buying at the open (+2.3 log points, not significant),
 the dip book's return per day 0.184 vs 0.127%; February 2021 - July 2024 lower (+23.6 vs +26.0).
 
-## The meta-model filter (PREREG96's RP33) — BUILT 2026-10-14, OFF until the user deploys it
+## THE DAILY TOP PICK (PREREG116's Q1) — LIVE from the 2026-10-16 session
+
+User 2026-10-14: "does it favor its best picks first? Would it be better the buy the top 1 pick even if we have more
+slots available?" (PREREG107), then 2026-10-15: "Deploy Q1". Settings `dip_long_daily_top` (1), `dip_long_rank`
+("score"), `dip_long_account_slices` (6); code `dip_long.compute_signals` → `_daily_top` / `rank_key`,
+`dip_filter.score_signals`, `tracker._place_dip_orders` (`dip_long.placeable`, `not_top_order`); tests
+`tests/test_dip_top_pick.py` + the top pick's guard in `tests/test_no_lookahead.py`; evidence
+`memory/pooled-retune-new-arms-2026-10.md`.
+
+| | |
+|---|---|
+| Score | the meta-model below (the model file `dip_long_filter_model`, fit on the signals exiting before 2026-10-08) scores every signal of the day on the closes through D-1 — its RP33 CUT is not applied (`enable_dip_long_filter` stays off); with the filter on, the pick is the best of the kept signals |
+| Pick | the highest score; a signal whose inputs raise ranks after every scored one by its RSI2; the order id (ticker + "|") breaks a tie — the simulator's `strategies.dip.rank_pieces` (`test_the_daily_top_pick_is_the_simulators_choice`) |
+| The others | journaled in `signals/<day>.json` `not_top` and in `orders/<day>.json` with status `not_top` (never placed, never rested at IBKR, no slot) |
+| Transition | an order of a day before the rule (no `dip_top`) is never placed: `superseded` at its next opening tick; a working one is armed as before |
+| Fail-open | no model, a checksum that is not the JSON's, or no SPY close for D-1: the day is unscored and the DEEPEST DIP is the pick (the simulator's rule for an unscored order); the `top` block's `error` raises a scorer-banner problem |
+| Why the slice and the pick go together | the 1/5 slice WITHOUT the daily top-1 met margin calls in 27 (set, draw) pairs against the live 10 (PREREG117): never raise the slice with `dip_long_daily_top` 0 |
+| Evidence | PREREG107's O4 (top-1 at 1/5) +5.00 +- 0.34 log points a year but a PEAK (PREREG116: neighbours +2.8..+3.5); Q1 = top-1 at 1/6 + at most two shorts of one name: +2.89 +- 0.29 (ADD), margin-call pairs 10 -> 7, drawdown 27.8 -> 26.4, the live account +52.8 %/yr; the 2010-2017 replay +12.8 vs +11.2 %/yr; about 1.7 dip trades a week against 3.3 |
+| Journal | `signals/<day>.json`: the `top` block (the rule, by, top, breadth, scored, the model and its cut, SPY's source, `picked`, `error`), each signal's `top_rank` / `filter_score` / `filter_inputs`; the trade stamps `dip_top_rank` and `dip_filter_score` |
+| Simulator | `Mimic()`'s defaults follow production (`dip_rank` / `dip_topk` from `dip_long_rank` / `dip_long_daily_top`; the walk-forward scores `strategies.dip.filter_scores` run to the signals of 2026-10-06 — a later one is unscored) |
+
+## The meta-model filter (PREREG96's RP33) — BUILT 2026-10-14, OFF until the user deploys it (its model ranks the daily top pick)
 
 User 2026-10-14: "I'm ok with deploying PREREG96's dip meta-model filters RP33 and CP33 if they gain in total on all
 three sets" — RP33's add-rule gains: set A +2.39, set B -1.06, set A0 +1.13 log points a year (+2.46 in total; CP33

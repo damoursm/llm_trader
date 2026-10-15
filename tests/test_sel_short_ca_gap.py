@@ -12,6 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from config.settings import settings
 from src.signals import sel_short as ss
 
 
@@ -55,6 +56,9 @@ def test_a_crash_that_keeps_trading_wildly_and_smaller_or_upward_gaps_are_not_fl
 
 
 def test_the_vol_and_etf_arms_leave_flagged_bars_out_and_the_model_arm_does_not(monkeypatch):
+    # UVIX stands for any unflagged product here: the VIX block (2026-10-14) is pinned off — its tests are in
+    # tests/test_sel_short.py
+    monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", False)
     monkeypatch.setattr(ss, "load_model", lambda: (None, {"tickers": ["AAA", "CTVA", "UVIX"]}))
     monkeypatch.setitem(ss._TYPES, "t", {"AAA": "CS", "CTVA": "CS", "UVIX": "ETF", "GAPE": "ETF"})
     monkeypatch.setattr(ss, "vol_listing_names", lambda: [])

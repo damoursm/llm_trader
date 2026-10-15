@@ -343,23 +343,24 @@ def signal_inputs(ticker: str, session: date, breadth: int, spy: dict, prior: Di
     return out
 
 
-def apply(signals: List[dict], d: date, prev: date, path: Optional[Path] = None) -> Tuple[List[dict], dict]:
-    """Score the signals of session ``d`` (decided at the close of ``prev``) and drop those under the cut: returns
-    (the kept signals, deepest dip first as given; ``{"info": ..., "filtered": [the dropped signals]}``). Every signal
-    is stamped ``filter_score`` / ``filter_keep`` / ``filter_inputs``. Fail-open: no model, or no SPY close for
-    ``prev``, keeps every signal (``info["error"]``)."""
-    info: dict = {"model": MODEL_NAME, "policy": POLICY, "breadth": len(signals), "scored": 0, "kept": len(signals),
-                  "filtered": 0, "error": None}
+def score_signals(signals: List[dict], d: date, prev: date, path: Optional[Path] = None) -> dict:
+    """Score the signals of session ``d`` (decided at the close of ``prev``) IN PLACE — each stamped
+    ``filter_score`` / ``filter_inputs`` / ``filter_prev_signal``, or ``filter_error`` when its own inputs raise (left
+    unscored) — and return the journal block: the model, its cut and fit, the breadth (every signal given: the day's
+    count, an input), how many were scored, SPY's source and session, and ``error`` when nothing could be scored (no
+    model, or no SPY close for ``prev``). The RP33 filter (`apply`) and the daily top pick (`dip_long`, PREREG116's
+    Q1) both read these scores."""
+    info: dict = {"model": MODEL_NAME, "breadth": len(signals), "scored": 0, "error": None}
     if not signals:
-        return signals, {"info": info, "filtered": []}
+        return info
     try:
         booster, meta = load_model(path)
     except Exception as e:                                      # noqa: BLE001
-        info["error"] = f"model unavailable ({type(e).__name__}: {e}) — every signal kept"
+        info["error"] = f"model unavailable ({type(e).__name__}: {e})"
         logger.error(f"[dip_filter] {d}: {info['error']}")
-        return signals, {"info": info, "filtered": []}
-    cut = float(meta["policy"]["cut"])
-    info.update(cut=cut, fit_cut=(meta.get("fit") or {}).get("cut_date"),
+        return info
+    cut = (meta.get("policy") or {}).get("cut")
+    info.update(cut=None if cut is None else float(cut), fit_cut=(meta.get("fit") or {}).get("cut_date"),
                 model_sha256=str((meta.get("checksums") or {}).get("model_sha256"))[:16])
     try:
         spy, src = spy_inputs(prev)
@@ -367,9 +368,9 @@ def apply(signals: List[dict], d: date, prev: date, path: Optional[Path] = None)
         spy, src = None, f"error: {type(e).__name__}: {e}"
     info["spy_source"] = src
     if spy is None:
-        info["error"] = f"no SPY close for {prev} ({src}) — every signal kept"
+        info["error"] = f"no SPY close for {prev} ({src})"
         logger.error(f"[dip_filter] {d}: {info['error']}")
-        return signals, {"info": info, "filtered": []}
+        return info
     info["spy_session"] = prev.isoformat()
     prior = meta.get("prior_signals") or {}
     rows, idx = [], []
@@ -378,8 +379,7 @@ def apply(signals: List[dict], d: date, prev: date, path: Optional[Path] = None)
             x = signal_inputs(str(s["ticker"]), prev, len(signals), spy, prior)
         except Exception as e:                                  # noqa: BLE001
             s["filter_error"] = f"{type(e).__name__}: {e}"
-            s["filter_keep"] = True
-            logger.warning(f"[dip_filter] {s.get('ticker')}: not scored ({s['filter_error']}) — kept")
+            logger.warning(f"[dip_filter] {s.get('ticker')}: not scored ({s['filter_error']})")
             continue
         s["filter_prev_signal"] = x.pop("_prev_signal")
         s["filter_inputs"] = {k2: _clean(float(x[k2])) for k2 in FEATURES}
@@ -388,12 +388,32 @@ def apply(signals: List[dict], d: date, prev: date, path: Optional[Path] = None)
     scores = booster.predict(matrix(rows)) if rows else np.zeros(0)
     for k, sc in zip(idx, scores):
         signals[k]["filter_score"] = float(sc)
-        signals[k]["filter_keep"] = keep(sc, cut)
+    info["scored"] = len(rows)
+    return info
+
+
+def apply(signals: List[dict], d: date, prev: date, path: Optional[Path] = None) -> Tuple[List[dict], dict]:
+    """Score the signals of session ``d`` (decided at the close of ``prev``; `score_signals`) and drop those under the
+    cut: returns (the kept signals, deepest dip first as given; ``{"info": ..., "filtered": [the dropped signals]}``).
+    Every signal is stamped ``filter_score`` / ``filter_keep`` / ``filter_inputs``. Fail-open: no model, or no SPY
+    close for ``prev``, keeps every signal (``info["error"]``); a signal whose own inputs raise is kept unscored."""
+    info: dict = {"model": MODEL_NAME, "policy": POLICY, "breadth": len(signals), "scored": 0, "kept": len(signals),
+                  "filtered": 0, "error": None}
+    if not signals:
+        return signals, {"info": info, "filtered": []}
+    sc = score_signals(signals, d, prev, path)
+    info.update({k: v for k, v in sc.items() if k != "model"})
+    if sc["error"] or sc.get("cut") is None:
+        info["error"] = f"{sc['error'] or 'the model carries no cut'} — every signal kept"
+        return signals, {"info": info, "filtered": []}
+    cut = float(sc["cut"])
+    for s in signals:
+        s["filter_keep"] = keep(s["filter_score"], cut) if s.get("filter_score") is not None else True
     kept = [s for s in signals if s.get("filter_keep", True)]
     dropped = [s for s in signals if not s.get("filter_keep", True)]
-    info.update(scored=len(rows), kept=len(kept), filtered=len(dropped))
-    logger.info(f"[dip_filter] {d}: {len(rows)} of {len(signals)} signal(s) scored (cut {cut:+.4f}, SPY from the "
-                f"{src}): {len(kept)} kept, {len(dropped)} filtered"
+    info.update(kept=len(kept), filtered=len(dropped))
+    logger.info(f"[dip_filter] {d}: {sc['scored']} of {len(signals)} signal(s) scored (cut {cut:+.4f}, SPY from the "
+                f"{sc.get('spy_source')}): {len(kept)} kept, {len(dropped)} filtered"
                 + (": " + ", ".join(f"{s['ticker']} {s['filter_score']:+.3f}" for s in dropped) if dropped else ""))
     return kept, {"info": info, "filtered": dropped}
 
@@ -544,16 +564,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             day = dip_long.compute_signals(d, extend=False)
         finally:
             dip_long._write_json = orig
-        if "filter" in day:                                         # the switch is on: already scored
-            sig, info = list(day.get("signals") or []) + list(day.get("filtered") or []), day["filter"]
+        every = (list(day.get("signals") or []) + list(day.get("filtered") or [])
+                 + list(day.get("not_top") or []))                  # the daily top pick keeps the rest in not_top
+        if "filter" in day or "top" in day:                         # already scored (the filter / the daily top pick)
+            sig = every
+            info = dict(day.get("filter") or {}, **({"top": day["top"]} if "top" in day else {}))
         else:                                                       # off: score them here (apply stamps each dict)
-            sig = [dict(s) for s in day.get("signals") or []]
+            sig = [dict(s) for s in every]
             info = apply(sig, d, dip_long.prev_session(d))[1]["info"]
         print(json.dumps(info, indent=1, default=str))
         for s in sorted(sig, key=lambda r: (r.get("filter_score") is None, -(r.get("filter_score") or 0.0))):
             sc = s.get("filter_score")
             print(f"  {s['ticker']:<8} RSI2 {float(s['rsi2']):5.2f}  score {'%+.4f' % sc if sc is not None else '   n/a '}  "
-                  f"{'KEEP' if s.get('filter_keep', True) else 'DROP'}")
+                  + (f"top #{s['top_rank']}  " if s.get("top_rank") is not None else "")
+                  + ("" if "filter_keep" not in s else ("KEEP" if s["filter_keep"] else "DROP")))
         return 0
     ap.print_help()
     return 1

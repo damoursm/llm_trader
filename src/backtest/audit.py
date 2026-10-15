@@ -98,6 +98,12 @@ def baseline_json() -> Path:
     return research_dir() / "studies" / "prereg103" / "global103.json"
 
 
+def bench_history_json() -> Path:
+    """PREREG120's carried benchmark histories (the bank's bar before the daily cache's first session): the indices
+    stitched before their ETF, the 3x funds synthetic before their inception."""
+    return research_dir() / "studies" / "prereg120" / "bench_history.json"
+
+
 def live_calibration_dir() -> Path:
     from config.settings import settings
     p = Path(getattr(settings, "live_calibration_dir", "cache/ml/live_calibration"))

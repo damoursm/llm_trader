@@ -142,17 +142,23 @@ section. Evidence: `memory/selection-model-exits-2026-09.md`; deployment record:
   under one day of volume (the short-interest filter, next bullet) and IBKR can
   lend it (>= $10k available, any fee). Flat size: `sel_short_size_multiplier` (1.0) × the
   base order (2,000 CAD). No gate cascade, no sizing chain. Both arms trade through
-  this. There is NO one-position-per-ticker limit (user directive 2026-09-28:
-  "Remove the one position per ticker rule"): a repeat pick of a name the book
+  this. Stacking (user directive 2026-09-28: "Remove the one position per ticker
+  rule"; capped at two from 2026-10-16, below): a repeat pick of a name the book
   already shorts opens ANOTHER trade (`sel_stack_n`), netted into one position at
   IBKR — the broker sync sizes each entry and cover by what each open trade owns;
   a name two arms pick on the same bar opens ONE TRADE PER ARM, each with its own
   target, the model's first (user directive 2026-10-04: "Two trades, one per arm";
   until then one trade stamped `sel_arm = "model+vol"`); a name another book holds is
   never stacked on.
-  `SEL_SHORT_MAX_OPEN_PER_TICKER` = 1 restores the old rule (a repeat pick noted on
-  the open trade, `sel_also`). Measured on 2025 + Jan–Sep 2026: model 0.87 → 1.04
-  %/day, vol 1.99 → 2.22, not significant; up to 3–4 shorts stacked on one name.
+  AT MOST TWO OPEN SHORTS OF ONE NAME from the 2026-10-16 session (PREREG116's Q1
+  with PREREG113's C2, user 2026-10-15: "Deploy Q1"; `SEL_SHORT_MAX_OPEN_PER_TICKER`
+  = 2, every arm's open trades of the name counted): a pick past it is settled
+  `already_open` and noted on the newest open trade (`sel_also`); 1 = one per name,
+  0 = no limit (the rule from 2026-09-28 to 2026-10-15: up to 3–4 shorts stacked on
+  one name; measured on 2025 + Jan–Sep 2026: model 0.87 → 1.04 %/day, vol 1.99 →
+  2.22, not significant). Every margin call of the live draws was a squeeze on a
+  name the account held; the cap alone cost nothing (-0.01 +- 0.24 log points a year)
+  and took the margin-call pairs 10 → 8 (PREREG113).
   Every trade carries `sel_arm` (`model` / `vol` / `etf`; `model+vol` only on trades
   opened before 2026-10-04).
 - **The short-interest filter** (user directive 2026-09-27: "Add in live production
