@@ -258,15 +258,49 @@ def real_leg_cost_frac(side: str, filled_qty, model_price, fill_price,
     return max(0.0, pct) / 100.0
 
 
+# A leg priced from its own quote (AUDIT151, the user's go-ahead 2026-10-19): IBKR's exact fees on its shares (the
+# simulator's `account.SEC_FEE` / `TAF_PER_SHARE`, `Mimic(quote_costs=True)`) and the broker's widest limit cap.
+SEC_FEE_RATE = 27.80e-6                  # SEC Section 31 fee per dollar sold
+TAF_PER_SHARE, TAF_MAX = 0.000166, 8.30  # FINRA's trading activity fee on shares sold, capped per trade
+QUOTE_CAP_BPS = 400.0                    # the spread-aware regular-hours limit cap: a leg never crosses wider
+
+
+def quote_leg_cost_frac(side: str, price, bid, ask, shares) -> Optional[float]:
+    """The one-way cost FRACTION of a leg with no usable fill of its own, from its OWN book at submit (AUDIT151:
+    the liquidity-bucket averages were calibrated on calm names' fills — ~23 bp all-in — while the volatile names
+    the short arms trade quote 50-80 bp half-spreads): the quoted half-spread over the mid, capped at
+    `QUOTE_CAP_BPS`, + IBKR's commission on the leg's shares (``commission_model``: fixed max($1, $0.005 a share),
+    tiered max($0.35, $0.0035), at most 1% of the value; none = spread only) + on a sale the SEC fee and FINRA's TAF.
+    None without a two-sided quote, a price or the shares."""
+    try:
+        b, a, p, n = float(bid), float(ask), float(price), float(shares)
+    except (TypeError, ValueError):
+        return None
+    if not (b > 0 and a >= b and p > 0 and n > 0):
+        return None
+    hs = min((a - b) / (a + b), QUOTE_CAP_BPS / 1e4)
+    value = n * p
+    model = (settings.commission_model or "none").lower()
+    if model == "none":                  # spread only, as every other tier under this model
+        return hs
+    fee = max(0.35, 0.0035 * n) if model == "ibkr_tiered" else max(1.00, 0.005 * n)
+    fee = min(fee, 0.01 * value)
+    if str(side or "").upper() == "SELL":
+        fee += SEC_FEE_RATE * value + min(TAF_PER_SHARE * n, TAF_MAX)
+    return hs + fee / value
+
+
 def resolve_leg_cost(*, side: str, price: float, asset_type: str, session_fine: str,
                      ref, filled_qty, model_price, fill_price, commission,
                      coarse_session: Optional[str] = None, run=None,
-                     adv=None) -> float:
+                     adv=None, quote_bid=None, quote_ask=None, shares=None) -> float:
     """The per-trade one-way cost FRACTION for one leg, by the hierarchy
     (2026-08-25 user directive — realized fills first, the parametric formula
     demoted to the cold-start prior):
       1. the leg's OWN realized cost, if it filled at the broker
          ("we shouldn't approximate costs that were actually filled");
+      1b. else its OWN QUOTE at submit (``quote_bid`` / ``quote_ask`` on its
+         ``shares``, `quote_leg_cost_frac`; AUDIT151, 2026-10-19) — at any price;
       2. else the SAME-TICK average of fills in the leg's LIQUIDITY CLASS
          (price band × dollar-volume band);
       3. else the plain same-tick average;
@@ -297,6 +331,11 @@ def resolve_leg_cost(*, side: str, price: float, asset_type: str, session_fine: 
         real = real_leg_cost_frac(side, filled_qty, model_price, fill_price, commission)
         if real is not None:
             return real
+    if quote_bid is not None and quote_ask is not None:
+        q = quote_leg_cost_frac(side, price, quote_bid, quote_ask, shares)
+        if q is not None:
+            return q
+    if above_min:
         pb, ab = price_band(price), adv_band(adv)
         # Tick average: the run the leg was DECIDED in. The entry leg passes it
         # directly (trade.run_id); otherwise fall back to the ref→run map (only
@@ -375,6 +414,20 @@ def borrow_cost_fraction(action: str, days_held: Optional[float],
     return borrow_annual_pct(trade) / 100.0 * (d / 365.0)
 
 
+def _leg_shares(trade: dict, which: str) -> Optional[float]:
+    """The shares a leg orders: the broker's requested quantity, else the live account's share count."""
+    keys = (("broker_requested_qty",) if which == "entry" else ("broker_exit_requested_qty",)) + (
+        "sel_account_shares", "dip_account_shares", "crash_account_shares", "etf_dm_account_shares")
+    for k in keys:
+        try:
+            v = float(trade.get(k) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            return v
+    return None
+
+
 def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: str) -> float:
     """One-way cost FRACTION for a real trade's entry or exit leg. Extracts the
     broker leg fields from the trade UNIFORMLY so ``_pct_return`` (tracker) and
@@ -394,7 +447,8 @@ def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: 
             ref=trade.get("broker_client_ref") or trade.get("recommendation_id"),
             filled_qty=trade.get("broker_fill_qty"), model_price=trade.get("entry_price"),
             fill_price=trade.get("broker_fill_price"), commission=trade.get("broker_commission"),
-            adv=_adv)
+            adv=_adv, quote_bid=trade.get("broker_bid_at_submit"), quote_ask=trade.get("broker_ask_at_submit"),
+            shares=_leg_shares(trade, "entry"))
     # exit leg — the closing side is the opposite of the entry
     side = "SELL" if action == "BUY" else "BUY"
     return resolve_leg_cost(
@@ -403,7 +457,8 @@ def resolve_trade_leg_cost(trade: dict, which: str, price: float, session_fine: 
         ref=trade.get("broker_exit_client_ref"),
         filled_qty=trade.get("broker_exit_fill_qty"), model_price=trade.get("exit_price"),
         fill_price=trade.get("broker_exit_fill_price"), commission=trade.get("broker_exit_commission"),
-        adv=_adv)
+        adv=_adv, quote_bid=trade.get("broker_exit_bid_at_submit"),
+        quote_ask=trade.get("broker_exit_ask_at_submit"), shares=_leg_shares(trade, "exit"))
 
 
 def effective_cost_hurdle_pct() -> float:
@@ -578,7 +633,8 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
                 entry_session=None, exit_session=None,
                 entry_cost: Optional[float] = None,
                 exit_cost: Optional[float] = None,
-                borrow_cost: Optional[float] = None) -> float:
+                borrow_cost: Optional[float] = None,
+                dividend: Optional[float] = None) -> float:
     """Percent return, sign-aware, with round-trip half-spread + commission.
 
     BUY  : paid the ask at entry (+cost), receive the bid at exit (−cost).
@@ -599,6 +655,10 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
     period — see ``borrow_cost_fraction``. Ignored for longs, which never pay
     it. None = no borrow charged (the pre-2026-07-25 behaviour).
 
+    ``dividend`` (a positive fraction of the entry price) is the cash of the
+    ex-dates the position was entitled to (``src/performance/dividends.py``):
+    a long RECEIVES it, a short PAYS it (the payment in lieu). None = none.
+
     Returns ``0.0`` for non-positive prices — the round-trip is undefined
     there.  Callers refuse to trade at such prices; this guard exists to
     keep stats clean for any record that slipped through historically.
@@ -607,17 +667,19 @@ def _pct_return(action: str, entry: float, current: float, asset_type: str = "ST
         return 0.0
     entry_cost = entry_cost if entry_cost is not None else _one_side_cost(entry, asset_type, entry_session)
     exit_cost  = exit_cost  if exit_cost  is not None else _one_side_cost(current, asset_type, exit_session)
+    div = float(dividend or 0.0) * 100.0
     if action == "BUY":
         effective_entry = entry   * (1 + entry_cost)
         effective_exit  = current * (1 - exit_cost)
-        return (effective_exit - effective_entry) / effective_entry * 100
+        return (effective_exit - effective_entry) / effective_entry * 100 + div
     # SELL = short. Borrow carry (a SHORT-only holding cost — see
     # borrow_cost_fraction) reduces the realised return; it is not a price
-    # adjustment, so it is subtracted after the round trip.
+    # adjustment, so it is subtracted after the round trip — as is the
+    # dividend a short owes the lender.
     effective_entry = entry   * (1 - entry_cost)
     effective_exit  = current * (1 + exit_cost)
     gross = (effective_entry - effective_exit) / effective_entry * 100
-    return gross - (borrow_cost or 0.0) * 100.0
+    return gross - (borrow_cost or 0.0) * 100.0 - div
 
 
 def fmt_price(p) -> str:

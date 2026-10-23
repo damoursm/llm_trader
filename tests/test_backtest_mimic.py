@@ -182,14 +182,37 @@ def test_the_configuration_switches():
     assert M.short_extra(M.Mimic().without("entry")) == {"rule201": False}
     assert M.short_extra(M.Mimic.off()) == {}
     r, r0 = M.live_rules(M.Mimic()), M.live_rules(M.Mimic.off())
-    assert (r.trigger, r.fees, r.mark_net, r.one_book_per_name) == ("close", "ledger", True, True)
-    assert (r0.trigger, r0.fees, r0.mark_net) == ("high", "engine", False)
+    assert (r.trigger, r.fees, r.mark_net, r.one_book_per_name) == ("high", "ledger", True, True)
+    assert (r0.trigger, r0.fees, r0.mark_net, r0.liquidation) == ("high", "engine", False, "all")
+    r1 = M.live_rules(M.Mimic(**M.PRE174))                   # the margin calls before PREREG174: at the tick marks
+    assert (r1.trigger, r1.liquidation, r1.sem, r1.regt_close) == ("close", "all", 0.0, False)
     S = {s.name: s for s in M.live_strategies(M.Mimic())}
     assert {S[n].priority for n in ("vol", "etf", "fall")} == {0} and S["dip"].fees == "engine"
     assert S["vol"].shrink_budget == pytest.approx(float(settings.sel_short_account_house_init))
     S0 = {s.name: s for s in M.live_strategies(M.Mimic.off())}
     assert (S0["vol"].priority, S0["etf"].priority, S0["fall"].priority) == (0, 1, 2) and S0["vol"].shrink_budget is None
 
+
+
+def test_margin_calls_are_ibkrs_liquidation_by_default():
+    """PREREG174 (the user 2026-10-21: the backtest does what IBKR does at a margin call): the default judges the margin
+    on the bars' extremes and liquidates as IBKR documents it — the most recent positions first, in 100-share lots,
+    only back to the maintenance requirement —, strict (no Soft Edge Margin), with the end-of-day Reg T floor."""
+    r = M.live_rules(M.Mimic())
+    assert (r.trigger, r.liquidation, r.liq_order, r.liq_lot, r.sem, r.regt_close, r.liq_fill, r.liq_slip) == (
+        "high", "ibkr", "recent", 100, 0.0, True, "path", pytest.approx(0.10))
+    assert M.live_rules(M.Mimic(margin_fill="extreme")).liq_fill == "extreme"
+    assert M.live_rules(M.Mimic(margin_check="ticks")).trigger == "close"
+    assert M.live_rules(M.Mimic(margin_sem=0.10)).sem == pytest.approx(0.10)
+    assert M.live_rules(M.Mimic(margin_order="requirement")).liq_order == "requirement"
+    assert M.live_rules(M.Mimic(margin_regt=False)).regt_close is False
+    # with the earlier rule the trigger switch decides where it is judged, as before
+    assert M.live_rules(M.Mimic(margin="all")).trigger == "close"
+    assert M.live_rules(M.Mimic(margin="all").without("trigger")).trigger == "high"
+    for bad in ({"margin": "some"}, {"margin_check": "intrabar"}, {"margin_order": "worst"}, {"margin_sem": 1.0},
+                {"margin_sem": True}, {"margin_regt": 1}, {"margin_fill": "worst"}, {"margin_slip": 2.0}):
+        with pytest.raises(ValueError):
+            M.Mimic(**bad)
 
 # ── the ledger's costs ───────────────────────────────────────────────────────
 
@@ -270,7 +293,8 @@ def test_a_lendability_shift_moves_every_draw_the_same_way():
                       "bod": np.zeros(n, int), "actual": np.full(n, 10.0)})
     eng = types.SimpleNamespace(st=types.SimpleNamespace(C=C), lend_mask=lambda at="pick": np.ones(n, bool))
     p = np.full(n, 0.5)
-    indep = {"house": False, "lend_persist": 0.0, "lend_day_lam": 0.0}      # one day: no market-wide factor here
+    indep = {"house": False, "lend_persist": 0.0, "lend_day_lam": 0.0,     # one day: no market-wide factor here
+             "lend_intra": None}                                            # the draw model alone (no AUDIT151 loss)
     base = M.lend_all(eng, M.Mimic(**indep), p_lend=p).mean()
     lo = M.lend_all(eng, M.Mimic(lend_shift=-1.0, **indep), p_lend=p).mean()
     hi = M.lend_all(eng, M.Mimic(lend_shift=+1.0, **indep), p_lend=p).mean()

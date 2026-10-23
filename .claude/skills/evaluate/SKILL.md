@@ -1,6 +1,6 @@
 ---
 name: evaluate
-description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO KINDS of test sets: the NEWS test sets for signals and models, each reported separately, never pooled (news set 1 history 2026-06-17..09-27, news set 2 live all-source news from 2026-09-28), and the BORROW-DATA sets for strategy backtests, DECIDED on their union — the POOLED HISTORY A0 + A + B, 2018-01-02..2026-09-24 (set A0 2018-01-02..2021-01-29 and set A 2021-02-01..2024-06-24 with IBKR's short-stock file, set B 2024-06-25..2026-09-24 without it; set C our own archive from 2026-09-25, set D the forward holdout — src/backtest/periods.py), every set reported beside; model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective for models trained on it; gates/exits = counterfactual excess return per decision; the LIVE STRATEGY (the $10,000 live account) = return per day, the GROSS win rate AND growth per year on the pooled history (no deposits, the simulator that mimics production, src/backtest/mimic.py) with its years and months; each ARM qualified for the bank on the pooled history (>= 100 trades in 30 entry months, the return per day's entry-month interval above its bar — 0 for a short arm, the same exposure's average day for a long one: SPY, or the fund it trades —, both halves and every leave-one-year-out above it, growth at its slice; an arm failing only significance re-judged on its longest history, clustered — src/backtest/bank.py); a change by the pooled add rule (add_rule.pooled_verdict); label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
+description: House standard for evaluating any model, signal, gate or exit rule in llm_trader — TWO KINDS of test sets: the NEWS test sets for signals and models, each reported separately, never pooled (news set 1 history 2026-06-17..09-27, news set 2 live all-source news from 2026-09-28), and the BORROW-DATA sets for strategy backtests, DECIDED on their union — the POOLED HISTORY A0 + A + B, 2018-01-02..2026-09-24 (set A0 2018-01-02..2021-01-29 and set A 2021-02-01..2024-06-24 with IBKR's short-stock file, set B 2024-06-25..2026-09-24 without it; set C our own archive from 2026-09-25, set D the forward holdout — src/backtest/periods.py), every set reported beside; model metrics = IC to the next H/L pivot, its day-clustered t, and the top/bottom 5%, 3% and 1% next-pivot returns (src/analysis/eval_metrics.py), plus the selection objective for models trained on it; gates/exits = counterfactual excess return per decision; the LIVE STRATEGY (the $10,000 live account) = return per day, the GROSS win rate AND growth per year on the pooled history (no deposits, the simulator that mimics production, src/backtest/mimic.py) with its years and months; each ARM qualified for the bank on the pooled history (>= 100 trades in 30 entry months, the return per day's entry-month interval above its bar — 0 for a short arm, the same exposure's average day for a long one: SPY, or the fund it trades —, both halves and every leave-one-year-out above it, growth at its slice; an arm failing only significance re-judged on its longest history, clustered — src/backtest/bank.py); a change by the pooled add rule (add_rule.pooled_verdict) with its market-noise reading beside (add_rule.market_noise: t, p, deflated p, oFDR — PREREG183); Sharpe inference with autocorrelation, skew and kurtosis, episodes (months) not trades, MinTRL and power, alpha and beta against SPY / QQQ, purged folds (src/analysis/stats.py, PREREG183); label = the next H/L pivot on 30-minute bars from the tick, unresolved rows at the last close; simulated/panel rows, never the trade ledger.
 argument-hint: "[what to evaluate, e.g. 'the ml_exit upgrade' or 'Gate 1c']"
 ---
 
@@ -269,6 +269,49 @@ compare levels across definitions.
   the arm has thousands of trades (the dip book); the bundle's overlap and headroom
   (`reliability.bundle`); the live score against the card's reference (the calibration
   record's `arms`).
+- SHARPE-RATIO INFERENCE (PREREG183, the user 2026-10-22: "Copy the formulas to improve our own
+  skills"; López de Prado, Lipton & Zoonekynd, SSRN 5520741; `src/analysis/stats.py`, dependency-free,
+  pinned to the paper's reference values by `tests/test_stats_sharpe_inference.py`). Use them, never the
+  iid shortcuts, whenever a claim rests on a RETURN SERIES:
+  - **Significance of a series** (a book's monthly P&L, an account, a paired difference): `stats.sharpe_psr`
+    with the series' own autocorrelation ρ, skewness and plain kurtosis (`stats.sharpe_moments`) — its
+    variance is taken UNDER THE NULL; the older `probabilistic_sharpe` (variance at the estimate, T - 1, no ρ)
+    stays only to reproduce studies before 2026-10-22.
+  - **Count episodes, not trades**: trades that cluster (same-day batches, a squeeze stacked over a month)
+    are not independent observations. Read an arm's deflated Sharpe on its MONTHLY unit-bet P&L
+    (`bank.monthly_unit_pnl`, `bank.dsr_months` — every card carries it as ``dsr_months`` beside the per-trade
+    ``dsr``), deflated by `stats.deflated_sharpe_k` (the best of K trials: the threshold SR0 + E[max] and the
+    maximum's own variance). PREREG183: on its months the vol arm's deflated Sharpe at its 753 trials is 0.10
+    (0.56 per trade), the capitulation book's 0.69 (0.73).
+  - **How long a record must run**: `stats.min_track_record` (an even chance to show the edge) and
+    `stats.track_record_for_power` (any power; `stats.sharpe_power` reads the power at a given length, either
+    direction). The bank's ``combination.track_record`` states it for the live record every build — PREREG183:
+    10 months at the backtest's own Sharpe for an even chance to show a profit (21 for 80% power), 41 (85) at half
+    of it, 67 months for 80% power to show the live Sharpe is half the backtest's. A live gap read in weeks is a
+    sanity check, never evidence.
+  - **A change against the MARKET's noise**: the add rule's standard error is the DRAWS' (simulation noise, which
+    more draws remove); one history carries market noise no draw removes. Report `add_rule.market_noise(live,
+    variant)` (or `pooled_verdict(..., market=True)`; the records need their daily NAV) beside the verdict: the
+    paired monthly gain's Newey-West t, its p with ρ / skew / kurtosis, deflated for K tries, and the observed
+    false discovery rate `stats.ofdr` at the research log's prior (the deploy rate, 22% on 2026-10-22; say which
+    alternative). PREREG183: the five changes deployed 2026-10-19..21 have t 1.6-1.9 (one -0.1), oFDR 12-30% each,
+    and a no-effect change shows the +0.5 gain 32-47% of the time on this history — the +0.5 bar alone is not a
+    significance test.
+  - **Skill or market exposure**: `stats.ols_cluster` of each trade's net return on SPY's (and QQQ's) return over
+    the trade's own window, errors clustered by entry month — α a trade, its return per day beside the raw one, β;
+    `stats.ols_hac` (Newey-West) for a daily account series, the previous day's market return beside (the marks'
+    timing). PREREG183: the dip book +2.00% a trade of alpha out of +2.22% (β 1.26), the capitulation book +1.85%
+    (β 1.07), the crash book none (β 3.95 on SPY: its edge is the timing of 3x exposure), the account's monthly β ~0.
+  - **Purged folds**: any out-of-fold score (a cut, a calibration, a stacker's input) drops the training rows
+    whose label window [signal, exit] overlaps a test fold's span and embargoes the days after it
+    (`studies/prereg183/h183.py purge`; the dip meta-model's RP33 cut moved 0.006 points, 5 of 5,439 signals).
+- THE DEPLOY RULE'S OWN RECORD AND THE FORWARD CHECK (PREREG184 / 185, 2026-10-22). Backtested out of time on its
+  303 recorded verdicts (`studies/prereg184/h184.py`), the add rule's year-end adds gained no more the next year than
+  its refusals and kept about a tenth of their in-sample gain; a change near the +0.5 bar is the market's noise until
+  its market t says otherwise, so always quote that t (above) and say when it is under 2. Live execution is read (the EOD chain's `forward_check` step from 2026-10-23, `src/backtest/forward_check.py`; the research version below)
+  trade by trade against the simulator's own construction (`studies/prereg185/h185.py all <ledger copy>`): entry,
+  exit at the same tick, timing, costs, the net trade, IBKR's fills, and the live account in the backtest's tracking
+  band. A few weeks of live P&L is never evidence about an edge (PREREG183); a paired execution gap can be.
 - The house bar, PRE-REGISTERED before the run: paired t ≥ 2 AND same-sign
   halves, judged on each test set as §1 requires (a strategy: on the pooled history,
   its halves chronological; report each set beside — an effect on set B only may be
@@ -277,14 +320,16 @@ compare levels across definitions.
   2026-10-14): a variant the house bar does not call proven is still ADDED when its
   POOLED gain — the years-weighted mean of the sets' paired gains — is at least +0.5
   log points a year (no set must gain alone), no ONE calendar year carries it (the
-  pooled gain stays above 0 with any year left out: save every draw's daily NAV), no
-  more (set, draw) pairs meet a margin call than the live configuration's on the same
-  seeds and the pooled worst drawdown is at most 1 point deeper — judged PAIRED on
+  pooled gain stays above 0 with any year left out: save every draw's daily NAV), its
+  margin events are not significantly more frequent — AS A RATE from 2026-10-23: the
+  one-sided exact binomial on the (set, draw) pairs where one side alone meets one,
+  p < 0.05 (`add_rule.margin_events`; one extra pair refused before) — and the pooled
+  worst drawdown is at most 1 point deeper — judged PAIRED on
   common seeds, 20 stratified draws per set (40 in every set within 2 SE of +0.5; 3 SE
   below +0.5 after 5 draws rejects at once), mechanically by
   `add_rule.pooled_verdict`. What it adds must rest on enough trades: an arm
   qualified for the bank, a filter justified by its removed trades (or by risk:
-  fewer margin calls, a shallower drawdown — the user's call). Report each set's and
+  significantly fewer margin events, a shallower drawdown — the user's call). Report each set's and
   each year's gain in log points a year (set B's higher growth inflates percentage
   points); PREREG81: rule tweaks keep 9–23% of their in-sample gain out of sample.
 - A new ARM for the live combination (user 2026-10-11: arms that cover different
@@ -349,8 +394,13 @@ parts and the months:
 
 For an ARM, its bank card (`python -m src.backtest.bank`):
 
-| arm | verdict (basis) | trades / months | return/day (95%) | bar | gross win | halves | worst year left out | alone at its slice | earns / loses in |
-|---|---|---|---|---|---|---|---|---|---|
+| arm | verdict (basis) | trades / months | return/day (95%) | bar | gross win | halves | worst year left out | alone at its slice | earns / loses in | deflated Sharpe (trades / months) | α a trade, β (SPY) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+
+For a CHANGE, beside the add rule's verdict, its market-noise line (`add_rule.market_noise`):
+
+| change | gain (lp/yr) | market se | t (Newey-West) | p (ρ, skew, kurt) | p deflated (K 10 / 50) | oFDR at the prior | P[no-effect change passes +0.5] |
+|---|---|---|---|---|---|---|---|
 
 For a model trained on the selection objective, add per side:
 

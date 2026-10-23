@@ -131,6 +131,7 @@ import pandas as pd
 from loguru import logger
 
 from config.settings import settings
+from src.accounts import paths as _acct
 
 ET = ZoneInfo("America/New_York")
 EPOCH = pd.Timestamp("1970-01-01")
@@ -151,7 +152,8 @@ _SCORE_DIRS = {"model": "scores", "vol": "scores_vol", "etf": "scores_etf", "thi
 VOL_RULE_ARMS = ("vol", "etf", "thin", "vol2", "fall")  # the arms that rank the `vol` column (30-min ATR%)
 # VOL2 (user directive 2026-10-07: "Deploy it as another version that will also make real trades in the paper
 # account"): the vol arm's ranking, universe, freshness (its own copy of the vol history, `scores_vol2/`), first
-# fresh pick of the day, riser, same-bar fallback, whole give-back target, 15-session limit and 6x cover — WITHOUT
+# fresh pick of the day, riser, same-bar fallback, the vol arm's give-back target (`give_back`: 1.25 from
+# 2026-10-14), 15-session limit and 6x cover; SHADOW since 2026-10-09 (never traded) — WITHOUT
 # the crowding filter, the relative-volume filter and the volatility exit. PREREG37 (2021-02..2024-06, one $10,000
 # account, every restriction): +20.7 vs +11.7 %/yr (+7.7 pp, 95% -5.7..+20.4, both halves and every start
 # positive), return per day 0.36 vs 1.44 %, 6 vs 1 margin calls over the 2021-26 context; not significant.
@@ -193,6 +195,53 @@ def cover_multiple(arm) -> float:
     if str(arm or "model") == "vol":
         return float(getattr(settings, "sel_short_vol_cover_multiple", settings.sel_short_cover_multiple))
     return float(settings.sel_short_cover_multiple)
+
+
+def max_hold(arm) -> int:
+    """The arm's time limit in sessions (the deadline: the same bar that many sessions after the pick, stamped on the
+    pick when it is journaled): the VOL arm's own `sel_short_vol_max_hold_sessions` (15 from 2026-10-21, PREREG173's
+    V15 — the shadow vol2 arm's too, as it takes the vol arm's rule without its filters, and the decommissioned thin
+    arm's), the ETF and fall arms' `sel_short_arm_max_hold_sessions` (10 from the 2026-10-20 session, PREREG159's
+    RPD_IS; 15 before), the shadow model arm's `sel_short_max_hold_sessions` (15)."""
+    a = str(arm or "model")
+    if a in ("vol", "vol2", "thin"):
+        return int(getattr(settings, "sel_short_vol_max_hold_sessions", settings.sel_short_arm_max_hold_sessions))
+    if a in ("etf", "fall"):
+        return int(getattr(settings, "sel_short_arm_max_hold_sessions", settings.sel_short_max_hold_sessions))
+    return int(settings.sel_short_max_hold_sessions)
+
+
+def volnorm_ratio(arm) -> float:
+    """The volatility exit's ratio for the arm's trades (it covers in profit once the ATR% has fallen to that share
+    of the pick bar's): the fall arm's `sel_short_fall_volnorm_ratio` (0.7 from the 2026-10-20 session, PREREG159's
+    RPD_IS), every other arm's `sel_short_volnorm_ratio` (0.5)."""
+    if str(arm or "model") == "fall":
+        return float(getattr(settings, "sel_short_fall_volnorm_ratio", settings.sel_short_volnorm_ratio))
+    return float(settings.sel_short_volnorm_ratio)
+
+
+def fresh_start() -> Optional[datetime]:
+    """THE FRESH START's instant (`live_account_fresh_start`, user 2026-10-20); None when unset or unreadable."""
+    raw = str(getattr(settings, "live_account_fresh_start", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        logger.warning(f"[sel_short] live_account_fresh_start={raw!r} is not an ISO instant — ignored")
+        return None
+
+
+def before_fresh_start(rec: dict, now: datetime) -> bool:
+    """A pick decided before the fresh start (its bar ended before the instant), once the instant has passed: the
+    account that starts fresh never enters it (settled ``fresh_start``)."""
+    fs = fresh_start()
+    if fs is None or now < fs:
+        return False
+    try:
+        return datetime.fromisoformat(str(rec["bar_end"])) < fs
+    except (KeyError, TypeError, ValueError):
+        return False
 DTC_FEATURE = "dp_si_dtc"              # FINRA days to cover in the session snapshot (the short-interest filter)
 LOCK_HEARTBEAT_SECONDS = 30.0
 LOCK_STALE_SECONDS = 180.0
@@ -526,7 +575,9 @@ def _journal(rec: dict) -> None:
 
 
 def _consumed_path(d: date) -> Path:
-    return root() / "picks" / f"{_iso(d)}.consumed.json"
+    """The picks THIS account consumed (an extra account's under its own root, `src.accounts.paths`: the journal
+    beside it is the main account's scorer's, shared)."""
+    return _acct.state(root() / "picks" / f"{_iso(d)}.consumed.json")
 
 
 def consumed(d: date) -> Dict[str, str]:
@@ -571,6 +622,11 @@ def pending_entries(now: Optional[datetime] = None) -> List[dict]:
         if rec.get("decision") != "short" or pick_key(rec) in done or pick_key(rec) in seen:
             continue                                   # (a pick journaled twice — a rerun after a crash — once)
         seen.add(pick_key(rec))
+        traded = traded_arms()
+        if (traded is None or (rec.get("arm") or "model") in traded) and before_fresh_start(rec, now):
+            mark_consumed(d, pick_key(rec), "fresh_start")
+            journal_entry(rec, "fresh_start")
+            continue                                   # picked before the fresh start: never entered
         if _turn_traded(rec.get("arm")):
             continue                                   # waits for its turn (below), never expired at 75 minutes
         end = datetime.fromisoformat(rec["bar_end"])
@@ -701,6 +757,12 @@ def turn_entries(now: datetime) -> List[dict]:
             if key in done or key in seen:
                 continue                                       # (a pick journaled twice — once)
             seen.add(key)
+            if before_fresh_start(rec, now):
+                mark_consumed(day, key, "fresh_start")
+                journal_entry(rec, "fresh_start")
+                logger.info(f"[sel_short] {rec['ticker']} [{rec.get('arm')}]: picked before the fresh start — never "
+                            f"entered")
+                continue
             st = turn_state(rec, now)
             if st["state"] == "cancelled":
                 mark_consumed(day, key, "target_reached")
@@ -767,6 +829,12 @@ def _in_todays_terms(rec: dict, now: datetime) -> dict:
 # vol trade, the short-sale restriction, the borrow at entry and the broker's actual fill) ──
 
 def entries_path(d: date) -> Path:
+    return _acct.state(root() / "entries" / f"{_iso(d)}.jsonl")          # this account's entry step
+
+
+def main_entries_path(d: date) -> Path:
+    """The MAIN account's entry journal: an extra account reads IBKR's what-if answers there
+    (`sim_account.main_account_answer`)."""
     return root() / "entries" / f"{_iso(d)}.jsonl"
 
 
@@ -836,7 +904,7 @@ TRADELOG_SESSIONS = 25                 # the prepare rewrites this many recent d
 
 
 def tradelog_path(d: date) -> Path:
-    return root() / "tradelog" / f"{_iso(d)}.jsonl"
+    return _acct.state(root() / "tradelog" / f"{_iso(d)}.jsonl")         # this account's trades
 
 
 _ORDER_COLS = ("event", "intent", "side", "requested_qty", "filled_qty", "model_price", "limit_price", "fill_price",
@@ -2360,10 +2428,11 @@ def crowded(days_to_cover: Optional[float]) -> bool:
 
 
 def low_rvol(rvol: Optional[float], arm: str) -> bool:
-    """The VOL arm's relative-volume filter (user directive 2026-10-01: "implement
-    relative volume filter to prod"): a vol pick whose bar traded less than
-    `sel_short_vol_min_rvol` x the name's usual 30-minute volume (`rvol_at`) is not
-    shorted. Unknown passes; the model arm is never filtered (its picks journal it)."""
+    """The relative-volume filter of the ATR% arms (user directive 2026-10-01: "implement
+    relative volume filter to prod"; live: vol, ETF, fall — vol2 is exempted by its caller,
+    `UNFILTERED_ARMS`): a pick whose bar traded less than `sel_short_vol_min_rvol` x the
+    name's usual 30-minute volume (`rvol_at`) is not shorted. Unknown passes; the model arm
+    is never filtered (its picks journal it)."""
     if arm not in VOL_RULE_ARMS or rvol is None or not getattr(settings, "enable_sel_short_vol_rvol_filter", False):
         return False
     return float(rvol) < float(settings.sel_short_vol_min_rvol)
@@ -2379,10 +2448,11 @@ def _ssr_journal(top: pd.Series) -> dict:
 
 
 def give_back(arm: str) -> float:
-    """The share of the 5-session run-up an arm's target gives back: the WHOLE run-up for the vol
-    arm (`sel_short_vol_give_back` 1.0; user directive 2026-10-04 evening, "Vol arm only") and the
-    ETF arm (`sel_short_etf_give_back` 1.0 from the 2026-10-12 session, PREREG77), HALF for the
-    model arm (`sel_short_give_back` 0.5; at 100% it fell to 0.30 %/day)."""
+    """The share of the 5-session run-up an arm's target gives back: 125% for the vol arm and the
+    shadow vol2 / thin arms (`sel_short_vol_give_back` 1.25 from 2026-10-14, PREREG97's G1; the
+    whole run-up from the user's 2026-10-04 "Vol arm only"), the WHOLE run-up for the ETF arm
+    (`sel_short_etf_give_back` 1.0 from the 2026-10-12 session, PREREG77), HALF for the model arm
+    (`sel_short_give_back` 0.5; at 100% it fell to 0.30 %/day). The fall arm has no target."""
     if arm in ("vol", "thin", "vol2"):
         return float(settings.sel_short_vol_give_back)
     if arm == "etf":
@@ -2417,7 +2487,7 @@ def _vol_backups(ok: pd.DataFrame, stand: pd.DataFrame, earlier: Sequence[dict],
     order = ok.sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort").head(n)
     fresh_names: List[str] = []
     backups: List[dict] = []
-    hold = int(settings.sel_short_max_hold_sessions)
+    hold = max_hold(arm)
     for rank, (_, row) in enumerate(order.iterrows(), start=1):
         tk = str(row["ticker"])
         fresh = _is_fresh(float(row["score"]), tk, stand)
@@ -2543,7 +2613,7 @@ def select(res: pd.DataFrame, d: date, bar_of_day: int, stand: pd.DataFrame,
             rec["decision"] = "no_base"
         else:
             rec["target"] = None                               # no run-up to give back
-            dl = session_after(d, int(settings.sel_short_max_hold_sessions))
+            dl = session_after(d, max_hold(arm))
             rec["deadline"] = bar_end_et(dl, bar_of_day).isoformat()
             rec["decision"] = "crowded" if crowded(dtc) else "short"
             if rec["decision"] == "short" and low_rvol(rvol, arm):
@@ -2560,7 +2630,7 @@ def select(res: pd.DataFrame, d: date, bar_of_day: int, stand: pd.DataFrame,
         rec["decision"] = "not_a_riser"
     else:
         rec["target"] = px - g * (px - pre5)
-        dl = session_after(d, int(settings.sel_short_max_hold_sessions))
+        dl = session_after(d, max_hold(arm))
         rec["deadline"] = bar_end_et(dl, bar_of_day).isoformat()
         filtered = arm not in UNFILTERED_ARMS                 # vol2: no crowding, no relative-volume filter
         rec["decision"] = "crowded" if (filtered and crowded(dtc)) else "short"

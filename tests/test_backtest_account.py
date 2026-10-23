@@ -759,6 +759,34 @@ def test_with_the_flag_an_order_is_placed_through_the_sleeve_and_its_fill_sells_
     assert all(x["t"] == T0 + 5 * H for x in r["preemptions"])         # sold at the fill, not at the placement
 
 
+def _caps_and_a_dip_order(**rules):
+    """Three capitulation-like lots (quality 0.1, preemptible whole, 25 shares at $100 each) and a plain long Y fill the
+    long side at T0; a dip order (quality 0.13, 1/2, "fill") placed an hour later is sized as if the lots were freed
+    (100 at $50); Y's mark falls to $80 before the order is touched, so the order's quantity is above its slice at
+    the fill (the equity $9,500: 94 shares)."""
+    c = A.Strategy("C", 1, slices=4.0, max_open=3, priority=7, quality=0.1, preemptible=True, yield_whole=True)
+    y = A.Strategy("Y", 1, slices=4.0, max_open=1, priority=0)
+    d = A.Strategy("D", 1, slices=2.0, max_open=2, priority=6, quality=0.13, preemptible=True, orders="fill")
+    P = [piece("Y", "YYY", 100.0, 80.0, days=3, bars=[80.0] * 3, t0=T0)]
+    P += [piece("C", f"C{k}", 100.0, 100.0, days=3, bars=[100.0] * 3, t0=T0 + k * 60 * 10**9) for k in (1, 2, 3)]
+    P += order("D", "DIP", "o1", 50.0, place=[T0 + H], end=T0 + 2 * DAY, fills={0: (T0 + DAY + H, 50.0, 3, 51.0)})
+    return A.simulate(P, [y, c, d], A.Rules(trigger="close", fills_make_room=True, **rules), settle=settle)
+
+
+def test_the_fills_own_size_decides_the_give_way_with_fill_room_exact():
+    """`Rules.fill_room_exact` (production's `live_account.fill_give_way_plan`, 2026-10-20): the fill sells the lots,
+    the latest first, only until its own size (the room and its side's cap, no slice) reaches the order's quantity;
+    without it the slice-capped size keeps selling the earliest lot too, for no share."""
+    old = _caps_and_a_dip_order()
+    new = _caps_and_a_dip_order(fill_room_exact=True)
+    assert sorted(x["tkn"] for x in old["preemptions"]) == ["C1", "C2", "C3"]
+    assert sorted(x["tkn"] for x in new["preemptions"]) == ["C2", "C3"]                # the earliest lot kept
+    for r in (old, new):
+        dp = next(p for p in r["positions"] if p["strategy"] == "D")
+        placed = next(o for o in r["orders"] if o["what"] == "placed")
+        assert dp["shares"] == placed["n"] == 99                       # the whole order either way (99: the costs)
+
+
 def test_the_flag_changes_nothing_without_a_lower_quality_preemptible_position():
     d = A.Strategy("D", 1, slices=1.25, max_open=3, priority=1, orders="fill", quality=0.13, preemptible=True)
     s = A.Strategy("S", -1, slices=1.4, priority=0, min_equity=2000.0, house_maint=2.0, house_init=2.86)

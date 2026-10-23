@@ -265,3 +265,65 @@ def test_a_resting_order_filled_before_the_ledger_sees_it_is_not_drift(lim, monk
     b._positions = [Position(ticker="AAA", quantity=10, avg_cost=98.0)]   # ... and fills before the next tick
     rec.sync(broker=b)
     assert not [o for o in b.orders[n:] if o.ticker == "AAA" and o.side == "SELL"]   # not flattened
+
+
+def test_an_open_fill_links_its_resting_order_and_books_ibkrs_own_price(lim, monkeypatch):
+    """AUDIT151 (2026-10-19): the resting order reaches IBKR ~30 s after the open and fills there; the ledger's
+    open fill — decided once the first bar shows the session opened under the limit — is linked to that order (no
+    second order), and once IBKR's execution is read the ledger books IBKR's average price, the print kept."""
+    from src.broker.base import FillSummary
+    lim[("BBB", DAY)] = bars(DAY, [(51.0, 51.2, 50.5, 51.0)])
+    tracker.record_dip_long_trades(now=OPEN_TICK)                  # no first bar yet: placed, not filled
+    store = {"trades": tracker._load_trades()}
+    rec, b = _broker(monkeypatch, store)
+    rec.sync(broker=b)                                             # rests at IBKR
+    ref = orders_of()["AAA"]["ibkr"]["ref"]
+    lim[("AAA", DAY)] = bars(DAY, [(97.5, 99.0, 97.0, 98.5)])       # the first bar: opened under 98.00
+    assert tracker.record_dip_long_trades(now=OPEN_TICK + timedelta(minutes=8)) == 1
+    t = dips()["AAA"]
+    assert t["dip_fill_kind"] == "open" and t["entry_price"] == 97.5
+    assert t["broker_client_ref"] == ref and orders_of()["AAA"]["ibkr"]["state"] == "linked"
+    b.fills = [FillSummary(client_ref=ref, ticker="AAA", side="BUY", filled_qty=10, avg_fill_price=97.62,
+                           order_id=t["broker_order_id"])]
+    store["trades"] = tracker._load_trades()
+    n_before = len(b.orders)
+    rec.sync(broker=b)
+    assert not [o for o in b.orders[n_before:] if o.ticker == "AAA"]         # no second order
+    aaa = next(x for x in store["trades"] if x["ticker"] == "AAA" and x.get("entry_mechanism") == "dip_long")
+    assert aaa["entry_price"] == 97.62 and aaa["dip_open_print"] == 97.5 and aaa["broker_fill_qty"] == 10
+    assert ref not in b.cancelled                                   # the linked order is never cancelled
+
+
+def test_a_cancel_not_confirmed_still_links_the_fill(lim, monkeypatch):
+    """A resting order whose cancel IBKR did not confirm may have filled: a fill the ledger decides then is linked
+    to it (never a second order behind one that may have filled)."""
+    lim[("BBB", DAY)] = bars(DAY, [(51.0, 51.2, 50.5, 51.0)])
+    tracker.record_dip_long_trades(now=OPEN_TICK)
+    o = dl.load_orders(DAY)
+    for x in o:
+        if x["ticker"] == "AAA":
+            x["ibkr"] = {"ref": "dipw-AAA-2026-10-08-1", "order_id": "77", "qty": 10, "session": DAY.isoformat(),
+                         "state": "cancel_failed", "status": "Submitted"}
+    dl.save_orders(DAY, o)
+    lim[("AAA", DAY)] = bars(DAY, [(97.5, 99.0, 97.0, 98.5)])
+    tracker.record_dip_long_trades(now=OPEN_TICK + timedelta(minutes=8))
+    assert dips()["AAA"]["broker_client_ref"] == "dipw-AAA-2026-10-08-1"
+
+
+def test_only_an_open_fill_is_booked_at_ibkrs_price():
+    from src.broker.reconcile import _book_dip_open_fill
+    base = {"entry_mechanism": "dip_long", "entry_price": 97.5, "broker_fill_price": 97.62, "broker_fill_qty": 4}
+    t = dict(base, dip_fill_kind="open")
+    _book_dip_open_fill(t)
+    assert t["entry_price"] == 97.62 and t["dip_open_print"] == 97.5             # a partial fill: its average so far
+    t["broker_fill_price"], t["broker_fill_qty"] = 97.70, 10
+    _book_dip_open_fill(t)
+    assert t["entry_price"] == 97.70 and t["dip_open_print"] == 97.5             # the print kept from the first
+    touch = dict(base, dip_fill_kind="touch", entry_price=98.0)
+    _book_dip_open_fill(touch)
+    assert touch["entry_price"] == 98.0 and "dip_open_print" not in touch
+    for other in (dict(base, dip_fill_kind="open", entry_mechanism="sel_short"),
+                  dict(base, dip_fill_kind="open", broker_fill_qty=0), dict(base, dip_fill_kind="open",
+                                                                          broker_fill_price=None)):
+        _book_dip_open_fill(other)
+        assert other["entry_price"] == 97.5 and "dip_open_print" not in other

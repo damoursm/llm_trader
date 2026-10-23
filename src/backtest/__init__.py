@@ -1,7 +1,8 @@
 """Research backtesting: one simulated IBKR account that runs several strategies at once (user directive
 2026-10-08: "Rework our simulator ... so that it can consider multiple strategies ... reuse it to evaluate different
-models or combination of models"). Production imports one module of it: `live_calibration` (the EOD chain's
-record of the live trades against the simulator's assumptions, and its line in the email's scorer banner).
+models or combination of models"). Production imports two modules of it: `live_calibration` (the EOD chain's
+record of the live trades against the simulator's assumptions, and its line in the email's scorer banner) and, from
+2026-10-17, `mimic` (the news-hold shadow measures its would-be exits with `mimic.news_extend`).
 
 * `account` — the account engine: $10,000, longs and shorts, IBKR's fees, Reg T + house margin, available capital,
   slices per strategy, margin calls at bar closes or intrabar extremes, per-strategy attribution, both metrics.

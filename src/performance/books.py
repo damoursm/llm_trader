@@ -8,7 +8,8 @@ SEL_SHORT = "sel_short"      # the selection short (src/signals/sel_short.py, fr
 DIP_LONG = "dip_long"        # the mega-cap dip long book (src/signals/dip_long.py, from 2026-10-08)
 ETF_DM = "etf_dm"            # the ETF dual-momentum book (src/signals/etf_dm.py; trades only with enable_etf_dm)
 CRASH_LONG = "crash_long"    # the crash-rebound book (src/signals/crash_long.py, from 2026-10-12)
-LIVE_MECHANISMS = (SEL_SHORT, DIP_LONG, ETF_DM, CRASH_LONG)
+CAP_LONG = "cap_long"        # the capitulation book (src/signals/cap_long.py, from 2026-10-21)
+LIVE_MECHANISMS = (SEL_SHORT, DIP_LONG, ETF_DM, CRASH_LONG, CAP_LONG)
 
 
 def is_live(trade: dict) -> bool:

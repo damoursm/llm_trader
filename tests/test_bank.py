@@ -291,6 +291,8 @@ def test_every_long_live_arm_has_a_bar_and_no_short_arm_has_one():
     from src.backtest import reliability as REL
     longs = {a for a, s in REL.SIDE.items() if s == "long"}
     assert longs and longs == set(BK.BENCH), (longs, BK.BENCH)
+    # PREREG123 (user 2026-10-16): the market's average day, whatever the arm holds — the crash book's 3x fund too
+    assert set(BK.BENCH.values()) == {"SPY"}, BK.BENCH
 
 
 def test_an_arm_failing_only_significance_is_re_judged_on_its_longest_history():
@@ -346,3 +348,40 @@ def test_the_benchmark_takes_the_carried_history_before_the_daily_cache(monkeypa
         assert list(s.to_numpy()) == [1.0, 2.0, 0.2, 0.2]               # the cache wins where both hold a day
     finally:
         BK.bench_daily.cache_clear()
+
+
+def test_load_runs_names_every_book_by_its_live_name(tmp_path):
+    """PREREG165 / 167 built the capitulation book as "capb": the live configuration's draws (`LIVE_RUNS`) must
+    read as the live arm "cap" everywhere they are loaded (2026-10-20: the cap trades read 0 under the other name)."""
+    import pickle
+    rec = {"growth": 0.5, "maxdd": 20.0, "pos": [{"strategy": "capb", "pnl": 1.0, "exit_ns": 1},
+                                                  {"strategy": "dip", "pnl": 2.0, "exit_ns": 2}],
+           "calls": [{"strategy": "capb", "ns": 3}], "label": "X"}
+    for st in ("A0", "A", "B"):
+        with open(tmp_path / f"{st}_X_s0.pkl", "wb") as fh:
+            pickle.dump(rec, fh)
+    runs = BK.load_runs(tmp_path, "X")
+    assert set(runs) == {"A0", "A", "B"}
+    assert [p["strategy"] for p in runs["B"][0]["pos"]] == ["cap", "dip"]
+    assert runs["B"][0]["calls"] == [{"strategy": "cap", "ns": 3}]
+    assert rec["pos"][0]["strategy"] == "capb"                                  # the record loaded is a copy
+    assert BK.canonical_book("capb") == "cap" and BK.canonical_book("vol") == "vol"
+    assert set(BK.ARMS) == {"vol", "etf", "fall", "dip", "crash", "cap"} and "cap" in BK.live_slices()
+
+def test_a_live_arms_earlier_trades_are_read_as_its_longest_history(tmp_path):
+    """`bank.LONG_TRADES` (the capitulation book: PREREG165's untouched 2006-2017 trades) feeds the re-judging; a
+    missing file or an arm without a table reads None, never an error."""
+    import pickle
+    assert set(BK.LONG_TRADES) <= set(BK.ARMS)
+    frame = pd.DataFrame({"entry_day": pd.to_datetime(["2008-02-07", "2009-03-10"]), "net": [9.1, -4.8],
+                          "gross": [9.12, -4.78], "days": [3.7, 7.0], "tk": ["AAPL", "MSFT"]})
+    path, key, _ = BK.LONG_TRADES["cap"]
+    (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_path / path, "wb") as fh:
+        pickle.dump({key: frame}, fh)
+    t = BK.long_trades("cap", root=tmp_path)
+    assert list(t.columns) == ["entry_day", "net", "gross", "days"] and len(t) == 2
+    assert "PREREG165" in t.attrs["source"]
+    assert BK.long_trades("vol", root=tmp_path) is None
+    assert BK.long_trades("cap", root=tmp_path / "missing") is None
+

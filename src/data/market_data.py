@@ -16,11 +16,16 @@ Rate-limit handling (yfinance fallback only)
   …up to BACKOFF_MAX                      (600 s)
 """
 
+import json
+import os
 import re
+import threading
 import time
+import numpy as np
 import yfinance as yf
 import pandas as pd
-from datetime import datetime as _datetime, time as _dtime, timedelta as _timedelta, timezone as _timezone
+from datetime import date, datetime as _datetime, time as _dtime, timedelta as _timedelta, timezone as _timezone
+from pathlib import Path
 from loguru import logger
 from typing import Iterable, List, Optional, Tuple
 from config import settings
@@ -506,6 +511,118 @@ def _merge_ohlcv(cached: Optional[pd.DataFrame], fresh: pd.DataFrame) -> pd.Data
     return combined
 
 
+# ── the daily cache's split guard (2026-10-16) ───────────────────────────────
+# The merge below keeps cached rows older than the fresh window as they are, so a split left every row before the
+# window on the PRE-split scale (APH / MNST / IESC / CLBK ... x2 before ~2026-05/06: a fake -50% day at the boundary).
+# A name with an effective split (`split_check`'s verified set) executed after its history was last fetched WHOLE, or
+# whose cached bars disagree with the fresh ones on their overlap (`DAILY_SCALE_TOL`), is refetched whole (20 years)
+# and stamped; Polygon's bars carry the split table's corrections (`split_check.correct_frame`).
+DAILY_ADJ_PATH = Path("cache/ohlcv_meta/adjusted_asof.json")
+DAILY_SCALE_TOL = 0.02
+_DAILY_ADJ_DEFAULT = "2006-01-01"
+_DAILY_ADJ_LOCK = threading.Lock()
+
+
+_DAILY_STAMPS_CACHE: dict = {}
+
+
+def _daily_stamps() -> dict:
+    """The adjusted-as-of stamps, parsed once per file version (every `get_history` call reads them)."""
+    try:
+        key = (Path(DAILY_ADJ_PATH).as_posix(), Path(DAILY_ADJ_PATH).stat().st_mtime)
+    except OSError:
+        return {}
+    hit = _DAILY_STAMPS_CACHE.get("s")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        s = json.loads(Path(DAILY_ADJ_PATH).read_text(encoding="utf-8"))
+        s = s if isinstance(s, dict) else {}
+    except Exception:                                            # noqa: BLE001
+        s = hit[1] if hit is not None else {}
+    _DAILY_STAMPS_CACHE["s"] = (key, s)
+    return s
+
+
+def _stamp_daily(ticker: str, day: Optional[date] = None) -> None:
+    with _DAILY_ADJ_LOCK:
+        s = dict(_daily_stamps())
+        s[ticker.upper()] = (day or date.today()).isoformat()
+        DAILY_ADJ_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DAILY_ADJ_PATH.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(s, sort_keys=True), encoding="utf-8")
+        for i in range(6):                                       # WinError 5 while another process reads it
+            try:
+                os.replace(tmp, DAILY_ADJ_PATH)
+                break
+            except PermissionError:
+                if i == 5:
+                    raise
+                time.sleep(0.2 * (i + 1))
+        _DAILY_STAMPS_CACHE.pop("s", None)
+
+
+def daily_split_since_stamp(ticker: str, today: Optional[date] = None) -> Optional[date]:
+    """The newest effective split of ``ticker`` executed after its daily history was last fetched whole (and on or
+    before today), else None."""
+    from src.data.intraday_store import split_rows
+    today = today or date.today()
+    asof = date.fromisoformat(_daily_stamps().get(ticker.upper(), _DAILY_ADJ_DEFAULT))
+    ds = [d for d, _, _ in (split_rows() or {}).get(ticker.upper(), []) if asof < d <= today]
+    return max(ds) if ds else None
+
+
+def overlap_scale(cached: Optional[pd.DataFrame], fresh: Optional[pd.DataFrame]) -> Optional[float]:
+    """The median fresh / cached close over the sessions both hold when it is off 1 by more than `DAILY_SCALE_TOL`
+    (the adjustment changed under the cache), else None."""
+    if cached is None or fresh is None or cached.empty or fresh.empty:
+        return None
+    a = _normalize_index_tz(cached)
+    b = _normalize_index_tz(fresh)
+    ia = pd.DatetimeIndex(a.index).normalize()
+    ib = pd.DatetimeIndex(b.index).normalize()
+    ca = pd.Series(pd.to_numeric(a["Close"], errors="coerce").to_numpy(float), index=ia)
+    cb = pd.Series(pd.to_numeric(b["Close"], errors="coerce").to_numpy(float), index=ib)
+    ca = ca[~ca.index.duplicated(keep="last")]
+    cb = cb[~cb.index.duplicated(keep="last")]
+    j = pd.concat([ca.rename("a"), cb.rename("b")], axis=1, join="inner").dropna()
+    j = j[(j.a > 0) & (j.b > 0)]
+    if j.empty:
+        return None
+    m = float(np.median(j.b / j.a))
+    return m if abs(m - 1.0) > DAILY_SCALE_TOL else None
+
+
+def _refetch_daily_whole(ticker: str, cached: Optional[pd.DataFrame], why: str) -> Optional[pd.DataFrame]:
+    """The ticker's whole daily history from Polygon (20 years, corrected), with any cached rows OLDER than it kept
+    on its scale (the ratio over their first overlap), saved and stamped; None when Polygon returns nothing."""
+    from src.data.cache import save_ohlcv
+    from src.data.split_check import correct_frame
+    full = polygon_client.get_bars(ticker, "20y")
+    if full is None or full.empty:
+        return None
+    full = correct_frame(ticker, full, utc_naive=False)
+    out = full
+    if cached is not None and not cached.empty:
+        c = _normalize_index_tz(cached)
+        older = c[pd.DatetimeIndex(c.index).normalize() < pd.DatetimeIndex(full.index).normalize().min()]
+        if len(older):
+            r = overlap_scale(c, full) or 1.0
+            older = older.copy()
+            for col in ("Open", "High", "Low", "Close"):
+                if col in older:
+                    older[col] = pd.to_numeric(older[col], errors="coerce") * r
+            if "Volume" in older:
+                older["Volume"] = pd.to_numeric(older["Volume"], errors="coerce") / r
+            out = pd.concat([older, _normalize_index_tz(full)]).sort_index()
+            out = out[~out.index.duplicated(keep="last")]
+    out = _drop_forming_bar(out)
+    save_ohlcv(ticker, out)
+    _stamp_daily(ticker)
+    logger.warning(f"[market_data] {ticker}: daily history refetched WHOLE ({why}) — {len(out)} bars")
+    return out
+
+
 def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False,
                 interval: str = "1d") -> pd.DataFrame:
     """
@@ -543,7 +660,13 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False,
         return pd.DataFrame()
 
     cached = load_ohlcv(ticker)
-    if cached is not None and not cached.empty and not force_refresh:
+    split_due = None
+    if cached is not None and not cached.empty:
+        try:
+            split_due = daily_split_since_stamp(ticker)
+        except Exception as e:                                   # noqa: BLE001
+            logger.debug(f"[market_data] {ticker}: split check failed ({e})")
+    if cached is not None and not cached.empty and not force_refresh and split_due is None:
         last_bar = cached.index[-1].date()
         if (_date.today() - last_bar).days <= 3:
             logger.debug(f"[market_data] get_history: cache hit for {ticker} (last bar {last_bar})")
@@ -556,6 +679,18 @@ def get_history(ticker: str, period: str = "3mo", force_refresh: bool = False,
     # ── 1. Polygon ────────────────────────────────────────────────────────
     df = polygon_client.get_bars(ticker, period)
     if not df.empty:
+        from src.data.split_check import correct_frame
+        df = correct_frame(ticker, df, utc_naive=False)
+        # THE SPLIT GUARD: a split since the history was fetched whole, or cached bars on another scale than the
+        # fresh window's -> the whole history again, never a merge across two scales
+        ratio = overlap_scale(cached, df)
+        if split_due is not None or ratio is not None:
+            why = (f"split effective {split_due}" if split_due is not None else "") + \
+                  (f"{'; ' if split_due is not None else ''}cached bars x{ratio:.4g} off the fresh ones"
+                   if ratio is not None else "")
+            whole = _refetch_daily_whole(ticker, cached, why)
+            if whole is not None:
+                return whole
         merged = _drop_forming_bar(_merge_ohlcv(cached, df))
         save_ohlcv(ticker, merged)
         logger.debug(

@@ -1,10 +1,10 @@
 # Production deployment (Windows) — reliable always-on scheduling
 
-Three independent pieces must stay up for unattended trading (what is LIVE on this box as of 2026-09-28 is in the last column):
+Three independent pieces must stay up for unattended trading (as run on this box, 2026-10-17):
 
 | Piece | Job | Kept alive by |
 |---|---|---|
-| **Scheduler** (`main.py --supervise`, via `scripts\run_scheduler.bat`) | runs the pipeline every 30 min, places paper/live orders; launches its own SUBPROCESSES — the selection-short scorer on every market-day tick (`python -m src.signals.sel_short`, log `logs\sel_short.log`), the 08:30 ET deep pre-open run, the 23:45 ET deep refresh and the EOD spread sweep — each safe to orphan when the scheduler is killed (a file log and an OS or heartbeat lock, never a pipe) | Task Scheduler job **`LlmTraderScheduler`** (auto-restart on crash); inside it `--supervise` relaunches the `--schedule` child whenever a watchdog force-exits it |
+| **Scheduler** (`main.py --supervise`, via `scripts\run_scheduler.bat`) | runs a full trading tick at every slot (regular hours every 30 min 09:30–16:00 ET, the extended and overnight slots — CLAUDE.md "Slots") and places the live books' paper orders; launches its own SUBPROCESSES — the selection-short scorer on every market-day tick (`python -m src.signals.sel_short`, log `logs\sel_short.log`), the 08:30 ET deep pre-open run, the 23:45 ET deep refresh, the EOD process at/after 16:20 ET on market days (`python -m src.scheduler.eod`, with its IBKR spread sweep) — each safe to orphan when the scheduler is killed (a file log and an OS or heartbeat lock, never a pipe); and threads of its own (the news-hold shadow's pass, the Finnhub refresher, the borrow-file fetch) | Task Scheduler job **`LlmTraderScheduler`** (auto-restart on crash); inside it `--supervise` relaunches the `--schedule` child whenever a watchdog force-exits it |
 | **IB Gateway** (headless, paper port 4002) | the broker connection the scheduler talks to | **IBC** under Task Scheduler job **`IBC Gateway`** (`C:\IBC\StartGateway.bat /INLINE`, at log on + daily `AutoRestartTime` 23:50) |
 | **Ollama** (`scripts\run_ollama.bat`, loopback `127.0.0.1:11434`) | the LOCAL sentiment engine — the ONLY one (`SENTIMENT_LOCAL_SHARE=1.0`, hosted engines off). Since 2026-09-28 news reaches no trade (the selection short reads none), so a dead server costs the news columns of the panel and the shadow rank rule, not trading; it also serves the one-year news backfill scorers between ticks | Task Scheduler job **`LlmTraderOllama`** (`scripts\register_ollama_task.ps1`, at log on) |
 
@@ -67,6 +67,23 @@ DuckDB writer and can double broker submissions.
 supervisor nor Task Scheduler would ever see it; two watchdogs convert hangs into exits
 (`broker_sync_watchdog_seconds` 600 around the broker sync, `tick_watchdog_seconds` 2700
 around the whole tick) via `os._exit(1)`, which `--supervise` then relaunches.
+
+### Deploying new scheduler code
+
+To put new code live while the stack runs, kill ONLY the `--schedule` child, between slots (never during a tick,
+never just before the 23:45 deep refresh or the 08:30 pre-open launch): the `--supervise` parent relaunches it in
+~5 s with the new code, and the subprocesses keep running.
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match 'main.py' } |
+    Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine      # one --supervise, one --schedule
+Stop-Process -Id <the --schedule child's pid> -Force
+```
+
+Then confirm a new `--schedule` child of the same parent, and a clean `Scheduler started` block in
+`logs\llm_trader_<date>.log` with no ERROR / CRITICAL after it. Run the full test suite first
+(`.venv\Scripts\python.exe -m pytest tests/ -q`). `restart_all.ps1` / `Stop-ScheduledTask` take the subprocesses down
+with the task's process tree — use them to bounce the whole stack, not to deploy.
 
 ---
 
@@ -153,6 +170,12 @@ whole week on one Monday login. This replaces the daily logoff that kept breakin
 
 ## 3 — Monitoring dashboard (optional, not trading-critical)
 
+**DEACTIVATED from 2026-10-13 until the user says otherwise** (user: "You can deactivate the dashboard until further
+notice"; its cache warm-up after every tick peaked near 7 GB of the box's commit). While `cache\dashboard.disabled`
+exists, `scripts\run_dashboard.bat` exits at once (the task's logon trigger starts nothing) and `restart_all.ps1` stops
+it and starts only the scheduler. To reactivate: delete the file, then `Start-ScheduledTask -TaskName LlmTraderDashboard`
+(and check exactly one PID listens on 8050, below).
+
 The read-only dashboard (`main.py --dashboard`, bound to loopback `127.0.0.1:8050` and
 published ONLY through Tailscale Funnel at `https://victushp.tail8e1bf1.ts.net`, HTTP Basic
 auth on one shared credential) is kept always-on the same way as the scheduler — a Task
@@ -182,7 +205,7 @@ survivor before `Start-ScheduledTask`.
 ## Sanity checklist before flipping to `ibkr_live`
 - [ ] Scheduler runs as a service and **survives a reboot + a kill** (test both).
 - [ ] TWS/IBC survives its `AutoRestartTime` without manual login (watch it cross that time once).
-- [ ] A market-hours tick logs `connected … 7497` and `sync — … drift=0`.
+- [ ] A market-hours tick logs `connected … 4002` (the gateway; TWS listens on 7497) and `sync — … drift=0`.
 - [ ] Paper validation window complete (slippage / tracking-error / reject-rate acceptable).
 - [ ] Circuit breakers in place (daily-loss kill switch, etc. — see Tier-1 #4).
 - [ ] The selection short's shorts locate on the LIVE account: its borrow check reads IBKR's PUBLIC

@@ -153,11 +153,14 @@ def deep_last_session(tk: str) -> Optional[date]:
 
 
 def _fetch_range(tk: str, from_date: str, to_date: str) -> pd.DataFrame:
+    """Polygon's adjusted bars, with the verified split table's corrections (`split_check.correct_frame`: a split
+    record the traded prices contradict is undone, a confirmed missing split applied)."""
     from src.data.polygon_client import get_intraday_bars_range
+    from src.data.split_check import correct_frame
     df = get_intraday_bars_range(tk, from_date, to_date)
     if df is None or df.empty:
         return pd.DataFrame()
-    return _naive_utc_index(df)
+    return correct_frame(tk, _naive_utc_index(df), utc_naive=True)
 
 
 # ── splits: reset a ticker's history before any inference on it ─────────────
@@ -252,40 +255,37 @@ _SPLIT_CACHE: Dict[str, tuple] = {}
 
 
 def latest_splits(today: date) -> Optional[Dict[str, date]]:
-    """``{ticker: latest split execution date <= today}`` from the split data
-    (read once per file version), or None when it cannot be read."""
-    p = Path(SPLITS_PATH)
-    try:
-        key = (p.as_posix(), p.stat().st_mtime, today.isoformat())
-    except OSError:
+    """``{ticker: latest split execution date <= today}`` of the EFFECTIVE split set (`split_rows`: the records the
+    traded prices do not contradict; a confirmed missing split corrects the stores through `split_check.corrections`,
+    never through this set), or None when it cannot be read."""
+    rows = split_rows()
+    if rows is None:
         return None
-    hit = _SPLIT_CACHE.get("v")
-    if hit is not None and hit[0] == key:
-        return hit[1]
-    try:
-        import duckdb
-        df = duckdb.connect().execute(
-            f"SELECT ticker, max(execution_date) AS d FROM read_parquet('{p.as_posix()}') "
-            "WHERE split_from > 0 AND split_to > 0 AND split_from <> split_to "
-            f"AND execution_date <= '{today.isoformat()}' GROUP BY ticker").fetchdf()
-    except Exception as e:                                   # noqa: BLE001
-        logger.warning(f"[intraday_store] split data unreadable ({e})")
-        return None
-    out = {str(t).upper(): d for t, d in zip(df["ticker"], pd.to_datetime(df["d"]).dt.date)}
-    _SPLIT_CACHE["v"] = (key, out)
+    out: Dict[str, date] = {}
+    for tk, lst in rows.items():
+        ds = [d for d, _, _ in lst if d <= today]
+        if ds:
+            out[tk] = max(ds)
     return out
 
 
-def split_rows() -> Optional[Dict[str, List[Tuple[date, float, float]]]]:
-    """``{ticker: [(execution date, split_from, split_to), ...]}`` from the split data —
-    every split it records, future-dated ones included (the caller cuts by date) — read
-    once per file version, or None when it cannot be read."""
+def _checks_mtime() -> float:
+    from src.data.split_check import CHECKS_PATH
+    try:
+        return Path(CHECKS_PATH).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def raw_split_rows() -> Optional[Dict[str, List[Tuple[date, float, float]]]]:
+    """``{ticker: [(execution date, split_from, split_to), ...]}`` as the split data RECORDS them (Polygon's), read
+    once per file version, or None when it cannot be read. Readers want `split_rows` (the verified set)."""
     p = Path(SPLITS_PATH)
     try:
         key = (p.as_posix(), p.stat().st_mtime)
     except OSError:
         return None
-    hit = _SPLIT_CACHE.get("rows")
+    hit = _SPLIT_CACHE.get("raw")
     if hit is not None and hit[0] == key:
         return hit[1]
     try:
@@ -299,6 +299,29 @@ def split_rows() -> Optional[Dict[str, List[Tuple[date, float, float]]]]:
     out: Dict[str, List[Tuple[date, float, float]]] = {}
     for t, d, a, b in zip(df["ticker"], pd.to_datetime(df["execution_date"]).dt.date, df["split_from"], df["split_to"]):
         out.setdefault(str(t).upper(), []).append((d, float(a), float(b)))
+    _SPLIT_CACHE["raw"] = (key, out)
+    return out
+
+
+def split_rows() -> Optional[Dict[str, List[Tuple[date, float, float]]]]:
+    """``{ticker: [(execution date, split_from, split_to), ...]}`` — the EFFECTIVE split set every reader uses (the
+    store resets, the ledger's `apply_splits`, the broker, the selection short's turn and cover, the dip orders, the
+    borrow schedule): the split data's records MINUS those the traded prices contradict (`split_check`, 2026-10-16; a
+    confirmed missing split corrects the price stores only) — future-dated records included (the caller cuts by date).
+    Read once per version of either file, or None when the split data cannot be read."""
+    p = Path(SPLITS_PATH)
+    try:
+        key = (p.as_posix(), p.stat().st_mtime, _checks_mtime())
+    except OSError:
+        return None
+    hit = _SPLIT_CACHE.get("rows")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    raw = raw_split_rows()
+    if raw is None:
+        return None
+    from src.data.split_check import effective_rows
+    out = effective_rows(raw)
     _SPLIT_CACHE["rows"] = (key, out)
     return out
 
@@ -330,11 +353,60 @@ def split_to_apply(tk: str, today: date, splits: Optional[Dict[str, date]] = Non
     return d if d > asof else None
 
 
+def _applied_path() -> Path:
+    return DEEP_DIR / "_split_corrections_applied.json"
+
+
+def reset_corrected(tickers: Optional[Iterable[str]] = None, today: Optional[date] = None) -> Dict[str, str]:
+    """Reset every stored name with a split CORRECTION (`split_check`: a record the traded prices contradict, undone;
+    a confirmed missing split, applied) its stored history does not carry yet — the refetch applies it
+    (`_fetch_range`). The corrections each name's history carries are kept in `_split_corrections_applied.json`.
+    Returns ``{ticker: outcome}``."""
+    import json
+    from src.data.split_check import load_checks
+    today = today or date.today()
+    checks = load_checks()
+    want = {t.upper() for t in tickers} if tickers is not None else None
+    try:
+        applied = json.loads(_applied_path().read_text(encoding="utf-8"))
+    except Exception:                                        # noqa: BLE001
+        applied = {}
+    by_tk: Dict[str, List[str]] = {}
+    for k, rec in checks.items():
+        if rec.get("status") in ("false", "missing"):
+            tk = k.split("|", 1)[0]
+            if want is None or tk in want:
+                by_tk.setdefault(tk, []).append(k)
+    for tk in applied:                                       # a correction withdrawn since: its history goes back
+        if (want is None or tk in want) and tk not in by_tk:
+            by_tk[tk] = []
+    out: Dict[str, str] = {}
+    for tk, keys in sorted(by_tk.items()):
+        if not _path(tk).exists() or set(keys) == set(applied.get(tk, [])):
+            continue
+        changed = sorted(set(keys) ^ set(applied.get(tk, [])))
+        out[tk] = reset_deep_30m(tk, today, why=f"split correction {', '.join(changed)}")
+        if out[tk] == "reset":
+            if keys:
+                applied[tk] = sorted(set(keys))
+            else:
+                applied.pop(tk, None)
+    if out:
+        tmp = _applied_path().with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(applied, indent=1, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, _applied_path())
+    return out
+
+
 def reset_split_tickers(tickers: Iterable[str], today: Optional[date] = None) -> Dict[str, str]:
     """Reset every ticker in ``tickers`` whose split (the split data) took
     effect after its stored history was last adjusted and on/before ``today``.
     Returns ``{ticker: outcome}`` for the names it touched. Fail-soft: unreadable
-    split data resets nothing (logged)."""
+    split data resets nothing (logged). A split whose record the raw prices of its
+    date contradict (`split_check`: ``suspect``) is NOT loaded yet: refetching would
+    scale the history by a split that may not have traded (a fake jump the scorer
+    reads); the history stays in its own terms until the record is decided."""
+    from src.data.split_check import status_of
     today = today or date.today()
     names = {t.upper() for t in tickers}
     splits = latest_splits(today) if names else None
@@ -345,8 +417,14 @@ def reset_split_tickers(tickers: Iterable[str], today: Optional[date] = None) ->
         if not _path(tk).exists():
             continue
         d = split_to_apply(tk, today, splits)
-        if d is not None:
-            out[tk] = reset_deep_30m(tk, today, why=f"split effective {d}")
+        if d is None:
+            continue
+        if status_of(tk, d) == "suspect":
+            logger.warning(f"[intraday_store] {tk}: split of {d} not loaded — its record is contradicted by the raw "
+                           f"prices (suspect): the history keeps its terms until the record is decided")
+            out[tk] = "held_suspect"
+            continue
+        out[tk] = reset_deep_30m(tk, today, why=f"split effective {d}")
     return out
 
 

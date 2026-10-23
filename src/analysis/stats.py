@@ -24,10 +24,26 @@ The overfitting statistics (`pbo_cscv`, `deflated_sharpe`, `probabilistic_sharpe
 are the construction PREREG81 ran in its study script (`part2_81.py`), ported
 here so the next study reuses one audited copy — `tests/test_stats_overfitting.py`
 pins them.
+
+The SHARPE-RATIO INFERENCE section (PREREG183, the user 2026-10-22: "Copy the
+formulas to improve our own skills") ports López de Prado, Lipton & Zoonekynd,
+"Sharpe Ratio Inference: A New Standard for Reporting and Decision-Making" (SSRN
+5520741; the reference code github.com/zoonek/2025-sharpe-ratio, `functions.py`):
+the Sharpe estimate's variance under skewness, fat tails and AR(1)
+autocorrelation, the PSR with that variance UNDER THE NULL, the minimum track
+record, the critical Sharpe, the power, the planned and observed false discovery
+rates (pFDR, oFDR), the FDR-controlling critical value and the deflated (FWER)
+test with the variance of the maximum of K trials — plus the two regressions a
+book's market exposure needs (Newey-West and cluster-robust OLS). The older
+functions above keep their numbers (Bailey & López de Prado 2012/2014: the
+variance at the estimate, T - 1, no autocorrelation); every study before PREREG183
+reads them. `tests/test_stats_sharpe_inference.py` pins the reference code's own
+test values.
 """
 
 from __future__ import annotations
 
+import functools
 import itertools
 import math
 from statistics import NormalDist
@@ -37,7 +53,10 @@ import numpy as np
 
 __all__ = ["binom_p_less", "binom_p_greater", "welch_t_test", "t_sf_two_sided",
            "pbo_cscv", "deflated_sharpe", "probabilistic_sharpe", "expected_max_sharpe",
-           "EULER_GAMMA"]
+           "EULER_GAMMA",
+           "ar1_terms", "max_normal_moments", "sharpe_variance", "sharpe_psr", "min_track_record",
+           "track_record_for_power", "critical_sharpe", "sharpe_power", "pfdr", "ofdr",
+           "fdr_critical_sharpe", "deflated_sharpe_k", "sharpe_moments", "ols_hac", "ols_cluster"]
 
 
 # ── binomial ──────────────────────────────────────────────────────────────────
@@ -432,3 +451,372 @@ def deflated_sharpe(sr: float, n_trials: int, T: int, skew: float = 0.0, kurt: f
         "kurt": float(kurt),
         "sr_var": float(sr_var),
     }
+
+
+# ── Sharpe-ratio inference (López de Prado, Lipton & Zoonekynd 2025; PREREG183) ─
+#
+# The reference code's names: sharpe_ratio_variance -> `sharpe_variance`, moments_Mk -> `max_normal_moments`,
+# probabilistic_sharpe_ratio -> `sharpe_psr`, minimum_track_record_length -> `min_track_record`,
+# critical_sharpe_ratio -> `critical_sharpe`, sharpe_ratio_power -> `sharpe_power`, pFDR -> `pfdr`, oFDR -> `ofdr`,
+# control_for_FDR -> `fdr_critical_sharpe`; the FWER construction of its numeric example -> `deflated_sharpe_k`.
+# Units: a Sharpe ratio per period of the returns it was measured on (monthly returns give a monthly Sharpe; never
+# annualize before testing). Skewness γ3 and the PLAIN kurtosis γ4 (3 for a normal) of those returns; ρ their
+# first-order autocorrelation, the returns read as AR(1).
+
+_SQRT2 = math.sqrt(2.0)
+_LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
+
+
+def _z(p: float) -> float:
+    return _ND.inv_cdf(float(p))
+
+
+def _norm_logsf(x: float) -> float:
+    """log P[Z > x] for a standard normal, accurate in both tails (the asymptotic series past erfc's underflow)."""
+    x = float(x)
+    if x < 25.0:
+        return math.log(0.5 * math.erfc(x / _SQRT2))
+    x2 = x * x
+    return -0.5 * x2 - math.log(x) - _LOG_SQRT_2PI + math.log1p(-1.0 / x2 + 3.0 / (x2 * x2) - 15.0 / (x2 * x2 * x2))
+
+
+def ar1_terms(rho: float = 0.0) -> Tuple[float, float, float]:
+    """The paper's AR(1) factors (a, b, c) of the Sharpe variance, ρ the returns' first-order autocorrelation:
+    a = (1 + ρ) / (1 - ρ), b = (1 + ρ + ρ²) / (1 - ρ²), c = (1 + ρ²) / (1 - ρ²) — all 1 for independent returns."""
+    r = float(rho)
+    if not -1.0 < r < 1.0:
+        raise ValueError(f"rho must lie strictly between -1 and 1, got {rho}")
+    return (1.0 + r) / (1.0 - r), (1.0 + r + r * r) / (1.0 - r * r), (1.0 + r * r) / (1.0 - r * r)
+
+
+@functools.lru_cache(maxsize=1)
+def _max_grid() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The integration grid of `max_normal_moments`: x on [-12, 12] by 0.001, log φ(x) and log Φ(x) (both tails
+    exact: erfc below 0, log1p above)."""
+    x = np.linspace(-12.0, 12.0, 24_001)
+    log_phi = -0.5 * x * x - _LOG_SQRT_2PI
+    log_cdf = np.array([math.log(0.5 * math.erfc(-v / _SQRT2)) if v < 0.0 else math.log1p(-0.5 * math.erfc(v / _SQRT2))
+                        for v in x.tolist()])
+    return x, log_phi, log_cdf
+
+
+@functools.lru_cache(maxsize=4096)
+def max_normal_moments(k: int) -> Tuple[float, float, float]:
+    """(E[M], E[M²], Var[M]) of M = the maximum of ``k`` independent standard normals — the density k φ(x) Φ(x)^(k-1)
+    integrated on a fine grid (the reference code takes the same integral by Gauss-Hermite quadrature). k = 1 is the
+    normal itself (0, 1, 1); the variance shrinks as k grows: the best of many trials is a sharper statistic."""
+    k = int(k)
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if k == 1:
+        return 0.0, 1.0, 1.0
+    x, log_phi, log_cdf = _max_grid()
+    f = np.exp(math.log(k) + log_phi + (k - 1) * log_cdf)
+    w = np.full(len(x), x[1] - x[0])
+    w[0] = w[-1] = 0.5 * (x[1] - x[0])
+    mass = float((w * f).sum())
+    e1 = float((w * f * x).sum()) / mass
+    e2 = float((w * f * x * x).sum()) / mass
+    return e1, e2, e2 - e1 * e1
+
+
+def sharpe_variance(sr: float, T: float, skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0,
+                    n_trials: int = 1) -> float:
+    """The asymptotic variance of a Sharpe ratio estimated over ``T`` periods (the paper's equation):
+
+        V[SR] = (a - b·γ3·SR + c·(γ4 - 1)/4·SR²) / T  ×  Var[max of K standard normals]
+
+    with (a, b, c) = `ar1_terms(rho)` and K = ``n_trials`` (1: no selection, the factor is 1). ``nan`` when the
+    bracket is not positive (a large positive skew with a high Sharpe can do that) or an input is not finite."""
+    T = float(T)
+    if not T > 0.0:
+        raise ValueError(f"T must be positive, got {T}")
+    sr, skew, kurt = float(sr), float(skew), float(kurt)
+    if not all(math.isfinite(v) for v in (sr, skew, kurt, float(rho))):
+        return float("nan")
+    a, b, c = ar1_terms(rho)
+    bracket = a - b * skew * sr + c * (kurt - 1.0) / 4.0 * sr * sr
+    if not bracket > 0.0:
+        return float("nan")
+    v = bracket / T
+    if int(n_trials) > 1:
+        v *= max_normal_moments(int(n_trials))[2]
+    return v
+
+
+def sharpe_psr(sr: float, sr0: float, T: float, skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0,
+               n_trials: int = 1) -> float:
+    """The paper's Probabilistic Sharpe Ratio: 1 - the p-value of H0: SR = sr0 against SR > sr0,
+
+        PSR = Φ( (SR - SR0) / sqrt(V[SR0]) )
+
+    the variance taken UNDER THE NULL (at sr0, over T periods) — where `probabilistic_sharpe` (Bailey & López de
+    Prado 2012) takes it at the estimate with T - 1. With ``n_trials`` > 1, sr0 must already be the deflated
+    threshold (`deflated_sharpe_k` builds it); only the variance is the maximum's here. ``nan`` when undefined."""
+    v = sharpe_variance(sr0, T, skew, kurt, rho, n_trials)
+    if not v > 0.0 or not math.isfinite(float(sr)):
+        return float("nan")
+    return _ND.cdf((float(sr) - float(sr0)) / math.sqrt(v))
+
+
+def min_track_record(sr: float, sr0: float = 0.0, skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0,
+                     alpha: float = 0.05) -> float:
+    """The paper's MINIMUM TRACK RECORD LENGTH, in periods: the T at which an observed Sharpe ``sr`` (per period)
+    would reject H0: SR = sr0 at the one-sided level ``alpha``,
+
+        MinTRL = V[SR0](T = 1) · ( z_{1-α} / (SR - SR0) )²
+
+    (the T for a 50% power when the true Sharpe is ``sr``: `track_record_for_power` gives any other power). ``inf``
+    when sr <= sr0 — no record makes a lower Sharpe significantly higher (the reference code squares the gap and
+    returns a number there)."""
+    sr, sr0 = float(sr), float(sr0)
+    if not sr > sr0:
+        return float("inf")
+    v1 = sharpe_variance(sr0, 1.0, skew, kurt, rho)
+    if not v1 > 0.0:
+        return float("nan")
+    return v1 * (_z(1.0 - float(alpha)) / (sr - sr0)) ** 2
+
+
+def critical_sharpe(sr0: float, T: float, skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0,
+                    alpha: float = 0.05, n_trials: int = 1, lower: bool = False) -> float:
+    """The critical Sharpe of the one-sided test of H0: SR = sr0 at level ``alpha`` over ``T`` periods:
+    SR_c = SR0 + z_{1-α} sqrt(V[SR0]) (``lower``: SR0 - z_{1-α} sqrt(V[SR0]), the test against a SHORTFALL)."""
+    v = sharpe_variance(sr0, T, skew, kurt, rho, n_trials)
+    if not v > 0.0:
+        return float("nan")
+    step = _z(1.0 - float(alpha)) * math.sqrt(v)
+    return float(sr0) - step if lower else float(sr0) + step
+
+
+def sharpe_power(sr0: float, sr1: float, T: float, skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0,
+                 alpha: float = 0.05, n_trials: int = 1) -> float:
+    """The POWER (1 - β) over ``T`` periods of the one-sided test of H0: SR = sr0 at level ``alpha``, against the
+    alternative H1: SR = sr1 — upward when sr1 > sr0 (the paper's: 1 - Φ((SR_c - SR1) / sqrt(V[SR1]))), downward when
+    sr1 < sr0 (the test that a record falls SHORT of sr0: Φ((SR_c,lower - SR1) / sqrt(V[SR1]))). ``n_trials`` applies
+    to both variances (the reference code leaves it out of the critical value; the same for one trial)."""
+    sr0, sr1 = float(sr0), float(sr1)
+    lower = sr1 < sr0
+    c = critical_sharpe(sr0, T, skew, kurt, rho, alpha, n_trials, lower=lower)
+    v1 = sharpe_variance(sr1, T, skew, kurt, rho, n_trials)
+    if not v1 > 0.0 or c != c:
+        return float("nan")
+    z = (c - sr1) / math.sqrt(v1)
+    return _ND.cdf(z) if lower else 1.0 - _ND.cdf(z)
+
+
+def track_record_for_power(sr0: float, sr1: float, power: float = 0.8, skew: float = 0.0, kurt: float = 3.0,
+                           rho: float = 0.0, alpha: float = 0.05) -> float:
+    """The periods T at which the one-sided level-``alpha`` test of H0: SR = sr0 reaches ``power`` against
+    H1: SR = sr1 (either direction; `sharpe_power` at this T returns ``power``):
+
+        T = ( (z_{1-α} sqrt(V[SR0](1)) + z_power sqrt(V[SR1](1))) / |SR1 - SR0| )²
+
+    ``power`` 0.5 with sr1 the observed Sharpe is the paper's MinTRL. ``inf`` when sr1 == sr0."""
+    sr0, sr1 = float(sr0), float(sr1)
+    if sr1 == sr0:
+        return float("inf")
+    v0, v1 = sharpe_variance(sr0, 1.0, skew, kurt, rho), sharpe_variance(sr1, 1.0, skew, kurt, rho)
+    if not (v0 > 0.0 and v1 > 0.0):
+        return float("nan")
+    num = _z(1.0 - float(alpha)) * math.sqrt(v0) + _z(float(power)) * math.sqrt(v1)
+    return (num / abs(sr1 - sr0)) ** 2 if num > 0.0 else 0.0
+
+
+def pfdr(p_h1: float, alpha: float, beta: float) -> float:
+    """The PLANNED false discovery rate: P[H0 | the test rejects], for a test of level ``alpha`` and type II error
+    ``beta`` (1 - its power against the alternative) when H1 is true with prior probability ``p_h1``:
+
+        pFDR = 1 / (1 + (1 - β) · P[H1] / (α · P[H0]))
+
+    It reads the DECISION RULE (its level and power), not the observed Sharpe — `ofdr` reads the observation."""
+    p, a, b = float(p_h1), float(alpha), float(beta)
+    if not (0.0 < p < 1.0 and 0.0 < a < 1.0 and 0.0 <= b <= 1.0):
+        raise ValueError(f"need 0 < p_h1 < 1, 0 < alpha < 1, 0 <= beta <= 1; got {p_h1}, {alpha}, {beta}")
+    return 1.0 / (1.0 + (1.0 - b) * p / (a * (1.0 - p)))
+
+
+def ofdr(sr: float, sr0: float, sr1: float, T: float, p_h1: float, skew: float = 0.0, kurt: float = 3.0,
+         rho: float = 0.0, n_trials: int = 1) -> float:
+    """The OBSERVED false discovery rate: P[H0 | a Sharpe at least ``sr``], H0: SR = sr0 against the point alternative
+    H1: SR = sr1 with prior P[H1] = ``p_h1``:
+
+        oFDR = p0 · P[H0] / (p0 · P[H0] + p1 · P[H1]),   p0 = 1 - PSR(SR; SR0),  p1 = 1 - PSR(SR; SR1)
+
+    — the observed p-value weighed against the chance a true sr1 would show a Sharpe this high. The alternative is
+    the caller's assumption and moves the answer most: say which one with every reading."""
+    p = float(p_h1)
+    if not 0.0 < p < 1.0:
+        raise ValueError(f"p_h1 must lie strictly between 0 and 1, got {p_h1}")
+    p0 = 1.0 - sharpe_psr(sr, sr0, T, skew, kurt, rho, n_trials)
+    p1 = 1.0 - sharpe_psr(sr, sr1, T, skew, kurt, rho, n_trials)
+    if p0 != p0 or p1 != p1:
+        return float("nan")
+    den = p0 * (1.0 - p) + p1 * p
+    return p0 * (1.0 - p) / den if den > 0.0 else float("nan")
+
+
+def fdr_critical_sharpe(q: float, sr0: float = 0.0, sr1: float = 0.5, p_h1: float = 0.05, T: float = 24,
+                        skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0, n_trials: int = 1) -> Dict[str, float]:
+    """The critical Sharpe that CONTROLS THE FALSE DISCOVERY RATE at ``q`` (the paper's control_for_FDR): the c with
+    P[H0 | SR > c] = q when SR ~ N(sr0, σ0²) under H0 and N(sr1, σ1²) under H1 (σ = sqrt(V[·]) over ``T`` periods,
+    P[H1] = ``p_h1``), found by bisection on [-10, 10]. Returns {"sr_c", "alpha" (P[SR > c | H0]), "beta" (P[SR <= c |
+    H1]), "power", "q_hat" (`pfdr` at that alpha and beta: q at the root), "sigma0", "sigma1"}; ``sr_c`` is -inf when
+    even accepting every Sharpe keeps the FDR under q, nan when no c reaches q (as the reference code)."""
+    q, p = float(q), float(p_h1)
+    if not (sr0 < sr1 and 0.0 < q < 1.0 and 0.0 < p < 1.0):
+        raise ValueError(f"need sr0 < sr1, 0 < q < 1, 0 < p_h1 < 1; got {sr0}, {sr1}, {q}, {p_h1}")
+    s0 = math.sqrt(sharpe_variance(sr0, T, skew, kurt, rho, n_trials))
+    s1 = math.sqrt(sharpe_variance(sr1, T, skew, kurt, rho, n_trials))
+    odds = p / (1.0 - p)
+
+    def f(c: float) -> float:                       # P[H0 | SR > c]
+        lr = math.exp(min(700.0, _norm_logsf((c - sr1) / s1) - _norm_logsf((c - sr0) / s0)))
+        return 1.0 / (1.0 + lr * odds)
+    out = {"sigma0": s0, "sigma1": s1}
+    lo, hi = -10.0, 10.0
+    if f(lo) < q:
+        return dict(out, sr_c=float("-inf"), alpha=1.0, beta=0.0, power=1.0, q_hat=f(lo))
+    if (f(lo) - q) * (f(hi) - q) > 0.0:
+        return dict(out, sr_c=float("nan"), alpha=float("nan"), beta=float("nan"), power=float("nan"),
+                    q_hat=float("nan"))
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if (f(mid) - q) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-13:
+            break
+    c = 0.5 * (lo + hi)
+    alpha = math.exp(_norm_logsf((c - sr0) / s0))
+    beta = _ND.cdf((c - sr1) / s1)
+    q_hat = 1.0 / (1.0 + (1.0 - beta) * odds / alpha) if alpha > 0.0 else float("nan")
+    return dict(out, sr_c=c, alpha=alpha, beta=beta, power=1.0 - beta, q_hat=q_hat)
+
+
+def deflated_sharpe_k(sr: float, n_trials: int, T: float, skew: float = 0.0, kurt: float = 3.0, rho: float = 0.0,
+                      sr_var: Optional[float] = None, sr0: float = 0.0) -> Dict[str, float]:
+    """The paper's DEFLATED (FWER) test of the best of ``n_trials`` trials: the threshold SR0 + E[max], E[max] =
+    `expected_max_sharpe`(K, ``sr_var``), and the MAXIMUM's variance V[SR0 + E[max]] × Var[max of K normals]:
+
+        DSR = Φ( (SR - SR0 - E[max]) / sqrt(V[SR0 + E[max]] · Var[M_K]) )
+
+    ``sr_var`` — the variance of the trials' Sharpe ratios — is REQUIRED (as in `deflated_sharpe`: a silent default
+    would deflate by an unstated amount). For trials whose Sharpe varies only by sampling noise around zero, pass
+    ``sharpe_variance(0, T, rho=rho)`` = a / T (PREREG103 passed 1 / (T - 1)). Returns {"dsr", "threshold" (SR0 +
+    E[max]), "e_max", "psr0" (the undeflated `sharpe_psr` against sr0), the inputs}."""
+    if sr_var is None:
+        raise ValueError("deflated_sharpe_k needs sr_var, the variance of the trials' Sharpe ratios (for skill-less "
+                         "trials: sharpe_variance(0, T, rho=rho))")
+    e_max = expected_max_sharpe(n_trials, sr_var)
+    thr = float(sr0) + e_max
+    return {"dsr": sharpe_psr(sr, thr, T, skew, kurt, rho, int(n_trials)), "threshold": thr, "e_max": e_max,
+            "psr0": sharpe_psr(sr, sr0, T, skew, kurt, rho), "sr": float(sr), "sr0": float(sr0),
+            "n_trials": int(n_trials), "T": float(T), "skew": float(skew), "kurt": float(kurt), "rho": float(rho),
+            "sr_var": float(sr_var)}
+
+
+def sharpe_moments(x: Sequence[float]) -> Dict[str, float]:
+    """A return series' inputs to the formulas above: {"n", "mean", "sd" (ddof 1), "sr" (mean / sd), "skew" (the
+    population third standardized moment), "kurt" (the plain fourth: 3 for a normal), "rho" (the lag-1 Pearson
+    autocorrelation, the reference code's `autocorrelation`)}. Finite values only; ``nan`` where undefined (fewer than
+    3 values, or a constant series)."""
+    v = np.asarray([float(a) for a in x if a == a and math.isfinite(float(a))], float)
+    n = int(len(v))
+    out = {"n": n, "mean": float(v.mean()) if n else float("nan"), "sd": float("nan"), "sr": float("nan"),
+           "skew": float("nan"), "kurt": float("nan"), "rho": float("nan")}
+    if n < 3:
+        return out
+    sd = float(v.std(ddof=1))
+    sd0 = float(v.std(ddof=0))
+    if not sd > 0.0:
+        return out
+    z = (v - v.mean()) / sd0
+    out.update(sd=sd, sr=float(v.mean()) / sd, skew=float((z ** 3).mean()), kurt=float((z ** 4).mean()))
+    a, b = v[1:], v[:-1]
+    if a.std() > 0.0 and b.std() > 0.0:
+        out["rho"] = float(np.corrcoef(a, b)[0, 1])
+    return out
+
+
+# ── regressions with robust standard errors (a book's market exposure) ─────────
+
+def _design(y, X, const: bool, names: Optional[Sequence[str]]):
+    yv = np.asarray(y, float).ravel()
+    Xv = np.asarray(X, float)
+    if Xv.ndim == 1:
+        Xv = Xv[:, None]
+    if Xv.shape[0] != len(yv):
+        raise ValueError(f"y has {len(yv)} rows, X {Xv.shape[0]}")
+    if not (np.isfinite(yv).all() and np.isfinite(Xv).all()):
+        raise ValueError("y and X must be finite — align and drop the missing rows first")
+    nm = list(names) if names is not None else [f"x{i + 1}" for i in range(Xv.shape[1])]
+    if len(nm) != Xv.shape[1]:
+        raise ValueError(f"{len(nm)} names for {Xv.shape[1]} regressors")
+    if const:
+        Xv = np.column_stack([np.ones(len(yv)), Xv])
+        nm = ["const"] + nm
+    n, k = Xv.shape
+    if n <= k:
+        raise ValueError(f"{n} rows cannot fit {k} coefficients")
+    XtX = Xv.T @ Xv
+    if np.linalg.matrix_rank(XtX) < k:
+        raise ValueError("the regressors are collinear")
+    B = np.linalg.inv(XtX)
+    coef = B @ (Xv.T @ yv)
+    u = yv - Xv @ coef
+    return yv, Xv, nm, n, k, B, coef, u
+
+
+def _fit_out(yv, nm, n, k, coef, V, u, df, const) -> Dict[str, object]:
+    se = np.sqrt(np.maximum(np.diag(V), 0.0))
+    t = np.where(se > 0, coef / np.where(se > 0, se, 1.0), np.nan)
+    tss = float(((yv - yv.mean()) ** 2).sum()) if const else float((yv ** 2).sum())
+    return {"names": nm, "coef": [float(c) for c in coef], "se": [float(s) for s in se], "t": [float(v) for v in t],
+            "p": [t_sf_two_sided(float(v), df) if v == v else float("nan") for v in t],
+            "n": int(n), "k": int(k), "df": float(df),
+            "r2": (1.0 - float(u @ u) / tss) if tss > 0 else float("nan"),
+            "resid_sd": math.sqrt(float(u @ u) / (n - k))}
+
+
+def ols_hac(y, X, lags: Optional[int] = None, const: bool = True,
+            names: Optional[Sequence[str]] = None) -> Dict[str, object]:
+    """OLS of ``y`` on ``X`` (a constant first unless ``const`` is False) with NEWEY-WEST standard errors: the
+    Bartlett kernel, weights 1 - l / (L + 1), ``lags`` L by default floor(4 (n / 100)^(2/9)), the covariance scaled by
+    n / (n - k); t on n - k degrees of freedom, two-sided p. Rows in time order. Returns {"names", "coef", "se", "t",
+    "p", "n", "k", "df", "r2", "resid_sd", "lags"} — coefficient 0 the intercept (the ALPHA per period)."""
+    yv, Xv, nm, n, k, B, coef, u = _design(y, X, const, names)
+    L = int(math.floor(4.0 * (n / 100.0) ** (2.0 / 9.0))) if lags is None else int(lags)
+    if L < 0:
+        raise ValueError(f"lags must be >= 0, got {lags}")
+    S_ = Xv * u[:, None]
+    S = S_.T @ S_
+    for lag in range(1, min(L, n - 1) + 1):
+        G = S_[lag:].T @ S_[:-lag]
+        S = S + (1.0 - lag / (L + 1.0)) * (G + G.T)
+    V = B @ S @ B * (n / (n - k))
+    out = _fit_out(yv, nm, n, k, coef, V, u, n - k, const)
+    out["lags"] = L
+    return out
+
+
+def ols_cluster(y, X, clusters, const: bool = True, names: Optional[Sequence[str]] = None) -> Dict[str, object]:
+    """OLS of ``y`` on ``X`` with CLUSTER-ROBUST standard errors (CR1: the sandwich over the clusters' score sums,
+    scaled by G / (G - 1) · (n - 1) / (n - k)); t on G - 1 degrees of freedom. ``clusters``: one label per row (the
+    bank's unit is the entry month: a month's trades share its market). Returns `ols_hac`'s keys with ``"clusters"``
+    (G) in place of ``"lags"``."""
+    yv, Xv, nm, n, k, B, coef, u = _design(y, X, const, names)
+    lab = np.asarray(list(clusters), dtype=object)
+    if len(lab) != n:
+        raise ValueError(f"{len(lab)} cluster labels for {n} rows")
+    _, inv = np.unique(lab.astype(str), return_inverse=True)
+    G = int(inv.max()) + 1
+    if G < 2:
+        raise ValueError("at least two clusters are needed")
+    Sg = np.zeros((G, k))
+    np.add.at(Sg, inv, Xv * u[:, None])
+    V = B @ (Sg.T @ Sg) @ B * (G / (G - 1.0)) * ((n - 1.0) / (n - k))
+    out = _fit_out(yv, nm, n, k, coef, V, u, G - 1, const)
+    out["clusters"] = G
+    return out

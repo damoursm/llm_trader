@@ -173,7 +173,9 @@ def session_label(ts_utc: pd.Series) -> pd.Series:
 
 
 def bars30m_full(ticker: str, start: str = BARS_FROM, end: Optional[str] = None) -> pd.DataFrame:
-    """All 30-minute bars (extended hours included) for ``[start, end]``."""
+    """All 30-minute bars (extended hours included) for ``[start, end]``, Polygon's adjusted bars with the verified
+    split table's corrections (`split_check.correct_frame`, 2026-10-16)."""
+    from src.data.split_check import correct_frame
     pc = _client()
     end = end or date.today().isoformat()
     res = _paginate(f"/v2/aggs/ticker/{pc.to_polygon_symbol(ticker)}/range/30/minute/{start}/{end}",
@@ -182,6 +184,7 @@ def bars30m_full(ticker: str, start: str = BARS_FROM, end: Optional[str] = None)
     if len(df):
         df["session"] = session_label(df["ts"])
         df = df[df["session"] != "off"].reset_index(drop=True)
+        df = correct_frame(str(ticker).replace("@D", ""), df, utc_naive=True, ts_col="ts")
     return df
 
 

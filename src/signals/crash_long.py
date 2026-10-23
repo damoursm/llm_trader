@@ -8,7 +8,10 @@ The rule (PREREG86's CR1, decided on `crash_long_symbol`, QQQ): at the previous 
 `crash_long_exit_sma_sessions` (5) session average since the entry session (its own close counts; every close since
 the entry is read, so a missed day delays the exit instead of losing it), or after `crash_long_max_hold_sessions` (10)
 sessions — the dip book's exit. One position at a time. Both decisions read the DECISION symbol's closes, never the
-traded fund's (the trade stamps ``crash_decision_symbol``).
+traded fund's (the trade stamps ``crash_decision_symbol``). THE AFTER-HOURS EXIT (PREREG166's XC, from the 2026-10-20
+evening; `crash_long_pm_exit`): the same exit is taken at the first after-hours tick at/after 16:30 ET of the session
+whose close triggers it (`pm_exit_check`, `tracker.monitor_crash_long_pm_exit`) instead of the next open; a tick
+missed until 20:00 ET leaves it to the open.
 
 The daily bars are the dip book's construction (`dip_long.daily_bars`: the deep 30-minute store, one row per ET
 session); the decision reads the closes through D-1 only (`tests/test_no_lookahead.py`).
@@ -42,6 +45,7 @@ import pandas as pd
 from loguru import logger
 
 from config import settings
+from src.accounts import paths as _acct
 from src.signals import dip_long as DL
 
 MECHANISM = "crash_long"
@@ -124,6 +128,7 @@ def signal_for(d: date, extend: bool = True) -> dict:
             return json.loads(p.read_text(encoding="utf-8"))
         except ValueError:
             pass
+    _acct.decide_here(f"the crash decision of {d}")       # an extra account reads it, never computes it
     prev = DL.prev_session(d)
     sym = symbol()
 
@@ -206,14 +211,84 @@ def exit_check(trade: dict, d: date) -> Tuple[Optional[str], dict]:
     return None, info
 
 
+# ── THE AFTER-HOURS EXIT (PREREG166's XC; user 2026-10-20: "Deploy all three.") ─────────────────────────────────
+# The exit the next session's open would take (`exit_check`) is taken at the first after-hours tick at/after 16:30 ET
+# of the session whose close triggers it — the backtest's 16:00-16:30 bar close (`mimic.pm_exit`). The deep store holds
+# the sessions through the one before (the next pre-open run extends it), so the session's own regular-hours close is
+# Polygon's last regular-hours 30-minute bar of it — the store's construction (`dip_long.daily_bars`: the last bar's
+# close). A tick that cannot read it, or every tick missed until 20:00 ET, leaves the sale to the next open, as before.
+PM_EXIT_FROM = 16 * 60 + 30                 # 16:30 ET
+PM_EXIT_UNTIL = 20 * 60                     # the extended session's end
+
+
+def pm_exit_on() -> bool:
+    return bool(getattr(settings, "crash_long_pm_exit", False))
+
+
+def in_pm_exit_window(now: Optional[datetime] = None) -> bool:
+    """A session day's after-hours instant from 16:30 to 20:00 ET."""
+    now = now or datetime.now(timezone.utc)
+    et = now.astimezone(ET)
+    m = et.hour * 60 + et.minute
+    return DL.is_session(et.date()) and PM_EXIT_FROM <= m < PM_EXIT_UNTIL
+
+
+def session_close(ticker: str, s: date) -> Optional[float]:
+    """Session ``s``'s regular-hours close of ``ticker``: the close of Polygon's 15:30-16:00 ET 30-minute bar (None
+    when the session's bars cannot be read or do not reach it)."""
+    bars = DL.session_bars(ticker, s)
+    if bars is None or bars.empty:
+        return None
+    st, _ = DL._bar_times(bars)
+    last = st[-1].tz_convert(ET)
+    if last.date() != s or (last.hour, last.minute) != (15, 30):
+        return None
+    v = float(pd.to_numeric(bars["Close"].iloc[-1], errors="coerce"))
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def pm_exit_check(trade: dict, s: date) -> Tuple[Optional[str], dict]:
+    """At session ``s``'s after-hours tick: the exit the next session's open would take (`exit_check`'s rule through
+    the close of ``s``) — ``crash_rebound`` once a close of the decision symbol from the entry session through ``s``
+    is above its exit average, ``crash_time`` once the long has held `crash_long_max_hold_sessions` sessions through
+    ``s``; else None. ``info`` carries the numbers (``pm`` True; ``no_close`` when ``s``'s close cannot be read)."""
+    e = entry_day(trade)
+    info: dict = {"through": s.isoformat(), "pm": True}
+    if e is None or s < e:
+        return None, info
+    held = DL.sessions_held(e, s)
+    info["held"] = held
+    tk = str(trade.get("crash_decision_symbol") or symbol()).upper()
+    info["decision_symbol"] = tk
+    c = session_close(tk, s)
+    if c is None:
+        info["no_close"] = True
+        logger.warning(f"[crash_long] {tk}: no regular-hours close for {s} yet — the after-hours exit is judged at "
+                       f"the next tick")
+        return None, info
+    daily = DL._daily(tk)
+    before = daily[daily.index < pd.Timestamp(s)] if daily is not None and not daily.empty else None
+    row = pd.DataFrame({"o": [np.nan], "h": [np.nan], "l": [np.nan], "c": [c], "v": [np.nan]},
+                       index=pd.DatetimeIndex([pd.Timestamp(s)]))
+    full = row if before is None or before.empty else pd.concat([before[["o", "h", "l", "c", "v"]], row])
+    info["close_today"] = c
+    hit = rebound_session(full, e, s)
+    if hit is not None:
+        info.update(rebound_session=hit["session"].isoformat(), close=hit["close"], sma_exit=hit["sma_exit"])
+        return "crash_rebound", info
+    if held >= int(settings.crash_long_max_hold_sessions):
+        return "crash_time", info
+    return None, info
+
+
 # ── journals ─────────────────────────────────────────────────────────────────
 
 def entries_path(d: date) -> Path:
-    return root() / "entries" / f"{d.isoformat()}.jsonl"
+    return _acct.state(root() / "entries" / f"{d.isoformat()}.jsonl")   # this account's (`src.accounts.paths`)
 
 
 def exits_path(d: date) -> Path:
-    return root() / "exits" / f"{d.isoformat()}.jsonl"
+    return _acct.state(root() / "exits" / f"{d.isoformat()}.jsonl")
 
 
 def _append(p: Path, rec: dict) -> None:

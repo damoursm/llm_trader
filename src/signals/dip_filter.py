@@ -333,7 +333,7 @@ def signal_inputs(ticker: str, session: date, breadth: int, spy: dict, prior: Di
     """The 17 inputs of ``ticker``'s signal at the close of ``session`` (D-1), its stored series read through that
     close only. Raises when the store has no bar for ``session``."""
     from src.signals import dip_long
-    d = dip_long._daily(ticker) if daily is None else daily
+    d = dip_long._daily(ticker, session) if daily is None else daily
     f = name_features(d, session)
     if f is None or f.pop("session") != session:
         raise ValueError(f"{ticker}: no stored close for {session}")

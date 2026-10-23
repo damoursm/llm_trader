@@ -525,16 +525,20 @@ def get_intraday_bars(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
     return get_intraday_bars_range(ticker, from_date, date.today().isoformat())
 
 
-def get_intraday_bars_range(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
+def get_intraday_bars_range(ticker: str, from_date: str, to_date: str, adjusted: bool = True,
+                            rth_only: bool = True) -> pd.DataFrame:
     """30-minute RTH bars for an explicit ``[from_date, to_date]`` window (ISO
     dates, inclusive) — the deep-store extension's fetch (2026-09-16), paginated
-    like ``get_intraday_bars``. Same frame contract; empty on failure."""
+    like ``get_intraday_bars``. Same frame contract; empty on failure.
+    ``adjusted=False`` returns the prices as traded (no split adjustment);
+    ``rth_only=False`` keeps the extended-hours bars (04:00-20:00 ET) — the
+    news-hold shadow's outcome path (`src/signals/news_hold.py`)."""
     if not is_available():
         return pd.DataFrame()
 
     data = _get(
         f"/v2/aggs/ticker/{to_polygon_symbol(ticker)}/range/30/minute/{from_date}/{to_date}",
-        {"adjusted": "true", "sort": "asc", "limit": 50000},
+        {"adjusted": "true" if adjusted else "false", "sort": "asc", "limit": 50000},
     )
     if not data or not data.get("results"):
         logger.debug(f"[polygon] get_intraday_bars: no data for {ticker}")
@@ -576,7 +580,7 @@ def get_intraday_bars_range(ticker: str, from_date: str, to_date: str) -> pd.Dat
 
     df = pd.DataFrame(rows).set_index("ts").sort_index()
     df.index.name = None
-    return _rth_only_30m(df)
+    return _rth_only_30m(df) if rth_only else df
 
 
 def get_ratios_batch(tickers: List[str], chunk: int = 100) -> Dict[str, dict]:

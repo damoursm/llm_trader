@@ -1977,6 +1977,19 @@ def _persist_live_report(run_id: str, report: Optional[dict]) -> None:
         logger.warning(f"[broker] live report not persisted yet ({e}) — the tick's end persists it")
 
 
+def _launch_extra_accounts(start: Optional[datetime] = None) -> None:
+    """THE EXTRA ACCOUNTS (from 2026-10-26, the second account: its own ledger, calculated from this account — the
+    user's "The second account will be calculated from the same account"): each one's tick in its OWN process,
+    right after this account's live path — its own ledger and account on the decisions this tick just made, its
+    orders a dry run (`src.accounts.launch`; nothing unless `enable_extra_accounts`). Never waited for;
+    fail-soft."""
+    try:
+        from src.accounts import launch as _acct_launch
+        _acct_launch.launch_all(start)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[account] the extra accounts' launch failed (fail-soft): {e}")
+
+
 def run_live_path() -> Optional[dict]:
     """ONE slot's live trading path alone — what the scheduler runs when the slot comes
     due while the previous tick's shadow pipeline is still running: this slot's scorer,
@@ -2000,6 +2013,7 @@ def run_live_path() -> Optional[dict]:
     dip_closed = _live_marks_and_exits()
     report = _live_entries_and_sync(run_id, handle, f_borrow, dip_closed=dip_closed)
     _persist_live_report(run_id, report)
+    _launch_extra_accounts(start)
     try:                                      # its broker problems surface now (the slot's full tick re-checks)
         bh = _assess_broker_health(report)
         if bh and bh.get("down"):
@@ -2022,6 +2036,12 @@ def _live_marks_and_exits() -> int:
         update_open_trades()
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] marks failed (fail-soft): {e}")
+    fresh = 0
+    try:                            # THE FRESH START (2026-10-20): one-shot, before every book's exits
+        from src.performance.tracker import fresh_start_live_books
+        fresh = fresh_start_live_books(hold_prompt_active=bool(get_open_trades()))
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] fresh start failed (fail-soft): {e}")
     _hold = False
     try:
         from src.performance.tracker import flatten_legacy_positions, monitor_sel_short_positions
@@ -2041,6 +2061,16 @@ def _live_marks_and_exits() -> int:
         sold += monitor_crash_long_positions(hold_prompt_active=_hold)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] crash_long exit pass failed (fail-soft): {e}")
+    try:                            # ... and its AFTER-HOURS exit (PREREG166's XC, from 2026-10-20): 16:30-20:00 ET
+        from src.performance.tracker import monitor_crash_long_pm_exit
+        sold += monitor_crash_long_pm_exit(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] crash_long after-hours exit failed (fail-soft): {e}")
+    try:                            # THE CAPITULATION BOOK (2026-10-21): its exits at the open
+        from src.performance.tracker import monitor_cap_long_positions
+        sold += monitor_cap_long_positions(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] cap_long exit pass failed (fail-soft): {e}")
     try:                            # THE LIVE ACCOUNT (2026-10-09): margin call / de-leveraging over both books
         from src.performance.tracker import monitor_live_account
         sold += monitor_live_account(hold_prompt_active=_hold)
@@ -2051,12 +2081,17 @@ def _live_marks_and_exits() -> int:
         sold += monitor_dip_long_orders()
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] dip_long limit orders failed (fail-soft): {e}")
+    try:                            # THE CAPITULATION BOOK (2026-10-21): its orders' touches, after the dip book's
+        from src.performance.tracker import monitor_cap_long_orders
+        sold += monitor_cap_long_orders()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] cap_long limit orders failed (fail-soft): {e}")
     try:                            # THE CRASH-REBOUND BOOK (2026-10-11): its buy at the open, after the dip fills
         from src.performance.tracker import record_crash_long_trades
         sold += record_crash_long_trades()
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] crash_long entry pass failed (fail-soft): {e}")
-    return sold
+    return sold + fresh
 
 
 def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
@@ -2077,13 +2112,24 @@ def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
         etf_traded = rebalance_etf_dm(run_id=run_id)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] etf_dm rotation failed (fail-soft): {e}")
+    n_long = 0
     try:
         from src.performance.tracker import record_dip_long_trades
-        if record_dip_long_trades(run_id=run_id) or dip_closed or etf_traded:
-            dip_report = _broker_sync_watchdogged(run_id, None)
-            logger.info(f"[live] dip_long / etf_dm orders synced {time.time() - t0:.0f}s into the live entries")
+        n_long += record_dip_long_trades(run_id=run_id)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] dip_long entry pass failed (fail-soft): {e}")
+    try:                              # THE CAPITULATION BOOK (2026-10-21): its orders at the open, after the dip book's
+        from src.performance.tracker import record_cap_long_trades
+        n_long += record_cap_long_trades(run_id=run_id)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] cap_long entry pass failed (fail-soft): {e}")
+    try:
+        if n_long or dip_closed or etf_traded:
+            dip_report = _broker_sync_watchdogged(run_id, None)
+            logger.info(f"[live] dip_long / cap_long / etf_dm orders synced {time.time() - t0:.0f}s into the live "
+                        f"entries")
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] long books' broker sync failed (fail-soft): {e}")
     if borrow_future is not None:
         try:
             borrow_future.result(timeout=120)
@@ -2184,6 +2230,7 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             logger.warning(f"[live] open trades before the entries unreadable (Step 0 reads them later): {_ot_e}")
         live_broker_report = _live_entries_and_sync(run_id, _sel_handle, f_borrow, dip_closed=_dip_closed)
         _persist_live_report(run_id, live_broker_report)
+        _launch_extra_accounts(start)
 
     # ── Long-horizon buy arm A/B (2026-08-01) ─────────────────────────────
     # Per-run coin: replace combined_buy_score with the learned 5d stacker AND
@@ -3589,6 +3636,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
         # BEFORE the legacy monitor: the legacy book is closed as a whole at the
         # first regular-hours tick at/after `legacy_flatten_after`, and the
         # strategy's shorts take only their own two rules.
+        try:                       # THE FRESH START (2026-10-20): what the live path could not price
+            from src.performance.tracker import fresh_start_live_books
+            fresh_start_live_books(hold_prompt_active=hold_prompt_active)
+        except Exception as _fresh_x:                              # noqa: BLE001
+            logger.warning(f"[live_account] fresh start failed (fail-soft): {_fresh_x}")
         try:
             from src.performance.tracker import flatten_legacy_positions, monitor_sel_short_positions
             flatten_legacy_positions(hold_prompt_active=hold_prompt_active)
@@ -3607,6 +3659,16 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             monitor_crash_long_positions(hold_prompt_active=hold_prompt_active)
         except Exception as _crash_x:                              # noqa: BLE001
             logger.warning(f"[crash_long] exit pass failed (fail-soft): {_crash_x}")
+        try:                       # ... and its after-hours exit (PREREG166's XC)
+            from src.performance.tracker import monitor_crash_long_pm_exit
+            monitor_crash_long_pm_exit(hold_prompt_active=hold_prompt_active)
+        except Exception as _crash_px:                             # noqa: BLE001
+            logger.warning(f"[crash_long] after-hours exit failed (fail-soft): {_crash_px}")
+        try:                       # THE CAPITULATION BOOK (2026-10-21): an exit the live path could not price
+            from src.performance.tracker import monitor_cap_long_positions
+            monitor_cap_long_positions(hold_prompt_active=hold_prompt_active)
+        except Exception as _cap_x:                                # noqa: BLE001
+            logger.warning(f"[cap_long] exit pass failed (fail-soft): {_cap_x}")
         # ── THE LIVE ACCOUNT (2026-10-09): margin call / de-leveraging over both books
         try:
             from src.performance.tracker import monitor_live_account
@@ -3618,6 +3680,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             monitor_dip_long_orders(run_id=run_id)
         except Exception as _dip_lo:                               # noqa: BLE001
             logger.warning(f"[dip_long] limit orders failed (fail-soft): {_dip_lo}")
+        try:                       # THE CAPITULATION BOOK (2026-10-21): its orders' touches
+            from src.performance.tracker import monitor_cap_long_orders
+            monitor_cap_long_orders(run_id=run_id)
+        except Exception as _cap_lo:                               # noqa: BLE001
+            logger.warning(f"[cap_long] limit orders failed (fail-soft): {_cap_lo}")
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
@@ -3668,6 +3735,13 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             record_dip_long_trades(run_id=run_id)
         except Exception as _dip_o:
             logger.warning(f"[dip_long] entry pass failed (fail-soft): {_dip_o}")
+        try:                       # THE CAPITULATION BOOK (2026-10-21): its orders, after the dip book's; before the
+            from src.performance.tracker import record_cap_long_trades   # open, the day's breadth is computed
+            record_cap_long_trades(run_id=run_id)
+            from src.signals import cap_long as _cap_long_p
+            _cap_long_p.prepare()
+        except Exception as _cap_o:                                # noqa: BLE001
+            logger.warning(f"[cap_long] entry pass failed (fail-soft): {_cap_o}")
         try:                       # THE CRASH-REBOUND BOOK (2026-10-11): a buy the live path could not price
             from src.performance.tracker import record_crash_long_trades
             record_crash_long_trades(run_id=run_id)
@@ -3722,6 +3796,8 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             if getattr(r, "ticker", None) and getattr(r, "action", None)
         })
         broker_report = _merge_broker_reports(live_broker_report, broker_report)
+        if live_first:                        # the extra accounts' second pass (one at a time: a running one is kept)
+            _launch_extra_accounts()
 
     # Merge per-gate counters from the actionable filter + the trade-entry path
     # into one diagnostic blob so the user can see at a glance which constraints
@@ -3864,11 +3940,40 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
                                       + _crash_long_h.health(trades=get_open_trades())["problems"])
         except Exception as _ch_e:                                 # noqa: BLE001
             logger.warning(f"[crash_long] health check failed (fail-soft): {_ch_e}")
+        try:                                  # the capitulation book's (2026-10-21)
+            from src.signals import cap_long as _cap_long_h
+            _kh = _cap_long_h.health(trades=get_open_trades())
+            sel_health["problems"] = list(sel_health.get("problems") or []) + _kh["problems"]
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _kh["notes"]
+        except Exception as _kh_e:                                 # noqa: BLE001
+            logger.warning(f"[cap_long] health check failed (fail-soft): {_kh_e}")
+        try:                                  # the price data's integrity (2026-10-16): split records, stores
+            from src.data import integrity as _integrity_h
+            _ih = _integrity_h.health(trades=get_open_trades())
+            sel_health["problems"] = list(sel_health.get("problems") or []) + _ih["problems"]
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _ih["notes"]
+        except Exception as _ih_e:                                 # noqa: BLE001
+            logger.warning(f"[integrity] health check failed (fail-soft): {_ih_e}")
         try:                                  # the live record against the simulator's assumptions (2026-10-12): notes
             from src.backtest import live_calibration as _live_cal_h
             sel_health["notes"] = list(sel_health.get("notes") or []) + _live_cal_h.health()["notes"]
         except Exception as _lc_e:                                 # noqa: BLE001
             logger.warning(f"[live_calibration] health read failed (fail-soft): {_lc_e}")
+        try:                                  # every live trade beside the simulator's (PREREG185, 2026-10-23): notes
+            from src.backtest import forward_check as _fwd_h
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _fwd_h.health()["notes"]
+        except Exception as _fc_e:                                 # noqa: BLE001
+            logger.warning(f"[forward_check] health read failed (fail-soft): {_fc_e}")
+        try:                                  # the extra accounts (2026-10-23, the second account): one note each
+            from src.accounts import summary as _acct_sum
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _acct_sum.health()["notes"]
+        except Exception as _as_e:                                 # noqa: BLE001
+            logger.warning(f"[account] extra accounts' summary read failed (fail-soft): {_as_e}")
+        try:                                  # the vol shorts' news hold, SHADOW (PREREG136, 2026-10-17): notes only
+            from src.signals import news_hold as _news_hold_h
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _news_hold_h.health()["notes"]
+        except Exception as _nh_e:                                 # noqa: BLE001
+            logger.warning(f"[news_hold] health read failed (fail-soft): {_nh_e}")
         try:                                  # the ETF dual-momentum book's too
             from src.signals import etf_dm as _etf_dm_h
             _eh = _etf_dm_h.health(trades=get_open_trades())

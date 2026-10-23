@@ -11,13 +11,20 @@ growth all the time"): sets A0 + A + B (`periods.POOLED`, 2018-01-02 .. 2026-09-
 * not one episode: with per-year records (each draw's log growth per calendar-year part, `year_lp` from its daily
   NAV), the pooled gain stays above 0 with ANY ONE calendar year left out — a gain one year carries alone does not
   transfer;
-* margin calls: no more (set, draw) pairs meet a margin call than the live configuration's on the same seeds, summed
-  over the pool;
+* margin events AS A RATE (from 2026-10-23; the user: "update the add rule to judge margin calls as a rate. We
+  shouldn't judge the performance based on number of margin calls anymore, just the performance in rates (return per
+  day and growth)"): on the (set, draw) pairs where exactly ONE side meets a margin event, the change's excess refuses
+  it only when a fair coin would rarely give it — the one-sided exact binomial (McNemar's exact test, `margin_events`)
+  p < `MARGIN_P` (0.05): five more pairs and none fewer refuse, four do not; a pair or two is the draws' noise
+  (PREREG184: the one-pair count refused changes that later gained with no more calls). ``margin="count"`` restores the
+  count rule before — no more (set, draw) pairs with a margin call than the live configuration's on the same seeds,
+  summed over the pool — and reproduces every decision before 2026-10-23;
 * drawdown: the pooled history's worst drawdown (per seed the worst of its sets', averaged over the seeds) at most
   `MAX_DD_DEEPER` (1) point deeper.
 Draws as below (20 a set; 40 in every set when the pooled gain lies within 2 SE of +0.5; futility from 5 in every set).
-A variant whose growth fails while it meets fewer margin calls (or a drawdown more than 1 point shallower) with no
-deeper drawdown is flagged ``risk_protection`` — the user's call, as before. The sets' own gains and each calendar
+A variant whose growth fails while its margin events are significantly FEWER (the same test the other way; any
+fewer under ``margin="count"``) or its drawdown more than 1 point shallower, with no deeper drawdown, is flagged
+``risk_protection`` — the user's call, as before. The sets' own gains and each calendar
 year's are REPORTED (where a change earns and where it costs), never required.
 
 `verdict` below is the two-set rule (sets A and B) every study before 2026-10-14 decided on — kept, unchanged, to
@@ -50,6 +57,14 @@ THE OVERFITTING REPORT (PREREG106, registered 2026-10-14 13:09 ET — REPORT ONL
 z) and its RETENTION-SHRUNK expectation (PREREG81's measured retention: rule tweaks ~0.15 (0.09-0.23), sizing ~0.5).
 The formulas are in `verdict`'s docstring. Without those arguments every output is byte for byte the add rule's
 (`tests/test_add_rule.py` pins it against the pre-PREREG106 module).
+
+THE MARKET-NOISE REPORT (PREREG183, 2026-10-22 — REPORT ONLY): the draws' standard error says nothing about the
+market's noise (one history, eight years). `market_noise(live, variant)` reads the change as the paired MONTHLY log
+difference of the two configurations' NAVs (the mean over the seeds), with López de Prado, Lipton & Zoonekynd's
+Sharpe inference (`src.analysis.stats`): its Newey-West t, its p with the months' autocorrelation, skewness and
+kurtosis, deflated for K tries, the observed false discovery rate at a few priors, and the chance that a change
+without effect shows the +0.5 gain; `pooled_verdict(..., market=True)` adds it as ``"market_noise"`` (off by default:
+every verdict before stays byte for byte).
 """
 from __future__ import annotations
 
@@ -61,6 +76,8 @@ POOLED_SETS = ("A0", "A", "B")   # `periods.POOLED`: the pooled history (2018-01
 LOYO_MIN = 0.0            # the pooled gain with any one calendar year left out stays above this (log points a year)
 HALF = 0.5                # the smaller gain at least this share of the larger
 MAX_DD_DEEPER = 1.0       # points
+MARGIN_P = 0.05           # the margin events' rate test: the one-sided exact binomial on the discordant pairs (2026-10-23)
+MARGIN_RULES = ("rate", "count")   # `pooled_verdict(margin=...)`: "rate" from 2026-10-23; "count" the rule before it
 DRAWS = 20                # paired draws per set (four stratified blocks of five)
 MORE_DRAWS = 40           # when a set is undecided after DRAWS
 UNDECIDED_SE = 2.0        # a set within this many standard errors of a threshold is undecided
@@ -103,6 +120,47 @@ def paired(live: Mapping[int, dict], variant: Mapping[int, dict]) -> dict:
 
 def _undecided(est: float, thr: float, se: float) -> bool:
     return bool(math.isfinite(se) and se > 0 and abs(est - thr) < UNDECIDED_SE * se)
+
+
+def binom_upper(k: int, n: int) -> float:
+    """P[X >= k] for X ~ Binomial(n, 1/2), exact; 1.0 when k <= 0 or n <= 0."""
+    k, n = int(k), int(n)
+    if k <= 0 or n <= 0:
+        return 1.0
+    return sum(math.comb(n, j) for j in range(k, n + 1)) / 2.0 ** n
+
+
+def margin_events(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str, Mapping[int, dict]],
+                  sets=POOLED_SETS) -> dict:
+    """THE MARGIN EVENTS AS A RATE (from 2026-10-23): over the (set, draw) pairs both sides hold, the pairs where only
+    the live configuration meets a margin event (``only_live``), only the variant (``only_variant``), both and neither.
+    With no change in the rate each DISCORDANT pair falls either way with probability 1/2 (McNemar's exact test):
+    ``p_more`` = P[at least ``only_variant`` of them on the variant's side], ``p_fewer`` the same for the live side;
+    ``more`` / ``fewer``: that side's excess significant at `MARGIN_P`."""
+    only_l = only_v = both = neither = 0
+    for st in sets:
+        L, V = live.get(st, {}), variant.get(st, {})
+        for k in set(L) & set(V):
+            a, b = bool(L[k].get("calls")), bool(V[k].get("calls"))
+            if a and b:
+                both += 1
+            elif a:
+                only_l += 1
+            elif b:
+                only_v += 1
+            else:
+                neither += 1
+    n = only_l + only_v
+    p_more, p_fewer = binom_upper(only_v, n), binom_upper(only_l, n)
+    return {"only_live": only_l, "only_variant": only_v, "both": both, "neither": neither, "discordant": n,
+            "p_more": p_more, "p_fewer": p_fewer, "level": MARGIN_P,
+            "more": bool(only_v > only_l and p_more < MARGIN_P),
+            "fewer": bool(only_l > only_v and p_fewer < MARGIN_P)}
+
+
+def _risk_note(margin: str) -> str:
+    calls = "significantly fewer margin events" if margin == "rate" else "fewer margin calls"
+    return f"RISK PROTECTION: {calls} or a shallower drawdown for the growth it costs: the user's call"
 
 
 def verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str, Mapping[int, dict]],
@@ -320,22 +378,29 @@ def _pooled_years(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str, 
 def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str, Mapping[int, dict]],
                    sets=POOLED_SETS, weights: Optional[Mapping[str, float]] = None, *,
                    n_trials: Union[int, Tuple[int, int], None] = None, model: Optional[str] = None,
-                   kind: Optional[str] = None, ledger=None) -> dict:
+                   kind: Optional[str] = None, ledger=None, market: bool = False, margin: str = "rate") -> dict:
     """THE ADD RULE ON THE POOLED HISTORY (the module docstring; user directive 2026-10-14). ``live`` / ``variant``:
     per set, the per-seed records {"growth", "maxdd", "calls"} (+ ``"years"``: `year_lp` of the draw's NAV).
     ``weights`` default to `periods.pool_weights(sets)`. Returns {"sets": {set: paired}, "weights", "pooled": {"gain",
     "se", "calls_live", "calls_variant", "dd_live", "dd_variant", "dd_basis"}, "years": {year: gain} or None, "loyo":
     {year: the pooled gain without it} or None, "criteria", "undecided", "decision": "add" | "reject" | "more draws" |
     "needs per-year growth", "risk_protection", "why"}; with ``n_trials`` / ``model`` / ``kind``, PREREG106's report on
-    the pooled gain (its standard error the draws' — pass a market one to `deflated_gain`)."""
+    the pooled gain (its standard error the draws' — pass a market one to `deflated_gain`); with ``market``,
+    PREREG183's ``"market_noise"`` (`market_noise`: the gain against the MARKET's noise; the records must carry their
+    daily NAV). Neither changes the decision. ``margin``: "rate" (from 2026-10-23: refused only when the change's
+    margin events are significantly more frequent, `margin_events`; their record in ``pooled["margin_events"]``) or
+    "count" (the rule before: no more pairs with a call than the live configuration's — every decision before
+    2026-10-23)."""
     from src.backtest import periods
+    if margin not in MARGIN_RULES:
+        raise ValueError(f"margin must be one of {MARGIN_RULES}, not {margin!r}")
     spec = _report_spec(n_trials, model, kind, ledger) if (n_trials is not None or model is not None
                                                           or kind is not None) else None
     sets = tuple(sets)
     w = dict(weights) if weights is not None else periods.pool_weights(sets)
     P = {st: paired(live.get(st, {}), variant.get(st, {})) for st in sets}
     out: Dict[str, object] = {"sets": P, "weights": w, "criteria": {}, "undecided": [], "risk_protection": False,
-                              "years": None, "loyo": None}
+                              "years": None, "loyo": None, "margin_rule": margin}
     ns = {st: P[st].get("n", 0) for st in sets}
     if all(ns[st] >= 2 for st in sets):
         gain = sum(w[st] * P[st]["gain"] for st in sets)
@@ -344,6 +409,9 @@ def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str,
         gain = se = float("nan")
     calls_l = sum(P[st].get("calls_live", 0) for st in sets)
     calls_v = sum(P[st].get("calls_variant", 0) for st in sets)
+    me = margin_events(live, variant, sets)
+    calls_ok = (not me["more"]) if margin == "rate" else calls_v <= calls_l
+    calls_fewer = me["fewer"] if margin == "rate" else calls_v < calls_l
     common = sorted(set.intersection(*[set(P[st].get("seeds", [])) for st in sets])) if sets else []
     if common:
         dd_l = sum(max(float(live[st][k]["maxdd"]) for st in sets) for k in common) / len(common)
@@ -354,9 +422,14 @@ def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str,
         dd_v = max((P[st].get("dd_variant", float("nan")) for st in sets), default=float("nan"))
         basis = "the worst of the sets' mean drawdowns (no seed common to every set)"
     out["pooled"] = {"gain": gain, "se": se, "calls_live": calls_l, "calls_variant": calls_v,
-                     "dd_live": dd_l, "dd_variant": dd_v, "dd_basis": basis}
+                     "dd_live": dd_l, "dd_variant": dd_v, "dd_basis": basis, "margin_events": me}
     if spec is not None and math.isfinite(gain):
         out["overfitting"] = _report({"pooled": {"n": min(ns.values()), "gain": gain, "se": se}}, spec)
+    if market:
+        try:
+            out["market_noise"] = market_noise(live, variant, sets)
+        except Exception as e:                                         # noqa: BLE001 — a report, never a decision
+            out["market_noise"] = {"error": str(e)}
     why: List[str] = []
     if all(ns[st] >= FUTILITY_DRAWS for st in sets) and math.isfinite(se) and se > 0             and gain + FUTILITY_SE * se < MIN_GAIN:
         why = [f"pooled gain {gain:+.2f} +- {se:.2f} log pts, more than {FUTILITY_SE:g} SE below {MIN_GAIN:+.1f} "
@@ -364,10 +437,9 @@ def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str,
         if all(ns[st] >= DRAWS for st in sets):           # the risk reading needs the rule's draws
             out["years"] = _pooled_years(live, variant, sets)
             out["risk_protection"] = bool(dd_v <= dd_l + MAX_DD_DEEPER
-                                          and (calls_v < calls_l or dd_v < dd_l - MAX_DD_DEEPER))
+                                          and (calls_fewer or dd_v < dd_l - MAX_DD_DEEPER))
             if out["risk_protection"]:
-                why.append("RISK PROTECTION: fewer margin calls or a shallower drawdown for the growth it costs: the "
-                           "user's call")
+                why.append(_risk_note(margin))
         out.update(decision="reject", why=why)
         return out
     short = [st for st in sets if ns[st] < DRAWS]
@@ -386,7 +458,7 @@ def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str,
     out["years"], out["loyo"] = yrs, loyo
     crit = {"pooled_gain": gain >= MIN_GAIN,
             "not_one_year": (min(loyo.values()) > LOYO_MIN) if loyo else None,
-            "margin_calls": calls_v <= calls_l,
+            "margin_calls": calls_ok,
             "drawdown": dd_v <= dd_l + MAX_DD_DEEPER}
     out["criteria"] = crit
     if _undecided(gain, MIN_GAIN, se) and any(ns[st] < MORE_DRAWS for st in sets):
@@ -401,7 +473,12 @@ def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str,
         y0 = min(loyo, key=loyo.get)
         why.append(f"one year carries the gain: without {y0} the pooled gain is {loyo[y0]:+.2f} log pts")
     if not crit["margin_calls"]:
-        why.append(f"margin calls in {calls_v} (set, draw) pairs vs the live {calls_l}")
+        if margin == "rate":
+            why.append(f"margin events significantly more frequent: {me['only_variant']} (set, draw) pairs only with the "
+                       f"change against {me['only_live']} only without (one-sided exact binomial p {me['p_more']:.3f} "
+                       f"< {MARGIN_P:g})")
+        else:
+            why.append(f"margin calls in {calls_v} (set, draw) pairs vs the live {calls_l}")
     if not crit["drawdown"]:
         why.append(f"pooled worst drawdown {dd_v:.1f} vs the live {dd_l:.1f} (> +{MAX_DD_DEEPER:g})")
     growth_ok = crit["pooled_gain"] and crit["not_one_year"] is not False
@@ -413,19 +490,84 @@ def pooled_verdict(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str,
         return out
     out["decision"] = "add" if (growth_ok and risk_ok) else "reject"
     out["risk_protection"] = bool(not growth_ok and dd_v <= dd_l + MAX_DD_DEEPER
-                                  and (calls_v < calls_l or dd_v < dd_l - MAX_DD_DEEPER))
+                                  and (calls_fewer or dd_v < dd_l - MAX_DD_DEEPER))
     if out["risk_protection"]:
-        why.append("RISK PROTECTION: fewer margin calls or a shallower drawdown for the growth it costs: the user's call")
+        why.append(_risk_note(margin))
     out["why"] = why
     return out
+
+
+MARKET_LAGS = 3                       # PREREG183: Newey-West lags of the monthly paired difference
+MARKET_PRIORS = (0.1, 0.25, 0.5)      # ... P[H1], the prior that a change is truly better, for the oFDR
+MARKET_TRIALS = (10, 50)              # ... K of the deflated p (the best of K tries)
+
+
+def market_noise(live: Mapping[str, Mapping[int, dict]], variant: Mapping[str, Mapping[int, dict]],
+                 sets=POOLED_SETS, lags: int = MARKET_LAGS, priors=MARKET_PRIORS, trials=MARKET_TRIALS) -> dict:
+    """PREREG183 (REPORT ONLY — no decision reads it): a change's gain against the MARKET's noise. The add rule's
+    standard error is the draws' (`paired`): more draws remove the simulation's noise, never the history's — eight
+    years hold one market. Each seed both sides have in every set: its monthly returns chained through the sets
+    (`bank._months` of its daily NAV, `bank._chain`), the monthly LOG difference variant - live; their mean over the
+    seeds = the change's monthly series d. Returns {"seeds", "months", "gain" (1200 x mean(d): log points a year, the
+    pooled gain's monthly form), "se" (Newey-West with ``lags``, the same unit), "t", "sr_month", "skew", "kurt",
+    "rho", "p" (1 - `stats.sharpe_psr`(SR; 0) with the series' autocorrelation, skewness and kurtosis: López de Prado,
+    Lipton & Zoonekynd), "p_deflated" ({K: 1 - the FWER test's DSR, the change as the best of K tries}), "ofdr"
+    ({P[H1]: `stats.ofdr` with the alternative at the observed Sharpe}), "addrule_false_pass" (P[a change WITHOUT
+    effect shows the +0.5 gain the rule asks] = 1 - Φ(MIN_GAIN / se): the year, margin and drawdown guards not
+    modelled, so an upper bound)}. Records without a daily NAV (``"nav": {"days", "values"}``, as the runs' pickles
+    carry) give {"error"}."""
+    from statistics import NormalDist
+
+    import numpy as np
+    import pandas as pd
+
+    from src.analysis import stats as STS
+    from src.backtest import bank as BK
+    from src.backtest import periods
+    sets = tuple(sets)
+    seeds = sorted(set.intersection(*[set(live.get(s, {})) & set(variant.get(s, {})) for s in sets])) if sets else []
+    if not seeds:
+        return {"error": "no seed both sides have in every set"}
+    if not all(live[s][k].get("nav") and variant[s][k].get("nav") for s in sets for k in seeds):
+        return {"error": "the records carry no daily NAV (\"nav\")"}
+    cols = []
+    for k in seeds:
+        a = BK._chain([BK._months(BK.nav_of(live[s][k], periods.get(s).lo)[0]) for s in sets])
+        b = BK._chain([BK._months(BK.nav_of(variant[s][k], periods.get(s).lo)[0]) for s in sets])
+        j = a.index.intersection(b.index)
+        cols.append(pd.Series(np.log1p(b.loc[j].to_numpy(float)) - np.log1p(a.loc[j].to_numpy(float)), index=j))
+    D = pd.concat(cols, axis=1).dropna()
+    d = D.mean(axis=1).to_numpy(float)
+    n = int(len(d))
+    m = STS.sharpe_moments(d)
+    if n < 3 or m["sr"] != m["sr"]:
+        return {"error": f"{n} months: too few, or no variation"}
+    se_m = float(STS.ols_hac(d, np.empty((n, 0)), lags=lags)["se"][0])
+    rho = float(np.clip(m["rho"], -0.95, 0.95)) if m["rho"] == m["rho"] else 0.0
+    kw = {"skew": m["skew"], "kurt": m["kurt"], "rho": rho}
+    v0 = STS.sharpe_variance(0.0, n, rho=rho)
+    gain, se = 1200.0 * float(d.mean()), 1200.0 * se_m
+    return {"seeds": len(seeds), "months": n, "first": str(D.index[0]), "last": str(D.index[-1]),
+            "gain": gain, "se": se, "t": gain / se if se > 0 else None, "lags": int(lags),
+            "sr_month": m["sr"], "skew": m["skew"], "kurt": m["kurt"], "rho": m["rho"],
+            "p": 1.0 - STS.sharpe_psr(m["sr"], 0.0, n, **kw),
+            "p_deflated": {str(K): 1.0 - STS.deflated_sharpe_k(m["sr"], int(K), n, sr_var=v0, **kw)["dsr"]
+                           for K in trials},
+            "ofdr": {str(pr): (STS.ofdr(m["sr"], 0.0, m["sr"], n, float(pr), **kw) if m["sr"] > 0 else None)
+                     for pr in priors},
+            "ofdr_alternative": "the observed Sharpe (an effect as large as seen)",
+            "addrule_false_pass": (1.0 - NormalDist().cdf(MIN_GAIN / se)) if se > 0 else None}
 
 
 def pooled_summary(v: dict) -> str:
     """One line for a study's log: the pooled decision, gain, calls and drawdown, then each set's gain (reported)."""
     p = v.get("pooled", {})
     head = (f"{v['decision'].upper()} (pooled {'+'.join(v['sets'])}): {p.get('gain', float('nan')):+.2f} +- "
-            f"{p.get('se', float('nan')):.2f} lp/yr, calls {p.get('calls_live')}->{p.get('calls_variant')}, dd "
-            f"{p.get('dd_live', float('nan')):.1f}->{p.get('dd_variant', float('nan')):.1f}")
+            f"{p.get('se', float('nan')):.2f} lp/yr, calls {p.get('calls_live')}->{p.get('calls_variant')}"
+            + (f" (only with {p['margin_events']['only_variant']}, only without {p['margin_events']['only_live']}: p "
+               f"{p['margin_events']['p_more']:.3f} more, {p['margin_events']['p_fewer']:.3f} fewer; "
+               f"{v.get('margin_rule', 'rate')} rule)" if p.get("margin_events") else "")
+            + f", dd {p.get('dd_live', float('nan')):.1f}->{p.get('dd_variant', float('nan')):.1f}")
     sets = "; ".join(f"{st} {r['gain']:+.2f}" for st, r in v["sets"].items() if r.get("n", 0) >= 2)
     line = head + (f" | sets {sets}" if sets else "")
     if v.get("loyo"):
@@ -435,6 +577,10 @@ def pooled_summary(v: dict) -> str:
         line += " | " + "; ".join(v["why"])
     if "overfitting" in v:
         line += _report_line(v["overfitting"])
+    mn = v.get("market_noise") or {}
+    if mn.get("t") is not None:
+        line += (f" | market noise (PREREG183): {mn['gain']:+.2f} +- {mn['se']:.2f} lp/yr over {mn['months']} months, "
+                 f"t {mn['t']:.2f}, p {mn['p']:.3f}")
     return line
 
 

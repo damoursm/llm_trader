@@ -57,7 +57,7 @@ def test_live_books_on_set_a_runs_no_a0_code_and_builds_what_it_built_before(mon
         assert "period" not in k, "the crash book took a period on a set-A window"
         return real_pieces(lo, hi, *a, **k)
     monkeypatch.setattr(CRASH, "pieces", crash_pieces)
-    books, log, eng, etf = T._live_books(monkeypatch, M.Mimic(seed=3))
+    books, log, eng, etf = T._live_books(monkeypatch, M.Mimic(seed=3, **M.PRE151))
     assert T._fields(books) == T.BEFORE and log == T.BEFORE_LOG
     assert eng.calls == [("turn", "fall", 0.5, 5, True, True),
                          ("pieces", "vol", {"entry_at_pick": True, "rule201": False}, 6)]
@@ -137,7 +137,8 @@ def test_live_books_refuses_another_periods_components_on_an_a0_window(monkeypat
     T = _halts_tests()
     eng, etf, costs, p_lend, dip = T._stub_case()
     with pytest.raises(ValueError, match="A0's components"):
-        M.live_books("2018-03-01", "2018-03-14", M.Mimic(seed=0), eng=eng, etf=etf, panel=None, bars=M.ExtBars(),
+        M.live_books("2018-03-01", "2018-03-14", M.Mimic(seed=0, **M.PRE151), eng=eng, etf=etf, panel=None,
+                     bars=M.ExtBars(),
                      costs=costs, p_lend=p_lend, settle=lambda d: int(d) + 2, dip=[])
 
 
@@ -155,7 +156,8 @@ def test_an_a0_engine_builds_the_crash_book_from_a0s_data(monkeypatch):
     monkeypatch.setattr(CRASH, "pieces", lambda lo, hi, **k: seen.setdefault("crash", (lo, hi, k)) and [])
     a0_settle = A0.settles_a0
     monkeypatch.setattr(A0, "settles_a0", lambda f: True)
-    books = M.live_books("2021-02-01", "2021-04-30", M.Mimic(seed=0, ext=False), eng=eng, etf=etf, panel=panel,
+    books = M.live_books("2021-02-01", "2021-04-30", M.Mimic(seed=0, ext=False, **M.PRE151), eng=eng, etf=etf,
+                         panel=panel,
                          bars=bars, costs=costs, p_lend=p_lend, settle=lambda d: int(d) + 2, dip=dip)
     assert seen["crash"] == ("2021-02-01", "2021-04-30", {"period": "A0"}) and "crash" in books
     assert a0_settle(lambda d: int(d) + 2)                 # a calendar-day stub: 2018-01-02 + 2 = 2018-01-04

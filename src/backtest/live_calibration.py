@@ -25,12 +25,21 @@ session's facts (``session``), the last five sessions' (``window``) and the reco
 * the dip book's limit orders by status (the simulator fills them by rule, cut to the account's room);
 * EACH ARM'S RELIABILITY (``arms``; item 6 of the user's program, 2026-10-12: "the daily live-vs-simulator
   calibration gives each arm a reliability score: live return per day against the simulated one"): the live arms —
-  the selection short's vol, ETF and fall arms by the trade's ``sel_arm``, the dip and crash books by their mechanism
-  (`books.py`) — over their CLOSED trades: the mean net trade, the mean 24-hour hold, RETURN PER DAY by the standing
-  definition, the GROSS win rate with its Wilson range and the net median with its order-statistic range, each beside
-  the simulator's REFERENCE for the arm (`reference.json` under the record's directory, written by another module)
-  and a verdict: "no reference", "too few trades" (under `MIN_N` closed), "consistent" (the reference inside the live
-  ranges) or "gap" (`arm_compare`, its limitation stated there).
+  the selection short's vol, ETF and fall arms by the trade's ``sel_arm``, the dip, crash and capitulation books by
+  their mechanism (`books.py`) — over their CLOSED trades: the mean net trade, the mean 24-hour hold, RETURN PER DAY
+  by the standing definition, the GROSS win rate and the net median, each beside the simulator's REFERENCE for the
+  arm (`reference.json` under the record's directory, written by `reliability.build`) and a verdict: "no reference",
+  "stale reference", "too few trades" / "too few episodes" (under `MIN_N`), "consistent" (the reference inside the
+  live ranges) or "gap" (`arm_compare`, its limitation stated there). Three corrections of 2026-10-21 (the user's
+  "Fix all" after the audit of 2026-10-20, when the fresh start's nine closes of five chip stocks read as a dip "gap"
+  in every email): (1) only the arm's OWN exits are scored — a close the account forced (a give-way for room,
+  de-leveraging, a margin call) or the operator did (``fresh_start``) is reported apart (``forced``): the reference
+  runs each arm alone with capital that never binds and holds none; (2) the ranges are taken over EPISODES
+  (`episodes`: trades entered or closed in the same session share its market and count once), not over trades;
+  (3) each arm is scored from its CONFIGURATION EPOCH (`epochs`: the first session its current settings traded, never
+  before the live account's fresh start), and a reference built on other settings or another simulator than the
+  deployed ones (`reliability.arm_fingerprint` / `simulator_fingerprint`) is "stale": no gap is judged on it and a
+  note asks for the rebuild — a reference must follow every deploy.
 
 `health()` reads the latest file for the email's scorer banner: one line of the record and a note for every live
 rate outside the simulator's assumption beyond its sampling error — a share's Wilson 95% range, a median's
@@ -45,7 +54,7 @@ import math
 import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -60,8 +69,14 @@ DRIFT_NOTE_BP = 50.0                    # an entry this far from the decision ba
 FILL_NOTE = 0.8                         # under this share of the live books' legs filled at IBKR (the range below)
 FEE_RATIO_NOTE = (0.8, 1.25)            # IBKR's charge over the formula's, or its quantity over the ledger's shares
 HOUSE_RATIO_NOTE = (0.5, 2.0)           # IBKR's quoted initial house rate over the simulator's mix (median)
-ARM_KEYS = ("vol", "etf", "fall", "dip", "crash")   # the live arms as the simulator names them (`mimic.BOOK`'s keys)
+ARM_KEYS = ("vol", "etf", "fall", "dip", "crash", "cap")   # the live arms as the simulator names them (`mimic.BOOK`'s keys)
 REFERENCE_FILE = "reference.json"       # the simulator's reference per arm, under `out_dir()` (another module writes it)
+EPOCHS_FILE = "arm_epochs.json"         # each arm's configuration epoch (`epochs`), under `out_dir()`, kept by `write`
+# a close the arm's own rule did not decide: the operator's fresh start, the account's give-way, de-leveraging and
+# margin call (``<book>_gave_way`` / ``<book>_delever`` / ``<book>_margin_call``, every book's)
+FORCED_REASONS = ("fresh_start",)
+FORCED_SUFFIXES = ("_gave_way", "_delever", "_margin_call")
+REBUILD = "python -m src.backtest.reliability --build (and --build --sets A0)"
 
 
 def out_dir() -> Path:
@@ -130,7 +145,10 @@ def assumptions() -> dict:
         out["house_maint_median"] = float(np.median(maint))
         out["house_init_above_2_86"] = float(np.mean(init > 2.86 + 1e-9))
         out["house_names"] = int(len(mix))
-        out["etf_lend_rate"] = float(M.ETF_LEND_RATE)
+        # the ETF picks' lendability AT THE TRADE (the live record checks it there): the archive years' morning-file
+        # rate x AUDIT151's intraday survival when the default carries it (`Mimic.lend_intra`)
+        li = M.Mimic().lend_intra
+        out["etf_lend_rate"] = float(M.ETF_LEND_RATE * li[4]) if li is not None else float(M.ETF_LEND_RATE)
     except Exception as e:                                     # noqa: BLE001
         out["error"] = f"mimic assumptions unreadable: {e}"
     return out
@@ -242,7 +260,9 @@ def trade_facts(trades: Sequence[dict], lo: date, hi: date) -> dict:
     the turn entries apart), the broker's entry fills, the exits."""
     from src.performance import books
     live = [t for t in trades if books.is_live(t)]
-    opened = [t for t in live if lo.isoformat() <= str(t.get("entry_date") or "")[:10] <= hi.isoformat()]
+    # a lot IBKR's liquidation split off a trade (`tracker._split_margin_lot`) shares its trade's entry: not an entry
+    opened = [t for t in live if lo.isoformat() <= str(t.get("entry_date") or "")[:10] <= hi.isoformat()
+              and not t.get("margin_lot_of")]
     closed = [t for t in live if t.get("status") == "CLOSED"
               and lo.isoformat() <= str(t.get("exit_date") or "")[:10] <= hi.isoformat()]
     delay: Dict[str, List[float]] = {"immediate": [], "turn": []}
@@ -376,11 +396,11 @@ def _f(x) -> Optional[float]:
 
 def arm_books() -> Dict[str, str]:
     """Each arm key -> the ledger's entry mechanism (`books.py`'s constants, the one definition of the live books):
-    the selection short's arms share `books.SEL_SHORT` and are told apart by the trade's ``sel_arm``; the dip and
-    crash books ARE their mechanism. The keys are the simulator's (`mimic.BOOK`; a test pins the two sites equal)."""
+    the selection short's arms share `books.SEL_SHORT` and are told apart by the trade's ``sel_arm``; the dip, crash and
+    capitulation books ARE their mechanism. The keys are the simulator's (`mimic.BOOK`; a test pins the two sites equal)."""
     from src.performance import books
     return {"vol": books.SEL_SHORT, "etf": books.SEL_SHORT, "fall": books.SEL_SHORT,
-            "dip": books.DIP_LONG, "crash": books.CRASH_LONG}
+            "dip": books.DIP_LONG, "crash": books.CRASH_LONG, "cap": books.CAP_LONG}
 
 
 def arm_of(t: dict) -> Optional[str]:
@@ -418,40 +438,98 @@ def return_per_day(avg_trade: Optional[float], avg_days: Optional[float]) -> Opt
     return float(v) if math.isfinite(v) else None
 
 
-def arm_facts(trades: Sequence[dict], lo: date, hi: date) -> dict:
-    """Each live arm's record over its CLOSED trades entered in [lo, hi] (``entry_date``, the ET session) — the
-    simulator's per-arm metrics (`account.metrics`) on the live ledger: ``n``, the mean net trade (``avg_trade``:
-    ``return_pct``, cost-aware, in %), the mean hold in 24-hour days (``avg_days``), ``return_per_day`` by the
-    standing definition, the GROSS win rate — `tracker.is_gross_win`, the right direction on raw prices; a trade
-    without a usable price pair in neither count — as a share with its Wilson range (``gross_win``) and as the
-    convention's helper reports it (``gross_win_rate``, %), the net return's median with its order-statistic range
-    (``net``) and the hold's (``hold``). The trades still open are counted apart (``open_n``), never in the
-    statistics: their return is not known yet."""
+def forced_exit(t: dict) -> bool:
+    """A close the arm's own rule did not decide: the operator's (``fresh_start``) or the account's — a give-way for
+    room, de-leveraging, a margin call (``<book>_gave_way`` / ``<book>_delever`` / ``<book>_margin_call``). The
+    simulator's reference runs each arm alone with capital that never binds: it holds none of them."""
+    r = str(t.get("exit_reason") or "")
+    return r in FORCED_REASONS or r.endswith(FORCED_SUFFIXES)
+
+
+def episodes(ts: Sequence[dict]) -> List[List[int]]:
+    """The trades ``ts`` (one arm's) grouped into EPISODES, as lists of their indices: trades ENTERED in the same
+    session or CLOSED in the same session share that session's market — a capitulation basket bought together, a
+    sector's selloff closing several longs at once — so they are one episode, joined transitively. A verdict rests on
+    the episodes, not on the trades: correlated trades counted one by one make a range look narrower than it is."""
+    parent = list(range(len(ts)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    first: Dict[Tuple[str, str], int] = {}
+    for i, t in enumerate(ts):
+        for key in (("in", str(t.get("entry_date") or "")[:10]), ("out", str(t.get("exit_date") or "")[:10])):
+            if not key[1]:
+                continue
+            j = first.setdefault(key, i)
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[max(ri, rj)] = min(ri, rj)
+    groups: Dict[int, List[int]] = {}
+    for i in range(len(ts)):
+        groups.setdefault(find(i), []).append(i)
+    return [groups[k] for k in sorted(groups)]
+
+
+def _share_f(k: float, n: int) -> dict:
+    """`_share` for a fractional count (a sum of episodes' win shares)."""
+    lo, hi = wilson(k, n)
+    return {"k": round(float(k), 3), "n": int(n), "share": (k / n) if n else None, "lo95": lo, "hi95": hi}
+
+
+def arm_facts(trades: Sequence[dict], lo: date, hi: date, since: Optional[Mapping[str, date]] = None) -> dict:
+    """Each live arm's record over its CLOSED trades entered in [lo, hi] (``entry_date``, the ET session) — from the
+    arm's own ``since`` when later (its configuration epoch, `epochs`) — on its OWN exits: ``n``, the mean net trade
+    (``avg_trade``: ``return_pct``, cost-aware, in %), the mean hold in 24-hour days (``avg_days``),
+    ``return_per_day`` by the standing definition, the GROSS win rate — `tracker.is_gross_win`, the right direction on
+    raw prices; a trade without a usable price pair in neither count — as a share with its Wilson range
+    (``gross_win``) and as the convention's helper reports it (``gross_win_rate``, %), the net return's median with
+    its order-statistic range (``net``) and the hold's (``hold``); the same over EPISODES (`episodes`):
+    ``episodes``, ``gross_win_episodes`` (each episode's win share summed, over the episodes) and ``net_episodes``
+    (each episode's mean net trade). The closes the arm's rule did not decide (`forced_exit`) are counted apart
+    (``forced``: n, by reason, the mean net trade, the gross wins), never in the statistics; the trades still open
+    likewise (``open_n``): their return is not known yet."""
     from src.performance import tracker as T
-    lo_s, hi_s = lo.isoformat(), hi.isoformat()
+    hi_s = hi.isoformat()
+    lo_s = {a: max(lo, (since or {}).get(a) or lo).isoformat() for a in ARM_KEYS}
     groups: Dict[str, List[dict]] = {a: [] for a in ARM_KEYS}
+    forced: Dict[str, List[dict]] = {a: [] for a in ARM_KEYS}
     open_n: Dict[str, int] = {a: 0 for a in ARM_KEYS}
     for t in trades:
         a = arm_of(t)
-        if a is None or not (lo_s <= str(t.get("entry_date") or "")[:10] <= hi_s):
+        if a is None or not (lo_s[a] <= str(t.get("entry_date") or "")[:10] <= hi_s):
             continue
         st = str(t.get("status") or "").upper()
         if st == "OPEN":
             open_n[a] += 1
         elif st == "CLOSED":
-            groups[a].append(t)
+            (forced if forced_exit(t) else groups)[a].append(t)
     out: Dict[str, dict] = {}
     for a, ts in groups.items():
-        rets = [r for r in (_f(t.get("return_pct")) for t in ts) if r is not None]
+        rets = [_f(t.get("return_pct")) for t in ts]
         holds = [h for h in (hold_days(t) for t in ts) if h is not None]
-        wins = [w for w in (T.is_gross_win(t) for t in ts) if w is not None]
-        avg_trade = float(np.mean(rets)) if rets else None
+        wins = [T.is_gross_win(t) for t in ts]
+        ok = [r for r in rets if r is not None]
+        avg_trade = float(np.mean(ok)) if ok else None
         avg_days = float(np.mean(holds)) if holds else None
-        out[a] = {"n": len(ts), "open_n": open_n[a], "avg_trade": avg_trade, "avg_days": avg_days,
+        eps = episodes(ts)
+        ep_net = [float(np.mean(v)) for v in ([rets[i] for i in g if rets[i] is not None] for g in eps) if v]
+        ep_win = [float(np.mean(v)) for v in ([bool(wins[i]) for i in g if wins[i] is not None] for g in eps) if v]
+        fz = forced[a]
+        fr = [r for r in (_f(t.get("return_pct")) for t in fz) if r is not None]
+        fw = [w for w in (T.is_gross_win(t) for t in fz) if w is not None]
+        out[a] = {"since": lo_s[a], "n": len(ts), "open_n": open_n[a], "avg_trade": avg_trade, "avg_days": avg_days,
                   "return_per_day": return_per_day(avg_trade, avg_days),
-                  "gross_win": _share(sum(1 for w in wins if w), len(wins)),
+                  "gross_win": _share(sum(1 for w in wins if w), sum(1 for w in wins if w is not None)),
                   "gross_win_rate": T.gross_win_rate(ts),
-                  "net": _summary(rets), "hold": _summary(holds)}
+                  "net": _summary(ok), "hold": _summary(holds),
+                  "episodes": len(eps), "gross_win_episodes": _share_f(sum(ep_win), len(ep_win)),
+                  "net_episodes": _summary(ep_net),
+                  "forced": {"n": len(fz), "by_reason": _count(t.get("exit_reason") for t in fz),
+                             "avg_trade": float(np.mean(fr)) if fr else None,
+                             "gross_win": _share(sum(1 for w in fw if w), len(fw))}}
     return out
 
 
@@ -468,16 +546,19 @@ def reference() -> dict:
     return js if isinstance(js, dict) and isinstance(js.get("arms"), dict) else {}
 
 
-def arm_compare(f: dict, ref: Optional[dict]) -> dict:
+def arm_compare(f: dict, ref: Optional[dict], stale: Optional[str] = None) -> dict:
     """One arm's live record (`arm_facts`'s entry) against its simulator reference — ``verdict``: "no reference"
-    (none for the arm, or one without a testable figure), "too few trades" (under `MIN_N` closed), "consistent"
-    when every reference figure the live record can test lies inside the live range, "gap" otherwise; ``checks``
-    holds each test — ``gross_win_rate``: the reference share against the live GROSS win rate's Wilson 95% range;
-    ``avg_trade``: the reference's AVERAGE trade against the live net trades' MEDIAN order-statistic 95% range (from
-    n = 6; at n = 5 only the win rate is tested). The second is a crude stand-in for a test of return per day, and
-    its limitation is known: a mean is held against a median's range — a book whose few large winners carry its mean
-    (the shorts) has a median under its mean, so a reference mean above the live median range can be skew rather than
-    a gap, and the hold is not tested at all. The live and reference return per day are shown side by side
+    (none for the arm, or one without a testable figure), "stale reference" (``stale``: the reference was built on
+    other settings or another simulator than the deployed ones — `stale_arms`; nothing is judged on it), "too few
+    trades" (under `MIN_N` closed on the arm's own exits), "too few episodes" (under `MIN_N` episodes), "consistent"
+    when every reference figure the live record can test lies inside the live range, "gap" otherwise. The ranges are
+    the EPISODES' (`arm_facts`: trades entered or closed in the same session count once) — ``checks`` holds each test:
+    ``gross_win_rate``: the reference share against the Wilson 95% range of the episodes' win shares; ``avg_trade``:
+    the reference's AVERAGE trade against the order-statistic 95% range of the episodes' MEDIAN net trade (from 6
+    episodes; at 5 only the win rate is tested). The second is a crude stand-in for a test of return per day, and its
+    limitation is known: a mean is held against a median's range — a book whose few large winners carry its mean (the
+    shorts) has a median under its mean, so a reference mean above the live median range can be skew rather than a
+    gap, and the hold is not tested at all. The live and reference return per day are shown side by side
     (``checks["return_per_day"]``), their difference untested: no distribution-free range exists for a compounded
     ratio of two means at 5–20 trades. A "gap" is a note for the operator, never a trading change."""
     if not isinstance(ref, dict) or not ref:
@@ -487,14 +568,20 @@ def arm_compare(f: dict, ref: Optional[dict]) -> dict:
     live_rpd, ref_rpd = _f(f.get("return_per_day")), _f(ref.get("return_per_day"))
     checks["return_per_day"] = {"live": live_rpd, "reference": ref_rpd,
                                 "diff": (live_rpd - ref_rpd) if live_rpd is not None and ref_rpd is not None else None}
+    if stale:
+        out["verdict"], out["stale"] = "stale reference", stale
+        return out
     if int(f.get("n", 0) or 0) < MIN_N:
         out["verdict"] = "too few trades"
         return out
-    gw, r = f.get("gross_win") or {}, _f(ref.get("gross_win_rate"))
+    if int(f.get("episodes", 0) or 0) < MIN_N:
+        out["verdict"] = "too few episodes"
+        return out
+    gw, r = f.get("gross_win_episodes") or {}, _f(ref.get("gross_win_rate"))
     if r is not None and gw.get("lo95") is not None:
         checks["gross_win_rate"] = {"reference": r, "live": gw.get("share"), "lo95": gw["lo95"], "hi95": gw["hi95"],
                                     "inside": bool(gw["lo95"] <= r <= gw["hi95"])}
-    net, r = f.get("net") or {}, _f(ref.get("avg_trade"))
+    net, r = f.get("net_episodes") or {}, _f(ref.get("avg_trade"))
     if r is not None and net.get("median_lo95") is not None:
         checks["avg_trade"] = {"reference": r, "live_median": net.get("median"), "lo95": net["median_lo95"],
                                "hi95": net["median_hi95"], "inside": bool(net["median_lo95"] <= r <= net["median_hi95"])}
@@ -503,38 +590,134 @@ def arm_compare(f: dict, ref: Optional[dict]) -> dict:
     return out
 
 
-def arm_records(trades: Sequence[dict], lo: date, hi: date, ref_arms: Optional[dict] = None) -> dict:
-    """The record's ``arms`` section: `arm_facts` over [lo, hi] with each arm's comparison to its reference
-    (`arm_compare`; ``ref_arms`` = the reference file's ``arms``, read here when not given)."""
+def arm_records(trades: Sequence[dict], lo: date, hi: date, ref_arms: Optional[dict] = None,
+                since: Optional[Mapping[str, date]] = None, stale: Optional[Mapping[str, str]] = None) -> dict:
+    """The record's ``arms`` section: `arm_facts` over [lo, hi] (each arm from its ``since`` when later) with each
+    arm's comparison to its reference (`arm_compare`; ``ref_arms`` = the reference file's ``arms``, read here when not
+    given; ``stale`` = {arm: why} of `stale_arms`)."""
     if ref_arms is None:
         ref_arms = reference().get("arms") or {}
-    out = arm_facts(trades, lo, hi)
+    out = arm_facts(trades, lo, hi, since)
     for a, f in out.items():
-        f.update(arm_compare(f, ref_arms.get(a)))
+        f.update(arm_compare(f, ref_arms.get(a), (stale or {}).get(a)))
     return out
 
 
 def _arm_notes(rec: dict) -> List[Tuple[str, str]]:
-    """(key, note) for every arm whose verdict is "gap" on `MIN_N` or more closed trades (see `_notes`)."""
+    """(key, note) for every arm whose verdict is "gap" on `MIN_N` or more episodes (see `_notes`)."""
     out: List[Tuple[str, str]] = []
     for a, f in sorted((rec.get("arms") or {}).items()):
-        if not isinstance(f, dict) or f.get("verdict") != "gap" or int(f.get("n", 0) or 0) < MIN_N:
+        if not isinstance(f, dict) or f.get("verdict") != "gap" or int(f.get("episodes", 0) or 0) < MIN_N:
             continue
         ch = f.get("checks") or {}
         bits = []
         g = ch.get("gross_win_rate") or {}
         if g and not g.get("inside"):
             gw = f.get("gross_win") or {}
-            bits.append(f"gross win {gw.get('k')}/{gw.get('n')} ({(gw.get('share') or 0):.0%}; the simulator "
-                        f"{g['reference']:.0%})")
+            bits.append(f"gross win {gw.get('k')}/{gw.get('n')} ({(g.get('live') or 0):.0%} over the episodes; the "
+                        f"simulator {g['reference']:.0%})")
         m = ch.get("avg_trade") or {}
         if m and not m.get("inside"):
-            bits.append(f"net median {m['live_median']:+.2f}% a trade (the simulator's average {m['reference']:+.2f}%)")
+            bits.append(f"the episodes' median net {m['live_median']:+.2f}% a trade (the simulator's average "
+                        f"{m['reference']:+.2f}%)")
         r = ch.get("return_per_day") or {}
         tail = (f" — {r['live']:.2f} vs the simulator's {r['reference']:.2f} %/day"
                 if r.get("live") is not None and r.get("reference") is not None else "")
-        out.append((f"arm_{a}", f"the {a} arm's {f['n']} live trades: " + "; ".join(bits) + tail))
+        out.append((f"arm_{a}", f"the {a} arm's {f['n']} live trades in {f['episodes']} episodes since {f.get('since')}: "
+                                + "; ".join(bits) + tail))
     return out
+
+
+# ── the reference's freshness and each arm's configuration epoch ─────────────────────────────────────────────────
+
+def arm_floor() -> date:
+    """The first session any arm's record counts: the live account's FRESH START (`live_account_fresh_start`, the
+    2026-10-20 session: every position closed, the account restarted at $50,000 on the rules then deployed)."""
+    try:
+        return datetime.fromisoformat(str(settings.live_account_fresh_start)).date()
+    except (AttributeError, TypeError, ValueError):
+        return LIVE_SINCE
+
+
+def current_fingerprints() -> dict:
+    """The deployed configuration's fingerprints — {"arms": {arm: `reliability.arm_fingerprint`}, "simulator":
+    `reliability.simulator_fingerprint`} — or {"error": why} (then no epoch moves and no reference is judged stale)."""
+    try:
+        from src.backtest import reliability as REL
+        return {"arms": {a: REL.arm_fingerprint(a) for a in ARM_KEYS if a in REL.SPEC},
+                "simulator": REL.simulator_fingerprint()}
+    except Exception as e:                                     # noqa: BLE001 — a note, never a failed record
+        return {"error": f"fingerprints unreadable: {str(e)[:200]}"}
+
+
+def _read_json(name: str) -> dict:
+    try:
+        js = json.loads((out_dir() / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return js if isinstance(js, dict) else {}
+
+
+def epochs(day: date, fps: Mapping[str, str]) -> Dict[str, dict]:
+    """Each arm's CONFIGURATION EPOCH on ``day``: {arm: {"since": ISO date, "fingerprint", "changed"}} — the first
+    session its current settings traded, so its live record never mixes trades of other rules. Read from `EPOCHS_FILE`
+    (`write` keeps it): an arm whose fingerprint (``fps``, `current_fingerprints`) equals the stored one keeps its
+    epoch; one whose settings changed starts a new epoch on ``day`` — the first record built under them: a deploy
+    takes effect from a session, and the EOD record of that session is the first to read the new settings (a deploy
+    in the middle of a session counts that whole session in the new epoch); an arm never stored starts at the floor
+    (`arm_floor`). No epoch starts before the fresh start."""
+    stored = (_read_json(EPOCHS_FILE).get("arms") or {})
+    floor = arm_floor()
+    out: Dict[str, dict] = {}
+    for a in ARM_KEYS:
+        fp, s = fps.get(a), stored.get(a) or {}
+        try:
+            prev = date.fromisoformat(str(s.get("since")))
+        except ValueError:
+            prev = None
+        if fp is None or (prev is not None and s.get("fingerprint") == fp):
+            since, changed = (prev or floor), False
+        elif prev is None:
+            since, changed = floor, False
+        else:
+            since, changed = day, True
+        out[a] = {"since": max(since, floor).isoformat(), "fingerprint": fp if fp is not None else s.get("fingerprint"),
+                  "changed": changed}
+    return out
+
+
+def stale_arms(ref: Mapping, fps: Mapping) -> Dict[str, str]:
+    """{arm: why} for every arm of the reference built on other settings than the deployed ones (its fingerprint, or
+    none: a reference from before the fingerprints) or on another simulator (`simulator_fingerprint`); {} when the
+    deployed fingerprints are unreadable or there is no reference."""
+    if not ref or not isinstance(fps.get("arms"), dict):
+        return {}
+    rf = ref.get("fingerprints") or {}
+    sim = ref.get("simulator") != fps.get("simulator")
+    out: Dict[str, str] = {}
+    for a in (ref.get("arms") or {}):
+        why = []
+        if a in fps["arms"] and rf.get(a) != fps["arms"][a]:
+            why.append("its settings changed since" if rf.get(a) else "no fingerprint")
+        if sim:
+            why.append("the simulator's defaults changed since" if ref.get("simulator") else "no simulator fingerprint")
+        if why:
+            out[a] = "; ".join(why)
+    return out
+
+
+def _reference_note(ref: Mapping, stale: Mapping[str, str], fps: Mapping) -> Optional[str]:
+    """The one note asking for the reference's rebuild: arms judged on a stale reference, and live arms without one."""
+    missing = [a for a in (fps.get("arms") or {}) if a not in (ref.get("arms") or {})] if ref else []
+    if not stale and not missing:
+        return None
+    bits = []
+    if stale:
+        bits.append(f"built on other rules than the deployed {', '.join(sorted(stale))}")
+    if missing:
+        bits.append(f"none for {', '.join(missing)}")
+    return (f"the simulator's reference (as of {ref.get('as_of')}) is out of date — " + "; ".join(bits)
+            + f": nothing is judged on it until it is rebuilt ({REBUILD})")
 
 
 def _notes(rec: dict, assume: dict) -> List[Tuple[str, str]]:
@@ -581,9 +764,12 @@ def compare(rec: dict, assume: dict) -> List[str]:
     return [n for _, n in _notes(rec, assume)]
 
 
-def build(day: date, trades: Optional[Sequence[dict]] = None) -> dict:
+def build(day: date, trades: Optional[Sequence[dict]] = None, fps: Optional[Mapping] = None) -> dict:
     """The day's record (``day`` its ISO date): the session, the last `WINDOW_SESSIONS` sessions and since
-    `LIVE_SINCE`, with the notes — the record's since `LIVE_SINCE`, then the last sessions' that it does not show."""
+    `LIVE_SINCE`, with the notes — the reference's own when it is out of date (`_reference_note`), the record's since
+    `LIVE_SINCE`, then the last sessions' that it does not show. ``fps``: the deployed configuration's fingerprints
+    (`current_fingerprints`, read here when not given); the arms' epochs (`epochs`) are computed, never stored here
+    (`write` keeps them)."""
     from src.signals import sel_short as ss
     if trades is None:
         from src.db import repo
@@ -594,12 +780,19 @@ def build(day: date, trades: Optional[Sequence[dict]] = None) -> dict:
     assume = assumptions()
     ref = reference()
     ref_arms = ref.get("arms") or {}
+    fps = dict(fps) if fps is not None else current_fingerprints()
+    ep = epochs(day, fps.get("arms") or {})
+    since = {a: date.fromisoformat(v["since"]) for a, v in ep.items()}
+    stale = stale_arms(ref, fps)
     rec: Dict[str, object] = {"day": day.isoformat(), "live_since": LIVE_SINCE.isoformat(), "live_arms": arms,
                               "assumptions": assume, "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                               # the simulator's reference per arm: what the arms' verdicts were judged against
                               "reference": ({"path": str(out_dir() / REFERENCE_FILE), "as_of": ref.get("as_of"),
-                                             "source": ref.get("source"), "arms": sorted(ref_arms)} if ref
-                                            else {"path": str(out_dir() / REFERENCE_FILE), "missing": True})}
+                                             "source": ref.get("source"), "arms": sorted(ref_arms), "stale": stale,
+                                             "fingerprints": ref.get("fingerprints"), "simulator": ref.get("simulator")}
+                                            if ref else {"path": str(out_dir() / REFERENCE_FILE), "missing": True}),
+                              # the deployed configuration and each arm's epoch: the arms are scored from it
+                              "deployed": fps, "arm_epochs": ep}
     for name, ds in (("session", [day] if day in days_all else []), ("window", win), ("since", days_all)):
         if not ds:
             rec[name] = {"sessions": 0}
@@ -610,17 +803,34 @@ def build(day: date, trades: Optional[Sequence[dict]] = None) -> dict:
                         ("trades", lambda: trade_facts(trades, lo, hi)),
                         ("fees", lambda: fee_facts(trades, lo, hi)),
                         ("dip_orders", lambda: dip_order_facts(ds)),
-                        ("arms", lambda: arm_records(trades, lo, hi, ref_arms))):
+                        ("arms", lambda: arm_records(trades, lo, hi, ref_arms, since, stale))):
             try:
                 part[key] = fn()
             except Exception as e:                             # noqa: BLE001 — one section's failure is reported
                 part[key] = {"error": str(e)[:300]}
         rec[name] = part
-    since = _notes(rec["since"], assume) if rec["since"].get("sessions") else []
+    whole = _notes(rec["since"], assume) if rec["since"].get("sessions") else []
     window = _notes(rec["window"], assume) if rec["window"].get("sessions") else []
-    seen = {k for k, _ in since}
-    rec["notes"] = [n for _, n in since] + [f"last {len(win)} sessions: {n}" for k, n in window if k not in seen]
+    seen = {k for k, _ in whole}
+    head = [n for n in (_reference_note(ref, stale, fps), fps.get("error")) if n]
+    rec["notes"] = head + [n for _, n in whole] + [f"last {len(win)} sessions: {n}" for k, n in window if k not in seen]
     return rec
+
+
+def _keep_epochs(day: date, ep: Mapping[str, dict]) -> None:
+    """Store the arms' epochs (`EPOCHS_FILE`) — never from a record of an earlier day than the stored one's (a rerun
+    of a past day must not move an epoch back)."""
+    from src.scheduler import db_fence
+    cur = _read_json(EPOCHS_FILE)
+    if str(cur.get("day") or "") > day.isoformat():
+        return
+    js = {"day": day.isoformat(), "arms": {a: {"since": v["since"], "fingerprint": v["fingerprint"]}
+                                           for a, v in ep.items() if v.get("fingerprint")}}
+    p = out_dir() / EPOCHS_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(js, indent=1), encoding="utf-8")
+    db_fence.retry_os(lambda: os.replace(tmp, p))
 
 
 def write(day: date, trades: Optional[Sequence[dict]] = None) -> Path:
@@ -631,6 +841,8 @@ def write(day: date, trades: Optional[Sequence[dict]] = None) -> Path:
     tmp = p.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(rec, indent=1, default=str), encoding="utf-8")
     db_fence.retry_os(lambda: os.replace(tmp, p))              # the scheduler may be reading the file this moment
+    if not (rec.get("deployed") or {}).get("error"):
+        _keep_epochs(day, rec.get("arm_epochs") or {})
     return p
 
 

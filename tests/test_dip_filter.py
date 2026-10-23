@@ -120,11 +120,11 @@ def test_spy_comes_from_the_daily_cache_else_the_deep_store(monkeypatch):
     monkeypatch.setattr(DF, "cache_daily", lambda tk: d)
     assert DF.spy_inputs(PREV)[1] == "cache"
     monkeypatch.setattr(DF, "cache_daily", lambda tk: d.iloc[:-1])    # the EOD warm did not run
-    monkeypatch.setattr(dl, "_daily", lambda tk: d)
+    monkeypatch.setattr(dl, "_daily", lambda tk, through=None: d)
     monkeypatch.setattr(dl, "_extend", lambda tks, through: None)
     got, src = DF.spy_inputs(PREV)
     assert src == "deep_store" and got == DF.spy_features_at(d, PREV)
-    monkeypatch.setattr(dl, "_daily", lambda tk: d.iloc[:-1])
+    monkeypatch.setattr(dl, "_daily", lambda tk, through=None: d.iloc[:-1])
     assert DF.spy_inputs(PREV) == (None, "missing")
 
 
@@ -232,7 +232,7 @@ def scored(monkeypatch):
             "prior_signals": {"OLD": "2019-05-01"}}
     monkeypatch.setattr(DF, "load_model", lambda path=None: (_Booster(by_rsi), meta))
     monkeypatch.setattr(DF, "spy_inputs", lambda through: (dict(SPY_IN), "cache"))
-    monkeypatch.setattr(dl, "_daily", lambda tk: series.get(tk))
+    monkeypatch.setattr(dl, "_daily", lambda tk, through=None: series.get(tk))
     return series
 
 
@@ -269,7 +269,7 @@ def test_apply_is_fail_open(monkeypatch, scored):
     monkeypatch.setattr(DF, "load_model", boom)
     kept, block = DF.apply([dict(s) for s in sig], DAY, PREV)
     assert len(kept) == 2 and block["filtered"] == [] and "model unavailable" in block["info"]["error"]
-    monkeypatch.setattr(dl, "_daily", lambda tk: None)                # one signal's inputs raise: kept, unscored
+    monkeypatch.setattr(dl, "_daily", lambda tk, through=None: None)                # one signal's inputs raise: kept, unscored
     monkeypatch.setattr(DF, "load_model", lambda path=None: (_Booster(), {"policy": {"cut": 7.0}}))
     monkeypatch.setattr(DF, "spy_inputs", lambda through: (dict(SPY_IN), "cache"))
     kept, block = DF.apply([dict(s) for s in sig], DAY, PREV)

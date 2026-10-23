@@ -87,8 +87,14 @@ def whatif_enabled() -> bool:
 
 def ibkr_margin(ticker: str, price: float) -> Optional[dict]:
     """IBKR's what-if margin for a ~$500 short of ``ticker`` at ``price`` (`Broker.what_if_short`:
-    priced by IBKR, never transmitted), or None without an IBKR broker. Fail-soft."""
+    priced by IBKR, never transmitted), or None without an IBKR broker. An extra account
+    (`src.accounts`) never asks IBKR — it is calculated from the main account (the user, 2026-10-23:
+    "The second account will be calculated from the same account") — and takes the answer IBKR gave
+    the main account for the name (`main_account_answer`). Fail-soft."""
     try:
+        from src.accounts import paths as _acct
+        if not _acct.is_main():
+            return main_account_answer(ticker)
         from src.broker import get_broker
         broker = get_broker()
         if broker is None or not price or price <= 0:
@@ -100,15 +106,71 @@ def ibkr_margin(ticker: str, price: float) -> Optional[dict]:
         return None
 
 
+MAIN_ANSWER_DAYS = 8         # the main account's entry journals searched (a fall pick's turn can come 5 sessions on)
+
+
+def main_account_answer(ticker: str, now: Optional[datetime] = None) -> Optional[dict]:
+    """The answer IBKR's what-if gave the MAIN account for ``ticker`` this ET session — the latest refusal or
+    priced answer in its entry journals (`sel_short.main_entries_path`, the picks of the last `MAIN_ANSWER_DAYS`
+    days: an entry is journaled under its pick's day), marked ``source: "main_account"`` with its ``asked_at`` —
+    or None (the main account did not ask: the default rates). Fail-soft."""
+    try:
+        import json
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
+        from src.signals import sel_short
+        et = ZoneInfo("America/New_York")
+        today = (now or datetime.now(timezone.utc)).astimezone(et).date()
+        tk = str(ticker or "").upper()
+        best = None
+        for k in range(MAIN_ANSWER_DAYS + 1):
+            p = sel_short.main_entries_path(today - timedelta(days=k))
+            if not p.exists():
+                continue
+            for ln in p.read_text(encoding="utf-8").splitlines():
+                try:
+                    r = json.loads(ln)
+                    at = datetime.fromisoformat(str(r.get("at")))
+                except (ValueError, TypeError):
+                    continue
+                m = r.get("ibkr_margin")
+                if str(r.get("ticker") or "").upper() != tk or not isinstance(m, dict) or at.astimezone(et).date() != today:
+                    continue
+                if not (m.get("refused") or (m.get("init_rate") and m.get("maint_rate"))):
+                    continue
+                if best is None or at > best[0]:
+                    best = (at, m)
+        if best is None:
+            return None
+        return {**best[1], "source": "main_account", "asked_at": best[0].isoformat()}
+    except Exception as e:                                     # noqa: BLE001
+        logger.warning(f"[sel_short] the main account's what-if for {ticker} unread ({type(e).__name__}: {e})")
+        return None
+
+
 def comm(n: float, p: float) -> float:
     """IBKR's fixed commission: max($1, $0.005 a share), at most 1% of the order's value."""
     return min(max(1.0, 0.005 * n), 0.01 * n * p)
 
 
 def paid_in(now: datetime) -> float:
-    """The money paid in: the start balance `sel_short_account_initial` ($10,000), no deposits (user
-    directive 2026-10-07: "Change the $5000+$1000/14days to $10000. We'll use this number from now on.")."""
+    """The money paid in: the start balance `sel_short_account_initial` — $50,000 from the 2026-10-20 fresh start
+    (the user: "I actually want the live account to restart at $50,000"; $10,000 from 2026-10-07: "Change the
+    $5000+$1000/14days to $10000"), no deposits."""
     return float(settings.sel_short_account_initial)
+
+
+def counts(trade: dict) -> bool:
+    """THE FRESH START (`live_account_fresh_start`, user 2026-10-20): the account counts every OPEN trade it funded
+    and the closed ones entered at/after the instant — its trades before it stay in the ledger, out of its equity (it
+    restarts at `sel_short_account_initial`). An unreadable entry time counts."""
+    raw = str(getattr(settings, "live_account_fresh_start", "") or "").strip()
+    if not raw or trade.get("status") == "OPEN":
+        return True
+    try:
+        return datetime.fromisoformat(str(trade.get("entry_datetime"))) >= datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return True
 
 
 def funded(trade: dict) -> bool:
@@ -132,7 +194,7 @@ def state(trades: Sequence[dict], now: Optional[datetime] = None) -> Dict[str, f
     out = {"paid_in": paid_in(now), "realized": 0.0, "unrealized": 0.0, "gross": 0.0, "maint": 0.0,
            "init_req": 0.0, "open": 0, "funded": 0}
     for t in trades:
-        if not funded(t):
+        if not funded(t) or not counts(t):
             continue
         out["funded"] += 1
         pnl = dollars(t)

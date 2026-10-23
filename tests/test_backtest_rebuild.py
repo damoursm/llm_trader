@@ -96,7 +96,7 @@ def test_live_books_with_rebuilt_components_runs_the_default_path_and_builds_the
         eng.period = etf.period = RB.PERIOD                  # the rebuilt components' marker
         return eng, etf, costs, p_lend, dip
     monkeypatch.setattr(T, "_stub_case", case)
-    books, log, eng, etf = T._live_books(monkeypatch, M.Mimic(seed=3))
+    books, log, eng, etf = T._live_books(monkeypatch, M.Mimic(seed=3, **M.PRE151))
     assert T._fields(books) == T.BEFORE and log == T.BEFORE_LOG
 
 

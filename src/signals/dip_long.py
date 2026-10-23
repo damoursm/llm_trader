@@ -23,19 +23,32 @@ signals only the `dip_long_daily_top` (1) best become orders, ranked by `dip_lon
 score — `dip_filter.score_signals`, the closes through D-1, no cut — highest first, an unscored signal after every
 scored one by its RSI2; `rank_key`, the simulator's `strategies.dip.rank_pieces`); the others are journaled
 ``not_top`` and an order of a day before the rule is never placed (``superseded``), so the bigger slice
-(1/`dip_long_account_slices`, 6) only ever buys a day's top pick. Fail-open to the deepest dip: a model or SPY close
+(1/`dip_long_account_slices`) only ever buys a day's top pick. THE $2B ORDER FLOOR (PREREG147's S3, user 2026-10-18:
+"Deploy the $2B+ stocks only, 1/3 per position"; from the 2026-10-19 session): the pick is the best of the signals
+whose dv20 is at least `dip_long_order_min_dollar_volume` ($2B) — every $1B signal still computed and scored (the
+meta-model's breadth counts them all), the ones under the floor journaled not-top (``below_order_floor``) — at a 1/3
+slice (`dip_long_account_slices` 3, at most 3 open). Fail-open to the deepest dip: a model or SPY close
 that cannot be read leaves the signals unscored, the error journaled (a scorer-banner problem).
+
+THE EARNINGS-DIP DEMOTION (PREREG137's DEMOTE_E, user 2026-10-17: "Fully deploy the earnings dip demotion in live"; from
+the 2026-10-19 session; `src/signals/dip_earnings.py`, `enable_dip_long_earnings_demote`): in the daily top pick a
+signal whose company filed an 8-K Item 2.02 (its earnings release) after 16:00 ET of the session three before the
+signal session and by D's 09:30 ranks after every other signal of its day (`rank_key`: ``earnings_dip``) — the day's
+best other dip is bought instead; a day of earnings dips only buys its best one. Fail-open: a signal whose filings
+cannot be read is not demoted (the ``top`` block's ``earnings`` journal; a problem when it is the pick).
 
 Execution: the regular-hours ticks only. Exits first (`exit_check`: their slots free up for the same
 tick), then entries within `dip_long_entry_window_minutes` of the 09:30 open — marketable limit orders
 through the ordinary broker sync, a few seconds to a minute after the opening auction the study traded.
 Each signal is settled once a day (`entries/<day>.jsonl`); only a missing live price is retried.
 
-Sizing: the book's OWN simulated cash account, as in the study's account (`lg_account.simulate`):
-`dip_long_account_initial` ($10,000, no deposits) plus the dollar P&L of its trades (shares x entry x the
-ledger's net return); each new long = floor(min(equity / slices, cash) / price) whole shares with the
-study's spread-and-commission margin, at most `dip_long_account_slices` (10) open. Never a name another
-open trade holds (and the short book never stacks on a dip long: `record_sel_short_trades`).
+Sizing: THE LIVE ACCOUNT (`live_account.size_long`, shared with the shorts and the crash book; CLAUDE.md): each
+order 1/`dip_long_account_slices` (3) of the shared equity at its limit, at most that many open (working orders
+count), each fill cut to the room (`live_account.fill_cap`). With `enable_live_account` off, the book's OWN simulated
+cash account, as in the study's account (`lg_account.simulate`): `dip_long_account_initial` ($10,000, no deposits)
+plus the dollar P&L of its trades; each new long = floor(min(equity / slices, cash) / price) whole shares with the
+study's spread-and-commission margin. Never a name another open trade holds (and the short book never stacks on a
+dip long: `record_sel_short_trades`).
 
 Journals under `dip_long_dir` (cache/ml/dip_long/): ``signals/<day>.json`` (the day's computation: every
 qualifying name with its numbers), ``entries/<day>.jsonl`` (each signal's outcome at the entry step) and
@@ -57,6 +70,7 @@ import pandas as pd
 from loguru import logger
 
 from config import settings
+from src.accounts import paths as _acct
 from src.performance.books import DIP_LONG as MECHANISM      # one definition of the book's mechanism
 from src.utils import ET
 
@@ -156,10 +170,12 @@ def rsi2(c: np.ndarray) -> np.ndarray:
     return np.where(rd == 0, 100.0, r)
 
 
-def stats_at(daily: Optional[pd.DataFrame], through: date, min_history: int = MIN_HISTORY) -> Optional[dict]:
+def stats_at(daily: Optional[pd.DataFrame], through: date, min_history: int = MIN_HISTORY,
+             trend: Optional[int] = None, exit_sma: Optional[int] = None) -> Optional[dict]:
     """The rule's numbers at the close of the last session on or before ``through`` (nothing later is read):
     its ``session``, ``close``, the trend and exit averages, ``rsi2`` and ``dv20`` (the 20-session mean of
-    close x volume); None below ``min_history`` daily bars."""
+    close x volume); None below ``min_history`` daily bars. ``trend`` / ``exit_sma``: the averages' lengths (default
+    the dip book's; the capitulation book passes its own)."""
     if daily is None or daily.empty:
         return None
     d = daily[daily.index <= pd.Timestamp(through)]
@@ -167,7 +183,8 @@ def stats_at(daily: Optional[pd.DataFrame], through: date, min_history: int = MI
         return None
     c = d["c"].to_numpy(float)
     v = d["v"].to_numpy(float)
-    nt, nx = int(settings.dip_long_trend_sessions), int(settings.dip_long_exit_sma_sessions)
+    nt = int(settings.dip_long_trend_sessions if trend is None else trend)
+    nx = int(settings.dip_long_exit_sma_sessions if exit_sma is None else exit_sma)
     sma_t = float(np.mean(c[-nt:])) if len(c) >= nt else float("nan")
     sma_x = float(np.mean(c[-nx:])) if len(c) >= nx else float("nan")
     dv20 = float(np.mean((c * v)[-20:])) if len(c) >= 20 else float("nan")
@@ -216,13 +233,26 @@ def _sec_type(ticker: str) -> Optional[str]:
     return security_type(ticker)
 
 
-def _daily(ticker: str) -> Optional[pd.DataFrame]:
+def own_security() -> bool:
+    return bool(getattr(settings, "enable_dip_long_own_security", True))
+
+
+def _daily(ticker: str, through: Optional[date] = None) -> Optional[pd.DataFrame]:
+    """The name's daily bars: its deep-store series rebuilt from its OWN security (`dip_security`: a reused ticker's
+    older security cut, a renamed company's earlier tickers joined; `enable_dip_long_own_security`), with ``through``
+    only the sessions on or before it read."""
     from src.data.intraday_store import load_deep_30m
-    return daily_bars(load_deep_30m(ticker))
+    b = load_deep_30m(ticker)
+    if own_security():
+        from src.signals import dip_security
+        b, rec = dip_security.own_bars(ticker, b, through)
+        dip_security.LAST[ticker] = rec
+    return daily_bars(b)
 
 
-def name_stats(ticker: str, through: date, min_history: int = MIN_HISTORY) -> Optional[dict]:
-    return stats_at(_daily(ticker), through, min_history)
+def name_stats(ticker: str, through: date, min_history: int = MIN_HISTORY, trend: Optional[int] = None,
+               exit_sma: Optional[int] = None) -> Optional[dict]:
+    return stats_at(_daily(ticker, through), through, min_history, trend=trend, exit_sma=exit_sma)
 
 
 def _extend(tickers: Sequence[str], through: date) -> None:
@@ -239,13 +269,13 @@ def _extend(tickers: Sequence[str], through: date) -> None:
 
 # ── the day's signals ────────────────────────────────────────────────────────
 
-def candidates(d: date) -> Tuple[List[str], str]:
-    """The names worth the exact test on ``d``: within `PREFILTER_SHARE` of the dollar-volume floor on
-    Polygon's whole-market daily bars of the 20 sessions before ``d`` (the selection short's cached
-    `grouped_day`) or on the day's universe file — common stocks / ADRs only. Neither available: every
-    name in the deep store (slow, logged)."""
+def candidates(d: date, min_dv: Optional[float] = None) -> Tuple[List[str], str]:
+    """The names worth the exact test on ``d``: within `PREFILTER_SHARE` of the dollar-volume floor (``min_dv``,
+    default the dip book's; the capitulation book passes its own) on Polygon's whole-market daily bars of the 20
+    sessions before ``d`` (the selection short's cached `grouped_day`) or on the day's universe file — common stocks /
+    ADRs only. Neither available: every name in the deep store (slow, logged)."""
     from src.signals import sel_short
-    floor = PREFILTER_SHARE * float(settings.dip_long_min_dollar_volume)
+    floor = PREFILTER_SHARE * float(settings.dip_long_min_dollar_volume if min_dv is None else min_dv)
     names: set = set()
     src: List[str] = []
     frames = {}
@@ -302,9 +332,11 @@ def compute_signals(d: date, extend: bool = True) -> dict:
     """The entry signals for session ``d``: every prefiltered name's numbers at the close of D-1 from its
     store series cut at D-1; a name whose store ends before D-1 is extended once, then left out
     (``stale``). Written to ``signals/<d>.json``, deepest dip first."""
+    _acct.decide_here(f"the dip signals of {d}")          # an extra account reads them, never computes them
     prev = prev_session(d)
     names, src = candidates(d)
     t0 = datetime.now(timezone.utc)
+    sec = _security_prepare(names, prev) if own_security() else None
 
     def evaluate(tks):
         got, late = {}, []
@@ -323,6 +355,15 @@ def compute_signals(d: date, extend: bool = True) -> dict:
         _extend(stale, prev)
         more, stale = evaluate(stale)
         rows.update(more)
+    if sec is not None:
+        # a day's signal whose security answer is a day old is asked again before it is kept (a ticker reused since)
+        redo = _security_recheck([tk for tk, st in rows.items() if qualifies(st)], prev, sec)
+        if redo:
+            more, _ = evaluate(redo)
+            for tk in redo:
+                rows.pop(tk, None)
+            rows.update(more)
+        _security_journal(sec, names)
     inactive: List[str] = []
     if stale:
         # a name that did not trade on D-1 at all (a merger closed, a halt) is not a data fault
@@ -333,6 +374,10 @@ def compute_signals(d: date, extend: bool = True) -> dict:
     sig = [{"ticker": tk, **st} for tk, st in rows.items() if qualifies(st)]
     for r in sig:                                      # the limit entry's price (journaled in either mode)
         r["limit"] = limit_price(r["close"], r.get("atr14"))
+        if sec is not None:                            # its series rebuilt from its own security (or the failure)
+            own = (sec.get("changed") or {}).get(r["ticker"]) or (sec.get("errors") or {}).get(r["ticker"])
+            if own:
+                r["own_security"] = own
     sig.sort(key=lambda r: (r["rsi2"], r["ticker"]))
     filt = None
     if getattr(settings, "enable_dip_long_filter", False):     # PREREG96's RP33 (src/signals/dip_filter.py)
@@ -357,7 +402,15 @@ def compute_signals(d: date, extend: bool = True) -> dict:
         out["filter"], out["filtered"] = filt["info"], filt["filtered"]
     if top is not None:                                # the daily top pick (PREREG116's Q1): the rest, journaled
         out["top"], out["not_top"] = top["info"], top["not_top"]
+    if sec is not None:                                # the own-security series (dip_security): what it changed
+        out["security"] = sec
     _write_json(signals_path(d), out)
+    if sec is not None:                                # tomorrow's answers: the stale ones refreshed off the tick
+        try:
+            from src.signals import dip_security
+            dip_security.refresh_async(names)
+        except Exception as e:                         # noqa: BLE001
+            logger.warning(f"[dip_long] the security refresh could not start ({type(e).__name__}: {e})")
     logger.info(f"[dip_long] {d}: {len(sig)} signal(s) from the {prev} close among {len(big)} name(s) over "
                 f"${float(settings.dip_long_min_dollar_volume) / 1e9:g}B a day ({len(names)} prefiltered by {src}"
                 f"{f', {len(stale)} stale' if stale else ''}, {out['seconds']:.0f}s)"
@@ -366,6 +419,82 @@ def compute_signals(d: date, extend: bool = True) -> dict:
                 + (f" — the daily top pick of {top['info']['breadth']}, {len(top['not_top'])} not ordered"
                    if top is not None else ""))
     return out
+
+
+# ── the own-security series (src/signals/dip_security.py; user 2026-10-18: "Yes please apply the fix") ──────────
+
+def _security_prepare(names: Sequence[str], prev: date) -> dict:
+    """Before the day's series are read: ask Polygon about the candidates it never answered for (their ticker runs),
+    within `dip_long_security_budget_seconds`. Returns the signal file's ``security`` block. Never raises."""
+    t0 = datetime.now(timezone.utc)
+    sec: dict = {"on": True, "budget_seconds": float(settings.dip_long_security_budget_seconds), "asked_new": [],
+                 "rechecked": [], "failed": [], "skipped": [], "runs_fetched": [], "spent_seconds": 0.0,
+                 "changed": {}, "errors": {}, "error": None}
+    try:
+        from src.signals import dip_security as SEC
+        new = SEC.needs_events(names)
+        if new and sec["budget_seconds"] > 0:
+            r = SEC.ensure(new, sec["budget_seconds"], through=prev)
+            sec.update(asked_new=[n for n in new if n not in r["skipped"]], failed=list(r["failed"]),
+                       skipped=list(r["skipped"]), runs_fetched=list(r["runs_fetched"]))
+        elif new:
+            sec["skipped"] = list(new)
+    except Exception as e:                                      # noqa: BLE001
+        sec["error"] = f"{type(e).__name__}: {e}"
+        logger.error(f"[dip_long] the own-security check could not ask Polygon ({sec['error']})")
+    sec["spent_seconds"] = round((datetime.now(timezone.utc) - t0).total_seconds(), 1)
+    return sec
+
+
+def _security_recheck(sig_names: Sequence[str], prev: date, sec: dict) -> List[str]:
+    """The day's signals whose ticker runs were last answered a day ago or earlier are asked again (within the budget
+    left: a ticker reused since then cannot become an order on another security's history); returns the names asked,
+    to be evaluated again."""
+    t0 = datetime.now(timezone.utc)
+    try:
+        from src.signals import dip_security as SEC
+        stale = [n for n in SEC.needs_events(sig_names, SEC.RECHECK_DAYS) if n not in sec["asked_new"]]
+        left = float(sec["budget_seconds"]) - float(sec["spent_seconds"])
+        if not stale:
+            return []
+        if left <= 0:
+            sec["skipped"] += [n for n in stale if n not in sec["skipped"]]
+            return []
+        r = SEC.ensure(stale, left, through=prev)
+        asked = [n for n in stale if n not in r["skipped"]]
+        sec["rechecked"] = asked
+        sec["failed"] += [n for n in r["failed"] if n not in sec["failed"]]
+        sec["skipped"] += [n for n in r["skipped"] if n not in sec["skipped"]]
+        sec["runs_fetched"] += list(r["runs_fetched"])
+        return asked
+    except Exception as e:                                      # noqa: BLE001
+        sec["error"] = f"{type(e).__name__}: {e}"
+        logger.error(f"[dip_long] the own-security recheck failed ({sec['error']})")
+        return []
+    finally:
+        sec["spent_seconds"] = round(float(sec["spent_seconds"]) + (datetime.now(timezone.utc) - t0).total_seconds(), 1)
+
+
+def _security_journal(sec: dict, names: Sequence[str]) -> None:
+    """The ``security`` block's per-name part: every candidate whose series the construction changed (how, its first
+    session, the cut, the runs joined) or could not build (read as stored)."""
+    from src.signals import dip_security as SEC
+    for tk in names:
+        rec = SEC.LAST.get(tk)
+        if not rec:
+            continue
+        if rec.get("error"):
+            sec["errors"][tk] = {"error": rec["error"]}
+        elif rec.get("changed"):
+            sec["changed"][tk] = {k: rec.get(k) for k in ("how", "first_session", "cut_from", "stored_cut", "joined",
+                                                         "missing_runs")}
+    ch = sec["changed"]
+    if ch or sec["errors"] or sec["failed"]:
+        logger.info(f"[dip_long] own security: {len(ch)} candidate(s) rebuilt"
+                    + (" (" + ", ".join(f"{tk} from {v.get('first_session')}" for tk, v in list(ch.items())[:8]) + ")"
+                       if ch else "")
+                    + (f", {len(sec['errors'])} read as stored after a failure" if sec["errors"] else "")
+                    + (f", Polygon did not answer for {len(sec['failed'])}" if sec["failed"] else ""))
 
 
 def _meta_filter(sig: List[dict], d: date, prev: date) -> Tuple[List[dict], dict]:
@@ -400,15 +529,18 @@ def rank_key(sig: Mapping, by: Optional[str] = None) -> tuple:
     """A signal's (or its order's) place in the ranking, lower first — the simulator's `strategies.dip.rank_pieces`:
     by "score", a scored signal by its meta-model score, highest first, an unscored one after every scored one by its
     RSI2 (the deepest dip first); by "rsi2", the deepest dip first; a tie goes to the lower order id (the ticker and
-    "|", as the simulator's ``oid`` sorts: "T10|" before "T1|")."""
+    "|", as the simulator's ``oid`` sorts: "T10|" before "T1|"). An EARNINGS DIP (``earnings_dip`` True, stamped by
+    `dip_earnings.flag_signals` — PREREG137's DEMOTE_E, the simulator's ``demote``) ranks after every other signal,
+    the earnings dips among themselves by the same key."""
     by = by or rank_by()
     tk = str(sig.get("ticker") or "") + "|"
+    late = 2 if sig.get("earnings_dip") is True else 0
     r = sig.get("rsi2")
     rsi = float(r) if r is not None and math.isfinite(float(r)) else 1e9
     s = sig.get("filter_score")
     if by == "score" and s is not None and math.isfinite(float(s)):
-        return (0, -float(s), tk)
-    return (1 if by == "score" else 0, rsi, tk)
+        return (late, -float(s), tk)
+    return (late + (1 if by == "score" else 0), rsi, tk)
 
 
 def _daily_top(sig: List[dict], d: date, prev: date, n: int) -> Tuple[List[dict], dict]:
@@ -430,19 +562,85 @@ def _daily_top(sig: List[dict], d: date, prev: date, n: int) -> Tuple[List[dict]
     elif by == "score" and sig:                         # the RP33 filter scored them (its block holds the model)
         info["scored_by"] = "the RP33 filter"
     info["scored"] = sum(1 for s in sig if s.get("filter_score") is not None)
+    if _earnings_on():                                 # PREREG137's DEMOTE_E: the earnings dips rank last
+        info["earnings"] = _flag_earnings(sig, d, by)
     ranked = sorted(sig, key=lambda s: rank_key(s, by))
-    for k, s in enumerate(ranked, 1):
+    # THE $2B ORDER FLOOR (PREREG147's S3): the pick is the best of the signals at or above it; the ones under it keep
+    # their place in the journal (``below_order_floor``, no rank), every signal scored as before
+    floor = order_floor()
+    info["order_floor"] = floor
+    eligible = [s for s in ranked if not floor or _dv20(s) >= floor]
+    below = [s for s in ranked if floor and _dv20(s) < floor]
+    for k, s in enumerate(eligible, 1):
         s["top_rank"] = k
-    keep, rest = ranked[:n], ranked[n:]
-    info["picked"] = [{"ticker": s["ticker"], "score": s.get("filter_score"), "rsi2": s.get("rsi2")} for s in keep]
+    for s in below:
+        s["top_rank"] = None
+        s["below_order_floor"] = True
+    info["below_floor"] = [s["ticker"] for s in below]
+    keep = eligible[:n]
+    rest = [s for s in ranked if s not in keep]
+    info["picked"] = [dict({"ticker": s["ticker"], "score": s.get("filter_score"), "rsi2": s.get("rsi2")},
+                           **({"earnings_dip": s.get("earnings_dip"), "earnings_status": s.get("earnings_status")}
+                              if "earnings" in info else {})) for s in keep]
     if info["error"]:
         logger.error(f"[dip_long] {d}: the daily top pick could not score the signals ({info['error']}) — the "
                      f"deepest dip instead: {', '.join(s['ticker'] for s in keep) or 'none'}")
+    elif not keep and sig:
+        logger.info(f"[dip_long] {d}: no signal at or above the ${floor / 1e9:g}B order floor among {len(sig)} — no "
+                    f"order today")
     elif keep:
         logger.info(f"[dip_long] {d}: the daily top pick by {by}: " + ", ".join(
             f"{s['ticker']} (score {s['filter_score']:+.3f})" if s.get("filter_score") is not None else
-            f"{s['ticker']} (unscored, RSI2 {float(s['rsi2']):.1f})" for s in keep) + f" of {len(sig)} signal(s)")
+            f"{s['ticker']} (unscored, RSI2 {float(s['rsi2']):.1f})" for s in keep) + f" of {len(sig)} signal(s)"
+            + (f"; earnings dip(s) ranked last: {', '.join(info['earnings']['flagged'])}"
+               if (info.get("earnings") or {}).get("flagged") else "")
+            + (f"; {len(below)} under the ${floor / 1e9:g}B order floor" if below else ""))
     return keep, {"info": info, "not_top": rest}
+
+
+def order_floor() -> float:
+    """The daily top pick's dollar-volume floor (`dip_long_order_min_dollar_volume`; PREREG147's S3: $2B) — 0 = none."""
+    try:
+        return max(0.0, float(getattr(settings, "dip_long_order_min_dollar_volume", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dv20(s: Mapping) -> float:
+    try:
+        v = float(s.get("dv20"))
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) else 0.0
+
+
+def _earnings_on() -> bool:
+    from src.signals import dip_earnings
+    return dip_earnings.enabled()
+
+
+def _flag_earnings(sig: List[dict], d: date, by: str) -> dict:
+    """PREREG137's earnings-dip flags on the day's signals (`dip_earnings.flag_signals`), checked best-ranked first by
+    the ranking without them; fail-open — any error flags none (the ranking as without the demotion), journaled in the
+    block's ``error`` (a scorer-banner problem)."""
+    from src.signals import dip_earnings
+    try:
+        block = dip_earnings.flag_signals(sorted(sig, key=lambda s: rank_key(s, by)), d)
+    except Exception as e:                                      # noqa: BLE001
+        for s in sig:
+            for k in ("earnings_dip", "earnings_status", "earnings_release", "earnings_error"):
+                s.pop(k, None)
+        logger.error(f"[dip_long] {d}: the earnings-dip check failed ({type(e).__name__}: {e}) — no signal demoted")
+        return {"rule": dip_earnings.RULE, "error": f"{type(e).__name__}: {e} — no signal demoted"}
+    for s in sig:
+        if s.get("earnings_dip") is True:
+            rel = s.get("earnings_release") or {}
+            logger.info(f"[dip_long] {d}: {s['ticker']} is an earnings dip — 8-K {rel.get('items')} accepted "
+                        f"{rel.get('acceptance')} ({rel.get('source')}): ranked after the day's other signals")
+        elif s.get("earnings_status") == "unknown":
+            logger.warning(f"[dip_long] {d}: {s['ticker']}: its filings could not be read ({s.get('earnings_error')})"
+                           f" — not demoted")
+    return block
 
 
 def signals_for(d: date) -> dict:
@@ -499,11 +697,11 @@ def exit_check(trade: dict, d: date) -> Tuple[Optional[str], dict]:
     held = sessions_held(e, prev)
     info["held"] = held
     tk = str(trade["ticker"])
-    daily = _daily(tk)
+    daily = _daily(tk, prev)
     last = None if daily is None or daily.empty else pd.Timestamp(daily.index[daily.index <= pd.Timestamp(prev)].max())
     if last is None or pd.isna(last) or last.date() != prev:
         _extend([tk], prev)
-        daily = _daily(tk)
+        daily = _daily(tk, prev)
         last = None if daily is None or daily.empty else pd.Timestamp(daily.index[daily.index <= pd.Timestamp(prev)].max())
     if last is None or pd.isna(last) or last.date() != prev:
         info["stale"] = True
@@ -582,11 +780,11 @@ def summary(st: Dict[str, float]) -> str:
 # ── journals ─────────────────────────────────────────────────────────────────
 
 def entries_path(d: date) -> Path:
-    return root() / "entries" / f"{_iso(d)}.jsonl"
+    return _acct.state(root() / "entries" / f"{_iso(d)}.jsonl")    # this account's (`src.accounts.paths`)
 
 
 def exits_path(d: date) -> Path:
-    return root() / "exits" / f"{_iso(d)}.jsonl"
+    return _acct.state(root() / "exits" / f"{_iso(d)}.jsonl")
 
 
 def _append(p: Path, rec: dict) -> None:
@@ -636,8 +834,10 @@ def trade_id(d: date, ticker: str) -> str:
 # an ORDER: a BUY limit at the signal close minus `dip_long_limit_atr` x its 14-session ATR, alive sessions D ..
 # D+`dip_long_limit_sessions`-1. The ledger owns the decision, from the same data the backtest engine reads
 # (`src/backtest/account.py` orders="fill", `strategies/dip.py` `order_pieces`): at each window session's
-# 09:30 tick the pending orders are PLACED deepest dip first (quantity fixed then: the dip slice at the limit,
-# within the live account's room; working orders count toward the 10 dip slots; nothing reserved); an order FILLS
+# 09:30 tick the pending orders are PLACED best-ranked first (`rank_key`: with the daily top pick, the day's top
+# picks by score, an earnings dip after the others; the deepest dip first with `dip_long_daily_top` 0) — quantity
+# fixed then: the dip slice at the limit, within the live account's room; working orders count toward the
+# `dip_long_account_slices` (3) dip slots; nothing reserved; an order FILLS
 # at the session's open when it opens at/under the limit, else at the END of the first 30-minute regular-hours bar
 # whose low reaches it (Polygon's bars, the deep store's source) — the fills of a tick before the shorts' entries —
 # buying AT MOST what the room allows then; a touch that finds no room buys nothing and the order waits for the
@@ -657,7 +857,9 @@ def window(d: date) -> List[date]:
 
 
 def orders_path(d: date) -> Path:
-    return root() / "orders" / f"{_iso(d)}.json"
+    """THIS account's orders of signal day ``d`` — built from the shared signals, sized and filled by the account
+    (an extra account's under its own root, `src.accounts.paths`)."""
+    return _acct.state(root() / "orders" / f"{_iso(d)}.json")
 
 
 def load_orders(d: date) -> List[dict]:
@@ -729,7 +931,10 @@ def apply_order_splits(orders: Sequence[dict], now: Optional[datetime] = None) -
         orig = o.setdefault("split_orig", {})
         for k in ("close", "atr14", "sma_trend", "limit", "qty"):
             if k not in orig and o.get(k) is not None:
-                orig[k] = float(o[k]) / done if k != "qty" else int(o[k])
+                # a value set after an earlier rescale is in its terms: back into the order day's (prices / the factor
+                # done, a quantity x it — a quantity placed after a split, then a split record withdrawn, must come
+                # back with its limit)
+                orig[k] = float(o[k]) / done if k != "qty" else float(o[k]) * done
         for k in ("close", "atr14", "sma_trend"):
             if k in orig:
                 o[k] = round(orig[k] * f, 6)
@@ -789,8 +994,22 @@ def not_top_order(d: date, sig: dict, day: dict) -> dict:
          "sma_trend": sig.get("sma_trend"), "status": "not_top", "top_rank": sig.get("top_rank"),
          "filter_score": sig.get("filter_score"), "qty": None, "ibkr_qty": 0, "ibkr": None, "trade": None,
          "events": []}
-    order_event(o, "not_top", rank=sig.get("top_rank"), score=sig.get("filter_score"))
+    o.update(earnings_fields(sig))
+    if sig.get("below_order_floor"):                 # PREREG147's S3: under the daily top pick's $2B floor
+        o["below_order_floor"] = True
+    order_event(o, "not_top", rank=sig.get("top_rank"), score=sig.get("filter_score"),
+                **({"earnings_dip": True} if sig.get("earnings_dip") is True else {}),
+                **({"below_order_floor": True} if sig.get("below_order_floor") else {}))
     return o
+
+
+EARNINGS_FIELDS = ("earnings_dip", "earnings_status", "earnings_release")
+
+
+def earnings_fields(sig: Mapping) -> dict:
+    """A signal's earnings-dip stamps (PREREG137's DEMOTE_E, `dip_earnings.flag_signals`) for its order — the flag
+    `rank_key` reads when the day's orders compete; nothing for a signal computed without the rule."""
+    return {k: sig[k] for k in EARNINGS_FIELDS if k in sig}
 
 
 def placeable(o: Mapping) -> bool:
@@ -901,6 +1120,8 @@ def health(now: Optional[datetime] = None, trades: Optional[Sequence[dict]] = No
                     _filter_health(s, out)
                 if daily_top() > 0:
                     _top_health(s, out)
+                if own_security():
+                    _security_health(s, out)
             except Exception:                                   # noqa: BLE001
                 out["problems"].append("dip long: today's signal file is unreadable")
     if limit_mode():                                   # the limit entry's orders: a note, never an alarm
@@ -958,16 +1179,73 @@ def _top_health(s: dict, out: dict) -> None:
     if t.get("error"):
         out["problems"].append(f"dip long: the daily top pick could not score today's signals — {t['error']} (the "
                                f"deepest dip was taken)")
+        _earnings_health(t, out)
         return
+    _earnings_health(t, out)
     if not t.get("breadth"):
         return                                         # no signal today: nothing to say
     picked = ", ".join(f"{p['ticker']}" + (f" (score {float(p['score']):+.2f})" if p.get("score") is not None else
-                                           " (unscored)") for p in t.get("picked") or [])
+                                           " (unscored)") + (" — an earnings dip" if p.get("earnings_dip") is True
+                                                             else "") for p in t.get("picked") or [])
+    flagged = [tk for tk in ((t.get("earnings") or {}).get("flagged") or [])
+               if tk not in {p.get("ticker") for p in t.get("picked") or []}]
+    fl = t.get("order_floor") or 0.0
     out["notes"].append(f"dip long: today's top pick {picked or 'none'} of {t.get('breadth')} signal(s)"
+                        + (f" ({len(t.get('below_floor') or [])} under the ${float(fl) / 1e9:g}B order floor)"
+                           if fl and t.get("below_floor") else "")
                         + (f", {int(t['breadth']) - int(t.get('scored') or 0)} unscored"
                            if int(t.get("scored") or 0) < int(t.get("breadth") or 0) else "")
+                        + (f"; earnings dip(s) ranked last: {', '.join(flagged)}" if flagged else "")
                         + ("; SPY from the deep store (the daily cache lacked the close)"
                            if t.get("spy_source") == "deep_store" else ""))
+
+
+def _security_health(s: dict, out: dict) -> None:
+    """The own-security series' line (dip_security): the check failing as a whole (every name read as stored), or the
+    day's PICK read as stored after its construction failed, is a problem; a signal rebuilt from its own security and
+    Polygon not answering for a signal (its last answer, else the list date, decided) are notes."""
+    sec = s.get("security")
+    if not isinstance(sec, dict):
+        if s.get("signals"):
+            out["notes"].append("dip long: today's signals were computed without the own-security check")
+        return
+    if sec.get("error"):
+        out["problems"].append(f"dip long: the own-security check failed — {sec['error']}")
+    picked = {p.get("ticker") for p in ((s.get("top") or {}).get("picked") or [])} or \
+        {r.get("ticker") for r in s.get("signals") or []}
+    for tk in sorted(picked & set(sec.get("errors") or {})):
+        out["problems"].append(f"dip long: today's pick {tk}'s series could not be rebuilt from its own security — "
+                               f"read as stored ({(sec['errors'][tk] or {}).get('error')})")
+    sig = {r.get("ticker") for r in s.get("signals") or []} | {r.get("ticker") for r in s.get("not_top") or []}
+    ch = {tk: v for tk, v in (sec.get("changed") or {}).items() if tk in sig}
+    if ch:
+        out["notes"].append("dip long: read from its own security: " + ", ".join(
+            f"{tk} (from {v.get('first_session')}" + (f", joined {', '.join(v.get('joined') or {})}" if v.get("joined")
+                                                     else "") + ")" for tk, v in sorted(ch.items())))
+    failed = sorted(sig & set(sec.get("failed") or []))
+    if failed:
+        out["notes"].append(f"dip long: Polygon did not answer for the ticker history of {', '.join(failed)} — its "
+                            f"last answer (or its list date) decided")
+
+
+def _earnings_health(t: dict, out: dict) -> None:
+    """The earnings-dip demotion's line (PREREG137's DEMOTE_E): the check failing as a whole, or the day's PICK's filings
+    unread (it may be an earnings dip left undemoted), is a problem; EDGAR unreachable for the pick (the store's filings
+    through its last pass decided) is a note. A check that failed for a signal ranked below the pick changes nothing."""
+    e = t.get("earnings")
+    if not isinstance(e, dict):
+        return
+    if e.get("error"):
+        out["problems"].append(f"dip long: the earnings-dip check failed — {e['error']}")
+        return
+    for p in t.get("picked") or []:
+        st = p.get("earnings_status")
+        if st == "unknown":
+            out["problems"].append(f"dip long: today's pick {p.get('ticker')}'s filings could not be read — not checked "
+                                   f"for an earnings release (not demoted)")
+        elif st == "store_only" and (e.get("edgar") or {}).get("on"):
+            out["notes"].append(f"dip long: EDGAR did not answer for today's pick {p.get('ticker')} — its earnings "
+                                f"check read the store's filings (through {e.get('store_through') or 'its last pass'})")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

@@ -365,11 +365,17 @@ def _record_order(report: dict, *, event: str, intent: str, ticker: str, side: s
 #   RESTORED_NOT_SUBMITTED — position was never broker-entered
 #   RESTORED_ADOPTED       — a real broker position exists, but the original
 #                            order linkage was lost (e.g. the 2026-06-10 wipe)
-_RESTORED_STATUSES = ("RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED")
+#   MARGIN_LOT             — the lot IBKR's liquidation took out of an open
+#                            trade (`tracker._split_margin_lot`, PREREG175): its
+#                            shares are part of the original order's fill, which
+#                            the remainder's leg keeps (`broker_split_out_qty`);
+#                            its exit covers what the position holds past the
+#                            open trades' shares
+_RESTORED_STATUSES = ("RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED", "MARGIN_LOT")
 
 _TERMINAL_STATUSES = ("Filled", "Cancelled", "ApiCancelled", "Inactive", "DRYRUN",
                       "RESTORED_NOT_SUBMITTED", "RESTORED_ADOPTED",
-                      "DUPLICATE_REF_NOT_SUBMITTED")
+                      "DUPLICATE_REF_NOT_SUBMITTED", "MARGIN_LOT")
 
 # A submit IBKR REFUSED outright: the order ended at once with nothing filled.
 # It is resent in the same tick (user directive 2026-09-27: "Try resend them
@@ -432,21 +438,59 @@ def _apply_fill(t: dict, prefix: str, fs: FillSummary) -> bool:
     k = _split_k(t, prefix)
     qty = round(fs.filled_qty / k, 6) if fs.filled_qty and k != 1.0 else fs.filled_qty
     px = round(fs.avg_fill_price * k, 6) if fs.avg_fill_price and k != 1.0 else fs.avg_fill_price
+    comm = fs.commission
+    out = float(t.get(f"{prefix}split_out_qty") or 0.0) if prefix == "broker_" else 0.0
+    if out > 0 and qty:
+        # IBKR's liquidation took lots out of this trade (`tracker._split_margin_lot`): those shares of the order's
+        # fill are the lots' own ledger trades now — this leg keeps the rest, and its share of the commission
+        total = float(qty)
+        qty = max(0.0, total - out)
+        qty = int(qty) if float(qty).is_integer() else qty
+        if comm is not None and total > 0:
+            comm = round(float(comm) * float(qty) / total, 6)
     if qty and qty != t.get(f"{prefix}fill_qty"):
         t[f"{prefix}fill_qty"] = qty
         changed = True
     if px and px != t.get(f"{prefix}fill_price"):
         t[f"{prefix}fill_price"] = px
         changed = True
-    if fs.commission is not None and fs.commission != t.get(f"{prefix}commission"):
-        t[f"{prefix}commission"] = fs.commission
+    if comm is not None and comm != t.get(f"{prefix}commission"):
+        t[f"{prefix}commission"] = comm
         changed = True
     if changed:
         req = t.get(f"{prefix}requested_qty")
         t[f"{prefix}status"] = ("Filled" if not req or (qty or 0) >= int(req)
                                 else "PartiallyFilled")
         t[f"{prefix}fill_refreshed_at"] = _utcnow_iso()
+        if prefix == "broker_":
+            _book_dip_open_fill(t)
     return changed
+
+
+_OPEN_FILL_BOOKS = {"dip_long": "dip", "cap_long": "cap"}      # the books whose limit orders fill at the open
+
+
+def _book_dip_open_fill(t: dict) -> None:
+    """A dip long (or a capitulation-book long) filled AT THE OPEN (``dip_fill_kind`` / ``cap_fill_kind`` "open") books
+    IBKR's own average fill as its entry price (AUDIT151, the user's go-ahead 2026-10-19: the opening print the ledger
+    booked was never attainable — the resting order reaches IBKR ~30 s after the open — and no real price was kept);
+    the print stays as ``dip_open_print`` / ``cap_open_print``. The leg's own fill then costs only its commission
+    (`spread.resolve_leg_cost`). A touch fill keeps its limit."""
+    pre = _OPEN_FILL_BOOKS.get(str(t.get("entry_mechanism") or ""))
+    if pre is None or t.get(f"{pre}_fill_kind") != "open":
+        return
+    try:
+        px, qty = float(t.get("broker_fill_price") or 0.0), float(t.get("broker_fill_qty") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if px <= 0 or qty <= 0:
+        return
+    t.setdefault(f"{pre}_open_print", t.get("entry_price"))
+    if t.get("entry_price") != px:
+        t["entry_price"] = px
+        t[f"{pre}_entry_repriced_at"] = _utcnow_iso()
+        logger.info(f"[broker] {pre} open fill {t.get('ticker')}: the ledger books IBKR's {px} "
+                    f"(the opening print {t.get(pre + '_open_print')})")
 
 
 def _persist_legs(trades: List[dict], changed: Optional[dict] = None) -> None:
@@ -885,6 +929,12 @@ def _owned_by_open(trades: List[dict], exclude: Optional[dict] = None) -> Dict[s
     return out
 
 
+def _holds_positions(broker) -> bool:
+    """A broker whose positions are real: a dry run holds none (an extra account's orders, `src.accounts`), so
+    its empty positions say nothing of a buy-in."""
+    return getattr(broker, "name", "") != "dry_run"
+
+
 def _buy_in_check(trades: List[dict], positions: dict, report: dict) -> bool:
     """IBKR bought a short back? (user 2026-10-07: "The lender can take back borrowed shares, and IBKR then
     buys back our short at market.") Per ticker the selection short holds, IBKR's position is compared with
@@ -934,7 +984,7 @@ def _entry_qty(t: dict, price: float, equity_usd: float, fx_notional: float) -> 
     they are resent at; every other entry the configured sizing (`broker_sizing_mode`)
     times the trade's multiplier."""
     for key in ("sel_account_shares", "dip_account_shares", "etf_dm_account_shares",
-                "crash_account_shares"):                      # a live book's simulated account
+                "crash_account_shares", "cap_account_shares"):   # a live book's simulated account
         if t.get(key) is not None:
             try:
                 return max(0, int(t[key]))
@@ -1171,68 +1221,101 @@ def _sweep_orphan_orders(broker: Broker, trades: List[dict], report: dict) -> No
 DIP_REST_MAX_REFUSALS = 3            # IBKR refusals of one order in one session before it is left for the session
 
 
+def _resting_books() -> List[dict]:
+    """The books whose limit orders rest at IBKR — the dip book's (in its limit mode) and the capitulation book's
+    (2026-10-21): ``label``, its signal ``module`` (``active_orders`` / ``save_orders`` / ``today_et`` /
+    ``MECHANISM``), the ref ``prefix``, its switch and ``free_cap`` (a dip order's fill sells the capitulation book's
+    longs for room: it rests at the size that frees, `live_account.fill_cap`)."""
+    from src.signals import cap_long, dip_long
+    out = []
+    if dip_long.limit_mode():
+        out.append({"label": "dip", "module": dip_long, "prefix": "dipw", "switch": "enable_dip_long",
+                    "free_cap": True, "today_et": dip_long.today_et})
+    out.append({"label": "cap", "module": cap_long, "prefix": "capw", "switch": "enable_cap_long",
+                "free_cap": False, "today_et": dip_long.today_et})
+    return out
+
+
 def _dip_resting_refs() -> set:
-    """The refs of the dip book's limit orders resting at IBKR now — owned, so the orphan sweep keeps them."""
+    """The refs of the dip and capitulation books' limit orders resting at IBKR now — owned, so the orphan sweep keeps
+    them."""
+    out = set()
     try:
-        from src.signals import dip_long
-        if not dip_long.limit_mode():
-            return set()
-        out = set()
-        for lst in dip_long.active_orders(dip_long.today_et()).values():
-            for o in lst:
-                ib = o.get("ibkr") or {}
-                if ib.get("ref") and ib.get("state") == "working":
-                    out.add(ib["ref"])
-        return out
+        books = _resting_books()
     except Exception as e:                                         # noqa: BLE001
-        logger.warning(f"[broker] dip resting refs unreadable ({e}) — the orphan sweep may cancel them")
-        return set()
+        logger.warning(f"[broker] resting books unreadable ({e}) — the orphan sweep may cancel their orders")
+        return out
+    for bk in books:
+        try:
+            for lst in bk["module"].active_orders(bk["today_et"]()).values():
+                for o in lst:
+                    ib = o.get("ibkr") or {}
+                    if ib.get("ref") and ib.get("state") == "working":
+                        out.add(ib["ref"])
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning(f"[broker] {bk['label']} resting refs unreadable ({e}) — the orphan sweep may cancel them")
+    return out
 
 
 def _dip_resting_tickers() -> set:
-    """The names with a dip limit order resting (or possibly filled) at IBKR this session: a position there may be
-    that order's fill, which the ledger links at the next tick (when the bar that reached the limit has ended) — not
-    drift. A fill the ledger never recognizes is flattened as drift from the next session."""
+    """The names with a dip (or capitulation-book) limit order resting (or possibly filled) at IBKR this session: a
+    position there may be that order's fill, which the ledger links at the next tick (when the bar that reached the
+    limit has ended) — not drift. A fill the ledger never recognizes is flattened as drift from the next session."""
+    out = set()
     try:
-        from src.signals import dip_long
-        if not dip_long.limit_mode():
-            return set()
-        today = dip_long.today_et().isoformat()
-        out = set()
-        for lst in dip_long.active_orders(dip_long.today_et()).values():
-            for o in lst:
-                ib = o.get("ibkr") or {}
-                if ib.get("session") == today and ib.get("state") in ("working", "cancel_failed"):
-                    out.add(o["ticker"])
-        return out
+        books = _resting_books()
     except Exception as e:                                         # noqa: BLE001
-        logger.warning(f"[broker] dip resting names unreadable ({e})")
-        return set()
+        logger.warning(f"[broker] resting books unreadable ({e})")
+        return out
+    for bk in books:
+        try:
+            today = bk["today_et"]().isoformat()
+            for lst in bk["module"].active_orders(bk["today_et"]()).values():
+                for o in lst:
+                    ib = o.get("ibkr") or {}
+                    if ib.get("session") == today and ib.get("state") in ("working", "cancel_failed"):
+                        out.add(o["ticker"])
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning(f"[broker] {bk['label']} resting names unreadable ({e})")
+    return out
 
 
 def _sync_dip_orders(broker: Broker, trades: List[dict], report: dict) -> None:
-    """Mirror the ledger's working dip limit orders at IBKR (regular hours only): each order armed for today rests
-    as a DAY limit BUY at its limit, sized to what the live account's room allows NOW (`live_account.fill_cap`) —
-    none when the book is off, another book holds the name, or the order met no room today. A size that changed
-    cancels the resting order and places the new one under a new ref; an order no longer working is cancelled. A
-    cancel that fails (the order may have filled) places nothing behind it: the ledger's bars decide the fill, and
-    the long it opens is linked to that order, whose execution the entry leg then reads. Fail-soft."""
+    """Mirror the ledger's working limit orders of the dip and capitulation books at IBKR (regular hours only;
+    `_sync_book_orders` for each of `_resting_books`). Fail-soft."""
+    try:
+        books = _resting_books()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[broker] resting books unreadable ({e})")
+        return
+    for bk in books:
+        _sync_book_orders(broker, trades, report, bk)
+
+
+def _sync_book_orders(broker: Broker, trades: List[dict], report: dict, bk: dict) -> None:
+    """Mirror one book's working limit orders at IBKR (regular hours only): each order armed for today rests as a DAY
+    limit BUY at its limit, sized to what the live account's room allows NOW (`live_account.fill_cap`; the dip book's
+    as if the capitulation book's longs were sold — its fill sells them) — none when the book is off, another book
+    holds the name, or the order met no room today. A size that changed cancels the resting order and places the new
+    one under a new ref; an order no longer working is cancelled. A cancel that fails (the order may have filled)
+    places nothing behind it: the ledger's bars decide the fill, and the long it opens is linked to that order, whose
+    execution the entry leg then reads. Fail-soft."""
+    label, mod, prefix = bk["label"], bk["module"], bk["prefix"]
     try:
         from src.performance import live_account
         from src.performance.market_calendar import current_session
-        from src.signals import dip_long
-        if not dip_long.limit_mode() or current_session() != "rth":
+        if current_session() != "rth":
             return
         now = datetime.now(timezone.utc)
-        d = dip_long.today_et(now)
+        d = bk["today_et"](now)
         iso = d.isoformat()
-        books = dip_long.active_orders(d)
+        books = mod.active_orders(d)
     except Exception as e:                                         # noqa: BLE001
-        logger.warning(f"[broker] dip limit orders unreadable ({e})")
+        logger.warning(f"[broker] {label} limit orders unreadable ({e})")
         return
-    on = bool(getattr(settings, "enable_dip_long", False))
+    on = bool(getattr(settings, bk["switch"], False))
     other = {t["ticker"] for t in trades
-             if t.get("status") == "OPEN" and t.get("entry_mechanism") != dip_long.MECHANISM}
+             if t.get("status") == "OPEN" and t.get("entry_mechanism") != mod.MECHANISM}
     for dd, lst in books.items():
         changed = False
         for o in lst:
@@ -1241,8 +1324,8 @@ def _sync_dip_orders(broker: Broker, trades: List[dict], report: dict) -> None:
             want = 0
             if (on and o.get("status") == "working" and iso in (o.get("session_armed_at") or {})
                     and o.get("unfunded_session") != iso and o["ticker"] not in other):
-                cap = (live_account.fill_cap(trades, float(o["limit"]), now)[0] if live_account.enabled()
-                       else int(o.get("qty") or 0))
+                cap = (live_account.fill_cap(trades, float(o["limit"]), now, free_cap=bk["free_cap"])[0]
+                       if live_account.enabled() else int(o.get("qty") or 0))
                 want = max(0, min(int(o.get("qty") or 0), int(cap)))
             if int(o.get("ibkr_qty") or 0) != want:
                 o["ibkr_qty"] = want
@@ -1254,12 +1337,12 @@ def _sync_dip_orders(broker: Broker, trades: List[dict], report: dict) -> None:
                 try:
                     ok = bool(broker.cancel_order(ib["ref"]))
                 except Exception as e:                             # noqa: BLE001
-                    logger.warning(f"[broker] dip limit {o['ticker']}: cancel {ib['ref']} raised: {e}")
+                    logger.warning(f"[broker] {label} limit {o['ticker']}: cancel {ib['ref']} raised: {e}")
                 ib["state"] = "cancelled" if ok else "cancel_failed"
                 ib["cancelled_at"] = now.isoformat(timespec="seconds")
                 changed = True
                 why = f"resized to {want}" if want else "no longer to rest"
-                logger.info(f"[broker] dip limit {o['ticker']}: resting {ib.get('qty')} sh cancelled ({why})"
+                logger.info(f"[broker] {label} limit {o['ticker']}: resting {ib.get('qty')} sh cancelled ({why})"
                             + ("" if ok else " — cancel NOT confirmed, nothing placed behind it"))
                 if not ok:
                     continue                                       # never a second order behind one that may have filled
@@ -1267,13 +1350,13 @@ def _sync_dip_orders(broker: Broker, trades: List[dict], report: dict) -> None:
             if want <= 0 or refused >= DIP_REST_MAX_REFUSALS:
                 continue
             k = int(o.get("ibkr_n") or 0) + 1
-            ref = f"dipw-{o['ticker']}-{o['day']}-{k}"
+            ref = f"{prefix}-{o['ticker']}-{o['day']}-{k}"
             req = OrderRequest(ticker=o["ticker"], side="BUY", quantity=want, order_type="LMT",
                                limit_price=round(float(o["limit"]), 2), client_ref=ref, intent="ENTRY", rest=True)
             try:
                 res = broker.submit_order(req)
             except Exception as e:                                 # noqa: BLE001
-                logger.warning(f"[broker] dip limit {o['ticker']}: submit raised: {e}")
+                logger.warning(f"[broker] {label} limit {o['ticker']}: submit raised: {e}")
                 continue
             o["ibkr_n"] = k
             ok = bool(res.ok) and (res.status or "") not in ("Cancelled", "ApiCancelled", "Inactive")
@@ -1288,14 +1371,14 @@ def _sync_dip_orders(broker: Broker, trades: List[dict], report: dict) -> None:
                           limit_price=req.limit_price, fill_price=res.avg_fill_price, commission=res.commission,
                           status=res.status, ok=res.ok, error=res.error, order_id=res.order_id, client_ref=ref,
                           submitted_at=res.submitted_at)
-            report["dip_limits_rested"] = int(report.get("dip_limits_rested") or 0) + (1 if ok else 0)
-            logger.info(f"[broker] dip limit {o['ticker']}: BUY {want} @ {req.limit_price} resting (ref {ref}, "
+            report[f"{label}_limits_rested"] = int(report.get(f"{label}_limits_rested") or 0) + (1 if ok else 0)
+            logger.info(f"[broker] {label} limit {o['ticker']}: BUY {want} @ {req.limit_price} resting (ref {ref}, "
                         f"{res.status})" + ("" if ok else f" — refused: {res.error}"))
         if changed:
             try:
-                dip_long.save_orders(dd, lst)
+                mod.save_orders(dd, lst)
             except Exception as e:                                 # noqa: BLE001
-                logger.warning(f"[broker] dip limit orders of {dd} not saved ({e})")
+                logger.warning(f"[broker] {label} limit orders of {dd} not saved ({e})")
 
 
 # ── drift auto-reconciliation: flatten orphan positions ─────────────────────
@@ -1980,8 +2063,9 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         # ── FILL REFRESH: repair orders that completed after a previous tick ──
         changed = _refresh_fills(broker, trades, report) or changed
 
-        # ── BUY-INS: shorts IBKR holds fewer shares of than the open trades own ──
-        changed = _buy_in_check(trades, positions, report) or changed
+        # ── BUY-INS: shorts IBKR holds fewer shares of than the open trades own (a dry run holds none) ──
+        if _holds_positions(broker):
+            changed = _buy_in_check(trades, positions, report) or changed
 
         # ── ORPHAN SWEEP: working orders no ledger leg owns ───────────────
         # Runs before any decision is made, so this tick reasons about a book
@@ -1998,7 +2082,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
         # ── DRIFT PREVENTION: cancel working entries behind CLOSED trades ──
         changed = _cancel_entries_for_closed(broker, trades, report) or changed
 
-        # ── THE DIP BOOK'S RESTING LIMIT ORDERS (2026-10-09): mirror the ledger's working orders ──
+        # ── THE DIP AND CAPITULATION BOOKS' RESTING LIMIT ORDERS (2026-10-09 / 10-21): mirror the ledger's orders ──
         _sync_dip_orders(broker, trades, report)
 
         # Off-RTH submissions: IBKR rejects MKT outside regular hours, so
@@ -2391,7 +2475,7 @@ def sync(broker: Optional[Broker] = None, trades: Optional[List[dict]] = None,
                     or tk in pending_exit_tickers or tk in exited_this_tick):
                 continue
             if tk in dip_resting and p.quantity > 0:
-                logger.info(f"[broker] {tk}: {p.quantity:g} sh held with a dip limit order resting today — its fill, "
+                logger.info(f"[broker] {tk}: {p.quantity:g} sh held with a long book's limit order resting today — its fill, "
                             f"linked by the ledger at the next tick (not drift)")
                 continue
             entry = {"ticker": tk, "broker_qty": p.quantity, "action": drift_action}
@@ -2485,6 +2569,17 @@ def _apply_entry_result(t: dict, res) -> None:
     t["broker_status"]       = res.status
     t["broker_submitted_at"] = res.submitted_at
     t["broker_client_ref"]   = res.client_ref
+    _stamp_quote(t, "broker_")
+    _book_dip_open_fill(t)
+
+
+def _stamp_quote(t: dict, prefix: str) -> None:
+    """The book the order was priced on at this submit (`_quote_for`, fresh within `_QUOTE_FRESH_SECONDS`) on the
+    leg: a leg with no usable fill of its own is costed at its OWN quoted half-spread (`spread.quote_leg_cost_frac`;
+    AUDIT151, 2026-10-19), not the liquidity-bucket average. Kept from the latest submit with a book."""
+    q = _LAST_QUOTE.get(str(t.get("ticker") or "").upper())
+    if q and (time.time() - q[2]) <= _QUOTE_FRESH_SECONDS and q[0] and q[1] and float(q[1]) >= float(q[0]) > 0:
+        t[f"{prefix}bid_at_submit"], t[f"{prefix}ask_at_submit"] = float(q[0]), float(q[1])
 
 
 def _apply_exit_result(t: dict, res) -> None:
@@ -2496,3 +2591,4 @@ def _apply_exit_result(t: dict, res) -> None:
     t["broker_exit_status"]       = res.status
     t["broker_exit_submitted_at"] = res.submitted_at
     t["broker_exit_client_ref"]   = res.client_ref
+    _stamp_quote(t, "broker_exit_")

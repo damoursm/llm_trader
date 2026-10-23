@@ -19,12 +19,14 @@ account engine at the live costs, `Mimic()` seed 0; A0 from the latest ``<day>_A
   1. ENOUGH TRADES: at least `MIN_TRADES` (100) in at least `MIN_EPISODES` (30) distinct entry months — the trades of
      one month share its market, so the months are its independent episodes;
   2. SIGNIFICANT: the 95% interval of its RETURN PER DAY lies above its BAR (a bootstrap over ENTRY MONTHS — a
-     month's trades resampled together —, `B_BOOT` resamples, seed 0). THE BAR (user directive 2026-10-15: "test long
-     arms against the market's average daily rise. The idea is to beat the market but I'm also ok with using 3x for
-     trades we are confident the market will go up (or down)."): for a LONG arm, what the same exposure earns on an
-     average day over the same span (`BENCH`, `bench_rpd`: SPY's for a stock arm; for an index arm the fund it trades
-     — a 3x fund's own average day, so the leverage is never the edge, the timing is); for a SHORT arm 0 (a random
-     short loses the market's rise: 0 is the stricter bar);
+     month's trades resampled together —, `B_BOOT` resamples, seed 0). THE BAR (user directives 2026-10-15: "test
+     long arms against the market's average daily rise. The idea is to beat the market but I'm also ok with using 3x
+     for trades we are confident the market will go up (or down).", and 2026-10-16: "if we pick a 3x ETF position in
+     the right direction, this should be considered a good pick. So, it's not only about beating the market, it's
+     also about following it with 3x leverage."; PREREG123): for a LONG arm, THE MARKET's average day over the same
+     span (`BENCH`, `bench_rpd`: SPY's), whatever it holds — a stock, a 1x fund or a 3x fund: the leverage is part
+     of the arm's return; for a SHORT arm, and a long position in an inverse fund, 0 (a random short loses the
+     market's rise: 0 is the stricter bar);
   3. TRANSFERABLE: its return per day beats its bar in both chronological halves of its trades (each half against the
      bar over its own span), and with ANY one calendar year left out (a model one year carries does not transfer);
   4. GROWTH: the arm alone at its live slice of a $10,000 account — its P&L realized at each exit and compounded (the
@@ -81,7 +83,7 @@ from src.backtest.account import per_day
 REPO = Path(__file__).resolve().parents[2]
 BANK_DIR = REPO / "cache" / "ml" / "bank"
 ET = "America/New_York"
-ARMS = ("vol", "etf", "fall", "dip", "crash")
+ARMS = ("vol", "etf", "fall", "dip", "crash", "cap")
 POOL = periods.POOLED
 POOL_LO, POOL_HI = periods.pool_span(POOL)
 MIN_TRADES = 100                 # 1. an arm's trades on the pooled history (or its longest)
@@ -90,16 +92,46 @@ MIN_CELL = 30                    # a context cell a reading or a filter rests on
 MIN_CELL_MONTHS = 10             # ... in this many distinct entry months
 B_BOOT, SEED = 10_000, 0
 T_SIG = 1.96                     # 2. the clustered t a longest history carried as yearly summaries must reach
-# 2. THE BAR of each LONG live arm: the daily cache's symbol of what the same exposure earns on an average day (a short
-# arm's bar is 0; `card`'s ``bench`` names a candidate's)
-BENCH = {"dip": "SPY", "crash": "TQQQ"}
+# 2. THE BAR of each LONG live arm: the market's average day (SPY's, the daily cache's symbol), whatever the arm holds
+# — the crash book's TQQQ too (PREREG123); a short arm's bar is 0; `card`'s ``bench`` names a candidate's
+BENCH = {"dip": "SPY", "crash": "SPY", "cap": "SPY"}
 FIRST_WF_YEAR = 2020             # the walk-forward's first out-of-time year (two years to decide on)
 START = 10_000.0
-# the live configuration's latest draws with a daily NAV each (research repository): PREREG116's Q1 — the
-# configuration from the 2026-10-16 session (2026-10-14's — vol give-back 1.25, the ETF arm without the VIX-linked
-# products, PREREG102's LIVE_S3 — with the dip book's daily top pick at 1/6 and at most two shorts of one name)
-LIVE_RUNS = ("studies/prereg116/runs", "Q1")
+# the live configuration's latest draws with a daily NAV each (research repository): PREREG147's S3 — the
+# configuration from the 2026-10-19 session (PREREG116's Q1: vol give-back 1.25, the ETF arm without the VIX-linked
+# products, at most two shorts of one name; PREREG137's earnings dips ranked last; the dip book's daily top pick among
+# the $2B+ signals at 1/3, at most 3 open — user 2026-10-18: "Deploy the $2B+ stocks only, 1/3 per position") on the
+# OWN-SECURITY dip panels (the reused-ticker fix) — under AUDIT151's corrected market model, `Mimic()`'s defaults from
+# 2026-10-19 (the legs' real quoted spreads, lendability at the trade, the halt guard, the dip's attainable open fills,
+# the dividends, the ETF arm's stock-era tickers out, set A's dip warm-up): the default's own draws, DEF151
+# (audit151/default151.py). The same configuration on the simulator before them: PREREG147's S3 (prereg147/runs,
+# `Mimic(**mimic.PRE151)` on the panel without the warm-up); before it (the $1B pick at 1/6) PREREG142's R142_OLD
+# (prereg142/runs); on the stored panels PREREG137's DMTE (prereg116/runs). FROM THE 2026-10-20 SESSION the live
+# configuration is PREREG152's return-per-day tuning on all years (RPD_IS, the user's deploy after PREREG159): its 20
+# draws a set through PREREG152's harness (prereg159/runs, label RPD152; the harness reproduces DEF151 exactly for the
+# configuration before it) — DEF151 stays the previous configuration's. FROM THE 2026-10-21 SESSION RPD_IS + the dip
+# book's RP33 cut + the crash book's after-hours exit + the capitulation book (PREREG167's ALL3, the user 2026-10-20:
+# "Deploy all three."; prereg167/runs, label ALL3 — the default `Mimic()` reproduces its 60 accounts exactly). FROM
+# 2026-10-21 (the vol picks journaled from the 15:00 ET tick) ALL3 with the vol arm's own 15-session limit (PREREG173's
+# V15, the user's call: "Move the vol arm to 15 sessions"; prereg173/runs, label V15 — the default `Mimic()`
+# reproduces its accounts exactly, `studies/prereg173/verify173.py`); ALL3 stays the previous configuration's. FROM
+# 2026-10-21 19:40 ET the SIMULATOR's margin calls are IBKR's liquidation (PREREG174, the user: "I want the backtest to
+# do exactly the same"; `Mimic(margin="ibkr", margin_fill="path")`, the default): V15's draws under it — prereg174/runs,
+# label PATH, the harness with the default `Mimic()`; V15 (the margin calls before it) stays the previous model's.
+# FROM 2026-10-21 22:05 ET the simulator's margin check sees what production's sees (PREREG175: every bar between the
+# marks, every book marked at the off-grid ticks; production's account liquidating as IBKR does): V15's draws on the
+# books rebuilt under it — prereg175/runs, label NEWMARKS; PATH stays PREREG174's
+LIVE_RUNS = ("studies/prereg175/runs", "NEWMARKS")
 RUN_FILE = re.compile(r"^(A0|A|B)_(?P<label>.+)_s(?P<seed>\d+)\.pkl$")
+# a book a study named otherwise -> the live arm's name (PREREG165 / 167 built the capitulation book as "capb"; the
+# live configuration's draws, `LIVE_RUNS`, are PREREG167's): every loaded run speaks the live arms' names
+BOOK_ALIASES = {"capb": "cap"}
+# THE LONGEST HISTORY as a TABLE for a live arm whose earlier trades a study kept (research repository): {arm: (path,
+# key in the pickled dict, what they are)} — read by `long_trades`, judged by `_longest_trades` (the re-judging)
+LONG_TRADES = {"cap": ("studies/prereg165/trades165.pkl", ("oos", 0.2),
+                       "PREREG165's untouched 2006-2017 test: every signal at the deployed 20% breadth on a "
+                       "survivorship-free whole-market panel, limit fills on daily bars, 2 bp a side (the pooled part "
+                       "is the card's: the arm alone through the engine, at most 3 open)")}
 
 
 def live_slices() -> Dict[str, float]:
@@ -107,7 +139,7 @@ def live_slices() -> Dict[str, float]:
     from config.settings import settings as S
     return {"vol": 1.0 / float(S.sel_short_vol_account_slices), "etf": 1.0 / float(S.sel_short_etf_account_slices),
             "fall": 1.0 / float(S.sel_short_fall_account_slices), "dip": 1.0 / float(S.dip_long_account_slices),
-            "crash": 1.0 / float(S.crash_long_account_slices)}
+            "crash": 1.0 / float(S.crash_long_account_slices), "cap": 1.0 / float(S.cap_long_account_slices)}
 
 
 # ── the trades ───────────────────────────────────────────────────────────────
@@ -219,7 +251,7 @@ def alone(t: pd.DataFrame, slice_: float, lo: str, hi: str, start: float = START
                      + (f", at most {int(max_open)} open" if max_open is not None else "")}
 
 
-# ── the bar: the market's average day (user directive 2026-10-15) ───────────
+# ── the bar: the market's average day (user directives 2026-10-15 / 2026-10-16) ──
 
 def _cache_returns(sym: str) -> pd.Series:
     """``sym``'s daily price returns (%) from the daily cache (`cache/ohlcv/<sym>.json`), by session date."""
@@ -370,7 +402,51 @@ def card(T: pd.DataFrame, arm: str, regimes: Optional[pd.DataFrame] = None, long
                           "high": AU.dsr_trades(t.net.to_numpy(float), int(n_trials[1]))}
         except Exception as e:                                        # noqa: BLE001 — a report, never a decision
             rec["dsr"] = {"error": str(e)}
+        try:
+            rec["dsr_months"] = dsr_months(t, n_trials)
+        except Exception as e:                                        # noqa: BLE001 — a report, never a decision
+            rec["dsr_months"] = {"error": str(e)}
     return rec
+
+
+RHO_CLIP = 0.95                  # PREREG183: an estimated autocorrelation is clipped here before the AR(1) terms
+
+
+def monthly_unit_pnl(t: pd.DataFrame, lo: str = POOL_LO, hi: str = POOL_HI) -> pd.Series:
+    """An arm's MONTHLY P&L OF UNIT BETS (PREREG183): every calendar month of [lo, hi], the sum of the net returns
+    (fractions) of its trades ENTERED that month — 0 in a month without one —, keyed "YYYY-MM": the return series the
+    Sharpe-ratio formulas read, its months the bank's independent episodes (a month's trades share its market)."""
+    months = pd.period_range(pd.Timestamp(lo), pd.Timestamp(hi), freq="M").astype(str)
+    s = (t.groupby("month").net.sum() / 100.0) if len(t) else pd.Series(dtype=float)
+    out = pd.Series(0.0, index=months)
+    common = [m for m in s.index if m in out.index]
+    out.loc[common] = s.loc[common].to_numpy(float)
+    return out
+
+
+def dsr_months(t: pd.DataFrame, n_trials: Tuple[int, int], lo: str = POOL_LO, hi: str = POOL_HI) -> dict:
+    """PREREG183's DEFLATED SHARPE ON AN EFFECTIVE N — REPORTED BESIDE PREREG103's per-trade one (``dsr``), never a
+    decision: López de Prado, Lipton & Zoonekynd's construction (`stats.deflated_sharpe_k`) on the arm's monthly
+    unit-bet P&L (`monthly_unit_pnl`), its T the months, with their skewness, kurtosis and lag-1 autocorrelation —
+    where the per-trade one counts every trade as an independent observation (a book buying in same-day batches
+    then reads as many times the evidence it holds). The skill-less trials' Sharpe variance is a / T
+    (`stats.sharpe_variance(0, T, rho)`); ``low`` / ``high`` at the trial ledger's N."""
+    from src.analysis import stats as STS
+    x = monthly_unit_pnl(t, lo, hi)
+    m = STS.sharpe_moments(x.to_numpy(float))
+    T = int(m["n"])
+    rho = float(np.clip(m["rho"], -RHO_CLIP, RHO_CLIP)) if m["rho"] == m["rho"] else 0.0
+    out = {"basis": "monthly P&L of unit bets, every month of the pool (0 without a trade)", "T": T,
+           "active_months": int((x != 0).sum()), "sr_month": m["sr"], "skew": m["skew"], "kurt": m["kurt"],
+           "rho": m["rho"], "rho_used": rho,
+           "psr0": STS.sharpe_psr(m["sr"], 0.0, T, m["skew"], m["kurt"], rho) if m["sr"] == m["sr"] else None}
+    if m["sr"] != m["sr"]:
+        return out
+    v0 = STS.sharpe_variance(0.0, T, rho=rho)
+    for key, n in (("low", n_trials[0]), ("high", n_trials[1])):
+        d = STS.deflated_sharpe_k(m["sr"], max(1, int(n)), T, m["skew"], m["kurt"], rho, sr_var=v0)
+        out[key] = {"N": int(d["n_trials"]), "dsr": d["dsr"], "threshold": d["threshold"]}
+    return out
 
 
 PRE_HI = (pd.Timestamp(POOL_LO) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")     # the last day before the pool
@@ -445,6 +521,27 @@ def _longest(t: pd.DataFrame, long: Mapping, daily: Optional[pd.Series] = None,
             "source": long.get("source", "PREREG103's LONG history (carried)")}
 
 
+def long_trades(arm: str, root: Optional[Path] = None) -> Optional[pd.DataFrame]:
+    """The arm's earlier trades (`LONG_TRADES`) as `card`'s ``long_trades`` table — ``entry_day``, ``net`` / ``gross``
+    (%), ``days`` (24-hour holds), what they are in ``attrs["source"]`` — or None (no table named, or unreadable)."""
+    spec = LONG_TRADES.get(arm)
+    if spec is None:
+        return None
+    if root is None:
+        from config.settings import settings
+        root = Path(settings.backtest_research_dir)
+    try:
+        with open(Path(root) / spec[0], "rb") as fh:
+            t = pickle.load(fh)[spec[1]]
+        out = pd.DataFrame({"entry_day": pd.to_datetime(t["entry_day"]).to_numpy(),
+                            "net": t["net"].astype(float).to_numpy(), "gross": t["gross"].astype(float).to_numpy(),
+                            "days": t["days"].astype(float).to_numpy()})
+    except (OSError, KeyError, ValueError, TypeError, pickle.UnpicklingError):
+        return None
+    out.attrs["source"] = f"{spec[2]} ({spec[0]})"
+    return out
+
+
 def _longest_trades(t: pd.DataFrame, earlier: pd.DataFrame, daily: Optional[pd.Series] = None,
                     bname: Optional[str] = None) -> Optional[dict]:
     """The pooled trades with the arm's EARLIER TRADES (a table: ``entry_day``, ``net``, ``gross``, ``days``; those
@@ -474,7 +571,7 @@ def _longest_trades(t: pd.DataFrame, earlier: pd.DataFrame, daily: Optional[pd.S
             "years_before": sorted({y for y in per if int(y) < int(POOL_LO[:4])}), "halves": hl["halves"],
             "loyo": {y: float(A.net[A.year != int(y)].mean()) for y in per if (A.year != int(y)).any()},
             "loyo_rpd": hl["loyo_rpd"], "loyo_bar": hl["loyo_bar"], "checks": checks,
-            "source": "the arm's earlier trades (a table)"}
+            "source": earlier.attrs.get("source") or "the arm's earlier trades (a table)"}
 
 
 def qualify(c: Mapping) -> dict:
@@ -659,14 +756,32 @@ def activated(t: pd.DataFrame, sched: Mapping[str, dict]) -> np.ndarray:
 
 # ── the combination ──────────────────────────────────────────────────────────
 
+def canonical_book(name) -> str:
+    """A book's live name (`BOOK_ALIASES`; any other name unchanged)."""
+    return BOOK_ALIASES.get(str(name), str(name))
+
+
+def canonical_run(rec: Mapping) -> dict:
+    """A draw record whose positions and margin-call events name their book by its live name (`canonical_book`)."""
+    out = dict(rec)
+    for key in ("pos", "calls", "live_calls"):
+        rows = rec.get(key)
+        if isinstance(rows, list):
+            out[key] = [dict(r, strategy=canonical_book(r["strategy"])) if isinstance(r, dict) and "strategy" in r
+                        else r for r in rows]
+    return out
+
+
 def load_runs(folder: Path, label: str, sets: Sequence[str] = POOL) -> Dict[str, Dict[int, dict]]:
-    """A study's account draws {set: {seed: record}} from ``folder``'s ``<set>_<label>_s<seed>.pkl`` files."""
+    """A study's account draws {set: {seed: record}} from ``folder``'s ``<set>_<label>_s<seed>.pkl`` files, each book
+    under its live name (`canonical_run`: PREREG167's "capb" is the live "cap")."""
     out: Dict[str, Dict[int, dict]] = {}
     for p in sorted(Path(folder).glob(f"*_{label}_s*.pkl")):
         m = RUN_FILE.match(p.name)
         if not m or m.group(1) not in sets or m.group("label") != label:
             continue
-        out.setdefault(m.group(1), {})[int(m.group("seed"))] = pickle.load(open(p, "rb"))
+        with open(p, "rb") as fh:
+            out.setdefault(m.group(1), {})[int(m.group("seed"))] = canonical_run(pickle.load(fh))
     return out
 
 
@@ -734,6 +849,42 @@ def _yearly(path: Path) -> Dict[str, float]:
     return out
 
 
+TR_ALPHA, TR_POWER, TR_DECAY = 0.05, 0.8, 0.5     # PREREG183: one-sided level, target power, the decayed Sharpe
+TR_HORIZONS = (3, 6, 12, 24, 36)                  # months at which the powers are read
+
+
+def track_record(M: pd.DataFrame, alpha: float = TR_ALPHA, power: float = TR_POWER, decay: float = TR_DECAY,
+                 horizons: Sequence[int] = TR_HORIZONS) -> dict:
+    """HOW LONG THE LIVE RECORD NEEDS (PREREG183, López de Prado, Lipton & Zoonekynd's formulas, `src.analysis.stats`):
+    ``M`` = the draws' monthly returns (months x draws, chained through the sets); per draw the Sharpe ratio, skewness,
+    kurtosis and lag-1 autocorrelation, their means over the draws = THE BACKTEST'S. In months, one-sided at
+    ``alpha``: ``profit`` — the MinTRL against 0 (a 50% chance to show it at that length) and the months for ``power``,
+    at the backtest's Sharpe and at ``decay`` x it (PREREG103's out-of-sample decay 0.47); ``shortfall`` — the months
+    for ``power`` of the test that the live Sharpe falls short of the backtest's when it is ``decay`` x it; the powers
+    at ``horizons``. The backtest's Sharpe is in sample: the decayed row is the cautious one."""
+    from src.analysis import stats as STS
+    per = [STS.sharpe_moments(M[c].dropna().to_numpy(float)) for c in M.columns]
+    per = [p for p in per if p["sr"] == p["sr"]]
+    if not per:
+        return {"note": "no draw with a defined Sharpe ratio"}
+    sr, g3, g4 = (float(np.mean([p[k] for p in per])) for k in ("sr", "skew", "kurt"))
+    rho = float(np.clip(np.mean([p["rho"] for p in per if p["rho"] == p["rho"]] or [0.0]), -RHO_CLIP, RHO_CLIP))
+    kw = {"skew": g3, "kurt": g4, "rho": rho}
+    low = decay * sr
+
+    def row(sr1: float, sr0: float) -> dict:
+        return {"sr1": sr1, "sr0": sr0,
+                "months_for_power": STS.track_record_for_power(sr0, sr1, power, alpha=alpha, **kw),
+                "power_at": {str(h): STS.sharpe_power(sr0, sr1, h, alpha=alpha, **kw) for h in horizons}}
+    prof = {"backtest": dict(row(sr, 0.0), min_trl=STS.min_track_record(sr, 0.0, alpha=alpha, **kw)),
+            "decayed": dict(row(low, 0.0), min_trl=STS.min_track_record(low, 0.0, alpha=alpha, **kw))}
+    return {"draws": len(per), "months": int(M.shape[0]), "sr_month": sr, "sr_year": sr * math.sqrt(12.0),
+            "skew": g3, "kurt": g4, "rho": rho, "alpha": alpha, "power": power, "decay": decay,
+            "profit": prof, "shortfall": row(low, sr),
+            "basis": "the draws' monthly simple returns against 0 (no cash rate); the paper's variance with the "
+                     "returns' autocorrelation, skewness and kurtosis"}
+
+
 def combination(runs: Mapping[str, Mapping[int, dict]], regimes: Optional[pd.DataFrame] = None) -> dict:
     """The live configuration on the pooled history (the module docstring) from its draws ``runs`` {set: {seed:
     record}}: the seeds every set has, each chained through the sets."""
@@ -775,6 +926,10 @@ def combination(runs: Mapping[str, Mapping[int, dict]], regimes: Optional[pd.Dat
            "spy": _yearly(Path("cache") / "ohlcv" / "SPY.json"), "qqq": _yearly(Path("cache") / "ohlcv" / "QQQ.json")}
     if regimes is not None:
         out["coverage"] = coverage(M, runs, seeds, regimes)
+    try:                                                               # PREREG183: a report, never a decision
+        out["track_record"] = track_record(M)
+    except Exception as e:                                             # noqa: BLE001
+        out["track_record"] = {"error": str(e)}
     return out
 
 
@@ -865,7 +1020,7 @@ def build(day: Optional[date] = None, cards: Optional[Mapping[str, Path]] = None
             nt = (max(1, int(c["low"])), max(1, int(c["high"])))
         except Exception:                                              # noqa: BLE001 — the ledger is optional
             nt = None
-        cd = card(T, arm, reg, long.get(arm), sl.get(arm), nt)
+        cd = card(T, arm, reg, long.get(arm), sl.get(arm), nt, long_trades=long_trades(arm))
         cd["qualify"] = qualify(cd)
         arms[arm] = cd
     rd = Path(runs_dir) if runs_dir is not None else Path(settings.backtest_research_dir) / LIVE_RUNS[0]
@@ -879,11 +1034,13 @@ def build(day: Optional[date] = None, cards: Optional[Mapping[str, Path]] = None
             "rules": {"min_trades": MIN_TRADES, "min_episodes": MIN_EPISODES, "min_cell": MIN_CELL,
                       "min_cell_months": MIN_CELL_MONTHS, "bootstrap": {"resamples": B_BOOT, "seed": SEED,
                                                                          "over": "entry months"},
-                      "bar": {"long": "the same exposure's average day (user directive 2026-10-15)", "short": 0.0,
-                              "bench": dict(BENCH)},
+                      "bar": {"long": "the market's (SPY's) average day, whatever the arm holds — a 3x fund's "
+                                      "leverage counts (user directives 2026-10-15 / 2026-10-16, PREREG123)",
+                              "short": 0.0, "bench": dict(BENCH)},
                       "rejudge": "an arm failing only significance, its return per day above its bar, is judged on "
                                  "its longest history (user directive 2026-10-15)", "t_sig_summaries": T_SIG},
             "inputs": {"cards": srcs, "runs": f"{rd} / {lab}", "long": {a: v.get("source") for a, v in long.items()},
+                       "long_trades": {a: v[2] for a, v in LONG_TRADES.items()},
                        "bench_history": str(AU.bench_history_json())},
             "arms": arms, "combination": comb}
 
@@ -910,6 +1067,10 @@ def lines(b: Mapping) -> List[str]:
             for k, v in ((c.get("context") or {}).get(name) or {}).items():
                 if v.get("label") in ("EARNS", "LOSES"):
                     out.append(f"         {v['label']:5s} in {k}: n {v['n']} rpd {v['return_per_day']:+.3f}")
+        dm, dt = c.get("dsr_months") or {}, (c.get("dsr") or {}).get("low") or {}
+        if dm.get("low") and dt.get("dsr") is not None:
+            out.append(f"         deflated Sharpe (N {dm['low']['N']}): per trade {dt['dsr']:.2f}, on {dm['T']} months "
+                       f"{dm['low']['dsr']:.2f} (rho {dm['rho_used']:+.2f})")
     cb = b["combination"]
     if cb.get("seeds"):
         g = cb["growth"]
@@ -920,6 +1081,13 @@ def lines(b: Mapping) -> List[str]:
                    f"{cb['months']['worst_month']:+.1f}%, worst 12 months {cb['months']['worst_12m']:+.1f}%")
         out.append("  years: " + "  ".join(f"{y} {v['mean']:+.0f}% (SPY {cb['spy'].get(y, float('nan')):+.0f})"
                                          for y, v in cb["years"].items()))
+        tr = cb.get("track_record") or {}
+        if tr.get("profit"):
+            pb, pd_, sf = tr["profit"]["backtest"], tr["profit"]["decayed"], tr["shortfall"]
+            out.append(f"  live record needs (months, 5% one-sided): to show a profit {pb['min_trl']:.1f} at the "
+                       f"backtest's Sharpe ({pb['months_for_power']:.1f} for 80% power), {pd_['min_trl']:.1f} at "
+                       f"{tr['decay']:g} x it ({pd_['months_for_power']:.1f}); to show it falls to {tr['decay']:g} x "
+                       f"{sf['months_for_power']:.1f}")
     return out
 
 

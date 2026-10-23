@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from src.backtest.periods import OWN_ARCHIVE_FROM  # our own archive of IBKR's file decides from here
 from src.backtest import account as A
 
 FEE_MED = 9.75                         # %/yr: the median fee the recorded book used without an IBKR history
@@ -111,6 +112,12 @@ def excluded_events(period: Optional[str], exclude: Iterable[str], recorded: Opt
         f"needs them: production never ranks those products) — build them: python "
         f"{Path(root or settings.backtest_research_dir) / 'studies' / 'prereg102' / 'events102.py'} work; or pass "
         f"Mimic(etf_vix=True) for the arm before 2026-10-14")
+
+
+def archive_day(dn: int, lend_end: int, own_from: int) -> bool:
+    """A day an IBKR file decides lendability: IBKR's archived file (to `LEND_END`) or OUR OWN archive of it (from
+    `OWN_ARCHIVE_FROM`, set D — PREREG188); between them the modelled draws (``lend_after``) decide."""
+    return int(dn) <= int(lend_end) or int(dn) >= int(own_from)
 
 
 class EtfArm:
@@ -196,7 +203,8 @@ class EtfArm:
                max_dtc: Optional[float] = 1.0, min_rvol: float = 1.58, trend: Optional[str] = None,
                entry: str = "next", lend_after: Optional[Callable[[str, int], bool]] = None, cagap: bool = False,
                ctx: bool = False, limit: Optional[tuple] = None, through: bool = False,
-               turn: Optional[tuple] = None, exclude: Optional[Iterable[str]] = None) -> List[dict]:
+               turn: Optional[tuple] = None, exclude: Optional[Iterable[str]] = None,
+               lend_at: Optional[Callable] = None) -> List[dict]:
         """Pieces for picks on sessions [lo, hi]. ``lend``: "archive" = IBKR's archived file at the pick (to
         2024-06-24), None = the recorded book's flag (IBKR's file of 2026-09-26, the parity basis). ``trend``
         (PREREG45): "no_uptrend" skips a product whose previous session close is above its 200-session average,
@@ -217,12 +225,15 @@ class EtfArm:
         Its lendability is judged when it ENTERS, as live: IBKR's archived file at the turning bar, else
         ``lend_after`` on the turn's day.
         PREREG102: ``exclude`` (plain symbols) — products the arm never ranks: the picks re-ranked without them
-        (`events`; production's VIX block), never a piece of one of them."""
+        (`events`; production's VIX block), never a piece of one of them.
+        AUDIT151: ``lend_at`` — the archive days' check in `borrow_history.lendable_at`'s signature (default that
+        reader; `mimic.lendable_at_trade`: lendable at the trade, not on the morning file)."""
         ve, cal = self.ve, self.cal
         E = self.picks(lo, hi, max_dtc, min_rvol, exclude=exclude)
         if lend is None:
             E = E[E.borrowable.astype(bool)]
         lend_end = ve.dnum(LEND_END)
+        own_from = ve.dnum(OWN_ARCHIVE_FROM)      # PREREG188: our own archive of IBKR's file decides from here (set D)
         end_dn = ve.dnum(data_end)
         if entry not in ("next", "pick"):
             raise ValueError(f"entry must be 'next' or 'pick', not {entry!r}")
@@ -258,9 +269,10 @@ class EtfArm:
                     if (trend == "no_uptrend" and up) or (trend == "uptrend_only" and not up):
                         continue
             if turn is None:                                   # judged at the pick; a turn is judged when it enters
-                if lend == "archive" and int(r.dn) <= lend_end:
+                if lend == "archive" and archive_day(int(r.dn), lend_end, own_from):
                     from src.data.deep.borrow_history import lendable_at
-                    ok, _ = lendable_at(ve.plain(r.tkn), pd.Timestamp(int(ns[p]), unit="ns", tz="UTC"), px * f)
+                    ok, _ = (lend_at or lendable_at)(ve.plain(r.tkn), pd.Timestamp(int(ns[p]), unit="ns", tz="UTC"),
+                                                     px * f)
                     if ok is False:
                         continue
                 elif lend_after is not None and int(r.dn) > lend_end and not lend_after(str(r.tkn), int(r.dn)):
@@ -273,9 +285,10 @@ class EtfArm:
                 if q is None:
                     continue
                 t_day = int(A.day_numbers([int(q["ens"])])[0])
-                if lend == "archive" and t_day <= lend_end:
+                if lend == "archive" and archive_day(t_day, lend_end, own_from):
                     from src.data.deep.borrow_history import lendable_at
-                    ok, _ = lendable_at(ve.plain(r.tkn), pd.Timestamp(int(q["ens"]), unit="ns", tz="UTC"), q["e"])
+                    ok, _ = (lend_at or lendable_at)(ve.plain(r.tkn), pd.Timestamp(int(q["ens"]), unit="ns", tz="UTC"),
+                                                     q["e"])
                     if ok is False:
                         continue
                 elif lend_after is not None and t_day > lend_end and not lend_after(str(r.tkn), t_day):

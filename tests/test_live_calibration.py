@@ -173,8 +173,8 @@ def test_assumptions_are_the_simulators():
 
 
 def test_the_eod_chain_runs_it_last():
-    from src.scheduler import eod
-    assert eod.STEPS[-1] == "live_calibration" and "live_calibration" in eod.STEP_FNS
+    from src.scheduler import eod                      # the forward check (2026-10-23) runs after it
+    assert eod.STEPS[-2:] == ("live_calibration", "forward_check") and "live_calibration" in eod.STEP_FNS
     assert type(settings).model_fields["enable_eod_live_calibration"].default is True
 
 
@@ -221,12 +221,30 @@ def _closed(arm=None, mech="sel_short", action="SELL", entry="2026-10-12T14:00:0
     return t
 
 
-def _ref(**arms):
-    """Write the simulator's reference file under the (isolated) record directory."""
+def _ref(current=False, **arms):
+    """Write the simulator's reference file under the (isolated) record directory — ``current``: stamped with the
+    deployed configuration's fingerprints (else it carries none, as every reference before 2026-10-21: stale)."""
     LC.out_dir().mkdir(parents=True, exist_ok=True)
     js = {"as_of": "2026-10-11", "source": "test", "arms": arms}
+    if current:
+        fps = LC.current_fingerprints()
+        js.update(fingerprints={a: fps["arms"][a] for a in arms}, simulator=fps["simulator"])
     (LC.out_dir() / LC.REFERENCE_FILE).write_text(json.dumps(js), encoding="utf-8")
     return js
+
+
+def _apart(arm, n, ret=-10.5, exit_px=11.0, start=date(2026, 10, 12), **kw):
+    """``n`` closed trades of ``arm`` entered and closed on distinct sessions (each its own episode): entered
+    ``start`` + i days, closed two days later."""
+    from datetime import timedelta
+    out = []
+    for i in range(n):
+        e = start + timedelta(days=i)
+        x = e + timedelta(days=2)
+        r = ret[i] if isinstance(ret, (list, tuple)) else ret
+        out.append(_closed(arm, entry=f"{e.isoformat()}T14:00:00+00:00", exit_=f"{x.isoformat()}T14:00:00+00:00",
+                           exit_px=exit_px, ret=r, ticker=f"{(arm or 'x').upper()}{i}", **kw))
+    return out
 
 
 def test_arm_keys_and_books_are_the_simulators():
@@ -243,13 +261,14 @@ def test_arms_split_by_sel_arm_and_by_mechanism():
          _closed("vol", ticker="CCC"),
          _closed(mech=books.DIP_LONG, action="BUY", entry_px=100.0, exit_px=101.0, ret=0.9, ticker="DDD"),
          _closed(mech=books.CRASH_LONG, action="BUY", entry_px=50.0, exit_px=52.0, ret=3.8, ticker="TQQQ"),
+         _closed(mech=books.CAP_LONG, action="BUY", entry_px=80.0, exit_px=83.0, ret=3.6, ticker="KKK"),
          _closed("model"), _closed("vol2"), _closed("thin"),                        # the shadow arms: not counted
          _closed("model+vol", ticker="EEE"),                                         # a pre-2026-10-04 shared stamp
          _closed(mech=books.ETF_DM, action="BUY", ticker="QQQ"),                     # a live book, not an arm
          _closed(mech="rank", action="BUY", ticker="FFF"),                           # legacy
          _closed("vol", entry="2026-10-08T14:00:00+00:00", ticker="GGG")]           # entered before the window
     f = LC.arm_facts(T, date(2026, 10, 9), date(2026, 10, 14))
-    assert {a: f[a]["n"] for a in LC.ARM_KEYS} == {"vol": 3, "etf": 1, "fall": 1, "dip": 1, "crash": 1}
+    assert {a: f[a]["n"] for a in LC.ARM_KEYS} == {"vol": 3, "etf": 1, "fall": 1, "dip": 1, "crash": 1, "cap": 1}
     assert LC.arm_of(_closed("model+vol")) == "vol" and LC.arm_of(_closed("model")) is None
     assert LC.arm_of({"entry_mechanism": books.SEL_SHORT}) is None                 # no arm stamped at all
 
@@ -299,24 +318,24 @@ def test_too_few_trades_is_the_verdict_under_five_and_open_trades_do_not_count()
 def test_a_gap_is_noted_when_the_reference_sits_outside_the_live_ranges():
     _ref(vol={"return_per_day": 1.3, "gross_win_rate": 0.68, "avg_trade": 3.0, "avg_days": 2.5, "n": 400, "set": "A"},
          fall={"return_per_day": 1.5, "gross_win_rate": 0.1, "avg_trade": -9.0, "avg_days": 2.0, "n": 80, "set": "A"})
-    # eight shorts that all ROSE: gross win 0/8 (Wilson 0 .. 0.32), the net median -10.5 (range -10.5 .. -10.5)
-    T = [_closed("vol", exit_px=11.0, ret=-10.5, ticker=f"V{i}") for i in range(8)]
+    # eight shorts that all ROSE, each its own episode: gross win 0/8 (Wilson 0 .. 0.32), the median -10.5
+    T = _apart("vol", 8)
     # eight fallers, every one a loser too, but the reference lies inside both live ranges
-    rets = [-12.0, -11.0, -10.5, -10.0, -9.0, -8.0, -7.0, -6.0]
-    T += [_closed("fall", exit_px=11.0, ret=r, ticker=f"F{i}") for i, r in enumerate(rets)]
-    rec = LC.arm_records(T, date(2026, 10, 9), date(2026, 10, 14))
+    T += _apart("fall", 8, ret=[-12.0, -11.0, -10.5, -10.0, -9.0, -8.0, -7.0, -6.0])
+    rec = LC.arm_records(T, date(2026, 10, 9), date(2026, 10, 31))
     v = rec["vol"]
-    assert v["verdict"] == "gap"
+    assert v["verdict"] == "gap" and v["episodes"] == 8
     assert v["checks"]["gross_win_rate"]["inside"] is False and v["checks"]["avg_trade"]["inside"] is False
     assert v["checks"]["return_per_day"]["diff"] == pytest.approx(v["return_per_day"] - 1.3)
     assert rec["fall"]["verdict"] == "consistent"                                     # 0.1 in 0 .. 0.32; -9 in -12 .. -6
     notes = LC.compare({"arms": rec}, {})
     assert len(notes) == 1
-    assert notes[0].startswith("the vol arm's 8 live trades: gross win 0/8 (0%; the simulator 68%)")
-    assert "net median -10.50% a trade (the simulator's average +3.00%)" in notes[0]
+    assert notes[0].startswith("the vol arm's 8 live trades in 8 episodes since 2026-10-09: gross win 0/8 (0% over "
+                               "the episodes; the simulator 68%)")
+    assert "the episodes' median net -10.50% a trade (the simulator's average +3.00%)" in notes[0]
     assert "vs the simulator's 1.30 %/day" in notes[0]
     # the same gap on four trades is "too few trades" and silent
-    few = LC.arm_records(T[:4], date(2026, 10, 9), date(2026, 10, 14))
+    few = LC.arm_records(T[:4], date(2026, 10, 9), date(2026, 10, 31))
     assert few["vol"]["verdict"] == "too few trades" and LC.compare({"arms": few}, {}) == []
 
 
@@ -332,22 +351,128 @@ def test_a_missing_reference_file_compares_nothing():
     assert LC.reference() == {}
 
 
+def _floor(monkeypatch, iso="2026-10-09T09:30:00-04:00"):
+    """Move the arms' floor (the live account's fresh start) to ``iso``."""
+    monkeypatch.setattr(settings, "live_account_fresh_start", iso)
+
+
 def test_the_record_carries_the_arms_and_their_gap_rides_through_health(monkeypatch):
-    """2026-10-19: eight vol shorts entered 10-12 sit in the record since 10-09, not in the last five sessions."""
+    """Eight vol shorts entered 10-09 .. 10-16 (each its own episode) sit in the record since 10-09, five of them in
+    the last five sessions' window; a CURRENT reference judges them, the gap rides through the banner, and the live
+    arms without a reference make the reference's own note."""
     _quiet_sections(monkeypatch)
-    _ref(vol={"return_per_day": 1.3, "gross_win_rate": 0.68, "avg_trade": 3.0, "avg_days": 2.5, "n": 400, "set": "A"})
-    T = [_closed("vol", exit_px=11.0, ret=-10.5, ticker=f"V{i}") for i in range(8)]
+    _floor(monkeypatch)
+    _ref(current=True,
+         vol={"return_per_day": 1.3, "gross_win_rate": 0.68, "avg_trade": 3.0, "avg_days": 2.5, "n": 400, "set": "A"})
+    T = _apart("vol", 8, start=date(2026, 10, 9))
     rec = LC.build(date(2026, 10, 19), T)
     assert rec["reference"]["as_of"] == "2026-10-11" and rec["reference"]["arms"] == ["vol"]
+    assert rec["reference"]["stale"] == {}
     assert rec["since"]["arms"]["vol"]["n"] == 8 and rec["since"]["arms"]["vol"]["verdict"] == "gap"
-    assert rec["window"]["arms"]["vol"]["n"] == 0 and rec["window"]["arms"]["vol"]["verdict"] == "too few trades"
     assert rec["session"]["arms"]["dip"]["verdict"] == "no reference"
-    assert len(rec["notes"]) == 1 and rec["notes"][0].startswith("the vol arm's 8 live trades")
+    assert rec["notes"][0].startswith("the simulator's reference (as of 2026-10-11) is out of date — none for etf, ")
+    assert rec["notes"][1].startswith("the vol arm's 8 live trades in 8 episodes since 2026-10-09")
     path = LC.write(date(2026, 10, 19), T)
     assert json.loads(path.read_text(encoding="utf-8"))["since"]["arms"]["vol"]["return_per_day"] is not None
     h = LC.health()
-    assert h["problems"] == [] and h["notes"][1].startswith("live vs simulator: the vol arm's 8 live trades")
+    assert h["problems"] == [] and h["notes"][2].startswith("live vs simulator: the vol arm's 8 live trades")
     (LC.out_dir() / LC.REFERENCE_FILE).unlink()                                      # the file gone: nothing compared
     missing = LC.build(date(2026, 10, 19), T)
     assert missing["reference"] == {"path": str(LC.out_dir() / LC.REFERENCE_FILE), "missing": True}
     assert missing["since"]["arms"]["vol"]["verdict"] == "no reference" and missing["notes"] == []
+
+
+# ── 2026-10-21: the arm's own exits, episodes, configuration epochs, a stale reference (the user's "Fix all") ─────
+
+def test_forced_exits_are_reported_apart_never_scored():
+    """2026-10-20: the fresh start's nine closes of five chip stocks read as a dip "gap" — the account's and the
+    operator's closes are not the rule's."""
+    from src.performance import books
+    dip = dict(mech=books.DIP_LONG, action="BUY", entry_px=100.0)
+    T = _apart(None, 3, ret=2.0, exit_px=102.0, exit_reason="dip_rebound", **dip)
+    T += _apart(None, 2, ret=-15.0, exit_px=85.0, exit_reason="fresh_start", start=date(2026, 10, 20), **dip)
+    T += _apart(None, 1, ret=-3.0, exit_px=97.0, exit_reason="dip_gave_way", start=date(2026, 10, 25), **dip)
+    T += _apart("vol", 2, ret=-40.0, exit_px=14.0, exit_reason="sel_margin_call", start=date(2026, 10, 26))
+    f = LC.arm_facts(T, date(2026, 10, 9), date(2026, 10, 31))
+    d = f["dip"]
+    assert d["n"] == 3 and d["avg_trade"] == pytest.approx(2.0) and d["gross_win"]["k"] == 3
+    assert d["forced"]["n"] == 3 and d["forced"]["by_reason"] == {"fresh_start": 2, "dip_gave_way": 1}
+    assert d["forced"]["avg_trade"] == pytest.approx(-11.0) and d["forced"]["gross_win"]["k"] == 0
+    assert f["vol"]["n"] == 0 and f["vol"]["forced"]["by_reason"] == {"sel_margin_call": 2}
+    for r in ("fresh_start", "cap_delever", "crash_margin_call", "cap_gave_way"):
+        assert LC.forced_exit({"exit_reason": r})
+    for r in ("dip_rebound", "sel_target", "sel_cover", "crash_pm_exit", "cap_time", None):
+        assert not LC.forced_exit({"exit_reason": r})
+
+
+def test_episodes_join_trades_entered_or_closed_in_the_same_session():
+    T = [{"entry_date": "2026-10-12", "exit_date": "2026-10-14"},
+         {"entry_date": "2026-10-13", "exit_date": "2026-10-14"},       # closed with the first
+         {"entry_date": "2026-10-13", "exit_date": "2026-10-15"},       # entered with the second: the same episode
+         {"entry_date": "2026-10-14", "exit_date": "2026-10-16"},       # entered the day the first two closed: apart
+         {"entry_date": "2026-10-20", "exit_date": None}]
+    assert LC.episodes(T) == [[0, 1, 2], [3], [4]]
+    assert LC.episodes([]) == []
+
+
+def test_correlated_trades_count_once_in_the_verdict():
+    """Eight losers of one basket — bought in one session, sold in one — are ONE episode: too few to judge; the same
+    eight on eight sessions are a gap."""
+    _ref(current=True,
+         vol={"return_per_day": 1.3, "gross_win_rate": 0.68, "avg_trade": 3.0, "avg_days": 2.5, "n": 400, "set": "A"})
+    basket = [_closed("vol", exit_px=11.0, ret=-10.5, ticker=f"V{i}") for i in range(8)]
+    rec = LC.arm_records(basket, date(2026, 10, 9), date(2026, 10, 31))
+    assert rec["vol"]["n"] == 8 and rec["vol"]["episodes"] == 1 and rec["vol"]["verdict"] == "too few episodes"
+    assert LC.compare({"arms": rec}, {}) == []
+    apart = LC.arm_records(_apart("vol", 8), date(2026, 10, 9), date(2026, 10, 31))
+    assert apart["vol"]["episodes"] == 8 and apart["vol"]["verdict"] == "gap"
+
+
+def test_the_arms_start_at_the_fresh_start_and_at_their_epoch(monkeypatch):
+    """Trades entered before the live account's fresh start (or before an arm's settings changed) are never scored
+    against the deployed rules' reference."""
+    _floor(monkeypatch, "2026-10-20T09:30:00-04:00")
+    fps = {"vol": "aaa", "dip": "ddd"}
+    ep = LC.epochs(date(2026, 10, 21), fps)                              # nothing stored: every arm from the floor
+    assert ep["vol"] == {"since": "2026-10-20", "fingerprint": "aaa", "changed": False}
+    LC._keep_epochs(date(2026, 10, 21), ep)
+    same = LC.epochs(date(2026, 10, 22), fps)
+    assert same["vol"]["since"] == "2026-10-20" and not same["vol"]["changed"]
+    moved = LC.epochs(date(2026, 10, 23), {"vol": "aaa", "dip": "eee"})    # the dip book's settings changed
+    assert moved["dip"] == {"since": "2026-10-23", "fingerprint": "eee", "changed": True}
+    assert moved["vol"]["since"] == "2026-10-20"
+    LC._keep_epochs(date(2026, 10, 23), moved)
+    LC._keep_epochs(date(2026, 10, 22), same)                            # a rerun of an earlier day moves nothing
+    assert LC.epochs(date(2026, 10, 24), {"vol": "aaa", "dip": "eee"})["dip"]["since"] == "2026-10-23"
+    T = _apart("vol", 3, ret=1.0, exit_px=9.9, start=date(2026, 10, 17))   # entered 10-17, 10-18, 10-19
+    T += _apart("vol", 2, ret=2.0, exit_px=9.8, start=date(2026, 10, 20))  # entered 10-20, 10-21
+    f = LC.arm_facts(T, date(2026, 10, 9), date(2026, 10, 31), {"vol": date(2026, 10, 20)})
+    assert f["vol"]["n"] == 2 and f["vol"]["since"] == "2026-10-20" and f["vol"]["avg_trade"] == pytest.approx(2.0)
+
+
+def test_a_reference_built_on_other_rules_is_stale_and_judges_nothing():
+    ref = {"return_per_day": 1.3, "gross_win_rate": 0.68, "avg_trade": 3.0, "avg_days": 2.5, "n": 400, "set": "A"}
+    js = _ref(vol=ref)                                                   # no fingerprint: a reference before them
+    fps = LC.current_fingerprints()
+    assert "error" not in fps and set(fps["arms"]) == set(LC.ARM_KEYS)
+    assert LC.stale_arms(js, fps) == {"vol": "no fingerprint; no simulator fingerprint"}
+    rec = LC.arm_records(_apart("vol", 8), date(2026, 10, 9), date(2026, 10, 31), js["arms"],
+                         stale=LC.stale_arms(js, fps))
+    assert rec["vol"]["verdict"] == "stale reference" and LC.compare({"arms": rec}, {}) == []
+    cur = _ref(current=True, vol=ref)
+    assert LC.stale_arms(cur, fps) == {}
+    changed = dict(fps, arms=dict(fps["arms"], vol="changed"))           # a deploy since the build
+    assert LC.stale_arms(cur, changed) == {"vol": "its settings changed since"}
+    note = LC._reference_note(cur, LC.stale_arms(cur, changed), changed)
+    assert "built on other rules than the deployed vol" in note and "none for etf, fall, dip, crash, cap" in note
+    assert "python -m src.backtest.reliability --build" in note
+    assert LC._reference_note(cur, {}, {"arms": {"vol": "x"}}) is None
+
+
+def test_the_fingerprint_moves_with_an_arms_setting_and_only_its_own(monkeypatch):
+    from src.backtest import reliability as REL
+    before = {a: REL.arm_fingerprint(a) for a in REL.ARMS}
+    monkeypatch.setattr(settings, "dip_long_exit_sma_sessions", int(settings.dip_long_exit_sma_sessions) + 1)
+    after = {a: REL.arm_fingerprint(a) for a in REL.ARMS}
+    assert after["dip"] != before["dip"] and all(after[a] == before[a] for a in REL.ARMS if a != "dip")
+    assert REL.simulator_fingerprint() == REL.simulator_fingerprint()

@@ -179,7 +179,7 @@ def test_vol_arm_ranks_atr_with_its_own_history_and_first_pick(on):
     assert (m["ticker"], m["arm"]) == ("N00", "model")
     assert (v["ticker"], v["arm"], v["decision"]) == ("N24", "vol", "short")
     assert v["score"] == pytest.approx(5.0) and v["target"] == pytest.approx(20.0 - ss.give_back("vol") * 10.0)
-    assert datetime.fromisoformat(v["deadline"]) == ss.bar_end_et(ss.session_after(d, 15), 2)
+    assert datetime.fromisoformat(v["deadline"]) == ss.bar_end_et(ss.session_after(d, ss.max_hold("vol")), 2)
     # a row without the session snapshot still carries its ATR%: the vol arm ranks it, the model cannot
     r2 = res.assign(status="NO_SNAPSHOT")
     assert ss.select(r2, d, 2, stand, [])["decision"] == "thin_run"
@@ -279,7 +279,7 @@ def test_short_interest_filter_journals_crowded_picks_untraded(on, monkeypatch):
         r = ss.select(res.assign(dtc=np.where(res.ticker == tk, 1.47, 1.0)), d, 2, stand, [], arm=arm)
         assert (r["ticker"], r["decision"], r["days_to_cover"]) == (tk, "crowded", 1.47)
         assert r["target"] == pytest.approx(20.0 - ss.give_back(arm) * 10.0)
-        assert datetime.fromisoformat(r["deadline"]) == ss.bar_end_et(ss.session_after(d, 15), 2)
+        assert datetime.fromisoformat(r["deadline"]) == ss.bar_end_et(ss.session_after(d, ss.max_hold(arm)), 2)
     # unknown passes: a NaN in the scores, or scores without the column
     assert ss.select(res.assign(dtc=np.nan), d, 2, stand, [])["decision"] == "short"
     assert ss.select(res, d, 2, stand, [])["days_to_cover"] is None
@@ -379,7 +379,7 @@ def test_vol_arm_relative_volume_filter_journals_low_rvol_untraded(on, monkeypat
     r = ss.select(low, d, 2, stand, [], arm="vol")
     assert (r["ticker"], r["decision"], r["rvol"]) == ("N24", "low_rvol", 1.2)
     assert r["target"] == pytest.approx(20.0 - ss.give_back("vol") * 10.0)
-    assert datetime.fromisoformat(r["deadline"]) == ss.bar_end_et(ss.session_after(d, 15), 2)
+    assert datetime.fromisoformat(r["deadline"]) == ss.bar_end_et(ss.session_after(d, ss.max_hold("vol")), 2)
     json.dumps(r)
     # at the cut passes; unknown passes (NaN, or scores without the column)
     assert ss.select(res.assign(rvol=1.58), d, 2, stand, [], arm="vol")["decision"] == "short"
@@ -630,10 +630,13 @@ def test_give_back_per_arm(on, monkeypatch):
     """User directive 2026-10-04 evening: the 100% give-back for the VOL arm ("Vol arm only", once the
     per-arm numbers were in) — its target is the close 5 sessions before the pick, the whole run-up; the
     ETF arm too from the 2026-10-12 session (PREREG77, the user's choice); the model arm keeps half; the VOL
-    arm gives back 125% from 2026-10-14 (PREREG97's G1: its target is BELOW the close 5 sessions before). Each
-    arm reads its own knob."""
-    assert settings.sel_short_vol_give_back == pytest.approx(1.25) and settings.sel_short_give_back == pytest.approx(0.5)
-    assert settings.sel_short_etf_give_back == pytest.approx(1.0)
+    arm gives back 125% from 2026-10-14 (PREREG97's G1: its target is BELOW the close 5 sessions before); the vol
+    and ETF arms give back half from the 2026-10-20 session (PREREG159's RPD_IS). Each arm reads its own knob."""
+    assert settings.sel_short_vol_give_back == pytest.approx(0.5) and settings.sel_short_give_back == pytest.approx(0.5)
+    assert settings.sel_short_etf_give_back == pytest.approx(0.5)
+    assert [ss.give_back(a) for a in ("model", "vol", "etf")] == [0.5, 0.5, 0.5]
+    monkeypatch.setattr(settings, "sel_short_vol_give_back", 1.25)            # each arm its own knob
+    monkeypatch.setattr(settings, "sel_short_etf_give_back", 1.0)
     assert [ss.give_back(a) for a in ("model", "vol", "etf")] == [0.5, 1.25, 1.0]
     d = date(2026, 9, 28)
     res = _res()
@@ -642,7 +645,10 @@ def test_give_back_per_arm(on, monkeypatch):
     got = {a: ss.select(res, d, 2, stand, [], arm=a) for a in ("model", "vol", "etf")}
     assert all(r["decision"] == "short" for r in got.values())
     assert [got[a]["target"] for a in ("model", "vol", "etf")] == pytest.approx([15.0, 7.5, 10.0])    # px 20, 5 sessions before 10
-    assert len({r["deadline"] for r in got.values()}) == 1                    # the deadline is the same 15 sessions
+    for a, r in got.items():                                                  # each arm's own time limit (PREREG159)
+        assert datetime.fromisoformat(r["deadline"]) == ss.bar_end_et(ss.session_after(d, ss.max_hold(a)), 2)
+    # PREREG173's V15 (2026-10-21): the vol arm's own 15 sessions, the model arm's 15, the ETF arm's 10
+    assert got["vol"]["deadline"] == got["model"]["deadline"] != got["etf"]["deadline"]
     monkeypatch.setattr(settings, "sel_short_vol_give_back", 0.25)            # the knobs stay per arm
     monkeypatch.setattr(settings, "sel_short_give_back", 1.0)
     assert [ss.give_back(a) for a in ("model", "vol", "etf")] == [1.0, 0.25, 1.0]
@@ -1450,7 +1456,7 @@ def test_vol_backups_follow_the_evaluated_fallback_rule(on, monkeypatch):
     assert [b["ticker"] for b in rec["backups"]] == ["V1", "V2"] and [b["rank"] for b in rec["backups"]] == [2, 3]
     b = rec["backups"][0]
     assert b["target"] == pytest.approx(20.0 - ss.give_back("vol") * 10.0)
-    assert datetime.fromisoformat(b["deadline"]) == ss.bar_end_et(ss.session_after(d, 15), 4)
+    assert datetime.fromisoformat(b["deadline"]) == ss.bar_end_et(ss.session_after(d, ss.max_hold("vol")), 4)
     # rank 2 not fresh: it leaves the fresh pool and is no backup; rank 4 is never a backup
     rec = ss.select(res, d, 4, _fb_stand(res, stale=("V1",)), [], arm="vol")
     assert rec["fresh_pool"] == ["V0", "V2"] and [b["ticker"] for b in rec["backups"]] == ["V2"]

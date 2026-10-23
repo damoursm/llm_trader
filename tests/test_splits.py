@@ -199,6 +199,20 @@ def test_a_working_dip_order_is_rescaled_like_a_position(on):
     assert dip_long.apply_order_splits([o2], et(2026, 10, 8, 9, 30)) == 0 and o2["limit"] == 75.18
 
 
+def test_a_withdrawn_split_restores_a_dip_orders_quantity_with_its_limit(on):
+    """A pending order rescaled by a 2-for-1, then placed (its quantity in the new terms), then the record withdrawn
+    (the split table called it false, 2026-10-16): the order comes back to its day's terms — its quantity WITH its
+    limit (the quantity was kept in the new terms: x2 the notional)."""
+    from src.signals import dip_long
+    r = {"oid": "FWD|2026-10-05", "ticker": "FWD", "day": "2026-10-05", "status": "pending", "close": 152.0,
+         "atr14": 3.3, "sma_trend": 140.0, "limit": 150.37, "qty": None, "ibkr_qty": 0, "events": []}
+    assert dip_long.apply_order_splits([r], et(2026, 10, 7, 9, 30)) == 1 and r["limit"] == 75.18
+    r.update(status="working", qty=12)                                      # placed after the split: 12 x $75.18
+    on["FWD"] = []                                                          # the record withdrawn
+    assert dip_long.apply_order_splits([r], et(2026, 10, 8, 9, 30)) == 1
+    assert r["limit"] == 150.37 and r["qty"] == 6                           # ~$902 either way
+
+
 def test_off_nothing_moves(on, monkeypatch):
     monkeypatch.setattr(settings, "enable_split_adjustment", False)
     t, o = short(), {"ticker": "FWD", "day": "2026-10-05", "status": "working", "limit": 150.0, "qty": 7}

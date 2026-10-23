@@ -32,10 +32,17 @@ from config import settings
 # (PREREG95's {A,B}_LIVE_S2, PREREG101's A0_LIVE_S2) used 1.0 — pair a new study with new live draws, or pin 1.0
 LIVE = {"top_k": 1, "fallback": 5, "fresh_W": 20, "fresh_k": 1, "min_atr": 0.0, "runup_L": 5, "min_runup": 0.0,
         "max_dtc": 1.0, "min_rvol": 1.58, "min_lend_usd": 1e4, "max_fee": None, "max_pool_drop": None,
-        "give": float(settings.sel_short_vol_give_back), "cap": 4.0, "hmax": 15, "volnorm_on": False, "volnorm": 0.5}
+        "give": float(settings.sel_short_vol_give_back), "cap": 4.0,
+        "hmax": int(settings.sel_short_vol_max_hold_sessions), "volnorm_on": False, "volnorm": 0.5}
+# (from the 2026-10-20 session PREREG159's RPD_IS: the give-back 0.5 and the 10-session limit, production's
+# `sel_short_vol_give_back` / `sel_short_arm_max_hold_sessions`; 1.25 and 15 before; from 2026-10-21 the vol arm's own
+# limit, 15 sessions — PREREG173's V15, `sel_short_vol_max_hold_sessions`)
 # the fall arm (the faller shorts) on the vol rule: no same-bar fallback, every pick a candidate (the faller mask is the
-# adapter's), no give-back target; it keeps the 6x cover and the volatility exit (production's other arms)
-FALL = {"fallback": 0, "min_runup": -100.0, "give": None, "cap": 6.0, "volnorm_on": True}
+# adapter's), no give-back target; it keeps the 6x cover and the volatility exit — at production's
+# `sel_short_fall_volnorm_ratio` (0.7 from the 2026-10-20 session, PREREG159; 0.5 before) — and its OWN time limit,
+# production's `sel_short_arm_max_hold_sessions` (FALL merges over LIVE: without it the fall arm would take the vol's)
+FALL = {"fallback": 0, "min_runup": -100.0, "give": None, "cap": 6.0, "volnorm_on": True,
+        "volnorm": float(settings.sel_short_fall_volnorm_ratio), "hmax": int(settings.sel_short_arm_max_hold_sessions)}
 # the vol2 arm: the vol rule without the crowding filter, the relative-volume filter and the volatility exit (and with
 # the 6x cover: the vol arm's 4x is its own)
 VOL2 = {"max_dtc": None, "min_rvol": 0.0, "volnorm_on": False, "cap": 6.0}

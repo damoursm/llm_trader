@@ -21,8 +21,9 @@ The steps, in order, each fail-soft and under its own setting: the IBKR Flex bor
 (in their own thread: IBKR can take hours to generate a statement), the forward-return
 cache warm, retention, the replay (``signals_replay``), the walk-forward
 (``weight_history``), the shape history, the tier-2 backtest tail (``signals_backtest``)
-and the IBKR BID_ASK spread sweep (a subprocess: ib_async needs its own event loop and
-clientId). Neither the model retrains (weekly, `runner._run_weekly_ml_work`) nor the
+the IBKR BID_ASK spread sweep (a subprocess: ib_async needs its own event loop and
+clientId), the live record against the simulator's assumptions (``live_calibration``) and every
+live trade beside the simulator's construction of it (``forward_check``). Neither the model retrains (weekly, `runner._run_weekly_ml_work`) nor the
 automatic refactor (its own nightly slot) belong here.
 """
 from __future__ import annotations
@@ -50,7 +51,7 @@ LOG_DIR = Path("logs")
 LOG_KEEP_DAYS = 14
 FLEX = "flex"
 STEPS = ("cache_warm", "retention", "replay", "walkforward", "shape_history", "backtest", "spread_sweep",
-         "live_calibration")
+         "live_calibration", "forward_check")
 FINAL = ("ok", "failed", "off")
 FLEX_JOIN_SECONDS = 3900.0   # the Flex fetch gives IBKR up to an hour (its own host), then keeps the reference
 
@@ -245,9 +246,21 @@ def _live_calibration(day) -> Tuple[object, str]:
     return {"path": str(p), "notes": notes}, (f"{len(notes)} note(s): " + "; ".join(notes)) if notes else "no gap"
 
 
+def _forward_check(day) -> Tuple[object, str]:
+    # Every live trade beside the simulator's construction of it (PREREG185 -> production, 2026-10-23): one JSON per
+    # market day, a line and its notes in the email's scorer banner.
+    from src.backtest import forward_check as FC
+    p = FC.write(_day(day))
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    notes = rec.get("notes") or []
+    head = f"{rec.get('trades', 0)} trades, {rec.get('same_tick', 0)}/{rec.get('closed', 0)} on the simulator's tick"
+    return {"path": str(p), "notes": notes, "errors": rec.get("errors") or []}, (
+        head + (f"; {len(notes)} note(s): " + "; ".join(notes) if notes else "; no gap"))
+
+
 STEP_FNS = {FLEX: _flex, "cache_warm": _cache_warm, "retention": _retention, "replay": _replay,
             "walkforward": _walkforward, "shape_history": _shape_history, "backtest": _backtest,
-            "spread_sweep": _spread_sweep, "live_calibration": _live_calibration}
+            "spread_sweep": _spread_sweep, "live_calibration": _live_calibration, "forward_check": _forward_check}
 
 
 def _enabled(step: str) -> bool:
@@ -259,6 +272,7 @@ def _enabled(step: str) -> bool:
         "spread_sweep": (settings.enable_eod_spread_sweep
                          and str(settings.broker_mode or "off").startswith("ibkr")),
         "live_calibration": settings.enable_eod_live_calibration,
+        "forward_check": settings.enable_eod_forward_check,
     }.get(step, True))
 
 

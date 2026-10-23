@@ -192,7 +192,9 @@ def test_the_account_check_deleverages_and_a_margin_call_closes_both_books(monke
     assert [k for k in range(9) if t[f"D{k}"]["status"] == "CLOSED"] == [1, 2, 3, 4, 5, 6, 7, 8]
     assert {t[f"D{k}"]["exit_reason"] for k in range(1, 9)} == {"dip_delever"}
     assert all(t[f"S{k}"]["status"] == "OPEN" for k in range(3))
-    # squeezed past the equity: every short and long the account funded closed
+    # squeezed past the equity, under the rule before IBKR's liquidation (`live_account_liquidation` "all"; IBKR's:
+    # tests/test_live_liquidation.py): every short and long the account funded closed
+    monkeypatch.setattr(settings, "live_account_liquidation", "all")
     worse = [dip("D0")] + [short(f"S{k}", n=40, px=10.0, mark=40.0, ret=-300.0) for k in range(3)]
     tracker = _ledger(monkeypatch, worse)
     assert tracker.monitor_live_account(now=NOW) == 4

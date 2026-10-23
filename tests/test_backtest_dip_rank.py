@@ -45,3 +45,26 @@ def test_mimic_refuses_bad_dip_options(kw):
 def test_dip_slices_sets_the_slice_and_the_open_cap():
     s = {x.name: x for x in M.live_strategies(M.Mimic(seed=0, dip_slices=5))}["dip"]
     assert (s.slices, s.max_open) == (5.0, 5)
+
+
+def test_dip_scores_defaults_to_the_production_map_and_refuses_a_missing_file(tmp_path):
+    """PREREG142: ``Mimic.dip_scores`` (a research score file) is None by default — `strategies.dip.scores_path()`
+    ranks the daily top pick: the own-security panels' scores from 2026-10-18 (the reused-ticker fix), PREREG96's with
+    the stored panels, PREREG96's always for its research flags — and a path that does not exist is refused."""
+    assert M.Mimic(seed=0).dip_scores is None
+    assert DIP.OWN_DEFAULT is True and DIP.scores_path().name == DIP.OWN_SCORES.name
+    assert DIP.scores_path(research=True).name == DIP.FILTER_SCORES.name
+    with pytest.raises(ValueError):
+        M.Mimic(seed=0, dip_scores=str(tmp_path / "missing.pkl"))
+
+
+def test_dip_scores_file_is_the_map_the_ranking_reads(tmp_path):
+    import inspect
+
+    import pandas as pd
+    p = tmp_path / "scores.pkl"
+    pd.DataFrame({"oid": list(SCORES), "score": list(SCORES.values())}).to_pickle(p)
+    assert DIP.filter_scores(p) == SCORES
+    assert M.Mimic(seed=0, dip_scores=str(p)).dip_scores == str(p)
+    # `live_books` (too heavy to run here) hands the label's file to the ranking: the wiring, checked on its source
+    assert "DIP.filter_scores(mim.dip_scores)" in inspect.getsource(M.live_books)

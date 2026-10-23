@@ -20,16 +20,23 @@ items 1, 2 and 5).
 
 CLI: `python -m src.backtest.reliability --build` writes `cache/ml/reliability/<day>/` (one card per arm, the
 sensitivities, the bundle) and the live calibration's `reference.json` (`live_calibration.REFERENCE_FILE`: set B's
-numbers, the market the live account trades in).
+numbers, the market the live account trades in) with the FINGERPRINTS it was built on — each arm's production
+settings (`arm_fingerprint`: its SPEC's parameters, switches and sizing) and the simulator's defaults
+(`simulator_fingerprint`) — so the live calibration can tell a reference built for other rules (a deploy since) from
+a current one: a reference must be rebuilt after every deploy (2026-10-21, the user's "Fix all").
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
+import dataclasses
+import hashlib
 import json
 import math
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,50 +46,125 @@ from src.backtest import periods
 from src.backtest.account import per_day
 
 ET = "America/New_York"
-ARMS = ("vol", "etf", "fall", "dip", "crash")
-SIDE = {"vol": "short", "etf": "short", "fall": "short", "dip": "long", "crash": "long"}
+ARMS = ("vol", "etf", "fall", "dip", "crash", "cap")
+SIDE = {"vol": "short", "etf": "short", "fall": "short", "dip": "long", "crash": "long", "cap": "long"}
 MIN_GROUP = 10                       # a group of fewer trades says nothing about where the arm loses
 PLATEAU_TOL = 0.1                    # a neighbour within 10% of the best metric belongs to the plateau
-INIT_RATE = {"vol": 2.86, "etf": 2.86, "fall": 2.86, "dip": 0.5, "crash": 0.75}   # the live account's initial margin
+INIT_RATE = {"vol": 2.86, "etf": 2.86, "fall": 2.86, "dip": 0.5, "crash": 0.75, "cap": 0.5}   # the live account's
 
-# item 1 — each live arm as a mechanism; the numbers live in config/settings.py, named here, never copied
+# item 1 — each live arm as a mechanism; the numbers live in config/settings.py, named here, never copied (a copied
+# number goes stale at the next deploy). ``parameters`` are the rule's numbers, ``switches`` the parts of the rule
+# turned on or off, ``sizing`` its slice and its open-position limit: together they are the settings that shape the
+# arm's own trades, and their values are its fingerprint (`arm_settings`, `arm_fingerprint`).
+_SHORT_COMMON = ["sel_short_min_price", "sel_short_min_dollar_volume", "sel_short_own_min_history",
+                 "sel_short_runup_sessions", "sel_short_max_days_to_cover", "sel_short_vol_min_rvol",
+                 "sel_short_arm_max_hold_sessions", "sel_short_max_open_per_ticker"]
+_SHORT_SWITCHES = ["enable_sel_short_dtc_filter", "enable_sel_short_vol_rvol_filter", "enable_sel_short_squeeze_cover",
+                   "enable_sel_short_volnorm_exit", "enable_sel_short_halt_guard", "enable_sel_short_borrow_retry",
+                   "sel_short_traded_arms"]
 SPEC = {
     "vol": {"mechanism": "a stock whose 30-minute volatility is the market's highest and new (a fresh top-1 ATR%) "
-                         "after a 5-session rise gives the rise back",
-            "context": "the pick bar: fresh top-1 ATR%, a riser, relative volume >= sel_short_vol_min_rvol, "
-                       "days to cover <= sel_short_max_days_to_cover, lendable at IBKR",
-            "horizon": "the whole run-up given back (sel_short_vol_give_back), the 4x cover, 15 sessions",
-            "parameters": ["sel_short_vol_own_window_days", "sel_short_vol_min_rvol", "sel_short_max_days_to_cover",
-                           "sel_short_vol_give_back", "sel_short_vol_cover_multiple"]},
+                         "after a rise over sel_short_runup_sessions gives part of the rise back",
+            "context": "the pick bar: fresh top-1 ATR% over sel_short_vol_own_window_days, a riser, relative volume "
+                       ">= sel_short_vol_min_rvol, days to cover <= sel_short_max_days_to_cover, lendable at IBKR "
+                       "(else the bar's best passing backup within sel_short_vol_fallback_ranks), the pressure extras",
+            "horizon": "sel_short_vol_give_back of the run-up given back, the sel_short_vol_cover_multiple cover, "
+                       "sel_short_vol_max_hold_sessions sessions",
+            "parameters": [p for p in _SHORT_COMMON if p != "sel_short_arm_max_hold_sessions"]
+                          + ["sel_short_vol_max_hold_sessions", "sel_short_vol_own_window_days", "sel_short_vol_give_back",
+                             "sel_short_vol_cover_multiple", "sel_short_vol_fallback_ranks"],
+            "switches": _SHORT_SWITCHES + ["enable_sel_short_vol", "enable_sel_short_vol_added_stocks",
+                                           "enable_sel_short_vol_fallback", "enable_sel_short_vol_pressure_extras",
+                                           "enable_sel_short_vol_volnorm_exit"],
+            "sizing": ["sel_short_vol_account_slices"]},
     "etf": {"mechanism": "an exchange-traded product whose 30-minute volatility is the products' highest and new, "
-                         "after a 5-session rise, gives the rise back; entered on the turn",
-            "context": "the vol rule on the products; the ½-ATR turn within 5 sessions (sel_short_turn_atr, "
-                       "sel_short_turn_sessions)",
-            "horizon": "the whole run-up (sel_short_etf_give_back), the 6x cover, the volatility exit in profit, "
-                       "15 sessions",
-            "parameters": ["sel_short_etf_own_window_days", "sel_short_turn_atr", "sel_short_turn_sessions",
-                           "sel_short_etf_give_back", "sel_short_cover_multiple"]},
-    "fall": {"mechanism": "the market's most volatile name that did NOT rise over 5 sessions keeps falling once it "
-                          "turns down ½ ATR from its high since the pick",
-             "context": "the vol arm's pick on a non-riser with a valid base; the turn within 5 sessions",
-             "horizon": "no target: the volatility exit in profit, the 6x cover, 15 sessions",
-             "parameters": ["sel_short_turn_atr", "sel_short_turn_sessions", "sel_short_volnorm_ratio",
-                            "sel_short_cover_multiple"]},
-    "dip": {"mechanism": "a mega-cap in an uptrend, oversold over two sessions, bought on a further ½-ATR dip, "
-                         "rebounds to its 5-session average",
-            "context": "dollar volume >= dip_long_min_dollar_volume, close > the dip_long_trend_sessions average, "
-                       "RSI2 < dip_long_rsi_max; the limit alive dip_long_limit_sessions",
+                         "after a rise, gives part of the rise back; entered on the turn",
+            "context": "the vol rule on the products (the VIX-linked ones out, sel_short_etf_exclude_vix); the turn "
+                       "of sel_short_turn_atr x its ATR within sel_short_turn_sessions",
+            "horizon": "sel_short_etf_give_back of the run-up given back, the sel_short_cover_multiple cover, the "
+                       "volatility exit in profit (sel_short_volnorm_ratio), sel_short_arm_max_hold_sessions sessions",
+            "parameters": _SHORT_COMMON + ["sel_short_etf_own_window_days", "sel_short_turn_atr",
+                                           "sel_short_turn_sessions", "sel_short_etf_give_back",
+                                           "sel_short_cover_multiple", "sel_short_volnorm_ratio"],
+            "switches": _SHORT_SWITCHES + ["enable_sel_short_etf", "enable_sel_short_etf_turn",
+                                           "sel_short_etf_exclude_vix"],
+            "sizing": ["sel_short_etf_account_slices"]},
+    "fall": {"mechanism": "the market's most volatile name that did NOT rise keeps falling once it turns down from "
+                          "its high since the pick",
+             "context": "the vol arm's pick on a non-riser with a valid base; the turn of sel_short_turn_atr x its "
+                        "ATR within sel_short_turn_sessions",
+             "horizon": "no target: the volatility exit in profit (sel_short_fall_volnorm_ratio), the "
+                        "sel_short_cover_multiple cover, sel_short_arm_max_hold_sessions sessions",
+             "parameters": _SHORT_COMMON + ["sel_short_vol_own_window_days", "sel_short_turn_atr",
+                                            "sel_short_turn_sessions", "sel_short_fall_volnorm_ratio",
+                                            "sel_short_cover_multiple"],
+             "switches": _SHORT_SWITCHES + ["enable_sel_short_fall", "enable_sel_short_fall_turn"],
+             "sizing": ["sel_short_fall_account_slices"]},
+    "dip": {"mechanism": "a large stock in an uptrend, oversold over two sessions, bought on a further dip, "
+                         "rebounds to its short average",
+            "context": "dollar volume >= dip_long_min_dollar_volume (the order among those >= "
+                       "dip_long_order_min_dollar_volume), close > the dip_long_trend_sessions average, RSI2 < "
+                       "dip_long_rsi_max; the meta-model's cut (enable_dip_long_filter), then each day's top pick by "
+                       "its score (dip_long_daily_top, dip_long_rank), an earnings dip ranked last "
+                       "(dip_long_earnings_demote_sessions); the dip_long_limit_atr limit alive dip_long_limit_sessions",
             "horizon": "the first close above the dip_long_exit_sma_sessions average, or dip_long_max_hold_sessions",
-            "parameters": ["dip_long_rsi_max", "dip_long_trend_sessions", "dip_long_limit_atr",
-                           "dip_long_limit_sessions", "dip_long_exit_sma_sessions", "dip_long_max_hold_sessions"]},
-    "crash": {"mechanism": "the index in a downtrend, capitulating over two sessions, rebounds; traded with 3x "
-                           "leverage",
-              "context": "QQQ below its crash_long_trend_sessions average with RSI2 < crash_long_rsi_max",
+            "parameters": ["dip_long_min_dollar_volume", "dip_long_order_min_dollar_volume", "dip_long_rsi_max",
+                           "dip_long_trend_sessions", "dip_long_daily_top", "dip_long_rank",
+                           "dip_long_earnings_demote_sessions", "dip_long_entry_mode", "dip_long_limit_atr",
+                           "dip_long_limit_sessions", "dip_long_exit_sma_sessions", "dip_long_max_hold_sessions",
+                           "dip_long_filter_model"],
+            "switches": ["enable_dip_long", "enable_dip_long_filter", "enable_dip_long_earnings_demote",
+                         "enable_dip_long_own_security"],
+            "sizing": ["dip_long_account_slices"]},
+    "crash": {"mechanism": "the index in a downtrend, capitulating over two sessions, rebounds; traded in its "
+                           "leveraged fund (crash_long_trade_symbol)",
+              "context": "crash_long_symbol below its crash_long_trend_sessions average with RSI2 < "
+                         "crash_long_rsi_max; crash_long_trade_symbol bought at the open",
               "horizon": "the first close above the crash_long_exit_sma_sessions average, or "
-                         "crash_long_max_hold_sessions",
-              "parameters": ["crash_long_rsi_max", "crash_long_trend_sessions", "crash_long_exit_sma_sessions",
-                             "crash_long_max_hold_sessions"]},
+                         "crash_long_max_hold_sessions — sold after hours that evening (crash_long_pm_exit)",
+              "parameters": ["crash_long_symbol", "crash_long_trade_symbol", "crash_long_rsi_max",
+                             "crash_long_trend_sessions", "crash_long_exit_sma_sessions",
+                             "crash_long_max_hold_sessions", "crash_long_margin_rate"],
+              "switches": ["enable_crash_long", "crash_long_pm_exit"],
+              "sizing": ["crash_long_account_slices"]},
+    "cap": {"mechanism": "on a market-wide capitulation day, every large stock oversold under its own downtrend, "
+                         "bought on a further dip, rebounds to its short average",
+            "context": "the share of the cap_long_breadth_top most-traded stocks under their trend with RSI2 < 10 at "
+                       ">= cap_long_breadth_min; each stock with dollar volume >= cap_long_min_dollar_volume, close < "
+                       "the cap_long_trend_sessions average, RSI2 < cap_long_rsi_max; the cap_long_limit_atr limit "
+                       "alive cap_long_limit_sessions",
+            "horizon": "the first close above the cap_long_exit_sma_sessions average, or cap_long_max_hold_sessions",
+            "parameters": ["cap_long_breadth_top", "cap_long_breadth_min", "cap_long_min_dollar_volume",
+                           "cap_long_trend_sessions", "cap_long_rsi_max", "cap_long_limit_atr",
+                           "cap_long_limit_sessions", "cap_long_exit_sma_sessions", "cap_long_max_hold_sessions"],
+            "switches": ["enable_cap_long"],
+            "sizing": ["cap_long_account_slices", "cap_long_max_open"]},
 }
+
+
+def arm_settings(arm: str) -> Dict[str, object]:
+    """The production settings that shape ``arm``'s own trades — its SPEC's parameters, switches and sizing — as
+    {name: value} (a value JSON can hold: numbers, strings, booleans)."""
+    sp = SPEC[arm]
+    names = sorted(set(sp.get("parameters", [])) | set(sp.get("switches", [])) | set(sp.get("sizing", [])))
+    return {n: getattr(settings, n) for n in names}
+
+
+def _digest(values: Mapping) -> str:
+    return hashlib.sha1(json.dumps(values, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+def arm_fingerprint(arm: str) -> str:
+    """A short digest of `arm_settings`: equal exactly when every setting that shapes the arm's trades is equal."""
+    return _digest(arm_settings(arm))
+
+
+def simulator_fingerprint() -> str:
+    """A short digest of the production-mimicking simulator's defaults (every field of `mimic.Mimic()`): a market-model
+    correction or a new default changes the simulator's trades without any production setting changing."""
+    from src.backtest import mimic as M
+    m = M.Mimic()
+    return _digest({f.name: repr(getattr(m, f.name)) for f in dataclasses.fields(m)})
 
 
 # ── the market's regimes ─────────────────────────────────────────────────────
@@ -184,7 +266,7 @@ def arm_alone(pieces: Sequence[dict], strategies: dict, rules, settle=None, star
     from src.backtest import account as A
     books = {str(p["strategy"]) for p in pieces}
     strat = {k: v for k, v in _by_name(strategies).items() if k in books}
-    res = A.simulate(list(pieces), strat, replace(rules, start=float(start)), settle or A.default_settle())
+    res = A.simulate(list(pieces), strat, card_rules(rules, start), settle or A.default_settle())
     pick = {}
     for p in pieces:                                   # the decision day of each entry (an order's pieces: the order's)
         for ns in ([int(p["ens"])] if p.get("ens") is not None else []) + list(map(int, p.get("ord_place", []) or [])):
@@ -192,6 +274,13 @@ def arm_alone(pieces: Sequence[dict], strategies: dict, rules, settle=None, star
     pos = [dict(q, pick_day=pick.get((str(q["strategy"]), str(q["tkn"]), int(q["entry_ns"])), q.get("pick_day")))
            for q in res["positions"]]
     return trades_from_positions(pos)
+
+
+def card_rules(rules, start: float = 100_000.0):
+    """An arm card's account rules: the live ones at a start that never binds, the margin judged as before PREREG174
+    (at the tick marks, every position closed — which never fires at $100k): a card holds the RULE'S trades, never a
+    margin model's liquidation (IBKR's intrabar check could take a lot out of a $100k book in a squeeze)."""
+    return replace(rules, start=float(start), trigger="close", liquidation="all", sem=0.0, regt_close=False)
 
 
 def _by_name(strategies) -> dict:
@@ -377,11 +466,29 @@ def out_dir(day: Optional[date] = None) -> Path:
     return d / (day or datetime.now().date()).isoformat()
 
 
+@contextmanager
+def _halt_files(s: str):
+    """Set A0's halt history beside the existing files while its books are built (`a0.harness`'s halt paths: NYSE's
+    history and Nasdaq Trader's feed before August 2019) — production's halt guard is `Mimic()`'s default from
+    2026-10-19 (AUDIT151); the other sets read the existing files. Restored after."""
+    if s != "A0":
+        yield
+        return
+    from src.backtest import a0 as A0
+    from src.backtest import halts as H
+    saved = H.halt_paths()
+    H.set_halt_paths(A0.halt_files())
+    try:
+        yield
+    finally:
+        H.set_halt_paths(saved)
+
+
 def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: int = 0, cost_snapshot: Optional[str] = None,
           extra_bars: Optional[str] = None, day: Optional[date] = None, log=print) -> Path:
     """Build every live arm's card from the production-mimicking simulator (`mimic.live_books` under `Mimic()`),
     each arm alone at the live costs, for the borrow-data sets named; with ``sensitivities`` the same under doubled
-    leg costs, a one-bar entry delay (`Mimic().without("entry")`) and the lendability model's level shifted
+    leg costs, a one-bar entry delay (`Mimic(halts=None).without("entry")`) and the lendability model's level shifted
     (`Mimic(lend_shift=+-0.37)`, set B). Writes the cards, the bundle of the base run and the live calibration's
     reference (set B's base statistics). Research paths default to PREREG62's cost snapshot and extra bars."""
     from src.backtest import account as A
@@ -414,7 +521,8 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
     reg = regime_table()
     variants = {"base": M.Mimic(seed=seed)}
     if sensitivities:
-        variants["entry_delay"] = M.Mimic(seed=seed).without("entry")
+        # the halt model needs the entry at the pick bar's close (`halts.Applier`): the delay is read without it
+        variants["entry_delay"] = M.Mimic(seed=seed, halts=None).without("entry")
         variants["lend_lo"] = M.Mimic(seed=seed, lend_shift=-0.37)
         variants["lend_hi"] = M.Mimic(seed=seed, lend_shift=+0.37)
     tables: Dict[str, pd.DataFrame] = {}
@@ -426,7 +534,9 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
             S = periods.get(s)
             eng, etf, panel, bars, settle = components(s)
             log(f"[reliability] {name} set {s}: building the books")
-            B = M.live_books(S.lo, S.hi, mim, eng=eng, etf=etf, panel=panel, bars=bars, costs=costs, settle=settle)
+            with _halt_files(s):
+                B = M.live_books(S.lo, S.hi, mim, eng=eng, etf=etf, panel=panel, bars=bars, costs=costs,
+                                 settle=settle)
             strategies, rules = _by_name(M.live_strategies(mim)), M.live_rules(mim)
             lo_dn, hi_dn = M.dnum(S.lo), M.dnum(S.hi)
             for arm, pcs in B.items():
@@ -435,7 +545,7 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
                     continue
                 parts.append(arm_alone(pcs, strategies, rules, settle))
                 if name == "base":
-                    res = A.simulate(pcs, {arm: strategies[arm]}, replace(rules, start=100_000.0), settle)
+                    res = A.simulate(pcs, {arm: strategies[arm]}, card_rules(rules), settle)
                     pos_base.extend(res["positions"])
             if name == "base" and sensitivities:
                 for arm, pcs in B.items():
@@ -458,12 +568,16 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
         log(f"[reliability] cards for {sorted(cards)} -> {out} (no set B: the live calibration's reference unchanged)")
         return out
     ref = {"as_of": (day or datetime.now().date()).isoformat(), "source": "reliability.build: each arm alone, set B, Mimic() seed %d" % seed,
-           "arms": {}}
+           "built_at": datetime.now().astimezone().isoformat(timespec="seconds"), "arms": {},
+           # what the reference was built on: the live calibration compares them with the deployed ones
+           "simulator": simulator_fingerprint(), "fingerprints": {}, "settings": {}}
     for arm, c in cards.items():
         s = c["by_set"].get("B") or c["overall"]
         if s.get("n"):
             ref["arms"][arm] = {"return_per_day": s["return_per_day"], "gross_win_rate": s["gross_win_rate"],
                                 "avg_trade": s["avg_trade"], "avg_days": s["avg_days"], "n": s["n"], "set": "B" if c["by_set"].get("B") else "all"}
+            ref["fingerprints"][arm] = arm_fingerprint(arm)
+            ref["settings"][arm] = arm_settings(arm)
     LC.out_dir().mkdir(parents=True, exist_ok=True)
     (LC.out_dir() / LC.REFERENCE_FILE).write_text(json.dumps(_json_ready(ref), indent=1), encoding="utf-8")
     log(f"[reliability] cards for {sorted(cards)} -> {out}; reference -> {LC.out_dir() / LC.REFERENCE_FILE}")

@@ -52,7 +52,7 @@ def test_the_money_paid_in_is_the_start_balance_whenever_it_is_read(on):
     paid in is its start balance at every instant."""
     assert sa.paid_in(at(2026, 10, 5)) == sa.paid_in(at(2026, 11, 2)) == sa.paid_in(at(2027, 3, 1)) == 5000.0
     from config.settings import Settings
-    assert Settings.model_fields["sel_short_account_initial"].default == 10000.0
+    assert Settings.model_fields["sel_short_account_initial"].default == 50000.0   # the 2026-10-20 fresh start
 
 
 def test_equity_adds_every_funded_trades_dollar_pnl(on):

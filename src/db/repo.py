@@ -51,6 +51,8 @@ def _json(x) -> Optional[str]:
 
 def _trade_id(t: dict) -> str:
     key = f"{t.get('ticker', '')}|{t.get('decision_datetime') or t.get('entry_datetime') or t.get('entry_date', '')}"
+    if t.get("margin_lot_of"):          # a lot IBKR's liquidation took out of a trade shares its decision: its own id
+        key += f"|{t.get('recommendation_id', '')}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 

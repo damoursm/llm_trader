@@ -598,7 +598,8 @@ def load_borrow(at: str = "next"):
 def real_fees():
     """IBKR's daily fee for the rebuilt names, set A0's construction (`a0.real_fees`): its API bar where the name's
     API history covers the day, else IBKR's archived file of that day for the name (`archive_fee_dir`, fenced by its
-    bar window), else the fallback; each carried at most a week."""
+    bar window), else the fallback; each carried at most a week. PREREG188 (set D): from 2026-09-25 OUR OWN archive's
+    daily close (`borrow_daily.parquet`, `borrow_history.fee_daily`'s ``own_archive``) comes first on its days."""
     _research_path()
     import realfee as RF
     arch = str(archive_fee_dir())
@@ -633,13 +634,19 @@ def real_fees():
                     self.cache[key] = (dn[o], D["fee"].to_numpy(float)[o], int(dn[o][-1]) + RF.ARCHIVE_STALE)
             return self.cache[key]
 
+        def _own(self, tkn):
+            """Our own archive's daily close fee of the name (set D's days; None before 2026-09-25 / unlisted)."""
+            if "@OWN" not in self.cache:
+                self.cache["@OWN"] = _own_archive_fees()
+            return self.cache["@OWN"].get(plain(tkn))
+
         def series(self, tkn):
-            return self._api(tkn) or self._arch(tkn)
+            return self._api(tkn) or self._arch(tkn) or self._own(tkn)
 
         def daily(self, tkn, days, fallback):
             days = np.asarray(days, np.int64)
             out = np.full(len(days), np.nan)
-            for s in (self._api(tkn), self._arch(tkn)):
+            for s in (self._own(tkn), self._api(tkn), self._arch(tkn)):
                 if s is None or not len(s[0]):
                     continue
                 d, f = s[0], s[1]
@@ -655,12 +662,34 @@ def real_fees():
 
         def covered(self, tkn, day):
             day = int(day)
-            for s in (self._api(tkn), self._arch(tkn)):
+            for s in (self._own(tkn), self._api(tkn), self._arch(tkn)):
                 if s is not None and len(s[0]) and s[0][0] <= day and (len(s) < 3 or day <= s[2]):
                     return True
             return False
 
     return RealFeesR()
+
+
+def _own_archive_fees() -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """{plain symbol: (day numbers, our archive's daily close fee)} from `borrow_daily.parquet` (PREREG188: set D's
+    fees), read once; empty when the file is absent."""
+    import duckdb
+    from src.data.deep import borrow_history as BH
+    p = BH._deep.DEEP_DIR / "borrow_daily.parquet"
+    if not p.exists():
+        return {}
+    con = duckdb.connect()
+    try:
+        D = con.execute(f"SELECT ticker, CAST(date AS DATE) AS date, fee FROM read_parquet('{p.as_posix()}') "
+                        "WHERE fee IS NOT NULL").fetchdf()
+    finally:
+        con.close()
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for tk, g in D.groupby("ticker"):
+        dn = np.array([dnum(str(x)[:10]) for x in g["date"]], np.int64)
+        o = np.argsort(dn, kind="mergesort")
+        out[str(tk).replace(".", "-")] = (dn[o], g["fee"].to_numpy(float)[o])
+    return out
 
 
 def assembler(st, closes, rf, cap: int = 400_000):

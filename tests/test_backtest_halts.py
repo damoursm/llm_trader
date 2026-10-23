@@ -469,8 +469,11 @@ def test_the_etf_entry_piece_reproduces_the_turn_and_judges_a_delayed_entry_from
 
 # ── the Mimic switch ─────────────────────────────────────────────────────────
 
-def test_the_mimic_switch_is_off_by_default_and_refuses_nonsense():
-    assert M.Mimic().halts is None and M.Mimic.off().halts is None and M.Mimic.borrow_v2().halts is None
+def test_the_mimic_switch_is_productions_guard_by_default_and_refuses_nonsense():
+    """AUDIT151 (2026-10-19): production's halt guard is the default; the earlier simulator (`Mimic.off()`) and the
+    construction before AUDIT151 (`PRE151`) keep halts unmodelled."""
+    assert M.Mimic().halts == "guard" and M.Mimic.borrow_v2().halts == "guard"
+    assert M.Mimic.off().halts is None and M.Mimic(**M.PRE151).halts is None
     assert H.MODES == ("guard", "wait", "wait_half", "backup", "both")
     for mode in H.MODES:
         assert M.Mimic(halts=mode).halts == mode
@@ -584,14 +587,14 @@ def test_mimic_without_halts_builds_exactly_what_it_built_before(monkeypatch):
         def __init__(self, *a, **k):
             raise AssertionError("the halt model must not run with halts=None")
     monkeypatch.setattr(H, "Applier", Boom)
-    books, log, eng, etf = _live_books(monkeypatch, M.Mimic(seed=3))
+    books, log, eng, etf = _live_books(monkeypatch, M.Mimic(seed=3, **M.PRE151))
     assert _fields(books) == BEFORE and log == BEFORE_LOG
     assert eng.calls == [("turn", "fall", 0.5, 5, True, True),
                          ("pieces", "vol", {"entry_at_pick": True, "rule201": False}, 6)]
     # PREREG102: the default follows production's VIX block (`sel_short_etf_exclude_vix`, from 2026-10-14) — the ETF
     # arm's picks re-ranked without the VIX-linked products (``exclude``)
-    base = ["cagap", "ctx", "entry", "give", "lend_after", "limit", "through", "turn"]
-    assert etf.calls == [sorted(base + ([] if M.Mimic(seed=3).etf_vix else ["exclude"]))]
+    base = ["cagap", "ctx", "entry", "give", "hmax", "lend_after", "limit", "through", "turn"]   # hmax: 2026-10-20
+    assert etf.calls == [sorted(base + ([] if M.Mimic(seed=3, **M.PRE151).etf_vix else ["exclude"]))]
 
 
 def test_mimic_with_halts_routes_the_etf_entries_and_the_vol_and_fall_books_through_the_model(monkeypatch):
@@ -612,9 +615,26 @@ def test_mimic_with_halts_routes_the_etf_entries_and_the_vol_and_fall_books_thro
             books["vol"] = books["vol"][:1]
             log["halts"] = {"mode": "guard"}
     monkeypatch.setattr(H, "Applier", Fake)
-    books, log, _, _ = _live_books(monkeypatch, M.Mimic(seed=3, halts="guard"))
+    books, log, _, _ = _live_books(monkeypatch, M.Mimic(seed=3, **dict(M.PRE151, halts="guard")))
     assert seen["init"] == ("guard", 6) and seen["etf"][0] == "cagap"
     assert seen["apply"] == (["dip", "etf", "fall", "vol"], "2023-03-01", "2023-03-31",
                              {"entry_at_pick": True, "rule201": False})
     assert [p["tkn"] for p in books["vol"]] == ["BBB"] and log["halts"]["mode"] == "guard"
     assert _fields(books)["vol"][0][:5] == BEFORE["vol"][0][:5]                       # the post-processing still runs
+
+
+def test_the_pressure_extras_need_v6_installed():
+    """The plain evaluator (the reliability cards' construction) adds no pressure extras even when the engine carries
+    pressure flags (set A0's ``pressure_hi``); V6's ``Real6`` evaluator (a study harness's `R75.Applied`) does — the
+    halt model's pass loop follows (2026-10-19: the A0 cards failed its own selection check without it)."""
+    import types
+
+    class Real:
+        pass
+
+    class Real6(Real):
+        pass
+    eng = types.SimpleNamespace(Real=Real, pressure_hi=np.ones(3, bool))
+    assert H.pressure_flags(eng) is not None and not H.v6_installed(eng)
+    eng.Real = Real6
+    assert H.v6_installed(eng)

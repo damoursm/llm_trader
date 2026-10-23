@@ -136,3 +136,21 @@ def test_arm_alone_accepts_the_simulators_strategy_list():
     assert isinstance(strategies, list)
     assert set(R._by_name(strategies)) >= {"vol", "dip"}
     assert R.arm_alone([], strategies, M.live_rules(M.Mimic()), A.default_settle()).empty
+
+
+def test_every_live_arm_has_a_spec_naming_real_settings_and_no_copied_number():
+    """2026-10-21: the specs named "125%", "15 sessions", "the 5-session average" after the deploys changed them —
+    a spec names its settings; their values are the arm's fingerprint (`arm_settings`)."""
+    import re
+    from config.settings import settings
+    from src.backtest import live_calibration as LC
+    from src.backtest import reliability as REL
+    assert set(REL.ARMS) == set(REL.SPEC) == set(REL.SIDE) == set(REL.INIT_RATE) == set(LC.ARM_KEYS)
+    fields = type(settings).model_fields
+    for arm, sp in REL.SPEC.items():
+        names = sp["parameters"] + sp["switches"] + sp["sizing"]
+        assert names and all(n in fields for n in names), (arm, [n for n in names if n not in fields])
+        for key in ("mechanism", "context", "horizon"):
+            assert not re.search(r"\d+(\.\d+)?\s*(%|sessions?\b|x\b)", sp[key]), (arm, key, sp[key])
+        assert REL.arm_settings(arm) == {n: getattr(settings, n) for n in sorted(set(names))}
+        assert re.fullmatch(r"[0-9a-f]{12}", REL.arm_fingerprint(arm))

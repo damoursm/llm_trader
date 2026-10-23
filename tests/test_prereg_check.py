@@ -8,7 +8,7 @@ times would be off by four or five hours, enough to turn a same-morning violatio
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -157,7 +157,7 @@ def test_cli_prints_one_verdict_per_study_and_exits_nonzero_on_a_violation(tmp_p
     _touch(bad / "early.csv", _et(2026, 10, 12, 8, 0))
     assert prereg.main([str(good)]) == 0
     assert prereg.main([str(good), str(bad)]) == 1
-    out = capsys.readouterr().out.strip().splitlines()
+    out = [ln for ln in capsys.readouterr().out.strip().splitlines() if not ln.startswith(" ")]   # verdicts only
     assert len(out) == 3
     assert out[0].startswith("prereg909: OK") and out[1].startswith("prereg909: OK")
     assert out[2].startswith("prereg910: VIOLATION") and "early.csv" in out[2]
@@ -208,3 +208,96 @@ def test_a_results_heading_is_not_an_instant(tmp_path):
                   "## Results and verdict (2026-10-09 12:13 ET)\n", encoding="utf-8")
     found = prereg.parse_registrations(md)
     assert [(r["kind"], r["line"]) for r in found] == [("registration", 1)]
+
+
+# ── 2026-10-21: the stamps, the prior studies, the promised outputs (the user's "Fix all") ───────────────────────
+
+GATED = """# PREREG920 — IPO lock-up expiry shorts
+
+Registered 2026-10-21 10:00 ET (Wednesday), before any return was computed.
+
+Prior studies: PREREG111 (the same calendar; this one tests other windows).
+
+## The test (fixed now)
+
+Reported beside: [R1] every year, [R2] the overlap with the crash book's sessions.
+
+## RESULTS (stage 1, 2026-10-21 10:30 ET; run920.py -> stage1_920.json)
+
+[R1] 2018 +1%, 2019 -2%.
+
+NOTE (2026-10-21 10:20 ET): written after the results above.
+
+NOTE (2026-10-21 10:4x ET): a guess.
+"""
+
+
+def _gated(tmp_path, md=GATED, md_at=(2026, 10, 21, 10, 25), results_at=(2026, 10, 21, 10, 40)):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    d = _study(tmp_path, "prereg920", md)
+    _touch(d / "stage1_920.json", _et(*results_at))
+    os.utime(d / "PREREG920.md", (_et(*md_at), _et(*md_at)))
+    return d
+
+
+def test_stamps_the_clock_never_read_are_caught(tmp_path):
+    """2026-10-20: PREREG171's RESULTS and NOTE were stamped 19:45 and 19:50 in a file last written at 19:42."""
+    d = _gated(tmp_path)
+    f = prereg.stamp_findings(d / "PREREG920.md", d, now=datetime(2026, 10, 21, 12, 0, tzinfo=ET))
+    assert any(":11 (results): stamped 2026-10-21 10:30, after the file was last written (10:25:00)" in x for x in f)
+    assert any(":11 (results): stamped 10:30 but its result stage1_920.json was written later" in x for x in f)
+    assert any(":15 (note): stamped 2026-10-21 10:20, before the section above it (line 11, 10:30)" in x for x in f)
+    assert any(":17 (note): not an exact clock reading: '2026-10-21 10:4x ET'" in x for x in f)
+    assert len(f) == 4, f
+    # the same file, read the clock: no finding
+    clean = GATED.replace("10:20 ET): written after", "10:31 ET): written after").replace(
+        "NOTE (2026-10-21 10:4x ET): a guess.", "NOTE (2026-10-21 10:32 ET): read the clock.")
+    d2 = _gated(tmp_path / "b", md=clean, md_at=(2026, 10, 21, 10, 33), results_at=(2026, 10, 21, 10, 29))
+    assert prereg.stamp_findings(d2 / "PREREG920.md", d2, now=datetime(2026, 10, 21, 12, 0, tzinfo=ET)) == []
+    future = prereg.stamp_findings(d2 / "PREREG920.md", d2, now=datetime(2026, 10, 21, 10, 31, tzinfo=ET))
+    assert any("stamped in the future (2026-10-21 10:32)" in x for x in future)
+
+
+def test_promised_outputs_must_reappear_in_the_results(tmp_path):
+    """2026-10-20: PREREG169's registered "reported beside" overlap was left out of its results."""
+    d = _gated(tmp_path)
+    pr = prereg.promised(d / "PREREG920.md")
+    assert pr["declared"] == ["[R1]", "[R2]"] and pr["undelivered"] == ["[R2]"] and pr["untagged"] is None
+    assert pr["reported"] is True
+    d2 = _study(tmp_path, "prereg921", GATED.replace("[R1] every year, [R2] the overlap", "every year, the overlap"))
+    assert prereg.promised(d2 / "PREREG921.md")["untagged"] == 1          # the registration's promise, untagged
+
+
+def test_prior_studies_find_the_repeat_a_registration_did_not_search_for():
+    """2026-10-20: PREREG171 (IPO lock-up shorts) repeated PREREG111 unnoticed."""
+    rows = [("PREREG110/118", "10-14 | new arms | arms for the weak contexts (index dips...) | REJECTED |"),
+            ("PREREG111/112", "10-14 | new arms | IPO lockup shorts; insider clusters | FAILED |"),
+            ("PREREG168", "10-20 | new arms (new data) | event shorts from the SEC filings and the split records, "
+                          "offerings, reverse splits, deficiency notices on Polygon's whole-market bars | FAILED |"),
+            ("PREREG171", "10-20 | new arm | IPO lock-up expiry shorts on Polygon's IPO calendar | FAILED |")]
+    text = ("# PREREG171 - IPO lock-up expiry shorts (a new data source: Polygon's IPO calendar)\n\nRegistered "
+            "2026-10-20 19:32 ET. The 180-day lock-up expiry of every IPO, shorted on Polygon's bars.")
+    found = prereg.prior_studies(text, rows, exclude=["171"])
+    assert found[0]["label"] == "PREREG111/112" and {"ipo", "lockup"} <= set(found[0]["shared"])
+    assert all(r["label"] != "PREREG171" for r in found)
+
+
+def test_the_new_checks_gate_only_registrations_from_the_convention_day(tmp_path):
+    rows_log = tmp_path / "RESEARCH.md"
+    rows_log.write_text("| 111 / 112 | 10-14 | new arms | IPO lockup shorts; insider clusters | FAILED |\n",
+                        encoding="utf-8")
+    d = _gated(tmp_path)
+    res = prereg.check(d, [rows_log], now=datetime(2026, 10, 21, 12, 0, tzinfo=ET))
+    assert res["gated"] is True and res["ok"] is False and res["violations"] == [] and res["problems"] == []
+    assert any("[R2]" in x for x in res["failed"]) and len(res["failed"]) == 5
+    assert res["prior"]["line"] is True and res["prior"]["candidates"][0]["label"] == "PREREG111/112"
+    assert prereg.verdict_line(res).startswith("prereg920: FAILED - 5 check(s)")
+    old = _gated(tmp_path / "old", md=GATED.replace("Registered 2026-10-21 10:00", "Registered 2026-10-20 10:00")
+                 .replace("Prior studies: PREREG111 (the same calendar; this one tests other windows).\n", ""))
+    res_old = prereg.check(old, [rows_log], now=datetime(2026, 10, 21, 12, 0, tzinfo=ET))
+    assert res_old["gated"] is False and res_old["ok"] is True and res_old["failed"] == []
+    assert any("Prior studies" in x for x in res_old["findings"])          # listed, never failed
+
+
+def test_the_clock_stamp_is_the_house_form():
+    assert prereg.now_stamp(datetime(2026, 10, 21, 6, 15, tzinfo=timezone.utc)) == "2026-10-21 02:15 ET (Wednesday)"

@@ -29,6 +29,13 @@ from src.broker.base import (
 # Non-USD base currencies already flagged this process — the account config is
 # static, so warn once instead of every get_account() call (29×/day in one log).
 _WARNED_NON_USD_CCY: set = set()
+# IBKR's refusals of a quote for want of a market-data subscription: 10089 ("requires additional subscription for
+# API"), 354 ("not subscribed"). The account has none (verified 2026-08-31: 10089 at every session hour), so every
+# quote request cost a round trip and its timeout before the Polygon fallback priced the order (~2 s an order at the
+# open; the audit of 2026-10-20). After one, `get_quote` / `get_market_price` skip IBKR for
+# `broker_quote_entitlement_retry_seconds` and then ask once again — the day the subscription exists, the IBKR book
+# comes back by itself within that interval.
+_MD_ENTITLEMENT_CODES = frozenset({10089, 354})
 
 # Repeated-wedge history, PERSISTED across process restarts (2026-09-03). The
 # broker-sync watchdog answers a wedged gateway with ``os._exit(1)`` and
@@ -188,6 +195,8 @@ class IBKRBroker(Broker):
         # and a sync with nothing to send looks healthy (2026-09-28 10:59-12:07,
         # after a manual login elsewhere). UTC instant of the loss, or None.
         self._link_lost_at: Optional[datetime] = None
+        # monotonic instant of IBKR's last refusal of a quote for want of a market-data subscription, or None
+        self._md_refused_at: Optional[float] = None
 
     # ── connection ────────────────────────────────────────────────────────
     def _get_ib(self):
@@ -231,8 +240,21 @@ class IBKRBroker(Broker):
                 logger.info(f"[broker:ibkr] IBKR connectivity restored (error {code}) after "
                             f"{(datetime.now(timezone.utc) - self._link_lost_at).total_seconds():.0f}s")
                 self._link_lost_at = None
+            elif code in _MD_ENTITLEMENT_CODES:
+                if self._md_refused_at is None:
+                    logger.info(f"[broker:ibkr] IBKR refused a quote (error {code}: no market-data subscription) — "
+                                "quotes come from Polygon; IBKR is asked again every "
+                                f"{float(getattr(settings, 'broker_quote_entitlement_retry_seconds', 0) or 0):.0f}s")
+                self._md_refused_at = time.monotonic()
         except Exception:
             pass
+
+    def _quotes_refused(self) -> bool:
+        """IBKR refused a quote for want of a market-data subscription less than
+        ``broker_quote_entitlement_retry_seconds`` ago: a quote request now would only burn its round trip and
+        timeout (0 = always ask)."""
+        wait = float(getattr(settings, "broker_quote_entitlement_retry_seconds", 0) or 0)
+        return wait > 0 and self._md_refused_at is not None and time.monotonic() - self._md_refused_at < wait
 
     def ibkr_link_lost_since(self) -> Optional[datetime]:
         """When the gateway reported losing IBKR (error 1100) without a restore
@@ -529,8 +551,9 @@ class IBKRBroker(Broker):
             if currency != "USD" and currency not in _WARNED_NON_USD_CCY:
                 _WARNED_NON_USD_CCY.add(currency)
                 logger.warning(
-                    f"[broker:ibkr] account base currency is {currency}, not USD — sizing "
-                    "assumes USD. Set your IBKR paper account base currency to USD to avoid FX skew. "
+                    f"[broker:ibkr] account base currency is {currency}, not USD — the live books order "
+                    "their simulated USD account's shares; IBKR's figures in that currency (the equity behind "
+                    "the exposure cap, the margin what-if) are converted at the live rate (src/broker/fx.py). "
                     "(warned once per run)"
                 )
             # accountValues() is a LOCAL cache read (populated by the account-update
@@ -819,7 +842,7 @@ class IBKRBroker(Broker):
         entitlement exists. Prefers last trade, then the bid/ask midpoint
         (``marketPrice``), then the prior close; all NaN-filtered.
         """
-        if not self._ensure_connected():
+        if self._quotes_refused() or not self._ensure_connected():
             return None
         ib = self._ib
         prev_timeout = getattr(ib, "RequestTimeout", 0)
@@ -868,9 +891,11 @@ class IBKRBroker(Broker):
 
         Returns None unless BOTH sides are present and sane (ask ≥ bid > 0) —
         a one-sided book cannot tell us what crossing costs, and the caller's
-        fallback (the mid-based cap) is the honest answer there.
+        fallback (the mid-based cap) is the honest answer there. Skipped while
+        IBKR's last refusal for want of a subscription is recent
+        (`_quotes_refused`): the caller's Polygon book prices the order at once.
         """
-        if not self._ensure_connected():
+        if self._quotes_refused() or not self._ensure_connected():
             return None
         ib = self._ib
         prev_timeout = getattr(ib, "RequestTimeout", 0)

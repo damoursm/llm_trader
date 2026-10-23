@@ -469,15 +469,43 @@ def daily(name: str) -> Optional[pd.DataFrame]:
 _CACHE: Dict[str, object] = {}
 
 
-def dip_panel() -> DipPanel:
-    """The dip book's A0 panel, loaded once per process."""
-    if "panel" not in _CACHE:
-        p = dip_panel_path()
-        if not p.exists():
-            raise FileNotFoundError(f"set A0's dip panel is not built ({p}): run build101.py dip")
-        z = pickle.load(open(p, "rb"))
-        _CACHE["panel"] = DipPanel(z["panel"], z["eligible"])
-    return _CACHE["panel"]
+class OwnDipPanel(DipPanel):
+    """A0's own-security dip panel (PREREG142's cut of A0's reused tickers: AI, SNOW, SE): its fills read the A0 bars
+    from each cut name's own security's first session."""
+    own = True
+
+    def __init__(self, data: Dict[str, pd.DataFrame], eligible: Sequence[str], cuts: Dict[str, pd.Timestamp]):
+        super().__init__(data, eligible)
+        self.cuts = dict(cuts)
+
+    def bars_fn(self, name: str) -> Optional[pd.DataFrame]:             # type: ignore[override]
+        b = bars_rth_frame(name)
+        if b is None or name not in self.cuts:
+            return b
+        et = pd.DatetimeIndex(b.index).tz_localize("UTC").tz_convert("America/New_York").tz_localize(None).normalize()
+        return b[et >= self.cuts[name]]
+
+
+def dip_panel(own: Optional[bool] = None) -> DipPanel:
+    """The dip book's A0 panel, loaded once per process: the own-security one by default
+    (`strategies.dip.OWN_DEFAULT`: PREREG142's `panel142_a0.pkl`), else the stored one (`dip_panel_path`)."""
+    from src.backtest.strategies import dip as DIP
+    own = DIP.OWN_DEFAULT if own is None else bool(own)
+    key = "panel_own" if own else "panel"
+    if key not in _CACHE:
+        if own:
+            from config import settings
+            p = Path(settings.backtest_research_dir) / DIP.OWN_PANEL_A0
+            z = pickle.load(open(p, "rb"))
+            _CACHE[key] = OwnDipPanel(z["panel"], z["eligible"],
+                                      {k: pd.Timestamp(v) for k, v in (z.get("cuts") or {}).items()})
+        else:
+            p = dip_panel_path()
+            if not p.exists():
+                raise FileNotFoundError(f"set A0's dip panel is not built ({p}): run build101.py dip")
+            z = pickle.load(open(p, "rb"))
+            _CACHE[key] = DipPanel(z["panel"], z["eligible"])
+    return _CACHE[key]
 
 
 def vol_engine():
@@ -504,7 +532,7 @@ def dip_pieces(prm=None, lo: str = LO, hi: str = STORE_HI, **kw) -> List[dict]:
     per (rule, window, options) in a process."""
     from src.backtest.strategies import dip as DIP
     prm = prm or DIP.LIVE
-    key = ("dip", repr(prm), str(lo), str(hi), repr(sorted(kw.items())))
+    key = ("dip", repr(prm), str(lo), str(hi), repr(sorted(kw.items())), bool(DIP.OWN_DEFAULT))
     if key not in _CACHE:
         _CACHE[key] = DIP.order_pieces(prm, lo, hi, panel=dip_panel(), **kw)
     return _CACHE[key]

@@ -657,12 +657,91 @@ def refresh_companyfacts(deadline: Optional[float] = None, workers: int = 4,
     return r
 
 
+# THE SPLIT GUARD of the 04:00-20:00 store (2026-10-16): its tails are APPENDED, so a split left every stored bar on
+# the pre-split scale beside the post-split tail (DHY x0.1, MGF x0.2, VTAK x9 ... a fake jump at the split). A name with
+# an effective split executed after its part was last fetched whole, or a split correction (`split_check`) its part
+# does not carry yet, is refetched WHOLE (corrected) and its part replaced — prices are an adjusted series, the one
+# family where a stored row must change with the adjustment. Stamps in `_adjusted_asof.json` beside the parts.
+FULL_ADJ_DEFAULT = "2026-10-16"            # every part was checked against production's store that day (the audit)
+
+
+def _full_adj_path() -> Path:
+    return deep.family_dir("bars30m_full") / "_adjusted_asof.json"
+
+
+def _full_stamps() -> Dict[str, dict]:
+    try:
+        return json.loads(_full_adj_path().read_text(encoding="utf-8"))
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def full_parts_to_reset(keys: Sequence[str], today: Optional[date] = None) -> Dict[str, str]:
+    """``{key: why}`` of the parts of ``keys`` the split guard refetches whole."""
+    from src.data.intraday_store import split_rows
+    from src.data.split_check import load_checks
+    today = today or date.today()
+    rows = split_rows() or {}
+    checks = load_checks()
+    stamps = _full_stamps()
+    parts = deep.family_dir("bars30m_full") / "parts"
+    corr: Dict[str, set] = {}
+    for k, rec in checks.items():
+        if rec.get("status") in ("false", "missing"):
+            corr.setdefault(k.split("|", 1)[0], set()).add(k)
+    out: Dict[str, str] = {}
+    for tk in keys:
+        if not (parts / f"{tk}.parquet").exists():
+            continue
+        st = stamps.get(tk.upper(), {})
+        asof = date.fromisoformat(st.get("asof", FULL_ADJ_DEFAULT))
+        ds = [d for d, _, _ in rows.get(tk.upper(), []) if asof < d <= today]
+        if ds:
+            out[tk] = f"split effective {max(ds)}"
+        elif corr.get(tk.upper(), set()) != set(st.get("corrections", [])):       # added or withdrawn
+            out[tk] = "split correction " + ", ".join(sorted(corr.get(tk.upper(), set())
+                                                             ^ set(st.get("corrections", []))))
+    return out
+
+
+def reset_full_part(tk: str, why: str, today: Optional[date] = None) -> str:
+    """Refetch ``tk``'s whole 04:00-20:00 history (corrected) and replace its part; stamp it."""
+    from src.data.deep import polygon_deep
+    from src.data.split_check import load_checks
+    today = today or date.today()
+    fresh = polygon_deep.bars30m_full(tk)
+    if fresh is None or not len(fresh):
+        return "empty"
+    deep.write_parquet(fresh, deep.family_dir("bars30m_full") / "parts" / f"{tk}.parquet")
+    corr = sorted(k for k, rec in load_checks().items()
+                  if k.startswith(f"{tk.upper()}|") and rec.get("status") in ("false", "missing"))
+    stamps = _full_stamps()
+    stamps[tk.upper()] = {"asof": today.isoformat(), "corrections": corr}
+    tmp = _full_adj_path().with_suffix(f".json.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(stamps, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, _full_adj_path())
+    logger.warning(f"[deep.refresh] bars30m_full/{tk}: part refetched WHOLE ({why}) — {len(fresh)} bars")
+    return "reset"
+
+
 def refresh_bars30m_full(deadline: Optional[float] = None, workers: int = 6, **_) -> dict:
     from src.data.deep import polygon_deep
-    return run_tails("bars30m_full", deep.deep_universe(),
-                     lambda tk, since: polygon_deep.bars30m_full(tk, start=since),
-                     key_col="ts", dedupe_on=["ts"], sort_by="ts", start_default=polygon_deep.BARS_FROM,
-                     overlap_days=1, workers=workers, deadline=deadline)
+    keys = deep.deep_universe()
+    resets = {}
+    for tk, why in full_parts_to_reset(keys).items():
+        if deadline is not None and time.time() > deadline:
+            break
+        try:
+            resets[tk] = reset_full_part(tk, why)
+        except Exception as e:                           # noqa: BLE001
+            resets[tk] = "failed"
+            logger.warning(f"[deep.refresh] bars30m_full/{tk}: split reset failed ({e})")
+    r = run_tails("bars30m_full", keys,
+                  lambda tk, since: polygon_deep.bars30m_full(tk, start=since),
+                  key_col="ts", dedupe_on=["ts"], sort_by="ts", start_default=polygon_deep.BARS_FROM,
+                  overlap_days=1, workers=workers, deadline=deadline)
+    r["split_resets"] = resets
+    return r
 
 
 def refresh_polygon_news(deadline: Optional[float] = None, workers: int = 6, **_) -> dict:
@@ -1486,8 +1565,17 @@ def extend_bars_30m(day: int, budget_seconds: float = 1200.0, workers: int = 12)
     out = extend_deep_30m(_deep.deep_universe(), workers=workers, budget_seconds=budget_seconds,
                           min_age_days=0, today=prev)
     # a split effective up to today resets the name's history BEFORE the
-    # snapshot is built on it (user directive 2026-09-27)
+    # snapshot is built on it (user directive 2026-09-27) — its record first
+    # checked on the pre-market's traded prices (`integrity.verify_today`,
+    # 2026-10-16): a contradicted record leaves the effective set and is undone
     today = date(1970, 1, 1) + timedelta(days=int(day))
+    from config.settings import settings as _settings
+    if getattr(_settings, "enable_data_integrity", True):
+        try:
+            from src.data import integrity
+            out["split_checks"] = integrity.verify_today(today, _deep.deep_universe())
+        except Exception as e:                           # noqa: BLE001
+            logger.warning(f"[deep.refresh] split-record check failed (fail-soft): {e}")
     out["split_resets"] = reset_split_tickers(_deep.deep_universe(), today)
     return out
 
@@ -1567,6 +1655,16 @@ def main(argv=None) -> None:
         s = run(fams, force=a.force, budget_seconds=a.budget_seconds or 14400.0, workers=a.workers,
                 sec_rate=a.sec_rate or 0.2, profile="nightly",
                 lanes=NIGHTLY_LANES if getattr(_settings, "deep_refresh_lanes", True) else None)
+        # THE PRICE DATA'S INTEGRITY CHECK (2026-10-16), the NIGHTLY RUN's last step once the split records are
+        # fresh — only here, the scheduler's nightly entry, never a library call of `run` (a test's included): the
+        # records verified on traded prices, missing splits searched, every store repaired (`src.data.integrity`)
+        if not s.get("skipped") and getattr(_settings, "enable_data_integrity", True):
+            try:
+                from src.data import integrity
+                s["integrity"] = {k: v for k, v in integrity.run().items()
+                                  if k in ("verified", "missing", "new_corrections", "cross_store_off")}
+            except Exception as e:                       # noqa: BLE001
+                logger.warning(f"[deep.refresh] integrity check failed (fail-soft): {e}")
     # ASCII only: the scheduler logs this line from a cp1252 console
     if s.get("skipped"):
         print(f"deep refresh: skipped - {s['skipped']}")

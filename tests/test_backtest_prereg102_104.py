@@ -48,9 +48,10 @@ def test_the_defaults_follow_productions_switches(monkeypatch):
     assert m.short_arms == ("vol", "etf", "fall") and all(m.arm_on(a) for a in ("vol", "etf", "fall"))
     assert m.fall_slices is None and m.fall_volnorm_on is None and m.fall_volnorm is None
     monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", True)
-    assert M.Mimic().etf_vix is False and M.etf_exclusion(M.Mimic()) == VIX          # production today: left out
+    assert M.Mimic().etf_vix is False and M.etf_exclusion(M.Mimic()) == VIX | M.REUSED_ETF   # production today
+    assert M.etf_exclusion(M.Mimic(etf_reused=True)) == VIX                         # AUDIT151's tickers ranked again
     monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", False)
-    assert M.Mimic().etf_vix is True and M.etf_exclusion(M.Mimic()) is None          # the switch off: ranked
+    assert M.Mimic().etf_vix is True and M.etf_exclusion(M.Mimic(etf_reused=True)) is None   # the switch off
     assert _default("sel_short_etf_exclude_vix") is True                             # the block is live (2026-10-14)
     assert M.Mimic.off().etf_vix is True                                             # the earlier simulator
     assert M.Mimic.borrow_v2().short_arms == M.SHORT_ARMS
@@ -65,11 +66,15 @@ def test_the_vix_products_are_productions_list():
 def test_the_fall_arms_default_exit_and_slice_are_productions():
     fall = dict(VOL.LIVE, **VOL.FALL)                          # how `VolEngine.cfg` merges the fall arm's params
     assert fall["volnorm_on"] is _default("enable_sel_short_volnorm_exit") is True
-    assert fall["volnorm"] == _default("sel_short_volnorm_ratio") == 0.5
+    assert fall["volnorm"] == _default("sel_short_fall_volnorm_ratio") == 0.7     # the fall arm's own, 2026-10-20
     assert fall["cap"] == _default("sel_short_cover_multiple")
+    # the time limits (PREREG173's V15, 2026-10-21): the vol arm's own 15, the fall arm the shared 10 — FALL pins its
+    # own, as it merges over the vol rule
+    assert VOL.LIVE["hmax"] == _default("sel_short_vol_max_hold_sessions") == 15
+    assert fall["hmax"] == VOL.FALL["hmax"] == _default("sel_short_arm_max_hold_sessions") == 10
     S = {s.name: s for s in M.live_strategies(M.Mimic())}
     from src.performance.sim_account import arm_slices
-    assert S["fall"].slices == arm_slices("fall") and _default("sel_short_fall_account_slices") == 12.0
+    assert S["fall"].slices == arm_slices("fall") and _default("sel_short_fall_account_slices") == 8.0   # 2026-10-20
 
 
 def test_nonsense_is_refused():
@@ -137,24 +142,24 @@ def _run(monkeypatch, mim, etf_none=False, dip_override=None):
 def test_the_default_build_is_unchanged_and_asks_for_the_re_ranked_etf_picks(monkeypatch):
     monkeypatch.setattr(settings, "sel_short_etf_exclude_vix", True)
     keep = dict(VOL.FALL)
-    books, log, eng, etf, seen, T = _run(monkeypatch, M.Mimic(seed=3))
+    books, log, eng, etf, seen, T = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151))
     assert T._fields(books) == T.BEFORE and log == T.BEFORE_LOG            # the pieces of every book as before
     assert [kw.get("exclude") for kw in seen["etf_kw"]] == [VIX]            # production's VIX block
     assert seen["fall_cfg"] == [keep] and dict(VOL.FALL) == keep             # FALL untouched
     assert eng.asm.cache == {"stale": 1}                                     # the fall arm built: the stub's cache kept
-    _, _, _, _, seen0, _ = _run(monkeypatch, M.Mimic(seed=3, etf_vix=True))
+    _, _, _, _, seen0, _ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, etf_vix=True))
     assert ["exclude" in kw for kw in seen0["etf_kw"]] == [False]           # E0: the arm before the block
 
 
 def test_without_the_etf_arm_it_is_never_built_and_every_other_book_is_unchanged(monkeypatch):
-    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3))
+    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151))
     from src.backtest.strategies import etf as ETFm
 
     class Boom:
         def __init__(self, *a, **k):
             raise AssertionError("the ETF arm was loaded although it is out of the account")
     monkeypatch.setattr(ETFm, "EtfArm", Boom)
-    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, short_arms=("vol", "fall")), etf_none=True)
+    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, short_arms=("vol", "fall")), etf_none=True)
     assert books["etf"] == [] and seen["etf_kw"] == []
     fb, f0 = T._fields(books), T._fields(base)
     # every other book piece for piece — the ranks too: removing a ticker keeps the others' order (live: ticker, arm)
@@ -166,8 +171,8 @@ def test_without_the_etf_arm_it_is_never_built_and_every_other_book_is_unchanged
 
 
 def test_without_the_fall_arm_it_is_never_built_and_every_other_book_is_unchanged(monkeypatch):
-    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3))
-    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, short_arms=("vol", "etf")))
+    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151))
+    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, short_arms=("vol", "etf")))
     assert books["fall"] == [] and seen["fall_cfg"] == []
     assert [c[0] for c in eng.calls] == ["pieces"]                           # no turn build
     assert eng.asm.cache == {}                    # the vol arm built on an empty cache, as after the fall arm's build
@@ -183,13 +188,13 @@ def test_without_the_fall_arm_it_is_never_built_and_every_other_book_is_unchange
                                      ({"fall_volnorm": 0.3}, {"volnorm": 0.3})])
 def test_the_fall_exit_reaches_the_fall_build_alone_and_is_restored(monkeypatch, kw, over):
     keep, live = dict(VOL.FALL), dict(VOL.LIVE)
-    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3))
-    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, **kw))
+    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151))
+    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, **kw))
     assert seen["fall_cfg"] == [dict(keep, **over)]                          # the fall build saw the override
     assert dict(VOL.FALL) == keep and dict(VOL.LIVE) == live                 # restored; the vol rule never touched
     assert T._fields(books) == T._fields(base)                               # the stub's pieces do not read FALL
     cfg = dict(VOL.LIVE, **dict(keep, **over))                               # what the engine merges: the fall cfg
-    assert (cfg["volnorm_on"], cfg["volnorm"]) == ((False, 0.5) if "volnorm_on" in over else (True, 0.3))
+    assert (cfg["volnorm_on"], cfg["volnorm"]) == ((False, 0.7) if "volnorm_on" in over else (True, 0.3))
 
 
 def _two_orders(dip):
@@ -202,27 +207,29 @@ def _two_orders(dip):
 def test_the_dip_filter_is_productions_switch_and_changes_the_dip_book_alone(monkeypatch):
     """PREREG96 Amendment 3: ``dip_filter`` drops every piece of an order `dip.filter_keep()` maps to False (production's
     construction: a filtered signal never becomes an order, never holds a slot); every other book is the default's."""
+    from config.settings import settings
     from src.backtest.strategies import dip as DIP
-    assert M.Mimic().dip_filter is False and _default("enable_dip_long_filter") is False   # production: off
+    assert _default("enable_dip_long_filter") is True                # production: on from the 2026-10-21 session
+    assert M.Mimic().dip_filter is bool(settings.enable_dip_long_filter)   # the default follows production's switch
     with pytest.raises(ValueError):
         M.Mimic(dip_filter=1)
 
     def boom(*a, **k):
         raise AssertionError("the dip filter was read although it is off")
     monkeypatch.setattr(DIP, "filter_keep", boom)
-    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3), dip_override=_two_orders)
+    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, dip_filter=False), dip_override=_two_orders)
     assert [p["tkn"] for p in base["dip"]] == ["MEGA", "BIGG"]
     calls = []
     monkeypatch.setattr(DIP, "filter_keep", lambda *a, **k: calls.append((a, k)) or {"MEGA|2023-03-06": False,
                                                                                          "BIGG|2023-03-07": True})
-    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, dip_filter=True), dip_override=_two_orders)
+    books, log, eng, etf, seen, _ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, dip_filter=True), dip_override=_two_orders)
     assert calls == [((), {})]                                       # production's construction: research=False
     assert [p["tkn"] for p in books["dip"]] == ["BIGG"]              # the filtered order is gone, the kept one stays
     fb, f0 = T._fields(books), T._fields(base)
     assert all(fb[k] == f0[k] for k in fb if k != "dip") and fb["dip"] == [r for r in f0["dip"] if r[0] == "BIGG"]
     # an order the map does not hold is kept (outside the scored years)
     monkeypatch.setattr(DIP, "filter_keep", lambda *a, **k: {})
-    books2, *_ = _run(monkeypatch, M.Mimic(seed=3, dip_filter=True), dip_override=_two_orders)
+    books2, *_ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, dip_filter=True), dip_override=_two_orders)
     assert T._fields(books2) == f0
 
 
@@ -362,17 +369,27 @@ def test_activation_drops_only_the_pieces_an_arm_s_map_switches_off(monkeypatch,
     days = pd.bdate_range("2022-01-03", "2023-12-29")
     monkeypatch.setattr(CX, "cached_table", lambda: pd.DataFrame({"cell": ["above/mid"] * len(days)}, index=days))
     M._activation_schedule.cache_clear()
-    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3), dip_override=_two_orders)
+    base, _, _, _, _, T = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151), dip_override=_two_orders)
     assert base["dip"] and base["vol"]
     off = tmp_path / "off.json"
     off.write_text(json.dumps({"arms": {"dip": {"2023-03": ["above/low"]}, "vol": {"2023-03": list(CX.CELLS)}}}))
-    books, log, *_ = _run(monkeypatch, M.Mimic(seed=3, activation=str(off)), dip_override=_two_orders)
+    books, log, *_ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, activation=str(off)), dip_override=_two_orders)
     fb, f0 = T._fields(books), T._fields(base)
     assert fb["dip"] == [] and log["activation_dip_off"] == len(base["dip"]) and log["activation_vol_off"] == 0
     assert all(fb[k] == f0[k] for k in fb if k != "dip")             # every other book exactly the default's
     other = tmp_path / "other_month.json"
     other.write_text(json.dumps({"arms": {"dip": {"2023-02": []}}}))  # March not named: active everywhere
-    books2, *_ = _run(monkeypatch, M.Mimic(seed=3, activation=str(other)), dip_override=_two_orders)
+    books2, *_ = _run(monkeypatch, M.Mimic(seed=3, **M.PRE151, activation=str(other)), dip_override=_two_orders)
     assert T._fields(books2) == f0
     with pytest.raises(ValueError):
         M.Mimic(activation=str(tmp_path / "missing.json"))
+
+
+def test_the_etf_arm_reads_our_own_archive_on_set_ds_days():
+    """PREREG188: IBKR's archived file to 2024-06-24 and OUR OWN archive from 2026-09-25 decide the ETF arm's
+    lendability; the modelled draws (``lend_after``) only between them — sets A0 / A / B never reach the own days."""
+    from src.backtest import periods
+    from src.backtest.strategies import etf as ETF
+    end, own = 100, 200
+    assert ETF.archive_day(100, end, own) and ETF.archive_day(250, end, own) and not ETF.archive_day(150, end, own)
+    assert ETF.OWN_ARCHIVE_FROM == periods.OWN_ARCHIVE_FROM == "2026-09-25"

@@ -322,3 +322,79 @@ def test_the_adapter_holds_the_traded_fund_on_the_decision_symbols_longs(on, mon
     (p,) = CR.pieces(days[0], days[-1])
     assert seen == ["QQQ"]                                                   # decided on QQQ
     assert p["tkn"] == "TQQQ" and p["e"] == tq.loc[a, "Open"] and p["x"] == tq.loc[b, "Open"]
+
+
+# ── THE AFTER-HOURS EXIT (PREREG166's XC; `crash_long_pm_exit`) ──────────────
+
+def _session_bars(d, closes):
+    """Session ``d``'s regular-hours 30-minute bars from 09:30 with these closes (13 = the whole session)."""
+    idx = [(datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET) + timedelta(minutes=30 * k)).astimezone(timezone.utc)
+           .replace(tzinfo=None) for k in range(len(closes))]
+    c = np.asarray(closes, float)
+    return pd.DataFrame({"Open": c, "High": c + 1, "Low": c - 1, "Close": c, "Volume": np.full(len(c), 1e6)},
+                        index=pd.DatetimeIndex(idx))
+
+
+@pytest.fixture
+def pm(on, monkeypatch):
+    monkeypatch.setattr(settings, "crash_long_pm_exit", True)
+    falling = _frame(list(np.linspace(300, 500, 230)) + [400.0, 380.0, 370.0, 360.0, 350.0])   # through 10-07
+    monkeypatch.setattr(dl, "_daily", lambda tk, through=None: falling)
+    feed = {}
+    monkeypatch.setattr(dl, "session_bars", lambda tk, d: feed.get((tk, d)))
+    return feed
+
+
+def test_the_after_hours_exit_reads_todays_close_into_the_rebound_rule(pm):
+    t = {"ticker": "TQQQ", "crash_decision_symbol": "QQQ", "crash_entry_day": "2026-10-02"}
+    pm[("QQQ", DAY)] = _session_bars(DAY, [352.0] * 12 + [395.0])           # today's close above its 5-session average
+    reason, info = cl.pm_exit_check(t, DAY)
+    assert reason == "crash_rebound" and info["rebound_session"] == DAY.isoformat() and info["close_today"] == 395.0
+    pm[("QQQ", DAY)] = _session_bars(DAY, [352.0] * 12 + [340.0])           # still falling: held
+    assert cl.pm_exit_check(t, DAY)[0] is None
+    pm[("TQQQ", DAY)] = _session_bars(DAY, [99.0] * 13)                     # the traded fund's bars never decide
+    assert cl.pm_exit_check(t, DAY)[0] is None
+
+
+def test_the_after_hours_exit_takes_the_time_limit_on_the_last_session(pm, monkeypatch):
+    falling = _frame(list(np.linspace(300, 500, 220)) + list(np.linspace(400, 345, 20)))  # falling every day
+    monkeypatch.setattr(dl, "_daily", lambda tk, through=None: falling)
+    entry = _sessions(DAY, 10)[0]                                            # today is its 10th session
+    pm[("QQQ", DAY)] = _session_bars(DAY, [340.0] * 13)
+    reason, info = cl.pm_exit_check({"ticker": "TQQQ", "crash_entry_day": entry.isoformat()}, DAY)
+    assert reason == "crash_time" and info["held"] == 10
+    later = _sessions(DAY, 9)[0]
+    assert cl.pm_exit_check({"ticker": "TQQQ", "crash_entry_day": later.isoformat()}, DAY)[0] is None
+
+
+def test_without_the_sessions_last_bar_nothing_is_decided(pm):
+    t = {"ticker": "TQQQ", "crash_decision_symbol": "QQQ", "crash_entry_day": "2026-10-02"}
+    pm[("QQQ", DAY)] = _session_bars(DAY, [352.0] * 12)                     # no 15:30 bar yet
+    reason, info = cl.pm_exit_check(t, DAY)
+    assert reason is None and info["no_close"]
+
+
+def test_the_step_sells_from_1630_to_2000_et_only_with_the_switch_on(pm, monkeypatch):
+    pm[("QQQ", DAY)] = _session_bars(DAY, [352.0] * 12 + [395.0])
+    monkeypatch.setattr(tracker, "_fetch_price", lambda t: 61.5)
+    monkeypatch.setattr(tracker, "_reference_close", lambda t: None)
+    monkeypatch.setattr(tracker, "_execution_iso", lambda: datetime(2026, 10, 8, 16, 31, tzinfo=ET).isoformat())
+    tracker._save_trades([dict(crash(n=40, px=55.0), crash_entry_day="2026-10-02")])
+    assert tracker.monitor_crash_long_pm_exit(now=datetime(2026, 10, 8, 16, 20, tzinfo=ET)) == 0    # before 16:30
+    monkeypatch.setattr(settings, "crash_long_pm_exit", False)
+    assert tracker.monitor_crash_long_pm_exit(now=datetime(2026, 10, 8, 16, 31, tzinfo=ET)) == 0    # the switch off
+    monkeypatch.setattr(settings, "crash_long_pm_exit", True)
+    assert tracker.monitor_crash_long_pm_exit(now=datetime(2026, 10, 8, 20, 5, tzinfo=ET)) == 0     # after 20:00
+    assert tracker.monitor_crash_long_pm_exit(now=datetime(2026, 10, 8, 16, 31, tzinfo=ET)) == 1
+    t = tracker._load_trades()[0]
+    assert t["status"] == "CLOSED" and t["exit_reason"] == "crash_rebound" and t["exit_price"] == 61.5
+    assert t["crash_pm_exit"] and t["exit_session"] == "extended"
+    assert cl._read_jsonl(cl.exits_path(DAY))[0]["pm"] is True
+
+
+def test_the_simulator_moves_only_the_crash_books_exit_to_the_after_hours_tick(monkeypatch):
+    from src.backtest import mimic as M
+    monkeypatch.setattr(settings, "crash_long_pm_exit", True)
+    assert M.Mimic().crash_pm_exit and not M.Mimic().pm_exits               # the dip book keeps its open exit
+    monkeypatch.setattr(settings, "crash_long_pm_exit", False)
+    assert not M.Mimic().crash_pm_exit

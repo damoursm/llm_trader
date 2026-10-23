@@ -88,6 +88,15 @@ def _isolated_news_coverage_and_live_features(tmp_path, monkeypatch):
     monkeypatch.setattr(finnhub_refresher, "STATE_PATH", tmp_path / "finnhub_refresher_state.json")
     monkeypatch.setattr(live_features, "LIVE_DIR", tmp_path / "live_features")
     monkeypatch.setattr(settings, "enable_live_feature_capture", False)
+    # the price data's integrity checks (2026-10-16) never run in a test — they ask Polygon and yfinance and repair
+    # the real stores — and the split table a test reads is its own (an empty one: the records apply as recorded)
+    monkeypatch.setattr(settings, "enable_data_integrity", False)
+    from src.data import split_check, integrity
+    monkeypatch.setattr(split_check, "CHECKS_PATH", tmp_path / "split_checks.json")
+    monkeypatch.setattr(integrity, "OUT_DIR", tmp_path / "integrity")
+    split_check._CACHE.clear()
+    from src.data import market_data as _md_split_guard
+    monkeypatch.setattr(_md_split_guard, "DAILY_ADJ_PATH", tmp_path / "ohlcv_meta" / "adjusted_asof.json")
     finnhub_refresher.reset()
     # IBKR's borrow file (2026-09-25): never downloaded by a test, and the real
     # archive under data/ibkr_borrow/ must not decide a test's shorts.
@@ -107,6 +116,12 @@ def _isolated_news_coverage_and_live_features(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "ibkr_flex_query_id", "")
     monkeypatch.setattr(flex, "RAW_DIR", tmp_path / "ibkr_flex")
     borrow_fees.reset()
+    # The ledger's dividends (AUDIT151, 2026-10-19) read the deep store's real dividend records: off in the
+    # baseline, and never the real file (its tests opt in with their own table).
+    from src.performance import dividends
+    monkeypatch.setattr(settings, "enable_ledger_dividends", False)
+    monkeypatch.setattr(dividends, "DIV_PATH", tmp_path / "dividends.parquet")
+    dividends.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -133,6 +148,9 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "enable_sel_short_ibkr_whatif", False)
     # the halt guard reads NYSE's current-halt list over the network: its tests opt in with a fake list
     monkeypatch.setattr(settings, "enable_sel_short_halt_guard", False)
+    # the vol shorts' news-hold shadow (PREREG136, 2026-10-17) asks Polygon and the local LLM from a background
+    # thread: its tests opt in with fakes (its journal sits under the temp sel_short_dir)
+    monkeypatch.setattr(settings, "enable_sel_short_news_hold_shadow", False)
     # the vol arm's thin stocks (2026-10-07) add a fourth arm to every run: their tests opt in
     monkeypatch.setattr(settings, "enable_sel_short_thin", False)
     monkeypatch.setattr(settings, "enable_sel_short_vol2", False)
@@ -151,15 +169,42 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     # baseline keeps the rules before it (every signal an order at 1/10, no stacking cap); Q1's tests opt in
     monkeypatch.setattr(settings, "dip_long_daily_top", 0)
     monkeypatch.setattr(settings, "dip_long_account_slices", 10)
+    # PREREG147's S3 (2026-10-19 session): the daily top pick's $2B floor — the baseline has none; its tests opt in
+    monkeypatch.setattr(settings, "dip_long_order_min_dollar_volume", 0.0)
     monkeypatch.setattr(settings, "sel_short_max_open_per_ticker", 0)
+    # PREREG137's earnings-dip demotion (2026-10-17): it reads the deep store's filings and asks EDGAR — the baseline
+    # ranks without it and never asks EDGAR; its tests opt in (with their own store and a stubbed EDGAR)
+    monkeypatch.setattr(settings, "enable_dip_long_earnings_demote", False)
+    monkeypatch.setattr(settings, "dip_long_earnings_edgar", False)
+    # the own-security series (2026-10-18, src/signals/dip_security.py): it reads its events cache and asks Polygon —
+    # the baseline reads the store as stored and never asks; its tests opt in (with their own cache, no network)
+    monkeypatch.setattr(settings, "enable_dip_long_own_security", False)
+    monkeypatch.setattr(settings, "dip_long_security_budget_seconds", 0.0)
     monkeypatch.setattr(settings, "enable_etf_dm", False)
     monkeypatch.setattr(settings, "etf_dm_dir", str(tmp_path / "etf_dm"))
+    # the capitulation book (2026-10-21, src/signals/cap_long.py) reads the whole-market bars and journals under its
+    # own dir; the crash book's after-hours exit (PREREG166's XC): the baseline has neither — their tests opt in
+    monkeypatch.setattr(settings, "enable_cap_long", False)
+    monkeypatch.setattr(settings, "cap_long_dir", str(tmp_path / "cap_long"))
+    monkeypatch.setattr(settings, "crash_long_pm_exit", False)
     # the live record against the simulator (2026-10-12): the email's banner reads it — never production's files
     monkeypatch.setattr(settings, "live_calibration_dir", str(tmp_path / "live_calibration"))
+    monkeypatch.setattr(settings, "forward_check_dir", str(tmp_path / "forward_check"))
     from src.data import trade_halts
     trade_halts.reset()
     monkeypatch.setattr(settings, "legacy_flatten_after", "")
     monkeypatch.setattr(tracker, "_LEGACY_FLATTEN_MARKER", tmp_path / "legacy_flatten_done.json")
+    # the live account's fresh start (2026-10-20): none in the baseline, its marker never production's; the tests
+    # keep the $10,000 account they were written for
+    monkeypatch.setattr(settings, "live_account_fresh_start", "")
+    monkeypatch.setattr(tracker, "_FRESH_START_MARKER", tmp_path / "live_account_fresh_start_done.json")
+    monkeypatch.setattr(settings, "sel_short_account_initial", 10000.0)
+    # the live account's margin check (IBKR's liquidation, PREREG175): its state and journal never production's; no
+    # bar is fetched (the network is off; its tests hand the bars in)
+    from src.performance import margin_watch
+    monkeypatch.setattr(margin_watch, "STATE", tmp_path / "live_account" / "margin_state.json")
+    monkeypatch.setattr(margin_watch, "JOURNAL", tmp_path / "live_account" / "liquidations")
+    monkeypatch.setattr(margin_watch, "bars_since", lambda ticker, after, now: [])
     sel_short._MODEL.clear()
 
 

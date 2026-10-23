@@ -112,3 +112,67 @@ def test_calibrate_builds_shrunk_clamped_buckets(monkeypatch):
     # and an unfilled expensive leg now prices like its class, not the blend
     got = _resolve(price=200.0, adv=50e6, run="nope")
     assert got == pytest.approx(sb[("rth", pb_exp, ab)])
+
+
+# ── AUDIT151 (2026-10-19): a leg with no usable fill of its own is costed at its OWN quote at submit ──
+
+def test_a_legs_own_quote_prices_it_with_ibkrs_fees_on_its_shares(monkeypatch):
+    monkeypatch.setattr(settings, "commission_model", "ibkr_fixed")
+    # a short entry (a SELL) of 33 shares at 12.50, the book 12.40 x 12.60: 80 bp half-spread + $1 + SEC + TAF
+    got = spread.quote_leg_cost_frac("SELL", 12.50, 12.40, 12.60, 33)
+    value = 33 * 12.50
+    want = 0.2 / 25.0 + (1.0 + spread.SEC_FEE_RATE * value + spread.TAF_PER_SHARE * 33) / value
+    assert got == pytest.approx(want)
+    assert spread.quote_leg_cost_frac("BUY", 12.50, 12.40, 12.60, 33) == pytest.approx(0.2 / 25.0 + 1.0 / value)
+    assert spread.quote_leg_cost_frac("BUY", 10.0, 9.0, 11.5, 100) == pytest.approx(0.04 + 1.0 / 1000.0)  # capped
+    for bad in ((12.5, 0.0, 12.6, 33), (12.5, 12.6, 12.4, 33), (12.5, 12.4, 12.6, 0), (12.5, None, 12.6, 33)):
+        assert spread.quote_leg_cost_frac("BUY", *bad) is None
+    monkeypatch.setattr(settings, "commission_model", "none")
+    assert spread.quote_leg_cost_frac("SELL", 12.50, 12.40, 12.60, 33) == pytest.approx(0.008)   # spread only
+
+
+def test_the_quote_tier_sits_between_the_own_fill_and_the_bucket_averages(monkeypatch):
+    monkeypatch.setattr(settings, "sim_per_trade_cost_attribution", True)
+    monkeypatch.setattr(settings, "commission_model", "none")
+    pb, ab = spread.price_band(50.0), spread.adv_band(50e6)
+    spread.set_cost_attribution(tick_costs={"r1": 0.0030}, session_costs={"rth": 0.0040}, ref_to_run={},
+                                tick_bucket={("r1", pb, ab): 0.0010}, session_bucket={})
+    kw = dict(side="BUY", price=50.0, asset_type="STOCK", session_fine="rth", ref=None, run="r1", adv=50e6,
+              commission=None, quote_bid=49.75, quote_ask=50.25, shares=20)
+    assert spread.resolve_leg_cost(filled_qty=0, model_price=None, fill_price=None, **kw) == pytest.approx(0.005)
+    own = spread.resolve_leg_cost(filled_qty=20, model_price=50.0, fill_price=50.10, **kw)
+    assert own == pytest.approx(0.002)                         # its own fill first: 10 bp of slippage
+    kw.update(quote_bid=None, quote_ask=None)
+    assert spread.resolve_leg_cost(filled_qty=0, model_price=None, fill_price=None, **kw) == pytest.approx(0.0010)
+
+
+def test_a_trades_unfilled_exit_takes_its_exit_quote_and_its_entry_its_own(monkeypatch):
+    monkeypatch.setattr(settings, "sim_per_trade_cost_attribution", True)
+    monkeypatch.setattr(settings, "commission_model", "none")
+    t = {"ticker": "AEHL", "action": "SELL", "type": "STOCK", "entry_price": 11.975, "exit_price": 11.51,
+         "sel_account_shares": 29, "broker_requested_qty": 29, "broker_fill_qty": 0,
+         "broker_bid_at_submit": 11.90, "broker_ask_at_submit": 12.05,
+         "broker_exit_requested_qty": 29, "broker_exit_bid_at_submit": 11.10, "broker_exit_ask_at_submit": 11.88}
+    assert spread.resolve_trade_leg_cost(t, "entry", 11.975, "rth") == pytest.approx(0.15 / 23.95)
+    assert spread.resolve_trade_leg_cost(t, "exit", 11.51, "rth") == pytest.approx(0.78 / 22.98)
+
+
+def test_the_broker_stamps_the_book_it_priced_the_order_on(monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from src.broker import reconcile as rec
+    res = SimpleNamespace(order_id="1", side="SELL", requested_qty=29, filled_qty=0, avg_fill_price=None,
+                          commission=None, status="Submitted", submitted_at="x", client_ref="ref-1")
+    rec._LAST_QUOTE.clear()
+    rec._LAST_QUOTE["AEHL"] = (11.90, 12.05, time.time())
+    t = {"ticker": "AEHL", "action": "SELL"}
+    rec._apply_entry_result(t, res)
+    assert (t["broker_bid_at_submit"], t["broker_ask_at_submit"]) == (11.90, 12.05)
+    rec._LAST_QUOTE["AEHL"] = (11.10, 11.88, time.time())
+    rec._apply_exit_result(t, res)
+    assert (t["broker_exit_bid_at_submit"], t["broker_exit_ask_at_submit"]) == (11.10, 11.88)
+    rec._LAST_QUOTE["XYZ"] = (5.0, 5.1, time.time() - 3600)      # a stale book never stamps
+    u = {"ticker": "XYZ", "action": "BUY"}
+    rec._apply_entry_result(u, res)
+    assert "broker_bid_at_submit" not in u
+    rec._LAST_QUOTE.clear()

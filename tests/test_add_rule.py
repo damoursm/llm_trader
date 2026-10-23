@@ -324,7 +324,8 @@ def test_pooled_margin_calls_are_summed_and_the_drawdown_is_the_worst_set_per_se
     v = R.pooled_verdict(live, shift)
     assert v["pooled"]["calls_live"] == 2 and v["pooled"]["calls_variant"] == 2 and v["decision"] == "add"
     more = dict(shift, B=_pvariant(live["B"], 1.0, noise=0.1, calls=(1, 2)))
-    assert R.pooled_verdict(live, more)["decision"] == "reject"
+    assert R.pooled_verdict(live, more, margin="count")["decision"] == "reject"   # the count rule: 3 pairs against 2
+    assert R.pooled_verdict(live, more)["decision"] == "add"                       # as a rate: one pair more, p 0.5
     deep = dict(shift, B=_pvariant(live["B"], 1.0, noise=0.1, calls=(1,), dd=21.5))
     deep["B"][2]["calls"] = []
     x = R.pooled_verdict(live, deep)
@@ -340,8 +341,51 @@ def test_pooled_records_without_years_cannot_be_added_and_risk_protection_is_fla
     safer = {st: _pvariant(livec[st], -0.2, noise=0.2) for st in livec}
     for s in safer["A0"].values():
         s["calls"] = []
-    r = R.pooled_verdict(livec, safer)
+    r = R.pooled_verdict(livec, safer, margin="count")
     assert r["decision"] == "reject" and r["risk_protection"] and "RISK PROTECTION" in r["why"][-1]
+    assert not R.pooled_verdict(livec, safer)["risk_protection"]       # as a rate: 4 pairs fewer, p 1/16 = 0.0625
+    livec5 = _pool(calls={"A0": (0, 1, 2, 3, 4)})
+    safer5 = {st: _pvariant(livec5[st], -0.2, noise=0.2) for st in livec5}
+    for s in safer5["A0"].values():
+        s["calls"] = []
+    r5 = R.pooled_verdict(livec5, safer5)
+    assert r5["decision"] == "reject" and r5["risk_protection"]        # 5 fewer, p 1/32
+    assert "significantly fewer margin events" in r5["why"][-1]
+
+
+def test_margin_events_are_judged_as_a_rate():
+    """The user, 2026-10-23: "update the add rule to judge margin calls as a rate. We shouldn't judge the performance
+    based on number of margin calls anymore" — a change is refused on its margin events only when the pairs only it
+    meets are too many for chance (the one-sided exact binomial on the discordant pairs, p < 0.05)."""
+    live = _pool()
+    four = {st: _pvariant(live[st], 1.0, noise=0.1, calls=((0, 1, 2, 3) if st == "B" else ())) for st in live}
+    v4 = R.pooled_verdict(live, four)
+    me = v4["pooled"]["margin_events"]
+    assert (me["only_variant"], me["only_live"], me["discordant"]) == (4, 0, 4) and me["p_more"] == 1 / 16
+    assert v4["decision"] == "add" and v4["criteria"]["margin_calls"] and v4["margin_rule"] == "rate"
+    assert R.pooled_verdict(live, four, margin="count")["decision"] == "reject"
+    five = {st: _pvariant(live[st], 1.0, noise=0.1, calls=((0, 1, 2, 3, 4) if st == "B" else ())) for st in live}
+    v5 = R.pooled_verdict(live, five)
+    assert v5["decision"] == "reject" and not v5["criteria"]["margin_calls"]
+    assert "significantly more frequent" in v5["why"][0] and "p 0.031" in v5["why"][0]
+    assert "only with 5, only without 0: p 0.031 more, 1.000 fewer; rate rule" in R.pooled_summary(v5)
+
+
+def test_margin_events_count_the_discordant_pairs_only():
+    live = {"A": {0: {"calls": ["x"]}, 1: {"calls": ["x"]}, 2: {"calls": []}, 3: {"calls": []}, 4: {"calls": []}},
+            "B": {0: {"calls": []}, 1: {"calls": ["x"]}}}
+    var = {"A": {0: {"calls": ["x"]}, 1: {"calls": []}, 2: {"calls": ["x"]}, 3: {"calls": ["x"]}, 4: {"calls": []}},
+           "B": {0: {"calls": ["x"]}, 1: {"calls": ["x"]}, 9: {"calls": ["x"]}}}         # seed 9: not paired
+    me = R.margin_events(live, var, sets=("A", "B"))
+    assert (me["both"], me["only_live"], me["only_variant"], me["neither"]) == (2, 1, 3, 1)
+    assert me["p_more"] == 5 / 16 and me["p_fewer"] == 15 / 16 and not me["more"] and not me["fewer"]
+    assert R.binom_upper(0, 0) == 1.0 and R.binom_upper(5, 5) == 1 / 32 and R.binom_upper(3, 4) == 5 / 16
+
+
+def test_the_margin_rule_is_checked():
+    live = _pool()
+    with pytest.raises(ValueError):
+        R.pooled_verdict(live, live, margin="draws")
 
 
 def test_pooled_draws_futility_and_the_undecided_band():

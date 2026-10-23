@@ -18,7 +18,10 @@ which pieces the account can actually take and at what size, and books every dol
   50%) and IBKR's house rate (a multiple of the short's value); a long = Reg T 25% maintenance / 50% initial or the
   house rate if larger. At every bar (closes, or the bar's adverse extreme — high for a short, low for a long — with
   `trigger="high"`) equity below the maintenance of the open positions is a MARGIN CALL: every position is closed at
-  that price paying twice its entry half-spread (the audited engine's rule).
+  that price paying twice its entry half-spread (the audited engine's rule). With `Rules(liquidation="ibkr")`
+  (PREREG174) it is IBKR's liquidation instead: the most recently opened positions first, in 100-share lots, only until
+  equity is back at the requirement (IBKR's Soft Edge Margin and its end-of-day Reg T check as options; `Rules`);
+  ``calls`` then holds each liquidation instant, ``liquidations`` every lot sold and ``call_kinds`` each call's kind.
 * FEES, all real: the half-spread of each fill (the piece's ``hs_in`` / ``hs_out`` in bp, from the live NBBO or the
   fitted spread model), IBKR's fixed commission max($1, $0.005 a share) capped at 1% of the order, the SEC fee and
   FINRA's TAF on every SALE (a short's entry, a long's exit), and a short's IBKR borrow day by day (the piece's
@@ -115,6 +118,8 @@ class Strategy:
                                                 # next 09:30 ET mark with room, never by preempting (PREREG53)
     room_frac: Optional[float] = None           # MARGIN BUFFER: an entry opens only while the account's initial
                                                 # requirement after it is at most this share of equity (PREREG57)
+    min_frac: Optional[float] = None            # a new market position worth less than this share of equity is
+                                                # skipped (PREREG154: the QQQ sleeve's lots, at least 5% of equity)
     delever_order: Optional[int] = None         # DE-LEVERAGING (``Rules.delever``): its positions may be sold, the
                                                 # lowest order first, the latest opened first (PREREG57)
     yield_first: str = "latest"                 # which of its positions give way first: "latest" / "earliest" opened
@@ -202,10 +207,56 @@ class Rules:
     # if the lower-quality preemptible positions were freed (nothing sold then) and its fill sells just enough of them
     # for its quantity — so a sleeve that yields to every book never starves the dip book's orders
     fills_make_room: bool = False
+    # THE FILL'S OWN SIZE IN THE GIVE-WAY (off: False; 2026-10-20, production's `live_account.fill_give_way_plan`): a
+    # limit order's fill that makes room (``fills_make_room``) sells lower-quality positions until the FILL'S size —
+    # the margin room and its side's cap, no slice, as the fill buys — reaches its quantity, and nothing when selling
+    # every candidate would not raise it; off, `make_room` reads the entry's slice-capped size, so a quantity above the
+    # slice at the fill price keeps selling candidates that add no share (PREREG86's construction)
+    fill_room_exact: bool = False
+    # MARGIN CALLS (PREREG174; the user 2026-10-21: "I want the backtest to do exactly the same [as IBKR during margin
+    # calls], and, if we can't be exact, approximate closely and be only slightly on the safe side"). "all": equity
+    # under the maintenance requirement closes EVERY position at the check's prices and cancels every working order
+    # (the audited engine's rule). "ibkr": IBKR's liquidation (its "Margin Calculations for Securities" page) — the
+    # open positions liquidated the MOST RECENTLY OPENED first (``liq_order`` "recent"; "requirement": the largest
+    # maintenance requirement first, a sensitivity), each in ``liq_lot``-share lots — the fewest that bring equity up
+    # to the requirement net of their costs, the whole position when it holds fewer — until equity >= the maintenance
+    # requirement (IBKR's excess liquidity >= 0), at the check's prices, a ledger leg at the larger of its piece's entry
+    # and exit costs; every working order cancelled. ``sem``: IBKR's Soft Edge Margin — a deficit up to this share of
+    # equity tolerated at instants from 09:30 to 15:45 ET, the full requirement for the rest of a session once
+    # breached (0: strict at every hour). ``regt_close``: at the first instant at/after 15:50 ET of a session, equity
+    # under the Reg T initial requirement (the floor of IBKR's end-of-day SMA) is liquidated the same way
+    liquidation: str = "all"
+    liq_order: str = "recent"
+    liq_lot: int = 100
+    sem: float = 0.0
+    regt_close: bool = False
+    # WHERE the lots fill (PREREG174 Amendments 2-3): "extreme" — every lot at its position's price in the check (the
+    # bar's adverse extreme with `trigger="high"`); "path" — inside an instant whose check shows a deficit, every
+    # position moves along one path from its previous mark to that price (all together) and the check runs
+    # continuously along it: at each crossing the lots are sold until equity >= the requirement there, each filled at
+    # its price at the crossing moved ``liq_slip`` of it against the account (one limit-up-limit-down band: a market
+    # order meets at most about one pause), never beyond its check price
+    liq_fill: str = "extreme"
+    liq_slip: float = 0.10
 
     def __post_init__(self):
         if self.trigger not in ("close", "high"):
             raise ValueError(f"Rules.trigger must be 'close' or 'high', not {self.trigger!r}")
+        if self.liquidation not in ("all", "ibkr"):
+            raise ValueError(f"Rules.liquidation must be 'all' or 'ibkr', not {self.liquidation!r}")
+        if self.liq_order not in ("recent", "requirement"):
+            raise ValueError(f"Rules.liq_order must be 'recent' or 'requirement', not {self.liq_order!r}")
+        if isinstance(self.liq_lot, bool) or not isinstance(self.liq_lot, int) or self.liq_lot < 1:
+            raise ValueError(f"Rules.liq_lot must be a whole number of shares >= 1, not {self.liq_lot!r}")
+        if isinstance(self.sem, bool) or not isinstance(self.sem, (int, float)) or not 0.0 <= float(self.sem) < 1.0:
+            raise ValueError(f"Rules.sem must be a share of equity in [0, 1), not {self.sem!r}")
+        if self.liquidation != "ibkr" and (float(self.sem) > 0 or self.regt_close):
+            raise ValueError("Rules.sem / regt_close are IBKR's liquidation's (liquidation='ibkr')")
+        if self.liq_fill not in ("extreme", "path"):
+            raise ValueError(f"Rules.liq_fill must be 'extreme' or 'path', not {self.liq_fill!r}")
+        if isinstance(self.liq_slip, bool) or not isinstance(self.liq_slip, (int, float)) \
+                or not 0.0 <= float(self.liq_slip) <= 1.0:
+            raise ValueError(f"Rules.liq_slip must be a share in [0, 1], not {self.liq_slip!r}")
         if self.fees not in ("engine", "ledger"):
             raise ValueError(f"Rules.fees must be 'engine' or 'ledger', not {self.fees!r}")
         if self.delever is not None and not (len(self.delever) == 2 and 0 < self.delever[1] <= self.delever[0]):
@@ -711,13 +762,66 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
         n2 = int(math.floor(alloc2 / e)) if e > 0 and alloc2 > 0 else 0
         return min(n2, nm2)
 
-    def make_room(i, st, e, t, today, want_n=None):
+    def fill_size(i, e, today, freed: bool = False, own_order=None) -> int:
+        """A limit order's fill size at ``e`` as the fill computes it — the margin room and its side's cap, no slice,
+        the other working orders' reservations held (``own_order``'s own excluded); ``freed``: as if every
+        lower-quality preemptible position were sold (equity unchanged)."""
+        st_ = S[i]
+        eq, rq_now, g = cash, 0.0, 0.0
+        for w, m in o_n.items():
+            pw = o_px[w]
+            eq += unreal(w, m, pw, today)
+            if freed and S[w].preemptible and S[w].quality is not None and st_.quality is not None \
+                    and S[w].quality < st_.quality:
+                continue
+            rq_now += ireq_open(w, m, pw)
+            if side[w] == side[i]:
+                g += m * pw
+        for o2, r2 in res.items():
+            if r2["reserve"] and o2 != own_order:
+                rq_now += ireq_open(r2["row"], r2["n"], r2["lim"])
+                if side[r2["row"]] == side[i]:
+                    g += r2["n"] * r2["lim"]
+        room_ = eq - rq_now
+        r_i = irate(i, e)
+        nm = int(math.floor(room_ / r_i)) if room_ > 0 else 0
+        if nm > 0:
+            nm = int(math.floor(max(room_ - room_cost(i, nm, e), 0.0) / r_i))
+        n_side = int(math.floor((gcap[int(side[i])] * eq - g) / e)) if e > 0 else 0
+        return max(0, min(nm, n_side))
+
+    def make_room_fill(i, st, e, t, today, want_n, own_order=None):
+        """`make_room` for a limit order's fill under `Rules.fill_room_exact`: the lower-quality preemptible
+        positions sold (the lowest quality first, the latest opened first; whole when ``yield_whole``) until the fill's
+        own size reaches ``want_n`` — nothing when selling them all would not raise it (production's
+        `live_account.fill_give_way_plan`). Returns the fill's size then."""
+        now_n = fill_size(i, e, today, own_order=own_order)
+        if now_n >= want_n or fill_size(i, e, today, freed=True, own_order=own_order) <= now_n:
+            return now_n
+        for _ in range(500):
+            n = fill_size(i, e, today, own_order=own_order)
+            if n >= want_n:
+                return n
+            cands = [w for w in o_n if S[w].preemptible and S[w].quality is not None and S[w].quality < st.quality]
+            if not cands:
+                return n
+            w = min(cands, key=lambda v: (S[v].quality, (-1 if S[v].yield_first == "latest" else 1)
+                                          * pos_of[v]["entry_ns"]))
+            pw = o_px[w]
+            k = o_n[w] if S[w].yield_whole else max(1, min(int(math.ceil((want_n - n) * e / max(pw, 1e-9))) + 1,
+                                                            o_n[w]))
+            sell_part(i, w, k, pw, t, today)
+        return fill_size(i, e, today, own_order=own_order)
+
+    def make_room(i, st, e, t, today, want_n=None, own_order=None):
         """Capital priority: sell lower-quality preemptible positions until entry ``i`` gets its whole slice (or no
         candidate is left) — production's give-way: while the MARGIN ROOM holds the entry below its side-capped size,
         any side's candidate (a sale frees room); once only its side's cap does, its own side's (only they free it);
         nothing at all when even selling every candidate would not let it take more (`helps`, PREREG64).
-        ``want_n``: a limit order's fill wants its own quantity, not the slice at the fill price (PREREG86).
-        Returns the shares it can now take."""
+        ``want_n``: a limit order's fill wants its own quantity, not the slice at the fill price (PREREG86); with
+        `Rules.fill_room_exact` the fill's own size decides (`make_room_fill`). Returns the shares it can now take."""
+        if want_n is not None and getattr(rules, "fill_room_exact", False):
+            return make_room_fill(i, st, e, t, today, int(want_n), own_order)
         if not helps(i, st, e, today):
             _, _, _, nm, n_alloc, _ = entry_size(i, st, e, today)
             return min(n_alloc, nm)
@@ -795,6 +899,177 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
             refills.append({"t": int(t), "strategy": bk.strat[w], "tkn": bk.tkn[w], "shares": int(k), "px": float(pw),
                             "cost": float(cost)})
 
+    # ── IBKR's liquidation (PREREG174; `Rules.liquidation="ibkr"`) ──────────────
+    liq_ibkr = str(getattr(rules, "liquidation", "all")) == "ibkr"
+    sem = float(getattr(rules, "sem", 0.0) or 0.0)
+    regt_on = bool(getattr(rules, "regt_close", False))
+    lot = int(getattr(rules, "liq_lot", 100))
+    liq_req_first = str(getattr(rules, "liq_order", "recent")) == "requirement"
+    liq_path = liq_ibkr and str(getattr(rules, "liq_fill", "extreme")) == "path"
+    slip = float(getattr(rules, "liq_slip", 0.5))
+    liquidations: List[dict] = []                      # every lot sold: instant, position, shares, price, P&L, why
+    call_kind: List[str] = []                          # each margin event's kind: "maint", "regt" or both
+    sem_lost: set = set()                              # the sessions (ET day numbers) whose Soft Edge Margin broke
+    regt_done: set = set()                             # the sessions whose end-of-day Reg T check ran
+    SEM_FROM, SEM_TO, REGT_FROM = 9 * 60 + 30, 15 * 60 + 45, 15 * 60 + 50
+    MOD = np.zeros(0, np.int64)                        # each instant's ET minute of the day
+    if liq_ibkr and len(T):
+        uT, inv = np.unique(T, return_inverse=True)
+        idx_et = pd.DatetimeIndex(pd.to_datetime(uT, unit="ns", utc=True)).tz_convert(ET)
+        MOD = np.asarray(idx_et.hour * 60 + idx_et.minute, np.int64)[inv]
+
+    def regt_req(i, n, p_):
+        """Reg T's initial requirement, no house rate: the floor of IBKR's end-of-day SMA (equity minus it)."""
+        if side[i] < 0:
+            return max(0.5 * n * p_, short_maint(n, p_))
+        return li * n * p_
+
+    def liq_cost(i, n, xp):
+        """A liquidation leg's cost: a ledger leg the larger of its piece's entry and exit costs (a market order at a
+        stressed instant), an engine leg the engine's margin-call cost."""
+        if led[i]:
+            return n * xp * max(bk.hs_in[i], bk.hs_out[i]) / 1e4
+        return exit_cost(i, n, xp, call=True)
+
+    def liq_state(px_, today_, req):
+        """(equity, requirement) with every open position at ``px_``."""
+        need_, eq_ = 0.0, cash
+        for w, m in o_n.items():
+            need_ += req(w, m, px_[w])
+            eq_ += unreal(w, m, px_[w], today_)
+        return eq_, need_
+
+    def liquidate(t, today_, px_, kind, fill_=None):
+        """IBKR's liquidation at instant ``t``: the open positions the most recently opened first (or the largest
+        requirement first), each in lots of ``lot`` shares — the fewest lots that bring equity up to the requirement at
+        the prices ``px_`` (``kind`` "maint": the maintenance requirement; "regt": Reg T's initial, the end-of-day SMA's
+        floor), the whole position when it holds fewer — until equity >= the requirement; each lot filled at
+        ``fill_`` (default ``px_``)."""
+        nonlocal cash
+        req = mreq if kind == "maint" else regt_req
+        fill_ = px_ if fill_ is None else fill_
+        eq_, need_ = liq_state(px_, today_, req)
+        if liq_req_first:
+            order = sorted(o_n, key=lambda w: (-req(w, o_n[w], px_[w]), -int(bk.ens[w]), -int(w)))
+        else:
+            order = sorted(o_n, key=lambda w: (-int(bk.ens[w]), -int(w)))
+        for w in order:
+            if eq_ >= need_:
+                break
+            n, pw, pf, ew, cw = o_n[w], px_[w], fill_[w], o_e[w], o_cin[w]
+            rr = req(w, n, pw) / n                     # the requirement each share releases (linear at one price)
+
+            def effect(k):
+                """(equity change, the realized P&L, the leg's cost) of liquidating ``k`` shares filled at ``pf``:
+                the P&L realized minus what those shares added to the equity as marked at ``pw``."""
+                ck = cw * k / n
+                cout = liq_cost(w, k, pf)
+                xc = k * pw * bk.hs_mark[w] / 1e4 if mark_net else 0.0
+                if side[w] < 0:
+                    pnl = acct(w, k, ew, ck, k * (ew - pf) - ck - cout) - k * acc_liq(w, today_)
+                    held = acct(w, k, ew, ck, k * (ew - pw) - ck - xc) - (k * acc(w, today_) if today_ >= d0[w] else 0.0)
+                else:
+                    pnl = acct(w, k, ew, ck, k * (pf - ew) - ck - cout)
+                    held = acct(w, k, ew, ck, k * (pw - ew) - ck - xc)
+                return pnl - held, pnl, cout
+
+            def cures(k):
+                return eq_ + effect(k)[0] >= need_ - k * rr
+
+            if n <= lot or not cures(n):
+                k = n                                  # one lot or less, or the whole position does not cure it
+            else:
+                per = (effect(n)[0] + n * rr) / n      # the deficit each share cures, about
+                k = n if per <= 0 else min(n, max(lot, int(math.ceil((need_ - eq_) / per / lot)) * lot))
+                while k > lot and cures(k - lot):      # the fewest lots
+                    k -= lot
+                while k < n and not cures(k):
+                    k = min(n, k + lot)
+            _, pnl, cout = effect(k)
+            cash += pnl
+            liquidations.append({"t": int(t), "why": kind, "strategy": bk.strat[w], "tkn": bk.tkn[w],
+                                 "side": int(side[w]), "shares": int(k), "held": int(n), "px": float(pf),
+                                 "mark": float(pw),
+                                 "pnl": float(pnl), "cost": float(cout), "entry_ns": int(bk.ens[w]),
+                                 "equity": float(eq_), "need": float(need_), "closed": bool(k >= n)})
+            if k >= n:
+                for d in (o_n, o_e, o_cin, o_px, o_hi, o_eq):
+                    d.pop(w)
+                close_position(w, pf, t, pnl, cout, "margin_call")
+            else:
+                o_n[w] = n - k
+                o_cin[w] = cw - cw * k / n
+                rec = pos_of[w]
+                rec["pnl_partial"] = rec.get("pnl_partial", 0.0) + pnl
+                rec["cost_partial"] = rec.get("cost_partial", 0.0) + cout
+                rec["liquidated"] = rec.get("liquidated", 0) + int(k)
+            eq_, need_ = liq_state(px_, today_, req)
+
+    def liquidate_path(t, today_, ext, prev_, sem_on):
+        """IBKR's real-time check along the instant's bar (PREREG174 Amendment 2): every position moves from its
+        previous mark ``prev_`` to its check price ``ext`` together (lambda 0 -> 1); at each first lambda where equity
+        falls under the requirement (net of SEM's tolerance while ``sem_on`` and the session's SEM holds) the positions
+        are liquidated until equity >= the requirement there, each lot filled at its price there moved ``slip`` of it
+        against the account, never beyond its check price; then the path goes on, until lambda = 1."""
+        lam = 0.0
+
+        def at(l):
+            return {w: prev_.get(w, ext[w]) + l * (ext[w] - prev_.get(w, ext[w])) for w in o_n}
+
+        def short_by(l):
+            eq_, need_ = liq_state(at(l), today_, mreq)
+            th = sem * max(eq_, 0.0) if (sem_on and today_ not in sem_lost) else 0.0
+            return need_ - eq_ - th
+        while o_n and short_by(1.0) > 0:
+            if short_by(lam) > 0:
+                lc = lam
+            else:
+                lo_, hi_ = lam, 1.0
+                for _ in range(60):
+                    mid = 0.5 * (lo_ + hi_)
+                    if short_by(mid) > 0:
+                        hi_ = mid
+                    else:
+                        lo_ = mid
+                lc = hi_
+            x = at(lc)
+            if sem_on:
+                sem_lost.add(today_)
+            fill = {w: (min(ext[w], x[w] * (1.0 + slip)) if side[w] < 0 else max(ext[w], x[w] * (1.0 - slip)))
+                    for w in x}
+            liquidate(t, today_, x, "maint", fill)
+            lam = lc
+
+    def ruin(t):
+        """The account's end: equity at or under zero once every position is closed."""
+        curve_t.append(int(t))
+        curve_v.append(cash)
+        curve_l.append(0.0), curve_s.append(0.0), curve_r.append(0.0)
+        for b_ in curve_b.values():
+            b_.append(0.0)
+        dd_ = (peak - cash) / peak if peak > 0 else 1.0
+        nav_ = cash / units
+        mdn = max(maxdd_nav, (nav_peak - nav_) / nav_peak if nav_peak > 0 else 1.0)
+        out = {"final": cash, "calls": calls, "maxdd": max(maxdd, dd_), "maxdd_nav": mdn,
+               "ruined": int(t), "trades": len(positions), "positions": positions,
+               "curve_t": np.array(curve_t), "curve_v": np.array(curve_v)}
+        if keep_exposure:
+            out.update(curve_long=np.array(curve_l), curve_short=np.array(curve_s),
+                       curve_req=np.array(curve_r), curve_by={s: np.array(v) for s, v in curve_b.items()})
+        if keep_skips:
+            out["skips"] = skips
+        if pre_on:
+            out.update(preemptions=preempts, refills=refills)
+        if reenter_on:
+            out["reentries"] = reentries
+        if delev is not None:
+            out["delevers"] = delevers
+        if ORD:
+            out["orders"] = ord_log
+        if liq_ibkr:
+            out.update(liquidations=liquidations, call_kinds=call_kind)
+        return out
+
     N = len(T)
     p = 0
     while p < N:
@@ -804,6 +1079,7 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
             q += 1
         today = int(DN[p])
         bar_now = set()
+        prev_now: Dict[int, float] = {}
         re_now = []                                    # reenter: pending pieces at a 09:30 mark this instant
         for z in range(p, q):
             i = II[z]
@@ -828,6 +1104,8 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
             elif KIND[z] == 1:
                 if i in o_n:
                     j = JJ[z]
+                    if liq_path:
+                        prev_now[i] = o_px[i]          # IBKR's path (PREREG174): the mark before this bar
                     o_px[i] = bk.pc[i][j]
                     o_hi[i] = bk.ph[i][j] if side[i] < 0 else bk.pl[i][j]
                     bar_now.add(i)
@@ -846,7 +1124,37 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
             for i, n in o_n.items():
                 need += mreq(i, n, px[i])
                 eq += unreal(i, n, px[i], today)
-            if eq < need:
+            if liq_ibkr:
+                # IBKR (PREREG174): STRICT at every hour, or the Soft Edge Margin's tolerance at instants 09:30-15:45 ET
+                # until a breach that session; then the end-of-day Reg T floor at the first instant at/after 15:50 ET
+                mod = int(MOD[p])
+                thr = sem * max(eq, 0.0) if (sem > 0 and SEM_FROM <= mod <= SEM_TO and today not in sem_lost) else 0.0
+                fired, eq0 = [], eq
+                if eq < need - thr:
+                    if liq_path:
+                        liquidate_path(t, today, px, prev_now, thr > 0)
+                    else:
+                        if thr > 0:
+                            sem_lost.add(today)
+                        liquidate(t, today, px, "maint")
+                    fired.append("maint")
+                if regt_on and o_n and mod >= REGT_FROM and today not in regt_done:
+                    regt_done.add(today)
+                    # at the marks (PREREG175): the end-of-day check reads the prices of its instant, as production's
+                    # check at its first tick from 15:50 ET (the maintenance path above already met the bar's extreme)
+                    pxm = {w: o_px[w] for w in o_n}
+                    e_r, n_r = liq_state(pxm, today, regt_req)
+                    if e_r < n_r:
+                        liquidate(t, today, pxm, "regt")
+                        fired.append("regt")
+                if fired:
+                    for o in list(res):                # a liquidation cancels every working order
+                        cancel(o, t, "cancel_margin")
+                    calls.append((int(t), eq0, liq_state(px, today, mreq)[0] if o_n else cash))
+                    call_kind.append("+".join(fired))
+                    if not o_n and cash <= 0:
+                        return ruin(t)
+            elif eq < need:
                 eq0 = eq
                 for i in sorted(o_n, key=lambda w: -mreq(w, o_n[w], px[w])):
                     n, e, cin, xp = o_n[i], o_e[i], o_cin[i], px[i]
@@ -862,31 +1170,7 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
                     cancel(o, t, "cancel_margin")
                 calls.append((int(t), eq0, cash))
                 if cash <= 0:
-                    curve_t.append(int(t))
-                    curve_v.append(cash)
-                    curve_l.append(0.0), curve_s.append(0.0), curve_r.append(0.0)
-                    for b_ in curve_b.values():
-                        b_.append(0.0)
-                    dd = (peak - cash) / peak if peak > 0 else 1.0
-                    nav = cash / units
-                    maxdd_nav = max(maxdd_nav, (nav_peak - nav) / nav_peak if nav_peak > 0 else 1.0)
-                    out = {"final": cash, "calls": calls, "maxdd": max(maxdd, dd), "maxdd_nav": maxdd_nav,
-                           "ruined": int(t), "trades": len(positions), "positions": positions,
-                           "curve_t": np.array(curve_t), "curve_v": np.array(curve_v)}
-                    if keep_exposure:
-                        out.update(curve_long=np.array(curve_l), curve_short=np.array(curve_s),
-                                   curve_req=np.array(curve_r), curve_by={s: np.array(v) for s, v in curve_b.items()})
-                    if keep_skips:
-                        out["skips"] = skips
-                    if pre_on:
-                        out.update(preemptions=preempts, refills=refills)
-                    if reenter_on:
-                        out["reentries"] = reentries
-                    if delev is not None:
-                        out["delevers"] = delevers
-                    if ORD:
-                        out["orders"] = ord_log
-                    return out
+                    return ruin(t)
         if delev is not None and o_n and bar_now:
             trig, tgt = delev
             need_c, eq_c = 0.0, cash
@@ -937,7 +1221,7 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
                 e = bk.e[i]
                 if rules.fills_make_room and st.quality is not None and any(
                         S[w].preemptible and S[w].quality is not None and S[w].quality < st.quality for w in o_n):
-                    make_room(i, st, e, t, today, want_n=int(r["n"]))   # PREREG86: lower-quality books give way
+                    make_room(i, st, e, t, today, want_n=int(r["n"]), own_order=o)   # PREREG86: lower-quality books give way
                 eq, rq_now, g = cash, 0.0, 0.0
                 for w, m in o_n.items():
                     pw = o_px[w]
@@ -1034,6 +1318,10 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
                     why = "margin" if nm < n_alloc else (why_alloc or ("below_one_share" if want <= 0 else "rounding"))
                     skips.append(skip_rec(i, t, why, want, max(n, 0), eq, room))
             if n <= 0:
+                continue
+            if st.min_frac is not None and n * e < st.min_frac * eq:
+                if keep_skips:
+                    skips.append(skip_rec(i, t, "min_frac", n, 0, eq, room))
                 continue
             if st.avail_mult is not None and n * st.avail_mult > bk.avail[i]:
                 if keep_skips:
@@ -1155,6 +1443,8 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
         out["delevers"] = delevers
     if ORD:
         out["orders"] = ord_log
+    if liq_ibkr:
+        out.update(liquidations=liquidations, call_kinds=call_kind)
     if keep_exposure:
         out.update(curve_long=np.array(curve_l), curve_short=np.array(curve_s), curve_req=np.array(curve_r),
                    curve_by={s: np.array(v) for s, v in curve_b.items()})

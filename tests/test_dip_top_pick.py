@@ -32,10 +32,79 @@ def _q1(monkeypatch, **kw):
         monkeypatch.setattr(settings, k, v)
 
 
-def test_the_deployed_values_are_q1s():
+def test_the_deployed_values_are_q1s_with_s3s_slice_and_floor():
+    """Q1 (the daily top pick, two shorts a name) with PREREG147's $2B floor from the 2026-10-19 session,
+    PREREG159's slice from the 2026-10-20 session and the RP33 cut before the pick from the 2026-10-21 session
+    (PREREG166 / 167): each dip long 1/2 of the account, at most 2 open, the pick among the kept signals trading $2B+ a
+    day."""
     f = Settings.model_fields
     assert (f["dip_long_daily_top"].default, f["dip_long_rank"].default, f["dip_long_account_slices"].default,
-            f["sel_short_max_open_per_ticker"].default, f["enable_dip_long_filter"].default) == (1, "score", 6, 2, False)
+            f["sel_short_max_open_per_ticker"].default, f["enable_dip_long_filter"].default) == (1, "score", 2, 2, True)
+    assert f["dip_long_order_min_dollar_volume"].default == 2e9 and f["dip_long_min_dollar_volume"].default == 1e9
+
+
+# ── PREREG147's S3: the daily top pick's $2B order floor ─────────────────────────────────────────────────────────────
+
+def _scored(*rows):
+    """Signals already scored (the RP33 filter's path: `_daily_top` reads their scores, asks no model)."""
+    return [dict({"ticker": tk, "rsi2": rsi, "dv20": dv}, **({"filter_score": sc} if sc is not None else
+                                                           {"filter_error": "unscored"}))
+            for tk, sc, rsi, dv in rows]
+
+
+def test_the_pick_is_the_best_signal_at_or_above_the_order_floor(monkeypatch):
+    _q1(monkeypatch, dip_long_order_min_dollar_volume=2e9)
+    sig = _scored(("A", 3.0, 4.0, 1.5e9), ("B", 2.0, 6.0, 2.5e9), ("C", 1.0, 2.0, 5e9), ("D", 2.5, 3.0, 1.9e9))
+    keep, top = dl._daily_top(sig, DAY, PREV, 1)
+    assert [s["ticker"] for s in keep] == ["B"] and keep[0]["top_rank"] == 1
+    rest = {s["ticker"]: s for s in top["not_top"]}
+    assert rest["C"]["top_rank"] == 2 and not rest["C"].get("below_order_floor")
+    assert rest["A"]["top_rank"] is None and rest["A"]["below_order_floor"] is True and rest["D"]["below_order_floor"]
+    assert top["info"]["order_floor"] == 2e9 and top["info"]["below_floor"] == ["A", "D"]
+    o = dl.not_top_order(DAY, rest["A"], {"signal_session": str(PREV)})
+    assert o["status"] == "not_top" and o["below_order_floor"] is True
+    monkeypatch.setattr(settings, "dip_long_order_min_dollar_volume", 0.0)      # no floor: the best of every signal
+    keep, top = dl._daily_top(_scored(("A", 3.0, 4.0, 1.5e9), ("B", 2.0, 6.0, 2.5e9)), DAY, PREV, 1)
+    assert [s["ticker"] for s in keep] == ["A"] and top["info"]["below_floor"] == []
+
+
+def test_a_day_without_a_signal_over_the_floor_orders_nothing(monkeypatch):
+    _q1(monkeypatch, dip_long_order_min_dollar_volume=2e9)
+    keep, top = dl._daily_top(_scored(("A", 3.0, 4.0, 1.5e9), ("B", None, 6.0, 1.1e9)), DAY, PREV, 1)
+    assert keep == [] and [s["ticker"] for s in top["not_top"]] == ["A", "B"]
+    assert all(s["below_order_floor"] for s in top["not_top"]) and top["info"]["picked"] == []
+
+
+def test_the_floored_pick_is_the_simulators_choice(monkeypatch):
+    """Production's floored pick = the simulator's: `Mimic.dip_min_order_dv` drops the pieces under the floor, then
+    `rank_pieces(by="score", topk=1)` — random days, ties and unscored signals included."""
+    from src.backtest.strategies import dip as DIP
+    _q1(monkeypatch, dip_long_order_min_dollar_volume=2e9)
+    rng = np.random.default_rng(11)
+    names = ["T1", "T10", "T2", "AB", "ABC", "B"]
+    day = "2026-10-16"
+    for _ in range(400):
+        tks = list(rng.choice(names, size=int(rng.integers(1, 6)), replace=False))
+        rsi = {tk: float(rng.choice([0.5, 1.5, 4.0])) for tk in tks}
+        sc = {tk: float(rng.choice([-1.0, 0.5, 2.0])) for tk in tks if rng.random() < 0.6}
+        dv = {tk: float(rng.choice([1.2e9, 2.0e9, 3.5e9])) for tk in tks}
+        pieces = [{"oid": f"{tk}|{day}", "rank": rsi[tk], "tkn": tk, "dv20": dv[tk]} for tk in tks]
+        kept = [p for p in pieces if p["dv20"] >= 2e9]
+        sim = [p["oid"].split("|")[0] for p in DIP.rank_pieces(kept, {f"{tk}|{day}": v for tk, v in sc.items()},
+                                                                by="score", topk=1)]
+        keep, _ = dl._daily_top(_scored(*[(tk, sc.get(tk), rsi[tk], dv[tk]) for tk in tks]), DAY, PREV, 1)
+        assert sim == [s["ticker"] for s in keep]
+
+
+def test_the_simulators_floor_is_productions(monkeypatch):
+    from src.backtest import mimic as M
+    assert M.Mimic(seed=0).dip_min_order_dv is None                    # the baseline: no daily top pick, no floor
+    _q1(monkeypatch, dip_long_order_min_dollar_volume=2e9)
+    assert M.Mimic(seed=0).dip_min_order_dv == 2e9
+    monkeypatch.setattr(settings, "dip_long_order_min_dollar_volume", 0.0)
+    assert M.Mimic(seed=0).dip_min_order_dv is None
+    import inspect
+    assert "mim.dip_min_order_dv" in inspect.getsource(M.live_books)
 
 
 # ── the ranking ──────────────────────────────────────────────────────────────

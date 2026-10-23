@@ -10,8 +10,14 @@ sessions. Each piece carries the 30-minute path it is held through (bar END time
 closes and lows) — or one mark a day with ``granularity="daily"`` — the half-spread of its dollar-volume class (the
 study's table: 1 bp at $1B+ a day) and its rank (the RSI: the deepest dip first).
 
-The daily panel (the study's own construction, `dip_long.daily_bars`) is built once and cached in
-``cache/backtest/dip_daily.pkl`` (`build_panel`).
+The daily panel (the study's own construction, `dip_long.daily_bars`): by default THE OWN-SECURITY PANEL (2026-10-18,
+the reused-ticker fix — PREREG142's corrected construction, production's `src/signals/dip_security.py`: every series
+cut to its own security, every renamed company's earlier tickers joined; `OWN_PANEL`, with the walk-forward scores of
+its signals `OWN_SCORES`) — from 2026-10-19 WITH set A's warm-up (AUDIT151's D_WARM: the 223 names shared with the A0
+panel carry their 2016-2020 rows; `OWN_PANEL_NOWARM` / `OWN_SCORES_NOWARM` the studies 10-18 .. 10-19); ``OWN_DEFAULT =
+False`` (or ``build_panel(own=False)``) restores the stored construction cached in ``cache/backtest/dip_daily.pkl``
+and PREREG96's scores — the studies before 2026-10-18. A piece filled at the open PRINT is repriced at IBKR's
+attainable 09:30:30 price by `reprice_open` (AUDIT151's D_OPEN, `Mimic(dip_open=True)`).
 """
 from __future__ import annotations
 
@@ -19,15 +25,41 @@ import os
 import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set
 
 import numpy as np
 import pandas as pd
 
+from config import settings
 from src.signals.dip_long import daily_bars, rsi2
 
 PANEL = Path("cache/backtest/dip_daily.pkl")
 DELISTED = Path("cache/ml/deep/bars30m_delisted/parts")
+# THE OWN-SECURITY PANELS (2026-10-18; user: "Yes please apply the fix"): PREREG142's corrected AB / A0 panels and the
+# walk-forward scores of their signals (PREREG142's OLD: model96's yearly models on the corrected inputs), under
+# settings.backtest_research_dir — the simulator's defaults, production's construction (`dip_security --parity`: its
+# output equals the study's on 255 of the 256 names the study changed; RBC differs only by the study's duplicate drop,
+# never a $1B name). The deployed configuration on them: R142_OLD's draws, +56.8% a year (+0.6 points over the stored
+# panels). False: the stored panels (`PANEL`, `a0.dip_panel_path()`) and PREREG96's scores (`FILTER_SCORES`).
+# AUDIT151 (2026-10-19, the user: "Yes please do 1 and 2"): the A / B panel WITH ITS WARM-UP — it started 2021-01-04 for
+# every name, so with 220 sessions needed set A's first dip signal fell in November 2021 (live has the history): each of
+# the 223 names the A0 panel shares with it (identical on the overlap) carries its 2016-2020 rows
+# (`studies/audit151/dip_warm/save_warm_panel.py`), and the walk-forward scores add the 2021 signals scored by the 2021
+# fold model; +5.4 pp a year on set A's account. `OWN_PANEL_NOWARM` / `OWN_SCORES_NOWARM`: the studies 10-18 .. 10-19.
+OWN_DEFAULT = True
+# PREREG188 (set D, the live period): a signal or fill whose exit lies past the data is KEPT, its exit marked at the
+# data's last close ("open_at_end") — a position still open when the data ends. False (every study before it: their
+# data end lies past their decisions) drops it. A process sets it for a set-D run only.
+OPEN_END = False
+OWN_PANEL = Path("studies") / "audit151" / "dip_warm" / "panel151_warm.pkl"
+OWN_PANEL_A0 = Path("studies") / "prereg142" / "panel142_a0.pkl"
+OWN_SCORES = Path("studies") / "audit151" / "dip_warm" / "wf_scores_warm.pkl"
+OWN_PANEL_NOWARM = Path("studies") / "prereg142" / "panel142.pkl"
+OWN_SCORES_NOWARM = Path("studies") / "prereg142" / "wf_scores_old.pkl"
+# AUDIT151's D_OPEN: the price an order RESTING AT IBKR could get at a session's open (production's resting order
+# arrives ~09:30:30): every order piece that fills at an open in A0 / A / B, from Polygon's minute bars and trades
+# (`studies/audit151/dip_open/extend_fills.py`) — `reprice_open`
+OPEN_FILLS = Path("studies") / "audit151" / "dip_open" / "fills_all.csv"
 TYPES_OK = ("CS", "ADRC")
 MIN_BARS = 220                                       # the study's minimum daily bars per name
 
@@ -66,7 +98,9 @@ class DipParams:
         return tuple(sorted(asdict(self).items()))
 
 
-LIVE = DipParams()
+# production's exits: from the 2026-10-20 session PREREG159's RPD_IS (the first close above the 3-session average, or
+# 5 sessions; `dip_long_exit_sma_sessions` / `dip_long_max_hold_sessions`); `DipParams()` keeps the 5 / 10 before it
+LIVE = DipParams(exit_sma=int(settings.dip_long_exit_sma_sessions), max_hold=int(settings.dip_long_max_hold_sessions))
 
 
 def half_spread_bps(dv) -> np.ndarray:
@@ -99,9 +133,48 @@ def bars_30m(name: str) -> Optional[pd.DataFrame]:
     return load_deep_30m(name)
 
 
-def build_panel(force: bool = False, workers: int = 8) -> Dict[str, pd.DataFrame]:
-    """Daily regular-hours bars (o h l c v) for every name of the deep store and of the delisted store (``@D``),
-    cached in `PANEL`."""
+class OwnPanel(dict):
+    """The own-security AB panel: the daily frames, and the 30-minute bars its order fills read — a changed name's from
+    PREREG142's corrected series (``bars``: name -> file), every other name's from the deep / delisted store."""
+    own = True
+
+    def __init__(self, data: Dict[str, pd.DataFrame], bars: Mapping[str, str]):
+        super().__init__(data)
+        self.bars = dict(bars)
+
+    def bars_fn(self, name: str) -> Optional[pd.DataFrame]:
+        p = self.bars.get(name)
+        if p is None:
+            return bars_30m(name)
+        return pickle.load(open(p, "rb"))
+
+
+_OWN: Dict[str, object] = {}
+
+
+def own_panel() -> OwnPanel:
+    """The own-security AB panel (`OWN_PANEL`), loaded once per process (per file version)."""
+    from config import settings
+    p = Path(settings.backtest_research_dir) / OWN_PANEL
+    key = (str(p), p.stat().st_mtime_ns)
+    if _OWN.get("key") != key:
+        z = pickle.load(open(p, "rb"))
+        _OWN.clear()
+        _OWN.update(key=key, panel=OwnPanel(z["panel"], z["bars"]))
+    return _OWN["panel"]                                                # type: ignore[return-value]
+
+
+def build_panel(force: bool = False, workers: int = 8, own: Optional[bool] = None) -> Dict[str, pd.DataFrame]:
+    """Daily regular-hours bars (o h l c v) for every name of the deep store and of the delisted store (``@D``): the
+    own-security panel by default (`OWN_DEFAULT`, `own_panel`), else the stored construction cached in `PANEL`
+    (``force`` rebuilds it; the own-security panel is PREREG142's build: studies/prereg142 spans142.py raw / events /
+    spans -> bars142.py -> panel142.py)."""
+    if OWN_DEFAULT if own is None else own:
+        if force:
+            raise ValueError("the own-security panel is PREREG142's build (studies/prereg142: spans142.py raw / "
+                             "events / spans -> bars142.py -> panel142.py); build_panel(force=True, own=False) "
+                             "rebuilds the stored one")
+        return own_panel()
     if PANEL.exists() and not force:
         return pickle.load(open(PANEL, "rb"))
     from concurrent.futures import ThreadPoolExecutor
@@ -175,9 +248,9 @@ def signals(panel: Dict[str, pd.DataFrame], prm: DipParams, lo, hi, names: Optio
             last_close = False
             if prm.exit == "next_open":
                 if x + 1 >= n:
-                    if not ended:
+                    if not ended and not OPEN_END:
                         continue                                 # the exit lies past the data
-                    xd, last_close = n - 1, True                 # delisted / acquired: sold at its last close
+                    xd, last_close = n - 1, True                 # delisted / acquired (or OPEN_END): its last close
                 else:
                     xd = x + 1
             else:
@@ -194,7 +267,8 @@ def _session_open_ns(day: pd.Timestamp) -> int:
 
 def order_pieces(prm: DipParams, lo, hi, panel: Optional[Dict[str, pd.DataFrame]] = None, strategy: str = "dip",
                  names: Optional[Sequence[str]] = None, atr_mult: Optional[float] = None,
-                 sessions: Optional[int] = None, keep: Optional[Mapping[str, bool]] = None) -> List[dict]:
+                 sessions: Optional[int] = None, keep: Optional[Mapping[str, bool]] = None,
+                 signals_fn: Optional[Callable] = None, open_end: bool = False) -> List[dict]:
     """PRODUCTION'S LIMIT ENTRY (`dip_long_entry_mode` "limit", 2026-10-09) as the account engine's limit ORDERS
     (`Strategy(orders="fill")`, `Rules(one_book_per_name=True)` to mimic the live account): every signal of [lo, hi]
     is one order at `dip_long.limit_price(close, atr14, atr_mult)` (the price IBKR rests), PLACED at 09:30 (+1 ns) of
@@ -204,12 +278,16 @@ def order_pieces(prm: DipParams, lo, hi, panel: Optional[Dict[str, pd.DataFrame]
     the live exit counted from that session and its 30-minute marks; a never-touched order is a placeholder piece
     (``ord_k`` -1). Defaults: `dip_long_limit_atr`, `dip_long_limit_sessions`. ``keep`` (PREREG96's RP33, production's
     `enable_dip_long_filter`; `filter_keep`): {order id: kept} — a signal mapped to False never becomes an order (no
-    piece, not even a placeholder: it takes no slot); one the map does not hold is ordered as usual."""
+    piece, not even a placeholder: it takes no slot); one the map does not hold is ordered as usual. ``signals_fn``:
+    another book's signals in `signals`' form (the capitulation book's, `strategies.cap`) — the same orders, fills and
+    exits. ``open_end`` (PREREG188, set D): a fill whose exit lies past the data is kept, marked at the data's last
+    close (``why`` "open_at_end": a position still open when the data ends) instead of dropped — off for every set
+    whose data end lies past its decisions (A0 / A / B unchanged)."""
     from config import settings
     from src.signals.dip_long import atr14, limit_price
     panel = panel if panel is not None else build_panel()
     W = int(sessions if sessions is not None else settings.dip_long_limit_sessions)
-    S = signals(panel, prm, lo, hi, names)
+    S = (signals_fn or signals)(panel, prm, lo, hi, names)
     data_last = max(v.index[-1] for v in panel.values() if len(v))
     bars_of = getattr(panel, "bars_fn", None) or bars_30m      # PREREG101: an A0 panel reads its own bars
     out: List[dict] = []
@@ -263,11 +341,13 @@ def order_pieces(prm: DipParams, lo, hi, panel: Optional[Dict[str, pd.DataFrame]
                     ens, e = int(ends_ns[k0 + int(ks[0])]), float(lim)
                 x = next((k for k in range(j, min(n, j + int(prm.max_hold))) if exit_hit(prm, c, sma_x, r2x, k)),
                          min(n - 1, j + int(prm.max_hold) - 1))
+                why_end = None
                 if x + 1 >= n:
-                    if not ended:
+                    if not ended and not (open_end or OPEN_END):
                         continue                                 # the exit lies past the data
                     x = n - 1                                    # delisted / acquired: sold at its last close
                     xv, xns = float(c[x]), pd.Timestamp(f"{dates[x].date()} 16:00", tz=ET).value
+                    why_end = None if ended else "open_at_end"   # PREREG188: still open when the data ends
                 elif (dates[x + 1] - dates[j]).days > gap_days(prm):
                     continue
                 else:
@@ -277,6 +357,221 @@ def order_pieces(prm: DipParams, lo, hi, panel: Optional[Dict[str, pd.DataFrame]
                 p = dict(base)
                 p.update(ens=int(ens), xns=int(xns), e=e, x=xv, pt=np.asarray(ends_ns[held], np.int64),
                          pc=np.asarray(bc[held], float), pl=np.asarray(bl[held], float), ord_k=m,
+                         net=100.0 * (xv / e - 1) - 2 * hs / 100.0, days=(xns - ens) / 86400e9)
+                if why_end:
+                    p["why"] = why_end
+                out.append(p)
+                made += 1
+            if not made:
+                p = dict(base)
+                p.update(ens=int(end), xns=int(end) + 86400 * 10**9, e=float(lim), x=float(lim),
+                         pt=np.zeros(0, np.int64), pc=np.zeros(0), pl=np.zeros(0), ord_k=-1)
+                out.append(p)
+    return out
+
+
+def _ext_scale(b: Optional[pd.DataFrame], xb: Optional[dict], tol: float = 0.02) -> Optional[float]:
+    """The factor from the extended store's prices to the regular-hours store's (the dip panel's terms): the median
+    ratio of their regular-hours bar closes ending at the same instants; None when they disagree by more than ``tol``."""
+    if b is None or b.empty or xb is None or not len(xb["end"]):
+        return None
+    ends = (pd.DatetimeIndex(b.index).tz_localize("UTC") + pd.Timedelta(minutes=30)).asi8
+    j = np.searchsorted(xb["end"], ends)
+    ok = (j < len(xb["end"])) & (np.take(xb["end"], np.minimum(j, len(xb["end"]) - 1)) == ends)
+    if ok.sum() < 5:
+        return None
+    r = b["Close"].to_numpy(float)[ok] / np.where(xb["c"][j[ok]] > 0, xb["c"][j[ok]], np.nan)
+    r = r[np.isfinite(r) & (r > 0)]
+    lo_, hi_ = np.quantile(r, [0.05, 0.95]) if len(r) else (np.nan, np.nan)
+    if not len(r) or hi_ / lo_ - 1.0 > tol:
+        return None
+    return float(np.median(r))
+
+
+_OPEN: Dict[str, object] = {}
+
+
+def open_fills(path=None) -> Dict[tuple, tuple]:
+    """{(engine name, ET day, limit rounded to 1e-6): (how, price, touch minute, terms ok)} — `OPEN_FILLS`, loaded
+    once per file version."""
+    from config import settings
+    p = Path(path) if path is not None else Path(settings.backtest_research_dir) / OPEN_FILLS
+    key = (str(p), p.stat().st_mtime_ns)
+    if _OPEN.get("key") != key:
+        F = pd.read_csv(p)
+        tm = F["a30.touch_min"] if "a30.touch_min" in F else pd.Series([None] * len(F))
+        ok = F["terms_ok"] if "terms_ok" in F else pd.Series([True] * len(F))
+        _OPEN.update(key=key, map={
+            (str(t), str(d), round(float(lim), 6)): (str(h), float(px) if pd.notna(px) else None,
+                                                     str(m) if pd.notna(m) else None, bool(k) if pd.notna(k) else True)
+            for t, d, lim, h, px, m, k in zip(F.tkn, F.day, F.limit, F["a30.how"], F["a30.price"], tm, ok)})
+    return _OPEN["map"]                                                  # type: ignore[return-value]
+
+
+def reprice_open(p: dict, log: Optional[dict] = None) -> dict:
+    """AUDIT151's D_OPEN (`Mimic(dip_open=True)`, the default from 2026-10-19): a dip piece filled at the open PRINT
+    (``ens`` 09:30 + 2 ns) -> at the price IBKR could give its resting order arriving 09:30:30 — the arrival trades'
+    median at or under the limit (entered then), else the limit at a later touch (booked at that 30-minute bar's end,
+    the marks before it dropped), from `open_fills` by (name, day, limit). The print was never attainable; on the
+    deployed configuration the fills average 9 bp better (+0.59 pp a year). A piece the table lacks — or whose terms
+    disagree with the store's — keeps the print (counted in ``log``)."""
+    if p.get("strategy") != "dip" or int(p["ens"]) % (60 * 10 ** 9) != 2:
+        return p
+    t = pd.Timestamp(int(p["ens"]), unit="ns", tz="UTC").tz_convert(ET)
+    lim = p.get("ord_lim")
+    hit = open_fills().get((str(p["tkn"]), str(t.date()), round(float(lim), 6))) if lim is not None else None
+
+    def count(k):
+        if log is not None:
+            log[k] = log.get(k, 0) + 1
+    if hit is None or not hit[3]:
+        count("dip_open_unknown" if hit is None else "dip_open_terms")
+        return p
+    how, price, tmin, _ = hit
+    q = dict(p)
+    if how == "arrival" and price is not None:
+        q["e"], q["ens"] = float(price), int(pd.Timestamp(f"{t.date()} 09:30:30", tz=ET).value)
+        count("dip_open_arrival")
+        return q
+    if how == "touch" and tmin:
+        o = pd.Timestamp(f"{t.date()} 09:30", tz=ET)
+        m = pd.Timestamp(f"{t.date()} {tmin}", tz=ET)
+        end = o + pd.Timedelta(minutes=30 * (1 + int((m - o).total_seconds() // 1800)))
+        q["e"], q["ens"] = float(lim), int(end.value)
+        pt = np.asarray(p.get("pt", np.zeros(0)), np.int64)
+        keep = pt > int(end.value)
+        for k, v in p.items():
+            if isinstance(v, np.ndarray) and v.shape[:1] == pt.shape[:1] and k != "pt":
+                q[k] = v[keep]
+        q["pt"] = pt[keep]
+        count("dip_open_touch")
+        return q
+    count("dip_open_none")
+    return p
+
+
+def order_pieces_ext(prm: DipParams, lo, hi, panel: Optional[Dict[str, pd.DataFrame]] = None, ext=None, nights=None,
+                     strategy: str = "dip", names: Optional[Sequence[str]] = None, atr_mult: Optional[float] = None,
+                     sessions: Optional[int] = None, min_usd: float = 15_000.0) -> List[dict]:
+    """PREREG121's E1 / E2: production's limit orders also working OUTSIDE regular hours. A signal of D-1's close is
+    placed at D-1's 16:30 after-hours tick and re-placed at each window session's 04:00 (an IBKR DAY order outside
+    regular hours lives to 20:00), lapsing after D+4's 20:00; with ``nights`` (E2, `mimic.NightBars`) also each night
+    between (20:00-03:50, IBKR's OVERNIGHT venue, the same limit). In each such segment the order fills at the first
+    30-minute bar (pre-market, regular or after-hours; overnight) that opens at/under the limit (at that open) or
+    whose low reaches it (at the limit, at the bar's end) — outside regular hours only a bar with at least ``min_usd``
+    traded; the LATE-PRINT bar (`mimic.late_print_bar`: the TRF's report of the night's trades sets its open and low)
+    fills only by its close (amendment 2). The exit is the rule's, counted from the first regular close after the fill.
+    A name without extended bars or a price scale between the stores keeps `order_pieces`' pieces. ``ext``: a
+    `mimic.ExtBars`."""
+    from config import settings
+    from src.backtest.mimic import late_print_bar
+    from src.signals.dip_long import atr14, limit_price
+    panel = panel if panel is not None else build_panel()
+    W = int(sessions if sessions is not None else settings.dip_long_limit_sessions)
+    S = signals(panel, prm, lo, hi, names)
+    data_last = max(v.index[-1] for v in panel.values() if len(v))
+    bars_of = getattr(panel, "bars_fn", None) or bars_30m
+    out: List[dict] = []
+
+    def at(day, hhmm):
+        return pd.Timestamp(f"{pd.Timestamp(day).date()} {hhmm}", tz=ET).value
+
+    for tk, g in S.groupby("tk"):
+        d = panel[tk]
+        b = bars_of(tk)
+        if b is None or b.empty:
+            continue
+        xb = ext.get(tk) if ext is not None else None
+        s = _ext_scale(b, xb)
+        if s is None:                                               # no extended prices to trade on: the RTH book
+            out += order_pieces(prm, lo, hi, panel=panel, strategy=strategy, names=[tk], atr_mult=atr_mult,
+                                sessions=sessions)
+            continue
+        nb = nights.get(tk) if nights is not None else None
+        ended = d.index[-1] < data_last - pd.Timedelta(days=7)
+        starts = pd.DatetimeIndex(b.index)
+        st_utc = starts.tz_localize("UTC")
+        ends_ns = (st_utc + pd.Timedelta(minutes=30)).asi8
+        et_day = st_utc.tz_convert(ET).normalize().tz_localize(None)
+        bc, bl = b["Close"].to_numpy(float), b["Low"].to_numpy(float)
+        dates = d.index
+        n = len(d)
+        c = d["c"].to_numpy(float)
+        sma_x = pd.Series(c).rolling(int(prm.exit_sma)).mean().to_numpy()
+        r2x = rsi2(c) if prm.exit_rule == "rsi2" else None
+        for r in g.itertuples(index=False):
+            i = int(dates.get_loc(r.sig))
+            lim = limit_price(r.close, atr14(d.iloc[:i + 1]), atr_mult)
+            if lim is None:
+                continue
+            win = list(range(i + 1, min(n, i + 1 + W)))
+            if not win:
+                continue
+            # the segments, in time order: (placement instant, [t_from, t_to), store, "count from" session index)
+            segs = [(at(dates[i], "16:30") + 1, at(dates[i], "16:30"), at(dates[i], "20:00"), "pm0", i + 1)]
+            if nb is not None:
+                segs.append((at(dates[i], "20:00") + 1, at(dates[i], "20:00"), at(dates[win[0]], "04:00"), "night", i + 1))
+            for m, j in enumerate(win):
+                segs.append((at(dates[j], "04:00") + 1, at(dates[j], "04:00"), at(dates[j], "20:00"), "ext", j))
+                if nb is not None and m + 1 < len(win):
+                    segs.append((at(dates[j], "20:00") + 1, at(dates[j], "20:00"), at(dates[win[m + 1]], "04:00"),
+                                 "night", j + 1))
+            end = at(dates[win[-1]], "20:00") + 1
+            hs = float(half_spread_bps([r.dv20])[0])
+            base = {"strategy": strategy, "tkn": tk, "hs_in": hs, "hs_out": hs, "dv20": float(r.dv20),
+                    "rank": float(r.rsi2), "oid": f"{tk}|{dates[i + 1].date()}", "ord_place": [sg[0] for sg in segs],
+                    "ord_lim": float(lim), "ord_end": int(end), "signal_day": str(r.sig.date()), "rsi2": float(r.rsi2),
+                    "pick_day": int((pd.Timestamp(r.sig).normalize() - pd.Timestamp("1970-01-01")).days)}
+            made = 0
+            for k, (place, t0, t1, src, cnt) in enumerate(segs):
+                src_b = nb if src == "night" else xb
+                if src_b is None or not len(src_b["start"]):
+                    continue
+                a0_, a1_ = int(np.searchsorted(src_b["start"], t0)), int(np.searchsorted(src_b["start"], t1))
+                late = late_print_bar(src_b["start"][a0_:a1_]) if src != "night" else np.zeros(a1_ - a0_, bool)
+                hit = None
+                for q in range(a0_, a1_):
+                    rth = bool(src_b["rth"][q]) if "rth" in src_b else False
+                    usd = float(src_b["c"][q] * src_b["v"][q])
+                    if not rth and usd < min_usd:
+                        continue
+                    if late[q - a0_]:              # the TRF's late overnight prints set its open / low: its close only
+                        c_ = float(src_b["c"][q]) * s
+                        if c_ <= lim:
+                            hit = (int(src_b["end"][q]), c_, rth, int(src_b["start"][q]))
+                            break
+                        continue
+                    o_, l_ = float(src_b["o"][q]) * s, float(src_b["l"][q]) * s
+                    if o_ <= lim:
+                        hit = (int(src_b["start"][q]) + 2, o_, rth, int(src_b["start"][q]))
+                        break
+                    if l_ <= lim:
+                        hit = (int(src_b["end"][q]), float(lim), rth, int(src_b["start"][q]))
+                        break
+                if hit is None:
+                    continue
+                ens, e, _, bstart = hit
+                # the exit counts from the first regular close after the fill (an after-hours fill: the next session)
+                j0 = cnt
+                if src == "ext" and pd.Timestamp(bstart, unit="ns", tz="UTC").tz_convert(ET).hour >= 16:   # its own close
+                    j0 = cnt + 1
+                if j0 >= n:
+                    continue
+                x = next((kk for kk in range(j0, min(n, j0 + int(prm.max_hold))) if exit_hit(prm, c, sma_x, r2x, kk)),
+                         min(n - 1, j0 + int(prm.max_hold) - 1))
+                if x + 1 >= n:
+                    if not ended:
+                        continue
+                    x = n - 1
+                    xv, xns = float(c[x]), pd.Timestamp(f"{dates[x].date()} 16:00", tz=ET).value
+                elif (dates[x + 1] - dates[j0]).days > gap_days(prm):
+                    continue
+                else:
+                    xv, xns = float(d.iloc[x + 1]["o"]), _session_open_ns(dates[x + 1])
+                held = (et_day >= dates[j0]) & (et_day <= dates[x]) & (ends_ns > ens)
+                p = dict(base)
+                p.update(ens=int(ens), xns=int(xns), e=e, x=xv, pt=np.asarray(ends_ns[held], np.int64),
+                         pc=np.asarray(bc[held], float), pl=np.asarray(bl[held], float), ord_k=k, fill_src=src,
                          net=100.0 * (xv / e - 1) - 2 * hs / 100.0, days=(xns - ens) / 86400e9)
                 out.append(p)
                 made += 1
@@ -295,6 +590,15 @@ def order_pieces(prm: DipParams, lo, hi, panel: Optional[Dict[str, pd.DataFrame]
 FILTER_SCORES = Path("studies") / "prereg96" / "prod96" / "wf_scores_prod.pkl"
 
 
+def scores_path(path=None, research: bool = False) -> Path:
+    """The walk-forward score file: ``path``, else the own-security panels' (`OWN_SCORES`, `OWN_DEFAULT`) — PREREG96's
+    `FILTER_SCORES` with the stored panels, and always for ``research`` (only it carries the study's keep flags)."""
+    from config import settings
+    if path is not None:
+        return Path(path)
+    return Path(settings.backtest_research_dir) / (OWN_SCORES if OWN_DEFAULT and not research else FILTER_SCORES)
+
+
 def filter_keep(path=None, research: bool = False) -> Dict[str, bool]:
     """{order id (engine name | entry session): kept} for `order_pieces(keep=...)` / `filter_pieces` — PREREG96's RP33
     as production applies it (`enable_dip_long_filter`): EVERY signal scored at its signal close, filled or not (a
@@ -303,8 +607,7 @@ def filter_keep(path=None, research: bool = False) -> Dict[str, bool]:
     carry a flag, an unfilled order is kept as is (keyed by engine name here: run95 keyed the plain ticker, which left 6
     delisted ``@D`` orders of 2,370 unfiltered on sets A / B). A signal the map does not hold (outside the scored
     years) is kept."""
-    from config import settings
-    p = Path(path) if path is not None else Path(settings.backtest_research_dir) / FILTER_SCORES
+    p = scores_path(path, research)
     W = pd.read_pickle(p)
     if research:
         W = W[W["keep_research"].notna()]
@@ -315,36 +618,44 @@ def filter_keep(path=None, research: bool = False) -> Dict[str, bool]:
 def filter_scores(path=None) -> Dict[str, float]:
     """{order id: its walk-forward score} — PREREG96's map (`filter_keep`'s file), every signal scored at its signal
     close by the model of its year (PREREG107's ranking key)."""
-    from config import settings
-    p = Path(path) if path is not None else Path(settings.backtest_research_dir) / FILTER_SCORES
+    p = scores_path(path)
     W = pd.read_pickle(p)
     W = W[W["score"].notna()]
     return {str(o): float(s) for o, s in zip(W["oid"], W["score"])}
 
 
 def rank_pieces(pieces: Sequence[dict], scores: Mapping[str, float], by: str = "score",
-                topk: Optional[int] = None) -> List[dict]:
+                topk: Optional[int] = None, demote: Optional[Set[str]] = None) -> List[dict]:
     """PREREG107 (user 2026-10-14: "does it favor its best picks first? Would it be better the buy the top 1 pick even
     if we have more slots available?"): the dip book's order pieces (`order_pieces`, shared: copied, never modified)
     ranked by the meta-model's walk-forward score, highest first (``by="score"``: rank = -score; an unscored order
-    after every scored one, by its RSI2 — production's key; ``by="rsi2"`` keeps production's ranks), and with ``topk``
-    only each signal day's ``topk`` best orders by that score (the day = the order's first session, its ``oid``; an
-    unscored order ranks after the scored ones, by its RSI2)."""
+    after every scored one, by its RSI2 — production's key) or by the deepest dip (``by="rsi2"``: the order's RSI2, its
+    ``rank``; ``scores`` unread), and with ``topk`` only each signal day's ``topk`` best orders by that key (the day =
+    the order's first session, its ``oid``) — production's `dip_long.rank_key` either way. ``demote`` (PREREG137's
+    DEMOTE_E, production's earnings-dip demotion: `mimic.earnings_demoted`): the order ids that rank after every other
+    order of their day, among themselves by the same key (their rank + 1e7, so they also fill after the others).
+    2026-10-17: ``by="rsi2"`` with ``topk`` chose each day's best by the SCORE (only the fill order read the RSI2) —
+    production's "rsi2" picks the deepest dip; only PREREG137 Amendment 3's RS1 / RS1D ran it."""
     if by not in ("score", "rsi2"):
         raise ValueError(f"by must be 'score' or 'rsi2', not {by!r}")
+    demote = demote or frozenset()
 
     def key(p) -> float:
-        s = scores.get(str(p.get("oid")))
-        return -float(s) if s is not None else 1e6 + float(p.get("rank", 0.0))
-    out = [dict(p, rank=key(p)) if by == "score" else dict(p) for p in pieces]
+        if by == "score":
+            s = scores.get(str(p.get("oid")))
+            k = -float(s) if s is not None else 1e6 + float(p.get("rank", 0.0))
+        else:                                    # the deepest dip first: the order's RSI2
+            k = float(p.get("rank", 0.0))
+        return k + 1e7 if str(p.get("oid")) in demote else k
+    keys = [key(p) for p in pieces]                  # each order's key, from its own piece (never a re-keyed copy)
+    out = [dict(p, rank=k) for p, k in zip(pieces, keys)]
     if topk is None:
         return out
     best: Dict[str, List[tuple]] = {}
-    for p in out:
+    for p, k in zip(out, keys):
         oid = str(p.get("oid"))
         day = oid.split("|")[-1]
         best.setdefault(day, [])
-        k = key(p)
         if (k, oid) not in best[day]:
             best[day].append((k, oid))
     keep = {oid for day, rows in best.items() for _, oid in sorted(rows)[:int(topk)]}

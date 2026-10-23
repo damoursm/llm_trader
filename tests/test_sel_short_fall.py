@@ -82,7 +82,7 @@ def test_fall_shorts_the_pick_the_vol_arm_skips_and_skips_the_riser(on):
     assert (vol["ticker"], vol["decision"]) == ("AAA", "not_a_riser")
     assert (fall["ticker"], fall["decision"]) == ("AAA", "short")
     assert fall["target"] is None                                          # no run-up to give back
-    assert fall["deadline"] == ss.bar_end_et(ss.session_after(D, int(settings.sel_short_max_hold_sessions)), 2).isoformat()
+    assert fall["deadline"] == ss.bar_end_et(ss.session_after(D, ss.max_hold("fall")), 2).isoformat()
     assert fall["runup_pct"] == pytest.approx(-20.0) and fall["rose"] is False
     rose = _res(px=(20.0, 20.0, 20.0))
     assert ss.select(rose, D, 2, _stand(rose), [], arm="vol")["decision"] == "short"
@@ -140,6 +140,7 @@ def test_fall_trades_leave_on_the_volatility_exit_the_cover_and_the_time_limit(m
     from src.performance import tracker
     monkeypatch.setattr(settings, "enable_sel_short_volnorm_exit", True)
     monkeypatch.setattr(settings, "enable_sel_short_squeeze_cover", True)
+    monkeypatch.setattr(settings, "sel_short_fall_volnorm_ratio", 0.5)      # the mechanism at 0.5 (0.7 from 2026-10-20)
     monkeypatch.setattr(intraday_store, "split_factor_between", lambda t, a, b: 1.0)
     t, now = _trade()
     assert tracker._sel_short_exit_reason(dict(t, current_price=0.5), now) is None   # no target to reach
@@ -189,7 +190,7 @@ def test_the_entry_step_opens_and_funds_a_faller_short(monkeypatch, on):
     assert t["sel_target_price"] is None and t["sel_vol_score"] == 6.5 and t["sel_atr_pct"] == 6.5
     r = t["rationale"]
     assert "FELL" in r and "squeeze cover" in r and "N/A" not in r and "given back" not in r
-    assert "ATR% falls to 50% of 6.50%" in r                               # the volatility exit it leaves on
+    assert f"ATR% falls to {settings.sel_short_fall_volnorm_ratio:.0%} of 6.50%" in r   # the volatility exit it leaves on
 
 
 def test_a_faller_pick_ibkr_cannot_lend_takes_no_fallback(monkeypatch, on):

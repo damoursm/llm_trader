@@ -1,6 +1,7 @@
 """PREREG99 — trading halts at the short arms' entry passes: production's halt guard in the simulator (V0, a
-correction) and the registered variants (H1a / H1b / H2 / H3). OFF by default: ``Mimic(halts=None)`` builds every book
-exactly as before (`mimic.live_books` never imports this module); ``Mimic(halts="guard" | "wait" | "wait_half" |
+correction) and the registered variants (H1a / H1b / H2 / H3). Production's guard is `Mimic()`'s DEFAULT from
+2026-10-19 (AUDIT151's H_GUARD, -0.68 pp a year); ``Mimic(halts=None)`` (`Mimic.off()`, `mimic.PRE151`) builds every
+book as before (`mimic.live_books` then never imports this module); ``Mimic(halts="guard" | "wait" | "wait_half" |
 "backup" | "both")`` applies one of them to the vol, fall and ETF arms' entries.
 
 PRODUCTION (`tracker.record_sel_short_trades` -> ``attempt``, ``enable_sel_short_halt_guard``): a pick whose name is on
@@ -1044,6 +1045,13 @@ def pressure_flags(eng) -> Optional[np.ndarray]:
     return None
 
 
+def v6_installed(eng) -> bool:
+    """V6's pressure extras are part of the vol arm's selection: the engine's evaluator is V6's ``Real6``
+    (`run71.make_real6`, installed by a study harness's `R75.Applied`). The plain evaluator — the reliability cards'
+    construction — has none, though set A0's engine carries its pressure flags (``pressure_hi``) all the same."""
+    return getattr(getattr(eng, "Real", None), "__name__", "") == "Real6"
+
+
 _MODELS: Dict[tuple, HaltModel] = {}
 
 
@@ -1181,7 +1189,7 @@ class Applier:
         finally:
             ev.borrow = saved
         hi_rows = pressure_flags(eng)
-        extras = bool(pool and hi_rows is not None)
+        extras = bool(pool and hi_rows is not None and v6_installed(eng))
         runs = self._vol_runs(ev, SL, SP, fb, hi_rows)
         sched = self.model.schedule
         null = VolMachine(NoHalts(sched), "guard", pool, extras, self._lend_later).run(runs)

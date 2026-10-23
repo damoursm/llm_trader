@@ -467,11 +467,19 @@ def _daily_returns_for_trade(
         if day_fees is None:
             borrow_daily = borrow_annual_pct(trade) / 100.0 / 365.0
     entry_px = float(trade.get("entry_price") or 0.0)
+    # The dividends a live book's trade received (a long) or paid (a short): each booked on the interval holding
+    # its ex-date, as a fraction of the entry (`src/performance/dividends.py`); one due past the last mark (its
+    # instant passed, its ex-date's close not marked yet) goes to the last interval, as `_pct_return` counts it.
+    from src.performance.dividends import nav_events
+    div_days = nav_events(trade)
 
     def _scheduled(lo: date, hi: date, last: bool) -> float:
         if not day_fees or entry_px <= 0:
             return 0.0
         return sum(f for v, f in day_fees if lo < v and (v <= hi or last)) / entry_px
+
+    def _divs(lo: date, hi: date, last: bool) -> float:
+        return sum(f for v, f in div_days if lo < v and (v <= hi or last))
 
     results: List[Tuple[date, float, float]] = []
     prev_mark = marks[0][1] if marks[0][1] and marks[0][1] > 0 else None
@@ -489,6 +497,8 @@ def _daily_returns_for_trade(
             r -= borrow_daily * max(0, (d - prev_date).days)
         elif day_fees:
             r -= _scheduled(prev_date, d, i == last_i)
+        if div_days:
+            r += sign * _divs(prev_date, d, i == last_i)
         results.append((d, r, weight))
         prev_mark = mark
         prev_date = d

@@ -213,3 +213,34 @@ def test_the_restart_reaches_the_tick_report_and_the_email():
     manual = Template(block).render(broker_health=dict(down, gateway_session={
         "since": "2026-09-28 10:59:01", "reason": "login refused", "auto_recoverable": False}))
     assert "close that session" in manual and "restarts the gateway automatically" not in manual
+
+
+def test_a_quote_refused_for_want_of_a_subscription_is_not_asked_again_for_an_hour(monkeypatch):
+    """IBKR refuses every quote of this account (error 10089: no market-data subscription): after one refusal the
+    broker skips IBKR — the Polygon book prices the order at once — and asks once again an interval later, so the
+    IBKR book comes back by itself the day the subscription exists (the audit of 2026-10-20: ~2 s an order)."""
+    from src.broker import ibkr as I
+    b = I.IBKRBroker()
+    clock = [1000.0]
+    monkeypatch.setattr(I.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(settings, "broker_quote_entitlement_retry_seconds", 3600.0)
+    asked = []
+
+    class FakeIB:
+        RequestTimeout = 45.0
+
+        def reqTickers(self, *contracts):
+            asked.append(contracts)
+            b._on_ib_error(7, 10089, "Requested market data requires additional subscription for API.")
+            return []
+    b._ib = FakeIB()
+    monkeypatch.setattr(b, "_ensure_connected", lambda: True)
+    monkeypatch.setattr(b, "_qualify", lambda tk: tk)
+    assert b.get_quote("AAA") is None and len(asked) == 1
+    assert b.get_quote("BBB") is None and b.get_market_price("CCC") is None and len(asked) == 1   # skipped
+    clock[0] += 3601.0
+    assert b.get_quote("AAA") is None and len(asked) == 2                     # asked once again an hour later
+    monkeypatch.setattr(settings, "broker_quote_entitlement_retry_seconds", 0.0)
+    assert b.get_quote("AAA") is None and len(asked) == 3                     # 0 = always ask
+    b._on_ib_error(-1, 2104, "Market data farm connection is OK")             # an unrelated code changes nothing
+    assert b._md_refused_at == clock[0]

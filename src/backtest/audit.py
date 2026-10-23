@@ -58,7 +58,7 @@ REL_DIR = REPO / "cache" / "ml" / "reliability"
 ET = "America/New_York"
 REGISTRATION = "PREREG106.md (2026-10-14 13:09 ET)"
 B_BOOT, SEED = 10_000, 0                 # PREREG103: 10,000 resamples over trades, seed 0
-ARMS = ("vol", "etf", "fall", "dip", "crash")
+ARMS = ("vol", "etf", "fall", "dip", "crash", "cap")
 SETS = ("A0", "A", "B", "D")             # the sets the audit recomputes (LONG is carried, C is the live record)
 MIN_D_TRADES = 10                        # set D (accruing) is labelled from this many trades (positions per draw)
 DRAW_FILE = "{set}_LIVE_S2_s{seed}.pkl"  # the live configuration's account draws (PREREG101 / 103)
@@ -69,11 +69,12 @@ DESIGN = {
     "fall": {"IS": ("A",), "OOS": ("B", "A0", "D")},           # B is out of sample for the BASE rule
     "dip": {"IS": ("A", "B"), "OOS": ("LONG", "A0", "D")},
     "crash": {"IS": (), "OOS": ("D",)},                         # no IS split: context only, never a label
+    "cap": {"IS": (), "OOS": ("D",)},                           # chosen on A0 + A + B (PREREG165): as the crash book
     "combination": {"IS": ("A", "B"), "OOS": ("A0", "D")},
 }
 RANK = {"FAILS OUT OF SAMPLE": 0, "WEAKER OUT OF SAMPLE": 1, "ROBUST": 2}
 MODEL_NAME = {"vol": "the VOL arm", "etf": "the ETF arm", "fall": "the FALL arm", "dip": "the DIP book",
-              "crash": "the CRASH book", "combination": "THE COMBINATION"}
+              "crash": "the CRASH book", "cap": "the CAPITULATION book", "combination": "THE COMBINATION"}
 ROW_FIELDS = ("n", "rpd", "rpd_IS", "decay", "decay_lo95", "decay_hi95", "diff", "diff_lo95", "diff_hi95",
               "share_resamples_IS_le_0", "oos_boot_lo95", "oos_boot_hi95", "oos_lo95", "oos_hi95", "pairwise")
 
@@ -297,6 +298,7 @@ def load_draws(st: str, seeds, root=None) -> dict:
     """The live configuration's account draws of set ``st`` (PREREG103's `load_draws`): {seed: {"pos": positions
     (book, entry_day, exit_day, net %, pnl, days), "growth", "maxdd", "calls", "rpd_all"}}; a missing file is
     skipped."""
+    from src.backtest.bank import canonical_book
     out = {}
     for sd in seeds:
         p = Path(root if root is not None else draws_dir()) / DRAW_FILE.format(set=st, seed=sd)
@@ -306,7 +308,7 @@ def load_draws(st: str, seeds, root=None) -> dict:
         P = pd.DataFrame(r["pos"])
         ent = pd.to_datetime(P.entry_ns, unit="ns", utc=True).dt.tz_convert(ET).dt.tz_localize(None)
         ext = pd.to_datetime(P.exit_ns, unit="ns", utc=True).dt.tz_convert(ET).dt.tz_localize(None)
-        P = pd.DataFrame({"book": P.strategy.astype(str), "entry_day": ent.dt.normalize(), "exit_day": ext.dt.normalize(),
+        P = pd.DataFrame({"book": P.strategy.map(canonical_book), "entry_day": ent.dt.normalize(), "exit_day": ext.dt.normalize(),
                           "net": P.ret.astype(float) * 100.0, "pnl": P.pnl.astype(float),
                           "days": (P.exit_ns - P.entry_ns).astype(float) / 86400e9})
         out[sd] = {"pos": P, "growth": r["growth"], "maxdd": r["maxdd"], "calls": r["calls"], "rpd_all": r["rpd_all"]}
@@ -529,7 +531,8 @@ def build(day: Optional[date] = None, sets: Sequence[str] = SETS, cards: Optiona
     for model in ARMS:
         c = cnt[model]
         dsr[model] = {"N_low": max(1, c["low"]), "N_high": max(1, c["high"]),
-                      "N_source": "trial ledger" + ("" if c["seed"] else " (no seed: python -m src.backtest.trials --seed)")}
+                      "N_source": "trial ledger" + ("" if c["seed"] or c["recorded"]
+                                                     else " (no seed: python -m src.backtest.trials --seed)")}
         for s in DESIGN[model]["OOS"]:
             t = T[(T.book == model) & (T.set == s)] if s != "LONG" else None
             if t is None or len(t) < 3:

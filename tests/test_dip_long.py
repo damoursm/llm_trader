@@ -118,6 +118,7 @@ def test_the_entry_sessions_own_close_counts(monkeypatch, on):
 
 
 def test_ten_sessions_without_a_rebound_sell_on_time(monkeypatch, on):
+    monkeypatch.setattr(settings, "dip_long_max_hold_sessions", 10)  # the rule's mechanism (5 from 2026-10-20)
     closes = [100.0] * 30 + [100.0 - 2 * k for k in range(1, 12)]  # falling every session
     days, trade = _exit_case(monkeypatch, closes, len(closes) - 10)
     reason, info = dl.exit_check(trade, DAY)
