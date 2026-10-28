@@ -9,8 +9,9 @@ session's facts (``session``), the last five sessions' (``window``) and the reco
 
 * the selection short's live arms at the entry step (`cache/ml/sel_short/entries/`, one decision per pick): the
   share of picks IBKR could lend at their FIRST borrow check (the simulator reads our own archive from 2026-09-25, a
-  model before), IBKR's refusals of any opening short among the stock picks it answered (the simulator:
-  `mimic.REFUSAL_RATE`) and the house rates it quoted (the simulator: one of `mimic.house_mix()`'s names, drawn);
+  model before), IBKR's refusals of any opening short among the stock picks it answered (the simulator: by name,
+  its refusal table from 2026-10-24 — judged by ``refusal_model`` —, `mimic.REFUSAL_RATE` under `Mimic(**PRE193)`)
+  and the house rates it quoted (the simulator: one of `mimic.house_mix()`'s names, drawn);
 * the live books' trades (the ledger): a short's entry delay after the bar it was decided on and its entry price
   against that bar's close — the pick bar, or for a fall / ETF pick entered on its TURN (PREREG76 / 77) the turning
   bar; the simulator enters AT that close, stamped at its end — the immediate and the turn entries apart; the
@@ -23,6 +24,10 @@ session's facts (``session``), the last five sessions' (``window``) and the reco
   stored schedule takes IBKR's charges over the formula once they arrive, so it is never the comparison). Statements
   arrive with a lag (the EOD chain's Flex thread may still be waiting): the record reads what the table holds;
 * the dip book's limit orders by status (the simulator fills them by rule, cut to the account's room);
+* the fear book's implied-volatility store (``iv_revisions``, P7 of the parity audit of 2026-10-27): the stored bars
+  each pre-market fetch re-sent, the ones IBKR revised and the ones it no longer served (`fear_long.merge_rows`'
+  journal) — the simulator takes IBKR's past bars as final and its fear trades read the store — and the FEAR calls a
+  revision flips; a note on the session's revisions and on every flipped call;
 * EACH ARM'S RELIABILITY (``arms``; item 6 of the user's program, 2026-10-12: "the daily live-vs-simulator
   calibration gives each arm a reliability score: live return per day against the simulated one"): the live arms —
   the selection short's vol, ETF and fall arms by the trade's ``sel_arm``, the dip, crash and capitulation books by
@@ -69,7 +74,7 @@ DRIFT_NOTE_BP = 50.0                    # an entry this far from the decision ba
 FILL_NOTE = 0.8                         # under this share of the live books' legs filled at IBKR (the range below)
 FEE_RATIO_NOTE = (0.8, 1.25)            # IBKR's charge over the formula's, or its quantity over the ledger's shares
 HOUSE_RATIO_NOTE = (0.5, 2.0)           # IBKR's quoted initial house rate over the simulator's mix (median)
-ARM_KEYS = ("vol", "etf", "fall", "dip", "crash", "cap")   # the live arms as the simulator names them (`mimic.BOOK`'s keys)
+ARM_KEYS = ("vol", "etf", "fall", "dip", "crash", "cap", "ins", "fear")   # the live arms as the simulator names them (`mimic.BOOK`'s keys)
 REFERENCE_FILE = "reference.json"       # the simulator's reference per arm, under `out_dir()` (another module writes it)
 EPOCHS_FILE = "arm_epochs.json"         # each arm's configuration epoch (`epochs`), under `out_dir()`, kept by `write`
 # a close the arm's own rule did not decide: the operator's fresh start, the account's give-way, de-leveraging and
@@ -137,7 +142,11 @@ def assumptions() -> dict:
     out = {"entry_delay_min": 0.0, "entry_drift_bp": 0.0, "fill_share": 1.0, "fee_ratio": 1.0}
     try:
         from src.backtest import mimic as M
-        out["refusal_rate"] = float(M.REFUSAL_RATE)
+        mim = M.Mimic()
+        # by name from 2026-10-24 (PREREG193): no flat rate to judge the live share against — the refusal
+        # model's check (``refusal_model``: the count against its expected range) is the comparison
+        out["refusal_rate"] = float(M.REFUSAL_RATE) if mim.refusal == "rate" else None
+        out["refusal"] = ("rate" if mim.refusal == "rate" else f"by name: table {mim.refusal_table}")
         mix = M.house_mix()
         init = np.asarray([i for _, _, i in mix], float)
         maint = np.asarray([m for _, m, _ in mix], float)
@@ -189,6 +198,16 @@ def _quoted(e: dict) -> bool:
     return isinstance(m, dict) and m.get("init_rate") is not None
 
 
+def _refused(e: dict) -> bool:
+    """IBKR refused any opening short: the entry step's ``ibkr_refused``, or a refusal in a ``whatif_only`` answer
+    (`tracker.ask_unasked_sel_short`: a pick settled before its what-if, asked after the live path)."""
+    m = e.get("ibkr_margin")
+    return e.get("outcome") == "ibkr_refused" or (isinstance(m, dict) and bool(m.get("refused")))
+
+
+ASK_ONLY = "whatif_only"           # a journal line that answers IBKR's what-if, never an entry outcome
+
+
 def entry_facts(entries: Sequence[dict], live_arms: Sequence[str]) -> dict:
     """The live arms' entry-step record, ONE decision per pick (the journal holds a line per pass: a pick IBKR cannot
     lend is re-journaled every tick of its window): lendability at its FIRST borrow check, its LAST outcome, IBKR's
@@ -213,7 +232,7 @@ def entry_facts(entries: Sequence[dict], live_arms: Sequence[str]) -> dict:
     for es in by_key.values():
         if str(es[0].get("ticker")) in etfs:
             continue                                           # a fund's answer is not a stock's
-        if any(e.get("outcome") == "ibkr_refused" for e in es):
+        if any(_refused(e) for e in es):
             refused += 1
             continue
         q = next((e["ibkr_margin"] for e in es if _quoted(e)), None)
@@ -221,8 +240,9 @@ def entry_facts(entries: Sequence[dict], live_arms: Sequence[str]) -> dict:
             quoted.append(q)
     init = [float(q["init_rate"]) for q in quoted]
     maint = [float(q["maint_rate"]) for q in quoted if q.get("maint_rate") is not None]
-    return {"picks_settled": len(by_key),
-            "outcomes": _count(es[-1].get("outcome") for es in by_key.values()),
+    settled = [[e for e in es if e.get("outcome") != ASK_ONLY] for es in by_key.values()]
+    return {"picks_settled": sum(1 for es in settled if es),
+            "outcomes": _count(es[-1].get("outcome") for es in settled if es),
             "lendable_first_check": _share(sum(1 for e in lend if e.get("outcome") not in NO_BORROW), len(lend)),
             "lendable_by_arm": by_arm,
             "ibkr_refused_stock": _share(refused, refused + len(quoted)),
@@ -400,7 +420,8 @@ def arm_books() -> Dict[str, str]:
     capitulation books ARE their mechanism. The keys are the simulator's (`mimic.BOOK`; a test pins the two sites equal)."""
     from src.performance import books
     return {"vol": books.SEL_SHORT, "etf": books.SEL_SHORT, "fall": books.SEL_SHORT,
-            "dip": books.DIP_LONG, "crash": books.CRASH_LONG, "cap": books.CAP_LONG}
+            "dip": books.DIP_LONG, "crash": books.CRASH_LONG, "cap": books.CAP_LONG, "ins": books.INSIDER_LONG,
+            "fear": books.FEAR_LONG}
 
 
 def arm_of(t: dict) -> Optional[str]:
@@ -759,6 +780,296 @@ def _notes(rec: dict, assume: dict) -> List[Tuple[str, str]]:
     return out
 
 
+def pb_range(ps: Sequence[float], lo: float = 0.025, hi: float = 0.975) -> Tuple[int, int]:
+    """The 95% range of a count of events with these probabilities (the exact Poisson-binomial distribution)."""
+    dist = [1.0]
+    for q in ps:
+        q = min(max(float(q), 0.0), 1.0)
+        nxt = [0.0] * (len(dist) + 1)
+        for i, v in enumerate(dist):
+            nxt[i] += v * (1 - q)
+            nxt[i + 1] += v * q
+        dist = nxt
+    c, a, b = 0.0, None, None
+    for i, v in enumerate(dist):
+        c += v
+        if a is None and c >= lo:
+            a = i
+        if b is None and c >= hi:
+            b = i
+    return int(a or 0), int(b if b is not None else len(dist) - 1)
+
+
+def _auc(y: Sequence[int], p: Sequence[float]) -> Optional[float]:
+    pos = [q for q, v in zip(p, y) if v]
+    neg = [q for q, v in zip(p, y) if not v]
+    if not pos or not neg:
+        return None
+    return sum((n < q) + 0.5 * (n == q) for q in pos for n in neg) / (len(pos) * len(neg))
+
+
+def refusal_model_facts(entries: Sequence[dict], live_arms: Sequence[str]) -> dict:
+    """PREREG190's frozen refusal model (`sel_refusal`) against IBKR's own what-if answers, ONE per pick (refused, or
+    quoted with its rates; a timeout or an error counts in neither; the funds apart — the model never refuses one):
+    each stock pick's model probability at its session, the count refused against the sum of the probabilities and its
+    95% range, the AUC once both answers exist. Journal-only: nothing trades on it."""
+    from src.signals import sel_refusal as SR
+    from src.signals.sel_short import etf_names
+    if SR.model() is None:
+        return {"missing": str(SR.model_path())}
+    live = sorted((e for e in entries if (e.get("arm") or "model") in live_arms), key=lambda r: str(r.get("at") or ""))
+    by_key: Dict[str, List[dict]] = {}
+    for e in live:
+        by_key.setdefault(str(e.get("key")), []).append(e)
+    try:
+        etfs = set(etf_names(sorted({str(es[0].get("ticker")) for es in by_key.values()})))
+    except Exception:                                          # noqa: BLE001
+        etfs = set()
+    rows = []
+    for es in by_key.values():
+        tk = str(es[0].get("ticker"))
+        if tk in etfs:
+            continue
+        refused = any(_refused(e) for e in es)
+        q = next((e for e in es if _quoted(e)), None)
+        if not refused and q is None:
+            continue
+        e0 = es[0]
+        try:
+            d = date.fromisoformat(str(e0.get("day")))
+        except ValueError:
+            continue
+        p = SR.probability(tk, d, _f(e0.get("price")))
+        if p is None:
+            continue
+        rows.append({"ticker": tk, "day": d.isoformat(), "arm": e0.get("arm"), "refused": int(refused),
+                     "p": round(float(p), 5)})
+    y, ps = [r["refused"] for r in rows], [r["p"] for r in rows]
+    lo, hi = pb_range(ps) if ps else (0, 0)
+    return {"model": (SR.model() or {}).get("source"), "n": len(rows), "refused": sum(y),
+            "expected": round(sum(ps), 3), "range95": [lo, hi], "auc": _auc(y, ps), "picks": rows[-60:]}
+
+
+def _refusal_notes(f: Mapping) -> List[str]:
+    """A note when IBKR's refusals fall outside the model's 95% range (from `MIN_N` answers), and when IBKR's microcap
+    list is not archived (the refit due: `_refit_notes`)."""
+    out = []
+    n, k = int(f.get("n") or 0), int(f.get("refused") or 0)
+    lo, hi = (f.get("range95") or [0, 0])[:2]
+    if n >= MIN_N and not (lo <= k <= hi):
+        out.append(f"IBKR refused {k}/{n} stock picks against the refusal model's {float(f['expected']):.1f} expected "
+                   f"(95% {lo}-{hi}): its level is off (PREREG190's M2c)")
+    try:
+        from src.data import ibkr_microcaps
+        last = ibkr_microcaps.latest_day()
+        if last is None or (date.today() - last).days > int(settings.ibkr_microcap_max_age_days):
+            out.append(f"IBKR's microcap list not archived since {last or 'ever'} (the EOD's microcap_list step)")
+    except Exception as e:                                     # noqa: BLE001
+        out.append(f"IBKR's microcap archive unreadable ({e})")
+    return out
+
+
+def refusal_probe_facts(day: date) -> dict:
+    """The evening probe's answers through ``day`` (`src.signals.refusal_probe`, PREREG191) against the refusal model's
+    probability at each ask: by source and for the arms' candidates (the day's picks and backups, the new top-50
+    names) — the count refused against the expected count and its 95% range, the AUC —; how long a refusal lasts (the
+    week-old refusals asked again, still refused); the latest run. A timeout or an error counts in nothing."""
+    from src.signals import refusal_probe as RP
+    rows = []
+    for f in sorted(RP.probes_dir().glob("????-??-??.jsonl")):
+        if f.stem <= day.isoformat():
+            rows += [a for a in RP._read(f) if a.get("refused") or a.get("init_rate") is not None]
+
+    def part(xs: Sequence[dict]) -> dict:
+        xs = [a for a in xs if a.get("p_model") is not None]
+        y, ps = [int(bool(a.get("refused"))) for a in xs], [float(a["p_model"]) for a in xs]
+        lo, hi = pb_range(ps) if ps else (0, 0)
+        return {"n": len(xs), "refused": sum(y), "expected": round(sum(ps), 3), "range95": [lo, hi],
+                "auc": _auc(y, ps)}
+    by_src: Dict[str, List[dict]] = {}
+    for a in rows:
+        by_src.setdefault(str(a.get("source") or "?"), []).append(a)
+    re_ = by_src.get("reask") or []
+    out = {"answers": len(rows), "by_source": {k: part(v) for k, v in sorted(by_src.items())},
+           "arms": part([a for a in rows if a.get("source") in ("pick", "top50")]),
+           "reasks": {"n": len(re_), "still_refused": sum(1 for a in re_ if a.get("refused"))}}
+    # how IBKR's answer about a name changes when it is asked again (the re-asks, the watch; the studies' imported
+    # answers and the live entry step's included): every consecutive pair at least an hour apart, through ``day``
+    tr: Dict[str, object] = {"pairs": 0, "to_refused": [], "to_accepted": []}
+    for t, xs in RP.answers(day).items():
+        xs = sorted((a for a in xs if RP._at(a) is not None and RP._at(a).date() <= day), key=RP._at)
+        for a, b in zip(xs, xs[1:]):
+            if (RP._at(b) - RP._at(a)).total_seconds() < 3600:
+                continue
+            tr["pairs"] += 1
+            if bool(a.get("refused")) != bool(b.get("refused")):
+                tr["to_refused" if b.get("refused") else "to_accepted"].append(
+                    {"ticker": t, "from": str(a.get("at")), "to": str(b.get("at")), "reason": b.get("refused")})
+    out["transitions"] = tr
+    states = [p for p in sorted(RP.probes_dir().glob("????-??-??.state.json")) if p.name[:10] <= day.isoformat()]
+    if states:
+        try:
+            out["last_run"] = json.loads(states[-1].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def _probe_notes(f: Mapping) -> List[str]:
+    """A note when IBKR's evening refusals of the arms' candidates fall outside the model's 95% range (from `MIN_N`
+    answers), and when the latest evening run failed."""
+    out = []
+    a = f.get("arms") or {}
+    n, k = int(a.get("n") or 0), int(a.get("refused") or 0)
+    lo, hi = (a.get("range95") or [0, 0])[:2]
+    if n >= MIN_N and not (lo <= k <= hi):
+        out.append(f"IBKR's evening probe refused {k}/{n} of the arms' candidates against the refusal model's "
+                   f"{float(a['expected']):.1f} expected (95% {lo}-{hi})")
+    lr = f.get("last_run") or {}
+    if str(lr.get("stopped") or "").startswith("failed"):
+        out.append(f"the evening refusal probe of {lr.get('day')} failed: {str(lr['stopped'])[:160]}")
+    return out
+
+
+def refit_status(day: date) -> dict:
+    """What the refusal models have to learn from since they were fitted (the user 2026-10-24: "still refit/recalibrate
+    the model to make it better in the future"): IBKR's answers since the installed refusal model's ``installed``
+    instant — the live entry step's, the evening probe's and the studies' imported ones, each name once —, and IBKR's
+    daily microcap lists archived after the last list the simulator's refusal table was fitted on
+    (`mimic.REFUSAL_LISTS_THROUGH`)."""
+    from src.backtest import mimic as M
+    from src.data import ibkr_microcaps
+    from src.signals import refusal_probe as RP
+    from src.signals import sel_refusal as SR
+    inst = (SR.model() or {}).get("installed")
+    try:
+        t0 = datetime.fromisoformat(str(inst))
+    except (TypeError, ValueError):
+        t0 = None
+    asked, refused = set(), set()
+    if t0 is not None:
+        for t, xs in RP.answers(day).items():
+            for a in xs:
+                at = RP._at(a)
+                if at is None or at <= t0 or at.date() > day:
+                    continue
+                asked.add(t)
+                if a.get("refused"):
+                    refused.add(t)
+    thr = M.REFUSAL_LISTS_THROUGH.get(M.REFUSAL_TABLE)
+    lists = [p.name[:10] for p in ibkr_microcaps.root().glob("????-??-??.csv.gz")
+             if thr and thr < p.name[:10] <= day.isoformat()]
+    return {"refusal_model": {"installed": inst, "names_answered_since": len(asked), "refused_since": len(refused)},
+            "listing_model": {"table": M.REFUSAL_TABLE, "lists_through": thr, "lists_since": len(lists)}}
+
+
+def _refit_notes(f: Mapping) -> List[str]:
+    """A refit due: the refusal model once `refusal_model_refit_refusals` new refusals are in, the simulator's listing
+    model once `refusal_listing_refit_sessions` new daily lists are."""
+    out = []
+    rm, lm = f.get("refusal_model") or {}, f.get("listing_model") or {}
+    k = int(rm.get("refused_since") or 0)
+    if k >= int(getattr(settings, "refusal_model_refit_refusals", 20) or 20):
+        out.append(f"the refusal model has {k} new refusals of IBKR's since its install ({rm.get('names_answered_since')} "
+                   f"names answered): refit due (the next PREREG, as PREREG191; the simulator's table a new version)")
+    n = int(lm.get("lists_since") or 0)
+    if n >= int(getattr(settings, "refusal_listing_refit_sessions", 20) or 20):
+        out.append(f"IBKR's daily microcap list archived {n} sessions after the simulator's listing model (table "
+                   f"{lm.get('table')}, lists through {lm.get('lists_through')}): its refit due (PREREG192's [R6])")
+    return out
+
+
+# ── the fear book's implied-volatility store (P7) ────────────────────────────────────────────────────────────────
+
+def iv_revision_facts(day: date) -> dict:
+    """What the fear book's pre-market fetches changed in the implied-volatility store the simulator reads (P7, the
+    parity audit of 2026-10-27: the simulator takes IBKR's past bars as final, and the bank's fear trades read the
+    store). Over the fetches that journal their changes (`fear_long.merge_rows`: their names' records carry
+    ``revised``) from the book's first session to ``day``: the fetches, the stored bars IBKR re-sent (``reread``), the
+    bars it REVISED and the stored bars it no longer served (``absent``: kept in the store), their names, the largest
+    move of a revised close and the FEAR calls a revision flips (`_flip`); the session's apart (``session``)."""
+    from src.signals import fear_long as FL
+    first = FL.first_session() or LIVE_SINCE
+    cut = float(settings.fear_long_ivp_min)
+    out: Dict[str, object] = {"since": first.isoformat(), "fetches": 0, "reread": 0, "revised": 0, "absent": 0,
+                              "names": [], "max_close_move": None, "flips": [], "session": None}
+    names, cache, flips = set(), {}, []
+    for d in _sessions(first, day):
+        tab = FL.load_table(d) or {}
+        recs = [r for r in (tab.get("names") or {}).values() if isinstance(r, dict) and "revised" in r]
+        if not recs:
+            continue
+        reread = sum(max(0, int(r.get("answered") or 0) - int(r.get("added") or 0)) for r in recs)
+        js = FL.load_revisions(d)
+        rev = [x for x in js if x.get("kind") == "revised"]
+        gone = [x for x in js if x.get("kind") == "absent"]
+        moves = []
+        for x in rev:
+            o, n = (list(x.get("old") or []) + [None] * 4)[3], (list(x.get("new") or []) + [None] * 4)[3]
+            if o and n:
+                moves.append(abs(float(n) / float(o) - 1.0))
+            f = _flip(FL, cache, x, cut)
+            if f:
+                flips.append(f)
+        out["fetches"] += 1
+        out["reread"] += reread
+        out["revised"] += len(rev)
+        out["absent"] += len(gone)
+        names.update(x.get("sym") for x in js if x.get("sym"))
+        if moves:
+            out["max_close_move"] = max([out["max_close_move"] or 0.0] + moves)
+        if d == day:
+            out["session"] = {"reread": reread, "revised": len(rev), "absent": len(gone),
+                              "names": sorted({x.get("sym") for x in js if x.get("sym")}),
+                              "max_close_move": max(moves) if moves else None, "journal": str(FL.revisions_path(d))}
+    out["names"] = sorted(names)
+    out["flips"] = flips
+    out["share_revised"] = _share(int(out["revised"]), int(out["reread"])) if out["reread"] else None
+    return out
+
+
+def _flip(FL, cache: dict, x: Mapping, cut: float) -> Optional[dict]:
+    """The FEAR call at a revised bar's own session — the session whose close an order of the next session reads — with
+    the close the store held before against the store's (`fear_long.ivp_at`): the pair when they fall on either side of
+    ``cut``, else None."""
+    import pandas as pd
+    sym, t = x.get("sym"), pd.Timestamp(x.get("date"))
+    if sym not in cache:
+        cache[sym] = FL.iv_series(sym)
+    s = cache[sym]
+    if s is None:
+        return None
+    new = FL.ivp_at(s, t)
+    o = (list(x.get("old") or []) + [None] * 4)[3]
+    s_old = s.drop(t, errors="ignore")
+    if o is not None and math.isfinite(float(o)) and float(o) > 0:
+        s_old = pd.concat([s_old, pd.Series([float(o)], index=pd.DatetimeIndex([t]))]).sort_index()
+    old = FL.ivp_at(s_old, t)
+    if old is None or new is None or (old[0] >= cut) == (new[0] >= cut):
+        return None
+    return {"sym": sym, "date": str(t.date()), "ivp_old": round(old[0], 4), "ivp_new": round(new[0], 4)}
+
+
+def _iv_notes(f: Mapping) -> List[str]:
+    """A note on the session's fetch when it revised or no longer served a stored bar, and one on the FEAR calls the
+    record's revisions flipped — never an alarm: the store keeps IBKR's latest values, the journal the replaced ones."""
+    out = []
+    s = f.get("session") or {}
+    if s.get("revised") or s.get("absent"):
+        mv = s.get("max_close_move")
+        out.append(f"IBKR revised {s['revised']} of the {s['reread']} stored implied-volatility bars it re-sent this "
+                   f"morning" + (f" (the largest close move {mv:.1%})" if mv is not None else "") +
+                   f" and no longer served {s['absent']} ({', '.join(s.get('names', [])[:8])}): the store keeps its "
+                   f"latest values, the journal {s.get('journal')} the replaced ones; the simulator's fear trades read "
+                   f"the store")
+    fl = f.get("flips") or []
+    if fl:
+        out.append(f"{len(fl)} fear call{'' if len(fl) == 1 else 's'} flipped by IBKR's implied-volatility revisions "
+                   f"since {f.get('since')}: " + ", ".join(f"{x['sym']} {x['date']} IVP {x['ivp_old']:.2f} -> "
+                                                            f"{x['ivp_new']:.2f}" for x in fl[:5]))
+    return out
+
+
 def compare(rec: dict, assume: dict) -> List[str]:
     """The notes of one section (see `_notes`)."""
     return [n for _, n in _notes(rec, assume)]
@@ -809,11 +1120,44 @@ def build(day: date, trades: Optional[Sequence[dict]] = None, fps: Optional[Mapp
             except Exception as e:                             # noqa: BLE001 — one section's failure is reported
                 part[key] = {"error": str(e)[:300]}
         rec[name] = part
+    if bool(getattr(settings, "enable_live_calibration_refusal_model", True)):
+        try:                                                   # PREREG190's model on the live record: fail-soft
+            from src.accounts import profiles
+            rm_arms = sorted(set(arms) | set(profiles.short_arms_traded()))   # the extra accounts' arms answered too
+            rec["refusal_model"] = refusal_model_facts(_entries(days_all), rm_arms)
+        except Exception as e:                                 # noqa: BLE001
+            rec["refusal_model"] = {"error": str(e)[:300]}
+        try:                                                   # PREREG191's evening probe: fail-soft
+            rec["refusal_probe"] = refusal_probe_facts(day)
+        except Exception as e:                                 # noqa: BLE001
+            rec["refusal_probe"] = {"error": str(e)[:300]}
+        try:                                                   # what the refusal models have to learn from: fail-soft
+            rec["refusal_refit"] = refit_status(day)
+        except Exception as e:                                 # noqa: BLE001
+            rec["refusal_refit"] = {"error": str(e)[:300]}
+    if bool(getattr(settings, "enable_fear_long", False)):
+        try:                                                   # P7: what the fetches changed in the IV store: fail-soft
+            rec["iv_revisions"] = iv_revision_facts(day)
+        except Exception as e:                                 # noqa: BLE001
+            rec["iv_revisions"] = {"error": str(e)[:300]}
     whole = _notes(rec["since"], assume) if rec["since"].get("sessions") else []
     window = _notes(rec["window"], assume) if rec["window"].get("sessions") else []
     seen = {k for k, _ in whole}
     head = [n for n in (_reference_note(ref, stale, fps), fps.get("error")) if n]
     rec["notes"] = head + [n for _, n in whole] + [f"last {len(win)} sessions: {n}" for k, n in window if k not in seen]
+    rm = rec.get("refusal_model") or {}
+    if rm and not rm.get("missing"):
+        rec["notes"] += ([f"refusal model check failed: {rm['error']}"] if rm.get("error") else _refusal_notes(rm))
+    rp = rec.get("refusal_probe") or {}
+    if rp:
+        rec["notes"] += ([f"refusal probe check failed: {rp['error']}"] if rp.get("error") else _probe_notes(rp))
+    rr = rec.get("refusal_refit") or {}
+    if rr:
+        rec["notes"] += ([f"refusal refit check failed: {rr['error']}"] if rr.get("error") else _refit_notes(rr))
+    iv = rec.get("iv_revisions") or {}
+    if iv:
+        rec["notes"] += ([f"implied-volatility revision check failed: {iv['error']}"] if iv.get("error")
+                         else _iv_notes(iv))
     return rec
 
 

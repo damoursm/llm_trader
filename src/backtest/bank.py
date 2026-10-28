@@ -29,8 +29,8 @@ account engine at the live costs, `Mimic()` seed 0; A0 from the latest ``<day>_A
      market's rise: 0 is the stricter bar);
   3. TRANSFERABLE: its return per day beats its bar in both chronological halves of its trades (each half against the
      bar over its own span), and with ANY one calendar year left out (a model one year carries does not transfer);
-  4. GROWTH: the arm alone at its live slice of a $10,000 account — its P&L realized at each exit and compounded (the
-     marks inside a trade unseen) — grows over the pooled history.
+  4. GROWTH: the arm alone at its live slice of the live account (`live_start`: $50,000 from PREREG227's S6) — its P&L
+     realized at each exit and compounded (the marks inside a trade unseen) — grows over the pooled history.
 Short of trades only, it is INSUFFICIENT (not proven, not refuted); short of any other check it FAILS. THE LONGEST
 HISTORY — an arm whose own data reach before 2018: the dip book's daily bars from 2007 and the crash book's QQQ from
 1988 (PREREG103's LONG history, carried from `audit.baseline_json()` as yearly summaries), a candidate's earlier trades
@@ -62,6 +62,12 @@ margin-call draws, every calendar year against SPY and QQQ (price only), every M
 the worst month, the worst twelve months, the longest time under water) and the COVERAGE: its months grouped by the
 market context at their first session — where the bank earns, and where it is idle or loses (where a new arm is
 worth the most) — with each arm's share of each context's months.
+
+THE IMPLIED-VOLATILITY STORE (`iv_stores`, P7 of the parity audit of 2026-10-27): the fear book's trades read IBKR's
+history, which production's pre-market fetch rewrites every session. Each card build reads one frozen snapshot of it
+(`reliability.build`) and a study that saves the draws records the one it read (`strategies.fear.write_state`); the
+bank records them (``inputs.iv_store``), says when two inputs read different stores, and what changed in the store
+since the previous bank (`strategies.fear.diff`).
 """
 from __future__ import annotations
 
@@ -83,7 +89,7 @@ from src.backtest.account import per_day
 REPO = Path(__file__).resolve().parents[2]
 BANK_DIR = REPO / "cache" / "ml" / "bank"
 ET = "America/New_York"
-ARMS = ("vol", "etf", "fall", "dip", "crash", "cap")
+ARMS = ("vol", "etf", "fall", "dip", "crash", "cap", "ins", "fear")
 POOL = periods.POOLED
 POOL_LO, POOL_HI = periods.pool_span(POOL)
 MIN_TRADES = 100                 # 1. an arm's trades on the pooled history (or its longest)
@@ -94,9 +100,18 @@ B_BOOT, SEED = 10_000, 0
 T_SIG = 1.96                     # 2. the clustered t a longest history carried as yearly summaries must reach
 # 2. THE BAR of each LONG live arm: the market's average day (SPY's, the daily cache's symbol), whatever the arm holds
 # — the crash book's TQQQ too (PREREG123); a short arm's bar is 0; `card`'s ``bench`` names a candidate's
-BENCH = {"dip": "SPY", "crash": "SPY", "cap": "SPY"}
+BENCH = {"dip": "SPY", "crash": "SPY", "cap": "SPY", "ins": "SPY", "fear": "SPY"}
 FIRST_WF_YEAR = 2020             # the walk-forward's first out-of-time year (two years to decide on)
-START = 10_000.0
+# a run that records no start began at $10,000 (every run before PREREG227's S6; `nav_of`)
+RUN_START_BEFORE = 10_000.0
+
+
+def live_start() -> float:
+    """The account an arm alone is read at: production's live account (`sel_short_account_initial`, $50,000 —
+    PREREG227's S6, the user 2026-10-27: "both the simulated and live accounts should be at $50,000"; $10,000 before).
+    `alone` compounds shares of the equity, so its growth does not depend on it."""
+    from config.settings import settings as S
+    return float(getattr(S, "sel_short_account_initial", RUN_START_BEFORE))
 # the live configuration's latest draws with a daily NAV each (research repository): PREREG147's S3 — the
 # configuration from the 2026-10-19 session (PREREG116's Q1: vol give-back 1.25, the ETF arm without the VIX-linked
 # products, at most two shorts of one name; PREREG137's earnings dips ranked last; the dip book's daily top pick among
@@ -120,8 +135,27 @@ START = 10_000.0
 # label PATH, the harness with the default `Mimic()`; V15 (the margin calls before it) stays the previous model's.
 # FROM 2026-10-21 22:05 ET the simulator's margin check sees what production's sees (PREREG175: every bar between the
 # marks, every book marked at the off-grid ticks; production's account liquidating as IBKR does): V15's draws on the
-# books rebuilt under it — prereg175/runs, label NEWMARKS; PATH stays PREREG174's
-LIVE_RUNS = ("studies/prereg175/runs", "NEWMARKS")
+# books rebuilt under it — prereg175/runs, label NEWMARKS; PATH stays PREREG174's. FROM 2026-10-24 the simulator refuses
+# BY NAME (PREREG193's switch, the user: "Make the switch right away"; `Mimic.refusal` "model", the refusal table v1):
+# the live configuration's draws under it, 40 a set — prereg193/runs, label LIVE193 (seeds 0-19 equal PREREG193's
+# REFLIST accounts, 60 of 60); NEWMARKS stays the random 7%'s (`Mimic(**PRE193)`). FROM THE 2026-10-26 SESSION the live
+# configuration holds THE INSIDER BOOK (PREREG203's O1_20 as production trades it, the user 2026-10-24: "Ok. Deploy the
+# Opportunistic, SPY 20%+ down to the live combine."; `Mimic.ins`): LIVE193's draws with its pieces — prereg205/runs,
+# label LIVE205 (seed 0 without them reproduces LIVE193 exactly, `prereg205/gate205.json`); LIVE193 stays the
+# configuration before it (`Mimic(**PRE205)`). AND THE DIP BOOK PREFERS THE DAY'S WALLSTREETBETS-FLAGGED SIGNAL (PREREG209's
+# KD+, the user 2026-10-25: "Build KD+ for production and deploy it."; `Mimic.dip_wsb`): LIVE205's draws with KD+'s
+# dip book — prereg209/runs, label KDp (the default `Mimic()` rebuilds its dip book piece for piece, the harness
+# reproduced LIVE205's seed 0 exactly, `prereg209/gate209.json`); LIVE205 stays the configuration before it
+# (`Mimic(**PRE209)`). FROM THE 2026-10-28 SESSION THE FEAR BOOK (PREREG219-226, the user 2026-10-27: "Deploy to
+# production the $1B, 1/6 each, 4 slots."; `Mimic.fear`): KDp's draws with it — prereg225/runs, label E2s4, 40 a set
+# (the default `Mimic()` rebuilds its pieces exactly and reproduces its accounts of seeds 0-4, 15 of 15:
+# `studies/deploy_fear/parity_*.json`); KDp stays the configuration before it (`Mimic(**PRE226)`). FROM 2026-10-27 THE
+# SIMULATOR'S PARITY CORRECTIONS S1-S8 AND THE $50,000 ACCOUNT (PREREG227, the user: "Do S1 to S8 now. For S6, both the
+# simulated and live accounts should be at $50,000."): E2s4's configuration on the corrected simulator, today's data —
+# prereg227/runs, label L227, 40 a set (the working copy under `Mimic(**PRE227)` rebuilt E2s4's books as production's
+# tree does and reproduced its accounts of seeds 0-4 exactly, `prereg227/gate227_g0.json`); E2s4 stays the
+# construction before it (`Mimic(**PRE227)`; on today's data label OLD)
+LIVE_RUNS = ("studies/prereg227/runs", "L227")
 RUN_FILE = re.compile(r"^(A0|A|B)_(?P<label>.+)_s(?P<seed>\d+)\.pkl$")
 # a book a study named otherwise -> the live arm's name (PREREG165 / 167 built the capitulation book as "capb"; the
 # live configuration's draws, `LIVE_RUNS`, are PREREG167's): every loaded run speaks the live arms' names
@@ -131,7 +165,12 @@ BOOK_ALIASES = {"capb": "cap"}
 LONG_TRADES = {"cap": ("studies/prereg165/trades165.pkl", ("oos", 0.2),
                        "PREREG165's untouched 2006-2017 test: every signal at the deployed 20% breadth on a "
                        "survivorship-free whole-market panel, limit fills on daily bars, 2 bp a side (the pooled part "
-                       "is the card's: the arm alone through the engine, at most 3 open)")}
+                       "is the card's: the arm alone through the engine, at most 3 open)"),
+               "ins": ("studies/prereg205/trades205.pkl", "long",
+                       "PREREG201's 2007-2017 trades of the O1_20 rule: every opportunistic insider purchase with SPY "
+                       "20% under its high, bought at the open after the filing, sold at the 60th session's close on "
+                       "the whole-market daily bars as traded, the research spread model (the pooled part is the "
+                       "card's: the arm alone through the engine, at most 5 open, sold at the open after 60 sessions)")}
 
 
 def live_slices() -> Dict[str, float]:
@@ -139,7 +178,8 @@ def live_slices() -> Dict[str, float]:
     from config.settings import settings as S
     return {"vol": 1.0 / float(S.sel_short_vol_account_slices), "etf": 1.0 / float(S.sel_short_etf_account_slices),
             "fall": 1.0 / float(S.sel_short_fall_account_slices), "dip": 1.0 / float(S.dip_long_account_slices),
-            "crash": 1.0 / float(S.crash_long_account_slices), "cap": 1.0 / float(S.cap_long_account_slices)}
+            "crash": 1.0 / float(S.crash_long_account_slices), "cap": 1.0 / float(S.cap_long_account_slices),
+            "ins": 1.0 / float(S.insider_long_account_slices), "fear": 1.0 / float(S.fear_long_account_slices)}
 
 
 # ── the trades ───────────────────────────────────────────────────────────────
@@ -213,13 +253,15 @@ def _cell_label(s: dict) -> Optional[str]:
     return "EARNS" if s["rpd_lo95"] > 0 else ("LOSES" if s["rpd_hi95"] < 0 else "unclear")
 
 
-def alone(t: pd.DataFrame, slice_: float, lo: str, hi: str, start: float = START,
+def alone(t: pd.DataFrame, slice_: float, lo: str, hi: str, start: Optional[float] = None,
           max_open: Optional[int] = None) -> dict:
-    """The arm alone at its live slice of a $10,000 account: each trade sized at ``slice_`` of the equity REALIZED at
-    its entry, its P&L realized at its exit, compounded (the marks inside a trade unseen). Growth a year over [lo, hi],
-    the worst drawdown of the realized equity, every calendar year's growth. ``max_open``: an entry while that many
-    positions are open is skipped (counted in ``skipped``) — an arm whose trades overlap heavily (PREREG112: 283 at
-    once) is otherwise read at many times its equity; None = every trade taken (the live arms' rules bound them)."""
+    """The arm alone at its live slice of the live account (``start`` None: `live_start`, $50,000): each trade sized
+    at ``slice_`` of the equity REALIZED at its entry, its P&L realized at its exit, compounded (the marks inside a
+    trade unseen). Growth a year over [lo, hi], the worst drawdown of the realized equity, every calendar year's
+    growth. ``max_open``: an entry while that many positions are open is skipped (counted in ``skipped``) — an arm
+    whose trades overlap heavily (PREREG112: 283 at once) is otherwise read at many times its equity; None = every
+    trade taken (the live arms' rules bound them)."""
+    start = live_start() if start is None else float(start)
     if not len(t):
         return {"growth": None, "maxdd": None, "years": {}}
     ent = pd.DatetimeIndex(t.entry_day)
@@ -785,9 +827,10 @@ def load_runs(folder: Path, label: str, sets: Sequence[str] = POOL) -> Dict[str,
     return out
 
 
-def nav_of(rec: Mapping, lo: str, start: float = START) -> Tuple[pd.Series, str]:
+def nav_of(rec: Mapping, lo: str, start: Optional[float] = None) -> Tuple[pd.Series, str]:
     """A draw's equity as a NAV (1.0 at its start): its daily NAV, else its positions' P&L realized at their exits
-    (flagged "realized")."""
+    (flagged "realized") from ``start`` — None: the run's own (``start``, PREREG227), else $10,000 (every run before)."""
+    start = float(start if start is not None else (rec.get("start") or RUN_START_BEFORE))
     nav = rec.get("nav")
     if nav:
         s = pd.Series(np.asarray(nav["values"], float), index=pd.DatetimeIndex(pd.to_datetime(nav["days"])))
@@ -1028,6 +1071,10 @@ def build(day: Optional[date] = None, cards: Optional[Mapping[str, Path]] = None
     runs = load_runs(rd, lab)
     comb = combination(runs, reg) if runs else {"seeds": 0, "note": f"no draws {lab} in {rd}"}
     srcs = {s: str(p) for s, p in (dict(cards) if cards is not None else AU.card_dirs()).items() if s in POOL}
+    try:                                                               # P7: the store every input read
+        ivs = iv_stores(srcs, rd, day)
+    except Exception as e:                                             # noqa: BLE001 — a record, never the verdicts
+        ivs = {"error": f"{type(e).__name__}: {e}"[:300]}
     return {"built_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "registration": "user directive 2026-10-14 (the pooled evaluation)",
             "pool": {"sets": list(POOL), "span": [POOL_LO, POOL_HI], "weights": periods.pool_weights(POOL)},
@@ -1041,8 +1088,83 @@ def build(day: Optional[date] = None, cards: Optional[Mapping[str, Path]] = None
                                  "its longest history (user directive 2026-10-15)", "t_sig_summaries": T_SIG},
             "inputs": {"cards": srcs, "runs": f"{rd} / {lab}", "long": {a: v.get("source") for a, v in long.items()},
                        "long_trades": {a: v[2] for a, v in LONG_TRADES.items()},
-                       "bench_history": str(AU.bench_history_json())},
+                       "bench_history": str(AU.bench_history_json()), "iv_store": ivs},
             "arms": arms, "combination": comb}
+
+
+IV_KEYS = ("digest", "through", "names", "bars")
+
+
+def previous_bank(day: Optional[date] = None, bank_dir: Optional[Path] = None) -> Optional[Tuple[Path, dict]]:
+    """The newest bank written before ``day`` (default today): (its path, its record), or None."""
+    cut = (day or datetime.now().date()).isoformat()
+    files = sorted(p for p in Path(bank_dir or BANK_DIR).glob("????-??-??.json") if p.stem < cut)
+    for p in reversed(files):
+        try:
+            return p, json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def iv_stores(cards: Mapping[str, str], runs_dir: Path, day: Optional[date] = None,
+              bank_dir: Optional[Path] = None) -> dict:
+    """The fear book's implied-volatility store each input of the bank read (P7): every card build's (its
+    `strategies.fear.STATE_FILE`, written by `reliability.build`) and the draws' (beside the runs, when the study that
+    saved them recorded it) — ``consistent`` False when two inputs read different stores, ``recorded`` False when one
+    did not record its store (built before P7) — and the change since the previous bank's (`previous_bank`; the bars
+    added, removed and revised between the two snapshots, `strategies.fear.diff`, when both are kept)."""
+    from src.backtest.strategies import fear as FEAR
+
+    def part(rec: Optional[Mapping]) -> Optional[dict]:
+        return None if rec is None else {k: rec.get(k) for k in IV_KEYS}
+    builds = {s: part(FEAR.read_state(d)) for s, d in cards.items()}
+    runs = part(FEAR.read_state(runs_dir))
+    digests = sorted({r["digest"] for r in list(builds.values()) + [runs] if r and r.get("digest")})
+    first = next((r for r in list(builds.values()) + [runs] if r), None)
+    out = {"cards": builds, "runs": runs, "digest": digests[0] if len(digests) == 1 else None,
+           "consistent": len(digests) <= 1, "recorded": bool(builds) and all(builds.values()) and runs is not None}
+    if first is not None and len(digests) == 1:
+        out.update({k: first.get(k) for k in IV_KEYS if k != "digest"})
+    prev = previous_bank(day, bank_dir)
+    if prev is not None:
+        pv = ((prev[1].get("inputs") or {}).get("iv_store") or {})
+        out["previous"] = {"bank": prev[0].name, "digest": pv.get("digest"),
+                           "same": (pv.get("digest") == out["digest"]) if pv.get("digest") and out["digest"] else None}
+        if out["previous"]["same"] is False:
+            a, b = FEAR.snapshot_root() / pv["digest"], FEAR.snapshot_root() / out["digest"]
+            if a.is_dir() and b.is_dir():
+                out["previous"]["diff"] = FEAR.diff(a, b)
+    return out
+
+
+def iv_line(iv: Mapping) -> Optional[str]:
+    """The implied-volatility store's line in the bank's print (`lines`)."""
+    if not iv:
+        return None
+    if iv.get("error"):
+        return f"  implied-volatility store: not read ({iv['error']})"
+    cards = {s: (r or {}).get("digest") for s, r in (iv.get("cards") or {}).items()}
+    if not iv.get("consistent"):
+        return (f"  IMPLIED-VOLATILITY STORE: the inputs read different stores — cards {cards}, draws "
+                f"{(iv.get('runs') or {}).get('digest')}: rebuild them on one")
+    if not iv.get("digest"):
+        return "  implied-volatility store: not recorded (built before P7)"
+    s = (f"  implied-volatility store {iv['digest']} ({iv.get('names')} names, {iv.get('bars')} bars through "
+         f"{iv.get('through')}): read by the cards" + (" and the draws" if iv.get("runs") else
+                                                       "; the draws recorded none"))
+    pv = iv.get("previous") or {}
+    if pv.get("same") is True:
+        s += f"; unchanged since {pv['bank']}"
+    elif pv.get("same") is False:
+        d = pv.get("diff") or {}
+        s += (f"; CHANGED since {pv['bank']} ({pv.get('digest')}): " +
+              (f"{len(d.get('names_added') or [])} names added, {len(d.get('names_removed') or [])} removed, "
+               f"{d.get('bars_revised', 0)} bars revised, {d.get('bars_added', 0)} added, {d.get('bars_removed', 0)} "
+               f"removed" if d else "its snapshot is not kept"))
+    elif pv:
+        s += f"; {pv['bank']} recorded none"
+    return s
 
 
 def out_path(day: Optional[date] = None, bank_dir: Optional[Path] = None) -> Path:
@@ -1088,6 +1210,9 @@ def lines(b: Mapping) -> List[str]:
                        f"backtest's Sharpe ({pb['months_for_power']:.1f} for 80% power), {pd_['min_trl']:.1f} at "
                        f"{tr['decay']:g} x it ({pd_['months_for_power']:.1f}); to show it falls to {tr['decay']:g} x "
                        f"{sf['months_for_power']:.1f}")
+    ivl = iv_line((b.get("inputs") or {}).get("iv_store") or {})
+    if ivl:
+        out.append(ivl)
     return out
 
 

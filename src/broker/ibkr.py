@@ -104,6 +104,20 @@ def _is_socket_reset(msg: str) -> bool:
 _install_ib_log_bridge()
 
 
+WHATIF_REFUSAL_MARKS = ("no trading permission", "ineligib", "close-only", "no opening trades")
+
+
+def whatif_refusal(errors) -> Optional[str]:
+    """IBKR's reason for refusing to OPEN a position, from a what-if's errors (``(code, text)`` pairs): an error 201
+    carrying an eligibility mark (close-only, small-cap compliance, a DTC chill ...), the reason the text after
+    "Ineligibility reasons:"; None when IBKR did not refuse. One parser for the live what-if and the nightly probe."""
+    text = next((str(t) for c, t in errors if int(c) == 201 and any(m in str(t).lower() for m in WHATIF_REFUSAL_MARKS)),
+                None)
+    if text is None:
+        return None
+    return text.split("Ineligibility reasons:", 1)[-1].replace("<br>", " ").strip()[:240]
+
+
 def to_ib_symbol(ticker: str) -> str:
     """Map a yfinance-style ticker to IBKR symbology.
 
@@ -1007,7 +1021,7 @@ class IBKRBroker(Broker):
     # error 201's eligibility refusals ("No Trading Permission, Customer Ineligible;
     # Ineligibility reasons: Margin concern/risk management ... close-only" / "No Opening
     # Trades: Small Cap, Subject to Compliance Restriction", 2026-10-05)
-    _REFUSAL_MARKS = ("no trading permission", "ineligib", "close-only", "no opening trades")
+    _REFUSAL_MARKS = WHATIF_REFUSAL_MARKS
 
     def _base_currency(self) -> Optional[str]:
         """The account's base currency (what IBKR's margin figures are in), or None."""
@@ -1081,11 +1095,9 @@ class IBKRBroker(Broker):
             return {"qty": qty, "price": px, "error": _exc_text(e)[:240],
                     "seconds": round(time.monotonic() - t0, 2)}
         out = {"qty": qty, "price": px, "seconds": round(time.monotonic() - t0, 2)}
-        refusal = next((txt for code, txt in errors
-                        if code == 201 and any(m in txt.lower() for m in self._REFUSAL_MARKS)), None)
+        refusal = whatif_refusal(errors)
         if refusal:
-            reason = refusal.split("Ineligibility reasons:", 1)[-1].replace("<br>", " ").strip()
-            return {**out, "refused": reason[:240]}
+            return {**out, "refused": refusal}
 
         def num(x):
             try:

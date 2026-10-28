@@ -69,8 +69,10 @@ GAP_T = 2.0
 SAME_TICK_NS = 10 * 60 * 10 ** 9   # one slot: a live tick runs seconds to minutes after the bar's end
 GAP_KEYS = ("entry_gap_pct", "ibkr_entry_vs_ledger_pct", "exit_same_instant_gap_pct", "ibkr_exit_vs_ledger_pct",
             "exit_timing_gap_pct", "cost_gap_pct", "net_gap_pct", "ibkr_minus_sim_pct")
-SHARE_KEYS = ("dip_account_shares", "sel_account_shares", "cap_account_shares", "crash_account_shares")
-ARMS = ("vol", "etf", "fall", "dip", "cap", "crash")       # the live arms this module rebuilds
+SHARE_KEYS = ("dip_account_shares", "sel_account_shares", "cap_account_shares", "crash_account_shares",
+              "ins_account_shares")
+ARMS = ("vol", "etf", "fall", "dip", "cap", "crash", "ins", "fear")    # the live arms this module rebuilds
+ORDER_BOOKS = {"dip": "dip_long", "cap": "cap_long", "fear": "fear_long"}   # the limit-order books: their settings
 
 
 def out_dir() -> Path:
@@ -313,16 +315,16 @@ def _sessions_held(e: date, last: date) -> int:
 
 
 def book_rules(book: str) -> dict:
-    p = "dip_long" if book == "dip" else "cap_long"
+    p = ORDER_BOOKS[book]
     return {"exit_sma": int(getattr(settings, f"{p}_exit_sma_sessions")),
             "max_hold": int(getattr(settings, f"{p}_max_hold_sessions")),
             "order_life": int(getattr(settings, f"{p}_limit_sessions"))}
 
 
 def sim_order_book(t: dict, b: dict, mk: Market, book: str) -> dict:
-    """A dip or capitulation order filled and sold by the simulator's rule on the same bars."""
+    """A dip, capitulation or fear order filled and sold by the simulator's rule on the same bars."""
     import pandas as pd
-    p = "dip" if book == "dip" else "cap"
+    p = book if book in ORDER_BOOKS else "cap"
     rules = book_rules(book)
     lim = float(t.get(f"{p}_limit") or 0) or None
     od = _day(t.get(f"{p}_order_day") or t.get(f"{p}_signal_day") or t.get("entry_date"))
@@ -451,6 +453,27 @@ def sim_crash(t: dict, b: dict, q: dict) -> dict:
     return out
 
 
+def sim_insider(t: dict, b: dict) -> dict:
+    """The insider book's long (`strategies.insider`): bought at the entry session's opening print, sold at the opening
+    print of the session after `insider_long_hold_sessions` sessions held (the entry session the first)."""
+    e0 = _day(t.get("entry_date"))
+    out: dict = {"rule": {"hold": int(settings.insider_long_hold_sessions)}}
+    op = open_print(b, e0) if e0 else None
+    if op is None:
+        return out
+    out["fill"] = {"session": e0.isoformat(), "ns": op[0], "price": op[1], "kind": "open"}
+    days = sorted({x.date() for x in daily(b).index})
+    for i, s in enumerate(days):
+        if s < e0 or _sessions_held(e0, s) < out["rule"]["hold"]:
+            continue
+        if i + 1 < len(days):
+            nx = open_print(b, days[i + 1])
+            if nx is not None:
+                out["exit"] = {"session": days[i + 1].isoformat(), "ns": nx[0], "price": nx[1], "why": "time"}
+        break
+    return out
+
+
 # ── the comparison ────────────────────────────────────────────────────────────────────────────────────────────────
 
 def _lg(a, b) -> Optional[float]:
@@ -470,7 +493,7 @@ def compare(t: dict, s: dict, hs_fn: Callable[[str, str, int, str], Tuple[float,
     xL = float(t["exit_price"]) if t.get("exit_price") not in (None, "") else None
     closed = t.get("status") == "CLOSED"
     e_ns_L, x_ns_L = _ns(t.get("entry_datetime")), _ns(t.get("exit_datetime"))
-    fe = (s.get("fill") if arm in ("dip", "cap", "crash") else s.get("entry")) or {}
+    fe = (s.get("fill") if arm in ("dip", "cap", "crash", "ins", "fear") else s.get("entry")) or {}
     eS, e_ns_S = fe.get("price"), fe.get("ns")
     sx = s.get("exit") or {}
     xS, x_ns_S = sx.get("price"), sx.get("ns")
@@ -505,7 +528,7 @@ def compare(t: dict, s: dict, hs_fn: Callable[[str, str, int, str], Tuple[float,
     r["same_tick"] = (abs(int(x_ns_S) - int(x_ns_L)) < SAME_TICK_NS) if (x_ns_S and x_ns_L) else None
     r["same_session"] = (_et(x_ns_S).date() == _et(x_ns_L).date()) if (x_ns_S and x_ns_L) else None
     hs_in, fb = 0.0, 0
-    if arm in ("dip", "cap"):
+    if arm in ORDER_BOOKS:
         if fe.get("kind") == "open":
             v, m = hs_fn(arm, tk, int(e_ns_S), "in")
             hs_in, fb = min(Q.CAP_BP, v), fb + int(m)
@@ -716,7 +739,8 @@ def build(day: date, trades: Optional[Sequence[dict]] = None, mk: Optional[Marke
             continue
         try:
             tk, arm = str(t["ticker"]), arm_of(t)
-            od = _day(t.get("dip_order_day") or t.get("cap_order_day") or t.get("entry_date")) or day
+            od = _day(t.get("dip_order_day") or t.get("cap_order_day") or t.get("fear_order_day")
+                      or t.get("entry_date")) or day
             lo = (od - timedelta(days=21)).isoformat()
             x1 = _day(t.get("exit_date")) or day
             hi = min(x1 + timedelta(days=4), day).isoformat()
@@ -724,13 +748,15 @@ def build(day: date, trades: Optional[Sequence[dict]] = None, mk: Optional[Marke
             if b is None:
                 rows.append({"id": t.get("trade_id"), "ticker": tk, "arm": arm, "error": "no bars"})
                 continue
-            if arm in ("dip", "cap"):
+            if arm in ORDER_BOOKS:
                 s = sim_order_book(t, b, mk, arm)
             elif arm == "crash":
                 sym = str(t.get("crash_decision_symbol") or getattr(settings, "crash_long_symbol", "QQQ"))
                 if sym not in q_cache:
                     q_cache[sym] = mk.bars(sym, (od - timedelta(days=21)).isoformat(), hi)
                 s = sim_crash(t, b, q_cache[sym]) if q_cache[sym] is not None else {}
+            elif arm == "ins":
+                s = sim_insider(t, b)
             else:
                 s = sim_short(t, b)
             s["_b"] = b

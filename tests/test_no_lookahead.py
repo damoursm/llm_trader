@@ -63,6 +63,14 @@ any input at a decision point could see something that happened after it:
 * the ledger's dividends (2026-10-19, AUDIT151) — a live book's trade carries an ex-date's cash only once its
   entitlement instant (20:00 ET of the session before the ex-date) has passed by the tick: a later ex-date's record,
   added or rewritten, moves no mark (mutation-checked 2026-10-19: the instant's cut dropped).
+* the insider book (2026-10-24, PREREG203 / 205) — its decision at session D reads the insider filings filed BEFORE D
+  (the window from the session before through D's eve; a purchase filed on D, an insider's earlier trade reported on D,
+  a later amendment: none moves an event or its class), the stocks' bars through D-1 and SPY's close at D-1: bars and
+  closes of D and later, rewritten, move nothing (mutation-checked 2026-10-24: the filings' cut at <= D, the bars read
+  through D, the gate at its series' last close — each fails the guard).
+* the fear book (2026-10-28, PREREG219-226) — the implied volatility deciding session D is its percentile at the close
+  of D-1 among the 252 sessions through it: IBKR bars of D and later, rewritten wildly, move no IVP and no fear signal
+  (mutation-checked 2026-10-27: the percentile at the series' last bar instead of D-1's fails the guard).
 The deep features' point-in-time rules (the 08:30 cutoff, publication lags, rows
 published after the cutoff) are pinned in `tests/test_deep_features.py` — the Reg SHO
 (`rs`) and IBKR borrow (`bw`) groups there too (a list / borrow row of D is known from
@@ -1288,3 +1296,132 @@ def test_the_crash_after_hours_exit_never_reads_a_close_after_its_session(monkey
     monkeypatch.setattr(intraday_store, "load_deep_30m", lambda tk: rebound if tk == "QQQ" else None)
     assert cl.pm_exit_check(trade, DAY) == base
     assert cl.pm_exit_check(trade, nxt)[0] == "crash_rebound"               # the injected leak: a session later
+
+
+# ── the insider book (2026-10-24, PREREG203 / 205) ───────────────────────────────────────────────────────────────
+
+def _ins_row(owner, tk, fd, td, code="P", shares=1000.0, price=10.0, form="4"):
+    return {"ticker": tk, "issuer_cik": "0001", "form": form, "filing_date": fd, "trans_date": td,
+            "trans_code": code, "acq_disp": "A" if code == "P" else "D", "shares": shares, "price": price,
+            "shares_owned_after": 5000.0, "security_title": "Common Stock", "is_director": False, "is_officer": True,
+            "owner_cik": owner, "owner_title": "CFO", "aff_10b5_1": None}
+
+
+def test_the_insider_events_never_read_a_filing_of_their_own_session_or_later():
+    """The events deciding session D read the filings filed before D: a purchase filed ON D or later, an insider's
+    earlier trade reported on D (which would make the buyer routine) and an amendment repeating the window's purchase
+    filed on D — placed FIRST in the files' order — must not move the window's events or their classes; read with the
+    cut a day later (the injected leak) the amendment takes the purchase's place and the event leaves the window."""
+    from src.signals import insider_long as il
+    from src.signals import dip_long as dl
+    d = ss.session_after(DAY, 1)
+    prev = dl.prev_session(d)
+    lo, hi = il.filing_window(d)
+    assert hi < d                                                            # the window ends on D's eve
+    hist = [_ins_row("O", "OLD", f"{y}-03-15", f"{y}-03-10", code="S") for y in (2023, 2024, 2025)]
+    clean = hist + [_ins_row("O", "AAA", prev.isoformat(), prev.isoformat(), shares=1000, price=20.0)]
+    late = [_ins_row("O", "OLD", d.isoformat(), f"2025-{prev.month:02d}-03", code="S"),      # routine-making, on D
+            _ins_row("O", "OLD", d.isoformat(), f"2024-{prev.month:02d}-03", code="S"),
+            _ins_row("O", "OLD", d.isoformat(), f"2023-{prev.month:02d}-03", code="S"),
+            _ins_row("O", "AAA", d.isoformat(), prev.isoformat(), shares=999, price=21.0),   # a purchase filed on D
+            dict(_ins_row("O", "AAA", d.isoformat(), prev.isoformat(), shares=1000, price=20.0), form="4/A"),
+            dict(_ins_row("O", "AAA", (d + timedelta(days=3)).isoformat(), prev.isoformat(), shares=1000, price=20.0),
+                 form="4/A")]
+    base = il.events_from_rows(il.clean_rows(pd.DataFrame(clean)), lo, hi, d)
+    assert len(base) == 1 and bool(base["opp"].iloc[0])                      # the fixture is an opportunistic event
+    fut = il.events_from_rows(il.clean_rows(pd.DataFrame(late + clean)), lo, hi, d)
+    pd.testing.assert_frame_equal(base.reset_index(drop=True), fut.reset_index(drop=True))
+    leak = il.events_from_rows(il.clean_rows(pd.DataFrame(late + clean)), lo, hi, d + timedelta(days=1))
+    assert leak.empty                                                        # the injected leak: D's filings read
+
+
+def test_the_insider_stocks_numbers_never_read_a_bar_of_their_own_session(monkeypatch):
+    """A stock's numbers deciding session D (its run, its close, its dollar volume) come from its bars through D-1: a
+    frame already holding D's and a later session's bars, rewritten wildly, moves nothing; read at D+1 (the injected
+    leak) they move."""
+    from src.signals import insider_long as il
+    d = ss.session_after(DAY, 1)
+    days = ss.sessions_before(d, 80)
+    later = [d, ss.session_after(d, 1)]
+    clean = pd.DataFrame({"o": 10.0, "h": 10.2, "l": 9.8, "c": 10.0, "v": 1e6}, index=pd.DatetimeIndex(days))
+    fut = pd.concat([clean, pd.DataFrame({"o": 99.0, "h": 120.0, "l": 1.0, "c": 3.0, "v": 9e9},
+                                         index=pd.DatetimeIndex(later))])
+    base = il.bar_stats(clean, d)
+    assert base["bars"] == 80 and base["close"] == 10.0
+    assert il.bar_stats(fut, d) == base
+    assert il.bar_stats(fut, later[1]) != base                               # the injected leak: D's bar read
+
+
+def test_the_insider_gate_never_reads_spys_close_of_its_own_session():
+    """The gate deciding session D is SPY's close at D-1 against its 252-session high through D-1: closes of D and
+    later — a crash, then a melt-up — move nothing; judged at D (the injected leak) it moves."""
+    from src.signals import insider_long as il
+    from src.signals import dip_long as dl
+    d = ss.session_after(DAY, 1)
+    prev = dl.prev_session(d)
+    days = ss.sessions_before(d, 260)
+    vals = list(np.linspace(300.0, 400.0, 230)) + list(np.linspace(399.0, 330.0, 30))   # 17.5% under: off
+    clean = pd.Series(vals, index=pd.DatetimeIndex(days))
+    fut = pd.concat([clean, pd.Series([250.0, 600.0], index=pd.DatetimeIndex([d, ss.session_after(d, 1)]))])
+    base = il.gate_from_closes(clean, prev)
+    assert base["on"] is False and base["error"] is None
+    assert il.gate_from_closes(fut, prev) == base
+    assert il.gate_from_closes(fut, d)["on"] is True                          # the injected leak: D's close read
+
+
+def test_the_dip_wsb_preference_never_reads_a_post_after_its_cut(monkeypatch):
+    """PREREG209's KD+ (2026-10-26): session D's WallStreetBets flags read the titles CREATED before 09:00 ET of D only —
+    posts at or after the cut (that morning, D's session, D+1, D+5), and every later post rewritten, change no count,
+    flag or pick; titles before the cut flag a signal and change the pick (so the guard can fail)."""
+    from config.settings import settings
+    from src.data.feeds import wsb
+    from src.signals import dip_long as dl
+    from src.signals import dip_wsb as W
+    from tests.test_dip_wsb import AFTER, DAY, PREV, _full_window, _on, _post, _sig
+    _on(monkeypatch)
+    monkeypatch.setattr(W, "window_counts", lambda d, tks, now=None, _f=W.window_counts: _f(d, tks, now=AFTER))
+    t0, t1 = W.window(DAY)
+    start, cut = datetime.fromtimestamp(t0, timezone.utc), datetime.fromtimestamp(t1, timezone.utc)
+    _full_window([_post(f"n{k}", start + timedelta(hours=k), "$NVDA") for k in range(2)])
+
+    def run():
+        keep, top = dl._daily_top([_sig("NVDA", 0.30), _sig("TSLA", 0.20)], DAY, PREV, 1)
+        w = top["info"]["wsb"]
+        return [s["ticker"] for s in keep], dict(w["titles"]), list(w["flagged"]), w["status"]
+    base = run()
+    assert base == (["NVDA"], {"NVDA": 2, "TSLA": 0}, [], "ok")
+    later = [cut, cut + timedelta(seconds=1), cut + timedelta(hours=3), cut + timedelta(days=1), cut + timedelta(days=5)]
+    for k, when in enumerate(later):                          # the leak's material: TSLA named after the cut
+        wsb.write_day(when.date(), [_post(f"late{k}_{j}", when + timedelta(seconds=j), "$TSLA $TSLA") for j in range(9)])
+    assert run() == base
+    for d_ in sorted({w_.date() for w_ in later}):            # every later post rewritten
+        posts = [dict(p, title="NVDA NVDA") if p["created_utc"] >= t1 else p for p in wsb.read_day(d_)]
+        wsb.path_for(d_).unlink()
+        wsb.write_day(d_, posts)
+    assert run() == base
+    for d_ in sorted({w_.date() for w_ in later}):            # truncation: nothing at or after the cut
+        keep_ = [p for p in wsb.read_day(d_) if p["created_utc"] < t1]
+        wsb.path_for(d_).unlink()
+        if keep_:
+            wsb.write_day(d_, keep_)
+    assert run() == base
+    wsb.write_day(cut.date(), [_post(f"pre{j}", cut - timedelta(minutes=30 + j), "$TSLA") for j in range(5)])
+    got = run()                                               # titles before the cut: TSLA flagged and picked
+    assert got[0] == ["TSLA"] and got[1]["TSLA"] == 5 and got[2] == ["TSLA"]
+
+
+def test_the_fear_books_implied_volatility_never_reads_a_bar_of_its_own_session():
+    """The fear book (2026-10-28): the IVP deciding session D is the percentile of the implied volatility at the close of
+    D-1 among the 252 sessions through it (`fear_long.ivp_at`): bars of D and later — a spike, then a collapse — move
+    nothing; read at D (the injected leak) it moves."""
+    from src.signals import fear_long as fl
+    from src.signals import dip_long as dl
+    d = ss.session_after(DAY, 1)
+    prev = dl.prev_session(d)
+    days = ss.sessions_before(d, 300)
+    clean = pd.Series(np.r_[np.linspace(0.2, 0.3, 299), [0.25]], index=pd.DatetimeIndex(days))
+    fut = pd.concat([clean, pd.Series([0.95, 0.01], index=pd.DatetimeIndex([d, ss.session_after(d, 1)]))])
+    base = fl.ivp_at(clean, pd.Timestamp(prev))
+    assert base is not None and base[1] == 0.25
+    assert fl.ivp_at(fut, pd.Timestamp(prev)) == base
+    assert fl.ivp_at(fut, pd.Timestamp(d)) != base                            # the injected leak: D's bar read

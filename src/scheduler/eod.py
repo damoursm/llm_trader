@@ -18,7 +18,9 @@ steps also flushed the scheduler's calibration caches at every as-of step. Here 
     python -m src.scheduler.eod --day 2026-10-06 --steps replay,backtest    # rerun these
 
 The steps, in order, each fail-soft and under its own setting: the IBKR Flex borrow fees
-(in their own thread: IBKR can take hours to generate a statement), the forward-return
+(in their own thread: IBKR can take hours to generate a statement), IBKR's U.S. Microcap
+list archived (``microcap_list``), the evening refusal probe launched and never waited for
+(``refusal_probe``: a detached process, `src.signals.refusal_probe`), the forward-return
 cache warm, retention, the replay (``signals_replay``), the walk-forward
 (``weight_history``), the shape history, the tier-2 backtest tail (``signals_backtest``)
 the IBKR BID_ASK spread sweep (a subprocess: ib_async needs its own event loop and
@@ -50,8 +52,8 @@ CONSOLE = Path("logs/eod_console.log")
 LOG_DIR = Path("logs")
 LOG_KEEP_DAYS = 14
 FLEX = "flex"
-STEPS = ("cache_warm", "retention", "replay", "walkforward", "shape_history", "backtest", "spread_sweep",
-         "live_calibration", "forward_check")
+STEPS = ("microcap_list", "refusal_probe", "cache_warm", "retention", "replay", "walkforward", "shape_history",
+         "backtest", "spread_sweep", "live_calibration", "forward_check")
 FINAL = ("ok", "failed", "off")
 FLEX_JOIN_SECONDS = 3900.0   # the Flex fetch gives IBKR up to an hour (its own host), then keeps the reference
 
@@ -235,6 +237,36 @@ def _spread_sweep(day) -> Tuple[object, str]:
     return {"rc": res.returncode}, tail or "rc=0"
 
 
+def _microcap_list(day) -> Tuple[object, str]:
+    # IBKR's U.S. Microcap list (2026-10-23, PREREG190): the stocks behind its "No Opening Trades: Small Cap" refusals,
+    # one raw copy a market day — IBKR keeps no history (`src.data.ibkr_microcaps`; the live calibration's refusal
+    # model reads it).
+    from src.data import ibkr_microcaps as IM
+    p, n = IM.archive(_day(day))
+    return {"path": str(p), "symbols": n}, f"{n} symbols -> {p.name}"
+
+
+def _refusal_probe(day) -> Tuple[object, str]:
+    # IBKR's refusals asked every evening (2026-10-24, PREREG191): a DETACHED process on its own client, one name a
+    # minute until `refusal_probe_end_et` (`src.signals.refusal_probe`) — the chain never waits for it; launched only
+    # on the evening of its own session (a chain resumed the next morning launches nothing).
+    import subprocess as sp
+    from zoneinfo import ZoneInfo
+    from src.signals import refusal_probe as RP
+    d = _day(day)
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.date() != d or now >= RP.window_end(d):
+        return {"launched": False}, f"not launched: outside {d}'s evening window"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = LOG_DIR / f"refusal_probe_{d.isoformat()}.log"
+    flags = getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(sp, "DETACHED_PROCESS", 0)
+    with open(log, "a", encoding="utf-8") as fh:
+        proc = sp.Popen([sys.executable, "-m", "src.signals.refusal_probe", "--day", d.isoformat()], stdout=fh,
+                        stderr=sp.STDOUT, stdin=sp.DEVNULL, creationflags=flags, close_fds=True,
+                        env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    return {"launched": True, "pid": proc.pid, "log": str(log)}, f"launched pid {proc.pid} -> {log.name}"
+
+
 def _live_calibration(day) -> Tuple[object, str]:
     # The live record against the production-mimicking simulator's assumptions (2026-10-12): one JSON per market
     # day, its notes in the email's scorer banner. IBKR's Flex statement lags (its thread may still be waiting):
@@ -258,13 +290,17 @@ def _forward_check(day) -> Tuple[object, str]:
         head + (f"; {len(notes)} note(s): " + "; ".join(notes) if notes else "; no gap"))
 
 
-STEP_FNS = {FLEX: _flex, "cache_warm": _cache_warm, "retention": _retention, "replay": _replay,
-            "walkforward": _walkforward, "shape_history": _shape_history, "backtest": _backtest,
+STEP_FNS = {FLEX: _flex, "microcap_list": _microcap_list, "refusal_probe": _refusal_probe, "cache_warm": _cache_warm,
+            "retention": _retention,
+            "replay": _replay, "walkforward": _walkforward, "shape_history": _shape_history, "backtest": _backtest,
             "spread_sweep": _spread_sweep, "live_calibration": _live_calibration, "forward_check": _forward_check}
 
 
 def _enabled(step: str) -> bool:
     return bool({
+        "microcap_list": settings.enable_eod_microcap_list,
+        "refusal_probe": (settings.enable_eod_refusal_probe
+                          and str(settings.broker_mode or "off").lower() == "ibkr_paper"),
         "replay": settings.enable_eod_replay_refresh,
         "walkforward": settings.enable_eod_walkforward,
         "shape_history": settings.enable_eod_shape_history,

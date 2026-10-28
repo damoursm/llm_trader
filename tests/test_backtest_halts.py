@@ -594,6 +594,7 @@ def test_mimic_without_halts_builds_exactly_what_it_built_before(monkeypatch):
     # PREREG102: the default follows production's VIX block (`sel_short_etf_exclude_vix`, from 2026-10-14) — the ETF
     # arm's picks re-ranked without the VIX-linked products (``exclude``)
     base = ["cagap", "ctx", "entry", "give", "hmax", "lend_after", "limit", "through", "turn"]   # hmax: 2026-10-20
+    base += ["cover", "max_dtc", "min_rvol"]           # PREREG227's S7: production's numbers, the adapter's defaults
     assert etf.calls == [sorted(base + ([] if M.Mimic(seed=3, **M.PRE151).etf_vix else ["exclude"]))]
 
 

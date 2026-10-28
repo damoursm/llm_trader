@@ -154,8 +154,10 @@ def daily_logret(res: dict, bdn: np.ndarray, final: float, start: float) -> np.n
     return np.diff(np.log(np.r_[1.0, np.maximum(nav, 1e-6)]))
 
 
-def score(arms, combo, lo, t, settle, rules, start=10_000.0):
-    """One combo on the window [lo, t): (log growth per year, daily log returns, trades, margin calls)."""
+def score(arms, combo, lo, t, settle, rules, start=None):
+    """One combo on the window [lo, t): (log growth per year, daily log returns, trades, margin calls); ``start`` None
+    = the rules' own (`Rules.start`)."""
+    start = float(getattr(rules, "start", 10_000.0) if start is None else start)
     cut = cut_of(t)
     P = combo_pieces(arms, combo, dnum(lo), dnum(t) - 1, cut)
     strategies = [a.strategy for n, a in arms.items() if combo.rule(n) is not None]
@@ -343,13 +345,16 @@ def chained(study: Study, picks: Sequence[int], settle, keep_curve: bool = True)
     return {"res": res, "metrics": m}
 
 
-def nav_daily(res: dict, days: pd.DatetimeIndex, start: float = 10_000.0) -> np.ndarray:
+def nav_daily(res: dict, days: pd.DatetimeIndex, start: Optional[float] = None) -> np.ndarray:
+    """The run's daily NAV (1.0 = its start; ``start`` None = the run's own, `account.run_start` — PREREG227's S6:
+    the live configuration's runs start at production's $50,000)."""
+    start = A.run_start(res, start)
     bdn = np.array([dnum(d) for d in days], np.int64)
     return np.exp(np.cumsum(daily_logret(res, bdn, max(float(res["final"]), 1e-6), start)))
 
 
 def max_drawdown(nav) -> float:
-    """The worst drawdown (%) of a NAV path that starts at 1.0 ($10,000): a loss from the start counts."""
+    """The worst drawdown (%) of a NAV path that starts at 1.0 (the account's start): a loss from the start counts."""
     nav = np.asarray(nav, float)
     peak = np.maximum.accumulate(np.r_[1.0, nav])[1:]
     return float(np.max(1.0 - nav / peak) * 100.0) if len(nav) else 0.0

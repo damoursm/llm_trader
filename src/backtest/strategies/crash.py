@@ -26,9 +26,13 @@ def _daily(sym: str) -> Optional[pd.DataFrame]:
     return dip_long._daily(sym)
 
 
-def trades(lo, hi, daily: Optional[pd.DataFrame] = None, sym: Optional[str] = None) -> List[dict]:
+def trades(lo, hi, daily: Optional[pd.DataFrame] = None, sym: Optional[str] = None, every: bool = False) -> List[dict]:
     """The rule's longs for decisions on sessions [lo, hi]: {signal, entry, exit} session dates (an exit past the
-    data's end is the last session's close)."""
+    data's end is the last session's close). ``every`` (PREREG227's S2, `Mimic.crash_reenter`): one long for EVERY
+    qualifying session, each with its own exit — the account's one-at-a-time rule (`max_open` 1) rejects the ones that
+    overlap a held long, as production settles them ``holding``, so a buy the account could not fund or a long a margin
+    call sold is bought again at the next qualifying open; False: the first of each non-overlapping run only (the
+    construction before it, which never re-entered)."""
     from src.signals import crash_long
     sym = sym or crash_long.symbol()
     d = daily if daily is not None else _daily(sym)
@@ -48,7 +52,7 @@ def trades(lo, hi, daily: Optional[pd.DataFrame] = None, sym: Optional[str] = No
     lo, hi = pd.Timestamp(lo), pd.Timestamp(hi)
     out, busy_until = [], -1
     for j in range(1, len(days)):
-        if not (lo <= days[j] <= hi) or j < busy_until:
+        if not (lo <= days[j] <= hi) or (j < busy_until and not every):
             continue
         st = crash_long.stats_at(d.iloc[:j], days[j - 1].date())        # the close of D-1, nothing later
         if not crash_long.qualifies(st):
@@ -63,11 +67,12 @@ def trades(lo, hi, daily: Optional[pd.DataFrame] = None, sym: Optional[str] = No
 
 
 def pieces(lo, hi, end=None, strategy: str = "crash", sym: Optional[str] = None,
-           trade_sym: Optional[str] = None, period: Optional[str] = None) -> List[dict]:
+           trade_sym: Optional[str] = None, period: Optional[str] = None, every: bool = False) -> List[dict]:
     """The account engine's pieces of the crash book's longs decided on sessions [lo, hi]: decided on ``sym`` (the
     decision symbol, `crash_long_symbol`), held in ``trade_sym`` (`crash_long_trade_symbol`). ``period="A0"``
     (PREREG101): the decision symbol's daily rows and the fund's 30-minute bars from set A0's bars
-    (`src.backtest.a0`), production's construction over 2016-2021 (the fund's daily bars stay the OHLCV cache's)."""
+    (`src.backtest.a0`), production's construction over 2016-2021 (the fund's daily bars stay the OHLCV cache's).
+    ``every``: a piece for every qualifying session (`trades`; PREREG227's S2)."""
     from src.backtest.strategies import dm as DM
     from src.signals import crash_long
     sym = sym or crash_long.symbol()
@@ -87,7 +92,7 @@ def pieces(lo, hi, end=None, strategy: str = "crash", sym: Optional[str] = None,
     dv = (dd["Close"] * dd["Volume"]).rolling(20).mean()
     end = pd.Timestamp(end).normalize() if end is not None else None
     out = []
-    for t in trades(lo, hi, daily=dec, sym=sym):
+    for t in trades(lo, hi, daily=dec, sym=sym, **({"every": True} if every else {})):
         a, b = t["entry"], t["exit"]
         if a not in dd.index or (b is not None and b not in dd.index):
             continue

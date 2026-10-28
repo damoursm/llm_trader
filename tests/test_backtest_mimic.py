@@ -348,6 +348,52 @@ def test_independent_draws_are_unchanged_by_the_stratified_option():
             M.Mimic(**bad)
 
 
+def test_refusals_are_drawn_by_name_from_the_versioned_table_by_default(monkeypatch, tmp_path):
+    """PREREG193 (the user 2026-10-24: "Make the switch right away"): `Mimic()` refuses by NAME — the refusal table's
+    probability at the row (else the name's latest earlier row, else the stand-in) against ONE uniform per name —;
+    `Mimic(**PRE193)` keeps the random 7% per (name, session), the rule a study's patch of `refused` decides."""
+    rows = pd.DataFrame({"sym": ["AAA", "AAA", "BBB"], "dn": [20000, 20010, 20005], "p": [0.30, 0.90, 0.02]})
+    monkeypatch.setattr(M, "REFUSAL_TABLES", {"v1": "t.pkl", "vt": "t.pkl"})
+    monkeypatch.setattr(M, "refusal_path", lambda version="v1": tmp_path / "t.pkl")
+    pd.to_pickle({"rows": rows, "p_default": 0.005}, tmp_path / "t.pkl")
+    M.refusal_table.cache_clear()
+    try:
+        assert M.Mimic().refusal == "model" and M.Mimic(**M.PRE193).refusal == "rate"
+        assert M.Mimic.off().refusal == "rate"
+        assert M.refusal_p("AAA", 20000) == 0.30 and M.refusal_p("AAA", 20009) == 0.30       # the latest earlier row
+        assert M.refusal_p("AAA", 20010) == 0.90 and M.refusal_p("AAA", 19999) == 0.005       # before its first row
+        assert M.refusal_p("ZZZ", 20000) == 0.005                                             # no row: the stand-in
+        mim = M.Mimic(seed=3)
+        u = M.draw_u("refuse", "AAA", 0, 3, mim.strat_n)                                      # one uniform per name
+        assert M.is_refused(mim, "AAA@D", 20000) == (u < 0.30)
+        assert M.is_refused(mim, "AAA", 20010) == (u < 0.90)
+        rate = M.Mimic(seed=3, **M.PRE193)
+        assert M.is_refused(rate, "AAA", 20000) == M.refused("AAA", 20000, 3, n=rate.strat_n)
+        monkeypatch.setattr(M, "refused", lambda *a, **k: True)                              # a study's patch
+        assert M.is_refused(rate, "AAA", 20000) is True and M.is_refused(mim, "BBB", 20005) == (
+            M.draw_u("refuse", "BBB", 0, 3, mim.strat_n) < 0.02)
+        hit = [M.is_refused(M.Mimic(seed=s), "AAA", 20010) for s in range(200)]
+        assert 0.8 < sum(hit) / 200 < 0.98                                                    # ~ its 90%
+        for bad in ({"refusal": "always"}, {"refusal_table": "v9"}):
+            with pytest.raises(ValueError):
+                M.Mimic(**bad)
+    finally:
+        M.refusal_table.cache_clear()
+
+
+def test_the_installed_refusal_table_is_readable_and_covers_the_stores():
+    """The deployed table (v1, PREREG193's REFLIST probabilities): one row per (name, session), probabilities in [0, 1],
+    its stand-in REFCAL's — skipped where the research store is absent."""
+    path = M.refusal_path(M.REFUSAL_TABLE)
+    if not path.exists():
+        pytest.skip(f"no refusal table at {path}")
+    obj = pd.read_pickle(path)
+    rows = obj["rows"]
+    assert len(rows) > 30000 and not rows.duplicated(["sym", "dn"]).any()
+    assert rows["p"].between(0.0, 1.0).all() and 0.0 < float(obj["p_default"]) < 0.05
+    assert 0.015 < float(rows["p"].mean()) < 0.04
+
+
 def test_stratified_draws_put_one_draw_of_the_block_in_each_stratum():
     """PREREG95: within a block of n consecutive seeds every decision's n uniforms fall one per stratum, so a 7%
     refusal hits each (name, session) in its share of the block's draws; each draw alone stays uniform."""

@@ -30,10 +30,23 @@ from config import settings
 # (production's `sel_short_vol_cover_multiple`, `enable_sel_short_vol_volnorm_exit`). From 2026-10-14 the give-back is
 # production's 1.25 (PREREG97's G1, `sel_short_vol_give_back`): every study's live draws made before that day
 # (PREREG95's {A,B}_LIVE_S2, PREREG101's A0_LIVE_S2) used 1.0 — pair a new study with new live draws, or pin 1.0
-LIVE = {"top_k": 1, "fallback": 5, "fresh_W": 20, "fresh_k": 1, "min_atr": 0.0, "runup_L": 5, "min_runup": 0.0,
-        "max_dtc": 1.0, "min_rvol": 1.58, "min_lend_usd": 1e4, "max_fee": None, "max_pool_drop": None,
-        "give": float(settings.sel_short_vol_give_back), "cap": 4.0,
-        "hmax": int(settings.sel_short_vol_max_hold_sessions), "volnorm_on": False, "volnorm": 0.5}
+#
+# PREREG227's S7 (2026-10-27): every NUMBER production holds as a setting is read from it — the fallback depth
+# (`sel_short_vol_fallback_ranks`), the fresh window (`sel_short_vol_own_window_days`), the run-up look-back
+# (`sel_short_runup_sessions`), the crowding cut (`sel_short_max_days_to_cover`), the relative-volume cut
+# (`sel_short_vol_min_rvol`), the borrow minimum (`short_borrow_min_available_usd`), the cover
+# (`sel_short_vol_cover_multiple`) and the volatility exit's ratio (`sel_short_volnorm_ratio`; off for this arm, as
+# production's `enable_sel_short_vol_volnorm_exit`). The rule's switches stay the simulator's own (a switch turned in
+# production is a rule change: a study); the research store holds columns for the windows and look-backs it was
+# built with, so another setting fails there
+LIVE = {"top_k": 1, "fallback": int(settings.sel_short_vol_fallback_ranks),
+        "fresh_W": int(settings.sel_short_vol_own_window_days), "fresh_k": 1, "min_atr": 0.0,
+        "runup_L": int(settings.sel_short_runup_sessions), "min_runup": 0.0,
+        "max_dtc": float(settings.sel_short_max_days_to_cover), "min_rvol": float(settings.sel_short_vol_min_rvol),
+        "min_lend_usd": float(settings.short_borrow_min_available_usd), "max_fee": None, "max_pool_drop": None,
+        "give": float(settings.sel_short_vol_give_back), "cap": float(settings.sel_short_vol_cover_multiple),
+        "hmax": int(settings.sel_short_vol_max_hold_sessions),
+        "volnorm_on": False, "volnorm": float(settings.sel_short_volnorm_ratio)}
 # (from the 2026-10-20 session PREREG159's RPD_IS: the give-back 0.5 and the 10-session limit, production's
 # `sel_short_vol_give_back` / `sel_short_arm_max_hold_sessions`; 1.25 and 15 before; from 2026-10-21 the vol arm's own
 # limit, 15 sessions — PREREG173's V15, `sel_short_vol_max_hold_sessions`)
@@ -41,11 +54,12 @@ LIVE = {"top_k": 1, "fallback": 5, "fresh_W": 20, "fresh_k": 1, "min_atr": 0.0, 
 # adapter's), no give-back target; it keeps the 6x cover and the volatility exit — at production's
 # `sel_short_fall_volnorm_ratio` (0.7 from the 2026-10-20 session, PREREG159; 0.5 before) — and its OWN time limit,
 # production's `sel_short_arm_max_hold_sessions` (FALL merges over LIVE: without it the fall arm would take the vol's)
-FALL = {"fallback": 0, "min_runup": -100.0, "give": None, "cap": 6.0, "volnorm_on": True,
+FALL = {"fallback": 0, "min_runup": -100.0, "give": None, "cap": float(settings.sel_short_cover_multiple),
+        "volnorm_on": True,
         "volnorm": float(settings.sel_short_fall_volnorm_ratio), "hmax": int(settings.sel_short_arm_max_hold_sessions)}
 # the vol2 arm: the vol rule without the crowding filter, the relative-volume filter and the volatility exit (and with
 # the 6x cover: the vol arm's 4x is its own)
-VOL2 = {"max_dtc": None, "min_rvol": 0.0, "volnorm_on": False, "cap": 6.0}
+VOL2 = {"max_dtc": None, "min_rvol": 0.0, "volnorm_on": False, "cap": float(settings.sel_short_cover_multiple)}
 BIG = 1 << 30
 ET = "America/New_York"
 

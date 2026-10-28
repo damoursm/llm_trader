@@ -32,6 +32,9 @@ from config import settings
 ET = "America/New_York"
 SHORT = {"vol", "etf", "fall"}
 LONG = {"dip", "crash"}
+# PREREG227's S4 (`Mimic.div_all`, the default from 2026-10-27): every live long book's long receives its dividends —
+# production's ledger pays every live book (`src/performance/dividends.py`); `LONG` is AUDIT151's construction
+ALL_LONG = {"dip", "crash", "cap", "ins", "fear"}
 TABLE = Path("studies") / "audit151" / "dividends" / "div_table.pkl"       # under settings.backtest_research_dir
 GROUPED = Path("studies") / "prereg68" / "grouped_raw"
 _T: Dict[str, object] = {}
@@ -81,9 +84,12 @@ def _close_before(p: dict, prev: str) -> Optional[float]:
     return float(np.asarray(pc)[i])
 
 
-def adjust(p: dict, log: Optional[list] = None) -> dict:
-    """The piece with the dividends it owes (short) or receives (long) inside its hold — or ``p`` itself."""
-    side = "short" if p.get("strategy") in SHORT else ("long" if p.get("strategy") in LONG else None)
+def adjust(p: dict, log: Optional[list] = None, longs=None) -> dict:
+    """The piece with the dividends it owes (short) or receives (long) inside its hold — or ``p`` itself. ``longs``:
+    the long books paid (None = `LONG`, the dip and crash books — AUDIT151's; PREREG227's S4 pays `ALL_LONG`, every
+    live long book, as production's ledger does)."""
+    side = "short" if p.get("strategy") in SHORT else ("long" if p.get("strategy") in (LONG if longs is None else longs)
+                                                       else None)
     if side is None:
         return p
     t = table().get(psym(p["tkn"]))

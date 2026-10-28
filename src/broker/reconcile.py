@@ -467,7 +467,7 @@ def _apply_fill(t: dict, prefix: str, fs: FillSummary) -> bool:
     return changed
 
 
-_OPEN_FILL_BOOKS = {"dip_long": "dip", "cap_long": "cap"}      # the books whose limit orders fill at the open
+_OPEN_FILL_BOOKS = {"dip_long": "dip", "cap_long": "cap", "fear_long": "fear"}   # limit orders filled at the open
 
 
 def _book_dip_open_fill(t: dict) -> None:
@@ -984,7 +984,8 @@ def _entry_qty(t: dict, price: float, equity_usd: float, fx_notional: float) -> 
     they are resent at; every other entry the configured sizing (`broker_sizing_mode`)
     times the trade's multiplier."""
     for key in ("sel_account_shares", "dip_account_shares", "etf_dm_account_shares",
-                "crash_account_shares", "cap_account_shares"):   # a live book's simulated account
+                "crash_account_shares", "cap_account_shares",
+                "ins_account_shares", "fear_account_shares"):     # a live book's simulated account
         if t.get(key) is not None:
             try:
                 return max(0, int(t[key]))
@@ -1222,17 +1223,23 @@ DIP_REST_MAX_REFUSALS = 3            # IBKR refusals of one order in one session
 
 
 def _resting_books() -> List[dict]:
-    """The books whose limit orders rest at IBKR — the dip book's (in its limit mode) and the capitulation book's
-    (2026-10-21): ``label``, its signal ``module`` (``active_orders`` / ``save_orders`` / ``today_et`` /
-    ``MECHANISM``), the ref ``prefix``, its switch and ``free_cap`` (a dip order's fill sells the capitulation book's
-    longs for room: it rests at the size that frees, `live_account.fill_cap`)."""
-    from src.signals import cap_long, dip_long
+    """The books whose limit orders rest at IBKR — the dip book's (in its limit mode), the capitulation book's
+    (2026-10-21) and the fear book's (2026-10-28): ``label``, its signal ``module`` (``active_orders`` /
+    ``save_orders`` / ``today_et`` / ``MECHANISM``), the ref ``prefix``, its switch, ``free_cap`` (an order's fill sells
+    the longs of the books under its quality for room — a dip order the fear, insider and capitulation books', a
+    capitulation order the fear and insider books': it rests at the size that frees, `live_account.fill_cap` with its
+    ``label`` as the book; the fear book frees nothing) and ``own`` (the mechanisms that are not another book on its
+    names: itself and the books it shares names with, `books.same_book`)."""
+    from src.performance import books as BOOKS
+    from src.signals import cap_long, dip_long, fear_long
     out = []
     if dip_long.limit_mode():
         out.append({"label": "dip", "module": dip_long, "prefix": "dipw", "switch": "enable_dip_long",
-                    "free_cap": True, "today_et": dip_long.today_et})
+                    "free_cap": True, "today_et": dip_long.today_et, "own": BOOKS.same_book(dip_long.MECHANISM)})
     out.append({"label": "cap", "module": cap_long, "prefix": "capw", "switch": "enable_cap_long",
-                "free_cap": False, "today_et": dip_long.today_et})
+                "free_cap": True, "today_et": dip_long.today_et, "own": BOOKS.same_book(cap_long.MECHANISM)})
+    out.append({"label": "fear", "module": fear_long, "prefix": "fearw", "switch": "enable_fear_long",
+                "free_cap": False, "today_et": dip_long.today_et, "own": BOOKS.same_book(fear_long.MECHANISM)})
     return out
 
 
@@ -1314,8 +1321,9 @@ def _sync_book_orders(broker: Broker, trades: List[dict], report: dict, bk: dict
         logger.warning(f"[broker] {label} limit orders unreadable ({e})")
         return
     on = bool(getattr(settings, bk["switch"], False))
+    own = tuple(bk.get("own") or (mod.MECHANISM,))
     other = {t["ticker"] for t in trades
-             if t.get("status") == "OPEN" and t.get("entry_mechanism") != mod.MECHANISM}
+             if t.get("status") == "OPEN" and t.get("entry_mechanism") not in own}
     for dd, lst in books.items():
         changed = False
         for o in lst:
@@ -1324,7 +1332,8 @@ def _sync_book_orders(broker: Broker, trades: List[dict], report: dict, bk: dict
             want = 0
             if (on and o.get("status") == "working" and iso in (o.get("session_armed_at") or {})
                     and o.get("unfunded_session") != iso and o["ticker"] not in other):
-                cap = (live_account.fill_cap(trades, float(o["limit"]), now, free_cap=bk["free_cap"])[0]
+                cap = (live_account.fill_cap(trades, float(o["limit"]), now, free_cap=bk["free_cap"],
+                                             book=bk["label"])[0]
                        if live_account.enabled() else int(o.get("qty") or 0))
                 want = max(0, min(int(o.get("qty") or 0), int(cap)))
             if int(o.get("ibkr_qty") or 0) != want:

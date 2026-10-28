@@ -1,9 +1,13 @@
 """Discover trending / hot tickers from multiple online sources."""
 
+import json
 import re
+import time
+from pathlib import Path
+
 import httpx
 from loguru import logger
-from typing import List
+from typing import Callable, List
 from config import settings
 from src.data.ticker_extract import extract_candidate_tickers
 from src.data.reddit_sentiment import discover_wsb_tickers
@@ -85,6 +89,30 @@ def _alpha_vantage_movers() -> List[str]:
     except Exception as e:
         logger.warning(f"Alpha Vantage movers failed: {e}")
         return []
+
+
+def _av_cached(name: str, hours: float, fetch: Callable[[], List[str]]) -> List[str]:
+    """``fetch()``'s tickers, kept ``hours`` in `trending_av_cache_dir`/trending_av_<name>.json (an empty answer —
+    Alpha Vantage's quota message among them — is never kept). Alpha Vantage's free key allows 25 requests a day
+    (a window not at 00:00 UTC — still refused at 20:00 ET 2026-10-26): these two calls, uncached on every tick,
+    spent it by midday (2026-10-26) and left none for the earnings-call transcripts (PREREG211)."""
+    p = Path(settings.trending_av_cache_dir) / f"trending_av_{name}.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if time.time() - float(d["t"]) < float(hours) * 3600.0:
+            return [str(t) for t in d["tickers"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    tickers = fetch()
+    if tickers:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"t": time.time(), "tickers": tickers}), encoding="utf-8")
+            tmp.replace(p)
+        except OSError as e:
+            logger.warning(f"Alpha Vantage {name} cache save failed: {e}")
+    return tickers
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +229,9 @@ def get_trending_tickers(base_tickers: List[str], base_sectors: List[str]) -> Li
     """
     discovered: List[str] = []
     discovered.extend(_yahoo_trending())
-    discovered.extend(_alpha_vantage_movers())
+    discovered.extend(_av_cached("movers", settings.trending_av_movers_cache_hours, _alpha_vantage_movers))
     discovered.extend(_newsapi_discovered_tickers())
-    discovered.extend(_alpha_vantage_news_tickers())
+    discovered.extend(_av_cached("news", settings.trending_av_news_cache_hours, _alpha_vantage_news_tickers))
 
     # Social-momentum discovery (fail-graceful, gated by flags)
     if settings.enable_stocktwits_discovery:

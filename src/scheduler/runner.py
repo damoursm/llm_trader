@@ -530,6 +530,81 @@ def _start_deep_slot_timer(refresh_at: _time, preopen_at: _time, poll_seconds: f
     _DEEP_SLOT_TIMER.start()
 
 
+FEEDS_CONSOLE = "logs/feeds_console.log"
+_FEEDS_TIMER = None
+_FEEDS_THREAD = None
+
+
+def _feeds_due(now_naive: datetime, last, minutes: float) -> bool:
+    """A feeds run is due every ``minutes`` once the clock is 10-25 minutes into a half hour — never in the first
+    minutes of a :00 / :30 slot, where a tick's live path is running."""
+    if last is not None and (now_naive - last).total_seconds() < minutes * 60.0 - 300.0:
+        return False
+    return 10 <= now_naive.minute % 30 < 25
+
+
+def _feeds_work() -> None:
+    """`python -m src.data.feeds --run` as a SUBPROCESS, its output to a FILE (`FEEDS_CONSOLE`, overwritten each run),
+    killed with its process tree past its budget + 300 s; the feeds' own lock keeps one run at a time across
+    processes."""
+    import os as _os
+    import subprocess as _sp
+    from pathlib import Path as _Path
+    budget = int(settings.feeds_budget_seconds)
+    console = _Path(FEEDS_CONSOLE)
+    try:
+        console.parent.mkdir(parents=True, exist_ok=True)
+        with open(console, "w", encoding="utf-8", errors="replace") as fh:
+            proc = _sp.Popen([sys.executable, "-m", "src.data.feeds", "--run", "--budget-seconds", str(budget)],
+                             stdout=fh, stderr=_sp.STDOUT, env={**_os.environ, "PYTHONIOENCODING": "utf-8"})
+            try:
+                rc = proc.wait(timeout=budget + 300)
+            except _sp.TimeoutExpired:
+                _kill_process_tree(proc)
+                raise
+        lines = [l for l in console.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
+        summary = [l for l in lines if l.startswith("feeds:")]
+        logger.info("[scheduler] " + (summary[-1][:400] if summary else f"feeds: rc={rc} {(lines[-1] if lines else '')[:300]}"))
+    except _sp.TimeoutExpired:
+        logger.warning(f"[scheduler] data feeds KILLED after {budget + 300}s — each store keeps what it wrote")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[scheduler] data feeds failed to run: {exc}")
+
+
+def _run_feeds() -> None:
+    global _FEEDS_THREAD
+    if _FEEDS_THREAD is not None and _FEEDS_THREAD.is_alive():
+        return
+    _FEEDS_THREAD = threading.Thread(target=_feeds_work, name="data-feeds", daemon=True)
+    _FEEDS_THREAD.start()
+
+
+def _start_feeds_timer(poll_seconds: float = 30.0) -> None:
+    """The data feeds' own clock (2026-10-25): every ``poll_seconds`` it asks `_feeds_due` and launches a run in a
+    background thread. One per process; off with `enable_data_feeds`."""
+    global _FEEDS_TIMER
+    if not bool(settings.enable_data_feeds):
+        logger.info("[scheduler] data feeds off (enable_data_feeds)")
+        return
+    if _FEEDS_TIMER is not None and _FEEDS_TIMER.is_alive():
+        return
+    st: dict = {"last": None}
+
+    def _loop() -> None:
+        while True:
+            try:
+                now = now_et().replace(tzinfo=None)
+                if _feeds_due(now, st["last"], float(settings.feeds_poll_minutes)):
+                    st["last"] = now
+                    _run_feeds()
+            except Exception as exc:                      # noqa: BLE001
+                logger.exception(f"[scheduler] data feeds timer raised: {exc}")
+            _time_module.sleep(poll_seconds)
+
+    _FEEDS_TIMER = threading.Thread(target=_loop, name="feeds-timer", daemon=True)
+    _FEEDS_TIMER.start()
+
+
 DEEP_REFRESH_CONSOLE = "logs/deep_refresh_console.log"
 DEEP_PREOPEN_CONSOLE = "logs/deep_preopen_console.log"
 
@@ -1114,6 +1189,9 @@ def start_scheduler() -> None:
     # The deep store's slots (the 23:45 refresh, the 08:30 pre-open run) run on
     # their own timer thread, never behind a tick (2026-09-29).
     _start_deep_slot_timer(deep_refresh_time, deep_preopen_time)
+    # The data feeds (2026-10-25: WSB, the OCC, the FDA) on their own timer too: a subprocess every
+    # `feeds_poll_minutes`, off the :00 / :30 slots, never waited for.
+    _start_feeds_timer()
     try:
         while True:
             now_naive = now_et().replace(tzinfo=None)

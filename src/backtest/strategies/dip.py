@@ -60,6 +60,11 @@ OWN_SCORES_NOWARM = Path("studies") / "prereg142" / "wf_scores_old.pkl"
 # arrives ~09:30:30): every order piece that fills at an open in A0 / A / B, from Polygon's minute bars and trades
 # (`studies/audit151/dip_open/extend_fills.py`) — `reprice_open`
 OPEN_FILLS = Path("studies") / "audit151" / "dip_open" / "fills_all.csv"
+_OPEN_FILLS_AUDIT151 = OPEN_FILLS
+# PREREG227's S1: the same table EXTENDED to the capitulation and fear books' open fills (AUDIT151's rule and fetch,
+# `studies/prereg227/open_fills227.py`) — every AUDIT151 row unchanged, so the dip book's fills are the same; read
+# instead of AUDIT151's once it exists, unless a study set `OPEN_FILLS` to its own table (PREREG188's set D)
+OPEN_FILLS_EXT = Path("studies") / "prereg227" / "open_fills" / "fills_all227.csv"
 TYPES_OK = ("CS", "ADRC")
 MIN_BARS = 220                                       # the study's minimum daily bars per name
 
@@ -395,7 +400,12 @@ def open_fills(path=None) -> Dict[tuple, tuple]:
     """{(engine name, ET day, limit rounded to 1e-6): (how, price, touch minute, terms ok)} — `OPEN_FILLS`, loaded
     once per file version."""
     from config import settings
-    p = Path(path) if path is not None else Path(settings.backtest_research_dir) / OPEN_FILLS
+    if path is not None:
+        p = Path(path)
+    else:
+        root = Path(settings.backtest_research_dir)
+        ext = OPEN_FILLS == _OPEN_FILLS_AUDIT151 and (root / OPEN_FILLS_EXT).exists()
+        p = root / OPEN_FILLS_EXT if ext else root / OPEN_FILLS
     key = (str(p), p.stat().st_mtime_ns)
     if _OPEN.get("key") != key:
         F = pd.read_csv(p)
@@ -408,14 +418,24 @@ def open_fills(path=None) -> Dict[tuple, tuple]:
     return _OPEN["map"]                                                  # type: ignore[return-value]
 
 
-def reprice_open(p: dict, log: Optional[dict] = None) -> dict:
+def reprice_open(p: dict, log: Optional[dict] = None, books: Sequence[str] = ("dip",), none_drops: bool = False,
+                 stamp_unknown: bool = False, touch_free: bool = False) -> Optional[dict]:
     """AUDIT151's D_OPEN (`Mimic(dip_open=True)`, the default from 2026-10-19): a dip piece filled at the open PRINT
     (``ens`` 09:30 + 2 ns) -> at the price IBKR could give its resting order arriving 09:30:30 — the arrival trades'
     median at or under the limit (entered then), else the limit at a later touch (booked at that 30-minute bar's end,
     the marks before it dropped), from `open_fills` by (name, day, limit). The print was never attainable; on the
     deployed configuration the fills average 9 bp better (+0.59 pp a year). A piece the table lacks — or whose terms
-    disagree with the store's — keeps the print (counted in ``log``)."""
-    if p.get("strategy") != "dip" or int(p["ens"]) % (60 * 10 ** 9) != 2:
+    disagree with the store's — keeps the print (counted in ``log``).
+
+    PREREG227's S1 (`Mimic.open_order`, the default from 2026-10-27): ``books`` adds the capitulation and fear books
+    (production books IBKR's own fill for all three, and places the dip book's orders first, then the capitulation
+    book's, then the fear book's — at one instant the engine fills them in that order, `mimic.PRIORITY`);
+    ``none_drops`` — a fill the rule finds no price for that session ("none": the resting order never reached its
+    limit after arriving) is NO fill: None, the caller drops the piece and the order keeps working; ``stamp_unknown`` —
+    a fill the table cannot price keeps the print, stamped 09:30:30 (production's fill arrives then: the order holds).
+    S5 (`Mimic.quote_all`): ``touch_free`` — a fill moved to a later touch rested at its limit: no spread (``hs_in``
+    0; the open's quoted half-spread was its entry cost)."""
+    if p.get("strategy") not in books or int(p["ens"]) % (60 * 10 ** 9) != 2:
         return p
     t = pd.Timestamp(int(p["ens"]), unit="ns", tz="UTC").tz_convert(ET)
     lim = p.get("ord_lim")
@@ -426,6 +446,11 @@ def reprice_open(p: dict, log: Optional[dict] = None) -> dict:
             log[k] = log.get(k, 0) + 1
     if hit is None or not hit[3]:
         count("dip_open_unknown" if hit is None else "dip_open_terms")
+        if stamp_unknown:
+            q = dict(p)
+            q["ens"] = int(pd.Timestamp(f"{t.date()} 09:30:30", tz=ET).value)
+            count("dip_open_stamped")
+            return q
         return p
     how, price, tmin, _ = hit
     q = dict(p)
@@ -444,9 +469,14 @@ def reprice_open(p: dict, log: Optional[dict] = None) -> dict:
             if isinstance(v, np.ndarray) and v.shape[:1] == pt.shape[:1] and k != "pt":
                 q[k] = v[keep]
         q["pt"] = pt[keep]
+        if touch_free:
+            q["hs_in"] = 0.0
         count("dip_open_touch")
         return q
     count("dip_open_none")
+    if none_drops:
+        count("dip_open_none_dropped")
+        return None
     return p
 
 

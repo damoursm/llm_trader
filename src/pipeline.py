@@ -1982,7 +1982,13 @@ def _launch_extra_accounts(start: Optional[datetime] = None) -> None:
     user's "The second account will be calculated from the same account"): each one's tick in its OWN process,
     right after this account's live path — its own ledger and account on the decisions this tick just made, its
     orders a dry run (`src.accounts.launch`; nothing unless `enable_extra_accounts`). Never waited for;
-    fail-soft."""
+    fail-soft. First, IBKR is asked about the picks this account settled before a what-if (PREREG191's change 3,
+    `tracker.ask_unasked_sel_short`): the extra accounts take its answers."""
+    try:
+        from src.performance.tracker import ask_unasked_sel_short
+        ask_unasked_sel_short()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[sel_short] asking IBKR about the unasked picks failed (fail-soft): {e}")
     try:
         from src.accounts import launch as _acct_launch
         _acct_launch.launch_all(start)
@@ -2071,6 +2077,16 @@ def _live_marks_and_exits() -> int:
         sold += monitor_cap_long_positions(hold_prompt_active=_hold)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] cap_long exit pass failed (fail-soft): {e}")
+    try:                            # THE INSIDER BOOK (2026-10-26): its exits at the open
+        from src.performance.tracker import monitor_insider_long_positions
+        sold += monitor_insider_long_positions(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] insider_long exit pass failed (fail-soft): {e}")
+    try:                            # THE FEAR BOOK (2026-10-28): its exits at the open
+        from src.performance.tracker import monitor_fear_long_positions
+        sold += monitor_fear_long_positions(hold_prompt_active=_hold)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] fear_long exit pass failed (fail-soft): {e}")
     try:                            # THE LIVE ACCOUNT (2026-10-09): margin call / de-leveraging over both books
         from src.performance.tracker import monitor_live_account
         sold += monitor_live_account(hold_prompt_active=_hold)
@@ -2086,11 +2102,26 @@ def _live_marks_and_exits() -> int:
         sold += monitor_cap_long_orders()
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] cap_long limit orders failed (fail-soft): {e}")
+    try:                            # THE FEAR BOOK (2026-10-28): its orders' touches, after the capitulation book's
+        from src.performance.tracker import monitor_fear_long_orders
+        sold += monitor_fear_long_orders()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] fear_long limit orders failed (fail-soft): {e}")
     try:                            # THE CRASH-REBOUND BOOK (2026-10-11): its buy at the open, after the dip fills
         from src.performance.tracker import record_crash_long_trades
         sold += record_crash_long_trades()
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] crash_long entry pass failed (fail-soft): {e}")
+    try:                            # THE INSIDER BOOK (2026-10-26): its buys at the open, after the crash book's
+        from src.performance.tracker import record_insider_long_trades
+        sold += record_insider_long_trades()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] insider_long entry pass failed (fail-soft): {e}")
+    try:                            # THE FEAR BOOK (2026-10-28): the pre-market implied-volatility fetch (a detached
+        from src.signals import fear_long as _fear_long_p          # process launched in its window, never waited for)
+        _fear_long_p.prepare()
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] fear_long fetch launch failed (fail-soft): {e}")
     return sold + fresh
 
 
@@ -2123,6 +2154,11 @@ def _live_entries_and_sync(run_id: str, sel_handle, borrow_future=None,
         n_long += record_cap_long_trades(run_id=run_id)
     except Exception as e:                                         # noqa: BLE001
         logger.warning(f"[live] cap_long entry pass failed (fail-soft): {e}")
+    try:                              # THE FEAR BOOK (2026-10-28): its orders at the open, after the dip book's own order
+        from src.performance.tracker import record_fear_long_trades
+        n_long += record_fear_long_trades(run_id=run_id)
+    except Exception as e:                                         # noqa: BLE001
+        logger.warning(f"[live] fear_long entry pass failed (fail-soft): {e}")
     try:
         if n_long or dip_closed or etf_traded:
             dip_report = _broker_sync_watchdogged(run_id, None)
@@ -3669,6 +3705,16 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             monitor_cap_long_positions(hold_prompt_active=hold_prompt_active)
         except Exception as _cap_x:                                # noqa: BLE001
             logger.warning(f"[cap_long] exit pass failed (fail-soft): {_cap_x}")
+        try:                       # THE INSIDER BOOK (2026-10-26): an exit the live path could not price
+            from src.performance.tracker import monitor_insider_long_positions
+            monitor_insider_long_positions(hold_prompt_active=hold_prompt_active)
+        except Exception as _ins_x:                                # noqa: BLE001
+            logger.warning(f"[insider_long] exit pass failed (fail-soft): {_ins_x}")
+        try:                       # THE FEAR BOOK (2026-10-28): an exit the live path could not price
+            from src.performance.tracker import monitor_fear_long_positions
+            monitor_fear_long_positions(hold_prompt_active=hold_prompt_active)
+        except Exception as _fear_x:                               # noqa: BLE001
+            logger.warning(f"[fear_long] exit pass failed (fail-soft): {_fear_x}")
         # ── THE LIVE ACCOUNT (2026-10-09): margin call / de-leveraging over both books
         try:
             from src.performance.tracker import monitor_live_account
@@ -3685,6 +3731,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             monitor_cap_long_orders(run_id=run_id)
         except Exception as _cap_lo:                               # noqa: BLE001
             logger.warning(f"[cap_long] limit orders failed (fail-soft): {_cap_lo}")
+        try:                       # THE FEAR BOOK (2026-10-28): its orders' touches
+            from src.performance.tracker import monitor_fear_long_orders
+            monitor_fear_long_orders(run_id=run_id)
+        except Exception as _fear_lo:                              # noqa: BLE001
+            logger.warning(f"[fear_long] limit orders failed (fail-soft): {_fear_lo}")
         monitor_open_positions(
             signals_by_ticker=signals_by_ticker,
             macro_regime_context=macro_regime_context,
@@ -3742,11 +3793,25 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             _cap_long_p.prepare()
         except Exception as _cap_o:                                # noqa: BLE001
             logger.warning(f"[cap_long] entry pass failed (fail-soft): {_cap_o}")
+        try:                       # THE FEAR BOOK (2026-10-28): its orders, after the dip book's own; before the open,
+            from src.performance.tracker import record_fear_long_trades   # the implied-volatility fetch launched
+            record_fear_long_trades(run_id=run_id)
+            from src.signals import fear_long as _fear_long_p
+            _fear_long_p.prepare()
+        except Exception as _fear_o:                               # noqa: BLE001
+            logger.warning(f"[fear_long] entry pass failed (fail-soft): {_fear_o}")
         try:                       # THE CRASH-REBOUND BOOK (2026-10-11): a buy the live path could not price
             from src.performance.tracker import record_crash_long_trades
             record_crash_long_trades(run_id=run_id)
         except Exception as _crash_o:                              # noqa: BLE001
             logger.warning(f"[crash_long] entry pass failed (fail-soft): {_crash_o}")
+        try:                       # THE INSIDER BOOK (2026-10-26): a buy the live path could not price; before the
+            from src.performance.tracker import record_insider_long_trades   # open, the day's gate is decided
+            record_insider_long_trades(run_id=run_id)
+            from src.signals import insider_long as _insider_long_p
+            _insider_long_p.prepare()
+        except Exception as _ins_o:                                # noqa: BLE001
+            logger.warning(f"[insider_long] entry pass failed (fail-soft): {_ins_o}")
         # ── ETF DUAL-MOMENTUM rotation: the month's first session, opening window; this
         # pass retries what the live path could not price.
         try:
@@ -3947,6 +4012,20 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             sel_health["notes"] = list(sel_health.get("notes") or []) + _kh["notes"]
         except Exception as _kh_e:                                 # noqa: BLE001
             logger.warning(f"[cap_long] health check failed (fail-soft): {_kh_e}")
+        try:                                  # the insider book's (2026-10-26)
+            from src.signals import insider_long as _insider_long_h
+            _ih2 = _insider_long_h.health(trades=get_open_trades())
+            sel_health["problems"] = list(sel_health.get("problems") or []) + _ih2["problems"]
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _ih2["notes"]
+        except Exception as _ih2_e:                                # noqa: BLE001
+            logger.warning(f"[insider_long] health check failed (fail-soft): {_ih2_e}")
+        try:                                  # the fear book's (2026-10-28)
+            from src.signals import fear_long as _fear_long_h
+            _fh = _fear_long_h.health(trades=get_open_trades())
+            sel_health["problems"] = list(sel_health.get("problems") or []) + _fh["problems"]
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _fh["notes"]
+        except Exception as _fh_e:                                 # noqa: BLE001
+            logger.warning(f"[fear_long] health check failed (fail-soft): {_fh_e}")
         try:                                  # the price data's integrity (2026-10-16): split records, stores
             from src.data import integrity as _integrity_h
             _ih = _integrity_h.health(trades=get_open_trades())
@@ -3964,6 +4043,11 @@ def run_pipeline(send_email: bool = False, observe_only: bool = False,
             sel_health["notes"] = list(sel_health.get("notes") or []) + _fwd_h.health()["notes"]
         except Exception as _fc_e:                                 # noqa: BLE001
             logger.warning(f"[forward_check] health read failed (fail-soft): {_fc_e}")
+        try:                                  # the data feeds (2026-10-25: WSB, the OCC, the FDA): notes only
+            from src.data import feeds as _feeds_h
+            sel_health["notes"] = list(sel_health.get("notes") or []) + _feeds_h.health()["notes"]
+        except Exception as _fd_e:                                 # noqa: BLE001
+            logger.warning(f"[feeds] health read failed (fail-soft): {_fd_e}")
         try:                                  # the extra accounts (2026-10-23, the second account): one note each
             from src.accounts import summary as _acct_sum
             sel_health["notes"] = list(sel_health.get("notes") or []) + _acct_sum.health()["notes"]

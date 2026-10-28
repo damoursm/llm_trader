@@ -37,6 +37,13 @@ signal session and by D's 09:30 ranks after every other signal of its day (`rank
 best other dip is bought instead; a day of earnings dips only buys its best one. Fail-open: a signal whose filings
 cannot be read is not demoted (the ``top`` block's ``earnings`` journal; a problem when it is the pick).
 
+THE WALLSTREETBETS PREFERENCE (PREREG209's KD+, user 2026-10-25: "Build KD+ for production and deploy it."; from the
+2026-10-26 session; `src/signals/dip_wsb.py`, `enable_dip_long_wsb_prefer`): when any of the day's signals at or above
+the order floor was named in at least `dip_long_wsb_min_titles` (5) r/wallstreetbets titles in the 120 hours before
+09:00 ET of the session (the production feed's store), the pick is the best-ranked of those flagged signals; else the
+pick as above. Fail-open: a window the store does not cover prefers nothing (the ``top`` block's ``wsb`` journal, a
+note).
+
 Execution: the regular-hours ticks only. Exits first (`exit_check`: their slots free up for the same
 tick), then entries within `dip_long_entry_window_minutes` of the 09:30 open — marketable limit orders
 through the ordinary broker sync, a few seconds to a minute after the opening auction the study traded.
@@ -571,6 +578,15 @@ def _daily_top(sig: List[dict], d: date, prev: date, n: int) -> Tuple[List[dict]
     info["order_floor"] = floor
     eligible = [s for s in ranked if not floor or _dv20(s) >= floor]
     below = [s for s in ranked if floor and _dv20(s) < floor]
+    if _wsb_on():                                      # PREREG209's KD+: the day's WallStreetBets-flagged signal first
+        info["wsb"] = _flag_wsb(ranked, d)
+        before = eligible[0]["ticker"] if eligible else None
+        eligible, preferred = _wsb_prefer(eligible, info["wsb"])
+        info["wsb"]["preferred"] = preferred
+        info["wsb"]["pick_without"] = before
+        if preferred and eligible and eligible[0]["ticker"] != before:
+            logger.info(f"[dip_long] {d}: the WallStreetBets preference (PREREG209's KD+): {eligible[0]['ticker']} "
+                        f"({eligible[0].get('wsb_titles')} titles) instead of {before}")
     for k, s in enumerate(eligible, 1):
         s["top_rank"] = k
     for s in below:
@@ -581,7 +597,9 @@ def _daily_top(sig: List[dict], d: date, prev: date, n: int) -> Tuple[List[dict]
     rest = [s for s in ranked if s not in keep]
     info["picked"] = [dict({"ticker": s["ticker"], "score": s.get("filter_score"), "rsi2": s.get("rsi2")},
                            **({"earnings_dip": s.get("earnings_dip"), "earnings_status": s.get("earnings_status")}
-                              if "earnings" in info else {})) for s in keep]
+                              if "earnings" in info else {}),
+                           **({"wsb_titles": s.get("wsb_titles"), "wsb_flagged": s.get("wsb_flagged")}
+                              if "wsb" in info else {})) for s in keep]
     if info["error"]:
         logger.error(f"[dip_long] {d}: the daily top pick could not score the signals ({info['error']}) — the "
                      f"deepest dip instead: {', '.join(s['ticker'] for s in keep) or 'none'}")
@@ -617,6 +635,37 @@ def _dv20(s: Mapping) -> float:
 def _earnings_on() -> bool:
     from src.signals import dip_earnings
     return dip_earnings.enabled()
+
+
+def _wsb_on() -> bool:
+    from src.signals import dip_wsb
+    return dip_wsb.enabled()
+
+
+def _flag_wsb(sig: List[dict], d: date) -> dict:
+    """PREREG209's WallStreetBets flags on the day's signals (`dip_wsb.flag_signals`); fail-open — any error flags
+    none (the pick as without the preference), journaled with status "error" (a scorer-banner note)."""
+    from src.signals import dip_wsb
+    try:
+        block = dip_wsb.flag_signals(sig, d)
+    except Exception as e:                                      # noqa: BLE001
+        for s in sig:
+            s.pop("wsb_titles", None)
+            s.pop("wsb_flagged", None)
+        logger.error(f"[dip_long] {d}: the WallStreetBets flags failed ({type(e).__name__}: {e}) — nothing preferred")
+        return {"rule": dip_wsb.RULE, "status": "error", "error": f"{type(e).__name__}: {e}", "flagged": []}
+    if block.get("status") != "ok":
+        logger.warning(f"[dip_long] {d}: the WallStreetBets window is not in the store ({block.get('status')}: "
+                       f"missing {block.get('missing')}, newest post {block.get('newest_post')}) — nothing preferred")
+    elif block.get("flagged"):
+        logger.info(f"[dip_long] {d}: WallStreetBets-flagged signal(s): " + ", ".join(
+            f"{t} ({block['titles'].get(t)})" for t in block["flagged"]))
+    return block
+
+
+def _wsb_prefer(eligible: List[dict], block: Mapping) -> Tuple[List[dict], bool]:
+    from src.signals import dip_wsb
+    return dip_wsb.prefer(eligible, block)
 
 
 def _flag_earnings(sig: List[dict], d: date, by: str) -> dict:
@@ -1198,6 +1247,33 @@ def _top_health(s: dict, out: dict) -> None:
                         + (f"; earnings dip(s) ranked last: {', '.join(flagged)}" if flagged else "")
                         + ("; SPY from the deep store (the daily cache lacked the close)"
                            if t.get("spy_source") == "deep_store" else ""))
+    _wsb_health(t, out)
+
+
+def _wsb_health(t: dict, out: dict) -> None:
+    """The WallStreetBets preference's line (PREREG209's KD+): the window not in the store (nothing preferred: the
+    pick as without the rule), the flagged signals and a preference that changed the pick — all notes."""
+    w = t.get("wsb")
+    if not isinstance(w, dict):
+        if enabled_wsb_rule() and t.get("breadth"):
+            out["notes"].append("dip long: today's signals were computed without the WallStreetBets preference")
+        return
+    if w.get("status") != "ok":
+        out["notes"].append(f"dip long: the WallStreetBets preference was off today ({w.get('status')}"
+                            + (f": {w.get('error')}" if w.get("error") else
+                               f": missing {', '.join(w.get('missing') or [])}" if w.get("missing") else
+                               f": the store's newest post {w.get('newest_post')}") + ") — the pick as without it")
+        return
+    if w.get("flagged"):
+        out["notes"].append("dip long: WallStreetBets-flagged signal(s) "
+                            + ", ".join(f"{tk} ({(w.get('titles') or {}).get(tk)} titles)" for tk in w["flagged"])
+                            + (f" — preferred over {w.get('pick_without')}" if w.get("preferred") and
+                               (t.get("picked") or [{}])[0].get("ticker") != w.get("pick_without") else ""))
+
+
+def enabled_wsb_rule() -> bool:
+    """The WallStreetBets preference is on (`enable_dip_long_wsb_prefer`) with the daily top pick."""
+    return _wsb_on() and daily_top() > 0
 
 
 def _security_health(s: dict, out: dict) -> None:

@@ -19,7 +19,8 @@ items 1, 2 and 5).
   be before a margin call at the same history.
 
 CLI: `python -m src.backtest.reliability --build` writes `cache/ml/reliability/<day>/` (one card per arm, the
-sensitivities, the bundle) and the live calibration's `reference.json` (`live_calibration.REFERENCE_FILE`: set B's
+sensitivities, the bundle, ``iv_store.json``: the frozen implied-volatility store the build read — `build`, P7) and
+the live calibration's `reference.json` (`live_calibration.REFERENCE_FILE`: set B's
 numbers, the market the live account trades in) with the FINGERPRINTS it was built on — each arm's production
 settings (`arm_fingerprint`: its SPEC's parameters, switches and sizing) and the simulator's defaults
 (`simulator_fingerprint`) — so the live calibration can tell a reference built for other rules (a deploy since) from
@@ -46,11 +47,12 @@ from src.backtest import periods
 from src.backtest.account import per_day
 
 ET = "America/New_York"
-ARMS = ("vol", "etf", "fall", "dip", "crash", "cap")
-SIDE = {"vol": "short", "etf": "short", "fall": "short", "dip": "long", "crash": "long", "cap": "long"}
+ARMS = ("vol", "etf", "fall", "dip", "crash", "cap", "ins", "fear")
+SIDE = {"vol": "short", "etf": "short", "fall": "short", "dip": "long", "crash": "long", "cap": "long", "ins": "long",
+        "fear": "long"}
 MIN_GROUP = 10                       # a group of fewer trades says nothing about where the arm loses
 PLATEAU_TOL = 0.1                    # a neighbour within 10% of the best metric belongs to the plateau
-INIT_RATE = {"vol": 2.86, "etf": 2.86, "fall": 2.86, "dip": 0.5, "crash": 0.75, "cap": 0.5}   # the live account's
+INIT_RATE = {"vol": 2.86, "etf": 2.86, "fall": 2.86, "dip": 0.5, "crash": 0.75, "cap": 0.5, "ins": 0.5, "fear": 0.5}   # the live account's
 
 # item 1 — each live arm as a mechanism; the numbers live in config/settings.py, named here, never copied (a copied
 # number goes stale at the next deploy). ``parameters`` are the rule's numbers, ``switches`` the parts of the rule
@@ -106,15 +108,18 @@ SPEC = {
                        "dip_long_order_min_dollar_volume), close > the dip_long_trend_sessions average, RSI2 < "
                        "dip_long_rsi_max; the meta-model's cut (enable_dip_long_filter), then each day's top pick by "
                        "its score (dip_long_daily_top, dip_long_rank), an earnings dip ranked last "
-                       "(dip_long_earnings_demote_sessions); the dip_long_limit_atr limit alive dip_long_limit_sessions",
+                       "(dip_long_earnings_demote_sessions), a WallStreetBets-flagged one first (dip_long_wsb_min_titles "
+                       "titles in the dip_long_wsb_window_hours before dip_long_wsb_cut_et); the dip_long_limit_atr limit "
+                       "alive dip_long_limit_sessions",
             "horizon": "the first close above the dip_long_exit_sma_sessions average, or dip_long_max_hold_sessions",
             "parameters": ["dip_long_min_dollar_volume", "dip_long_order_min_dollar_volume", "dip_long_rsi_max",
                            "dip_long_trend_sessions", "dip_long_daily_top", "dip_long_rank",
                            "dip_long_earnings_demote_sessions", "dip_long_entry_mode", "dip_long_limit_atr",
                            "dip_long_limit_sessions", "dip_long_exit_sma_sessions", "dip_long_max_hold_sessions",
-                           "dip_long_filter_model"],
+                           "dip_long_filter_model", "dip_long_wsb_min_titles", "dip_long_wsb_window_hours",
+                           "dip_long_wsb_cut_et"],
             "switches": ["enable_dip_long", "enable_dip_long_filter", "enable_dip_long_earnings_demote",
-                         "enable_dip_long_own_security"],
+                         "enable_dip_long_own_security", "enable_dip_long_wsb_prefer"],
             "sizing": ["dip_long_account_slices"]},
     "crash": {"mechanism": "the index in a downtrend, capitulating over two sessions, rebounds; traded in its "
                            "leveraged fund (crash_long_trade_symbol)",
@@ -139,6 +144,34 @@ SPEC = {
                            "cap_long_limit_sessions", "cap_long_exit_sma_sessions", "cap_long_max_hold_sessions"],
             "switches": ["enable_cap_long"],
             "sizing": ["cap_long_account_slices", "cap_long_max_open"]},
+    "ins": {"mechanism": "an opportunistic insider's open-market purchase in a deep market sell-off: the officers and "
+                         "directors who buy against the panic know their company is cheap",
+            "context": "SPY at least insider_long_spy_drawdown under its insider_long_spy_high_sessions high at the "
+                       "close before; an officer's or director's Form 4 purchase (code P) filed since the session "
+                       "before, an opportunistic insider among the buyers and no routine one (Cohen, Malloy & "
+                       "Pomorski); the stock at insider_long_min_price or more, trading insider_long_min_dollar_volume "
+                       "a day, insider_long_min_history bars; bought at the open, the largest purchase first",
+            "horizon": "insider_long_hold_sessions sessions, sold at the open after",
+            "parameters": ["insider_long_gate_symbol", "insider_long_spy_drawdown", "insider_long_spy_high_sessions",
+                           "insider_long_spy_min_sessions", "insider_long_min_price",
+                           "insider_long_min_dollar_volume", "insider_long_min_history",
+                           "insider_long_hold_sessions"],
+            "switches": ["enable_insider_long"],
+            "sizing": ["insider_long_account_slices", "insider_long_max_open"]},
+    "fear": {"mechanism": "fear priced into a dip: a large stock's dip whose options price an unusually high implied "
+                          "volatility rebounds more than a calm one",
+             "context": "the dip book's signal — dollar volume >= fear_long_min_dollar_volume, close above the "
+                        "dip_long_trend_sessions average, RSI2 < dip_long_rsi_max — with IBKR's 30-day implied "
+                        "volatility at the close at or above the fear_long_ivp_min percentile of its own "
+                        "fear_long_ivp_window sessions (at least fear_long_ivp_min_values), not the dip book's own order "
+                        "of the day; the fear_long_limit_atr limit alive fear_long_limit_sessions, IVP highest first",
+             "horizon": "the first close above the fear_long_exit_sma_sessions average, or fear_long_max_hold_sessions",
+             "parameters": ["fear_long_ivp_min", "fear_long_ivp_window", "fear_long_ivp_min_values",
+                            "fear_long_min_dollar_volume", "dip_long_trend_sessions", "dip_long_rsi_max",
+                            "fear_long_limit_atr", "fear_long_limit_sessions", "fear_long_exit_sma_sessions",
+                            "fear_long_max_hold_sessions"],
+             "switches": ["enable_fear_long"],
+             "sizing": ["fear_long_account_slices", "fear_long_max_open"]},
 }
 
 
@@ -484,17 +517,38 @@ def _halt_files(s: str):
         H.set_halt_paths(saved)
 
 
+def iv_through(sets: Sequence[str]) -> str:
+    """The last implied-volatility bar a build of ``sets`` may read: the pooled history's end (every pooled build reads
+    the same span, so their stores compare), a later set's when it reaches further (an open-ended one: today)."""
+    his = [periods.get(s).hi or date.today().isoformat() for s in sets]
+    return max([periods.pool_span(periods.POOLED)[1]] + his)
+
+
 def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: int = 0, cost_snapshot: Optional[str] = None,
           extra_bars: Optional[str] = None, day: Optional[date] = None, log=print) -> Path:
     """Build every live arm's card from the production-mimicking simulator (`mimic.live_books` under `Mimic()`),
     each arm alone at the live costs, for the borrow-data sets named; with ``sensitivities`` the same under doubled
     leg costs, a one-bar entry delay (`Mimic(halts=None).without("entry")`) and the lendability model's level shifted
     (`Mimic(lend_shift=+-0.37)`, set B). Writes the cards, the bundle of the base run and the live calibration's
-    reference (set B's base statistics). Research paths default to PREREG62's cost snapshot and extra bars."""
+    reference (set B's base statistics). Research paths default to PREREG62's cost snapshot and extra bars.
+
+    THE IMPLIED-VOLATILITY STORE (P7, the parity audit of 2026-10-27): the whole build reads ONE frozen snapshot of the
+    fear book's store through `iv_through` (`strategies.fear.freeze`) — a pre-market fetch merging IBKR's bars during
+    the build moves nothing — and records its state (``iv_store.json`` beside the cards, the fear card's ``iv_store``,
+    the reference's), which `bank.build` compares across its inputs and with the previous bank's."""
+    from src.backtest.strategies import fear as FEAR
+    with FEAR.freeze(iv_through(sets)) as iv:
+        return _build(sets, sensitivities, seed, cost_snapshot, extra_bars, day, log, iv)
+
+
+def _build(sets: Sequence[str], sensitivities: bool, seed: int, cost_snapshot: Optional[str],
+           extra_bars: Optional[str], day: Optional[date], log, iv: dict) -> Path:
+    """`build`'s body, on the frozen store whose state is ``iv``."""
     from src.backtest import account as A
     from src.backtest import live_calibration as LC
     from src.backtest import mimic as M
     from src.backtest.strategies import dip as DIP
+    from src.backtest.strategies import fear as FEAR
     from src.backtest.strategies.etf import EtfArm
     from src.backtest.strategies.vol import VolEngine
     research = Path(settings.backtest_research_dir)
@@ -504,6 +558,7 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
     if tuple(sets) != ("A", "B"):                     # another selection of sets never overwrites the A / B cards
         out = out.with_name(f"{out.name}_{'-'.join(sets)}")
     out.mkdir(parents=True, exist_ok=True)
+    FEAR.write_state(out, iv)                         # P7: the implied-volatility store every card here read
     comps: Dict[str, tuple] = {}
 
     def components(s: str) -> tuple:
@@ -560,6 +615,8 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
     cards = {arm: card(base, arm, reg) for arm in ARMS if (base.book == arm).any()}
     for arm, c in cards.items():
         c["sensitivity"] = sensitivity(base, {k: v for k, v in tables.items() if k != "base"}, arm) if sensitivities else None
+        if arm == "fear":
+            c["iv_store"] = iv                        # P7: the store its trades read
         (out / f"{arm}.json").write_text(json.dumps(_json_ready(c), indent=1), encoding="utf-8")
     bnd = bundle(pos_base, start=100_000.0)
     (out / "bundle_arms_alone.json").write_text(json.dumps(_json_ready(bnd), indent=1), encoding="utf-8")
@@ -570,7 +627,8 @@ def build(sets: Sequence[str] = ("A", "B"), sensitivities: bool = True, seed: in
     ref = {"as_of": (day or datetime.now().date()).isoformat(), "source": "reliability.build: each arm alone, set B, Mimic() seed %d" % seed,
            "built_at": datetime.now().astimezone().isoformat(timespec="seconds"), "arms": {},
            # what the reference was built on: the live calibration compares them with the deployed ones
-           "simulator": simulator_fingerprint(), "fingerprints": {}, "settings": {}}
+           "simulator": simulator_fingerprint(), "fingerprints": {}, "settings": {},
+           "iv_store": {k: iv.get(k) for k in ("digest", "through", "names", "bars")}}
     for arm, c in cards.items():
         s = c["by_set"].get("B") or c["overall"]
         if s.get("n"):

@@ -62,8 +62,12 @@ setting, because both accounts read the same decisions.
     fill of its own.
   - IBKR's what-if for a fall short is the answer IBKR gave the MAIN account for that name in the same ET session
     (`sim_account.main_account_answer`, read from the main account's entry journals). A refusal skips the pick and
-    the quoted rates size it. When the main account got no answer, the default house rates apply, as they do for the
-    main account when IBKR does not answer.
+    the quoted rates size it. The main account asks before it sizes, so a pick it could not fund has its answer; a
+    pick it settles BEFORE its what-if for a reason of its own (the name at its stack cap or another book's,
+    `already_open`; its arm's trade of the name today; an arm it does not trade) is asked after its live path's
+    broker sync, before this account runs (`tracker.ask_unasked_sel_short`, from 2026-10-24: at most 3 a pass,
+    journaled ``whatif_only``). When IBKR gives no answer, the default house rates apply, as they do for the main
+    account.
   - A dry run holds no position, so the broker's buy-in check is skipped for it (`reconcile._holds_positions`).
 - **In the email.** The main email's scorer banner carries one note line from the account's `summary.json`
   (`summary.health`). That line gives the equity since its start, the open positions and today's closes. It is never
@@ -80,9 +84,9 @@ never enter. The account then counts only its own trades, from $50,000.
 
 - **Costs.** Its legs are costed at their own quote, not at fills: the main account's fills on the same trades are
   not read yet.
-- **Margin.** A fall pick the main account did not fund (for example, the main account's room was full) has no IBKR
-  answer: the default house rates (2.00 / 2.86) size it, and an IBKR refusal of that name is not seen. PREREG190's
-  refusal model would be the stand-in.
+- **Margin.** CLOSED 2026-10-24: a fall pick the main account settled before its what-if had no IBKR answer (the
+  default rates sized it, a refusal unseen); the main account now asks about it after its live path
+  (`tracker.ask_unasked_sel_short`). Left: an answer IBKR does not give (a timeout) - the default rates.
 - **Trade log.** The daily trade log (`tradelog/`) is the main scorer's prepare, built from the main ledger. The
   second account's entry journal is complete; its end-to-end trade log is not built yet.
 - **Live score.** The live calibration and the forward check (EOD) read the main account only.

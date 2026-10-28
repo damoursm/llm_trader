@@ -44,6 +44,27 @@ the backtest engine's (`src/backtest/account.py`, PREREG57's best configuration,
   sized as if they were sold (`size_long`, the engine's ``fills_make_room``) and its fill sells them, the latest first,
   whole, as far as that lets it buy its quantity (`fill_give_way_plan`); de-leveraging sells them first
   (`delever_plan`); a margin call closes them.
+* THE INSIDER BOOK (from the 2026-10-26 session, PREREG203 / 205; `src/signals/insider_long.py`): its market buys at
+  the open 1/`insider_long_account_slices` (10) of the equity within the long side's cap and the room at Reg T's 50%,
+  at most 1% of the stock's dollar volume, at most `insider_long_max_open` (5) open (`size_insider`). Its capital
+  GIVES WAY FIRST — the backtest's quality 0.05, under every other book's: the shorts', the crash book's, a dip or a
+  capitulation order's fill short of room sells its latest longs whole before any other long (`_give_way_longs`); the
+  dip and capitulation orders are sized as if they were sold (`size_long`, `size_cap`: the engine's
+  ``fills_make_room``) and their fills sell them (`fill_give_way_plan`); de-leveraging sells them WITH the capitulation
+  book's longs (the engine's ``delever_order`` 0 for both), the latest first, then the dip book's (`delever_plan`); a
+  margin call liquidates them like any position.
+* THE FEAR BOOK (from the 2026-10-28 session, PREREG219-226; `src/signals/fear_long.py`): its limit orders
+  1/`fear_long_account_slices` (6) of the equity at their limit within the long side's cap and the room at Reg T's 50%,
+  at most `fear_long_max_open` (4) open, working orders counted (`size_fear`), each fill cut to the room (`fill_cap`).
+  Its capital GIVES WAY FIRST — the backtest's quality 0.04, under every other book's: the shorts', the crash book's, a
+  dip, capitulation or insider entry's room sells its latest longs whole before any other long (`_give_way_longs`); the
+  other books' orders are sized as if they were sold (`_freed`); de-leveraging sells them WITH the capitulation and
+  insider books' longs (the engine's ``delever_order`` 0), the latest first; a margin call liquidates them like any
+  position. It is ONE BOOK WITH THE DIP BOOK for one book per name (`books.SHARED_NAMES`).
+
+THE GIVE-WAY ORDER is the engine's capital quality (`QUALITY`): the fear book 0.04, the insider book 0.05, the
+capitulation book 0.1, the dip book 0.13 — the lowest first, the latest opened first within a book; the crash book (0.2)
+and the shorts never give way.
 
 Off (`enable_live_account` False): the two books keep their own accounts (`sim_account`, `dip_long.size`).
 """
@@ -59,7 +80,12 @@ from src.performance import sim_account
 DIP_MECHANISM = "dip_long"
 CRASH_MECHANISM = "crash_long"
 CAP_MECHANISM = "cap_long"
+INS_MECHANISM = "insider_long"
+FEAR_MECHANISM = "fear_long"
 LONG_INIT, LONG_MAINT = 0.50, 0.25        # Reg T on a long (the engine's Rules.long_init / long_maint)
+# the long books' capital qualities (the backtest's `mimic.QUALITY`): a book gives way to every book above it, the
+# lowest first; the crash book never gives way (not preemptible)
+QUALITY = {"fear": 0.04, "ins": 0.05, "cap": 0.1, "dip": 0.13, "crash": 0.2}
 
 
 def _crash_rate(trade: Optional[dict] = None) -> float:
@@ -86,14 +112,42 @@ def cap_funded(trade: dict) -> bool:
     return trade.get("entry_mechanism") == CAP_MECHANISM and trade.get("cap_account_shares") is not None
 
 
+def ins_funded(trade: dict) -> bool:
+    return trade.get("entry_mechanism") == INS_MECHANISM and trade.get("ins_account_shares") is not None
+
+
+def fear_funded(trade: dict) -> bool:
+    return trade.get("entry_mechanism") == FEAR_MECHANISM and trade.get("fear_account_shares") is not None
+
+
+def long_book(trade: dict) -> Optional[str]:
+    """The long book of a funded long ("fear", "ins", "cap", "dip", "crash"), else None."""
+    if fear_funded(trade):
+        return "fear"
+    if ins_funded(trade):
+        return "ins"
+    if cap_funded(trade):
+        return "cap"
+    if dip_funded(trade):
+        return "dip"
+    if crash_funded(trade):
+        return "crash"
+    return None
+
+
 def _long_shares(trade: dict) -> Optional[float]:
-    """A funded long's share count (a dip long's, the crash book's or the capitulation book's), else None."""
+    """A funded long's share count (a dip long's, the crash book's, the capitulation book's, the insider book's or the
+    fear book's), else None."""
     if dip_funded(trade):
         return float(trade["dip_account_shares"])
     if crash_funded(trade):
         return float(trade["crash_account_shares"])
     if cap_funded(trade):
         return float(trade["cap_account_shares"])
+    if ins_funded(trade):
+        return float(trade["ins_account_shares"])
+    if fear_funded(trade):
+        return float(trade["fear_account_shares"])
     return None
 
 
@@ -110,9 +164,11 @@ def state(trades: Sequence[dict], now: Optional[datetime] = None) -> Dict[str, f
     ``maint``, ``init_req``) with the funded longs added — their P&L in the equity and ``realized`` /
     ``unrealized``, their value in ``long_gross``, their requirements in ``maint`` / ``init_req`` (a dip long Reg
     T's, the crash long the larger of Reg T's and its fund's rate); ``long_open`` counts the dip longs,
-    ``crash_open`` the crash long, ``cap_open`` the capitulation book's longs (``cap_gross`` their value)."""
+    ``crash_open`` the crash long, ``cap_open`` the capitulation book's longs (``cap_gross`` their value), ``ins_open``
+    the insider book's (``ins_gross``), ``fear_open`` the fear book's (``fear_gross``)."""
     st = dict(sim_account.state(trades, now))
-    st.update(long_gross=0.0, long_open=0, long_funded=0, crash_open=0, cap_open=0, cap_gross=0.0)
+    st.update(long_gross=0.0, long_open=0, long_funded=0, crash_open=0, cap_open=0, cap_gross=0.0, ins_open=0,
+              ins_gross=0.0, fear_open=0, fear_gross=0.0)
     for t in trades:
         n = _long_shares(t)
         if n is None or not sim_account.counts(t):    # the fresh start: the account's trades before it are out
@@ -132,6 +188,16 @@ def state(trades: Sequence[dict], now: Optional[datetime] = None) -> Dict[str, f
                 st["init_req"] += LONG_INIT * n * px
                 st["cap_open"] += 1                  # the capitulation book's slots
                 st["cap_gross"] += n * px
+            elif ins_funded(t):
+                st["maint"] += LONG_MAINT * n * px
+                st["init_req"] += LONG_INIT * n * px
+                st["ins_open"] += 1                  # the insider book's slots
+                st["ins_gross"] += n * px
+            elif fear_funded(t):
+                st["maint"] += LONG_MAINT * n * px
+                st["init_req"] += LONG_INIT * n * px
+                st["fear_open"] += 1                 # the fear book's slots
+                st["fear_gross"] += n * px
             else:
                 r = _crash_rate(t)
                 st["maint"] += max(LONG_MAINT, r) * n * px
@@ -167,32 +233,69 @@ def size_long(trades: Sequence[dict], price: float, now: Optional[datetime] = No
               working: int = 0, free_cap: bool = True) -> Tuple[int, str, Dict[str, float]]:
     """``(shares, why, state)`` for a new dip long at ``price`` — the engine's long sizing (`_long_size`): the slice
     (equity / `dip_long_account_slices`) within the long side's cap and the margin room at Reg T's 50%, AS IF the
-    capitulation book's longs were sold (they give way to a dip order's fill — the engine's ``fills_make_room``:
-    `fill_give_way_plan` sells them when it fills); at most that many dip longs open, the book's ``working`` limit
-    orders counted as slots taken (they reserve no money). ``free_cap`` False: from the room as it stands (a market
-    buy at the open, the entry mode before the limit orders, sells nothing). ``why`` is "ok", "no_slot",
-    "account_full" or "account_too_small"."""
+    lower-quality books' longs (the insider and capitulation books') were sold (they give way to a dip order's fill —
+    the engine's ``fills_make_room``: `fill_give_way_plan` sells them when it fills); at most that many dip longs open,
+    the book's ``working`` limit orders counted as slots taken (they reserve no money). ``free_cap`` False: from the room
+    as it stands (a market buy at the open, the entry mode before the limit orders, sells nothing). ``why`` is "ok",
+    "no_slot", "account_full" or "account_too_small"."""
     st = state(trades, now)
     slices = max(1, int(settings.dip_long_account_slices))
     if st["long_open"] + max(0, int(working)) >= slices:
         return 0, "no_slot", st
     if not price or price <= 0:
         return 0, "no_price", st
-    n, why = _long_size(_freed(st, trades) if free_cap else st, price, slices)
+    n, why = _long_size(_freed(st, trades, QUALITY["dip"]) if free_cap else st, price, slices)
     return n, why, st
 
 
 def size_cap(trades: Sequence[dict], price: float, now: Optional[datetime] = None,
              working: int = 0) -> Tuple[int, str, Dict[str, float]]:
     """``(shares, why, state)`` for a new capitulation-book order at ``price`` (its limit): the slice (equity /
-    `cap_long_account_slices`) within the long side's cap and the margin room at Reg T's 50% (`_long_size`) — no book
-    gives way to it; at most `cap_long_max_open` of its longs open, its ``working`` orders counted as slots taken."""
+    `cap_long_account_slices`) within the long side's cap and the margin room at Reg T's 50% (`_long_size`), AS IF the
+    insider book's longs were sold (they give way to its fill: the engine's ``fills_make_room``); at most
+    `cap_long_max_open` of its longs open, its ``working`` orders counted as slots taken."""
     st = state(trades, now)
     if st["cap_open"] + max(0, int(working)) >= max(1, int(settings.cap_long_max_open)):
         return 0, "no_slot", st
     if not price or price <= 0:
         return 0, "no_price", st
-    n, why = _long_size(st, price, max(1.0, float(settings.cap_long_account_slices)))
+    n, why = _long_size(_freed(st, trades, QUALITY["cap"]), price, max(1.0, float(settings.cap_long_account_slices)))
+    return n, why, st
+
+
+def size_fear(trades: Sequence[dict], price: float, now: Optional[datetime] = None,
+              working: int = 0) -> Tuple[int, str, Dict[str, float]]:
+    """``(shares, why, state)`` for a new fear-book order at ``price`` (its limit): the slice (equity /
+    `fear_long_account_slices`) within the long side's cap and the margin room at Reg T's 50% (`_long_size`) — no book
+    gives way to it (its quality is the lowest); at most `fear_long_max_open` of its longs open, its ``working`` orders
+    counted as slots taken. ``why`` is "ok", "no_slot", "account_full" or "account_too_small"."""
+    st = state(trades, now)
+    if st["fear_open"] + max(0, int(working)) >= max(1, int(settings.fear_long_max_open)):
+        return 0, "no_slot", st
+    if not price or price <= 0:
+        return 0, "no_price", st
+    n, why = _long_size(st, price, max(1.0, float(settings.fear_long_account_slices)))
+    return n, why, st
+
+
+def size_insider(trades: Sequence[dict], price: float, dv20: Optional[float] = None,
+                 now: Optional[datetime] = None) -> Tuple[int, str, Dict[str, float]]:
+    """``(shares, why, state)`` for a new insider-book long at ``price`` (a market buy at the open): the slice (equity /
+    `insider_long_account_slices`) within the long side's cap and the margin room at Reg T's 50% (`_long_size`), at most
+    1% of its 20-session dollar volume ``dv20`` (the engine's ``adv_cap``) — no book gives way to it (its quality is the
+    lowest); at most `insider_long_max_open` of its longs open. ``why`` is "ok", "no_slot", "account_full",
+    "account_too_small" or "volume_cap"."""
+    st = state(trades, now)
+    if st["ins_open"] >= max(1, int(settings.insider_long_max_open)):
+        return 0, "no_slot", st
+    if not price or price <= 0:
+        return 0, "no_price", st
+    n, why = _long_size(st, price, max(1.0, float(settings.insider_long_account_slices)))
+    if n > 0 and dv20 is not None and math.isfinite(float(dv20)) and float(dv20) > 0:
+        cap_n = int(math.floor(0.01 * float(dv20) / float(price)))
+        if cap_n < n:
+            n = cap_n
+            why = "ok" if n > 0 else "volume_cap"
     return n, why, st
 
 
@@ -212,23 +315,24 @@ def _fill_room(st: Dict[str, float], price: float) -> int:
 
 
 def fill_cap(trades: Sequence[dict], price: float, now: Optional[datetime] = None,
-             free_cap: bool = False) -> Tuple[int, Dict[str, float]]:
+             free_cap: bool = False, book: str = "dip") -> Tuple[int, Dict[str, float]]:
     """The shares a limit order may buy NOW at ``price`` (PREREG61 amendment 1, the engine's fill rule): what
     the margin room at Reg T's 50% funds (its commission out of it) within the long side's cap (the open longs'
     value at most the equity) — no slice: the order's own quantity was fixed when it was placed. ``free_cap``: as if
-    the capitulation book's longs were sold (a dip order's resting size at IBKR: its fill sells them,
+    the longs of the books under ``book``'s quality were sold (an order's resting size at IBKR — a dip order frees the
+    insider and capitulation books', a capitulation order the insider book's: its fill sells them,
     `fill_give_way_plan`)."""
     st = state(trades, now)
     if not price or price <= 0:
         return 0, st
-    return _fill_room(_freed(st, trades) if free_cap else st, price), st
+    return _fill_room(_freed(st, trades, QUALITY[book]) if free_cap else st, price), st
 
 
 def margin_call(trades: Sequence[dict], now: Optional[datetime] = None) -> Tuple[bool, Dict[str, float]]:
     """True when the shared account's equity is below the maintenance requirement of what it holds."""
     st = state(trades, now)
-    return bool((st["open"] or st["long_open"] or st["crash_open"] or st["cap_open"])
-                and st["equity"] < st["maint"]), st
+    return bool((st["open"] or st["long_open"] or st["crash_open"] or st["cap_open"] or st["ins_open"]
+                 or st["fear_open"]) and st["equity"] < st["maint"]), st
 
 
 # ── IBKR's LIQUIDATION (PREREG174 / 175; the user 2026-10-21: "production and backtest needs to liquidate like IBKR
@@ -253,8 +357,8 @@ def side_of(trade: dict) -> int:
 
 def maint_of(trade: dict, n: float, px: float) -> float:
     """The maintenance requirement of ``n`` shares of the funded trade at ``px`` — `state`'s rules (a short: the larger
-    of Reg T's tiers and its house rate; a dip or capitulation long Reg T's 25%; the crash long the larger of it and the
-    fund's rate)."""
+    of Reg T's tiers and its house rate; a dip, capitulation or insider long Reg T's 25%; the crash long the larger of it
+    and the fund's rate)."""
     if sim_account.funded(trade):
         hm, _ = sim_account.trade_rates(trade)
         return max(sim_account.maint(n, px), hm * n * px)
@@ -378,15 +482,37 @@ def _open_caps_latest_first(trades: Sequence[dict]) -> List[dict]:
     return _latest_first([t for t in trades if t.get("status") == "OPEN" and cap_funded(t) and sim_account.counts(t)])
 
 
-def _give_way_longs(trades: Sequence[dict]) -> List[dict]:
-    """The longs that give way, in the order they are sold: the capitulation book's (the engine's quality 0.1), the
-    latest first, then the dip book's (0.13), the latest first — the engine's `make_room` order (the lowest quality
-    first, the latest opened first within it)."""
-    return _open_caps_latest_first(trades) + _open_dips_latest_first(trades)
+def _open_ins_latest_first(trades: Sequence[dict]) -> List[dict]:
+    return _latest_first([t for t in trades if t.get("status") == "OPEN" and ins_funded(t) and sim_account.counts(t)])
+
+
+def _open_fear_latest_first(trades: Sequence[dict]) -> List[dict]:
+    return _latest_first([t for t in trades if t.get("status") == "OPEN" and fear_funded(t) and sim_account.counts(t)])
+
+
+def _give_way_longs(trades: Sequence[dict], below: Optional[float] = None) -> List[dict]:
+    """The longs that give way, in the order they are sold: the fear book's (the engine's quality 0.04), the insider
+    book's (0.05), the capitulation book's (0.1), then the dip book's (0.13), the latest first within each — the
+    engine's `make_room` order (the lowest quality first, the latest opened first within it); ``below``: only the books
+    whose quality is under it (a fill makes room only from the books under its own)."""
+    out: List[dict] = []
+    for book, lst in (("fear", _open_fear_latest_first(trades)), ("ins", _open_ins_latest_first(trades)),
+                      ("cap", _open_caps_latest_first(trades)), ("dip", _open_dips_latest_first(trades))):
+        if below is None or QUALITY[book] < below:
+            out += lst
+    return out
+
+
+def _delever_longs(trades: Sequence[dict]) -> List[dict]:
+    """The longs de-leveraging sells, in order: the fear, insider and capitulation books' together (the engine's
+    ``delever_order`` 0 for the three), the latest opened first, then the dip book's (1), the latest first."""
+    first = _latest_first(_open_fear_latest_first(trades) + _open_ins_latest_first(trades)
+                          + _open_caps_latest_first(trades))
+    return first + _open_dips_latest_first(trades)
 
 
 def _after_selling(st: Dict[str, float], t: dict) -> Dict[str, float]:
-    """The account once long ``t`` (a dip long or a capitulation-book long) is sold at its mark (its P&L realized; the
+    """The account once long ``t`` (a dip, capitulation or insider long) is sold at its mark (its P&L realized; the
     exit's costs left to the ledger)."""
     n = float(_long_shares(t) or 0.0)
     px = float(t.get("current_price") or t.get("entry_price") or 0.0)
@@ -397,23 +523,31 @@ def _after_selling(st: Dict[str, float], t: dict) -> Dict[str, float]:
     if cap_funded(t):
         out["cap_open"] -= 1
         out["cap_gross"] -= n * px
+    elif ins_funded(t):
+        out["ins_open"] = out.get("ins_open", 0) - 1
+        out["ins_gross"] = out.get("ins_gross", 0.0) - n * px
+    elif fear_funded(t):
+        out["fear_open"] = out.get("fear_open", 0) - 1
+        out["fear_gross"] = out.get("fear_gross", 0.0) - n * px
     else:
         out["long_open"] -= 1
     return out
 
 
-def _freed(st: Dict[str, float], trades: Sequence[dict]) -> Dict[str, float]:
-    """The account were every capitulation-book long sold (equity unchanged: the engine's `freed_size`)."""
+def _freed(st: Dict[str, float], trades: Sequence[dict], below: float = QUALITY["dip"]) -> Dict[str, float]:
+    """The account were every long of the books under quality ``below`` sold (equity unchanged: the engine's
+    `freed_size`) — for a dip order the insider and capitulation books', for a capitulation order the insider book's."""
     cur = st
-    for t in _open_caps_latest_first(trades):
+    for t in _give_way_longs(trades, below=below):
         cur = _after_selling(cur, t)
     return cur
 
 
 def delever_plan(trades: Sequence[dict], now: Optional[datetime] = None) -> Tuple[List[dict], Dict[str, float]]:
-    """The longs to sell now, whole — the capitulation book's first (the engine's ``delever_order`` 0), then the dip
-    book's (1), the latest first within each: none unless the maintenance requirement exceeds
-    `live_account_delever_trigger` x equity; then until it is at most `live_account_delever_target` x equity."""
+    """The longs to sell now, whole — the insider and capitulation books' first (the engine's ``delever_order`` 0 for
+    both, the latest opened first across them), then the dip book's (1), the latest first: none unless the maintenance
+    requirement exceeds `live_account_delever_trigger` x equity; then until it is at most
+    `live_account_delever_target` x equity."""
     st = state(trades, now)
     eq = st["equity"]
     trig = float(getattr(settings, "live_account_delever_trigger", 0.8))
@@ -421,7 +555,7 @@ def delever_plan(trades: Sequence[dict], now: Optional[datetime] = None) -> Tupl
     if eq <= 0 or st["maint"] <= trig * eq:
         return [], st
     out, cur = [], st
-    for t in _give_way_longs(trades):
+    for t in _delever_longs(trades):
         if cur["maint"] <= tgt * eq:
             break
         out.append(t)
@@ -433,8 +567,8 @@ def give_way_plan(trades: Sequence[dict], price: float, dv20: Optional[float] = 
                   now: Optional[datetime] = None,
                   rates: Optional[Tuple[float, float]] = None,
                   slices: Optional[float] = None) -> Tuple[List[dict], int, Dict[str, float]]:
-    """The longs to sell, whole — the capitulation book's, then the dip book's, the latest first within each
-    (`_give_way_longs`) — so that a new short at ``price`` gets the shares its slice and the side's cap allow
+    """The longs to sell, whole — the insider book's, the capitulation book's, then the dip book's, the latest first
+    within each (`_give_way_longs`) — so that a new short at ``price`` gets the shares its slice and the side's cap allow
     (``want``) — none when the margin room already funds them, and none when selling them would not let the short
     open more shares than it gets now (its own book's initial requirement past the equity: the longs would be sold for
     nothing — PREREG64). Returns (the longs, want, the state before)."""
@@ -457,20 +591,22 @@ def give_way_plan(trades: Sequence[dict], price: float, dv20: Optional[float] = 
 
 
 def fill_give_way_plan(trades: Sequence[dict], price: float, want: int,
-                       now: Optional[datetime] = None) -> Tuple[List[dict], Dict[str, float]]:
-    """A DIP order's fill (the engine's ``fills_make_room``): the capitulation book's longs to sell, the latest first,
-    whole, until the fill can buy its order's ``want`` shares at ``price`` — none when the room already lets it, and
-    none when selling them all would not let it buy more than it buys now (the engine's `helps`). Returns (the longs,
-    the state before)."""
+                       now: Optional[datetime] = None, book: str = "dip") -> Tuple[List[dict], Dict[str, float]]:
+    """A limit order's fill (the engine's ``fills_make_room``; ``book`` the order's: "dip" or "cap"): the longs of the
+    books under its quality to sell — the insider book's, then (for a dip order) the capitulation book's, the latest
+    first within each, whole — until the fill can buy its order's ``want`` shares at ``price``; none when the room
+    already lets it, and none when selling them all would not let it buy more than it buys now (the engine's `helps`).
+    Returns (the longs, the state before)."""
     st = state(trades, now)
-    caps = _open_caps_latest_first(trades)
-    if not caps or not price or price <= 0 or want <= 0:
+    q = QUALITY[book]
+    cands = _give_way_longs(trades, below=q)
+    if not cands or not price or price <= 0 or want <= 0:
         return [], st
     have = _fill_room(st, price)
-    if have >= want or _fill_room(_freed(st, trades), price) <= have:
+    if have >= want or _fill_room(_freed(st, trades, q), price) <= have:
         return [], st
     out, cur = [], st
-    for t in caps:
+    for t in cands:
         out.append(t)
         cur = _after_selling(cur, t)
         if _fill_room(cur, price) >= want:
@@ -509,11 +645,11 @@ def size_crash(trades: Sequence[dict], price: float, now: Optional[datetime] = N
 
 def crash_give_way_plan(trades: Sequence[dict], price: float,
                         now: Optional[datetime] = None) -> Tuple[List[dict], int, Dict[str, float]]:
-    """The longs to sell, whole — the capitulation book's, then the dip book's, the latest first within each
-    (`_give_way_longs`) — so the crash book's long at ``price`` gets its slice (``want``: its size were every one of
-    them freed) — none when it already gets it, and none when selling them would not let it buy more than it buys now
-    (PREREG64's rule; the backtest's crash book of quality 0.2 above the dip book's 0.13 and the capitulation book's
-    0.1). Returns (the longs, want, the state before)."""
+    """The longs to sell, whole — the insider book's, the capitulation book's, then the dip book's, the latest first
+    within each (`_give_way_longs`) — so the crash book's long at ``price`` gets its slice (``want``: its size were
+    every one of them freed) — none when it already gets it, and none when selling them would not let it buy more than
+    it buys now (PREREG64's rule; the backtest's crash book of quality 0.2 above the dip book's 0.13, the capitulation
+    book's 0.1 and the insider book's 0.05). Returns (the longs, want, the state before)."""
     st = state(trades, now)
     dips = _give_way_longs(trades)
     free = st
@@ -537,6 +673,8 @@ def summary(st: Dict[str, float]) -> str:
     return (f"live account equity ${st['equity']:,.0f} (paid in ${st['paid_in']:,.0f}, realized {st['realized']:+,.0f}, "
             f"open {st['unrealized']:+,.0f}): {int(st['open'])} short(s) ${st['gross']:,.0f}, "
             f"{int(st['long_open'])} dip long(s) + {int(st.get('crash_open', 0))} crash long + "
-            f"{int(st.get('cap_open', 0))} capitulation long(s) ${st['long_gross']:,.0f}, "
+            f"{int(st.get('cap_open', 0))} capitulation long(s) + {int(st.get('ins_open', 0))} insider long(s) + "
+            f"{int(st.get('fear_open', 0))} fear long(s) "
+            f"${st['long_gross']:,.0f}, "
             f"maintenance ${st['maint']:,.0f}, "
             f"initial ${st['init_req']:,.0f}")

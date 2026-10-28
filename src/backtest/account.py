@@ -438,7 +438,7 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
     start = float(rules.start)
     keep_curve = keep_curve or keep_exposure
     if not pieces:
-        out = {"final": start, "calls": [], "ruined": None, "maxdd": 0.0, "maxdd_nav": 0.0, "trades": 0,
+        out = {"final": start, "start": start, "calls": [], "ruined": None, "maxdd": 0.0, "maxdd_nav": 0.0, "trades": 0,
                "positions": [], "curve_t": np.zeros(0, np.int64), "curve_v": np.zeros(0)}
         if keep_exposure:
             out.update(curve_long=np.zeros(0), curve_short=np.zeros(0), curve_req=np.zeros(0),
@@ -450,6 +450,20 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
     S = [strat[s] for s in bk.strat]
     # each entry's slice count: its strategy's, or the piece's own ``slices`` (a sizing re-tuned week by week, PREREG80)
     SL = np.array([float(pk.get("slices") or S[k].slices) for k, pk in enumerate(bk.pieces)], float)
+    # THE VOL ARM'S FALLBACK WALK (PREREG227's S3, `mimic.Mimic.vol_walk`): pieces sharing an ``alt_of`` are one
+    # unlendable pick's backups at one pass, tried in their ``alt_k`` order (their ranks keep them together): the first
+    # the account opens settles the chain and a later member is skipped — unless it is a pressure extra (``alt_hi``:
+    # production's extras loop still tries it) —, a member the account rejects (another book's name, two shorts of the
+    # name, no room) passes to the next, as production's `tracker.fallback` walks the backups until one opens. A chain
+    # member or a V6 extra (``walk_dedupe``) is skipped while its strategy already opened the name that ET session
+    # (production's `_sel_traded_today`). No piece carries them: nothing changes
+    alt_of = [pk.get("alt_of") for pk in bk.pieces]
+    alt_on = any(a is not None for a in alt_of) or any(pk.get("walk_dedupe") for pk in bk.pieces)
+    alt_hi = [bool(pk.get("alt_hi")) for pk in bk.pieces]
+    dedupe = [bool(pk.get("walk_dedupe")) for pk in bk.pieces]
+    alt_done: Dict[str, int] = {}                      # chain -> the row of the member that opened it
+    alt_walks: List[dict] = []                         # chains a later member opened (an earlier one rejected)
+    opened_day: set = set()                            # (strategy, traded name, ET day) of every position opened
     # LIMIT ORDERS: the orders of strategies with ``orders`` (pieces sharing an ``oid``); their placements (kind 3) and
     # lapses (kind 4) join the timeline, after the exits, marks and entries of the same instant
     oid_of = np.full(bk.n, -1, np.int64)
@@ -1050,9 +1064,11 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
         dd_ = (peak - cash) / peak if peak > 0 else 1.0
         nav_ = cash / units
         mdn = max(maxdd_nav, (nav_peak - nav_) / nav_peak if nav_peak > 0 else 1.0)
-        out = {"final": cash, "calls": calls, "maxdd": max(maxdd, dd_), "maxdd_nav": mdn,
+        out = {"final": cash, "start": start, "calls": calls, "maxdd": max(maxdd, dd_), "maxdd_nav": mdn,
                "ruined": int(t), "trades": len(positions), "positions": positions,
                "curve_t": np.array(curve_t), "curve_v": np.array(curve_v)}
+        if alt_on:
+            out["alt_walks"] = alt_walks
         if keep_exposure:
             out.update(curve_long=np.array(curve_l), curve_short=np.array(curve_s),
                        curve_req=np.array(curve_r), curve_by={s: np.array(v) for s, v in curve_b.items()})
@@ -1258,7 +1274,19 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
                              "net": bk.pieces[i].get("net"), "days": bk.pieces[i].get("days"), "placed_ns": int(r["t"])}
                 ord_log.append({"t": int(t), "what": "filled", "oid": ORD[o]["oid"], "tkn": bk.tkn[i], "n": n,
                                 "n_order": int(r["n"]), "room": float(room_before), "need": float(need)})
+                if alt_on:
+                    opened_day.add((bk.strat[i], _plain(bk.tkn[i]), today))
                 continue
+            if alt_on:                                 # PREREG227's S3: the walk's settled members, one name a day
+                ak = alt_of[i]
+                if ak is not None and ak in alt_done and not alt_hi[i]:
+                    if keep_skips:
+                        skips.append(skip_rec(i, t, "alt_done", 0, 0, None, None))
+                    continue
+                if dedupe[i] and (bk.strat[i], _plain(bk.tkn[i]), today) in opened_day:
+                    if keep_skips:
+                        skips.append(skip_rec(i, t, "traded_today", 0, 0, None, None))
+                    continue
             if st.max_open is not None and open_by.get(st.name, 0) + working_by.get(st.name, 0) >= st.max_open:
                 if keep_skips:
                     skips.append(skip_rec(i, t, "max_open", 0, 0, None, None))
@@ -1334,6 +1362,15 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
             pos_of[i] = {"strategy": st.name, "tkn": bk.tkn[i], "side": int(side[i]), "shares": int(n),
                          "entry_ns": int(t), "entry_px": float(e), "cost_in": float(o_cin[i]), "equity_in": float(eq),
                          "net": bk.pieces[i].get("net"), "days": bk.pieces[i].get("days")}
+            if alt_on:
+                opened_day.add((bk.strat[i], _plain(bk.tkn[i]), today))
+                ak = alt_of[i]
+                if ak is not None and ak not in alt_done:
+                    alt_done[ak] = i
+                    k_ = int(bk.pieces[i].get("alt_k") or 0)
+                    if k_ > 0:                         # an earlier member was rejected: the walk reached this one
+                        alt_walks.append({"t": int(t), "strategy": st.name, "chain": ak, "alt_k": k_,
+                                          "tkn": bk.tkn[i], "shares": int(n), "extra": bool(alt_hi[i])})
         for i, j in re_now:
             st = S[i]
             if i not in pending or i in o_n or (st.max_open is not None and open_by.get(st.name, 0) >= st.max_open):
@@ -1432,9 +1469,11 @@ def simulate(pieces: Sequence[dict], strategies: Sequence[Strategy] | Dict[str, 
             cost_i += rec.pop("cost_partial")
         rec.update(exit_ns=None, exit_px=float(o_px[i]), pnl=float(pnl_i), cost_out=float(cost_i), how="open_at_end")
         positions.append(rec)
-    out = {"final": final, "calls": calls, "ruined": None, "maxdd": maxdd, "maxdd_nav": maxdd_nav,
+    out = {"final": final, "start": start, "calls": calls, "ruined": None, "maxdd": maxdd, "maxdd_nav": maxdd_nav,
            "trades": len(positions), "positions": positions,
            "curve_t": np.array(curve_t), "curve_v": np.array(curve_v)}
+    if alt_on:
+        out["alt_walks"] = alt_walks
     if pre_on:
         out.update(preemptions=preempts, refills=refills)
     if reenter_on:
@@ -1585,10 +1624,20 @@ def activity(res: dict, sessions, lo, end) -> dict:
     return out
 
 
-def exposure_daily(res: dict, sessions, start: float = 10_000.0) -> pd.DataFrame:
+def run_start(res: dict, start: Optional[float] = None) -> float:
+    """A run's starting equity: ``start`` when given, else the run's own (`simulate` records it — PREREG227's S6: the
+    live configuration's account is production's $50,000), else the $10,000 of every run made before it."""
+    if start is not None:
+        return float(start)
+    return float(res.get("start", 10_000.0) or 10_000.0)
+
+
+def exposure_daily(res: dict, sessions, start: Optional[float] = None) -> pd.DataFrame:
     """End-of-session equity, open longs' and shorts' value at their marks, each strategy's (``by:<name>``) and their
     initial margin requirement, per session (needs ``simulate(..., keep_exposure=True)``). A session without an event
-    held nothing: its exposure is 0 and its equity the last one (``start`` before the first event)."""
+    held nothing: its exposure is 0 and its equity the last one (``start`` before the first event; None = the run's
+    own, `run_start`)."""
+    start = run_start(res, start)
     days = pd.DatetimeIndex(pd.to_datetime(sessions)).normalize()
     t = np.asarray(res.get("curve_t", []), np.int64)
     by = res.get("curve_by") or {}
@@ -1619,12 +1668,13 @@ def per_day(ret_pct: float, days: float) -> float:
     return (b ** (1 / days) - 1) * 100.0 if b > 0 else -100.0
 
 
-def metrics(res: dict, lo, end, start: float = 10_000.0) -> dict:
+def metrics(res: dict, lo, end, start: Optional[float] = None) -> dict:
     """Both metrics of an account run over [lo, end]: GROWTH per year (and the log growth per year — the study
     objective), worst drawdown, margin calls; per strategy the positions taken, their P&L and costs, the average
     realized trade (net of every cost, on its notional), the average hold, RETURN PER DAY, and each position's log
     contribution log(1 + P&L / equity at entry) — whose sum is the account's log growth when positions do not
-    overlap (the per-trade objective's account-level form)."""
+    overlap (the per-trade objective's account-level form). ``start`` None: the run's own (`run_start`)."""
+    start = run_start(res, start)
     years = max((pd.Timestamp(end) - pd.Timestamp(lo)).days / 365.25, 1e-9)
     f = float(res["final"])
     out = {"final": f, "growth": (f / start) ** (1 / years) - 1 if f > 0 else -1.0,

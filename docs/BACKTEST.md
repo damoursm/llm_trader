@@ -15,13 +15,13 @@ leads — is `docs/RESEARCH.md`.
 
 | Module | What it does |
 |---|---|
-| `src/backtest/account.py` | THE account: $10,000, no deposits, every strategy's trades in one IBKR margin account — longs and shorts, real fees, Reg T + IBKR house margin, available capital, margin calls, per-strategy attribution, both metrics (`simulate`, `metrics`) |
+| `src/backtest/account.py` | THE account: its start (`Rules.start`; the live configuration's $50,000, production's `sel_short_account_initial` — PREREG227's S6; $10,000 before), no deposits, every strategy's trades in one IBKR margin account — longs and shorts, real fees, Reg T + IBKR house margin, available capital, margin calls, per-strategy attribution, both metrics (`simulate`, `metrics`) |
 | `src/backtest/strategies/vol.py` | the vol short arm (and any variant of its rule) as pieces, from the research vol engine (`VolEngine`) |
 | `src/backtest/strategies/dip.py` | the dip long book (and variants) as pieces, from the deep 30-minute store + the delisted names (`pieces`, `DipParams`) |
 | `src/backtest/strategies/etf.py` | the ETF short arm as pieces (`EtfArm().pieces(lo, hi)`): the research ETF run's picks (`<research>/etf/vol_events_de_arm.pkl`) — its DEFAULTS (half give-back, filters, volatility exit, 6x cover, IBKR's archived lendability to 2024-06) reproduce the recorded 141-trade book exactly (`<research>/etf/bt_etf_parity.py`); `mimic.live_books` passes production's rule (the whole give-back, the turn, no VIX-linked product) |
 | `src/backtest/strategies/dm.py` | the ETF dual-momentum book as pieces (`pieces(lo, hi, end=)`): the live decision code (`etf_dm.fund_stats`, `etf_dm.tbill_growth`) on the repo's daily OHLCV cache (2006 on), one piece per holding bought / sold at the month's first open, 30-minute marks from the deep store (daily before it); trades as `account.dm_long` (the whole account in one fund); all 68 monthly picks 2021-02 .. 2026-09 and the research's growth (+7.84 / +14.80 %/yr) reproduced |
 | `src/backtest/study.py` | weekly Sunday walk-forward re-tuning of one or several arms TOGETHER, objective = the window account's log growth; Reality Check / argmax / Optuna picks; the chained test account |
-| `src/backtest/mimic.py` | THE SIMULATOR MADE TO MIMIC PRODUCTION (PREREG62, below): `Mimic` (each fix a switch; its defaults FOLLOW production's settings), `live_books` / `live_strategies` / `live_rules` = the live combination as production runs it — the vol / ETF / fall shorts at 1/20 / 1/16 / 1/12 (at most two of one name), the dip book's daily top pick by score at 1/6 with the earnings dips ranked last, the crash book's TQQQ at 1/4 (75% margin), one $10,000 account. V6's pressure extras are installed on top by the study harness (`run71` via study102's `R75.Applied({})`), NOT by `live_books`: `Mimic()` alone, and so the reliability cards, leave them out |
+| `src/backtest/mimic.py` | THE SIMULATOR MADE TO MIMIC PRODUCTION (PREREG62, below): `Mimic` (each fix a switch; its defaults FOLLOW production's settings), `live_books` / `live_strategies` / `live_rules` = the live combination as production runs it — the vol / ETF / fall shorts at 1/20 / 1/16 / 1/12 (at most two of one name), the dip book's daily top pick by score at 1/6 with the earnings dips ranked last, the crash book's TQQQ at 1/4 (75% margin), one $50,000 account (production's; PREREG227's S6). V6's pressure extras are installed on top by the study harness (`run71` via study102's `R75.Applied({})`), NOT by `live_books`: `Mimic()` alone, and so the reliability cards, leave them out |
 | `src/backtest/strategies/crash.py` | the crash-rebound book as pieces: production's `crash_long` decisions on QQQ, held in TQQQ (`Mimic(crash=True)`) |
 | `src/backtest/bank.py`, `reliability.py`, `add_rule.py`, `periods.py`, `context.py` | THE EVALUATION STANDARD: the bank's qualification and the combination's pooled profile; each arm's card (its `SPEC` names its settings; the live calibration's reference carries each arm's settings fingerprint and the simulator's, and is STALE for the live score once a deploy changes either: rebuild the cards after every deploy — `--build`, `--build --sets A0`; `bank.load_runs` names every book by its live arm, PREREG165 / 167's "capb" as "cap"); the pooled add rule; the borrow-data sets (A0, A, B, C, D); the market contexts (CLAUDE.md's standing rules) |
 | `src/backtest/a0.py`, `halts.py`, `quotes.py`, `dividends.py`, `audit.py`, `trials.py`, `prereg.py`, `live_calibration.py` | set A0's components (PREREG101); the halt models (PREREG99; production's guard ON by default from 2026-10-19); the legs' real quoted spreads and the dividends (AUDIT151, ON by default); the overfitting audit and the trial ledger (PREREG106, run by hand); the pre-registration checker; the live record against the simulator (a production reader) |
@@ -33,7 +33,7 @@ scratchpads on 2026-10-08; junctions at the old scratchpad paths keep the older 
 
 ## The account's rules (`account.simulate`)
 
-* Equity = $10,000 + realized P&L + open positions marked at their latest bar (a short's accrued borrow included).
+* Equity = the start (`Rules.start`: $50,000 under `Mimic()` from PREREG227, $10,000 before; every run records it) + realized P&L + open positions marked at their latest bar (a short's accrued borrow included).
   Available capital = equity - the open positions' initial requirement.
 * A new position = floor(min(equity / slices, side cap x equity - the side's open value, 1% of its 20-session dollar
   volume) / price), cut to the initial-margin room after its own costs; none under the strategy's `min_equity`
@@ -238,7 +238,7 @@ each fix pinned by a test that fails on the old code (`tests/test_backtest_accou
 * WALK-FORWARD — a tie with the reference keeps the REFERENCE (M0); a limit order placed before a window's cut and
   touched after it stays a working order (a placeholder) instead of vanishing; a STANDING holding (``rebase``: the
   dual-momentum pick) is bought at a window's / a run's start (`account.rebase`, `account.from_start`) and when a
-  chained week turns its arm on; `study.max_drawdown` counts a loss from the $10,000 start.
+  chained week turns its arm on; `study.max_drawdown` counts a loss from the account's start.
 * ADAPTERS — dip: a signal needs 220 daily bars through its own close (`stats_at`), and a name that stops trading
   before its exit is sold at its last close (it vanished); ETF: a pick whose deadline lies past the data is judged to
   the data's end and marked (it was dropped), and every top pick with a base is re-judged as a riser on the session
@@ -381,6 +381,22 @@ by the SCORE (only the fill order read the RSI2); it now picks the deepest dip, 
 Amendment 3's RS1 / RS1D ran it. Tests: `tests/test_dip_earnings.py` (the ranking by score and by RSI2, with the
 demotion, is production's; the simulator's construction is production's `check`; the defaults follow the settings).
 
+### The WallStreetBets preference (PREREG209's KD+, the default from 2026-10-25; production's from the 2026-10-26 session)
+
+User 2026-10-25: "Build KD+ for production and deploy it." `Mimic.dip_wsb` follows production: (`dip_long_wsb_min_titles`
+5, `dip_long_wsb_window_hours` 120, `dip_long_wsb_cut_et` "09:00") while `enable_dip_long_wsb_prefer` and the daily top
+pick are on, else None (`mimic.PRE209` = {"dip_wsb": None}: every study before it). `mimic.wsb_preferred` runs in
+`live_books` after the RP33 cut and the floor, before `dip.rank_pieces`: on an order day (its ``oid``'s first session)
+where any order's name was in at least 5 r/wallstreetbets titles created in the 120 hours before 09:00 ET of that
+session, only the flagged orders stay — PREREG209's patched `rank_pieces`, the same pick as production's flagged-first
+order (`dip_wsb.prefer`) for the daily top 1; a session whose window the store does not cover flags nothing (before
+2018-01-08). The flags read the data feeds' store (`feeds_wsb_dir`, seeded with the whole history) through
+`dip_wsb.history_index` (built once per store version, ~20 s), counted as production counts (`dip_wsb.names_in`,
+`token_of`). PARITY (2026-10-25): the default `Mimic()` rebuilds PREREG209's KD+ long books piece for piece (A / B 813
+dip pieces, A0 316; crash, cap and insider books unchanged), so PREREG209's KDp draws (`studies/prereg209/runs`, 40 a
+set) are the deployed configuration's, `bank.LIVE_RUNS`. A study reproducing LIVE205 or earlier passes `Mimic(**PRE209)`.
+Tests: `tests/test_dip_wsb.py` (the simulator keeps a day's flagged orders only; the defaults follow the settings).
+
 ## The market model corrected (AUDIT151, the defaults from 2026-10-19)
 
 User 2026-10-18: "Can you validate the backtesting and live rules and models? I want to be 100% sure there aren't
@@ -472,6 +488,129 @@ ALL3). The research harness of PREREG152-167 (`studies/prereg153/joint153.py`, `
 `dip_filter=False` (study102's `BASE_KW`) and builds new books with the other two switches as production sets them: a
 study on it that must reproduce RPD_IS passes ``PRE167``.
 
+## The insider book (PREREG203 / 205, the default from 2026-10-24; production's from the 2026-10-26 session)
+
+The user's deploy of PREREG203's O1_20 ("Ok. Deploy the Opportunistic, SPY 20%+ down to the live combine.", 2026-10-24):
+`Mimic()`'s ``ins`` (with `enable_insider_long`, `mimic.ins_on`) adds THE INSIDER BOOK, `src/backtest/strategies/insider.py`
+— production's own code on history: the gate (`insider_long.gate_from_closes` on SPY's daily closes from the OHLCV cache,
+equal close for close to the whole-market bars production reads), the purchase events (`insider_long.load_rows` /
+`events_from_rows`, only the filings made before each session), the stocks' numbers (`insider_long.bar_stats` on the
+whole-market daily bars as traded, `sel_pressure.grouped_ohlc`'s cache — fetched where it lacks a session) and the
+ranking (`insider_long.decide`, the largest purchase first). Each signal is a long bought at its session's 09:30 open and
+sold at the 09:30 open of the session after 60 sessions held (its last close when it stops trading first), marked at
+every session's close and low and from the second session at its open, every price in the entry session's terms (the
+effective split set brings later bars back); costed as the crash book's market legs (`LedgerCosts.apply` with the
+quotes), the dividends and the off-grid marks as every long book's (``ext_longs`` holds ``ins``). Its strategy ``ins``:
+1/`insider_long_account_slices`, ``max_open`` `insider_long_max_open`, Reg T, priority 8, quality 0.05 (`mimic.QUALITY`:
+under every other book — it gives way first), preemptible whole, the latest first, ``delever_order`` 0 (with the
+capitulation book's), book ``insider_long``; `Rules.fills_make_room` and `Rules.fill_room_exact` on, so a dip or
+capitulation order is sized as if its lots were freed and its fill sells them. ``Mimic(**mimic.PRE205)`` builds the
+configuration before (LIVE193); `Mimic.off()` has none of it. A study that registered a RESEARCH book named ``ins``
+(PREREG203 / 204: `register_research("ins", ...)`) must rename it: ``ins`` is a production book now.
+
+PARITY (PREREG205, 2026-10-24): the adapter rebuilds PREREG203's 301 O1_20 pieces of 2018-2026 exactly (166 on set A0,
+135 on A-B; the same names and sessions, entry prices equal); the open after the 60th session against the study's 60th
+close: -0.56 pp a trade gross. With the default `Mimic()` the long books (dip 811 + 319, crash 12 + 3, capitulation 746 +
+141) are PREREG175's cached ones and seed 0 without the insider pieces reproduces LIVE193 exactly; with them, 40 draws a
+set: +3.76 +- 0.18 pp a year (75.1 -> 78.9%), the pooled add rule's ADD — `bank.LIVE_RUNS` = `studies/prereg205/runs`
+(LIVE205). The harness: `studies/prereg205/h205.py` (`books`, `gate`, `parity`, `work`, `verdict`).
+
+## The fear book (PREREG219-226, production from the 2026-10-28 session)
+
+The user's deploy of PREREG225's E2s4 ("Deploy to production the $1B, 1/6 each, 4 slots.", 2026-10-27): `Mimic()`'s
+``fear`` (with `enable_fear_long`, `mimic.fear_on`) adds THE FEAR BOOK, `src/backtest/strategies/fear.py` — production's
+own construction on history: every dip signal of the panel (above its 200-session average, RSI2 under
+`dip_long_rsi_max`, dv20 at least `fear_long_min_dollar_volume`) whose implied volatility at the signal close is FEAR
+(`fear_long.ivp_at` on `fear_long_iv_dir`, IBKR's daily OPTION_IMPLIED_VOLATILITY history: the store production's
+pre-market fetch extends; a name without a series is not FEAR; set A0's symbols through `mimic._a0map`) is the dip
+book's limit order (`strategies.dip.order_pieces` at `fear_long_limit_atr` / `fear_long_limit_sessions`, the exit at the
+`fear_long_exit_sma_sessions` average or `fear_long_max_hold_sessions`), each piece with its ``ivp`` and ``rank`` (-IVP +
+RSI2 x 1e-5: IVP highest first). `live_books` drops the orders the dip book itself places that day (its daily top pick)
+and treats the pieces as the capitulation book's: the limit fills' costs (``legs=False``), the off-grid marks
+(``ext_longs`` holds ``fear``); from PREREG227 its open fills at IBKR's attainable 09:30:30 price and its legs at their
+quotes, as the dip book's (``open_order``, ``quote_all``, below; the print and a flat 1 bp in E2s4's construction). Its strategy
+``fear`` — appended LAST to `live_strategies` (PREREG225's order): 1/`fear_long_account_slices`, ``max_open``
+`fear_long_max_open` with its working orders, priority 9, quality 0.04 (`mimic.QUALITY`: under every other book — it gives
+way first), preemptible whole, the latest first, ``delever_order`` 0, ``orders="fill"`` and BOOK the dip book's
+(`mimic.NAME_BOOK`: one book with the dip book for one book per name, PREREG223's M1; `mimic.BOOK["fear"]` stays the
+production mechanism ``fear_long`` the live calibration maps). ``Mimic(**mimic.PRE226)`` builds the configuration before
+(KDp); `Mimic.off()` has none of it. The dividends: from PREREG227 every long book's (``div_all``, `dividends.ALL_LONG`);
+E2s4's construction (`dividends.LONG`) paid the capitulation, insider and fear books' longs none.
+
+PARITY (2026-10-27, `llm_trader_research/studies/deploy_fear/parity.py`): with the default `Mimic()` the adapter's pieces
+equal PREREG225's E2s4 exactly (1,442 on A-B, 463 on A0; the dip, crash, capitulation and insider books equal KDp's), and
+the default strategies on them reproduce E2s4's stored accounts of seeds 0-4, every set, 15 of 15 — `studies/prereg225/runs`
+(E2s4, 40 draws a set; `bank.LIVE_RUNS` until PREREG227): 93.04% a year against KDp's 88.21% (+4.83 +- 0.27 pp).
+
+## The parity audit's corrections and the $50,000 account (PREREG227, the defaults from 2026-10-27)
+
+The user, on the live-vs-backtest parity audit of 2026-10-27 (https://claude.ai/artifact/LaGFRpuhVtz517nqZ2nbpU): "Do
+S1 to S8 now. For S6, both the simulated and live accounts should be at $50,000." — and "keep the best version of each
+of the simulator and live": a live mechanism the simulator can reproduce is reproduced; a better simulator rule is
+offered to production (`llm_trader_research/studies/prereg227/`). Each correction a `Mimic` switch, ON by default;
+``Mimic(**mimic.PRE227)`` (and `Mimic.off()`) builds the construction before — E2s4's:
+
+| switch | what |
+|---|---|
+| ``open_order`` (S1) | the capitulation and fear books' open fills repriced like the dip book's (`strategies.dip.reprice_open` with ``books`` the three): IBKR's attainable price for the resting order arriving 09:30:30, from AUDIT151's open-fills table EXTENDED to their (name, day, limit) by its own rule and fetch (`strategies.dip.OPEN_FILLS_EXT`, `studies/prereg227/open_fills/fills_all227.csv`: AUDIT151's rows unchanged + the new ones; a study that sets `OPEN_FILLS` itself keeps its own); a fill the rule finds no price for that session is NO fill (the order keeps working: ``none_drops``), one the table cannot price keeps the print stamped 09:30:30 (``stamp_unknown``). At every open the three books then fill in production's order — dip, capitulation, fear (`PRIORITY`), each cut to the room left — and no long is bought at the print and sold 30 seconds later to fund another book's fill (E2s4: 4.6% of the fear positions, 3.6% of the capitulation book's) |
+| ``crash_reenter`` (S2) | a crash piece for EVERY qualifying session (`strategies.crash.trades(every=True)`), the one-at-a-time rule (``max_open`` 1) rejecting the overlaps as production settles them ``holding``: a buy the account could not fund, or a long a margin call sold, is bought again at the next qualifying open |
+| ``vol_walk`` (S3) | the vol arm's fallback walked to the ACCOUNT (production's `tracker.fallback`): with the halt model, when an unlendable pick's backup enters as the fallback the pass loop also records the backups the walk would reach after it at that pass (`halts.VolMachine(walk=True)`'s ``chain``: every later lendable, rule-passing backup not traded that day an ALTERNATIVE piece, role "alt"; a HIGH one stays the extras loop's and joins the chain); the account opens the first member it can take (one book per name, two shorts of a name, the room) and skips the others unless they are extras (`account.simulate`'s ``alt_of`` / ``alt_k`` / ``alt_hi``), and skips a fallback, alternative or extra whose name the arm already opened that ET session (``walk_dedupe``: production's `_sel_traded_today`). Inert with ``halts=None`` |
+| ``div_all`` (S4) | every live long book's dividends (`dividends.ALL_LONG`: the capitulation, insider and fear books' too; production's ledger pays every live book) |
+| ``quote_all`` (S5) | the insider book's buys and sells at the open both at their quoted half-spread (`QuoteTable.apply`'s ``market_arms``, the crash book's construction; IBKR's fees once — the ledger's all-in cost no longer under the engine's commission), the capitulation and fear books' legs as the dip book's (``limit_arms``: an open-fill entry and every exit at its quote, a resting order's fill at its limit none; a leg the store lacks the dip book's AUDIT151 median), and, in the three limit books, an open fill moved to a later touch without the open's spread (``touch_free``). The quote store extended by `quotes.fetch` for the legs it lacked (`studies/audit151/quote_costs/quotes_ext.csv`; existing legs never change) |
+| ``start`` (S6) | the account's start: production's `sel_short_account_initial` ($50,000; `Rules.start`) — every run records it (`simulate`'s ``start``) and every reader of a run's NAV reads it (`account.run_start`: `study.nav_daily`, `account.metrics`, `exposure_daily`; `bank.nav_of` — a run that records none began at $10,000; `bank.alone` at `bank.live_start()`) |
+
+Without a switch: S7 — the numbers the simulator held as copies are read from production's settings (`strategies.vol.LIVE`
+/ `FALL`: the fallback depth, the fresh window, the run-up look-back, the crowding and relative-volume cuts, the borrow
+minimum, the covers, the volatility exits' ratios; the ETF arm's cover and cuts, `mimic.etf_rule_kw`, and its
+volatility-exit ratio, `strategies.etf.VOLNORM`; the turns' (k, W), `mimic._prod_turn`) — equal to the copies today; the
+rules' switches stay the simulator's own (a production switch turned is a rule change: a study). S8 — the capitulation
+and fear books' signals keep one whose exit lies past the data when `strategies.dip.OPEN_END` (set D) is on, as the dip
+book's did; sets A0 / A / B never set it. Tests: `tests/test_backtest_parity227.py`.
+
+MEASURED (PREREG227, 40 draws a set, paired; `llm_trader_research/studies/prereg227/`): the gate — the working copy
+under ``PRE227`` built every book as production's tree did that day and reproduced E2s4's accounts exactly; THE NEW
+DEFAULT's own draws are `bank.LIVE_RUNS` (label L227): 94.06% a year against E2s4's 93.04% (+1.02 +- 0.24 pp; the
+pooled rate 93.9%), the drawdown 27.7 -> 28.5%, margin-event pairs 38 -> 40 (p 0.25), the worst 12 months +7.9 ->
++8.7%. The corrections at $10,000 -2.00 pp, the $50,000 account +3.02; one by one inside the default: ``quote_all``
+-2.31 (the real half-spreads: the insider book's 85 / 51 bp median at its buys / sells, the fear book's 8-9, the
+capitulation book's 4 — against the ledger's bucket and a flat 1 bp), ``open_order`` +0.53 (no same-open round trip
+left: 5-6 fear and 1-3 capitulation positions a draw before; the capitulation book's 09:30:30 arrival averages 4.6 bp
+above its print, the dip book's 3.7 below), ``div_all`` +0.46, ``vol_walk`` +0.10 (n.s.: the chosen backup is almost
+always the last lendable one — 80 alternatives on A0 in 40 draws, none on A / B, never a new trade), ``crash_reenter``
+0.00 (every added candidate overlapped a held long). Live's rule is the better or equal side on S2 / S3: nothing was
+offered to production.
+
+## The implied-volatility store: one frozen copy for each build (P7 of the parity audit, from 2026-10-27)
+
+The fear book's trades read IBKR's implied-volatility history (`fear_long_iv_dir`, `data/ibkr_iv/`), the store
+production's pre-market fetch rewrites every session (a month re-read for each candidate, a fetched bar replacing the
+stored one): left as it was, a revision by IBKR would move the bank's fear trades unseen, and a build running across
+08:30 ET could read two states of the store. THE JOURNAL (production, `fear_long.merge_rows`): every stored bar an
+answer revises or no longer serves is written to `data/ibkr_iv/revisions/<D>.jsonl` before the merge, and the live
+calibration counts them (``iv_revisions``; `docs/FEAR_LONG.md`). THE FROZEN COPY (the simulator,
+`src/backtest/strategies/fear.py`): `snapshot(through)` takes every name's stored bars through a date — by default the
+pooled history's last decision, `periods.pool_span` (no card reads a later bar, and every pooled build then reads the
+same span) — names it by their digest (`state`: sha1 of each name's rows, the names sorted) and writes it ONCE in the
+store's own format under `cache/ml/bank/iv_store/<digest>/` with its state (`iv_store.json`; never delete: a bank's
+input); `freeze(through)` points the simulator at it for a block (``IV_ROOT``; `IVP(root=...)` reads any copy). A bar
+after the window or a name without a bar in it leaves the digest alone; a revision, a removed bar or a new name with a
+bar in the window changes it.
+
+- **The cards**: `reliability.build` runs its whole body inside `freeze(iv_through(sets))` and records the state beside
+  the cards (`iv_store.json`), in the fear card (``iv_store``) and in the live calibration's reference.
+- **The bank**: `bank.build` records the store each input read (``inputs.iv_store``, `bank.iv_stores`): the card
+  builds' and the draws' — ``consistent`` False when two of them read different stores, ``recorded`` False when one did
+  not record it — and the change since the previous bank's (`previous_bank`; `strategies.fear.diff` of the two copies:
+  the names added and removed, the bars added, removed and revised); `bank.lines` prints it.
+- **A study that saves draws for the bank** freezes the store for its whole run and writes the state beside its runs:
+  `with FEAR.freeze(through) as st: ...` then `FEAR.write_state(<runs dir>, st)` (``through`` covering the study's span:
+  set D's reaches the latest session). PREREG227's draws (`bank.LIVE_RUNS`, label L227) predate it: their state was
+  recorded at P7's install (`studies/prereg227/runs/iv_store.json`, digest 006917260971: 223 names, 794,934 bars through
+  2026-09-24) — the store's window then was the seed's (PREREG219's history fetched 2026-10-26, copied in on
+  2026-10-27: the research store has the same digest), and the only write since, the 20:04 ET fetch test of
+  2026-10-27, added a 2026-10-27 bar to 4 names and revised none. Today's card builds (`cache/ml/reliability/2026-10-27*`)
+  carry the same record, and today's bank its ``inputs.iv_store``.
+
 ## IBKR's liquidation at a margin call (PREREG174 / 175, the default from 2026-10-21; production's too)
 
 The user, 2026-10-21: "Research online what IBKR does exactly during margin calls. I want the backtest to do exactly the
@@ -535,6 +674,41 @@ margin events 17 in 14 set-draw pairs (12 draws) against 18 in 15 (13), the draw
 meet no deficit the old marks missed; the long books' extra marks move a few give-ways and de-leveraging sales. The
 bank's draws are these (`bank.LIVE_RUNS` = `studies/prereg175/runs`, NEWMARKS); ``Mimic(**PRE175)`` reproduces
 PREREG174's.
+
+## IBKR's refusals by name (PREREG190 / 192 / 193, the default from 2026-10-24)
+
+The user, 2026-10-24: "Make the switch right away but still refit/recalibrate the model to make it better in the
+future".
+
+* **What the simulator does.** IBKR refuses any opening short in some names (its small-cap compliance restriction,
+  risk management's close-only names, DTC chills), and the refusal lasts. `Mimic()` now draws it BY NAME
+  (`Mimic.refusal` "model", `mimic.is_refused`): each stock row of the short stores carries the probability that IBKR
+  refuses it, from a versioned table (`mimic.REFUSAL_TABLES`, `optvol/refusal/refusal_p_v1.pkl`), drawn against ONE
+  uniform per name (`draw_u` "refuse", session 0). A row outside the table takes its name's latest earlier row, else
+  the table's stand-in (`refusal_p`). The ETF arm is never refused (it draws its own lendability).
+* **The table v1.** PREREG190's refusal model (M2c: on IBKR's microcap list, a foreign filer, the listing's age, the
+  market cap; AUC 0.95 / 0.98 on two forward batches, its level recalibrated out of sample) applied through
+  PREREG193's listing model: the rebuilt microcap rule's state and its age turned into the probability that IBKR lists
+  the name (ON 13% at 0-5 sessions, ~30% to 40 sessions, 34% to 120, 47% to 250, 85% after; OFF 24% falling to 2%), the
+  refusal probability the mixture L x p(listed) + (1 - L) x p(not listed). Checked on IBKR's own past lists (the
+  Internet Archive's six, 2021-2025, and our own): out of sample the listing model's log loss 0.223 against 0.433 for
+  the rule read as it is, better at 7 of 7 lists.
+* **What it moved** (20 draws a set, PREREG193): +0.26 +- 0.14 pp a year against the refusal model on the bare rule
+  (REFCAL); against the random 7% it replaced (REF7) the same total (75.8 -> 75.9% a year), with the refusals placed by
+  era — 2018-2021 52.1 -> 53.8% a year, 2021-2024 70.1 -> 70.6%, 2024-2026 126.4 -> 122.4% (IBKR's microcap list nearly
+  doubled over those years). The default reproduces PREREG193's REFLIST books piece for piece (`parity193.json`).
+* **The studies before it.** `Mimic(**PRE193)` restores `REFUSAL_RATE` (7%) per (name, session) — `refused`, the
+  function PREREG190 / 193's arms patch; their harnesses pin it (`r6_190.PIN`).
+* **Refitting it** (each step its own study, pre-registered; nothing changes silently):
+  1. the live calibration notes a refit due (``refusal_refit``): the refusal model once `refusal_model_refit_refusals`
+     (20) names are refused after its install (the live entry step, the evening probe, the studies' imports), the
+     listing model once IBKR's daily list is archived `refusal_listing_refit_sessions` (20) sessions after the table's
+     last list (`mimic.REFUSAL_LISTS_THROUGH`);
+  2. the refit, held out (PREREG191's protocol: leave one batch out; the listing curve leave one list out);
+  3. a NEW table version built by the study (written once; `h193.install(version)`'s construction), added to
+     `REFUSAL_TABLES` and `REFUSAL_LISTS_THROUGH`, the new default checked piece for piece against the study's arm;
+  4. `REFUSAL_TABLE` switched to it, then the bank rebuilt (the cards for sets A / B and A0, `bank.LIVE_RUNS`' 40 draws a
+     set, `python -m src.backtest.bank`) and the docs.
 
 ## A rule under test: the short books on sell limits (`Mimic(short_limit=...)`, PREREG66, 2026-10-09)
 
@@ -653,7 +827,7 @@ simulator assumes —
 | live fact (source) | the simulator's assumption |
 |---|---|
 | lendable at each live pick's FIRST borrow check (`sel_short/entries/`, one decision per pick) | IBKR's archive to 2024-06-24, the lend model after |
-| IBKR's refusals among the stock picks its what-if answered; its quoted house rates (`ibkr_margin`) | `REFUSAL_RATE` 7%; a name of `house_mix()` drawn |
+| IBKR's refusals among the stock picks its what-if answered; its quoted house rates (`ibkr_margin`) | by name: the refusal table's probability, one uniform per name (`REFUSAL_RATE` 7% under `PRE193`); a name of `house_mix()` drawn |
 | a short's ledger entry: minutes after its decision bar's end, its price against that bar's close — the pick bar, or the turning bar for a turn entry (reported apart) | at that bar's close, stamped at its end |
 | the broker's entry legs filled, slippage against the ledger's price | every ledger trade is the account's position |
 | the exits by reason and session | the regular and extended sessions' ticks |
@@ -712,7 +886,7 @@ HISTORY A0 + A + B (`periods.POOLED`, 2018-01-02 .. 2026-09-24; user directive 2
 | A0 — before the deep store (PREREG101; in the pooled history) | 2018-01-02 .. 2021-01-29 | IBKR's short-stock file (the community archive from 2017-10-09), as set A; its own data (below) |
 
 `periods.LEND_ARCHIVE_END` / `OWN_ARCHIVE_FROM` are the mimic's lendability switch (`mimic` imports them), so a set
-cannot call a modeled day known. Each set is its own $10,000 account from its first session taking only its own
+cannot call a modeled day known. Each set is its own $50,000 account (PREREG227's S6; $10,000 before) from its first session taking only its own
 decisions (`periods.windows(data_end)`); the calendar years come in their parts (`periods.year_parts`: 2024 A / 2024
 B) with their returns read off the continuous account (`periods.growth(nav, lo, hi, annual=False)`). Example:
 `llm_trader_research/studies/borrow_sets/run_sets.py` + `analyze_sets.py`; with the PREREG67 models
@@ -804,7 +978,7 @@ need multiple models in our bank of models so that we cover all market condition
   average trade and return per day with each calendar year left out), `by_year`, `by_set`, `context` (`trend`, `vol`,
   `cell`: SPY above / below its 200-session average and its 20-session realized-volatility tercile at the entry —
   `reliability.regime_table`, whole-history terciles, a reading label — each cell `EARNS` / `LOSES` / `unclear` from
-  `MIN_CELL` 30 trades in `MIN_CELL_MONTHS` 10 months), `alone` (the arm alone at its live slice of $10,000: P&L
+  `MIN_CELL` 30 trades in `MIN_CELL_MONTHS` 10 months), `alone` (the arm alone at its live slice of the live account, $50,000: P&L
   realized at the exits and compounded — growth a year, the worst drawdown, every year), `bench` (a LONG arm's bar:
   its benchmark's return per day over the pool, over each half's span and with each year left out), `longest` (with
   the earlier years — `long` yearly summaries or `long_trades` a table: n, the mean, the clustered significance

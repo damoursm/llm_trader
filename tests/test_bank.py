@@ -366,7 +366,9 @@ def test_load_runs_names_every_book_by_its_live_name(tmp_path):
     assert runs["B"][0]["calls"] == [{"strategy": "cap", "ns": 3}]
     assert rec["pos"][0]["strategy"] == "capb"                                  # the record loaded is a copy
     assert BK.canonical_book("capb") == "cap" and BK.canonical_book("vol") == "vol"
-    assert set(BK.ARMS) == {"vol", "etf", "fall", "dip", "crash", "cap"} and "cap" in BK.live_slices()
+    assert set(BK.ARMS) == {"vol", "etf", "fall", "dip", "crash", "cap", "ins", "fear"} and "cap" in BK.live_slices()
+    assert "ins" in BK.live_slices() and BK.BENCH["ins"] == "SPY"
+    assert "fear" in BK.live_slices() and BK.BENCH["fear"] == "SPY"
 
 def test_a_live_arms_earlier_trades_are_read_as_its_longest_history(tmp_path):
     """`bank.LONG_TRADES` (the capitulation book: PREREG165's untouched 2006-2017 trades) feeds the re-judging; a
@@ -385,3 +387,42 @@ def test_a_live_arms_earlier_trades_are_read_as_its_longest_history(tmp_path):
     assert BK.long_trades("vol", root=tmp_path) is None
     assert BK.long_trades("cap", root=tmp_path / "missing") is None
 
+
+
+def test_the_bank_records_the_implied_volatility_store_every_input_read(tmp_path, monkeypatch):
+    """P7: the cards' and the draws' frozen stores recorded, compared with each other and with the previous bank's."""
+    import json
+    from datetime import date
+
+    from config.settings import settings
+    from src.backtest.strategies import fear as FEAR
+    from src.signals import fear_long as FL
+    monkeypatch.setattr(settings, "fear_long_iv_dir", str(tmp_path / "iv"))
+    monkeypatch.setattr(FEAR, "snapshot_root", lambda: tmp_path / "snaps")
+    FL.merge_rows("AAA", [["2026-09-01", 0.3, 0.3, 0.3, 0.3], ["2026-09-02", 0.3, 0.3, 0.3, 0.31]])
+    st1 = FEAR.snapshot("2026-09-24")
+    ab, a0, runs, bank_dir = tmp_path / "cards", tmp_path / "cards_A0", tmp_path / "runs", tmp_path / "bank"
+    for d in (ab, a0, runs):
+        FEAR.write_state(d, st1)
+    cards = {"A0": str(a0), "A": str(ab), "B": str(ab)}
+    day = date(2026, 10, 28)
+    iv = BK.iv_stores(cards, runs, day, bank_dir)
+    assert iv["consistent"] and iv["recorded"] and iv["digest"] == st1["digest"] and iv["bars"] == 2
+    assert "previous" not in iv and "read by the cards and the draws" in BK.iv_line(iv)
+    FEAR.write_state(a0, dict(st1, digest="0" * 12))                       # the A0 cards read another store
+    iv2 = BK.iv_stores(cards, runs, day, bank_dir)
+    assert not iv2["consistent"] and iv2["digest"] is None and "different stores" in BK.iv_line(iv2)
+    FL.merge_rows("AAA", [["2026-09-02", 0.3, 0.3, 0.3, 0.5]])               # IBKR revised a bar of the window
+    st2 = FEAR.snapshot("2026-09-24")
+    for d in (ab, a0, runs):
+        FEAR.write_state(d, st2)
+    bank_dir.mkdir()
+    (bank_dir / "2026-10-27.json").write_text(json.dumps({"inputs": {"iv_store": {"digest": st1["digest"]}}}),
+                                              encoding="utf-8")
+    (bank_dir / "2026-10-28.json").write_text("{}", encoding="utf-8")       # the day's own bank: not the previous
+    iv3 = BK.iv_stores(cards, runs, day, bank_dir)
+    assert iv3["previous"]["bank"] == "2026-10-27.json" and iv3["previous"]["same"] is False
+    assert iv3["previous"]["diff"]["bars_revised"] == 1
+    assert "CHANGED since 2026-10-27.json" in BK.iv_line(iv3) and "1 bars revised" in BK.iv_line(iv3)
+    iv4 = BK.iv_stores({"A": str(tmp_path / "old")}, tmp_path / "none", day, tmp_path / "nobank")
+    assert not iv4["recorded"] and iv4["digest"] is None and "not recorded" in BK.iv_line(iv4)

@@ -613,7 +613,7 @@ class Trade:
     at: int                      # its entry instant
     price: float                 # traded dollars
     scale: Optional[float]
-    role: str                    # pick / fallback / halted_fallback / extra / wait
+    role: str                    # pick / fallback / halted_fallback / extra / wait / alt (PREREG227's walk)
 
 
 class VolMachine:
@@ -624,13 +624,22 @@ class VolMachine:
     HIGH backup not yet settled). A pick expires after its window's last pass; H1 lets one halted at every pass wait
     alone; H2 / H3 make a halt at the first pass one more fallback trigger. ``lend_later(cand, at, price)``: its
     lendability when first priced at a later pass. Without halts the result is the simulator's own selection
-    (PREREG16's fallback + V6's extras) — `Applier` checks it every time."""
+    (PREREG16's fallback + V6's extras) — `Applier` checks it every time.
+
+    ``walk`` (PREREG227's S3, `Mimic.vol_walk`): production walks a pick's backups until one OPENS — a backup the
+    ACCOUNT refuses (another book's name, two shorts of the name, no room) passes to the next. The pass loop cannot see
+    the account, so when a backup enters as the fallback it also records the backups the walk would reach after it at
+    that pass (``chain``: store row -> (chain key, its place after the chosen one, HIGH)): each later backup that is
+    lendable there and not traded that day becomes an ALTERNATIVE trade (role "alt"; not "traded today", nothing
+    settled), a HIGH one is the extras loop's as before and joins the chain; the engine opens the first member the
+    account takes (`account.simulate`'s ``alt_of``)."""
 
     def __init__(self, model: HaltModel, mode: str, pool: bool, extras: bool,
-                 lend_later: Callable[[Cand, int, float], bool]):
+                 lend_later: Callable[[Cand, int, float], bool], walk: bool = False):
         if mode not in MODES:
             raise ValueError(f"halt mode must be one of {MODES}, not {mode!r}")
         self.model, self.mode, self.pool, self.extras, self.lend_later = model, mode, pool, extras, lend_later
+        self.walk = bool(walk)
 
     def run(self, runs: Sequence[Run]) -> "VolMachine":
         sched = self.model.schedule
@@ -656,6 +665,8 @@ class VolMachine:
         self._bdone: set = set()
         self._traded: set = set()
         self._ev: Dict[tuple, dict] = {}
+        self.chain: Dict[int, Tuple[str, int, bool]] = {}        # PREREG227's walk: store row -> (key, place, HIGH)
+        self._head: Dict[Tuple[int, int], int] = {}              # (run, pass) -> the chosen backup's index
         while heap:
             _, r, k, phase = heapq.heappop(heap)
             if self._done[r]:
@@ -777,8 +788,29 @@ class VolMachine:
             self._traded.add((c.tk, day))
             self._bdone.add((r, b))
             self._note((b, r), outcome="entered", at_k=k, at=iso_et(P), price=out[0], scale=out[1], as_role=role)
+            if self.walk:
+                self._alternatives(r, run, k, P, first, b, c)
             return t
         return None
+
+    def _alternatives(self, r: int, run: Run, k: int, P: int, first: bool, b0: int, c0: Cand) -> None:
+        """PREREG227's walk: the backups after the chosen one ``b0`` that the walk would try at this pass were the
+        account to refuse it — the HIGH ones are the extras loop's (`_extras` joins them to the chain), every other one
+        lendable here and not traded that day an alternative trade (role "alt", nothing settled)."""
+        key = f"w{int(run.pick.row)}_{int(k)}"
+        self._head[(r, k)] = b0
+        self.chain[int(c0.row)] = (key, 0, bool(c0.hi))
+        for b, c in enumerate(run.backups):
+            if b <= b0 or c.hi or (r, b) in self._bdone:
+                continue
+            day = c.day if first else day_of(P)
+            if (c.tk, day) in self._traded:
+                continue
+            out = self._attempt(r, b, c, k, P, first)
+            if not isinstance(out, tuple):
+                continue                                   # halted, no price, at its target or unlendable here
+            self.trades.append(Trade(c, k, c.T if first else P, out[0], out[1], "alt"))
+            self.chain[int(c.row)] = (key, int(b - b0), False)
 
     def _extras(self, r: int, run: Run, k: int, P: int, first: bool) -> None:
         """V6: every HIGH backup not yet settled (a halted one is left for a later pass while the pick is pending)."""
@@ -798,6 +830,9 @@ class VolMachine:
                 self.trades.append(Trade(c, k, c.T if first else P, out[0], out[1], "extra"))
                 self._traded.add((c.tk, day))
                 self._note((b, r), outcome="entered", at_k=k, at=iso_et(P), price=out[0], scale=out[1], as_role="extra")
+                b0 = self._head.get((r, k))
+                if self.walk and b0 is not None and b > b0:   # PREREG227's walk: an extra after this pass's fallback
+                    self.chain[int(c.row)] = (f"w{int(run.pick.row)}_{int(k)}", int(b - b0), True)
             else:
                 self._note((b, r), outcome=out)
 
@@ -1089,6 +1124,7 @@ class Applier:
             raise NotImplementedError("the halt model covers the fall and ETF arms on the turn (production's)")
         from src.backtest.mimic import turn_lend
         self.mim, self.mode, self.eng = mim, str(mim.halts), eng
+        self.walk = bool(getattr(mim, "vol_walk", False))     # PREREG227's S3: the fallback walked to the account
         self.L = np.asarray(L, bool)
         self.model = model or default_model(np.asarray(eng.C4.CAL, np.int64))
         self.lend_at = turn_lend(eng, mim, self.L)
@@ -1200,7 +1236,7 @@ class Applier:
                 f"halts: the vol arm's pass loop without halts does not reproduce the simulator's selection "
                 f"({len(got0 - set(orig))} rows it adds, {len(set(orig) - got0)} it misses, {len(pieces)} pieces) — "
                 f"V6's extras need eng.pressure_hi; a study's own vol parameters are not supported")
-        real = VolMachine(self.model, self.mode, pool, extras, self._lend_later).run(runs)
+        real = VolMachine(self.model, self.mode, pool, extras, self._lend_later, walk=self.walk).run(runs)
         halted = {int(e["row"]) for e in real.events if e.get("role") == "pick" and e.get("halted_at_first")}
         for run in runs:
             self._scope("vol", run.pick.day, run.pick.row in halted)
@@ -1226,8 +1262,34 @@ class Applier:
             items.append(it)
         add = build_vol_pieces(eng, ev, cfg, prm, items, "vol")
         if not add and len(out) == len(pieces):
-            return pieces
-        return out + sorted(add, key=lambda p: int(p["ens"]))
+            res = pieces
+        else:
+            res = out + sorted(add, key=lambda p: int(p["ens"]))
+        return self._walk_stamps(res, real) if self.walk else res
+
+    WALKED = ("fallback", "halted_fallback", "extra", "alt")
+
+    def _walk_stamps(self, pieces: List[dict], real: "VolMachine") -> List[dict]:
+        """PREREG227's S3: each chain member's ``alt_of`` / ``alt_k`` / ``alt_hi`` (`VolMachine.chain`) and, on every
+        fallback, extra and alternative, ``walk_dedupe`` (production's `_sel_traded_today` in both loops) — on copies:
+        the pieces may be the engine's cached ones."""
+        role = {int(t.cand.row): t.role for t in real.trades}
+        out = []
+        for p in pieces:
+            R = int(p["R"])
+            ch, rl = real.chain.get(R), role.get(R)
+            if ch is None and rl not in self.WALKED:
+                out.append(p)
+                continue
+            q = dict(p)
+            if rl in self.WALKED:
+                q["walk_dedupe"] = True
+            if ch is not None:
+                q["alt_of"], q["alt_k"], q["alt_hi"] = ch[0], int(ch[1]), bool(ch[2])
+            out.append(q)
+        self._count("vol_walk_chains", len({c[0] for c in real.chain.values()}))
+        self._count("vol_walk_alternatives", sum(1 for t in real.trades if t.role == "alt"))
+        return out
 
     def _vol_runs(self, ev, SL, SP, pool_n: int, hi_rows) -> List[Run]:
         idxL = np.asarray(SL[0], np.int64)

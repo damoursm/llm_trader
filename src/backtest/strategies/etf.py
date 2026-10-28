@@ -39,6 +39,10 @@ from src.backtest.periods import OWN_ARCHIVE_FROM  # our own archive of IBKR's f
 from src.backtest import account as A
 
 FEE_MED = 9.75                         # %/yr: the median fee the recorded book used without an IBKR history
+# PREREG227's S7: the arm's volatility exit at production's ratio (`sel_short_volnorm_ratio`, 0.5 — the number this
+# adapter held)
+VOLNORM = float(settings.sel_short_volnorm_ratio)
+_VN_CUT = VOLNORM
 LEND_END = "2024-06-24"                # IBKR's archived short-stock file ends here
 ET = "America/New_York"
 
@@ -305,7 +309,7 @@ class EtfArm:
                 continue                                       # already at the target: not entered (as live)
             s2, a2 = c[ie + 1:last + 1], atr[ie + 1:last + 1]
             atr_pick = float(np.float32(atr[p]))
-            hits = [np.flatnonzero(s2 <= lvl), np.flatnonzero((a2 <= 0.5 * atr_pick) & (s2 < e))]
+            hits = [np.flatnonzero(s2 <= lvl), np.flatnonzero((a2 <= _VN_CUT * atr_pick) & (s2 < e))]
             if cover:
                 hits.append(np.flatnonzero(s2 >= cover * e))
             first = min((int(x[0]) for x in hits if len(x)), default=None)
@@ -333,7 +337,7 @@ class EtfArm:
                 why = (("mark" if beyond else "time") if first is None
                        else "target" if len(hits[0]) and int(hits[0][0]) == first
                        else "volnorm" if len(hits[1]) and int(hits[1][0]) == first else "cap")
-                q.update(lvl=lvl * f, apk=atr_pick, pa=np.asarray(atr[ie + 1:xi + 1], float), vn=0.5,
+                q.update(lvl=lvl * f, apk=atr_pick, pa=np.asarray(atr[ie + 1:xi + 1], float), vn=VOLNORM,
                          cover_mult=cover, why=why, f=f)
             out.append(q)
         return out
@@ -373,7 +377,7 @@ class EtfArm:
                 continue
             jf = int(fwd[ks[0]])
             s2, a2 = c[jf:last + 1], atr[jf:last + 1]
-            hits = [np.flatnonzero(s2 <= lvl), np.flatnonzero((a2 <= 0.5 * atr_pick) & (s2 < off))]
+            hits = [np.flatnonzero(s2 <= lvl), np.flatnonzero((a2 <= _VN_CUT * atr_pick) & (s2 < off))]
             if cover:
                 hits.append(np.flatnonzero(s2 >= cover * off))
             first = min((int(x[0]) for x in hits if len(x)), default=None)
@@ -398,7 +402,7 @@ class EtfArm:
                 why = (("mark" if beyond else "time") if first is None
                        else "target" if len(hits[0]) and int(hits[0][0]) == first
                        else "volnorm" if len(hits[1]) and int(hits[1][0]) == first else "cap")
-                q.update(lvl=lvl * f, apk=atr_pick, pa=np.asarray(atr[jf + 1:xi + 1], float), vn=0.5,
+                q.update(lvl=lvl * f, apk=atr_pick, pa=np.asarray(atr[jf + 1:xi + 1], float), vn=VOLNORM,
                          cover_mult=cover, why=why, f=f)
             out.append(q)
         return out
@@ -426,7 +430,7 @@ class EtfArm:
             return None
         e = float(c[jf])
         s2, a2 = c[jf + 1:last + 1], atr[jf + 1:last + 1]
-        hits = [np.flatnonzero(s2 <= lvl), np.flatnonzero((a2 <= 0.5 * atr_pick) & (s2 < e))]
+        hits = [np.flatnonzero(s2 <= lvl), np.flatnonzero((a2 <= _VN_CUT * atr_pick) & (s2 < e))]
         if cover:
             hits.append(np.flatnonzero(s2 >= cover * e))
         first = min((int(x[0]) for x in hits if len(x)), default=None)
@@ -453,7 +457,7 @@ class EtfArm:
             why = (("mark" if beyond else "time") if first is None
                    else "target" if len(hits[0]) and int(hits[0][0]) == first
                    else "volnorm" if len(hits[1]) and int(hits[1][0]) == first else "cap")
-            q.update(lvl=lvl * f, apk=atr_pick, pa=np.asarray(atr[jf + 1:xi + 1], float), vn=0.5, cover_mult=cover,
+            q.update(lvl=lvl * f, apk=atr_pick, pa=np.asarray(atr[jf + 1:xi + 1], float), vn=VOLNORM, cover_mult=cover,
                      why=why, f=f)
         return q
 

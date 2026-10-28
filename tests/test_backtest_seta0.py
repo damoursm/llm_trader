@@ -159,7 +159,8 @@ def test_an_a0_engine_builds_the_crash_book_from_a0s_data(monkeypatch):
     books = M.live_books("2021-02-01", "2021-04-30", M.Mimic(seed=0, ext=False, **M.PRE151), eng=eng, etf=etf,
                          panel=panel,
                          bars=bars, costs=costs, p_lend=p_lend, settle=lambda d: int(d) + 2, dip=dip)
-    assert seen["crash"] == ("2021-02-01", "2021-04-30", {"period": "A0"}) and "crash" in books
+    # PREREG227's S2: a candidate every qualifying session (the one-at-a-time rule rejects the overlaps)
+    assert seen["crash"] == ("2021-02-01", "2021-04-30", {"period": "A0", "every": True}) and "crash" in books
     assert a0_settle(lambda d: int(d) + 2)                 # a calendar-day stub: 2018-01-02 + 2 = 2018-01-04
     assert not a0_settle(lambda d: dn("2021-01-06"))       # the default calendar: no session before 2021
 

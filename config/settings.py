@@ -1330,6 +1330,14 @@ class Settings(BaseSettings):
     # News sources
     newsapi_key: str = ""
     alpha_vantage_key: str = ""
+    # Alpha Vantage's free key allows 25 requests a day (its window does NOT start at 00:00 UTC: still refused at 20:00
+    # ET 2026-10-26 — midnight ET or a rolling 24 hours). The shadow pipeline's discovery keeps its two
+    # Alpha Vantage answers in `trending_av_cache_dir`: the top movers `trending_av_movers_cache_hours` (the free tier
+    # refreshes them once a day) and the news-active tickers `trending_av_news_cache_hours` — uncached on every tick
+    # they spent the quota by midday (2026-10-26) and left none for PREREG211's earnings-call transcripts.
+    trending_av_movers_cache_hours: float = 24.0
+    trending_av_news_cache_hours: float = 12.0
+    trending_av_cache_dir: str = "cache"
     # Finnhub — real-time company news (free tier). Empty key → the source is
     # skipped. Free company-news has no per-article sentiment, so it adds news
     # COVERAGE; the provider-sentiment LLM-skip is driven by Polygon insights.
@@ -2847,6 +2855,148 @@ class Settings(BaseSettings):
     # per market day and notes in the email's scorer banner. Reads only; nothing trades on it.
     enable_eod_forward_check: bool = True
     forward_check_dir: str = "cache/ml/forward_check"
+    # IBKR's U.S. MICROCAP LIST, archived daily (2026-10-23, PREREG190; the user: "Yes please add the two productions
+    # steps"; `src/data/ibkr_microcaps.py`): the EOD chain's first step downloads IBKR's published list of the stocks it
+    # restricts as U.S. microcaps (its "No Opening Trades: Small Cap" refusals) once a market day into
+    # `ibkr_microcap_dir`/<ET date>.csv.gz — raw, never delete: IBKR keeps no history. A reader takes the latest file
+    # of a day before the session asked about, at most `ibkr_microcap_max_age_days` old.
+    enable_eod_microcap_list: bool = True
+    ibkr_microcap_list_url: str = "https://www.interactivebrokers.com/download/us_microcaps.csv"
+    ibkr_microcap_dir: str = "data/ibkr_microcaps"
+    ibkr_microcap_max_age_days: int = 7
+    # THE DATA FEEDS (2026-10-25; the user: "Can you make sure we can fetch those new data sources on production as
+    # needed, like daily or every 30min?"; `src/data/feeds/`): PREREG208's free sources archived on their own cadence by
+    # `python -m src.data.feeds --run`, launched as a subprocess every `feeds_poll_minutes` from the scheduler's own
+    # timer (`runner._start_feeds_timer`, off the :00 / :30 slots), one run at a time (`feeds.lock`), within
+    # `feeds_budget_seconds`. No live book reads them yet: their health is a note, never an alarm.
+    enable_data_feeds: bool = True
+    feeds_poll_minutes: float = 30.0
+    feeds_budget_seconds: int = 900
+    feeds_pace_seconds: float = 1.0
+    feeds_state_dir: str = "cache/feeds"
+    # r/wallstreetbets from the Arctic Shift archive (posts captured within about a minute): what is new every run,
+    # the last `feeds_wsb_overlap_minutes` re-read for late captures; an empty store starts at `feeds_wsb_start`
+    # (YYYY-MM-DD; "" = 2 days back). `feeds_wsb_dir`/<UTC day>.jsonl.gz, never the author.
+    enable_feeds_wsb: bool = True
+    feeds_wsb_url: str = "https://arctic-shift.photon-reddit.com/api/posts/search"
+    feeds_wsb_subreddit: str = "wallstreetbets"
+    feeds_wsb_dir: str = "data/reddit_wsb"
+    feeds_wsb_overlap_minutes: float = 120.0
+    feeds_wsb_start: str = ""
+    # When the archive fails (from 2026-10-27; Arctic Shift was down from 08:10 ET on 2026-10-26 and the dip book's
+    # WallStreetBets window was stale at its cut): asked again `feeds_wsb_retries` times, `feeds_wsb_retry_seconds`
+    # apart (doubling), the pages it served kept; inside the dip book's pre-cut window of a market day
+    # (`feeds_wsb_precut_lead_minutes` before `dip_long_wsb_cut_et` to `feeds_wsb_precut_tail_minutes` after it) every
+    # `feeds_wsb_precut_retry_seconds` while the store is behind. With the user's Reddit app (`reddit_client_id` /
+    # `reddit_client_secret`, below; `enable_feeds_wsb_reddit_fill`) the gap is filled from Reddit's API by post id —
+    # at most `feeds_wsb_reddit_calls_per_minute` and `feeds_wsb_reddit_max_calls` a run, stopped
+    # `feeds_wsb_reddit_margin_seconds` before the run's budget; an outage's span is read from the archive again
+    # `feeds_wsb_reread_hours` after it ends.
+    feeds_wsb_retries: int = 2
+    feeds_wsb_retry_seconds: float = 30.0
+    feeds_wsb_precut_lead_minutes: float = 20.0
+    feeds_wsb_precut_tail_minutes: float = 27.0
+    feeds_wsb_precut_retry_seconds: float = 60.0
+    enable_feeds_wsb_reddit_fill: bool = True
+    feeds_wsb_reddit_calls_per_minute: float = 80.0
+    feeds_wsb_reddit_max_calls: int = 1000
+    feeds_wsb_reddit_margin_seconds: float = 90.0
+    feeds_wsb_reread_hours: float = 6.0
+    # The OCC's daily options volume by underlying (account type x put / call): it serves only its last 2 years
+    # (`feeds_occ_history_days`), so every completed session is archived raw, once — `feeds_occ_dir`/<day>.csv.gz, never
+    # delete; a session not published yet is asked again after `feeds_occ_retry_minutes`.
+    enable_feeds_occ: bool = True
+    feeds_occ_url: str = "https://marketdata.theocc.com/volume-query"
+    feeds_occ_dir: str = "data/occ_volume"
+    feeds_occ_history_days: int = 729
+    feeds_occ_retry_minutes: float = 60.0
+    # The FDA's Drugs@FDA export: openFDA's index read every `feeds_fda_check_hours`, a new export kept with its
+    # approvals extracted (`feeds_fda_dir`/approvals.csv).
+    enable_feeds_fda: bool = True
+    feeds_fda_index_url: str = "https://api.fda.gov/download.json"
+    feeds_fda_dir: str = "data/openfda"
+    feeds_fda_check_hours: float = 24.0
+    # THE FREE-DATA CENSUS'S FEEDS (from the 2026-10-26 evening; the user: "Continue exploring the new data sources and
+    # make sure we can pull it in live for our production"): archived on their own cadence, read by no live book yet.
+    # SEC requests (`efts`, `plans`) at most one every `feeds_sec_pace_seconds` with the deep store's headers, none
+    # inside production's own SEC lanes (`feeds_sec_quiet_et`, ET windows).
+    feeds_sec_pace_seconds: float = 1.0
+    feeds_sec_quiet_et: str = "23:30-00:45,08:15-09:45"
+    # EDGAR's full-text search (`efts.QUERIES`: 8-Ks naming PDUFA — each document kept, the FDA target dates extracted
+    # — and the red flags: going-concern doubts, Item 4.02 non-reliance, Wells notices) asked every
+    # `feeds_efts_check_hours` from each query's last window minus `feeds_efts_overlap_days` (`feeds_efts_dir`).
+    enable_feeds_efts: bool = True
+    feeds_efts_url: str = "https://efts.sec.gov/LATEST/search-index"
+    feeds_efts_dir: str = "data/edgar_fts"
+    feeds_efts_check_hours: float = 6.0
+    feeds_efts_overlap_days: int = 3
+    # Cboe's daily options statistics (every product's call / put volume, Cboe's put/call ratios): each completed
+    # session of the last `feeds_cboe_history_days` archived once (`feeds_cboe_dir`); one not posted yet asked again
+    # after `feeds_cboe_retry_minutes`.
+    enable_feeds_cboe: bool = True
+    feeds_cboe_url: str = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{day}_daily_options"
+    feeds_cboe_dir: str = "data/cboe_options"
+    feeds_cboe_history_days: int = 30
+    feeds_cboe_retry_minutes: float = 60.0
+    # The SEC's Financial Statement and Notes data sets (the Rule 10b5-1 trading-arrangement facts, Reg S-K Item
+    # 408(a)): the list page read every `feeds_plans_check_hours`, each file from `feeds_plans_start` on not held
+    # downloaded and parsed once, one a run (`feeds_plans_dir`; older files imported from the research download).
+    enable_feeds_plans: bool = True
+    feeds_plans_list_url: str = "https://www.sec.gov/data-research/sec-markets-data/financial-statement-notes-data-sets"
+    feeds_plans_zip_url: str = "https://www.sec.gov/files/dera/data/financial-statement-notes-data-sets/{name}_notes.zip"
+    feeds_plans_dir: str = "data/edgar_notes"
+    feeds_plans_check_hours: float = 24.0
+    feeds_plans_start: str = "2026_10"
+    # GDELT 1.0's daily Global Knowledge Graph (posted ~07:00 UTC the next day): each day from `feeds_gdelt_start`
+    # checked against GDELT's MD5 list and reduced to every theme's article count and tone sum (`feeds_gdelt_dir`), at
+    # most `feeds_gdelt_max_days` a run; the history before it (2015 on, ~156 GB) waits for the user's go-ahead.
+    enable_feeds_gdelt: bool = True
+    feeds_gdelt_url: str = "http://data.gdeltproject.org/gkg/{day}.gkg.csv.zip"
+    feeds_gdelt_md5_url: str = "http://data.gdeltproject.org/gkg/md5sums"
+    feeds_gdelt_dir: str = "data/gdelt"
+    feeds_gdelt_start: str = "2026-10-19"
+    feeds_gdelt_max_days: int = 3
+    # THE REFUSAL MODEL SCORED LIVE (2026-10-23, PREREG190's M2c; `src/signals/sel_refusal.py`, the live calibration's
+    # ``refusal_model``): every funded stock pick's IBKR what-if answer (refused or quoted) against the frozen model's
+    # probability at its session — the count refused against the model's expected count and its 95% range, a note
+    # when outside it, and a note once `refusal_model_refit_refusals` refusals are answered since the model's install
+    # (`live_calibration.refit_status`: the live entry step, the evening probe, the studies' imports — time to refit).
+    # Journal-only: production's entry step keeps asking IBKR, whose answer decides.
+    enable_live_calibration_refusal_model: bool = True
+    refusal_model_refit_refusals: int = 20
+    # THE LISTING MODEL'S REFIT (2026-10-24, the user: "still refit/recalibrate the model to make it better in the future"):
+    # the live calibration notes it due once IBKR's daily microcap list has been archived this many sessions after the last
+    # list the simulator's refusal table was fitted on (`mimic.REFUSAL_LISTS_THROUGH`); the refusal model's refit is due
+    # at `refusal_model_refit_refusals` refusals answered since its install (live, the evening probe, the studies).
+    refusal_listing_refit_sessions: int = 20
+    # IBKR'S REFUSALS ASKED EVERY EVENING (2026-10-24, PREREG191; the user: "Implement changes 1 to 4";
+    # `src/signals/refusal_probe.py`): the EOD process launches the probe after the close — IBKR's what-if (priced,
+    # never transmitted) on its own client (`ibkr_client_id` + `refusal_probe_client_offset`), one name every
+    # `refusal_probe_spacing_seconds`, at most `refusal_probe_max_names` a night beside the research queue
+    # (`sel_short_dir`/refusal/queue.json), until `refusal_probe_end_et`: every refused name again after
+    # `refusal_probe_reask_days`, the day's live picks and backups IBKR was not asked about, the day's new names in the
+    # vol arm's top 50 and the names the model is least sure of (none asked within `refusal_probe_fresh_days`); paused
+    # near each slot and while the EOD spread sweep runs, stopped on any IBC server reconnect or re-login.
+    enable_eod_refusal_probe: bool = True
+    refusal_probe_client_offset: int = 61
+    refusal_probe_spacing_seconds: float = 60.0
+    refusal_probe_max_names: int = 60
+    refusal_probe_end_et: str = "23:15"
+    refusal_probe_reask_days: int = 7
+    refusal_probe_fresh_days: int = 30
+    # THE WATCH (2026-10-24, the user's "Yes, go ahead with both"; PREREG192's companion): the names IBKR last ACCEPTED
+    # that the refusal model finds riskiest among the vol arm's universe, asked again after `refusal_probe_reask_days`,
+    # at most this many a night within `refusal_probe_max_names` - a name turning refused is seen only over time.
+    refusal_probe_watch_names: int = 10
+    # IBKR ASKED ABOUT EVERY LIVE PICK (2026-10-24, PREREG191's change 3; `tracker.ask_unasked_sel_short`): the entry
+    # step asks IBKR's what-if only for a pick it is about to size; a pick it settles before for a reason of this
+    # account's own (`already_open`, `traded_today`, `shadow_arm`) is asked after the live path's broker sync, before
+    # the extra accounts run, when this account or an extra account trades its arm and the name holds no answer this
+    # session — at most `sel_short_whatif_unasked_max` a pass, journaled ``whatif_only`` in the entry journal, where
+    # the extra accounts find IBKR's answer (`sim_account.main_account_answer`). The bar's other candidates are asked
+    # in the evening (the refusal probe above).
+    enable_sel_short_whatif_unasked: bool = True
+    sel_short_whatif_unasked_max: int = 3
     # ── Deep history store — nightly incremental refresh (2026-09-23, user
     # directive: every external source in the historical store, kept current by
     # the scheduler). `python -m src.data.deep.refresh` as a SUBPROCESS from its
@@ -3385,6 +3535,21 @@ class Settings(BaseSettings):
     enable_dip_long_earnings_demote: bool = True
     dip_long_earnings_demote_sessions: int = 3
     dip_long_earnings_edgar: bool = True
+    # THE WALLSTREETBETS PREFERENCE (PREREG209's KD+; user 2026-10-25: "Build KD+ for production and deploy it."; from the
+    # 2026-10-26 session; src/signals/dip_wsb.py, docs/DIP_LONG.md): in the daily top pick, when any of the day's signals
+    # at or above the order floor was named in at least `dip_long_wsb_min_titles` r/wallstreetbets titles created in the
+    # `dip_long_wsb_window_hours` before `dip_long_wsb_cut_et` ET of the session (the production feed's store,
+    # `feeds_wsb_dir`; PREREG208's counting, eight more tokens only as cashtags), the pick is the best-ranked of those
+    # flagged signals (by the score, an earnings dip after the others); else production's pick. Fail-open: a store that
+    # does not cover the window (a day missing, its newest post more than `dip_long_wsb_max_feed_lag_minutes` before the
+    # cut, or a computation before the cut) prefers nothing (a scorer-banner note). PREREG209, 40 draws a set, pooled
+    # A0+A+B: +9.3 pp a year (78.8 -> 88.1%), margin-event pairs 37 -> 36, the average worst drawdown 25.7 -> 27.3% (the
+    # add rule's only failed test: the user's call). Off: the daily top pick as before.
+    enable_dip_long_wsb_prefer: bool = True
+    dip_long_wsb_min_titles: int = 5
+    dip_long_wsb_window_hours: float = 120.0
+    dip_long_wsb_cut_et: str = "09:00"
+    dip_long_wsb_max_feed_lag_minutes: float = 60.0
     # THE OWN-SECURITY SERIES (user 2026-10-18: "Yes please apply the fix"; PREREG142's construction,
     # src/signals/dip_security.py, docs/DIP_LONG.md): before the rule reads a name, its deep-store bars are rebuilt from
     # its own security's ticker runs (Polygon's ticker events): a REUSED ticker's older security is cut (SpaceX's SPCX
@@ -3481,6 +3646,71 @@ class Settings(BaseSettings):
     cap_long_account_slices: float = 6.0
     cap_long_max_open: int = 3
     cap_long_entry_window_minutes: float = 60.0
+    # ── THE INSIDER BOOK (PREREG203's O1_20; user 2026-10-24: "Ok. Deploy the Opportunistic, SPY 20%+ down to the live
+    # combine."; src/signals/insider_long.py, docs/INSIDER_LONG.md). When SPY's close at D-1 is at least
+    # `insider_long_spy_drawdown` (20%) under its highest close of the `insider_long_spy_high_sessions` (252) sessions
+    # through it, every company whose officer or director filed an OPEN-MARKET PURCHASE (Form 4 / 4/A, code P) with a
+    # filing date from the session before D to D's eve — an OPPORTUNISTIC insider among the buyers, no ROUTINE one
+    # (Cohen, Malloy & Pomorski: traded in each of the three calendar years before, routine = in the trade's month all
+    # three) — that closed at D-1 at `insider_long_min_price` ($5) or more, traded `insider_long_min_dollar_volume`
+    # ($5M) a day over its last 20 bars and holds `insider_long_min_history` (61) bars, is BOUGHT at D's open (the
+    # largest purchase first), 1/`insider_long_account_slices` (10) of the LIVE ACCOUNT, at most `insider_long_max_open`
+    # (5) open; SOLD at the open after `insider_long_hold_sessions` (60) sessions held. Its capital GIVES WAY FIRST
+    # (quality 0.05: every other book's entry or fill short of room sells its latest longs whole). PREREG203 / 204: +3.68
+    # pp a year in the live account (the add rule's ADD; 2020 and 2022 carry it; PREREG205, as production trades it, +3.76),
+    # the arm FAILING the bank's checks (too few months, one year carrying it), held out +0.84 log points a year. Off: no
+    # buy (open longs still leave on their rule).
+    enable_insider_long: bool = True
+    insider_long_dir: str = "cache/ml/insider_long"   # gate / signals / entries / exits journals
+    insider_long_gate_symbol: str = "SPY"
+    insider_long_spy_drawdown: float = 0.20
+    insider_long_spy_high_sessions: int = 252
+    insider_long_spy_min_sessions: int = 200
+    insider_long_min_price: float = 5.0
+    insider_long_min_dollar_volume: float = 5_000_000.0
+    insider_long_min_history: int = 61
+    insider_long_hold_sessions: int = 60
+    insider_long_account_slices: float = 10.0
+    insider_long_max_open: int = 5
+    insider_long_entry_window_minutes: float = 60.0
+    # ── THE FEAR BOOK (PREREG219-226; user 2026-10-27: "Deploy to production the $1B, 1/6 each, 4 slots."; from the
+    # 2026-10-28 session; src/signals/fear_long.py, docs/FEAR_LONG.md). Every signal of the dip book's day (a common stock /
+    # ADR above its 200-session average with a 2-session RSI under 10, $1B+ a day) trading `fear_long_min_dollar_volume`
+    # ($1B) or more whose IBKR 30-day implied volatility at the signal close sits at or above the `fear_long_ivp_min`
+    # (0.8) percentile of its own `fear_long_ivp_window` (252) sessions (at least `fear_long_ivp_min_values` values) — and
+    # is not the dip book's own order of the day — becomes the capitulation book's limit order (close -
+    # `fear_long_limit_atr` x its 14-session ATR, alive `fear_long_limit_sessions` sessions), IVP highest first, each
+    # 1/`fear_long_account_slices` (6) of the LIVE ACCOUNT, at most `fear_long_max_open` (4) open (working orders count);
+    # SELL at the open after the first close above its `fear_long_exit_sma_sessions` average since the fill, or after
+    # `fear_long_max_hold_sessions` sessions. Its capital GIVES WAY FIRST (quality 0.04, under every other book); it is
+    # ONE BOOK WITH THE DIP BOOK for one book per name. The implied volatility: a detached pre-market fetch from
+    # `fear_long_iv_start_et` to `fear_long_iv_stop_et` on its own client (`ibkr_client_id` +
+    # `fear_long_iv_client_offset`, read-only), one request every `fear_long_iv_gap_seconds`, each bounded by
+    # `fear_long_iv_timeout_seconds`, merged into `fear_long_iv_dir` (never delete). PREREG225 / 226 (40 draws a set):
+    # 88.21 -> 93.04% a year (+4.83 +- 0.27 pp, every set), the worst 12 months +8.0 -> +7.9%, up to 71% of equity in one
+    # name (the dip and fear books together). Off: no order (open longs still leave on their rule).
+    enable_fear_long: bool = True
+    # its first session (YYYY-MM-DD; empty: none): before it no fetch, no order, no banner check of the day — the code
+    # was deployed between ticks of the 2026-10-27 session, whose pre-market fetch never ran
+    fear_long_first_session: str = "2026-10-28"
+    fear_long_dir: str = "cache/ml/fear_long"         # ivp / signals / orders / entries / exits journals
+    fear_long_iv_dir: str = "data/ibkr_iv"            # IBKR's daily implied volatility, one file a name (never delete)
+    fear_long_ivp_min: float = 0.8
+    fear_long_ivp_window: int = 252
+    fear_long_ivp_min_values: int = 126
+    fear_long_min_dollar_volume: float = 1_000_000_000.0
+    fear_long_limit_atr: float = 0.5
+    fear_long_limit_sessions: int = 3
+    fear_long_exit_sma_sessions: int = 3
+    fear_long_max_hold_sessions: int = 5
+    fear_long_account_slices: float = 6.0
+    fear_long_max_open: int = 4
+    fear_long_entry_window_minutes: float = 60.0
+    fear_long_iv_start_et: str = "08:30"
+    fear_long_iv_stop_et: str = "09:27"
+    fear_long_iv_client_offset: int = 68
+    fear_long_iv_gap_seconds: float = 12.0              # IBKR's pacing: at most 60 historical requests in 10 minutes
+    fear_long_iv_timeout_seconds: float = 60.0
     # ── THE ETF DUAL-MOMENTUM BOOK (user 2026-10-08: "Improve the ETF trading strategy focussing only on ETFs alone
     # ... Don't stop until you have a working, proven algo that can trade ETFs"; src/signals/etf_dm.py, PREREG46-51,
     # memory/etf-dual-momentum-2026-10.md). At each month's last close, the fund of `etf_dm_universe` with the best

@@ -38,6 +38,8 @@ def _cls(argv, cwd=PROJECT):
     ["-m", "src.signals.sel_short", "--prepare", "--day", "2026-10-21"],
     ["-m", "src.scheduler.eod", "--day", "2026-10-21"],
     ["-m", "src.accounts.run", "--account", "second"],          # the second account's tick (2026-10-23)
+    ["-m", "src.signals.refusal_probe", "--day", "2026-10-26"],  # IBKR's refusals asked in the evening (2026-10-24)
+    ["-m", "src.signals.fear_long", "--fetch", "--day", "2026-10-28"],   # the fear book's implied volatility (2026-10-28)
     ["-m", "src.data.deep.refresh", "--profile", "nightly", "--budget-seconds", "14400"],
     ["-m", "src.performance.spread_sweep"],
     ["-m", "src.analysis.deep_features", "--snapshot", "2026-10-21"],

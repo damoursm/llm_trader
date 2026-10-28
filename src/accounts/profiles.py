@@ -25,7 +25,7 @@ from config.settings import settings
 # The books a profile can trade: the selection short's arms (through `sel_short_traded_arms`) and the long books
 # (each by its switch); every book the profile does not name is off in the account's process.
 SHORT_ARMS = ("vol", "etf", "fall")
-LONG_BOOKS = ("dip", "crash", "cap")
+LONG_BOOKS = ("dip", "crash", "cap", "ins", "fear")
 BOOKS = SHORT_ARMS + LONG_BOOKS
 NO_ARM = "none"                                   # a traded-arms list naming no real arm
 CALCULATED_BROKER_MODE = "dry_run"                # an extra account's orders: logged, never sent
@@ -41,6 +41,23 @@ def books_of(raw) -> List[str]:
     if bad:
         raise ValueError(f"unknown books {bad} (known: {list(BOOKS)})")
     return books
+
+
+def short_arms_traded() -> List[str]:
+    """The selection short's arms the enabled extra accounts trade (none while `enable_extra_accounts` is off) — the
+    main account asks IBKR about their picks it settles before a what-if (`tracker.ask_unasked_sel_short`)."""
+    if not bool(getattr(settings, "enable_extra_accounts", False)):
+        return []
+    out: List[str] = []
+    for name in list(getattr(settings, "extra_accounts", []) or []):
+        if name != "second":                                    # the one profile (`env_for`)
+            continue
+        try:
+            books = books_of(settings.second_account_books)
+        except ValueError:
+            continue
+        out += [a for a in SHORT_ARMS if a in books and a not in out]
+    return out
 
 
 def env_for(name: str) -> Dict[str, str]:
@@ -61,6 +78,8 @@ def env_for(name: str) -> Dict[str, str]:
         "ENABLE_DIP_LONG": "true" if "dip" in books else "false",
         "ENABLE_CRASH_LONG": "true" if "crash" in books else "false",
         "ENABLE_CAP_LONG": "true" if "cap" in books else "false",
+        "ENABLE_INSIDER_LONG": "true" if "ins" in books else "false",
+        "ENABLE_FEAR_LONG": "true" if "fear" in books else "false",
         "ENABLE_ETF_DM": "false",
         # the main account's shadows and its journals stay the main account's
         "ENABLE_SEL_SHORT_NEWS_HOLD_SHADOW": "false",

@@ -4,8 +4,9 @@ mimic production as best as possible.").
 The engine (`account.simulate`) and the adapters keep their earlier behaviour by default; `Mimic` switches on each way
 the live account differed from the simulator, and `live_books` / `live_strategies` / `live_rules` assemble the live
 combination — the selection short's vol / ETF / fall arms at 1/20 / 1/16 / 1/12 (at most two of one name), the dip
-book's daily top pick at 1/6 (the earnings dips ranked last) and the crash book's TQQQ at 1/4 in one $10,000 account
-(`src/performance/live_account.py`) — under it; V6's pressure extras are installed by the study harness, not here. Every switch is on by default; `Mimic.off()` runs the earlier
+book's daily top pick at 1/6 (the earnings dips ranked last) and the crash book's TQQQ at 1/4 in one account
+(`src/performance/live_account.py`; production's $50,000 from PREREG227's S6, ``Mimic.start``; $10,000 before) —
+under it; V6's pressure extras are installed by the study harness, not here. Every switch is on by default; `Mimic.off()` runs the earlier
 simulator's rules (with PREREG63's bug fixes), `Mimic().without("ext")` one fix's ablation.
 
 * ``lend`` — after IBKR's archived short-stock file ends (2024-06-24) the simulator took every pick as lendable; now a
@@ -40,9 +41,11 @@ simulator's rules (with PREREG63's bug fixes), `Mimic().without("ext")` one fix'
   points vs IBKR's own fees, v2 +0.90); "v2": PREREG67's (log1p + Duan's smearing). ETFs keep the old fill.
 * ``house`` — each stock short carries the house rates IBKR quoted for one of the 36 names it priced on 2026-10-05
   (``optvol/house_mix.json``) and the live sizing's shrink (a slice x 2.86 / rate above 2.86,
-  `Strategy.shrink_budget`); IBKR refuses any opening short in `REFUSAL_RATE` of the stock picks (live's what-if,
-  error 201) — the vol arm's same-bar fallback takes the next candidate, as live. ETFs keep 2.00 / 2.86 (one live ETF
-  quote, 0.78 / 0.85: the defaults overstate them) and are never refused.
+  `Strategy.shrink_budget`); IBKR refuses any opening short in a stock pick (live's what-if, error 201) BY NAME, from
+  2026-10-24 (``refusal`` "model": PREREG190's refusal model on PREREG193's listing model, a versioned table of the
+  probability per (name, session), one uniform per name — `is_refused`; "rate", `Mimic(**PRE193)`: `REFUSAL_RATE` of
+  the picks at random) — the vol arm's same-bar fallback takes the next candidate, as live. ETFs keep 2.00 / 2.86
+  (one live ETF quote, 0.78 / 0.85: the defaults overstate them) and are never refused.
 * ``entry`` — a short enters at its PICK bar's close, stamped at that bar's end (live: ~2-3 minutes after it), its
   first exit check at the next bar (was: the next bar's close).
 * ``r201`` — Rule 201 does not delay the entry: the ledger opens at the live price (only the broker offers passively).
@@ -151,6 +154,14 @@ pinned by `tests/test_live_liquidation.py`). THE MARGIN CHECK SEES WHAT PRODUCTI
 the piece's previous mark, as production's check reads every bar completed since its last — and ``ext_longs`` — every
 long book marked at the off-grid ticks (the crash and capitulation books too).
 
+THE PARITY AUDIT'S CORRECTIONS (PREREG227; the user 2026-10-27: "Do S1 to S8 now. For S6, both the simulated and live
+accounts should be at $50,000."; the defaults from 2026-10-27, ``Mimic(**PRE227)`` / `Mimic.off()` without):
+``open_order`` (S1, the capitulation and fear books' open fills at the attainable 09:30:30 price — the three books fill
+at an open in production's order), ``crash_reenter`` (S2), ``vol_walk`` (S3, the fallback walked to the account through
+the halt model's chains), ``div_all`` (S4), ``quote_all`` (S5), ``start`` (S6, production's $50,000); S7 (the numbers the
+simulator held as copies read from production's settings) and S8 (set D's open-at-end capitulation and fear signals)
+change nothing of sets A0 / A / B. `docs/BACKTEST.md` "The parity audit's corrections".
+
 Not modelled (no history): in-window borrow retries before 2026-09-25, late prints at the scorer's cutoff, a leg the
 broker filled (the ledger charges its own realized cost), IBKR's intraday house-rate raises on a squeezing name, the
 overnight session (no stored price; production checks it at its overnight ticks).
@@ -160,7 +171,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field, fields, replace
 from statistics import NormalDist
 from functools import lru_cache
@@ -172,6 +185,7 @@ import pandas as pd
 
 from config import settings
 from src.backtest import account as A
+from src.utils import ET as ET_TZ
 
 ET = "America/New_York"
 EPOCH = pd.Timestamp("1970-01-01")
@@ -181,6 +195,19 @@ EPOCH = pd.Timestamp("1970-01-01")
 from src.backtest.periods import DATA_START, LEND_ARCHIVE_END, OWN_ARCHIVE_FROM  # noqa: E402
 ETF_LEND_RATE = 0.827                   # the ETF arm's picks IBKR's archived file could lend, 2021-02 .. 2024-06: 62/75
 REFUSAL_RATE = 0.07                     # IBKR refused any opening short in ~7% of the vol book's names (2026-10-05)
+# PREREG190 / 193 — IBKR'S REFUSALS BY NAME (the user 2026-10-24: "Make the switch right away but still refit/recalibrate
+# the model to make it better in the future"; `Mimic.refusal` "model", the default from 2026-10-24): each stock row of
+# the short stores carries the probability that IBKR refuses an opening short in it — PREREG190's refusal model (M2c)
+# on PREREG193's listing model (the rebuilt microcap rule's state and its age turned into the probability that IBKR
+# lists the name; held out on IBKR's own past lists, log loss 0.223 against the rule's 0.433) — in a VERSIONED table
+# built by the study (`refusal_path`), drawn against ONE uniform per name (a refusal is a lasting state). A refit is a
+# new version, made the default deliberately with the bank rebuilt on it; ``Mimic(**PRE193)`` restores the random
+# `REFUSAL_RATE` per (name, session), which `refused` draws (the studies before it patch that function).
+REFUSAL_TABLES = {"v1": "refusal_p_v1.pkl"}
+REFUSAL_TABLE = "v1"
+# the last of IBKR's microcap lists each table's listing model was fitted on (the live calibration notes a refit due
+# once the daily archive holds `refusal_listing_refit_sessions` lists after it)
+REFUSAL_LISTS_THROUGH = {"v1": "2026-10-23"}
 # AUDIT151's L_INTRA (`Mimic.lend_intra`, the default from 2026-10-19): P(still lendable at the trade | lendable on the
 # community archive's MORNING file, ~07:15 ET) by that file's pool at the pick — <= $250k / $250k-1M / > $1M — then
 # set B's drawn picks (a model of those morning files) and the ETF arm's set-B rate; our own per-tick archive, 16
@@ -208,6 +235,22 @@ PRE174 = {"margin": "all"}
 # the marks before PREREG175 became `Mimic()`'s default (2026-10-21): an off-grid tick's high and low the bar ending at
 # it only, and only the dip book marked at the off-grid ticks — ``Mimic(**PRE175)`` reproduces PREREG174's draws
 PRE175 = {"margin_bars": "tick", "ext_longs": ("dip",)}
+# IBKR's refusals before PREREG193's switch (2026-10-24): `REFUSAL_RATE` at random per (name, session) —
+# ``Mimic(**PRE193)`` reproduces every study before it (and lets a study's patched `refused` decide)
+PRE193 = {"refusal": "rate"}
+# the live combination before THE INSIDER BOOK (production from the 2026-10-26 session, PREREG205): ``Mimic(**PRE205)``
+# reproduces every study before it (LIVE193's draws among them)
+PRE205 = {"ins": False}
+# the dip book's daily top pick before THE WALLSTREETBETS PREFERENCE (production from the 2026-10-26 session, PREREG209's
+# KD+): ``Mimic(**PRE209)`` reproduces every study before it (LIVE205's draws among them)
+PRE209 = {"dip_wsb": None}
+# THE FEAR BOOK (production from the 2026-10-28 session; PREREG219-226): ``Mimic(**PRE226)`` reproduces every study
+# before it (KDp's draws, `bank.LIVE_RUNS` before the deploy, among them)
+PRE226 = {"fear": False}
+# THE PARITY AUDIT'S CORRECTIONS S1-S6 and the $50,000 account (PREREG227, the defaults from 2026-10-27):
+# ``Mimic(**PRE227)`` reproduces every study before it (E2s4's draws, `bank.LIVE_RUNS` at the fear book's deploy)
+PRE227 = {"open_order": False, "crash_reenter": False, "vol_walk": False, "div_all": False, "quote_all": False,
+          "start": 10_000.0}
 FULL = Path("cache/ml/deep/bars30m_full/parts")
 DELISTED = Path("cache/ml/deep/bars30m_delisted/parts")
 BAR_NS = 30 * 60 * 10**9
@@ -215,12 +258,16 @@ DAY_NS = 86400 * 10**9
 # the live account's books and the PREREG57 / 61 combination's priorities and capital qualities (`Strategy.quality`:
 # every short outranks the dip book, which gives way)
 BOOK = {"vol": "sel_short", "etf": "sel_short", "fall": "sel_short", "dip": "dip_long", "crash": "crash_long",
-        "cap": "cap_long"}
+        "cap": "cap_long", "ins": "insider_long", "fear": "fear_long"}
+# the book a strategy counts as for one book per name (the engine's ``Strategy.book``) where it is not its own: the
+# fear book is ONE BOOK WITH THE DIP BOOK (PREREG223's M1; production's `books.SHARED_NAMES`)
+NAME_BOOK = {"fear": BOOK["dip"]}
 # research books, never live (no production mechanism; `BOOK` stays the live arms', pinned to the live calibration's
 # map): PREREG154's QQQ sleeve
 RESEARCH_BOOK = {"sleeve": "qqq_sleeve"}
-PRIORITY = {"vol": 0, "etf": 1, "fall": 2, "crash": 5, "dip": 6, "cap": 7, "sleeve": 99}
-QUALITY = {"vol": 1.3, "etf": 0.7, "fall": 1.48, "crash": 0.2, "dip": 0.13, "cap": 0.1, "sleeve": 0.0}
+PRIORITY = {"vol": 0, "etf": 1, "fall": 2, "crash": 5, "dip": 6, "cap": 7, "ins": 8, "fear": 9, "sleeve": 99}
+QUALITY = {"vol": 1.3, "etf": 0.7, "fall": 1.48, "crash": 0.2, "dip": 0.13, "cap": 0.1, "ins": 0.05, "fear": 0.04,
+           "sleeve": 0.0}
 FIXES = ("lend", "house", "entry", "r201", "ext", "costs", "trigger", "order", "cagap")
 # PREREG99: production's halt guard (V0) and the registered variants H1a / H1b / H2 / H3 (`src/backtest/halts.py`)
 HALT_MODES = ("guard", "wait", "wait_half", "backup", "both")
@@ -294,6 +341,17 @@ def _prod_dip_rank() -> str:
     return str(getattr(settings, "dip_long_rank", "rsi2") or "rsi2") if _prod_dip_topk() else "rsi2"
 
 
+def _prod_dip_wsb() -> Optional[Tuple[int, float, str]]:
+    """Production's WallStreetBets preference in the daily top pick (PREREG209's KD+, from the 2026-10-26 session):
+    (`dip_long_wsb_min_titles`, `dip_long_wsb_window_hours`, `dip_long_wsb_cut_et`) while `enable_dip_long_wsb_prefer`
+    and the daily top pick are on, else None — production prefers inside `dip_long._daily_top` only."""
+    if not (bool(getattr(settings, "enable_dip_long_wsb_prefer", False)) and _prod_dip_topk()):
+        return None
+    return (int(getattr(settings, "dip_long_wsb_min_titles", 5)), float(getattr(settings, "dip_long_wsb_window_hours",
+                                                                                120.0)),
+            str(getattr(settings, "dip_long_wsb_cut_et", "09:00")))
+
+
 def _prod_dip_order_floor() -> Optional[float]:
     """Production's daily top pick floor (PREREG147's S3, from the 2026-10-19 session): `dip_long_order_min_dollar_volume`
     while the daily top pick is on (production applies it inside `dip_long._daily_top`), else None; 0 = None."""
@@ -306,6 +364,12 @@ def _prod_dip_order_floor() -> Optional[float]:
 def _prod_dip_filter() -> bool:
     """Production's RP33 cut (`enable_dip_long_filter`, on from the 2026-10-21 session)."""
     return bool(getattr(settings, "enable_dip_long_filter", False))
+
+
+def _prod_turn(arm: str) -> Optional[Tuple[float, int]]:
+    """Production's turn for the fall or ETF arm (PREREG76 / 77) at its numbers (PREREG227's S7):
+    (`sel_short_turn_atr`, `sel_short_turn_sessions`); ``None`` (shorted at the pick) is a study's choice."""
+    return (float(settings.sel_short_turn_atr), int(settings.sel_short_turn_sessions))
 
 
 def _prod_crash_pm_exit() -> bool:
@@ -347,8 +411,10 @@ class Mimic:
     lend_day_r: float = 0.5
     fee_model: bool = True                                   # PREREG67: the fee model where IBKR holds no fee
     fee_version: str = "v4"                                  # PREREG94's F4 ("v2": PREREG67's model)
-    fall_turn: Optional[Tuple[float, int]] = (0.5, 5)        # PREREG76: (k, W) — the faller shorts enter on the turn
-    etf_turn: Optional[Tuple[float, int]] = (0.5, 5)         # PREREG77: (k, W) — the ETF arm enters on the turn
+    # PREREG76 / 77: (k, W) — the faller shorts / the ETF arm enter on the turn; the defaults are production's numbers
+    # (`sel_short_turn_atr` 0.5, `sel_short_turn_sessions` 5; PREREG227's S7: read, not copied)
+    fall_turn: Optional[Tuple[float, int]] = field(default_factory=lambda: _prod_turn("fall"))
+    etf_turn: Optional[Tuple[float, int]] = field(default_factory=lambda: _prod_turn("etf"))
     short_limit: Optional[Tuple[float, int]] = None          # PREREG66: (k, W) — the short arms' sell limits
     short_limit_arms: Tuple[str, ...] = ("vol", "etf", "fall")
     short_limit_through: bool = False
@@ -357,6 +423,12 @@ class Mimic:
     # while `enable_cap_long` is on, `cap_on`); PREREG166's XC: the crash book's after-hours exit (the default follows
     # production's `crash_long_pm_exit`)
     cap: bool = True
+    # PREREG203 / 205 (production from the 2026-10-26 session): the insider book (production's insider_long — built while
+    # `enable_insider_long` is on, `ins_on`)
+    ins: bool = True
+    # PREREG219-226 (production from the 2026-10-28 session): the fear book (production's fear_long — built while
+    # `enable_fear_long` is on, `fear_on`): the dip signals whose implied volatility is in their own top fifth
+    fear: bool = True
     crash_pm_exit: bool = field(default_factory=lambda: _prod_crash_pm_exit())
     # PREREG154 (a RESEARCH book; rejected 2026-10-19, no production book): the QQQ sleeve — the capital no book uses
     # held in QQQ above its 200-session average, as lots that give way first (`strategies/sleeve.py`)
@@ -443,6 +515,12 @@ class Mimic:
     # whose signal's dv20 is at least this many dollars (the pieces' ``dv20``; every order still scored on its $1B day's
     # inputs); the default is production's (`dip_long_order_min_dollar_volume` with the daily top pick on), None = none
     dip_min_order_dv: Optional[float] = field(default_factory=lambda: _prod_dip_order_floor())
+    # PREREG209's KD+ as production runs it (from the 2026-10-26 session, `src/signals/dip_wsb.py`): (min titles, window
+    # hours, cut ET) — on a day where any dip order (after the RP33 cut and the floor) was named in at least min titles
+    # r/wallstreetbets titles created in the window before the cut of its first session, only those flagged orders
+    # compete for the daily top pick (`wsb_preferred`; the history index of the production feed's store,
+    # `dip_wsb.history_index`); the default is production's, None = no preference (`PRE209`)
+    dip_wsb: Optional[Tuple[int, float, str]] = field(default_factory=lambda: _prod_dip_wsb())
     # AUDIT151 (the user's go-ahead 2026-10-19: "Yes please do 1 and 2"): the backtest's model of the market corrected —
     # each ON by default, `Mimic.off()` without them; measured one by one against the deployed configuration (20 paired
     # draws a set, pp a year) and together (68.0% a year instead of 71.6%, `studies/audit151`):
@@ -490,11 +568,46 @@ class Mimic:
     # the bar ending at the tick only (PREREG174's). ``ext_longs``: the long books marked at production's off-grid
     # ticks — production marks every book at every tick; ("dip",) = PREREG174's
     margin_bars: str = "all"
-    ext_longs: Tuple[str, ...] = ("dip", "crash", "cap")
+    ext_longs: Tuple[str, ...] = ("dip", "crash", "cap", "ins", "fear")
+    # PREREG193 — IBKR'S REFUSALS BY NAME (the default from 2026-10-24, `Mimic(**PRE193)` without): ``refusal`` "model" =
+    # the refusal table's probability per (name, session) against one uniform per name (`is_refused`;
+    # ``refusal_table`` its version, `REFUSAL_TABLES`); "rate" = `REFUSAL_RATE` per (name, session) (`refused`)
+    refusal: str = "model"
+    refusal_table: str = REFUSAL_TABLE
+    # PREREG227 — THE PARITY AUDIT'S CORRECTIONS (the user 2026-10-27: "Do S1 to S8 now. For S6, both the simulated and
+    # live accounts should be at $50,000."; the defaults from 2026-10-27, ``Mimic(**PRE227)`` without):
+    # ``open_order`` (S1) — the capitulation and fear books' open fills at IBKR's attainable 09:30:30 price like the dip
+    # book's (`strategies.dip.reprice_open` for the three books, on the extended open-fills table), a fill the rule finds
+    # no price for that session no fill (the order keeps working), one the table cannot price stamped 09:30:30: at every
+    # open the three books fill in production's order — dip, capitulation, fear (`PRIORITY`) — each cut to the room left;
+    # ``crash_reenter`` (S2) — a crash piece for EVERY qualifying session (`strategies.crash.trades(every=True)`), the
+    # one-at-a-time rule rejecting overlaps: a buy the account could not fund, or a long a margin call sold, is bought
+    # again at the next qualifying open (production); ``vol_walk`` (S3) — with the halt model (``halts``), an unlendable
+    # vol pick's backups are walked until the ACCOUNT opens one (`halts.VolMachine(walk=True)`'s chains, the engine's
+    # ``alt_of``: production's `tracker.fallback`), a chain member or extra skipped once the arm opened its name that
+    # session; inert with ``halts=None``; ``div_all`` (S4) — every live long book's dividends (`dividends.ALL_LONG`);
+    # ``quote_all`` (S5) — the insider book's legs at their quotes like the crash book's (IBKR's fees once), the
+    # capitulation and fear books' like the dip book's, a fill moved to a later touch without the open's spread;
+    # ``start`` (S6) — the account's starting equity: production's `sel_short_account_initial` ($50,000 from the
+    # 2026-10-20 fresh start). S7 (the vol / fall / ETF arms' parameters and the turns read from production's settings)
+    # and S8 (the capitulation and fear signals keep one whose exit lies past the data with `strategies.dip.OPEN_END`)
+    # have no switch: they change nothing of sets A0 / A / B
+    open_order: bool = True
+    crash_reenter: bool = True
+    vol_walk: bool = True
+    div_all: bool = True
+    quote_all: bool = True
+    start: float = field(default_factory=lambda: float(settings.sel_short_account_initial))
 
     def __post_init__(self):
         if self.entry and not self.r201:
             raise ValueError("entry at the pick bar mimics the ledger, which opens at the live price: it needs r201")
+        for name in ("open_order", "crash_reenter", "vol_walk", "div_all", "quote_all"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be True or False, not {getattr(self, name)!r}")
+        v = self.start
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) or float(v) <= 0:
+            raise ValueError(f"start must be a positive amount of dollars, not {v!r}")
         d = self.delever
         if d is not None and not (isinstance(d, tuple) and len(d) == 2 and 0 < float(d[1]) <= float(d[0])):
             raise ValueError(f"delever must be None or (trigger, target) with 0 < target <= trigger, not {d!r}")
@@ -504,6 +617,10 @@ class Mimic:
             raise ValueError(f"dip_demote: no file {self.dip_demote!r}")
         if self.dip_scores is not None and not Path(self.dip_scores).exists():
             raise ValueError(f"dip_scores: no file {self.dip_scores!r}")
+        w = self.dip_wsb
+        if w is not None and not (isinstance(w, tuple) and len(w) == 3 and int(w[0]) >= 1 and float(w[1]) > 0
+                                  and re.fullmatch(r"\d{1,2}:\d{2}", str(w[2]))):
+            raise ValueError(f"dip_wsb must be None or (min titles >= 1, window hours > 0, 'HH:MM'), not {w!r}")
         e = self.dip_earnings
         if e is not None and (isinstance(e, bool) or not isinstance(e, int) or e < 1):
             raise ValueError(f"dip_earnings must be None or a whole number of sessions >= 1, not {e!r}")
@@ -513,6 +630,10 @@ class Mimic:
             raise ValueError(f"lend_model must be one of {sorted(LEND_P_FILES)}, not {self.lend_model!r}")
         if self.fee_version not in FEE_PRED_FILES:
             raise ValueError(f"fee_version must be one of {sorted(FEE_PRED_FILES)}, not {self.fee_version!r}")
+        if self.refusal not in ("model", "rate"):
+            raise ValueError(f"refusal must be 'model' or 'rate', not {self.refusal!r}")
+        if self.refusal_table not in REFUSAL_TABLES:
+            raise ValueError(f"refusal_table must be one of {sorted(REFUSAL_TABLES)}, not {self.refusal_table!r}")
         for name in ("lend_persist", "lend_day_lam", "lend_day_r"):
             if not 0.0 <= float(getattr(self, name)) < 1.0:
                 raise ValueError(f"{name} must be in [0, 1), not {getattr(self, name)!r}")
@@ -536,7 +657,7 @@ class Mimic:
                 raise ValueError(f"{name} must be True or False, not {getattr(self, name)!r}")
         if not isinstance(self.etf_vix, bool):
             raise ValueError(f"etf_vix must be True or False, not {self.etf_vix!r}")
-        for name in ("dip_filter", "cap", "crash_pm_exit"):
+        for name in ("dip_filter", "cap", "crash_pm_exit", "fear"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be True or False, not {getattr(self, name)!r}")
         if self.margin not in ("ibkr", "all"):
@@ -559,8 +680,9 @@ class Mimic:
             raise ValueError(f"margin_bars must be 'all' or 'tick', not {self.margin_bars!r}")
         el = self.ext_longs
         if (not isinstance(el, tuple) or any(not isinstance(n, str) for n in el) or len(set(el)) != len(el)
-                or set(el) - {"dip", "crash", "cap"}):
-            raise ValueError(f"ext_longs must be a tuple of distinct books among dip / crash / cap, not {el!r}")
+                or set(el) - {"dip", "crash", "cap", "ins", "fear"}):
+            raise ValueError(f"ext_longs must be a tuple of distinct books among dip / crash / cap / ins / fear, not "
+                             f"{el!r}")
         if self.activation is not None and not (isinstance(self.activation, str) and Path(self.activation).is_file()):
             raise ValueError(f"activation must be None or a schedule file, not {self.activation!r}")
         r = self.research
@@ -620,7 +742,8 @@ class Mimic:
                    etf_turn=None, crash=False, lend_persist=0.0, lend_day_lam=0.0, fee_version="v2", draws="iid",
                    etf_vix=True, short_name_cap=None, dip_rank="rsi2", dip_topk=None, dip_slices=10,
                    dip_earnings=None, halts=None, lend_intra=None, etf_reused=True, quote_costs=False,
-                   dip_open=False, dividends=False, dip_filter=False, crash_pm_exit=False, cap=False, margin="all")
+                   dip_open=False, dividends=False, dip_filter=False, crash_pm_exit=False, cap=False, margin="all",
+                   refusal="rate", ins=False, dip_wsb=None, fear=False, **PRE227)
 
     @classmethod
     def borrow_v2(cls, seed: int = 0, **kw) -> "Mimic":
@@ -685,8 +808,47 @@ def house_rates(tkn, day: int, seed: int, *, n: Optional[int] = None) -> Tuple[f
 
 
 def refused(tkn, day: int, seed: int, rate: float = REFUSAL_RATE, *, n: Optional[int] = None) -> bool:
-    """IBKR refuses any opening short in the name that session (what-if error 201)."""
+    """IBKR refuses any opening short in the name that session (what-if error 201) — at random, ``rate`` of the
+    (name, session) draws: `Mimic(**PRE193)`'s rule."""
     return draw_u("refuse", plain(tkn), int(day), seed, n) < rate
+
+
+def refusal_path(version: str = REFUSAL_TABLE) -> Path:
+    """The refusal table of ``version`` (`REFUSAL_TABLES`), beside the short stores."""
+    return Path(settings.backtest_research_dir) / "optvol" / "refusal" / REFUSAL_TABLES[version]
+
+
+@lru_cache(maxsize=4)
+def refusal_table(version: str = REFUSAL_TABLE) -> Tuple[Dict[str, Tuple[np.ndarray, np.ndarray]], float]:
+    """({symbol: (its rows' session day numbers, sorted; their probabilities)}, the stand-in probability of a name
+    without a row) — the table a study built (``rows``: sym, dn, p — one row per (sym, dn); ``p_default``)."""
+    obj = pd.read_pickle(refusal_path(version))
+    by: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for sym, g in obj["rows"].groupby("sym", sort=False):
+        g = g.sort_values("dn", kind="mergesort")
+        by[str(sym)] = (g["dn"].to_numpy(np.int64), g["p"].to_numpy(float))
+    return by, float(obj["p_default"])
+
+
+def refusal_p(sym: str, day: int, version: str = REFUSAL_TABLE) -> float:
+    """The table's probability that IBKR refuses an opening short in ``sym`` at session ``day``: its own row, else its
+    latest earlier row (the state persists), else the table's stand-in."""
+    by, p0 = refusal_table(version)
+    hit = by.get(str(sym))
+    if hit is None:
+        return p0
+    dn, p = hit
+    k = int(np.searchsorted(dn, int(day), side="right")) - 1
+    return float(p[k]) if k >= 0 else p0
+
+
+def is_refused(mim: "Mimic", tkn, day: int) -> bool:
+    """IBKR refuses any opening short in the name that session, by ``mim.refusal``: "model" — the refusal table's
+    probability against ONE uniform per name (`draw_u` "refuse", session 0: a lasting state); "rate" — `refused`."""
+    if mim.refusal == "rate":
+        return refused(tkn, int(day), mim.seed, n=mim.strat_n)
+    sym = plain(tkn)
+    return draw_u("refuse", sym, 0, mim.seed, mim.strat_n) < refusal_p(sym, int(day), mim.refusal_table)
 
 
 LEND_P_FILES = {"v1": "lend_p.npy", "v2": "lend_p_v2.npy"}   # PREREG62's logistic, PREREG67's LightGBM
@@ -804,7 +966,7 @@ def lend_all(eng, mim: Mimic, p_lend: Optional[np.ndarray] = None,
         for i in np.flatnonzero(out):
             k = (sym[i], int(dn[i]))
             if k not in memo2:
-                memo2[k] = refused(k[0], k[1], mim.seed, n=mim.strat_n)
+                memo2[k] = is_refused(mim, k[0], k[1])
             if memo2[k]:
                 out[i] = False
     if mim.lend and mim.lend_intra is not None:
@@ -1622,6 +1784,45 @@ def _a0map(d: Path = NEWS_HOLD_DIR) -> Dict[str, str]:
     return _A0MAP[key]
 
 
+def wsb_preferred(pieces: Sequence[dict], spec: Tuple[int, float, str], log: Optional[dict] = None) -> List[dict]:
+    """PREREG209's KD+ as production runs it (`dip_wsb`, `dip_long._daily_top`) on the simulator's dip order pieces
+    (after the RP33 cut and the floor, before the daily top pick): on an order day (its ``oid``'s first session) where
+    any order's name was in at least ``spec[0]`` r/wallstreetbets titles created in the ``spec[1]`` hours before
+    ``spec[2]`` ET of that session, only those flagged orders stay (PREREG209's patched `rank_pieces`: the same pick as
+    production's flagged-first order for the daily top 1). A session whose window the store does not cover flags
+    nothing. ``log`` counts the days preferred and the orders left out."""
+    import numpy as np
+    from src.signals import dip_wsb as W
+    idx = W.history_index()
+    n_min, hours, cut = int(spec[0]), float(spec[1]), str(spec[2])
+    hh, mm = (int(x) for x in cut.split(":"))
+
+    def flagged(p) -> bool:
+        day = pd.Timestamp(str(p.get("oid")).split("|")[-1]).date()
+        c = datetime(day.year, day.month, day.day, hh, mm, tzinfo=ET_TZ).astimezone(timezone.utc)
+        t1 = int(c.timestamp())
+        t0 = int((c - timedelta(hours=hours)).timestamp())
+        d = datetime.fromtimestamp(t0, timezone.utc).date()
+        while d <= c.date():
+            if d not in idx["days"]:
+                return False
+            d += timedelta(days=1)
+        a = idx["tokens"].get(W.token_of(p["tkn"]))
+        if a is None:
+            return False
+        return int(np.searchsorted(a, t1, "left") - np.searchsorted(a, t0, "left")) >= n_min
+    fl = [flagged(p) for p in pieces]
+    days = {}
+    for p, f in zip(pieces, fl):
+        days.setdefault(str(p.get("oid")).split("|")[-1], []).append(f)
+    pref = {dd for dd, v in days.items() if any(v)}
+    out = [p for p, f in zip(pieces, fl) if str(p.get("oid")).split("|")[-1] not in pref or f]
+    if log is not None:
+        log["wsb_days_preferred"] = len(pref)
+        log["wsb_orders_left_out"] = len(pieces) - len(out)
+    return out
+
+
 def earnings_demoted(oids: Sequence[str], n: int, a0: bool = False) -> frozenset:
     """PREREG137's DEMOTE_E as production runs it (`src/signals/dip_earnings.py`) on the simulator's own dip orders
     (``oids``: "NAME|D"): the orders whose company released earnings — an 8-K / 8-K/A naming Item 2.02, in the deep
@@ -1698,12 +1899,14 @@ class LedgerCosts:
                                      model_price=None, fill_price=None, commission=None, adv=adv)
         return float(f) * 1e4
 
-    def apply(self, p: dict, side: int, legs: bool = True, adv: Optional["DailyADV"] = None, quotes=None) -> dict:
+    def apply(self, p: dict, side: int, legs: bool = True, adv: Optional["DailyADV"] = None, quotes=None,
+              quote_kw: Optional[dict] = None) -> dict:
         """The piece with the ledger's costs: its entry and exit legs' (``legs``) and the exit estimate its marks are
         net of (``hs_mark``: a regular-hours leg at the entry price). The liquidity class reads production's
         dollar-volume basis as of each leg's day (``adv``: `DailyADV`; else the piece's 20-session mean).
         ``quotes`` (AUDIT151's C_QUOTE, `src/backtest/quotes.py`): the market legs then at their REAL quoted
-        half-spreads — the marks stay net of the ledger's estimate, as production marks its open trades."""
+        half-spreads — the marks stay net of the ledger's estimate, as production marks its open trades;
+        ``quote_kw``: `QuoteTable.apply`'s books (PREREG227's S5: ``limit_arms`` / ``market_arms``)."""
         q = dict(p)
         dv = float(p["dv20"]) if p.get("dv20") is not None and np.isfinite(p["dv20"]) else None
 
@@ -1717,7 +1920,7 @@ class LedgerCosts:
         rth = pd.Timestamp(f"{pd.Timestamp(int(p['ens']), unit='ns', tz='UTC').tz_convert(ET).date()} 12:00", tz=ET)
         q["hs_mark"] = self.bp(out_side, p["e"], rth.value, a(p["ens"]))
         if quotes is not None:
-            q = quotes.apply(q, p, side, legs)
+            q = quotes.apply(q, p, side, legs, **(quote_kw or {}))
         return q
 
 
@@ -1730,6 +1933,12 @@ def rank_shorts(pieces: Sequence[dict]) -> None:
     pos = {s: i for i, s in enumerate(sorted({plain(p["tkn"]) for p in pieces}))}
     for p in pieces:
         p["rank"] = float(pos[plain(p["tkn"])] * 10 + ARMS.index(p["strategy"]))
+    # PREREG227's S3: one pick's fallback chain is tried in its walk's order, together, at its first member's place
+    # (production walks a pick's backups right after the pick itself)
+    head = {p["alt_of"]: p["rank"] for p in pieces if p.get("alt_of") is not None and int(p.get("alt_k") or 0) == 0}
+    for p in pieces:
+        if p.get("alt_of") is not None and p["alt_of"] in head:
+            p["rank"] = float(head[p["alt_of"]]) + 1e-3 * int(p.get("alt_k") or 0)
 
 
 def live_strategies(mim: Mimic) -> List[A.Strategy]:
@@ -1773,6 +1982,13 @@ def live_strategies(mim: Mimic) -> List[A.Strategy]:
                               yield_first="latest", delever_order=0, delever_first="latest",  # the latest first, and
                               orders="fill", book=BOOK["cap"],                                 # is de-levered first
                               fees="engine" if mim.costs else None))
+    if ins_on(mim):                # PREREG203 / 205: the insider book — 1/10 of the equity, at most 5 open, Reg T,
+        out.append(A.Strategy("ins", 1, slices=float(settings.insider_long_account_slices),   # 1% of the dollar volume;
+                              max_open=int(settings.insider_long_max_open), priority=PRIORITY["ins"],  # capital quality
+                              quality=QUALITY["ins"], preemptible=True, yield_whole=True,   # 0.05: it gives way first,
+                              yield_first="latest", delever_order=0, delever_first="latest",  # whole, the latest first,
+                              book=BOOK["ins"],                                  # de-levered with the capitulation book
+                              fees="engine" if quoted(mim) else None))
     if mim.sleeve:                 # PREREG154: the QQQ sleeve — a lot of the capital no book uses each open, at least
         from src.backtest.strategies import sleeve as SLEEVE                                # its min share;
         out.append(A.Strategy("sleeve", 1, slices=1.0, max_open=None, priority=PRIORITY["sleeve"],
@@ -1786,6 +2002,13 @@ def live_strategies(mim: Mimic) -> List[A.Strategy]:
                               quality=r["quality"], book=r["book"], house_maint=r["rate"], house_init=r["rate"],
                               fees="engine" if (r.get("fees") == "engine" and mim.costs) else None,
                               delever_order=r.get("delever_order")))
+    if fear_on(mim):               # PREREG219-226: the fear book — 1/6 of the equity, at most 4 open (its working orders
+        out.append(A.Strategy("fear", 1, slices=float(settings.fear_long_account_slices),     # count), capital quality
+                              max_open=int(settings.fear_long_max_open), priority=PRIORITY["fear"],  # 0.04: it gives
+                              quality=QUALITY["fear"], preemptible=True, yield_whole=True,  # way first, whole, the
+                              yield_first="latest", delever_order=0, delever_first="latest",  # latest first, de-levered
+                              orders="fill", book=NAME_BOOK["fear"],      # first; ONE BOOK WITH THE DIP BOOK for one book
+                              fees="engine" if mim.costs else None))      # per name (PREREG223's M1)
     return out
 
 
@@ -1804,6 +2027,16 @@ def cap_on(mim: Mimic) -> bool:
     return bool(mim.cap) and bool(getattr(settings, "enable_cap_long", False))
 
 
+def fear_on(mim: Mimic) -> bool:
+    """The fear book is built (PREREG219-226): the Mimic's ``fear`` and production's `enable_fear_long`."""
+    return bool(mim.fear) and bool(getattr(settings, "enable_fear_long", False))
+
+
+def ins_on(mim: Mimic) -> bool:
+    """The insider book is part of the live combination: production's switch and the mimic's."""
+    return bool(mim.ins) and bool(getattr(settings, "enable_insider_long", False))
+
+
 def margin_rules(mim: Mimic) -> dict:
     """The account's margin calls (PREREG174): IBKR's liquidation judged on the bars' extremes (``margin_check``
     "bars") or at the tick marks, or every position closed at once (``margin`` "all", judged where ``trigger`` says)."""
@@ -1815,17 +2048,17 @@ def margin_rules(mim: Mimic) -> dict:
 
 
 def live_rules(mim: Mimic) -> A.Rules:
-    # PREREG154 / 165: with the QQQ sleeve or the capitulation book a dip order is sized at placement as if their lots
-    # were freed and its fill sells them for room (`Rules.fills_make_room`; inert without a lower-quality preemptible
-    # book)
-    return A.Rules(**margin_rules(mim),
+    # PREREG154 / 165 / 205: with the QQQ sleeve, the capitulation book or the insider book a dip (or capitulation)
+    # order is sized at placement as if the lower-quality lots were freed and its fill sells them for room
+    # (`Rules.fills_make_room`; inert without a lower-quality preemptible book)
+    return A.Rules(start=float(mim.start), **margin_rules(mim),                  # PREREG227's S6: production's start
                    delever=(tuple(float(x) for x in mim.delever) if mim.delever is not None else
                             (float(settings.live_account_delever_trigger), float(settings.live_account_delever_target))),
                    one_book_per_name=True, fees="ledger" if mim.costs else "engine", mark_net=bool(mim.costs),
-                   fills_make_room=bool(mim.sleeve) or cap_on(mim),
+                   fills_make_room=bool(mim.sleeve) or cap_on(mim) or ins_on(mim) or fear_on(mim),
                    # production's fill give-way (`live_account.fill_give_way_plan`): the fill's own size decides; on
                    # PREREG167's 60 accounts identical to the slice-capped rule (2026-10-20)
-                   fill_room_exact=cap_on(mim))
+                   fill_room_exact=cap_on(mim) or ins_on(mim) or fear_on(mim))
 
 
 def turn_lend(eng, mim: Mimic, L: np.ndarray) -> Optional[Callable[[int, int, float], bool]]:
@@ -1849,8 +2082,16 @@ def turn_lend(eng, mim: Mimic, L: np.ndarray) -> Optional[Callable[[int, int, fl
         lend, _ = lendable_at(sym, pd.Timestamp(int(ns), unit="ns", tz="UTC"), float(price))
         if lend is False:
             return False
-        return not (mim.house and refused(sym, int(dn[row]), mim.seed, n=mim.strat_n))
+        return not (mim.house and is_refused(mim, sym, int(dn[row])))
     return ok
+
+
+def etf_rule_kw() -> Dict:
+    """The ETF arm's trade rule at production's numbers (PREREG227's S7; `EtfArm.pieces`' keywords, the values it held
+    as numbers): the 6x cover (`sel_short_cover_multiple`), the crowding cut (`sel_short_max_days_to_cover`) and the
+    relative-volume cut (`sel_short_vol_min_rvol`) — the switches stay the simulator's (`strategies.vol.LIVE`'s rule)."""
+    return {"cover": float(settings.sel_short_cover_multiple), "max_dtc": float(settings.sel_short_max_days_to_cover),
+            "min_rvol": float(settings.sel_short_vol_min_rvol)}
 
 
 def short_extra(mim: Mimic) -> Dict:
@@ -2015,6 +2256,7 @@ def live_books(lo, hi, mim: Mimic, eng=None, etf=None, panel=None, bars: Optiona
             books["etf"] = (etf.pieces if halt is None else halt.etf_pieces(etf))(
                 lo, hi, give=float(getattr(settings, "sel_short_etf_give_back", 0.5)),
                 hmax=int(getattr(settings, "sel_short_arm_max_hold_sessions", 15)),     # 10 from 2026-10-20 (PREREG159)
+                **etf_rule_kw(),                     # PREREG227's S7: the cover and the two cuts from the settings
                 entry="pick" if mim.entry else "next",
                 lend_after=etf_lend if mim.lend else None, cagap=mim.cagap, ctx=True,
                 limit=lim if mim.limited("etf") else None, through=thru,
@@ -2042,14 +2284,25 @@ def live_books(lo, hi, mim: Mimic, eng=None, etf=None, panel=None, bars: Optiona
             demote = (_demoted(mim.dip_demote) if mim.dip_demote is not None else
                       earnings_demoted([p["oid"] for p in books["dip"] if p.get("oid") is not None],
                                        mim.dip_earnings, a0) if mim.dip_earnings else None)
+            if mim.dip_wsb:                                     # PREREG209's KD+: a day's flagged orders only
+                books["dip"] = wsb_preferred(books["dip"], mim.dip_wsb, log)
             books["dip"] = DIP.rank_pieces(books["dip"], DIP.filter_scores(mim.dip_scores), by=mim.dip_rank,
                                            topk=mim.dip_topk, demote=demote)
         if cap_on(mim):                                        # PREREG165 / 167: production's cap_long, its own pieces
             from src.backtest.strategies import cap as CAP
             books["cap"] = CAP.pieces(lo, hi, panel=panel, period="A0" if a0 else None)
+        if fear_on(mim):                                       # PREREG219-226: production's fear_long, its own pieces —
+            from src.backtest.strategies import fear as FEAR   # the dip book's own orders of the day left out
+            dip_oids = {str(p["oid"]) for p in books["dip"] if p.get("oid") is not None}
+            books["fear"] = [p for p in FEAR.pieces(lo, hi, panel=panel, period="A0" if a0 else None)
+                             if str(p["oid"]) not in dip_oids]
         if crash_on(mim):                                      # PREREG86: production's crash_long, its own pieces
             from src.backtest.strategies import crash as CRASH
-            books["crash"] = CRASH.pieces(lo, hi, period="A0") if a0 else CRASH.pieces(lo, hi)
+            ck = {"every": True} if mim.crash_reenter else {}  # PREREG227's S2: every qualifying session a candidate
+            books["crash"] = CRASH.pieces(lo, hi, period="A0", **ck) if a0 else CRASH.pieces(lo, hi, **ck)
+        if ins_on(mim):                                        # PREREG203 / 205: production's insider_long
+            from src.backtest.strategies import insider as INS
+            books["ins"] = INS.pieces(lo, hi, period="A0" if a0 else None)
         if mim.sleeve:                                         # PREREG154: the QQQ sleeve's candidate lots
             from src.backtest.strategies import sleeve as SLEEVE
             books["sleeve"] = SLEEVE.pieces(lo, hi, period="A0") if a0 else SLEEVE.pieces(lo, hi)
@@ -2150,11 +2403,21 @@ def live_books(lo, hi, mim: Mimic, eng=None, etf=None, panel=None, bars: Optiona
             books[n] = [costs.apply(p, -1, adv=adv, **qk) for p in books[n]]
         books["dip"] = [costs.apply(p, 1, legs=False, adv=adv, **qk) if int(p.get("ord_k", 0)) >= 0 else p
                         for p in books["dip"]]
+        # PREREG227's S5 (``quote_all``): the capitulation and fear books' legs at their quotes as the dip book's, the
+        # insider book's buys and sells at the open both at their quotes as the crash book's (IBKR's fees once, the
+        # engine's: no ledger all-in cost under them)
+        lk = {"quote_kw": {"limit_arms": ("dip", "cap", "fear")}} if (qt is not None and mim.quote_all) else {}
+        mk = {"quote_kw": {"market_arms": ("crash", "ins")}} if (qt is not None and mim.quote_all) else {}
         if "cap" in books:                                     # limit orders, as the dip book's
-            books["cap"] = [costs.apply(p, 1, legs=False, adv=adv, **qk) if int(p.get("ord_k", 0)) >= 0 else p
+            books["cap"] = [costs.apply(p, 1, legs=False, adv=adv, **qk, **lk) if int(p.get("ord_k", 0)) >= 0 else p
                             for p in books["cap"]]
+        if "fear" in books:                                    # the fear book's: the same
+            books["fear"] = [costs.apply(p, 1, legs=False, adv=adv, **qk, **lk) if int(p.get("ord_k", 0)) >= 0 else p
+                             for p in books["fear"]]
         if "crash" in books:                                   # market buys / sells at the open: both legs
             books["crash"] = [costs.apply(p, 1, adv=adv, **qk) for p in books["crash"]]
+        if "ins" in books:                                     # the insider book's: the same
+            books["ins"] = [costs.apply(p, 1, adv=adv, **qk, **mk) for p in books["ins"]]
         if "sleeve" in books:                                  # PREREG154: the same, every lot at the open
             books["sleeve"] = [costs.apply(p, 1, adv=adv, **qk) for p in books["sleeve"]]
         for name in mim.research:                              # PREREG110: market orders at the open, both legs
@@ -2171,19 +2434,28 @@ def live_books(lo, hi, mim: Mimic, eng=None, etf=None, panel=None, bars: Optiona
         for n in SHORT_ARMS:
             for p in books[n]:
                 p["group"] = plain(p["tkn"])
-    if mim.dip_open and books.get("dip"):      # AUDIT151's D_OPEN: an open fill at IBKR's attainable price (09:30:30)
+    # AUDIT151's D_OPEN: an open fill at IBKR's attainable price (09:30:30). PREREG227's S1 (``open_order``): the
+    # capitulation and fear books' open fills too, a fill without a price that session dropped (the order keeps
+    # working), one the table cannot price stamped 09:30:30 — the three then fill in production's order at the open;
+    # S5 (``quote_all``): a fill moved to a later touch pays no spread
+    ok = {"books": ("dip", "cap", "fear"), "none_drops": True, "stamp_unknown": True} if mim.open_order else {}
+    if mim.quote_all and quoted(mim):
+        ok = dict(ok, touch_free=True)
+    if mim.dip_open and books.get("dip"):
         log = log if log is not None else {}
-        books["dip"] = [DIP.reprice_open(p, log) for p in books["dip"]]
-    if mim.dip_open and books.get("cap"):      # the capitulation book's open fills likewise
-        log = log if log is not None else {}
-        cl: dict = {}
-        books["cap"] = [DIP.reprice_open(p, cl) for p in books["cap"]]
-        for k_, v_ in cl.items():
-            log[f"cap_{k_}"] = log.get(f"cap_{k_}", 0) + v_
+        books["dip"] = [q for q in (DIP.reprice_open(p, log, **ok) for p in books["dip"]) if q is not None]
+    for n in ("cap", "fear"):                  # the capitulation and fear books' likewise (before PREREG227 a no-op:
+        if mim.dip_open and books.get(n):      # `reprice_open` repriced the dip book's pieces only)
+            log = log if log is not None else {}
+            nl: dict = {}
+            books[n] = [q for q in (DIP.reprice_open(p, nl, **ok) for p in books[n]) if q is not None]
+            for k_, v_ in nl.items():
+                log[f"{n}_{k_}"] = log.get(f"{n}_{k_}", 0) + v_
     if mim.dividends:                          # AUDIT151's DIV: a short pays, a long receives (after the repricing)
         from src.backtest import dividends as DIV
         log = log if log is not None else {}
         dl: List[dict] = []
-        books = {k: [DIV.adjust(p, dl) for p in v] for k, v in books.items()}
+        longs = DIV.ALL_LONG if mim.div_all else None          # PREREG227's S4: every live long book
+        books = {k: [DIV.adjust(p, dl, longs=longs) for p in v] for k, v in books.items()}
         log["div_events"] = len(dl)
     return books

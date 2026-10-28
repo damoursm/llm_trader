@@ -61,19 +61,22 @@ class QuoteTable:
             return v, False
         return self.med.get((arm, leg), default), True
 
-    def apply(self, q: dict, p: dict, side: int, legs: bool) -> dict:
+    def apply(self, q: dict, p: dict, side: int, legs: bool, limit_arms: Sequence[str] = ("dip",),
+              market_arms: Sequence[str] = ("crash",)) -> dict:
         """``q`` (the piece with the ledger's costs) with its market legs at their real half-spreads: a short's
-        legs (``legs``) and the crash book's, the dip book's exit and its open-fill entry (``ens`` 09:30 + 2 ns; a
-        later touch rests: 0)."""
+        legs (``legs``) and the ``market_arms``' (the crash book's; PREREG227's S5 adds the insider book's buys and
+        sells at the open), the ``limit_arms``' exit and open-fill entry (``ens`` 09:30 + 2 ns; a later touch rests: 0)
+        — the dip book's, and with S5 the capitulation and fear books' (a leg the store lacks: the dip book's AUDIT151
+        median)."""
         arm, tk = p.get("strategy"), str(p["tkn"])
         ens, xns = int(p["ens"]), int(p["xns"])
         fb = 0
-        if side < 0 and legs or arm == "crash":
+        if side < 0 and legs or arm in market_arms:
             h_in, m_in = self._get(arm, tk, ens, "in", float(q["hs_in"]))
             h_out, m_out = self._get(arm, tk, xns, "out", float(q["hs_out"]))
             q["hs_in"], q["hs_out"] = min(CAP_BP, h_in), min(CAP_BP, h_out)
             fb = int(m_in) | 2 * int(m_out)
-        elif arm == "dip" and int(p.get("ord_k", 0)) >= 0:
+        elif arm in limit_arms and int(p.get("ord_k", 0)) >= 0:
             m_in = False
             if ens % MIN_NS == 2:
                 h_in, m_in = self._get("dip", tk, ens, "in", 1.0)

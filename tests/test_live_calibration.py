@@ -164,12 +164,19 @@ def test_health_reads_the_latest_record_as_notes_never_problems():
     assert h["notes"][1] == "live vs simulator: IBKR refused 1/3 stock picks"
 
 
-def test_assumptions_are_the_simulators():
+def test_assumptions_are_the_simulators(monkeypatch):
+    """The simulator refuses BY NAME from 2026-10-24 (PREREG193): no flat rate to judge the live share against (the
+    refusal model's own check judges it); under `Mimic(**PRE193)`'s rule the 7% comes back."""
     from src.backtest import mimic as M
     a = LC.assumptions()
     assert "error" not in a
-    assert a["refusal_rate"] == M.REFUSAL_RATE and a["entry_delay_min"] == 0.0
-    assert a["house_names"] == len(M.house_mix())
+    assert a["refusal_rate"] is None and a["refusal"] == f"by name: table {M.REFUSAL_TABLE}"
+    assert a["entry_delay_min"] == 0.0 and a["house_names"] == len(M.house_mix())
+    class _Rate:                                                                   # a simulator on PRE193's rule
+        refusal, refusal_table, lend_intra = "rate", M.REFUSAL_TABLE, M.LEND_INTRA
+    monkeypatch.setattr(M, "Mimic", lambda *a, **k: _Rate())
+    b = LC.assumptions()
+    assert b["refusal_rate"] == M.REFUSAL_RATE and b["refusal"] == "rate"
 
 
 def test_the_eod_chain_runs_it_last():
@@ -262,13 +269,16 @@ def test_arms_split_by_sel_arm_and_by_mechanism():
          _closed(mech=books.DIP_LONG, action="BUY", entry_px=100.0, exit_px=101.0, ret=0.9, ticker="DDD"),
          _closed(mech=books.CRASH_LONG, action="BUY", entry_px=50.0, exit_px=52.0, ret=3.8, ticker="TQQQ"),
          _closed(mech=books.CAP_LONG, action="BUY", entry_px=80.0, exit_px=83.0, ret=3.6, ticker="KKK"),
+         _closed(mech=books.INSIDER_LONG, action="BUY", entry_px=20.0, exit_px=24.0, ret=19.5, ticker="III"),
+         _closed(mech=books.FEAR_LONG, action="BUY", entry_px=60.0, exit_px=62.0, ret=3.2, ticker="JJJ"),
          _closed("model"), _closed("vol2"), _closed("thin"),                        # the shadow arms: not counted
          _closed("model+vol", ticker="EEE"),                                         # a pre-2026-10-04 shared stamp
          _closed(mech=books.ETF_DM, action="BUY", ticker="QQQ"),                     # a live book, not an arm
          _closed(mech="rank", action="BUY", ticker="FFF"),                           # legacy
          _closed("vol", entry="2026-10-08T14:00:00+00:00", ticker="GGG")]           # entered before the window
     f = LC.arm_facts(T, date(2026, 10, 9), date(2026, 10, 14))
-    assert {a: f[a]["n"] for a in LC.ARM_KEYS} == {"vol": 3, "etf": 1, "fall": 1, "dip": 1, "crash": 1, "cap": 1}
+    assert {a: f[a]["n"] for a in LC.ARM_KEYS} == {"vol": 3, "etf": 1, "fall": 1, "dip": 1, "crash": 1, "cap": 1,
+                                                   "ins": 1, "fear": 1}
     assert LC.arm_of(_closed("model+vol")) == "vol" and LC.arm_of(_closed("model")) is None
     assert LC.arm_of({"entry_mechanism": books.SEL_SHORT}) is None                 # no arm stamped at all
 
@@ -476,3 +486,180 @@ def test_the_fingerprint_moves_with_an_arms_setting_and_only_its_own(monkeypatch
     after = {a: REL.arm_fingerprint(a) for a in REL.ARMS}
     assert after["dip"] != before["dip"] and all(after[a] == before[a] for a in REL.ARMS if a != "dip")
     assert REL.simulator_fingerprint() == REL.simulator_fingerprint()
+
+
+def _wi(tk, outcome, answer):
+    return {"key": f"2026-10-20|{tk}|fall", "day": "2026-10-20", "arm": "fall", "ticker": tk, "outcome": outcome,
+            "at": "2026-10-20T15:00:00+00:00", "price": 10.0, "ibkr_margin": answer}
+
+
+def test_the_refusal_model_is_scored_on_ibkrs_own_answers(monkeypatch):
+    """PREREG190's model against IBKR's what-if answers: one per pick, a timeout counts in neither, the expected count
+    and the AUC (journal-only)."""
+    from src.signals import sel_refusal as SR
+    probs = {"A": 0.5, "B": 0.5, "C": 0.01, "D": 0.01, "E": 0.01, "F": 0.01, "G": 0.9}
+    monkeypatch.setattr(SR, "model", lambda: {"source": "test"})
+    monkeypatch.setattr(SR, "probability", lambda tk, d, price=None: probs[tk])
+    monkeypatch.setattr("src.signals.sel_short.etf_names", lambda names: [])
+    priced, refused = {"init_rate": 2.9, "maint_rate": 2.0}, {"refused": "closing-only"}
+    entries = [_wi("A", "ibkr_refused", refused), _wi("B", "opened", priced), _wi("C", "opened", priced),
+               _wi("D", "opened", priced), _wi("E", "opened", priced), _wi("F", "ibkr_refused", refused),
+               _wi("F", "ibkr_refused", refused),                       # the same pick journaled twice: one answer
+               _wi("G", "opened", {"error": "timeout"})]                # no answer: in neither
+    f = LC.refusal_model_facts(entries, ["fall"])
+    assert f["n"] == 6 and f["refused"] == 2 and abs(f["expected"] - 1.04) < 1e-9
+    assert abs(f["auc"] - 0.625) < 1e-12 and f["range95"][0] <= 2 <= f["range95"][1]
+    assert LC.pb_range([0.5, 0.5]) == (0, 2) and LC.pb_range([]) == (0, 0)
+
+
+def test_the_refusal_models_notes(monkeypatch):
+    from datetime import timedelta
+    from src.data import ibkr_microcaps
+    monkeypatch.setattr(ibkr_microcaps, "latest_day", lambda before=None: date.today() - timedelta(days=1))
+    assert LC._refusal_notes({"n": 6, "refused": 2, "expected": 1.0, "range95": [0, 3]}) == []
+    off = LC._refusal_notes({"n": 6, "refused": 5, "expected": 0.3, "range95": [0, 1]})
+    assert len(off) == 1 and "its level is off" in off[0]
+    monkeypatch.setattr(settings, "refusal_model_refit_refusals", 20)
+    assert LC._refusal_notes({"n": 400, "refused": 20, "expected": 19.0, "range95": [11, 28]}) == []   # _refit_notes
+    monkeypatch.setattr(ibkr_microcaps, "latest_day", lambda before=None: None)
+    assert any("not archived" in n for n in LC._refusal_notes({"n": 0, "refused": 0, "range95": [0, 0]}))
+
+
+def test_a_whatif_only_answer_is_a_label_never_an_entry_outcome(monkeypatch):
+    """PREREG191's change 3: a pick settled before its what-if (``already_open``) and asked after the live path — its
+    answer counts as IBKR's, its last OUTCOME stays the entry step's."""
+    from src.signals import sel_refusal as SR
+    monkeypatch.setattr("src.signals.sel_short.etf_names", lambda names: [])
+    entries = [_wi("A", "already_open", None),
+               {**_wi("A", "whatif_only", {"refused": "Small Cap"}), "at": "2026-10-20T15:01:00+00:00"},
+               _wi("B", "opened", {"init_rate": 2.9, "maint_rate": 2.0})]
+    f = LC.entry_facts(entries, ["fall"])
+    assert f["outcomes"] == {"already_open": 1, "opened": 1} and f["picks_settled"] == 2
+    assert f["ibkr_refused_stock"]["k"] == 1 and f["ibkr_refused_stock"]["n"] == 2
+    monkeypatch.setattr(SR, "model", lambda: {"source": "test"})
+    monkeypatch.setattr(SR, "probability", lambda tk, d, price=None: 0.2)
+    g = LC.refusal_model_facts(entries, ["fall"])
+    assert g["n"] == 2 and g["refused"] == 1
+
+
+def test_the_evening_probes_answers_are_scored_by_source(monkeypatch, tmp_path):
+    """PREREG191's evening probe against the refusal model: the arms' candidates (picks, top names) apart, an
+    unanswered ask nowhere, the re-asks still refused, the latest run's failure a note."""
+    from src.signals import refusal_probe as RP
+    monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel"))
+    d = RP.probes_dir()
+    d.mkdir(parents=True)
+    rows = [{"ticker": "A", "source": "pick", "refused": "Small Cap", "p_model": 0.6},
+            {"ticker": "B", "source": "top50", "init_rate": 2.9, "maint_rate": 2.0, "p_model": 0.1},
+            {"ticker": "C", "source": "top50", "error": "timeout", "p_model": 0.1},
+            {"ticker": "D", "source": "reask", "refused": "close-only", "p_model": 0.5},
+            {"ticker": "E", "source": "queue", "init_rate": 3.0, "maint_rate": 2.0, "p_model": 0.05}]
+    (d / "2026-10-26.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    (d / "2026-10-27.jsonl").write_text(json.dumps({"ticker": "Z", "source": "pick", "refused": "x", "p_model": 0.1}),
+                                        encoding="utf-8")                    # after the day: not read
+    (d / "2026-10-26.state.json").write_text(json.dumps({"day": "2026-10-26", "stopped": "failed: boom"}),
+                                             encoding="utf-8")
+    f = LC.refusal_probe_facts(date(2026, 10, 26))
+    assert f["answers"] == 4 and f["arms"]["n"] == 2 and f["arms"]["refused"] == 1
+    assert abs(f["arms"]["expected"] - 0.7) < 1e-9 and f["arms"]["auc"] == 1.0
+    assert f["reasks"] == {"n": 1, "still_refused": 1} and set(f["by_source"]) == {"pick", "top50", "reask", "queue"}
+    notes = LC._probe_notes(f)
+    assert len(notes) == 1 and "failed" in notes[0]
+    off = LC._probe_notes({"arms": {"n": 6, "refused": 5, "expected": 0.4, "range95": [0, 2]}})
+    assert len(off) == 1 and "evening probe refused 5/6" in off[0]
+
+
+def test_a_changed_answer_when_asked_again_is_recorded(monkeypatch, tmp_path):
+    """PREREG192's watch: every consecutive pair of IBKR's answers about one name at least an hour apart, the changes
+    either way listed — the studies' imports included, a later day's answers never."""
+    from src.signals import refusal_probe as RP
+    monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel"))
+    d = RP.probes_dir()
+    d.mkdir(parents=True)
+    (d / "import_prereg190.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"ticker": "A", "init_rate": 2.9, "maint_rate": 2.0, "at": "2026-10-23T14:00:00-04:00"},
+        {"ticker": "B", "refused": "Small Cap", "at": "2026-10-23T14:00:00-04:00"},
+        {"ticker": "C", "init_rate": 2.9, "maint_rate": 2.0, "at": "2026-10-23T14:00:00-04:00"}]), encoding="utf-8")
+    (d / "2026-10-30.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"ticker": "A", "source": "watch", "refused": "closing-only", "at": "2026-10-30T17:00:00-04:00"},
+        {"ticker": "B", "source": "reask", "init_rate": 3.1, "maint_rate": 2.2, "at": "2026-10-30T17:01:00-04:00"},
+        {"ticker": "C", "source": "watch", "init_rate": 2.9, "maint_rate": 2.0, "at": "2026-10-30T17:02:00-04:00"},
+        {"ticker": "C", "source": "watch", "refused": "x", "at": "2026-10-30T17:30:00-04:00"}]),   # 28 min later: skipped
+        encoding="utf-8")
+    (d / "2026-11-02.jsonl").write_text(json.dumps({"ticker": "C", "source": "watch", "refused": "later",
+                                                    "at": "2026-11-02T17:00:00-05:00"}), encoding="utf-8")
+    f = LC.refusal_probe_facts(date(2026, 10, 30))
+    tr = f["transitions"]
+    assert tr["pairs"] == 3
+    assert [x["ticker"] for x in tr["to_refused"]] == ["A"] and tr["to_refused"][0]["reason"] == "closing-only"
+    assert [x["ticker"] for x in tr["to_accepted"]] == ["B"]
+
+
+def test_a_refit_is_due_on_new_refusals_since_the_install_and_new_daily_lists(monkeypatch, tmp_path):
+    """The user 2026-10-24: "still refit/recalibrate the model to make it better in the future" — the refusal model's
+    refit is due once `refusal_model_refit_refusals` names are refused after its install (the probe, the live record,
+    the studies' imports; an answer before the install never counts), the listing model's once IBKR's daily list is
+    archived `refusal_listing_refit_sessions` sessions after its table's last list."""
+    from src.backtest import mimic as M
+    from src.signals import refusal_probe as RP
+    from src.signals import sel_refusal as SR
+    monkeypatch.setattr(settings, "sel_short_dir", str(tmp_path / "sel"))
+    monkeypatch.setattr(settings, "ibkr_microcap_dir", str(tmp_path / "micro"))
+    monkeypatch.setattr(SR, "model", lambda: {"installed": "2026-10-23T21:00:00-04:00"})
+    d = RP.probes_dir()
+    d.mkdir(parents=True)
+    rows = [{"ticker": f"R{i}", "source": "watch", "refused": "Small Cap", "at": "2026-10-27T17:00:00-04:00"} for i in range(3)]
+    rows += [{"ticker": "OLD", "refused": "Small Cap", "at": "2026-10-23T19:00:00-04:00"},       # before the install
+             {"ticker": "P1", "init_rate": 2.9, "maint_rate": 2.0, "at": "2026-10-27T17:05:00-04:00"}]
+    (d / "2026-10-27.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    (tmp_path / "micro").mkdir()
+    for day in ("2026-10-22", "2026-10-23", "2026-10-26", "2026-10-27"):
+        (tmp_path / "micro" / f"{day}.csv.gz").write_bytes(b"")
+    monkeypatch.setattr(M, "REFUSAL_LISTS_THROUGH", {M.REFUSAL_TABLE: "2026-10-23"})
+    st = LC.refit_status(date(2026, 10, 27))
+    assert st["refusal_model"] == {"installed": "2026-10-23T21:00:00-04:00", "names_answered_since": 4, "refused_since": 3}
+    assert st["listing_model"]["lists_since"] == 2
+    monkeypatch.setattr(settings, "refusal_model_refit_refusals", 3)
+    monkeypatch.setattr(settings, "refusal_listing_refit_sessions", 20)
+    notes = LC._refit_notes(st)
+    assert len(notes) == 1 and "refit due" in notes[0] and "3 new refusals" in notes[0]
+    monkeypatch.setattr(settings, "refusal_listing_refit_sessions", 2)
+    assert len(LC._refit_notes(st)) == 2
+
+
+def test_the_record_counts_the_implied_volatility_bars_ibkr_revised_and_the_fear_calls_they_flip(monkeypatch, tmp_path):
+    """P7: the fetches' journal read against the store; a fetch before the journal (no ``revised`` field) not counted."""
+    from datetime import timedelta
+
+    import numpy as np
+
+    from src.signals import dip_long as dl
+    from src.signals import fear_long as fl
+    monkeypatch.setattr(settings, "enable_fear_long", True)
+    monkeypatch.setattr(settings, "fear_long_dir", str(tmp_path / "fear_long"))
+    monkeypatch.setattr(settings, "fear_long_iv_dir", str(tmp_path / "iv"))
+    monkeypatch.setattr(settings, "fear_long_first_session", "2026-10-28")
+    d1, d2 = date(2026, 10, 28), date(2026, 10, 29)
+    days, x = [], date(2026, 10, 27)
+    while len(days) < 300:
+        if dl.is_session(x):
+            days.append(x)
+        x -= timedelta(days=1)
+    days = days[::-1]
+    vals = list(np.linspace(0.2, 0.3, 300))                                 # rising: the last bar the year's top
+    fl.merge_rows("AAA", [[str(d), v, v, v, v] for d, v in zip(days, vals)], day=d1)
+    dl._write_json(fl.table_path(d1), {"names": {"AAA": {"status": "ok", "added": 300, "bars": 300}}})   # no journal
+    fl.merge_rows("AAA", [[str(days[-1]), 0.05, 0.05, 0.05, 0.05]], day=d2)  # IBKR revised it: calm now
+    dl._write_json(fl.table_path(d2), {"names": {"AAA": {"status": "ok", "answered": 21, "added": 1, "revised": 1,
+                                                          "absent": 0}}})
+    f = LC.iv_revision_facts(d2)
+    assert (f["fetches"], f["reread"], f["revised"], f["absent"], f["names"]) == (1, 20, 1, 0, ["AAA"])
+    assert f["max_close_move"] == pytest.approx(1 - 0.05 / 0.3)
+    assert f["flips"] == [{"sym": "AAA", "date": str(days[-1]), "ivp_old": round((251 + 0.5) / 252, 4),
+                           "ivp_new": round(0.5 / 252, 4)}]
+    assert f["session"]["revised"] == 1 and f["session"]["journal"].endswith("2026-10-29.jsonl")
+    notes = LC._iv_notes(f)
+    assert len(notes) == 2 and notes[0].startswith("IBKR revised 1 of the 20 stored implied-volatility bars")
+    assert notes[1].startswith("1 fear call flipped") and "AAA" in notes[1]
+    f2 = LC.iv_revision_facts(date(2026, 10, 30))                            # a later session: the record's flip only
+    assert f2["session"] is None and f2["fetches"] == 1 and len(LC._iv_notes(f2)) == 1

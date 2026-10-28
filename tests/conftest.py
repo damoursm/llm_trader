@@ -176,6 +176,7 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     # ranks without it and never asks EDGAR; its tests opt in (with their own store and a stubbed EDGAR)
     monkeypatch.setattr(settings, "enable_dip_long_earnings_demote", False)
     monkeypatch.setattr(settings, "dip_long_earnings_edgar", False)
+    monkeypatch.setattr(settings, "enable_dip_long_wsb_prefer", False)  # PREREG209 KD+ (2026-10-26): its tests opt in
     # the own-security series (2026-10-18, src/signals/dip_security.py): it reads its events cache and asks Polygon —
     # the baseline reads the store as stored and never asks; its tests opt in (with their own cache, no network)
     monkeypatch.setattr(settings, "enable_dip_long_own_security", False)
@@ -187,6 +188,44 @@ def _isolated_sel_short(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "enable_cap_long", False)
     monkeypatch.setattr(settings, "cap_long_dir", str(tmp_path / "cap_long"))
     monkeypatch.setattr(settings, "crash_long_pm_exit", False)
+    # the insider book (2026-10-26, src/signals/insider_long.py) reads the insider tables and the whole-market bars and
+    # journals under its own dir: the baseline has none — its tests opt in
+    monkeypatch.setattr(settings, "enable_insider_long", False)
+    monkeypatch.setattr(settings, "insider_long_dir", str(tmp_path / "insider_long"))
+    # the fear book (2026-10-28, src/signals/fear_long.py) reads IBKR's implied-volatility store and journals under its
+    # own dirs: the baseline has neither — its tests opt in (and never reach the gateway: `fetch` takes a factory)
+    monkeypatch.setattr(settings, "enable_fear_long", False)
+    monkeypatch.setattr(settings, "fear_long_first_session", "")       # no first session: its tests' 2026-10 days
+    monkeypatch.setattr(settings, "fear_long_dir", str(tmp_path / "fear_long"))
+    monkeypatch.setattr(settings, "fear_long_iv_dir", str(tmp_path / "ibkr_iv"))
+    # its frozen copies (P7, `strategies.fear.snapshot`): the bank's ``iv_store/`` is production's cache — a test's card
+    # build freezes the test's own store into the test's own dir, and no test inherits another's frozen store
+    from src.backtest.strategies import fear as _fear_sim
+    monkeypatch.setattr(_fear_sim, "snapshot_root", lambda: tmp_path / "iv_store")
+    monkeypatch.setattr(_fear_sim, "IV_ROOT", None)
+    # the data feeds (2026-10-25, src/data/feeds/: WSB, the OCC, the FDA) fetch from public sites: off, every store and
+    # their state in the test's own dir — their tests opt in with injected fetchers
+    monkeypatch.setattr(settings, "enable_data_feeds", False)
+    monkeypatch.setattr(settings, "feeds_state_dir", str(tmp_path / "feeds"))
+    monkeypatch.setattr(settings, "feeds_wsb_dir", str(tmp_path / "reddit_wsb"))
+    monkeypatch.setattr(settings, "feeds_occ_dir", str(tmp_path / "occ_volume"))
+    monkeypatch.setattr(settings, "feeds_fda_dir", str(tmp_path / "openfda"))
+    monkeypatch.setattr(settings, "feeds_pace_seconds", 0.0)
+    # the WSB feed's retries, pre-cut loop and Reddit gap fill (2026-10-27): off; their tests opt in with a fake clock
+    monkeypatch.setattr(settings, "feeds_wsb_retries", 0)
+    monkeypatch.setattr(settings, "feeds_wsb_precut_lead_minutes", 0.0)
+    monkeypatch.setattr(settings, "feeds_wsb_precut_tail_minutes", 0.0)
+    monkeypatch.setattr(settings, "enable_feeds_wsb_reddit_fill", False)
+    # the free-data census's feeds (2026-10-26 evening: EDGAR full-text search, Cboe, the 10b5-1 notes files, GDELT):
+    # their stores in the test's own dir, no pacing and no SEC quiet window (their tests set one)
+    monkeypatch.setattr(settings, "feeds_efts_dir", str(tmp_path / "edgar_fts"))
+    monkeypatch.setattr(settings, "feeds_cboe_dir", str(tmp_path / "cboe_options"))
+    monkeypatch.setattr(settings, "feeds_plans_dir", str(tmp_path / "edgar_notes"))
+    monkeypatch.setattr(settings, "feeds_gdelt_dir", str(tmp_path / "gdelt"))
+    monkeypatch.setattr(settings, "feeds_sec_pace_seconds", 0.0)
+    monkeypatch.setattr(settings, "feeds_sec_quiet_et", "")
+    # the shadow discovery's Alpha Vantage cache (2026-10-26): never production's cache/
+    monkeypatch.setattr(settings, "trending_av_cache_dir", str(tmp_path / "trending_av"))
     # the live record against the simulator (2026-10-12): the email's banner reads it — never production's files
     monkeypatch.setattr(settings, "live_calibration_dir", str(tmp_path / "live_calibration"))
     monkeypatch.setattr(settings, "forward_check_dir", str(tmp_path / "forward_check"))

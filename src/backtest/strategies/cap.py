@@ -87,7 +87,7 @@ def signals_fn(theta: Optional[float] = None):
                 last_close = False
                 if prm.exit == "next_open":
                     if x + 1 >= n:
-                        if not ended:
+                        if not ended and not DIP.OPEN_END:      # PREREG227's S8: set D keeps it, as the dip book's
                             continue
                         xd, last_close = n - 1, True
                     else:
